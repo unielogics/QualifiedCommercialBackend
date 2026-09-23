@@ -196,7 +196,7 @@ async def ingest_reply(
             body=(subject or "Open the prospect to review the reply.")[:240],
             target_type="dealer_prospect",
             target_id=str(prospect.id),
-            deep_link=f"/contacts/prospects/{prospect.id}",
+            deep_link=f"/marketing/prospects/{prospect.id}",
             meta={"prospect_id": str(prospect.id), "draft_id": str(match.draft_id)},
             email=False,
             push=True,

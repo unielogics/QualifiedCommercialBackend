@@ -1111,7 +1111,7 @@ async def field_desk_global_search(
                 title=contact.full_name,
                 subtitle=_search_context(contact.company, dealer.name if dealer else None),
                 context=_search_context(contact.email, contact.phone_e164),
-                href=f"/contacts/{contact.id}",
+                href=f"/marketing/{contact.id}",
                 dealer_id=contact.dealer_id,
                 occurred_at=contact.last_activity_at or contact.updated_at,
             )

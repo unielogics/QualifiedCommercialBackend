@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import inspect
 import io
@@ -136,6 +137,94 @@ async def test_live_draft_read_exposes_honest_generation_and_instruction_diagnos
     assert generated.instruction_disposition == "submitted_to_ai"
 
 
+def test_enriched_draft_read_separates_provider_delivery_from_draft_state():
+    row = _draft(status="sent")
+    row.created_at = datetime.now(UTC)
+    row.compose_mode = "manual"
+    row.sent_at = datetime.now(UTC)
+    asset = DealerProspectEmailDraftAsset(
+        id=uuid.uuid4(),
+        draft_id=row.id,
+        asset_id=uuid.uuid4(),
+        asset_name="Dealer guide",
+        asset_version=3,
+        file_name="dealer-guide.pdf",
+        content_type="application/pdf",
+        size_bytes=9,
+        sha256="a" * 64,
+        validation_status="passed_antivirus",
+        document_bytes=b"%PDF-test",
+        sort_order=0,
+    )
+    delivered_at = datetime.now(UTC)
+    opened_at = delivered_at + timedelta(minutes=1)
+    ledger = SimpleNamespace(
+        id=uuid.uuid4(),
+        status="delivered",
+        detail="Delivery confirmed",
+        provider="ses",
+        provider_message_id="ses-123",
+        delivered_at=delivered_at,
+        opened_at=opened_at,
+        failed_at=None,
+    )
+    owner = SimpleNamespace(id=uuid.uuid4(), name="Owner", email="owner@example.com")
+    actor = SimpleNamespace(id=row.created_by_user_id, name="Agent", email="agent@example.com")
+    prospect = SimpleNamespace(
+        id=row.prospect_id,
+        owner_user_id=owner.id,
+        archived_at=datetime.now(UTC),
+    )
+    contact = SimpleNamespace(
+        id=uuid.uuid4(),
+        full_name="Alex Morgan",
+        email="alex@example.com",
+        phone_e164="+12025550100",
+    )
+
+    result = outreach._draft_read(
+        row,
+        assets=[asset],
+        prospect=prospect,
+        company=SimpleNamespace(name="Example Motors"),
+        contact=contact,
+        owner=owner,
+        actor=actor,
+        ledger=ledger,
+    )
+
+    assert result.compose_mode == "manual"
+    assert result.status == "sent"
+    assert result.delivery_status == "delivered"
+    assert result.provider_status == "delivered"
+    assert result.delivered_at == delivered_at
+    assert result.opened_at == opened_at
+    assert result.body == row.body_text
+    assert result.editable_body == row.editable_body
+    assert result.locked_footer_text == row.locked_footer_text
+    assert result.dealer_name == "Example Motors"
+    assert result.owner_user_id == owner.id
+    assert result.triggering_agent_id == actor.id
+    assert result.attachments[0].preview_url.endswith(
+        f"/{asset.id}?disposition=inline"
+    )
+
+    assert outreach._delivery_status(row, None) == "unavailable"
+
+
+def test_stale_delivery_claim_becomes_unavailable_but_live_claims_stay_pending():
+    row = _draft(status="sending")
+
+    row.dispatch_started_at = None
+    assert outreach._delivery_status(row, None) is None
+
+    row.dispatch_started_at = datetime.now(UTC) - outreach.DELIVERY_CLAIM_GRACE / 2
+    assert outreach._delivery_status(row, None) is None
+
+    row.dispatch_started_at = datetime.now(UTC) - outreach.DELIVERY_CLAIM_GRACE * 2
+    assert outreach._delivery_status(row, None) == "unavailable"
+
+
 def test_outreach_policy_normalizes_guidance_and_blocked_phrase_duplicates():
     policy = ProspectOutreachPolicyPatch(
         drafting_guidance="  Warm and concise.\nUse a direct call to action.  ",
@@ -171,6 +260,27 @@ def test_verified_conversation_context_is_normalized_and_bound_to_live_idempoten
     )
 
 
+def test_manual_drafts_require_copy_and_cannot_smuggle_ai_inputs():
+    draft = ProspectEmailDraftCreate(
+        compose_mode="manual",
+        subject="  Following up  ",
+        body="  Hi Alex,\n\nHere are the details we discussed.  ",
+        include_collateral=False,
+    )
+    assert draft.subject == "Following up"
+    assert draft.body == "Hi Alex,\n\nHere are the details we discussed."
+
+    with pytest.raises(ValidationError, match="subject and body are required"):
+        ProspectEmailDraftCreate(compose_mode="manual", subject="Only a subject")
+    with pytest.raises(ValidationError, match="available only for AI drafts"):
+        ProspectEmailDraftCreate(
+            compose_mode="manual",
+            subject="Following up",
+            body="Hello",
+            ai_instructions="Rewrite this",
+        )
+    with pytest.raises(ValidationError, match="available only for manual drafts"):
+        ProspectEmailDraftCreate(compose_mode="ai", subject="Ignored", body="Ignored")
 def test_collateral_request_has_explicit_all_selected_and_none_semantics():
     first = uuid.uuid4()
 
@@ -289,6 +399,99 @@ async def test_live_idempotency_key_cannot_replay_another_actors_branded_draft(
             actor=actor_b,
             payload=payload,
         )
+
+
+@pytest.mark.asyncio
+async def test_manual_draft_is_validated_snapshotted_and_never_auto_scheduled(monkeypatch):
+    actor = User(
+        id=uuid.uuid4(),
+        clerk_id="manual-actor",
+        email="agent@qualifiedcommercial.com",
+        name="Agent One",
+        role="loan_exec",
+        account_status="active",
+    )
+    prospect = SimpleNamespace(
+        id=uuid.uuid4(),
+        do_not_contact=False,
+        do_not_contact_reason=None,
+        owner_user_id=actor.id,
+        last_activity_at=None,
+    )
+    identity = outreach.ProspectIdentity(
+        contact_id=uuid.uuid4(),
+        contact_name="Alex",
+        dealer_name="Example Motors",
+        email="alex@example.com",
+        owner_user_id=actor.id,
+    )
+    payload = ProspectEmailDraftCreate(
+        compose_mode="manual",
+        subject="Following up",
+        body="Hi Alex,\n\nThank you for speaking with me today.",
+        include_collateral=False,
+    )
+
+    class EmptyResult:
+        @staticmethod
+        def scalar_one_or_none():
+            return None
+
+    class Nested:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_args):
+            return False
+
+    added = []
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=EmptyResult()),
+        begin_nested=lambda: Nested(),
+        add=added.append,
+        flush=AsyncMock(),
+    )
+    compose = AsyncMock(side_effect=AssertionError("manual copy must not call AI"))
+    validate = AsyncMock()
+    monkeypatch.setattr(outreach, "load_agent_branding", AsyncMock(return_value=_branding(actor)))
+    monkeypatch.setattr(outreach, "prospect_identity", AsyncMock(return_value=identity))
+    monkeypatch.setattr(outreach, "is_suppressed", AsyncMock(return_value=None))
+    monkeypatch.setattr(outreach, "_active_catalog_snapshot", AsyncMock(return_value=[]))
+    monkeypatch.setattr(outreach, "_compose_with_nova", compose)
+    monkeypatch.setattr(outreach, "validate_current_draft_copy", validate)
+    monkeypatch.setattr(outreach, "resolve_collateral_selection", AsyncMock(return_value=[]))
+    monkeypatch.setattr(outreach, "sync_draft_notifications", AsyncMock())
+    monkeypatch.setattr(outreach, "_record_private_note", AsyncMock())
+    monkeypatch.setattr(
+        outreach,
+        "get_settings",
+        lambda: SimpleNamespace(
+            public_api_url="https://api.qualifiedcommercial.com",
+            prospect_email_review_seconds=60,
+            prospect_email_max_attachment_bytes=7_000_000,
+            prospect_mailing_address="14 53rd St #408N, Brooklyn, NY 11232",
+            prospect_reply_to_email="support@qualifiedcommercial.com",
+            prospect_alternate_contact_email="franco@qualifiedcommercial.com",
+        ),
+    )
+
+    draft = await outreach.create_draft(db, prospect=prospect, actor=actor, payload=payload)
+
+    compose.assert_not_awaited()
+    validate.assert_awaited_once_with(
+        db,
+        subject="Following up",
+        editable_body="Hi Alex,\n\nThank you for speaking with me today.",
+        catalog_snapshot=[],
+    )
+    assert draft.compose_mode == "manual"
+    assert draft.status == "editing"
+    assert draft.auto_send_at is None
+    assert draft.review_stopped_at is not None
+    assert draft.body_text.startswith(draft.editable_body)
+    assert "Unsubscribe from Dealer Desk email:" in draft.locked_footer_text
+    activity = next(item for item in added if getattr(item, "kind", None) == "email.draft_created")
+    assert activity.metadata_json["compose_mode"] == "manual"
 
 
 @pytest.mark.asyncio
@@ -433,6 +636,82 @@ async def test_agent_collateral_options_expose_only_safe_selection_metadata(monk
     assert "status" not in dumped
     assert "sha256" not in dumped
     assert "uploaded_by_user_id" not in dumped
+
+
+@pytest.mark.asyncio
+async def test_email_attachment_rejects_guessed_draft_before_reading_bytes(monkeypatch):
+    denied = HTTPException(status_code=404, detail="Prospect not found")
+    visible = AsyncMock(side_effect=denied)
+    monkeypatch.setattr(prospect_outreach_router, "_visible_draft", visible)
+    db = SimpleNamespace(execute=AsyncMock())
+
+    with pytest.raises(HTTPException) as error:
+        await prospect_outreach_router.get_prospect_email_attachment(
+            draft_id=uuid.uuid4(),
+            attachment_id=uuid.uuid4(),
+            user=SimpleNamespace(),
+            db=db,
+            disposition="inline",
+        )
+
+    assert error.value.status_code == 404
+    db.execute.assert_not_awaited()
+    assert visible.await_args.kwargs["historical"] is True
+
+
+@pytest.mark.asyncio
+async def test_email_attachment_is_bound_to_draft_and_uses_safe_pdf_headers(monkeypatch):
+    draft_id = uuid.uuid4()
+    attachment_id = uuid.uuid4()
+    monkeypatch.setattr(
+        prospect_outreach_router,
+        "_visible_draft",
+        AsyncMock(return_value=(_draft(status="sent"), SimpleNamespace(archived_at=None))),
+    )
+
+    class Result:
+        def __init__(self, value):
+            self.value = value
+
+        def scalar_one_or_none(self):
+            return self.value
+
+    db = SimpleNamespace(execute=AsyncMock(return_value=Result(None)))
+    with pytest.raises(HTTPException) as missing:
+        await prospect_outreach_router.get_prospect_email_attachment(
+            draft_id=draft_id,
+            attachment_id=attachment_id,
+            user=SimpleNamespace(),
+            db=db,
+            disposition="inline",
+        )
+    assert missing.value.status_code == 404
+    assert "draft_id" in str(db.execute.await_args.args[0])
+
+    snapshot_bytes = b"%PDF-immutable"
+    snapshot = SimpleNamespace(
+        id=attachment_id,
+        draft_id=draft_id,
+        file_name='dealer;guide\\".pdf',
+        document_bytes=snapshot_bytes,
+        sha256=hashlib.sha256(snapshot_bytes).hexdigest(),
+        size_bytes=len(snapshot_bytes),
+        validation_status="passed_antivirus",
+    )
+    db.execute = AsyncMock(return_value=Result(snapshot))
+    response = await prospect_outreach_router.get_prospect_email_attachment(
+        draft_id=draft_id,
+        attachment_id=attachment_id,
+        user=SimpleNamespace(),
+        db=db,
+        disposition="attachment",
+    )
+    assert response.body == snapshot_bytes
+    assert response.media_type == "application/pdf"
+    assert response.headers["content-disposition"] == (
+        'attachment; filename="dealer_guide_.pdf"'
+    )
+    assert response.headers["cache-control"] == "private, no-store"
 
 
 @pytest.mark.asyncio
@@ -2082,14 +2361,118 @@ def test_rollout_gate_keeps_public_links_and_collateral_setup_available(monkeypa
         "/api/v1/dealer-os/prospect-outreach/test-email",
     ):
         prospect_outreach_router._require_outreach_enabled(
-            SimpleNamespace(url=SimpleNamespace(path=path))
+            SimpleNamespace(method="GET", url=SimpleNamespace(path=path))
         )
     guard.assert_not_called()
 
     prospect_outreach_router._require_outreach_enabled(
-        SimpleNamespace(url=SimpleNamespace(path="/api/v1/dealer-os/prospect-email-drafts"))
+        SimpleNamespace(
+            method="GET",
+            url=SimpleNamespace(path="/api/v1/dealer-os/prospect-email-drafts"),
+        )
+    )
+    guard.assert_not_called()
+
+    prospect_outreach_router._require_outreach_enabled(
+        SimpleNamespace(
+            method="POST",
+            url=SimpleNamespace(
+                path=f"/api/v1/dealer-os/prospect-email-drafts/{uuid.uuid4()}/approve"
+            ),
+        )
     )
     guard.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_marketing_email_log_filters_and_paginates_without_general_audit(monkeypatch):
+    owner_id = uuid.uuid4()
+    admin = User(
+        id=uuid.uuid4(),
+        clerk_id="marketing-log-admin",
+        email="admin@qualifiedcommercial.com",
+        name="Admin",
+        role="super_admin",
+        account_status="active",
+    )
+
+    class CountResult:
+        @staticmethod
+        def scalar_one():
+            return 0
+
+    class RowsResult:
+        def scalars(self):
+            return self
+
+        @staticmethod
+        def all():
+            return []
+
+    db = SimpleNamespace(execute=AsyncMock(side_effect=[CountResult(), RowsResult()]))
+    monkeypatch.setattr(outreach, "enriched_draft_reads", AsyncMock(return_value=[]))
+
+    result = await prospect_outreach_router.list_prospect_email_outbox(
+        user=admin,
+        db=db,
+        statuses=["sent"],
+        draft_statuses=["sent"],
+        delivery_statuses=["delivered"],
+        source="manual",
+        owner_user_id=owner_id,
+        q="Example Motors",
+        due="all",
+        limit=25,
+        offset=50,
+    )
+
+    assert result.total == 0
+    assert result.limit == 25
+    assert result.offset == 50
+    assert result.items == []
+    count_sql = str(db.execute.await_args_list[0].args[0])
+    rows_sql = str(db.execute.await_args_list[1].args[0])
+    for statement in (count_sql, rows_sql):
+        assert "dealer_prospect_email_drafts.compose_mode" in statement
+        assert "message_sends.prospect_draft_id" in statement
+        assert "message_sends.status" in statement
+        assert "dealer_prospects.owner_user_id" in statement
+        assert "dos_rep_companies.name" in statement
+        assert "dealer_prospect" in statement
+        assert "dealer_prospect_test" not in statement
+    assert "LIMIT" in rows_sql
+    assert "OFFSET" in rows_sql
+
+
+@pytest.mark.asyncio
+async def test_marketing_email_log_rejects_unknown_delivery_state_before_query():
+    admin = User(
+        id=uuid.uuid4(),
+        clerk_id="marketing-log-admin-invalid",
+        email="admin-invalid@qualifiedcommercial.com",
+        name="Admin",
+        role="super_admin",
+        account_status="active",
+    )
+    db = SimpleNamespace(execute=AsyncMock())
+
+    with pytest.raises(HTTPException) as error:
+        await prospect_outreach_router.list_prospect_email_outbox(
+            user=admin,
+            db=db,
+            statuses=[],
+            draft_statuses=[],
+            delivery_statuses=["opened"],
+            source=None,
+            owner_user_id=None,
+            q=None,
+            due="all",
+            limit=50,
+            offset=0,
+        )
+    assert error.value.status_code == 422
+    assert error.value.detail["code"] == "invalid_delivery_status"
+    db.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import re
 import zipfile
@@ -23,17 +24,20 @@ from fastapi import (
     UploadFile,
     status,
 )
-from sqlalchemy import case, func, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.config import get_settings
 from app.db import get_db
 from app.deps import CurrentUser
 from app.models.dealer_prospect import DealerProspect, DealerProspectActivity
+from app.models.message_send import MessageSend
 from app.models.prospect_outreach import (
     DRAFT_STATUSES,
     DealerProspectEmailDraft,
+    DealerProspectEmailDraftAsset,
     DealerProspectInboundReply,
     EmailSuppression,
     MarketingCollateralAsset,
@@ -72,6 +76,7 @@ from app.services import prospect_outreach as outreach
 from app.services.email import prospect_reply
 from app.services.email.user_inbox_sync import decrypt_body
 
+from .models import DealerRepCompany, DealerRepContact
 from .services import prospects as prospect_service
 
 
@@ -84,7 +89,13 @@ def _require_outreach_enabled(request: Request) -> None:
     path = request.url.path
     collateral_root = "/dealer-os/marketing-collateral"
     outreach_config_root = "/dealer-os/prospect-outreach"
+    historical_read = getattr(request, "method", "GET").upper() == "GET" and (
+        "/prospect-email-drafts" in path
+        or re.search(r"/prospects/[^/]+/(?:email-drafts|replies)$", path) is not None
+    )
     if (
+        historical_read
+        or
         "/prospect-email-unsubscribe/" in path
         or "/prospect-email-bundles/" in path
         or path.endswith(collateral_root)
@@ -128,14 +139,23 @@ def _require_outreach_reader_or_config_admin(user: User) -> None:
 
 
 async def _visible_draft(
-    db: AsyncSession, user, draft_id: UUID, *, lock: bool = False
+    db: AsyncSession,
+    user,
+    draft_id: UUID,
+    *,
+    lock: bool = False,
+    historical: bool = False,
 ) -> tuple[DealerProspectEmailDraft, DealerProspect]:
     try:
         row = await outreach.load_draft(db, draft_id, lock=lock)
     except Exception as exc:  # noqa: BLE001
         _raise_service(exc)
         raise
-    prospect = await prospect_service.load_visible_prospect(db, user, row.prospect_id)
+    prospect = await (
+        prospect_service.load_visible_prospect_history(db, user, row.prospect_id)
+        if historical
+        else prospect_service.load_visible_prospect(db, user, row.prospect_id)
+    )
     return row, prospect
 
 
@@ -308,7 +328,9 @@ async def preview_prospect_outreach_collateral_option(
     ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Collateral option not found.")
-    safe_name = row.file_name.replace('"', "_").replace("\r", "_").replace("\n", "_")
+    safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", row.file_name).strip(" .")
+    if not safe_name.casefold().endswith(".pdf"):
+        safe_name = f"{safe_name or 'dealer-outreach'}.pdf"
     return Response(
         content=bytes(row.document_bytes),
         media_type="application/pdf",
@@ -364,7 +386,7 @@ async def list_prospect_email_drafts(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ProspectEmailDraftList:
-    await prospect_service.load_visible_prospect(db, user, prospect_id)
+    await prospect_service.load_visible_prospect_history(db, user, prospect_id)
     rows = list(
         (
             await db.execute(
@@ -377,7 +399,61 @@ async def list_prospect_email_drafts(
         .scalars()
         .all()
     )
-    return ProspectEmailDraftList(items=[await outreach.draft_read(db, row) for row in rows])
+    return ProspectEmailDraftList(items=await outreach.enriched_draft_reads(db, rows))
+
+
+_DELIVERY_FILTERS = frozenset(
+    {
+        "provider_accepted",
+        "delivered",
+        "bounced",
+        "complaint",
+        "failed",
+        "blocked",
+        "cancelled",
+        "unavailable",
+    }
+)
+
+
+def _delivery_filter(value: str):
+    linked = and_(
+        MessageSend.prospect_draft_id == DealerProspectEmailDraft.id,
+        MessageSend.context == "dealer_prospect",
+        MessageSend.channel == "email",
+        MessageSend.direction == "outbound",
+    )
+    raw_status = {
+        "provider_accepted": "sent",
+        "delivered": "delivered",
+        "bounced": "bounced",
+        "complaint": "complained",
+        "failed": "failed",
+        "blocked": "blocked",
+    }.get(value)
+    if raw_status is not None:
+        ledger_match = select(MessageSend.id).where(linked, MessageSend.status == raw_status)
+        if value in {"failed", "blocked"}:
+            return or_(
+                DealerProspectEmailDraft.status == value,
+                ledger_match.exists(),
+            )
+        return ledger_match.exists()
+    if value == "cancelled":
+        return DealerProspectEmailDraft.status == "cancelled"
+    any_ledger = select(MessageSend.id).where(linked)
+    return and_(
+        ~any_ledger.exists(),
+        or_(
+            DealerProspectEmailDraft.status == "sent",
+            and_(
+                DealerProspectEmailDraft.status == "sending",
+                DealerProspectEmailDraft.dispatch_started_at.is_not(None),
+                DealerProspectEmailDraft.dispatch_started_at
+                <= datetime.now(UTC) - outreach.DELIVERY_CLAIM_GRACE,
+            ),
+        ),
+    )
 
 
 @router.get(
@@ -388,22 +464,59 @@ async def list_prospect_email_outbox(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     statuses: list[str] | None = Query(default=None, alias="status"),
+    draft_statuses: list[str] | None = Query(default=None, alias="draft_status"),
+    delivery_statuses: list[str] | None = Query(default=None, alias="delivery_status"),
+    source: str | None = Query(default=None, pattern="^(ai|manual)$"),
+    owner_user_id: UUID | None = Query(default=None),
+    q: str | None = Query(default=None, max_length=200),
     due: str = Query(default="all", pattern="^(all|scheduled|due)$"),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ) -> ProspectEmailOutboxList:
     """Authorized shared outbox across every prospect visible to the caller."""
-    prospect_service.require_prospect_actor(user)
-    selected = list(dict.fromkeys(statuses or []))
+    prospect_service.require_prospect_history_reader(user)
+    selected = list(dict.fromkeys([*(statuses or []), *(draft_statuses or [])]))
     invalid = sorted(set(selected) - set(DRAFT_STATUSES))
     if invalid:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             {"code": "invalid_draft_status", "statuses": invalid},
         )
+    selected_delivery = list(dict.fromkeys(delivery_statuses or []))
+    invalid_delivery = sorted(set(selected_delivery) - _DELIVERY_FILTERS)
+    if invalid_delivery:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {"code": "invalid_delivery_status", "statuses": invalid_delivery},
+        )
+    owner = aliased(User, name="marketing_prospect_owner")
+    actor = aliased(User, name="marketing_email_actor")
     conditions = [prospect_service.prospect_access_filter(user)]
     if selected:
         conditions.append(DealerProspectEmailDraft.status.in_(selected))
+    if selected_delivery:
+        conditions.append(or_(*[_delivery_filter(value) for value in selected_delivery]))
+    if source:
+        conditions.append(DealerProspectEmailDraft.compose_mode == source)
+    if owner_user_id is not None:
+        conditions.append(DealerProspect.owner_user_id == owner_user_id)
+    search = (q or "").strip()
+    if search:
+        like = f"%{search}%"
+        conditions.append(
+            or_(
+                DealerProspectEmailDraft.recipient_email.ilike(like),
+                DealerProspectEmailDraft.subject.ilike(like),
+                DealerRepCompany.name.ilike(like),
+                DealerRepContact.full_name.ilike(like),
+                DealerRepContact.email.ilike(like),
+                DealerRepContact.phone_e164.ilike(like),
+                owner.name.ilike(like),
+                owner.email.ilike(like),
+                actor.name.ilike(like),
+                actor.email.ilike(like),
+            )
+        )
     if due == "scheduled":
         conditions.append(DealerProspectEmailDraft.auto_send_at.is_not(None))
     elif due == "due":
@@ -418,6 +531,10 @@ async def list_prospect_email_outbox(
             await db.execute(
                 select(func.count(DealerProspectEmailDraft.id))
                 .join(DealerProspect, DealerProspect.id == DealerProspectEmailDraft.prospect_id)
+                .join(DealerRepCompany, DealerRepCompany.id == DealerProspect.company_id)
+                .join(DealerRepContact, DealerRepContact.id == DealerProspect.primary_contact_id)
+                .outerjoin(owner, owner.id == DealerProspect.owner_user_id)
+                .outerjoin(actor, actor.id == DealerProspectEmailDraft.created_by_user_id)
                 .where(*conditions)
             )
         ).scalar_one()
@@ -428,6 +545,10 @@ async def list_prospect_email_outbox(
             await db.execute(
                 select(DealerProspectEmailDraft)
                 .join(DealerProspect, DealerProspect.id == DealerProspectEmailDraft.prospect_id)
+                .join(DealerRepCompany, DealerRepCompany.id == DealerProspect.company_id)
+                .join(DealerRepContact, DealerRepContact.id == DealerProspect.primary_contact_id)
+                .outerjoin(owner, owner.id == DealerProspect.owner_user_id)
+                .outerjoin(actor, actor.id == DealerProspectEmailDraft.created_by_user_id)
                 .where(*conditions)
                 .order_by(
                     case(
@@ -445,7 +566,7 @@ async def list_prospect_email_outbox(
         .all()
     )
     return ProspectEmailOutboxList(
-        items=[await outreach.draft_read(db, row) for row in rows],
+        items=await outreach.enriched_draft_reads(db, rows),
         total=total,
         limit=limit,
         offset=offset,
@@ -458,7 +579,7 @@ async def list_prospect_email_replies(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ProspectReplyList:
-    await prospect_service.load_visible_prospect(db, user, prospect_id)
+    await prospect_service.load_visible_prospect_history(db, user, prospect_id)
     rows = list(
         (
             await db.execute(
@@ -501,8 +622,53 @@ async def get_prospect_email_draft(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ProspectEmailDraftRead:
-    row, _ = await _visible_draft(db, user, draft_id)
-    return await outreach.draft_read(db, row)
+    row, _ = await _visible_draft(db, user, draft_id, historical=True)
+    return (await outreach.enriched_draft_reads(db, [row]))[0]
+
+
+@router.get("/prospect-email-drafts/{draft_id}/attachments/{attachment_id}")
+async def get_prospect_email_attachment(
+    draft_id: UUID,
+    attachment_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    disposition: str = Query(default="inline", pattern="^(inline|attachment)$"),
+) -> Response:
+    """Serve the immutable PDF snapshot authorized through its prospect."""
+    await _visible_draft(db, user, draft_id, historical=True)
+    row = (
+        await db.execute(
+            select(DealerProspectEmailDraftAsset).where(
+                DealerProspectEmailDraftAsset.id == attachment_id,
+                DealerProspectEmailDraftAsset.draft_id == draft_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Email attachment not found.")
+    data = bytes(row.document_bytes)
+    if (
+        row.validation_status != "passed_antivirus"
+        or len(data) != int(row.size_bytes)
+        or hashlib.sha256(data).hexdigest() != row.sha256
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"code": "attachment_snapshot_invalid", "message": "Email attachment is unavailable."},
+        )
+    safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", row.file_name).strip(" .")
+    if not safe_name.casefold().endswith(".pdf"):
+        safe_name = f"{safe_name or 'dealer-outreach'}.pdf"
+    return Response(
+        content=data,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{safe_name}"',
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            "ETag": f'"{row.sha256}"',
+        },
+    )
 
 
 @router.post(
@@ -568,7 +734,10 @@ async def approve_prospect_email_draft(
             approved_by_user_id=user.id,
             automatic=False,
         )
-        return await outreach.draft_read(db, row)
+        # Dispatch commits both the draft and its MessageSend ledger row.  Read
+        # the enriched projection here so the immediate response distinguishes
+        # provider acceptance from a genuinely missing historical ledger.
+        return (await outreach.enriched_draft_reads(db, [row]))[0]
     except Exception as exc:  # noqa: BLE001
         _raise_service(exc)
         raise
@@ -826,7 +995,9 @@ async def preview_marketing_collateral(
 ) -> Response:
     prospect_service.require_config_admin(user)
     row = await _collateral(db, asset_id)
-    safe_name = row.file_name.replace('"', "_").replace("\r", "_").replace("\n", "_")
+    safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", row.file_name).strip(" .")
+    if not safe_name.casefold().endswith(".pdf"):
+        safe_name = f"{safe_name or 'dealer-outreach'}.pdf"
     return Response(
         content=bytes(row.document_bytes),
         media_type="application/pdf",

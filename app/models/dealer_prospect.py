@@ -113,6 +113,20 @@ class DealerProspect(TimestampMixin, Base):
             postgresql_where=text("archived_at IS NULL AND phone_normalized IS NOT NULL"),
         ),
         CheckConstraint("version > 0", name="ck_dealer_prospect_version_positive"),
+        CheckConstraint(
+            "conversion_target IS NULL OR conversion_target IN "
+            "('portfolio_application','dealer_ai_intake')",
+            name="ck_dealer_prospect_conversion_target",
+        ),
+        CheckConstraint(
+            "(conversion_target IS NULL AND converted_application_id IS NULL "
+            "AND converted_intake_id IS NULL) OR "
+            "(conversion_target = 'portfolio_application' AND converted_application_id IS NOT NULL "
+            "AND converted_intake_id IS NULL) OR "
+            "(conversion_target = 'dealer_ai_intake' AND converted_intake_id IS NOT NULL "
+            "AND converted_application_id IS NULL)",
+            name="ck_dealer_prospect_conversion_destination",
+        ),
     )
 
     id: Mapped[uuid.UUID] = _pk()
@@ -146,7 +160,16 @@ class DealerProspect(TimestampMixin, Base):
     )
     converted_intake_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True),
-        ForeignKey("public_underwriting_intakes.id", ondelete="SET NULL"),
+        ForeignKey("public_underwriting_intakes.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    # ``DealerBusiness`` is the durable Portfolio application record exposed
+    # at /applications/{id}.  Keep this separate from the AI Intake link so a
+    # prospect can be converted to exactly the workflow the operator chose.
+    conversion_target: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    converted_application_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("dos_dealers.id", ondelete="RESTRICT"),
         nullable=True,
     )
 

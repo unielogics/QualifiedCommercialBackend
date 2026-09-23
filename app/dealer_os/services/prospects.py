@@ -182,6 +182,15 @@ def require_prospect_actor(user: User) -> None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Prospect pipeline is not enabled")
 
 
+def require_prospect_history_reader(user: User) -> None:
+    """Authorize historical Marketing reads without a sending entitlement.
+
+    The global rollout switch and per-user package flag control new work and
+    delivery. They must not erase an otherwise authorized agent's audit trail.
+    """
+    require_team_or_rep(user)
+
+
 def require_pipeline_enabled() -> None:
     if not get_settings().dealer_prospect_pipeline_enabled:
         # A 404 keeps a disabled pilot surface undiscoverable to users who are
@@ -431,6 +440,26 @@ async def load_visible_prospect(
     return row
 
 
+async def load_visible_prospect_history(
+    db: AsyncSession,
+    user: User,
+    prospect_id: UUID,
+) -> DealerProspect:
+    """Load current or archived history under current owner/assignment RBAC."""
+    require_prospect_history_reader(user)
+    row = (
+        await db.execute(
+            select(DealerProspect).where(
+                DealerProspect.id == prospect_id,
+                prospect_access_filter(user),
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Prospect not found")
+    return row
+
+
 async def load_visible_contact(db: AsyncSession, user: User, contact_id: UUID) -> DealerRepContact:
     """Resolve an All Contacts row without widening the caller's CRM scope."""
     require_prospect_actor(user)
@@ -511,6 +540,9 @@ def _prospect_read_payload(
         "do_not_contact": prospect.do_not_contact,
         "do_not_contact_reason": prospect.do_not_contact_reason,
         "appointment_id": prospect.appointment_id,
+        "conversion_target": getattr(prospect, "conversion_target", None)
+        or ("dealer_ai_intake" if prospect.converted_intake_id else None),
+        "converted_application_id": getattr(prospect, "converted_application_id", None),
         "converted_intake_id": prospect.converted_intake_id,
         "converted_at": prospect.converted_at,
         "version": prospect.version,
@@ -1012,12 +1044,15 @@ async def move_stage(
     previous_do_not_contact = prospect.do_not_contact
     previous_do_not_contact_reason = prospect.do_not_contact_reason
     previous_appointment_id = prospect.appointment_id
-    if destination.key == "converted" and prospect.converted_intake_id is None:
+    if destination.key == "converted" and (
+        prospect.converted_intake_id is None
+        and getattr(prospect, "converted_application_id", None) is None
+    ):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             detail={
                 "code": "conversion_required",
-                "message": "Use Create AI Intake before moving this prospect to Converted.",
+                "message": "Convert this prospect to Portfolio or AI Intake before moving it.",
             },
         )
     if destination.key == "not_interested" and action != "none":
@@ -1353,6 +1388,25 @@ async def undo_activity(
 async def intake_candidates(
     db: AsyncSession, prospect: DealerProspect, user: User
 ) -> list[PublicUnderwritingIntake]:
+    identity_match = _intake_identity_match(prospect)
+    stmt = (
+        select(PublicUnderwritingIntake)
+        .where(
+            PublicUnderwritingIntake.variant == "dealer_gatekeeper_v1",
+            identity_match,
+        )
+        .order_by(PublicUnderwritingIntake.created_at.desc())
+        .limit(20)
+    )
+    if user.role not in TEAM_ROLES:
+        # Reps may only discover/link an intake already attributed to them or
+        # to the owner of the prospect they were explicitly assigned. Identity
+        # matching alone must never expose or mutate another rep's file.
+        stmt = stmt.where(_intake_visible_to_user(prospect, user))
+    return list((await db.execute(stmt)).scalars().all())
+
+
+def _intake_identity_match(prospect: DealerProspect):
     digits = re.sub(r"\D", "", prospect.phone_normalized)
     normalized_business = func.lower(
         func.regexp_replace(
@@ -1362,45 +1416,58 @@ async def intake_candidates(
             "g",
         )
     )
-    stmt = (
-        select(PublicUnderwritingIntake)
-        .where(
-            PublicUnderwritingIntake.variant == "dealer_gatekeeper_v1",
-            or_(
-                func.lower(PublicUnderwritingIntake.email) == prospect.email_normalized,
-                func.regexp_replace(
-                    func.coalesce(PublicUnderwritingIntake.phone, ""), "[^0-9]", "", "g"
-                )
-                == digits,
-                normalized_business == prospect.dealer_name_normalized,
-            ),
+    return or_(
+        func.lower(PublicUnderwritingIntake.email) == prospect.email_normalized,
+        func.regexp_replace(
+            func.coalesce(PublicUnderwritingIntake.phone, ""), "[^0-9]", "", "g"
         )
-        .order_by(PublicUnderwritingIntake.created_at.desc())
-        .limit(20)
+        == digits,
+        normalized_business == prospect.dealer_name_normalized,
     )
-    if user.role not in TEAM_ROLES:
-        # Reps may only discover/link an intake already attributed to them or
-        # to the owner of the prospect they were explicitly assigned. Identity
-        # matching alone must never expose or mutate another rep's file.
-        visible_owner_ids = {user.id}
-        if prospect.owner_user_id is not None:
-            visible_owner_ids.add(prospect.owner_user_id)
-        stmt = stmt.where(
-            or_(
-                PublicUnderwritingIntake.source_user_id.in_(visible_owner_ids),
-                PublicUnderwritingIntake.broker_id.in_(visible_owner_ids),
-                exists(
-                    select(Client.id).where(
-                        Client.id == PublicUnderwritingIntake.client_id,
-                        or_(
-                            Client.current_agent_id.in_(visible_owner_ids),
-                            Client.originating_agent_id.in_(visible_owner_ids),
-                        ),
-                    )
+
+
+def _intake_visible_to_user(prospect: DealerProspect, user: User):
+    visible_owner_ids = {user.id}
+    if prospect.owner_user_id is not None:
+        visible_owner_ids.add(prospect.owner_user_id)
+    return or_(
+        and_(
+            PublicUnderwritingIntake.source_user_id.is_not(None),
+            PublicUnderwritingIntake.source_user_id.in_(visible_owner_ids),
+        ),
+        and_(
+            PublicUnderwritingIntake.broker_id.is_not(None),
+            PublicUnderwritingIntake.broker_id.in_(visible_owner_ids),
+        ),
+        exists(
+            select(Client.id).where(
+                Client.id == PublicUnderwritingIntake.client_id,
+                or_(
+                    Client.current_agent_id.in_(visible_owner_ids),
+                    Client.originating_agent_id.in_(visible_owner_ids),
                 ),
             )
+        ),
+    )
+
+
+async def intake_restricted_match_exists(
+    db: AsyncSession, prospect: DealerProspect, user: User
+) -> bool:
+    """Return only whether an identity match exists outside caller scope."""
+
+    if user.role in TEAM_ROLES:
+        return False
+    stmt = select(
+        select(PublicUnderwritingIntake.id)
+        .where(
+            PublicUnderwritingIntake.variant == "dealer_gatekeeper_v1",
+            _intake_identity_match(prospect),
+            ~_intake_visible_to_user(prospect, user),
         )
-    return list((await db.execute(stmt)).scalars().all())
+        .exists()
+    )
+    return bool((await db.execute(stmt)).scalar_one())
 
 
 def intake_candidate_match_reasons(
@@ -1492,6 +1559,40 @@ async def complete_conversion(
     event_kind: str,
     note: str | None = None,
 ) -> None:
+    await complete_target_conversion(
+        db,
+        user,
+        prospect,
+        target="dealer_ai_intake",
+        destination_id=intake.id,
+        event_kind=event_kind,
+        note=note,
+    )
+
+
+async def complete_target_conversion(
+    db: AsyncSession,
+    user: User,
+    prospect: DealerProspect,
+    *,
+    target: str,
+    destination_id: UUID,
+    event_kind: str,
+    note: str | None = None,
+) -> None:
+    if target not in {"portfolio_application", "dealer_ai_intake"}:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unsupported conversion target")
+    if (
+        getattr(prospect, "converted_application_id", None) is not None
+        or prospect.converted_intake_id is not None
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "prospect_already_converted",
+                "message": "This prospect is already linked to an application workflow.",
+            },
+        )
     converted_stage = (
         await db.execute(
             select(DealerProspectStageDefinition).where(
@@ -1503,7 +1604,13 @@ async def complete_conversion(
     if converted_stage is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "The Converted stage is unavailable")
     old_stage = await db.get(DealerProspectStageDefinition, prospect.stage_definition_id)
-    prospect.converted_intake_id = intake.id
+    prospect.conversion_target = target
+    if target == "portfolio_application":
+        prospect.converted_application_id = destination_id
+        prospect.converted_intake_id = None
+    else:
+        prospect.converted_application_id = None
+        prospect.converted_intake_id = destination_id
     prospect.converted_at = now_utc()
     prospect.stage_definition_id = converted_stage.id
     prospect.next_follow_up_at = None
@@ -1516,7 +1623,10 @@ async def complete_conversion(
         event_kind,
         body=note,
         metadata={
-            "intake_id": str(intake.id),
+            "conversion_target": target,
+            "destination_id": str(destination_id),
+            "application_id": str(destination_id) if target == "portfolio_application" else None,
+            "intake_id": str(destination_id) if target == "dealer_ai_intake" else None,
             "from_stage_key": old_stage.key if old_stage else None,
             "to_stage_key": "converted",
             "version_before": before,

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import logging
-
 import hashlib
 import html
 import io
+import logging
 import re
 import secrets
 import uuid
@@ -1373,7 +1372,14 @@ async def assign_contact(contact_id: UUID, payload: ContactAssignmentIn, user: C
     contact = await _load_contact(db, user, contact_id)
     if is_rep(user) and contact.owner_user_id != user.id: raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the owning rep can share this contact")
     existing = (await db.execute(select(DealerRepContactAssignment).where(DealerRepContactAssignment.contact_id == contact.id, DealerRepContactAssignment.user_id == payload.user_id))).scalar_one_or_none()
-    if existing is None: db.add(DealerRepContactAssignment(contact_id=contact.id, user_id=payload.user_id, assigned_by_user_id=user.id)); await db.commit()
+    if existing is None:
+        db.add(DealerRepContactAssignment(contact_id=contact.id, user_id=payload.user_id, assigned_by_user_id=user.id, assignment_kind="explicit"))
+    else:
+        # Sharing an owner-held contact is meaningful: promote the temporary
+        # owner-derived grant so a later ownership transfer preserves it.
+        existing.assignment_kind = "explicit"
+        existing.assigned_by_user_id = user.id
+    await db.commit()
     return {"assigned": True}
 
 

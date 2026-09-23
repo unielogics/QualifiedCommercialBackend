@@ -37,6 +37,7 @@ from pypdf import PdfReader
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from app.config import get_settings
 from app.dealer_os.models import DealerFieldDeskProfile, DealerRepCompany, DealerRepContact
@@ -60,6 +61,7 @@ from app.models.prospect_outreach import (
 )
 from app.models.user import User
 from app.schemas.prospect_outreach import (
+    ProspectEmailAttachmentRead,
     ProspectEmailDraftCreate,
     ProspectEmailDraftRead,
     ProspectOutreachPolicyPatch,
@@ -74,6 +76,11 @@ log = logging.getLogger(__name__)
 DEALER_WEBSITE = "https://qualifiedcommercial.com/industries/auto"
 COLLATERAL_ASSIGNMENT = "dealer_outreach"
 DEFAULT_PURPOSE = "dealer_information"
+# A provider call normally resolves in seconds.  A claimed draft with no
+# ledger after this grace period represents the deliberate at-most-once crash
+# window: its delivery outcome is unknown and must never be shown as actively
+# sending forever.
+DELIVERY_CLAIM_GRACE = timedelta(minutes=5)
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _FINANCIAL_CLAIM_RE = re.compile(
     r"(?:\$\s?\d[\d,]*(?:\.\d+)?(?:\s?(?:k|m|million|thousand))?|\b\d+(?:\.\d+)?\s?%)",
@@ -415,7 +422,7 @@ async def sync_draft_notifications(
                     body=body,
                     target_type="dealer_prospect_email_draft",
                     target_id=target_id,
-                    deep_link=f"/contacts/prospects/{row.prospect_id}",
+                    deep_link=f"/marketing/prospects/{row.prospect_id}",
                     channels=["in_app"],
                     meta=meta,
                     batch_key=f"dealer-prospect-email-draft:{target_id}",
@@ -427,7 +434,7 @@ async def sync_draft_notifications(
         notice.priority = priority
         notice.title = title
         notice.body = body
-        notice.deep_link = f"/contacts/prospects/{row.prospect_id}"
+        notice.deep_link = f"/marketing/prospects/{row.prospect_id}"
         notice.channels = ["in_app"]
         notice.meta = meta
 
@@ -480,6 +487,9 @@ def request_fingerprint(
             getattr(prospect, "email", None) or getattr(prospect, "email_normalized", None)
         ),
         "purpose": payload.purpose,
+        "compose_mode": payload.compose_mode,
+        "subject": payload.subject,
+        "body": payload.body,
         "ai_instructions": payload.ai_instructions,
         "verified_conversation_context": payload.verified_conversation_context,
         "private_note": payload.private_note,
@@ -1507,24 +1517,36 @@ async def create_draft(
             )
 
     catalog = await _active_catalog_snapshot(db)
-    composed = await _compose_with_nova(
-        db,
-        prospect=prospect,
-        identity=identity,
-        purpose=payload.purpose,
-        ai_instructions=payload.ai_instructions,
-        catalog_snapshot=catalog,
-        actor_user_id=actor.id,
-    )
-    body_with_context = _insert_verified_conversation_context(
-        composed.body,
-        payload.verified_conversation_context,
-    )
-    editable_body = (
-        _with_approved_program_section(body_with_context, catalog)
-        if payload.purpose == "dealer_information"
-        else body_with_context
-    )
+    if payload.compose_mode == "manual":
+        # Schema validation guarantees both values are present. Manual copy is
+        # never submitted to a model and never starts an automatic countdown.
+        composed = ComposedCopy(
+            subject=payload.subject or "",
+            body=payload.body or "",
+            source="fallback",
+            generation_reason="approved_fallback",
+            instruction_disposition="none",
+        )
+        editable_body = composed.body
+    else:
+        composed = await _compose_with_nova(
+            db,
+            prospect=prospect,
+            identity=identity,
+            purpose=payload.purpose,
+            ai_instructions=payload.ai_instructions,
+            catalog_snapshot=catalog,
+            actor_user_id=actor.id,
+        )
+        body_with_context = _insert_verified_conversation_context(
+            composed.body,
+            payload.verified_conversation_context,
+        )
+        editable_body = (
+            _with_approved_program_section(body_with_context, catalog)
+            if payload.purpose == "dealer_information"
+            else body_with_context
+        )
     await validate_current_draft_copy(
         db,
         subject=composed.subject,
@@ -1573,17 +1595,19 @@ async def create_draft(
         body_text=rendered_body,
         body_html=_plain_html(rendered_body),
         ai_instructions=payload.ai_instructions,
+        compose_mode=payload.compose_mode,
         purpose=payload.purpose,
         draft_source=composed.source,
         model_id=composed.model_id,
         catalog_version=catalog_version(catalog),
         catalog_snapshot=catalog,
-        status="blocked" if oversized else "pending_review",
+        status="blocked" if oversized else "editing" if payload.compose_mode == "manual" else "pending_review",
         auto_send_at=(
             None
-            if oversized
+            if oversized or payload.compose_mode == "manual"
             else now + timedelta(seconds=max(1, settings.prospect_email_review_seconds))
         ),
+        review_stopped_at=now if payload.compose_mode == "manual" and not oversized else None,
         failure_code="attachment_bundle_too_large" if oversized else None,
         failure_detail=(
             "The complete approved PDF bundle exceeds the email delivery limit. "
@@ -1643,6 +1667,7 @@ async def create_draft(
             metadata_json={
                 "draft_id": str(draft.id),
                 "source": draft.draft_source,
+                "compose_mode": draft.compose_mode,
                 "generation_reason": composed.generation_reason,
                 "instruction_disposition": composed.instruction_disposition,
                 "send_after": draft.auto_send_at.isoformat() if draft.auto_send_at else None,
@@ -2230,7 +2255,7 @@ async def select_secure_bundle(
     """Explicitly replace an oversized PDF attachment set with one ZIP link."""
     row = await load_draft(db, draft_id, lock=True)
     _check_version(row, expected_version)
-    if row.delivery_mode == "secure_link" and row.status == "pending_review":
+    if row.delivery_mode == "secure_link" and row.status in {"pending_review", "editing"}:
         return row
     if row.status != "blocked" or row.failure_code != "attachment_bundle_too_large":
         raise OutreachConflict("Secure bundle is available only for an oversized blocked draft.")
@@ -2267,9 +2292,14 @@ async def select_secure_bundle(
     )
     row.body_text = _render_body(row.editable_body, row.locked_footer_text)
     row.body_html = _plain_html(row.body_text)
-    row.status = "pending_review"
-    row.auto_send_at = now + timedelta(seconds=max(1, settings.prospect_email_review_seconds))
-    row.review_stopped_at = None
+    if (getattr(row, "compose_mode", None) or "ai") == "manual":
+        row.status = "editing"
+        row.auto_send_at = None
+        row.review_stopped_at = now
+    else:
+        row.status = "pending_review"
+        row.auto_send_at = now + timedelta(seconds=max(1, settings.prospect_email_review_seconds))
+        row.review_stopped_at = None
     row.failure_code = None
     row.failure_detail = None
     row.version += 1
@@ -2872,10 +2902,11 @@ async def dispatch_due_drafts(*, limit: int = 40) -> int:
 
 
 async def draft_read(db: AsyncSession, row: DealerProspectEmailDraft) -> ProspectEmailDraftRead:
-    names = list(
+    assets = list(
         (
             await db.execute(
-                select(DealerProspectEmailDraftAsset.file_name)
+                select(DealerProspectEmailDraftAsset)
+                .options(defer(DealerProspectEmailDraftAsset.document_bytes))
                 .where(DealerProspectEmailDraftAsset.draft_id == row.id)
                 .order_by(
                     DealerProspectEmailDraftAsset.sort_order, DealerProspectEmailDraftAsset.id
@@ -2885,6 +2916,65 @@ async def draft_read(db: AsyncSession, row: DealerProspectEmailDraft) -> Prospec
         .scalars()
         .all()
     )
+    return _draft_read(row, assets=assets)
+
+
+def _delivery_status(
+    draft: DealerProspectEmailDraft,
+    ledger: MessageSend | None,
+) -> str | None:
+    if ledger is not None:
+        return {
+            "sent": "provider_accepted",
+            "delivered": "delivered",
+            "bounced": "bounced",
+            "complained": "complaint",
+            "failed": "failed",
+            "blocked": "blocked",
+        }.get(ledger.status)
+    if draft.status == "sent":
+        return "unavailable"
+    if (
+        draft.status == "sending"
+        and draft.dispatch_started_at is not None
+        and draft.dispatch_started_at <= utcnow() - DELIVERY_CLAIM_GRACE
+    ):
+        return "unavailable"
+    if draft.status in {"cancelled", "failed", "blocked"}:
+        return draft.status
+    return None
+
+
+def _attachment_read(
+    draft_id: uuid.UUID,
+    asset: DealerProspectEmailDraftAsset,
+) -> ProspectEmailAttachmentRead:
+    root = f"/api/v1/dealer-os/prospect-email-drafts/{draft_id}/attachments/{asset.id}"
+    return ProspectEmailAttachmentRead(
+        id=asset.id,
+        name=asset.asset_name,
+        version=asset.asset_version,
+        file_name=asset.file_name,
+        content_type=asset.content_type,
+        size_bytes=asset.size_bytes,
+        sha256=asset.sha256,
+        preview_url=f"{root}?disposition=inline",
+        download_url=f"{root}?disposition=attachment",
+    )
+
+
+def _draft_read(
+    row: DealerProspectEmailDraft,
+    *,
+    assets: list[DealerProspectEmailDraftAsset],
+    prospect: DealerProspect | None = None,
+    company: DealerRepCompany | None = None,
+    contact: DealerRepContact | None = None,
+    owner: User | None = None,
+    actor: User | None = None,
+    ledger: MessageSend | None = None,
+) -> ProspectEmailDraftRead:
+    names = [asset.file_name for asset in assets]
     countdown: int | None = None
     if row.status == "pending_review" and row.auto_send_at is not None:
         countdown = max(0, int((row.auto_send_at - utcnow()).total_seconds()))
@@ -2913,6 +3003,9 @@ async def draft_read(db: AsyncSession, row: DealerProspectEmailDraft) -> Prospec
         reply_contact_email=reply_contact_email(row.reply_to_email),
         subject=row.subject,
         body=row.body_text,
+        editable_body=row.editable_body,
+        locked_footer_text=row.locked_footer_text,
+        compose_mode=(getattr(row, "compose_mode", None) or "ai"),
         status=row.status,
         send_after=row.auto_send_at,
         review_stopped_at=row.review_stopped_at,
@@ -2933,8 +3026,131 @@ async def draft_read(db: AsyncSession, row: DealerProspectEmailDraft) -> Prospec
         delivery_mode=row.delivery_mode,
         secure_bundle_link_required=row.failure_code == "attachment_bundle_too_large",
         secure_bundle_expires_at=row.secure_bundle_expires_at,
+        prospect_archived_at=prospect.archived_at if prospect is not None else None,
+        contact_id=contact.id if contact is not None else None,
+        contact_name=contact.full_name if contact is not None else None,
+        contact_email=contact.email if contact is not None else None,
+        contact_phone=contact.phone_e164 if contact is not None else None,
+        dealer_name=company.name if company is not None else None,
+        owner_user_id=prospect.owner_user_id if prospect is not None else None,
+        owner_name=owner.name if owner is not None else None,
+        owner_email=owner.email if owner is not None else None,
+        triggering_agent_id=row.created_by_user_id,
+        triggering_agent_name=actor.name if actor is not None else None,
+        triggering_agent_email=actor.email if actor is not None else None,
+        message_send_id=ledger.id if ledger is not None else None,
+        delivery_status=_delivery_status(row, ledger),
+        provider_status=ledger.status if ledger is not None else None,
+        provider_detail=ledger.detail if ledger is not None else None,
+        provider=(ledger.provider if ledger is not None else row.provider),
+        provider_message_id=(
+            ledger.provider_message_id if ledger is not None else row.provider_message_id
+        ),
+        delivered_at=ledger.delivered_at if ledger is not None else None,
+        opened_at=ledger.opened_at if ledger is not None else None,
+        failed_at=ledger.failed_at if ledger is not None else None,
+        attachments=[_attachment_read(row.id, asset) for asset in assets],
         created_at=row.created_at,
     )
+
+
+async def enriched_draft_reads(
+    db: AsyncSession,
+    rows: Iterable[DealerProspectEmailDraft],
+) -> list[ProspectEmailDraftRead]:
+    """Batch-load immutable attachments, identities, and provider truth."""
+    drafts = list(rows)
+    if not drafts:
+        return []
+    draft_ids = [row.id for row in drafts]
+    prospect_ids = list({row.prospect_id for row in drafts})
+    asset_rows = list(
+        (
+            await db.execute(
+                select(DealerProspectEmailDraftAsset)
+                .options(defer(DealerProspectEmailDraftAsset.document_bytes))
+                .where(DealerProspectEmailDraftAsset.draft_id.in_(draft_ids))
+                .order_by(
+                    DealerProspectEmailDraftAsset.draft_id,
+                    DealerProspectEmailDraftAsset.sort_order,
+                    DealerProspectEmailDraftAsset.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assets_by_draft: dict[uuid.UUID, list[DealerProspectEmailDraftAsset]] = {}
+    for asset in asset_rows:
+        assets_by_draft.setdefault(asset.draft_id, []).append(asset)
+
+    identity_rows = (
+        await db.execute(
+            select(DealerProspect, DealerRepCompany, DealerRepContact)
+            .join(DealerRepCompany, DealerRepCompany.id == DealerProspect.company_id)
+            .join(DealerRepContact, DealerRepContact.id == DealerProspect.primary_contact_id)
+            .where(DealerProspect.id.in_(prospect_ids))
+        )
+    ).all()
+    identity_by_prospect = {
+        prospect.id: (prospect, company, contact)
+        for prospect, company, contact in identity_rows
+    }
+    user_ids = {
+        value
+        for row in drafts
+        for value in (
+            row.created_by_user_id,
+            identity_by_prospect.get(row.prospect_id, (None, None, None))[0].owner_user_id
+            if row.prospect_id in identity_by_prospect
+            else None,
+        )
+        if value is not None
+    }
+    users = list(
+        (
+            await db.execute(select(User).where(User.id.in_(user_ids)))
+        ).scalars().all()
+    ) if user_ids else []
+    users_by_id = {user.id: user for user in users}
+    ledger_rows = list(
+        (
+            await db.execute(
+                select(MessageSend)
+                .where(
+                    MessageSend.prospect_draft_id.in_(draft_ids),
+                    MessageSend.context == "dealer_prospect",
+                    MessageSend.channel == "email",
+                    MessageSend.direction == "outbound",
+                )
+                .order_by(MessageSend.created_at.desc(), MessageSend.id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    ledger_by_draft: dict[uuid.UUID, MessageSend] = {}
+    for ledger in ledger_rows:
+        if ledger.prospect_draft_id is not None:
+            ledger_by_draft.setdefault(ledger.prospect_draft_id, ledger)
+
+    output: list[ProspectEmailDraftRead] = []
+    for row in drafts:
+        identity = identity_by_prospect.get(row.prospect_id)
+        prospect, company, contact = identity if identity is not None else (None, None, None)
+        output.append(
+            _draft_read(
+                row,
+                assets=assets_by_draft.get(row.id, []),
+                prospect=prospect,
+                company=company,
+                contact=contact,
+                owner=users_by_id.get(prospect.owner_user_id) if prospect is not None else None,
+                actor=users_by_id.get(row.created_by_user_id),
+                ledger=ledger_by_draft.get(row.id),
+            )
+        )
+    return output
 
 
 def validate_pdf(data: bytes) -> PdfValidation:

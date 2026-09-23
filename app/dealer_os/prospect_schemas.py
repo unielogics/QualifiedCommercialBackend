@@ -85,6 +85,8 @@ class ProspectRead(BaseModel):
     do_not_contact: bool
     do_not_contact_reason: str | None
     appointment_id: UUID | None
+    conversion_target: Literal["portfolio_application", "dealer_ai_intake"] | None = None
+    converted_application_id: UUID | None = None
     converted_intake_id: UUID | None
     converted_at: datetime | None
     version: int
@@ -298,6 +300,63 @@ class ProspectConversionRequest(BaseModel):
         return self
 
 
+class ProspectPortfolioApplicationCreate(BaseModel):
+    entity_type: str = Field(min_length=1, max_length=32)
+    requested_amount: float = Field(gt=0, le=999_999_999_999.99)
+    funding_purpose: Literal[
+        "working_capital", "equipment", "real_estate", "refinance", "floorplan", "other"
+    ]
+    use_of_proceeds_note: str = Field(min_length=1, max_length=4000)
+    secure_room_pin: str = Field(pattern=r"^[0-9]{6}$")
+
+    @field_validator("entity_type", "use_of_proceeds_note", mode="before")
+    @classmethod
+    def strip_portfolio_text(cls, value: object) -> object:
+        return str(value).strip() if value is not None else value
+
+
+class ProspectGeneralConversionRequest(BaseModel):
+    target: Literal["portfolio_application", "dealer_ai_intake"]
+    action: Literal["detect", "link", "reactivate", "create"] = "detect"
+    expected_version: int = Field(ge=1)
+    candidate_id: UUID | None = None
+    portfolio_application: ProspectPortfolioApplicationCreate | None = None
+    note: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_conversion_choice(self) -> ProspectGeneralConversionRequest:
+        if self.action in {"link", "reactivate"} and self.candidate_id is None:
+            raise ValueError("candidate_id is required to link or reactivate")
+        if self.action in {"detect", "create"} and self.candidate_id is not None:
+            raise ValueError("candidate_id is only valid for link or reactivate")
+        if self.target == "portfolio_application":
+            if self.action == "create" and self.portfolio_application is None:
+                raise ValueError("portfolio_application is required to create an application")
+        elif self.portfolio_application is not None:
+            raise ValueError("portfolio_application is only valid for Portfolio conversion")
+        return self
+
+
+class ProspectConversionCandidate(BaseModel):
+    id: UUID
+    target: Literal["portfolio_application", "dealer_ai_intake"]
+    status: str
+    archived: bool = False
+    display_name: str
+    email: str | None = None
+    phone: str | None = None
+    created_at: datetime
+    match_reasons: list[Literal["email", "phone", "dealer_name"]] = Field(default_factory=list)
+    route: str
+
+
+class ProspectConversionCandidateList(BaseModel):
+    target: Literal["portfolio_application", "dealer_ai_intake"]
+    prospect_id: UUID
+    already_converted: bool = False
+    candidates: list[ProspectConversionCandidate] = Field(default_factory=list)
+
+
 class ProspectIntakeCandidate(BaseModel):
     id: UUID
     status: str
@@ -314,5 +373,17 @@ class ProspectConversionResult(BaseModel):
     status: Literal["choice_required", "linked", "reactivated", "created", "already_converted"]
     prospect: ProspectRead
     candidates: list[ProspectIntakeCandidate] = Field(default_factory=list)
+    intake_id: UUID | None = None
+    conversion_target: Literal["portfolio_application", "dealer_ai_intake"] = "dealer_ai_intake"
+    application_id: UUID | None = None
+    route: str | None = None
+
+
+class ProspectGeneralConversionResult(BaseModel):
+    status: Literal["choice_required", "linked", "reactivated", "created", "already_converted"]
+    conversion_target: Literal["portfolio_application", "dealer_ai_intake"]
+    prospect: ProspectRead
+    candidates: list[ProspectConversionCandidate] = Field(default_factory=list)
+    application_id: UUID | None = None
     intake_id: UUID | None = None
     route: str | None = None

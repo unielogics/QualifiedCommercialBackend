@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -9,15 +10,20 @@ import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
 
-from app.dealer_os import prospect_router
+from app.dealer_os import crm_router, prospect_router
+from app.dealer_os.crm_schemas import ContactAssignmentIn
+from app.dealer_os.models import DealerRepContactAssignment
 from app.dealer_os.prospect_schemas import (
     ProspectConversionRequest,
     ProspectCreate,
     ProspectDefinitionReorder,
+    ProspectGeneralConversionRequest,
     ProspectMoveResult,
     ProspectMoveStage,
+    ProspectPatch,
+    ProspectPortfolioApplicationCreate,
 )
-from app.dealer_os.services import prospects
+from app.dealer_os.services import prospect_conversion, prospects
 from app.enums import Role
 from app.models.dealer_prospect import DealerProspect
 
@@ -225,6 +231,39 @@ def test_conversion_requires_candidate_id_only_for_existing_actions() -> None:
         ProspectConversionRequest(action="create", expected_version=1, intake_id=candidate_id)
 
 
+def test_general_conversion_requires_explicit_target_specific_inputs() -> None:
+    application = ProspectPortfolioApplicationCreate(
+        entity_type="llc",
+        requested_amount=250_000,
+        funding_purpose="working_capital",
+        use_of_proceeds_note="Acquire additional dealer inventory.",
+        secure_room_pin="482915",
+    )
+    payload = ProspectGeneralConversionRequest(
+        target="portfolio_application",
+        action="create",
+        expected_version=3,
+        portfolio_application=application,
+    )
+    assert payload.portfolio_application.requested_amount == 250_000
+
+    with pytest.raises(ValueError):
+        ProspectGeneralConversionRequest(
+            target="portfolio_application", action="create", expected_version=3
+        )
+    with pytest.raises(ValueError):
+        ProspectGeneralConversionRequest(
+            target="dealer_ai_intake",
+            action="create",
+            expected_version=3,
+            portfolio_application=application,
+        )
+    with pytest.raises(ValueError):
+        ProspectGeneralConversionRequest(
+            target="dealer_ai_intake", action="link", expected_version=3
+        )
+
+
 def test_reorder_rejects_duplicate_definition_ids() -> None:
     row_id = uuid4()
     with pytest.raises(ValueError):
@@ -253,6 +292,444 @@ def test_ai_intake_candidate_explains_all_matching_identity_signals() -> None:
         "phone",
         "dealer_name",
     ]
+
+
+def test_portfolio_candidate_explains_all_matching_identity_signals() -> None:
+    prospect = SimpleNamespace(
+        email_normalized="rocio@example.com",
+        phone_normalized="+19735550148",
+        dealer_name_normalized="grace auto sales",
+    )
+    application = SimpleNamespace(
+        email="ROCIO@example.com",
+        phone="(973) 555-0148",
+        name="  Grace   Auto Sales ",
+    )
+
+    assert prospect_conversion.portfolio_candidate_match_reasons(
+        prospect, application
+    ) == ["email", "phone", "dealer_name"]
+
+
+@pytest.mark.asyncio
+async def test_complete_conversion_rejects_a_second_destination() -> None:
+    prospect = SimpleNamespace(
+        converted_application_id=uuid4(),
+        converted_intake_id=None,
+    )
+    db = SimpleNamespace(execute=AsyncMock(), get=AsyncMock(), flush=AsyncMock())
+
+    with pytest.raises(HTTPException) as error:
+        await prospects.complete_target_conversion(
+            db,
+            _user(Role.LOAN_EXEC),
+            prospect,
+            target="dealer_ai_intake",
+            destination_id=uuid4(),
+            event_kind="dealer_ai_intake_linked",
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "prospect_already_converted"
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_portfolio_creation_never_marks_prospect_converted(monkeypatch) -> None:
+    prospect = SimpleNamespace(
+        id=uuid4(),
+        version=1,
+        converted_application_id=None,
+        converted_intake_id=None,
+    )
+    create_application = AsyncMock(side_effect=RuntimeError("room setup failed"))
+    complete_conversion = AsyncMock()
+    monkeypatch.setattr(
+        prospect_router.service, "load_visible_prospect", AsyncMock(return_value=prospect)
+    )
+    monkeypatch.setattr(prospect_router, "_conversion_candidates", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        prospect_router.conversion_service,
+        "create_portfolio_application",
+        create_application,
+    )
+    monkeypatch.setattr(
+        prospect_router.conversion_service,
+        "acquire_conversion_identity_lock",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        prospect_router.service, "complete_target_conversion", complete_conversion
+    )
+    payload = ProspectGeneralConversionRequest(
+        target="portfolio_application",
+        action="create",
+        expected_version=1,
+        portfolio_application=ProspectPortfolioApplicationCreate(
+            entity_type="llc",
+            requested_amount=250_000,
+            funding_purpose="working_capital",
+            use_of_proceeds_note="Acquire additional dealer inventory.",
+            secure_room_pin="482915",
+        ),
+    )
+    request = Request(
+        {"type": "http", "method": "POST", "path": f"/prospects/{prospect.id}/convert", "headers": []}
+    )
+
+    with pytest.raises(RuntimeError, match="room setup failed"):
+        await prospect_router.convert_prospect(
+            prospect.id, payload, request, _user(Role.LOAN_EXEC), SimpleNamespace()
+        )
+
+    complete_conversion.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_ai_conversion_honors_existing_portfolio_conversion(monkeypatch) -> None:
+    application_id = uuid4()
+    prospect = SimpleNamespace(
+        id=uuid4(),
+        version=4,
+        converted_application_id=application_id,
+        converted_intake_id=None,
+    )
+    now = datetime.now(UTC)
+    read = prospect_router.ProspectRead(
+        id=prospect.id,
+        owner_user_id=None,
+        company_id=uuid4(),
+        primary_contact_id=uuid4(),
+        contact_id=uuid4(),
+        contact_name="Rocio Martinez",
+        name="Rocio Martinez",
+        dealer_name="Grace Auto Sales",
+        email="rocio@example.com",
+        phone="+19735550148",
+        stage_id=uuid4(),
+        stage_key="converted",
+        stage_label="Converted",
+        stage_sort_order=50,
+        source="quick_add",
+        next_follow_up_at=None,
+        last_activity_at=now,
+        call_attempt_count=0,
+        do_not_contact=False,
+        do_not_contact_reason=None,
+        appointment_id=None,
+        conversion_target="portfolio_application",
+        converted_application_id=application_id,
+        converted_intake_id=None,
+        converted_at=now,
+        version=4,
+        created_at=now,
+        updated_at=now,
+    )
+    find_candidates = AsyncMock()
+    monkeypatch.setattr(
+        prospect_router.service, "load_visible_prospect", AsyncMock(return_value=prospect)
+    )
+    monkeypatch.setattr(prospect_router.service, "prospect_read", AsyncMock(return_value=read))
+    monkeypatch.setattr(prospect_router.service, "intake_candidates", find_candidates)
+    db = SimpleNamespace(refresh=AsyncMock())
+
+    result = await prospect_router.convert_prospect_to_ai_intake(
+        prospect.id,
+        ProspectConversionRequest(expected_version=1),
+        Request({"type": "http", "method": "POST", "path": "/convert", "headers": []}),
+        _user(Role.LOAN_EXEC),
+        db,
+    )
+
+    assert result.status == "already_converted"
+    assert result.conversion_target == "portfolio_application"
+    assert result.application_id == application_id
+    find_candidates.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_general_conversion_retry_with_stale_version_returns_existing_destination(
+    monkeypatch,
+) -> None:
+    application_id = uuid4()
+    prospect = SimpleNamespace(
+        id=uuid4(),
+        version=7,
+        converted_application_id=application_id,
+        converted_intake_id=None,
+    )
+    now = datetime.now(UTC)
+    read = prospect_router.ProspectRead(
+        id=prospect.id,
+        owner_user_id=None,
+        company_id=uuid4(),
+        primary_contact_id=uuid4(),
+        contact_id=uuid4(),
+        contact_name="Rocio Martinez",
+        name="Rocio Martinez",
+        dealer_name="Grace Auto Sales",
+        email="rocio@example.com",
+        phone="+19735550148",
+        stage_id=uuid4(),
+        stage_key="converted",
+        stage_label="Converted",
+        stage_sort_order=50,
+        source="quick_add",
+        next_follow_up_at=None,
+        last_activity_at=now,
+        call_attempt_count=0,
+        do_not_contact=False,
+        do_not_contact_reason=None,
+        appointment_id=None,
+        conversion_target="portfolio_application",
+        converted_application_id=application_id,
+        converted_intake_id=None,
+        converted_at=now,
+        version=7,
+        created_at=now,
+        updated_at=now,
+    )
+    find_candidates = AsyncMock()
+    monkeypatch.setattr(
+        prospect_router.service, "load_visible_prospect", AsyncMock(return_value=prospect)
+    )
+    monkeypatch.setattr(prospect_router.service, "prospect_read", AsyncMock(return_value=read))
+    monkeypatch.setattr(prospect_router, "_conversion_candidates", find_candidates)
+    db = SimpleNamespace(refresh=AsyncMock())
+
+    result = await prospect_router.convert_prospect(
+        prospect.id,
+        ProspectGeneralConversionRequest(
+            target="dealer_ai_intake",
+            action="detect",
+            expected_version=1,
+        ),
+        Request({"type": "http", "method": "POST", "path": "/convert", "headers": []}),
+        _user(Role.LOAN_EXEC),
+        db,
+    )
+
+    assert result.status == "already_converted"
+    assert result.conversion_target == "portfolio_application"
+    assert result.application_id == application_id
+    find_candidates.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["portfolio_application", "dealer_ai_intake"])
+async def test_active_conversion_candidate_cannot_use_reactivate(monkeypatch, target) -> None:
+    candidate_id = uuid4()
+    prospect = SimpleNamespace(
+        id=uuid4(),
+        version=1,
+        converted_application_id=None,
+        converted_intake_id=None,
+    )
+    candidate = SimpleNamespace(id=candidate_id)
+    candidate_read = prospect_router.ProspectConversionCandidate(
+        id=candidate_id,
+        target=target,
+        status="active",
+        archived=False,
+        display_name="Grace Auto Sales",
+        email="rocio@example.com",
+        phone="+19735550148",
+        created_at=datetime.now(UTC),
+        match_reasons=["dealer_name"],
+        route=f"/{target}/{candidate_id}",
+    )
+    monkeypatch.setattr(
+        prospect_router.service, "load_visible_prospect", AsyncMock(return_value=prospect)
+    )
+    monkeypatch.setattr(
+        prospect_router, "_conversion_candidates", AsyncMock(return_value=[candidate])
+    )
+    monkeypatch.setattr(
+        prospect_router,
+        "_conversion_candidate_read",
+        lambda *_args, **_kwargs: candidate_read,
+    )
+    monkeypatch.setattr(
+        prospect_router.conversion_service,
+        "acquire_conversion_identity_lock",
+        AsyncMock(),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await prospect_router.convert_prospect(
+            prospect.id,
+            ProspectGeneralConversionRequest(
+                target=target,
+                action="reactivate",
+                candidate_id=candidate_id,
+                expected_version=1,
+            ),
+            Request(
+                {"type": "http", "method": "POST", "path": "/convert", "headers": []}
+            ),
+            _user(Role.LOAN_EXEC),
+            SimpleNamespace(),
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "prospect_conversion_candidate_active"
+
+
+@pytest.mark.asyncio
+async def test_owner_reassignment_rotates_only_owner_derived_contact_grants(monkeypatch) -> None:
+    actor = _user(Role.LOAN_EXEC)
+    previous_owner_id = uuid4()
+    next_owner = _user(Role.FIELD_REP)
+    contact = SimpleNamespace(id=uuid4(), owner_user_id=previous_owner_id)
+    company = SimpleNamespace(id=uuid4())
+    prospect = SimpleNamespace(
+        id=uuid4(),
+        version=1,
+        owner_user_id=previous_owner_id,
+        primary_contact_id=contact.id,
+        company_id=company.id,
+        dealer_name_normalized="grace auto sales",
+        email_normalized="rocio@example.com",
+        phone_normalized="+19735550148",
+    )
+    added = []
+
+    async def get(model, row_id):
+        if model.__name__ == "DealerRepContact":
+            return contact
+        if model.__name__ == "DealerRepCompany":
+            return company
+        if model.__name__ == "User" and row_id == next_owner.id:
+            return next_owner
+        return None
+
+    no_existing_assignment = SimpleNamespace(scalar_one_or_none=lambda: None)
+    db = SimpleNamespace(
+        get=get,
+        execute=AsyncMock(side_effect=[SimpleNamespace(), no_existing_assignment]),
+        add=Mock(side_effect=added.append),
+    )
+    monkeypatch.setattr(
+        prospect_router.service, "load_visible_prospect", AsyncMock(return_value=prospect)
+    )
+    monkeypatch.setattr(
+        prospect_router.service,
+        "find_duplicates",
+        AsyncMock(side_effect=RuntimeError("stop after assignment rotation")),
+    )
+
+    with pytest.raises(RuntimeError, match="stop after assignment rotation"):
+        await prospect_router.patch_prospect(
+            prospect.id,
+            ProspectPatch(expected_version=1, owner_user_id=next_owner.id),
+            actor,
+            db,
+        )
+
+    delete_statement = db.execute.await_args_list[0].args[0]
+    delete_params = delete_statement.compile().params
+    assert delete_params["assignment_kind_1"] == "prospect_owner"
+    assert previous_owner_id in delete_params.values()
+    assert contact.id in delete_params.values()
+    owner_grants = [row for row in added if isinstance(row, DealerRepContactAssignment)]
+    assert len(owner_grants) == 1
+    assert owner_grants[0].user_id == next_owner.id
+    assert owner_grants[0].assignment_kind == "prospect_owner"
+
+
+@pytest.mark.asyncio
+async def test_explicit_contact_share_promotes_owner_grant_and_survives_transfer(monkeypatch) -> None:
+    actor = _user(Role.LOAN_EXEC)
+    shared_user_id = uuid4()
+    contact = SimpleNamespace(id=uuid4(), owner_user_id=actor.id, dealer_id=None)
+    existing = SimpleNamespace(
+        contact_id=contact.id,
+        user_id=shared_user_id,
+        assigned_by_user_id=actor.id,
+        assignment_kind="prospect_owner",
+    )
+    monkeypatch.setattr(crm_router, "_load_contact", AsyncMock(return_value=contact))
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            return_value=SimpleNamespace(scalar_one_or_none=lambda: existing)
+        ),
+        add=Mock(),
+        commit=AsyncMock(),
+    )
+
+    result = await crm_router.assign_contact(
+        contact.id,
+        ContactAssignmentIn(user_id=shared_user_id),
+        actor,
+        db,
+    )
+
+    assert result == {"assigned": True}
+    assert existing.assignment_kind == "explicit"
+    assert existing.assigned_by_user_id == actor.id
+    db.add.assert_not_called()
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_team_owned_portfolio_conversion_does_not_create_rep_reporting_row(
+    monkeypatch,
+) -> None:
+    actor = _user(Role.LOAN_EXEC)
+    prospect = SimpleNamespace(
+        id=uuid4(),
+        owner_user_id=actor.id,
+        primary_contact_id=uuid4(),
+        company_id=uuid4(),
+        email_normalized="rocio@example.com",
+        phone_normalized="+19735550148",
+    )
+    contact = SimpleNamespace(
+        id=prospect.primary_contact_id,
+        full_name="Rocio Martinez",
+        email="rocio@example.com",
+        phone_e164="+19735550148",
+        dealer_id=None,
+    )
+    company = SimpleNamespace(id=prospect.company_id, name="Grace Auto Sales")
+    added = []
+
+    async def get(model, row_id):
+        if model.__name__ == "DealerRepContact":
+            return contact
+        if model.__name__ == "DealerRepCompany":
+            return company
+        if model.__name__ == "User" and row_id == actor.id:
+            return actor
+        return None
+
+    async def flush() -> None:
+        for row in added:
+            if row.__class__.__name__ == "DealerBusiness" and row.id is None:
+                row.id = uuid4()
+
+    db = SimpleNamespace(get=get, add=Mock(side_effect=added.append), flush=AsyncMock(side_effect=flush))
+    monkeypatch.setattr(prospect_conversion, "next_case_ref", AsyncMock(return_value="QC-2026-00001"))
+    monkeypatch.setattr(prospect_conversion, "propose_targets", AsyncMock())
+    monkeypatch.setattr(prospect_conversion.buckets_link, "ensure_bucket", AsyncMock())
+    monkeypatch.setattr(prospect_conversion.client_room, "initialize_room", AsyncMock())
+    monkeypatch.setattr(prospect_conversion, "_link_contact", AsyncMock())
+    monkeypatch.setattr(prospect_conversion, "log_action", AsyncMock())
+
+    await prospect_conversion.create_portfolio_application(
+        db,
+        prospect,
+        actor,
+        ProspectPortfolioApplicationCreate(
+            entity_type="llc",
+            requested_amount=250_000,
+            funding_purpose="working_capital",
+            use_of_proceeds_note="Acquire additional dealer inventory.",
+            secure_room_pin="482915",
+        ),
+    )
+
+    assert not any(row.__class__.__name__ == "DealerRepLead" for row in added)
 
 
 @pytest.mark.parametrize(
@@ -474,6 +951,58 @@ def test_pipeline_access_requires_per_user_assignment() -> None:
     assert error.value.status_code == 404
 
 
+def test_historical_marketing_access_survives_sending_package_disable() -> None:
+    rep = _user(Role.FIELD_REP)
+    rep.dealer_prospect_pipeline_enabled = False
+
+    prospects.require_prospect_history_reader(rep)
+    prospects.require_prospect_history_reader(_user(Role.SUPER_ADMIN))
+    with pytest.raises(HTTPException) as error:
+        prospects.require_prospect_history_reader(_user(Role.CLIENT))
+    assert error.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_historical_prospect_loader_includes_archived_but_keeps_current_scope() -> None:
+    rep = _user(Role.FIELD_REP)
+    rep.dealer_prospect_pipeline_enabled = False
+    archived = SimpleNamespace(id=uuid4(), archived_at=datetime.now(UTC))
+
+    class Result:
+        @staticmethod
+        def scalar_one_or_none():
+            return archived
+
+    db = SimpleNamespace(execute=AsyncMock(return_value=Result()))
+    result = await prospects.load_visible_prospect_history(db, rep, archived.id)
+
+    assert result is archived
+    statement = str(db.execute.await_args.args[0])
+    assert "dealer_prospects.archived_at IS NULL" not in statement
+    assert "dealer_prospects.owner_user_id" in statement
+    assert "dos_rep_contact_assignments" in statement
+
+
+@pytest.mark.asyncio
+async def test_previous_owner_cannot_read_marketing_history_after_reassignment() -> None:
+    previous_owner = _user(Role.FIELD_REP)
+    previous_owner.dealer_prospect_pipeline_enabled = False
+
+    class MissingResult:
+        @staticmethod
+        def scalar_one_or_none():
+            return None
+
+    db = SimpleNamespace(execute=AsyncMock(return_value=MissingResult()))
+    with pytest.raises(HTTPException) as error:
+        await prospects.load_visible_prospect_history(db, previous_owner, uuid4())
+
+    assert error.value.status_code == 404
+    statement = str(db.execute.await_args.args[0])
+    assert "dealer_prospects.owner_user_id" in statement
+    assert "dos_rep_contact_assignments.user_id" in statement
+
+
 def test_effective_pipeline_access_combines_master_user_and_eligibility(monkeypatch) -> None:
     user = _user(Role.FIELD_REP)
     monkeypatch.setattr(
@@ -567,6 +1096,30 @@ def test_unique_identity_indexes_are_scoped_to_dealer() -> None:
     ]
 
 
+def test_conversion_schema_preserves_exactly_one_immutable_destination() -> None:
+    table = DealerProspect.__table__
+    assert "conversion_target" in table.c
+    assert "converted_application_id" in table.c
+    assert next(iter(table.c.converted_application_id.foreign_keys)).ondelete == "RESTRICT"
+    assert next(iter(table.c.converted_intake_id.foreign_keys)).ondelete == "RESTRICT"
+    constraints = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in table.constraints
+        if hasattr(constraint, "sqltext")
+    }
+    assert "portfolio_application" in constraints["ck_dealer_prospect_conversion_target"]
+    assert "converted_application_id IS NOT NULL" in constraints[
+        "ck_dealer_prospect_conversion_destination"
+    ]
+
+    migration = Path("alembic/versions/0222_marketing_conversion.py").read_text()
+    assert 'down_revision = "0221_dealer_prospect_user_access"' in migration
+    assert "SET conversion_target = 'dealer_ai_intake'" in migration
+    assert migration.count('ondelete="RESTRICT"') == 2
+    assert '"compose_mode"' in migration
+    assert "compose_mode IN ('ai','manual')" in migration
+
+
 def test_router_exposes_board_and_configuration_contracts() -> None:
     paths = {
         (route.path, method) for route in prospect_router.router.routes for method in route.methods
@@ -583,6 +1136,8 @@ def test_router_exposes_board_and_configuration_contracts() -> None:
         "POST",
     ) in paths
     assert ("/dealer-os/prospects/{prospect_id}/convert-to-ai-intake", "POST") in paths
+    assert ("/dealer-os/prospects/{prospect_id}/conversion-candidates", "GET") in paths
+    assert ("/dealer-os/prospects/{prospect_id}/convert", "POST") in paths
     assert ("/dealer-os/prospect-stages/reorder", "POST") in paths
     assert ("/dealer-os/prospect-outcomes/reorder", "POST") in paths
     move_route = next(
@@ -695,3 +1250,461 @@ async def test_converted_move_requires_the_conversion_endpoint() -> None:
         )
     assert error.value.status_code == 409
     assert error.value.detail["code"] == "conversion_required"
+
+
+# Conversion identity privacy and race-safety regressions.  These live at the
+# end of the module to keep them separate from the conversion lifecycle tests
+# above, which are also maintained by the broader Marketing regression suite.
+
+
+def _unconverted_identity_prospect():
+    return SimpleNamespace(
+        id=uuid4(),
+        version=1,
+        owner_user_id=uuid4(),
+        converted_application_id=None,
+        converted_intake_id=None,
+        dealer_name_normalized="grace auto sales",
+        email_normalized="rocio@example.com",
+        phone_normalized="+19735550148",
+    )
+
+
+@pytest.mark.parametrize("target", ["portfolio_application", "dealer_ai_intake"])
+@pytest.mark.asyncio
+async def test_detect_conversion_reports_hidden_matches_without_identity_details(
+    monkeypatch, target: str
+) -> None:
+    prospect = _unconverted_identity_prospect()
+    user = _user(Role.FIELD_REP)
+    lock = AsyncMock()
+    candidate_scan = AsyncMock(return_value=[])
+    portfolio_hidden = AsyncMock(return_value=target == "portfolio_application")
+    intake_hidden = AsyncMock(return_value=target == "dealer_ai_intake")
+    create_portfolio = AsyncMock()
+    create_intake = AsyncMock()
+    monkeypatch.setattr(
+        prospect_router.service, "load_visible_prospect", AsyncMock(return_value=prospect)
+    )
+    monkeypatch.setattr(
+        prospect_router.conversion_service, "acquire_conversion_identity_lock", lock
+    )
+    monkeypatch.setattr(prospect_router, "_conversion_candidates", candidate_scan)
+    monkeypatch.setattr(
+        prospect_router.conversion_service,
+        "portfolio_restricted_match_exists",
+        portfolio_hidden,
+    )
+    monkeypatch.setattr(
+        prospect_router.service,
+        "intake_restricted_match_exists",
+        intake_hidden,
+    )
+    monkeypatch.setattr(
+        prospect_router.conversion_service,
+        "create_portfolio_application",
+        create_portfolio,
+    )
+    monkeypatch.setattr(
+        prospect_router.service, "create_intake_from_prospect", create_intake
+    )
+
+    payload = ProspectGeneralConversionRequest(
+        target=target,
+        action="detect",
+        expected_version=1,
+    )
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/prospects/x/convert", "headers": []}
+    )
+    with pytest.raises(HTTPException) as error:
+        await prospect_router.convert_prospect(
+            prospect.id, payload, request, user, SimpleNamespace()
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "prospect_conversion_restricted_match"
+    assert set(error.value.detail) == {"code", "message"}
+    serialized = str(error.value.detail).lower()
+    assert "rocio" not in serialized
+    assert "grace auto" not in serialized
+    assert str(prospect.owner_user_id) not in serialized
+    lock.assert_awaited_once()
+    candidate_scan.assert_awaited_once()
+    create_portfolio.assert_not_awaited()
+    create_intake.assert_not_awaited()
+
+
+@pytest.mark.parametrize("target", ["portfolio_application", "dealer_ai_intake"])
+@pytest.mark.asyncio
+async def test_visible_conversion_choice_takes_priority_over_hidden_match(
+    monkeypatch, target: str
+) -> None:
+    prospect = _unconverted_identity_prospect()
+    candidate_id = uuid4()
+    candidate = SimpleNamespace(id=candidate_id)
+    candidate_read = prospect_router.ProspectConversionCandidate(
+        id=candidate_id,
+        target=target,
+        status="active",
+        archived=False,
+        display_name="Visible Grace Auto Sales file",
+        email="rocio@example.com",
+        phone="+19735550148",
+        created_at=datetime.now(UTC),
+        match_reasons=["email"],
+        route=f"/{target}/{candidate_id}",
+    )
+    monkeypatch.setattr(
+        prospect_router.service, "load_visible_prospect", AsyncMock(return_value=prospect)
+    )
+    monkeypatch.setattr(
+        prospect_router.conversion_service,
+        "acquire_conversion_identity_lock",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        prospect_router, "_conversion_candidates", AsyncMock(return_value=[candidate])
+    )
+    monkeypatch.setattr(
+        prospect_router,
+        "_conversion_candidate_read",
+        lambda *_args, **_kwargs: candidate_read,
+    )
+    restricted = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        prospect_router, "_restricted_conversion_match_exists", restricted
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await prospect_router.convert_prospect(
+            prospect.id,
+            ProspectGeneralConversionRequest(
+                target=target, action="detect", expected_version=1
+            ),
+            Request(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/prospects/x/convert",
+                    "headers": [],
+                }
+            ),
+            _user(Role.FIELD_REP),
+            SimpleNamespace(),
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "prospect_conversion_choice_required"
+    assert error.value.detail["candidates"][0]["id"] == str(candidate_id)
+    restricted.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_detect_conversion_uses_hidden_match_privacy_guard(
+    monkeypatch,
+) -> None:
+    prospect = _unconverted_identity_prospect()
+    user = _user(Role.FIELD_REP)
+    monkeypatch.setattr(
+        prospect_router.service, "load_visible_prospect", AsyncMock(return_value=prospect)
+    )
+    lock = AsyncMock()
+    monkeypatch.setattr(
+        prospect_router.conversion_service, "acquire_conversion_identity_lock", lock
+    )
+    monkeypatch.setattr(
+        prospect_router.service, "intake_candidates", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        prospect_router.service,
+        "intake_restricted_match_exists",
+        AsyncMock(return_value=True),
+    )
+    create_intake = AsyncMock()
+    monkeypatch.setattr(
+        prospect_router.service, "create_intake_from_prospect", create_intake
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await prospect_router.convert_prospect_to_ai_intake(
+            prospect.id,
+            ProspectConversionRequest(action="detect", expected_version=1),
+            Request({"type": "http", "method": "POST", "path": "/convert", "headers": []}),
+            user,
+            SimpleNamespace(),
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "prospect_conversion_restricted_match"
+    assert set(error.value.detail) == {"code", "message"}
+    lock.assert_awaited_once()
+    create_intake.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_visible_choice_takes_priority_over_hidden_match(
+    monkeypatch,
+) -> None:
+    prospect = _unconverted_identity_prospect()
+    candidate = SimpleNamespace(
+        id=uuid4(),
+        full_name="Rocio Martinez",
+        business_name="Grace Auto Sales",
+        status="collecting",
+        outcome_status="submitted",
+        created_at=datetime.now(UTC),
+        email="rocio@example.com",
+        phone="+19735550148",
+    )
+    monkeypatch.setattr(
+        prospect_router.service, "load_visible_prospect", AsyncMock(return_value=prospect)
+    )
+    monkeypatch.setattr(
+        prospect_router.conversion_service,
+        "acquire_conversion_identity_lock",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        prospect_router.service,
+        "intake_candidates",
+        AsyncMock(return_value=[candidate]),
+    )
+    restricted = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        prospect_router.service, "intake_restricted_match_exists", restricted
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await prospect_router.convert_prospect_to_ai_intake(
+            prospect.id,
+            ProspectConversionRequest(action="detect", expected_version=1),
+            Request({"type": "http", "method": "POST", "path": "/convert", "headers": []}),
+            _user(Role.FIELD_REP),
+            SimpleNamespace(),
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "prospect_conversion_choice_required"
+    assert error.value.detail["candidates"][0]["id"] == str(candidate.id)
+    restricted.assert_not_awaited()
+
+
+@pytest.mark.parametrize("target", ["portfolio_application", "dealer_ai_intake"])
+@pytest.mark.asyncio
+async def test_only_explicit_create_may_pass_a_restricted_identity_match(
+    monkeypatch, target: str
+) -> None:
+    prospect = _unconverted_identity_prospect()
+    user = _user(Role.FIELD_REP)
+    monkeypatch.setattr(
+        prospect_router.service, "load_visible_prospect", AsyncMock(return_value=prospect)
+    )
+    monkeypatch.setattr(
+        prospect_router.conversion_service,
+        "acquire_conversion_identity_lock",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        prospect_router, "_conversion_candidates", AsyncMock(return_value=[])
+    )
+    restricted = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        prospect_router, "_restricted_conversion_match_exists", restricted
+    )
+    stop_after_explicit_choice = RuntimeError("explicit create reached")
+    create_portfolio = AsyncMock(side_effect=stop_after_explicit_choice)
+    create_intake = AsyncMock(side_effect=stop_after_explicit_choice)
+    monkeypatch.setattr(
+        prospect_router.conversion_service,
+        "create_portfolio_application",
+        create_portfolio,
+    )
+    monkeypatch.setattr(
+        prospect_router.service, "create_intake_from_prospect", create_intake
+    )
+    portfolio_payload = (
+        ProspectPortfolioApplicationCreate(
+            entity_type="llc",
+            requested_amount=250_000,
+            funding_purpose="working_capital",
+            use_of_proceeds_note="Acquire additional dealer inventory.",
+            secure_room_pin="482915",
+        )
+        if target == "portfolio_application"
+        else None
+    )
+
+    with pytest.raises(RuntimeError, match="explicit create reached"):
+        await prospect_router.convert_prospect(
+            prospect.id,
+            ProspectGeneralConversionRequest(
+                target=target,
+                action="create",
+                expected_version=1,
+                portfolio_application=portfolio_payload,
+            ),
+            Request(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/prospects/x/convert",
+                    "headers": [],
+                }
+            ),
+            user,
+            SimpleNamespace(),
+        )
+
+    restricted.assert_not_awaited()
+    if target == "portfolio_application":
+        create_portfolio.assert_awaited_once()
+        create_intake.assert_not_awaited()
+    else:
+        create_intake.assert_awaited_once()
+        create_portfolio.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_locked_rescan_detects_candidate_created_after_prior_lookup(
+    monkeypatch,
+) -> None:
+    prospect = _unconverted_identity_prospect()
+    user = _user(Role.LOAN_EXEC)
+    events: list[str] = []
+    candidate = prospect_router.DealerBusiness(
+        id=uuid4(),
+        name="Grace Auto Sales",
+        email="rocio@example.com",
+        phone="+19735550148",
+        status="active",
+        archived_at=None,
+        is_training=False,
+        created_at=datetime.now(UTC),
+    )
+
+    async def acquire_lock(_db, _prospect) -> None:
+        events.append("lock")
+
+    async def rescan(_db, _prospect, _user, _target):
+        events.append("rescan")
+        return [candidate]
+
+    monkeypatch.setattr(
+        prospect_router.service, "load_visible_prospect", AsyncMock(return_value=prospect)
+    )
+    monkeypatch.setattr(
+        prospect_router.conversion_service,
+        "acquire_conversion_identity_lock",
+        acquire_lock,
+    )
+    monkeypatch.setattr(prospect_router, "_conversion_candidates", rescan)
+    create_portfolio = AsyncMock()
+    monkeypatch.setattr(
+        prospect_router.conversion_service,
+        "create_portfolio_application",
+        create_portfolio,
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await prospect_router.convert_prospect(
+            prospect.id,
+            ProspectGeneralConversionRequest(
+                target="portfolio_application", action="detect", expected_version=1
+            ),
+            Request(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/prospects/x/convert",
+                    "headers": [],
+                }
+            ),
+            user,
+            SimpleNamespace(),
+        )
+
+    assert events == ["lock", "rescan"]
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "prospect_conversion_choice_required"
+    assert error.value.detail["candidates"][0]["id"] == str(candidate.id)
+    create_portfolio.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_conversion_identity_lock_is_stable_and_transaction_scoped() -> None:
+    prospect = _unconverted_identity_prospect()
+    same_identity = _unconverted_identity_prospect()
+    assert prospect_conversion.conversion_identity_lock_keys(prospect) == (
+        prospect_conversion.conversion_identity_lock_keys(same_identity)
+    )
+    different_identity = _unconverted_identity_prospect()
+    different_identity.dealer_name_normalized = "another dealer"
+    different_identity.phone_normalized = "+19735550149"
+    shared_email_locks = set(
+        prospect_conversion.conversion_identity_lock_keys(prospect)
+    ) & set(prospect_conversion.conversion_identity_lock_keys(different_identity))
+    assert len(shared_email_locks) == 1
+    assert prospect_conversion.conversion_identity_lock_keys(prospect) == tuple(
+        sorted(prospect_conversion.conversion_identity_lock_keys(prospect))
+    )
+
+    db = SimpleNamespace(execute=AsyncMock())
+    await prospect_conversion.acquire_conversion_identity_lock(db, prospect)
+
+    statements = [call.args[0] for call in db.execute.await_args_list]
+    assert len(statements) == 3
+    assert all("pg_advisory_xact_lock" in str(statement) for statement in statements)
+    acquired_keys = [next(iter(statement.compile().params.values())) for statement in statements]
+    assert acquired_keys == list(prospect_conversion.conversion_identity_lock_keys(prospect))
+
+
+@pytest.mark.parametrize(
+    ("action", "archived", "expected_code"),
+    [
+        ("link", True, "prospect_conversion_reactivation_required"),
+        ("reactivate", False, "prospect_conversion_candidate_active"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_legacy_conversion_enforces_candidate_archive_action_parity(
+    monkeypatch, action: str, archived: bool, expected_code: str
+) -> None:
+    prospect = _unconverted_identity_prospect()
+    intake = SimpleNamespace(
+        id=uuid4(),
+        status="archived" if archived else "collecting",
+        delete_requested_at=datetime.now(UTC) if archived else None,
+    )
+    monkeypatch.setattr(
+        prospect_router.service, "load_visible_prospect", AsyncMock(return_value=prospect)
+    )
+    monkeypatch.setattr(
+        prospect_router.conversion_service,
+        "acquire_conversion_identity_lock",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        prospect_router.service,
+        "intake_candidates",
+        AsyncMock(return_value=[intake]),
+    )
+    complete = AsyncMock()
+    monkeypatch.setattr(prospect_router.service, "complete_conversion", complete)
+
+    with pytest.raises(HTTPException) as error:
+        await prospect_router.convert_prospect_to_ai_intake(
+            prospect.id,
+            ProspectConversionRequest(
+                action=action,
+                intake_id=intake.id,
+                expected_version=1,
+            ),
+            Request({"type": "http", "method": "POST", "path": "/convert", "headers": []}),
+            _user(Role.FIELD_REP),
+            SimpleNamespace(),
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == expected_code
+    complete.assert_not_awaited()

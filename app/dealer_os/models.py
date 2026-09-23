@@ -1481,6 +1481,10 @@ class DealerRepContactAssignment(TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("contact_id", "user_id", name="uq_dos_rep_contact_assignment"),
         Index("ix_dos_rep_contact_assignments_user", "user_id", "contact_id"),
+        CheckConstraint(
+            "assignment_kind IN ('explicit','prospect_owner')",
+            name="ck_dos_rep_contact_assignment_kind",
+        ),
     )
 
     id: Mapped[uuid.UUID] = _pk()
@@ -1492,6 +1496,13 @@ class DealerRepContactAssignment(TimestampMixin, Base):
     )
     assigned_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    # Explicit shares survive a prospect ownership transfer.  The temporary
+    # assignment minted solely so a new owner can open the contact directory
+    # is removed on the next transfer, preventing former owners from retaining
+    # Marketing email history accidentally.
+    assignment_kind: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="explicit", server_default="explicit"
     )
 
 

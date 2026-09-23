@@ -71,6 +71,10 @@ class DealerProspectEmailDraft(TimestampMixin, Base):
             "delivery_mode IN ('attachments','secure_link')",
             name="ck_dealer_prospect_email_draft_delivery_mode",
         ),
+        CheckConstraint(
+            "compose_mode IN ('ai','manual')",
+            name="ck_dealer_prospect_email_draft_compose_mode",
+        ),
         Index("ix_dealer_prospect_email_drafts_due", "status", "auto_send_at"),
         Index("ix_dealer_prospect_email_drafts_prospect_created", "prospect_id", "created_at"),
     )
@@ -107,6 +111,9 @@ class DealerProspectEmailDraft(TimestampMixin, Base):
     body_text: Mapped[str] = mapped_column(Text, nullable=False)
     body_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     ai_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    compose_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="ai", server_default="ai"
+    )
     purpose: Mapped[str] = mapped_column(
         String(32),
         nullable=False,

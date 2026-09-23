@@ -7,7 +7,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -26,14 +26,18 @@ from app.schemas.prospect_outreach import ProspectEmailDraftCreate
 from app.services import prospect_outreach as outreach_service
 from app.services.user_access import record_access_event, request_metadata
 
-from .models import DealerRepCompany, DealerRepContact, DealerRepContactAssignment
+from .models import DealerBusiness, DealerRepCompany, DealerRepContact, DealerRepContactAssignment
 from .prospect_schemas import (
     ProspectActivityCreate,
     ProspectActivityRead,
+    ProspectConversionCandidate,
+    ProspectConversionCandidateList,
     ProspectConversionRequest,
     ProspectConversionResult,
     ProspectCreate,
     ProspectDefinitionReorder,
+    ProspectGeneralConversionRequest,
+    ProspectGeneralConversionResult,
     ProspectListRead,
     ProspectMoveResult,
     ProspectMoveStage,
@@ -53,6 +57,7 @@ from .prospect_schemas import (
     ProspectUserAccessPatch,
     ProspectUserAccessRead,
 )
+from .services import prospect_conversion as conversion_service
 from .services import prospects as service
 
 _PROSPECT_ACCESS_ADMIN_ROOT = "/dealer-os/admin/prospect-access"
@@ -550,23 +555,41 @@ async def patch_prospect(
         if user.role not in service.TEAM_ROLES and owner_id != user.id:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the team can reassign prospects")
         await _validate_owner(db, owner_id)
-        prospect.owner_user_id = owner_id
-        existing_assignment = (
-            await db.execute(
-                select(DealerRepContactAssignment).where(
-                    DealerRepContactAssignment.contact_id == contact.id,
-                    DealerRepContactAssignment.user_id == owner_id,
+        previous_owner_id = prospect.owner_user_id
+        if previous_owner_id != owner_id:
+            # Ownership is itself sufficient Marketing access.  The legacy
+            # reassignment path also left a contact assignment behind, which
+            # meant every former owner retained the prospect and its complete
+            # email history forever.  A transfer removes that owner-derived
+            # assignment before granting the new owner contact-directory
+            # access.  An administrator can explicitly share the contact
+            # again after the transfer when continuing access is intended.
+            if previous_owner_id is not None:
+                await db.execute(
+                    delete(DealerRepContactAssignment).where(
+                        DealerRepContactAssignment.contact_id == contact.id,
+                        DealerRepContactAssignment.user_id == previous_owner_id,
+                        DealerRepContactAssignment.assignment_kind == "prospect_owner",
+                    )
                 )
-            )
-        ).scalar_one_or_none()
-        if existing_assignment is None and contact.owner_user_id != owner_id:
-            db.add(
-                DealerRepContactAssignment(
-                    contact_id=contact.id,
-                    user_id=owner_id,
-                    assigned_by_user_id=user.id,
+            prospect.owner_user_id = owner_id
+            existing_assignment = (
+                await db.execute(
+                    select(DealerRepContactAssignment).where(
+                        DealerRepContactAssignment.contact_id == contact.id,
+                        DealerRepContactAssignment.user_id == owner_id,
+                    )
                 )
-            )
+            ).scalar_one_or_none()
+            if existing_assignment is None and contact.owner_user_id != owner_id:
+                db.add(
+                    DealerRepContactAssignment(
+                        contact_id=contact.id,
+                        user_id=owner_id,
+                        assigned_by_user_id=user.id,
+                        assignment_kind="prospect_owner",
+                    )
+                )
         changed_fields.append("owner_user_id")
     if "contact_name" in changes:
         contact.full_name = changes["contact_name"]
@@ -782,6 +805,267 @@ def _candidate_read(row: PublicUnderwritingIntake, *, prospect: DealerProspect) 
     }
 
 
+def _conversion_candidate_read(
+    target: Literal["portfolio_application", "dealer_ai_intake"],
+    row: DealerBusiness | PublicUnderwritingIntake,
+    *,
+    prospect: DealerProspect,
+) -> ProspectConversionCandidate:
+    if target == "portfolio_application":
+        application = row
+        assert isinstance(application, DealerBusiness)
+        return ProspectConversionCandidate(
+            id=application.id,
+            target=target,
+            status="archived" if application.archived_at else application.status,
+            archived=application.archived_at is not None,
+            display_name=application.name,
+            email=application.email,
+            phone=application.phone,
+            created_at=application.created_at,
+            match_reasons=conversion_service.portfolio_candidate_match_reasons(
+                prospect, application
+            ),
+            route=conversion_service.conversion_route(target, application.id),
+        )
+    intake = row
+    assert isinstance(intake, PublicUnderwritingIntake)
+    return ProspectConversionCandidate(
+        id=intake.id,
+        target=target,
+        status=intake.status,
+        archived=conversion_service.intake_archived(intake),
+        display_name=intake.business_name or intake.full_name,
+        email=intake.email,
+        phone=intake.phone,
+        created_at=intake.created_at,
+        match_reasons=service.intake_candidate_match_reasons(prospect, intake),
+        route=conversion_service.conversion_route(target, intake.id),
+    )
+
+
+async def _conversion_candidates(
+    db: AsyncSession,
+    prospect: DealerProspect,
+    user: User,
+    target: Literal["portfolio_application", "dealer_ai_intake"],
+) -> list[DealerBusiness | PublicUnderwritingIntake]:
+    if target == "portfolio_application":
+        return list(await conversion_service.portfolio_candidates(db, prospect, user))
+    return list(await service.intake_candidates(db, prospect, user))
+
+
+def _prospect_conversion_destination(
+    prospect: DealerProspect,
+) -> tuple[Literal["portfolio_application", "dealer_ai_intake"], UUID] | None:
+    if prospect.converted_application_id is not None:
+        return "portfolio_application", prospect.converted_application_id
+    if prospect.converted_intake_id is not None:
+        return "dealer_ai_intake", prospect.converted_intake_id
+    return None
+
+
+async def _restricted_conversion_match_exists(
+    db: AsyncSession,
+    prospect: DealerProspect,
+    user: User,
+    target: Literal["portfolio_application", "dealer_ai_intake"],
+) -> bool:
+    if target == "portfolio_application":
+        return await conversion_service.portfolio_restricted_match_exists(
+            db, prospect, user
+        )
+    return await service.intake_restricted_match_exists(db, prospect, user)
+
+
+def _raise_restricted_conversion_match() -> None:
+    # Intentionally do not include a record id, owner, match reason, count, or
+    # destination metadata.  Scoped agents may learn only that creating a
+    # separate destination requires an explicit choice.
+    raise HTTPException(
+        status.HTTP_409_CONFLICT,
+        detail={
+            "code": "prospect_conversion_restricted_match",
+            "message": (
+                "A matching file exists outside your available records. "
+                "Choose create separate only if a new file is intentional."
+            ),
+        },
+    )
+
+
+@router.get(
+    "/prospects/{prospect_id}/conversion-candidates",
+    response_model=ProspectConversionCandidateList,
+)
+async def list_prospect_conversion_candidates(
+    prospect_id: UUID,
+    user: CurrentUser,
+    db: DbSession,
+    target: Literal["portfolio_application", "dealer_ai_intake"] = Query(...),
+) -> ProspectConversionCandidateList:
+    prospect = await service.load_visible_prospect(db, user, prospect_id)
+    converted = _prospect_conversion_destination(prospect)
+    if converted is not None:
+        return ProspectConversionCandidateList(
+            target=target,
+            prospect_id=prospect.id,
+            already_converted=True,
+            candidates=[],
+        )
+    rows = await _conversion_candidates(db, prospect, user, target)
+    return ProspectConversionCandidateList(
+        target=target,
+        prospect_id=prospect.id,
+        candidates=[
+            _conversion_candidate_read(target, row, prospect=prospect) for row in rows
+        ],
+    )
+
+
+@router.post(
+    "/prospects/{prospect_id}/convert",
+    response_model=ProspectGeneralConversionResult,
+)
+async def convert_prospect(
+    prospect_id: UUID,
+    payload: ProspectGeneralConversionRequest,
+    request: Request,
+    user: CurrentUser,
+    db: DbSession,
+) -> ProspectGeneralConversionResult:
+    prospect = await service.load_visible_prospect(db, user, prospect_id, for_update=True)
+    converted = _prospect_conversion_destination(prospect)
+    if converted is not None:
+        converted_target, destination_id = converted
+        await _refresh_for_read(db, prospect)
+        return ProspectGeneralConversionResult(
+            status="already_converted",
+            conversion_target=converted_target,
+            prospect=ProspectRead.model_validate(await service.prospect_read(db, prospect)),
+            application_id=(destination_id if converted_target == "portfolio_application" else None),
+            intake_id=(destination_id if converted_target == "dealer_ai_intake" else None),
+            route=conversion_service.conversion_route(converted_target, destination_id),
+        )
+    service.assert_expected_version(prospect, payload.expected_version)
+
+    # A transaction-scoped identity lock closes the gap between a prior
+    # candidate lookup and destination creation.  The candidate queries below
+    # are deliberately rerun only after this lock is held.
+    await conversion_service.acquire_conversion_identity_lock(db, prospect)
+    rows = await _conversion_candidates(db, prospect, user, payload.target)
+    candidates = [
+        _conversion_candidate_read(payload.target, row, prospect=prospect) for row in rows
+    ]
+    if payload.action == "detect":
+        if candidates:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "prospect_conversion_choice_required",
+                    "target": payload.target,
+                    "candidates": [row.model_dump(mode="json") for row in candidates],
+                    "allowed_actions": ["link", "reactivate", "create"],
+                },
+            )
+        if await _restricted_conversion_match_exists(
+            db, prospect, user, payload.target
+        ):
+            _raise_restricted_conversion_match()
+
+    selected = None
+    if payload.action in {"link", "reactivate"}:
+        selected = next((row for row in rows if row.id == payload.candidate_id), None)
+        if selected is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Selected conversion candidate does not match this dealer contact.",
+            )
+        selected_read = _conversion_candidate_read(payload.target, selected, prospect=prospect)
+        if selected_read.archived and payload.action != "reactivate":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "prospect_conversion_reactivation_required",
+                    "message": "The selected file is archived. Choose reactivate to continue.",
+                },
+            )
+        if not selected_read.archived and payload.action == "reactivate":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "prospect_conversion_candidate_active",
+                    "message": "The selected file is already active. Choose link to continue.",
+                },
+            )
+
+    result_status: Literal["linked", "reactivated", "created"]
+    destination_id: UUID
+    if payload.target == "portfolio_application":
+        if selected is None:
+            if payload.portfolio_application is None:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "code": "portfolio_application_details_required",
+                        "message": "Application details and a six-digit room PIN are required.",
+                    },
+                )
+            application = await conversion_service.create_portfolio_application(
+                db, prospect, user, payload.portfolio_application
+            )
+            result_status = "created"
+        else:
+            assert isinstance(selected, DealerBusiness)
+            application = selected
+            await conversion_service.link_portfolio_application(
+                db,
+                prospect,
+                application,
+                user,
+                reactivate=payload.action == "reactivate",
+            )
+            result_status = "reactivated" if payload.action == "reactivate" else "linked"
+        destination_id = application.id
+    else:
+        if selected is None:
+            intake = await service.create_intake_from_prospect(db, request, prospect, user)
+            result_status = "created"
+        else:
+            assert isinstance(selected, PublicUnderwritingIntake)
+            intake = selected
+            result_status = "linked"
+            if payload.action == "reactivate":
+                intake.status = "collecting"
+                intake.outcome_status = "submitted"
+                intake.delete_requested_at = None
+                intake.delete_requested_by_user_id = None
+                intake.client_contact_suppressed = False
+                result_status = "reactivated"
+        destination_id = intake.id
+
+    await service.complete_target_conversion(
+        db,
+        user,
+        prospect,
+        target=payload.target,
+        destination_id=destination_id,
+        event_kind=f"{payload.target}_{result_status}",
+        note=payload.note,
+    )
+    await _refresh_for_read(db, prospect)
+    return ProspectGeneralConversionResult(
+        status=result_status,
+        conversion_target=payload.target,
+        prospect=ProspectRead.model_validate(
+            await service.prospect_read(db, prospect, include_activities=True)
+        ),
+        application_id=(destination_id if payload.target == "portfolio_application" else None),
+        intake_id=(destination_id if payload.target == "dealer_ai_intake" else None),
+        route=conversion_service.conversion_route(payload.target, destination_id),
+    )
+
+
 @router.post(
     "/prospects/{prospect_id}/convert-to-ai-intake",
     response_model=ProspectConversionResult,
@@ -794,16 +1078,32 @@ async def convert_prospect_to_ai_intake(
     db: DbSession,
 ) -> ProspectConversionResult:
     prospect = await service.load_visible_prospect(db, user, prospect_id, for_update=True)
-    service.assert_expected_version(prospect, payload.expected_version)
+    if prospect.converted_application_id is not None:
+        await _refresh_for_read(db, prospect)
+        return ProspectConversionResult(
+            status="already_converted",
+            conversion_target="portfolio_application",
+            prospect=ProspectRead.model_validate(await service.prospect_read(db, prospect)),
+            application_id=prospect.converted_application_id,
+            route=conversion_service.conversion_route(
+                "portfolio_application", prospect.converted_application_id
+            ),
+        )
     if prospect.converted_intake_id is not None:
         await _refresh_for_read(db, prospect)
         return ProspectConversionResult(
             status="already_converted",
+            conversion_target="dealer_ai_intake",
             prospect=ProspectRead.model_validate(await service.prospect_read(db, prospect)),
             intake_id=prospect.converted_intake_id,
             route=f"/admin/ai-underwriter-leads?lead={prospect.converted_intake_id}",
         )
+    service.assert_expected_version(prospect, payload.expected_version)
 
+    # Keep this compatibility endpoint under the same race/privacy contract as
+    # the generalized conversion endpoint.  Candidates are rescanned only
+    # after the identity-level transaction lock is acquired.
+    await conversion_service.acquire_conversion_identity_lock(db, prospect)
     candidates = await service.intake_candidates(db, prospect, user)
     if payload.action == "detect":
         if candidates:
@@ -826,6 +1126,8 @@ async def convert_prospect_to_ai_intake(
                     "allowed_actions": ["link", "reactivate", "create"],
                 },
             )
+        if await service.intake_restricted_match_exists(db, prospect, user):
+            _raise_restricted_conversion_match()
         # No match means there is no decision to ask the agent to make. The
         # default detect request creates exactly one new dealer intake.
         intake = await service.create_intake_from_prospect(db, request, prospect, user)
@@ -837,6 +1139,23 @@ async def convert_prospect_to_ai_intake(
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "Selected AI intake does not match this dealer contact.",
+            )
+        archived = conversion_service.intake_archived(intake)
+        if archived and payload.action != "reactivate":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "prospect_conversion_reactivation_required",
+                    "message": "The selected file is archived. Choose reactivate to continue.",
+                },
+            )
+        if not archived and payload.action == "reactivate":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "prospect_conversion_candidate_active",
+                    "message": "The selected file is already active. Choose link to continue.",
+                },
             )
         result_status = "linked"
         if payload.action == "reactivate":
@@ -864,6 +1183,7 @@ async def convert_prospect_to_ai_intake(
     await _refresh_for_read(db, prospect)
     return ProspectConversionResult(
         status=result_status,
+        conversion_target="dealer_ai_intake",
         prospect=ProspectRead.model_validate(
             await service.prospect_read(db, prospect, include_activities=True)
         ),

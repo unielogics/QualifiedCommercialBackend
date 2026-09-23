@@ -156,7 +156,10 @@ class ProspectTestEmailResponse(BaseModel):
 
 class ProspectEmailDraftCreate(BaseModel):
     idempotency_key: UUID = Field(default_factory=uuid4)
+    compose_mode: Literal["ai", "manual"] = "ai"
     purpose: DraftPurpose = "dealer_information"
+    subject: str | None = Field(default=None, min_length=1, max_length=240)
+    body: str | None = Field(default=None, min_length=1, max_length=30_000)
     ai_instructions: str | None = Field(default=None, max_length=1500)
     verified_conversation_context: str | None = Field(default=None, max_length=500)
     # This value is routed directly to DealerProspectActivity.  It is never
@@ -167,7 +170,7 @@ class ProspectEmailDraftCreate(BaseModel):
     include_collateral: bool = True
     collateral_asset_ids: list[UUID] = Field(default_factory=list, max_length=100)
 
-    @field_validator("ai_instructions", "private_note")
+    @field_validator("subject", "body", "ai_instructions", "private_note")
     @classmethod
     def strip_optional_text(cls, value: str | None) -> str | None:
         clean = (value or "").strip()
@@ -187,6 +190,15 @@ class ProspectEmailDraftCreate(BaseModel):
             raise ValueError(
                 "collateral_asset_ids must be empty when include_collateral is true"
             )
+        if self.compose_mode == "manual":
+            if not self.subject or not self.body:
+                raise ValueError("subject and body are required for manual drafts")
+            if self.ai_instructions or self.verified_conversation_context:
+                raise ValueError(
+                    "AI instructions and verified conversation context are available only for AI drafts"
+                )
+        elif self.subject is not None or self.body is not None:
+            raise ValueError("subject and body are available only for manual drafts")
         return self
 
 
@@ -213,6 +225,18 @@ class ProspectDraftAction(BaseModel):
     expected_version: int = Field(ge=1)
 
 
+class ProspectEmailAttachmentRead(BaseModel):
+    id: UUID
+    name: str
+    version: int
+    file_name: str
+    content_type: str
+    size_bytes: int
+    sha256: str
+    preview_url: str
+    download_url: str
+
+
 class ProspectEmailDraftRead(BaseModel):
     id: UUID
     prospect_id: UUID
@@ -228,6 +252,9 @@ class ProspectEmailDraftRead(BaseModel):
     reply_contact_email: str | None = None
     subject: str
     body: str
+    editable_body: str
+    locked_footer_text: str
+    compose_mode: Literal["ai", "manual"] = "ai"
     status: Literal[
         "pending_review", "editing", "sending", "sent", "cancelled", "failed", "blocked"
     ]
@@ -252,6 +279,37 @@ class ProspectEmailDraftRead(BaseModel):
     delivery_mode: Literal["attachments", "secure_link"] = "attachments"
     secure_bundle_link_required: bool = False
     secure_bundle_expires_at: datetime | None = None
+    prospect_archived_at: datetime | None = None
+    contact_id: UUID | None = None
+    contact_name: str | None = None
+    contact_email: str | None = None
+    contact_phone: str | None = None
+    dealer_name: str | None = None
+    owner_user_id: UUID | None = None
+    owner_name: str | None = None
+    owner_email: str | None = None
+    triggering_agent_id: UUID | None = None
+    triggering_agent_name: str | None = None
+    triggering_agent_email: str | None = None
+    message_send_id: UUID | None = None
+    delivery_status: Literal[
+        "provider_accepted",
+        "delivered",
+        "bounced",
+        "complaint",
+        "failed",
+        "blocked",
+        "cancelled",
+        "unavailable",
+    ] | None = None
+    provider_status: str | None = None
+    provider_detail: str | None = None
+    provider: str | None = None
+    provider_message_id: str | None = None
+    delivered_at: datetime | None = None
+    opened_at: datetime | None = None
+    failed_at: datetime | None = None
+    attachments: list[ProspectEmailAttachmentRead] = Field(default_factory=list)
     created_at: datetime
 
 
