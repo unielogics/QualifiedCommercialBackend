@@ -408,3 +408,31 @@ def test_the_migration_chain_has_one_head():
 
     heads = ScriptDirectory.from_config(Config("alembic.ini")).get_heads()
     assert heads == ["0222_marketing_conversion"]
+
+
+def test_marketing_migration_identifiers_fit_postgres():
+    """PostgreSQL rejects explicit migration identifiers longer than 63 bytes."""
+    import ast
+    from pathlib import Path
+
+    source = Path("alembic/versions/0222_marketing_conversion.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    named_operations = {
+        "create_check_constraint",
+        "create_foreign_key",
+        "create_index",
+        "drop_constraint",
+        "drop_index",
+    }
+    identifiers: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr not in named_operations or not node.args:
+            continue
+        first = node.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            identifiers.append(first.value)
+
+    assert identifiers
+    assert all(len(identifier.encode("utf-8")) <= 63 for identifier in identifiers)

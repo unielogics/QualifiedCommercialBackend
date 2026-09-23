@@ -66,7 +66,7 @@ def upgrade() -> None:
         type_="foreignkey",
     )
     op.create_foreign_key(
-        "fk_dealer_prospects_converted_intake_id_public_underwriting_intakes",
+        "fk_dealer_prospects_converted_intake",
         "dealer_prospects",
         "public_underwriting_intakes",
         ["converted_intake_id"],
@@ -158,7 +158,7 @@ def downgrade() -> None:
     op.drop_column("dealer_prospects", "converted_application_id")
     op.drop_column("dealer_prospects", "conversion_target")
     op.drop_constraint(
-        "fk_dealer_prospects_converted_intake_id_public_underwriting_intakes",
+        "fk_dealer_prospects_converted_intake",
         "dealer_prospects",
         type_="foreignkey",
     )
