@@ -20,7 +20,7 @@ from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, with_loader_criteria
@@ -57,6 +57,7 @@ from app.models.bucket import (
 from app.models.client import Client
 from app.models.dealer_intake_login import DealerIntakeLoginChallenge
 from app.models.event import CalendarEvent
+from app.models.notification import Notification
 from app.models.public_underwriting_intake import (
     PublicUnderwritingIntake,
     PublicUnderwritingIntakeArtifact,
@@ -106,6 +107,7 @@ from app.services import (
     inline_images,
     locked_file_requests,
     merchant_processing,
+    notifications,
     provenance,
     upload_validation,
 )
@@ -1286,6 +1288,103 @@ class DealerAILeadListResponse(BaseModel):
     offset: int
 
 
+INTAKE_NOTIFICATION_EVENT_DEFINITIONS: dict[str, tuple[str, str]] = {
+    "intake_started": (
+        "Intake started",
+        "A new AI Intake file is created.",
+    ),
+    "file_uploaded": (
+        "File uploaded",
+        "A new evidence file is accepted into this intake.",
+    ),
+    "review_approved": (
+        "Positive AI review",
+        "The preliminary AI screen returns a positive result.",
+    ),
+    "review_denied": (
+        "Negative AI review",
+        "The preliminary AI screen returns a negative result.",
+    ),
+}
+INTAKE_NOTIFICATION_DEFAULT_EVENTS = {
+    "intake_started",
+    "review_approved",
+    "review_denied",
+}
+INTAKE_NOTIFICATION_ROUTING_STATE_KEY = "notification_routing"
+INTAKE_NOTIFICATION_AUDIT_STATE_KEY = "notification_delivery_audit"
+INTAKE_NOTIFICATION_ROUTING_VERSION = 1
+
+
+class IntakeNotificationRule(BaseModel):
+    enabled: bool = True
+    email_enabled: bool = True
+    in_app_enabled: bool = False
+    to_user_ids: list[UUID] = Field(default_factory=list, max_length=50)
+    cc_user_ids: list[UUID] = Field(default_factory=list, max_length=50)
+
+    @field_validator("to_user_ids", "cc_user_ids")
+    @classmethod
+    def unique_user_ids(cls, values: list[UUID]) -> list[UUID]:
+        return list(dict.fromkeys(values))
+
+    @model_validator(mode="after")
+    def validate_delivery_shape(self) -> IntakeNotificationRule:
+        overlap = set(self.to_user_ids) & set(self.cc_user_ids)
+        if overlap:
+            raise ValueError("A recipient cannot be both a primary recipient and CC.")
+        if self.enabled and not (self.email_enabled or self.in_app_enabled):
+            raise ValueError("An enabled notification requires Email or In-app delivery.")
+        if self.cc_user_ids and not self.email_enabled:
+            raise ValueError("CC recipients require email delivery.")
+        if self.enabled and self.email_enabled and self.cc_user_ids and not self.to_user_ids:
+            raise ValueError("Choose at least one primary recipient before adding CC recipients.")
+        return self
+
+
+class IntakeNotificationRoutingUpdate(BaseModel):
+    events: dict[str, IntakeNotificationRule]
+
+    @field_validator("events")
+    @classmethod
+    def known_events_only(
+        cls, value: dict[str, IntakeNotificationRule]
+    ) -> dict[str, IntakeNotificationRule]:
+        unknown = set(value) - set(INTAKE_NOTIFICATION_EVENT_DEFINITIONS)
+        if unknown:
+            raise ValueError(f"Unsupported notification event(s): {', '.join(sorted(unknown))}")
+        missing = set(INTAKE_NOTIFICATION_EVENT_DEFINITIONS) - set(value)
+        if missing:
+            raise ValueError(f"Missing notification event(s): {', '.join(sorted(missing))}")
+        return value
+
+
+class IntakeNotificationUserRead(BaseModel):
+    user_id: UUID
+    name: str
+    email: str
+    role: str
+    relations: list[str] = Field(default_factory=list)
+
+
+class IntakeNotificationEventRead(BaseModel):
+    key: str
+    label: str
+    description: str
+    rule: IntakeNotificationRule
+
+
+class IntakeNotificationRoutingRead(BaseModel):
+    intake_id: UUID
+    version: int = INTAKE_NOTIFICATION_ROUTING_VERSION
+    uses_default: bool
+    updated_at: datetime | None = None
+    updated_by_user_id: UUID | None = None
+    default_fallback_email: str | None = None
+    candidates: list[IntakeNotificationUserRead]
+    events: list[IntakeNotificationEventRead]
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -1444,21 +1543,199 @@ def _dealer_label(intake: PublicUnderwritingIntake) -> str:
     return intake.business_name or intake.full_name or intake.email or "Dealer AI lead"
 
 
-async def _super_admin_emails(db: AsyncSession) -> list[str]:
+async def _intake_notification_candidates(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+) -> list[IntakeNotificationUserRead]:
+    """Return only active users who are allowed to receive this file's updates.
+
+    Desk operators can always receive an intake update. External/Field Desk
+    users are eligible only when the intake itself links them as the source,
+    broker, underwriter, or a member of the linked referral company. This keeps
+    the CC picker useful without turning it into an arbitrary-address data leak.
+    """
+
+    direct_relations: dict[UUID, set[str]] = {}
+
+    def relate(user_id: UUID | None, relation: str) -> None:
+        if user_id is not None:
+            direct_relations.setdefault(user_id, set()).add(relation)
+
+    relate(intake.assigned_underwriter_user_id, "Assigned underwriter")
+    relate(intake.source_user_id, "Originating agent")
+    relate(intake.broker_id, "Broker / dealer partner")
+
     rows = (
         await db.execute(
-            select(User.email)
-            .where(User.role == Role.SUPER_ADMIN)
-            .where(User.deleted_at.is_(None))
-            .order_by(User.email.asc())
+            select(User).where(
+                User.deleted_at.is_(None),
+                or_(User.account_status.is_(None), User.account_status == "active"),
+                or_(
+                    User.role.in_([Role.SUPER_ADMIN.value, Role.LOAN_EXEC.value]),
+                    User.id.in_(set(direct_relations) or {UUID(int=0)}),
+                    *(
+                        [
+                            User.referral_partner_company_id
+                            == intake.referral_partner_company_id
+                        ]
+                        if intake.referral_partner_company_id is not None
+                        else []
+                    ),
+                ),
+            )
         )
     ).scalars().all()
-    recipients = [email.strip().lower() for email in rows if email and "@" in email]
-    if not recipients:
-        fallback = get_settings().primary_super_admin_email.strip().lower()
-        if fallback:
-            recipients.append(fallback)
-    return sorted(set(recipients))
+
+    candidates: list[IntakeNotificationUserRead] = []
+    for row in rows:
+        relations = set(direct_relations.get(row.id, set()))
+        role_value = row.role.value if hasattr(row.role, "value") else str(row.role)
+        if role_value == Role.SUPER_ADMIN.value:
+            relations.add("Super Admin")
+        elif role_value == Role.LOAN_EXEC.value:
+            relations.add("Loan Executive")
+        if (
+            intake.referral_partner_company_id is not None
+            and row.referral_partner_company_id == intake.referral_partner_company_id
+        ):
+            relations.add("Referral team")
+        # A client/vendor/lender row is never an internal notification target,
+        # even if historical data accidentally links it to a partner company.
+        if role_value in {Role.CLIENT.value, Role.VENDOR.value, Role.LENDER.value}:
+            continue
+        email = (row.email or "").strip().lower()
+        if not email or "@" not in email:
+            continue
+        candidates.append(
+            IntakeNotificationUserRead(
+                user_id=row.id,
+                name=(row.name or email).strip(),
+                email=email,
+                role=role_value,
+                relations=sorted(relations),
+            )
+        )
+    return sorted(candidates, key=lambda item: (item.name.casefold(), item.email))
+
+
+def _default_intake_notification_rules(
+    candidates: list[IntakeNotificationUserRead],
+) -> dict[str, IntakeNotificationRule]:
+    super_admin_ids = [
+        candidate.user_id
+        for candidate in candidates
+        if candidate.role == Role.SUPER_ADMIN.value
+    ]
+    return {
+        event_key: IntakeNotificationRule(
+            enabled=event_key in INTAKE_NOTIFICATION_DEFAULT_EVENTS,
+            email_enabled=event_key in INTAKE_NOTIFICATION_DEFAULT_EVENTS,
+            in_app_enabled=False,
+            to_user_ids=super_admin_ids
+            if event_key in INTAKE_NOTIFICATION_DEFAULT_EVENTS
+            else [],
+            cc_user_ids=[],
+        )
+        for event_key in INTAKE_NOTIFICATION_EVENT_DEFINITIONS
+    }
+
+
+def _stored_intake_notification_rules(
+    intake: PublicUnderwritingIntake,
+    candidates: list[IntakeNotificationUserRead],
+) -> tuple[dict[str, IntakeNotificationRule], bool, datetime | None, UUID | None]:
+    state = _intake_state(intake)
+    raw = state.get(INTAKE_NOTIFICATION_ROUTING_STATE_KEY)
+    if not isinstance(raw, dict) or raw.get("version") != INTAKE_NOTIFICATION_ROUTING_VERSION:
+        return _default_intake_notification_rules(candidates), True, None, None
+    raw_events = raw.get("events")
+    if not isinstance(raw_events, dict):
+        return _default_intake_notification_rules(candidates), True, None, None
+    defaults = _default_intake_notification_rules(candidates)
+    eligible_ids = {candidate.user_id for candidate in candidates}
+    rules: dict[str, IntakeNotificationRule] = {}
+    for event_key in INTAKE_NOTIFICATION_EVENT_DEFINITIONS:
+        try:
+            stored_rule = IntakeNotificationRule.model_validate(
+                raw_events.get(event_key)
+            )
+            # A user can be deactivated or detached from the file after the
+            # routing was saved. Do not expose an invisible/stale ID that the
+            # operator cannot remove and the PUT endpoint must reject.
+            rules[event_key] = stored_rule.model_copy(
+                update={
+                    "to_user_ids": [
+                        user_id
+                        for user_id in stored_rule.to_user_ids
+                        if user_id in eligible_ids
+                    ],
+                    "cc_user_ids": [
+                        user_id
+                        for user_id in stored_rule.cc_user_ids
+                        if user_id in eligible_ids
+                    ],
+                }
+            )
+            # Relationship and account-status changes can remove every
+            # previously selected primary recipient.  Return a safe Off rule
+            # instead of presenting an enabled route that cannot deliver.
+            # The stored audit/config remains intact so the change is still
+            # explainable and an operator can select a current recipient.
+            if rules[event_key].enabled and not rules[event_key].to_user_ids:
+                rules[event_key] = rules[event_key].model_copy(
+                    update={"enabled": False, "cc_user_ids": []}
+                )
+        except Exception:  # noqa: BLE001
+            rules[event_key] = defaults[event_key]
+    updated_at = None
+    if raw.get("updated_at"):
+        try:
+            updated_at = datetime.fromisoformat(str(raw["updated_at"]))
+        except ValueError:
+            updated_at = None
+    updated_by_user_id = None
+    if raw.get("updated_by_user_id"):
+        try:
+            updated_by_user_id = UUID(str(raw["updated_by_user_id"]))
+        except ValueError:
+            updated_by_user_id = None
+    return rules, False, updated_at, updated_by_user_id
+
+
+def _notification_routing_read(
+    intake: PublicUnderwritingIntake,
+    candidates: list[IntakeNotificationUserRead],
+) -> IntakeNotificationRoutingRead:
+    rules, uses_default, updated_at, updated_by_user_id = (
+        _stored_intake_notification_rules(intake, candidates)
+    )
+    return IntakeNotificationRoutingRead(
+        intake_id=intake.id,
+        uses_default=uses_default,
+        updated_at=updated_at,
+        updated_by_user_id=updated_by_user_id,
+        default_fallback_email=(
+            get_settings().primary_super_admin_email.strip().lower()
+            if uses_default
+            and not any(
+                rule.to_user_ids
+                for rule in rules.values()
+                if rule.enabled and rule.email_enabled
+            )
+            and "@" in get_settings().primary_super_admin_email
+            else None
+        ),
+        candidates=candidates,
+        events=[
+            IntakeNotificationEventRead(
+                key=key,
+                label=definition[0],
+                description=definition[1],
+                rule=rules[key],
+            )
+            for key, definition in INTAKE_NOTIFICATION_EVENT_DEFINITIONS.items()
+        ],
+    )
 
 
 def _email_line(value: Any) -> str:
@@ -1484,26 +1761,192 @@ def _dealer_decision_from_result(result: dict[str, Any]) -> str | None:
     return None
 
 
-async def _send_super_admin_email(
+async def _dispatch_intake_notification(
     db: AsyncSession,
+    intake: PublicUnderwritingIntake,
     *,
+    event_type: str,
     subject: str,
     body_text: str,
     body_html: str,
 ) -> list[dict[str, Any]]:
+    candidates = await _intake_notification_candidates(db, intake)
+    rules, uses_default, _, _ = _stored_intake_notification_rules(intake, candidates)
+    rule = rules[event_type]
+    if not rule.enabled:
+        return [{"status": "disabled", "event_type": event_type}]
+
+    by_id = {candidate.user_id: candidate for candidate in candidates}
+    to_users = [by_id[user_id] for user_id in rule.to_user_ids if user_id in by_id]
+    cc_users = [by_id[user_id] for user_id in rule.cc_user_ids if user_id in by_id]
+    # CC is an email-envelope concept.  In-app notifications go only to TO
+    # recipients so a user selected only as an email copy is not silently
+    # subscribed to application alerts as well.
+    in_app_user_ids = {user.user_id for user in to_users}
+    notification_by_user: dict[UUID, Notification] = {}
+    if rule.in_app_enabled and in_app_user_ids:
+        created = await notifications.notify_users(
+            db,
+            recipient_ids=in_app_user_ids,
+            event_type=f"dealer_ai_{event_type}",
+            category="ai_intake",
+            priority="high" if event_type in {"review_approved", "review_denied"} else "medium",
+            title=subject,
+            body=body_text.split("\n", 1)[0],
+            target_type="dealer_ai_intake",
+            target_id=str(intake.id),
+            deep_link=_admin_lead_url(intake),
+            meta={"intake_id": str(intake.id), "event_type": event_type},
+            email=False,
+            push=False,
+        )
+        notification_by_user = {row.recipient_user_id: row for row in created}
+
+    fallback_to_emails: list[str] = []
+    if rule.email_enabled and not to_users and uses_default:
+        fallback = get_settings().primary_super_admin_email.strip().lower()
+        if fallback and "@" in fallback:
+            fallback_to_emails.append(fallback)
+
+    result = None
+    if rule.email_enabled and (to_users or fallback_to_emails):
+        result = await asyncio.to_thread(
+            send_raw_email,
+            to_emails=list(
+                dict.fromkeys([*(user.email for user in to_users), *fallback_to_emails])
+            ),
+            cc_emails=list(dict.fromkeys(user.email for user in cc_users)),
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+        )
+
+    sent_at = _now().isoformat()
     records: list[dict[str, Any]] = []
-    for recipient in await _super_admin_emails(db):
-        result = send_email(to_email=recipient, subject=subject, body_text=body_text, body_html=body_html)
+    for recipient_type, users in (("to", to_users), ("cc", cc_users)):
+        for recipient in users:
+            notification = notification_by_user.get(recipient.user_id)
+            records.append(
+                {
+                    "user_id": str(recipient.user_id),
+                    "recipient": recipient.email,
+                    "recipient_type": recipient_type,
+                    "role": recipient.role,
+                    "in_app_notification_id": str(notification.id)
+                    if notification is not None
+                    else None,
+                    "email_enabled": rule.email_enabled,
+                    "email_ok": result.ok if result is not None else None,
+                    "email_status": result.detail if result is not None else "not_enabled",
+                    "message_id": result.message_id if result is not None else None,
+                    "sent_at": sent_at,
+                }
+            )
+    for email in fallback_to_emails:
         records.append(
             {
-                "recipient": recipient,
-                "ok": result.ok,
-                "status": result.detail,
-                "message_id": result.message_id,
-                "sent_at": _now().isoformat(),
+                "user_id": None,
+                "recipient": email,
+                "recipient_type": "to",
+                "role": "configured_super_admin_fallback",
+                "in_app_notification_id": None,
+                "email_enabled": True,
+                "email_ok": result.ok if result is not None else None,
+                "email_status": result.detail if result is not None else "not_enabled",
+                "message_id": result.message_id if result is not None else None,
+                "sent_at": sent_at,
             }
         )
+    if not records:
+        records.append({"status": "no_active_recipients", "event_type": event_type})
     return records
+
+
+async def _record_intake_notification_once(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    *,
+    event_type: str,
+    event_key: str,
+    subject: str,
+    body_text: str,
+    body_html: str,
+    request: Request | None,
+) -> dict[str, Any]:
+    """Claim, dispatch and audit one event with at-most-once provider calls."""
+
+    locked = (
+        await db.execute(
+            select(PublicUnderwritingIntake)
+            .where(PublicUnderwritingIntake.id == intake.id)
+            .with_for_update()
+        )
+    ).scalar_one()
+    await db.refresh(locked, attribute_names=["intake_state"])
+    intake = locked
+    state = _intake_state(intake)
+    audit = state.get(INTAKE_NOTIFICATION_AUDIT_STATE_KEY)
+    if not isinstance(audit, dict):
+        audit = {}
+    existing = audit.get(event_key)
+    if isinstance(existing, dict):
+        return existing
+
+    record: dict[str, Any] = {
+        "event_type": event_type,
+        "status": "dispatching",
+        "claimed_at": _now().isoformat(),
+        **(_request_audit(request) if request is not None else {}),
+    }
+    audit[event_key] = record
+    state[INTAKE_NOTIFICATION_AUDIT_STATE_KEY] = audit
+    intake.intake_state = state
+    # Commit the claim before calling SES. A worker crash may require manual
+    # retry, but it cannot create a duplicate email by replaying this event.
+    await db.commit()
+
+    dispatch_error: Exception | None = None
+    try:
+        deliveries = await _dispatch_intake_notification(
+            db,
+            intake,
+            event_type=event_type,
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+        )
+    except Exception as exc:  # noqa: BLE001
+        dispatch_error = exc
+        deliveries = [{"status": "failed", "error": str(exc)[:500]}]
+    locked = (
+        await db.execute(
+            select(PublicUnderwritingIntake)
+            .where(PublicUnderwritingIntake.id == intake.id)
+            .with_for_update()
+        )
+    ).scalar_one()
+    await db.refresh(locked, attribute_names=["intake_state"])
+    intake = locked
+    record = {
+        **record,
+        "status": "failed" if dispatch_error is not None else "completed",
+        "completed_at": _now().isoformat(),
+        "deliveries": deliveries,
+    }
+    state = _intake_state(intake)
+    audit = state.get(INTAKE_NOTIFICATION_AUDIT_STATE_KEY)
+    if not isinstance(audit, dict):
+        audit = {}
+    audit[event_key] = record
+    # This map is also the permanent at-most-once claim ledger.  Never trim it:
+    # replaying an old upload completion must not be able to send again merely
+    # because newer uploads pushed its audit entry out of a display window.
+    state[INTAKE_NOTIFICATION_AUDIT_STATE_KEY] = audit
+    intake.intake_state = state
+    await db.commit()
+    if dispatch_error is not None:
+        raise dispatch_error
+    return record
 
 
 async def _record_super_admin_intake_notification(
@@ -1542,13 +1985,31 @@ async def _record_super_admin_intake_notification(
         f'<p><a href="{html.escape(bucket_url)}">Open bucket</a></p>'
     )
     try:
+        record = await _record_intake_notification_once(
+            db,
+            intake,
+            event_type="intake_started",
+            event_key="intake_started",
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            request=request,
+        )
+        await db.execute(
+            select(PublicUnderwritingIntake)
+            .where(PublicUnderwritingIntake.id == intake.id)
+            .with_for_update()
+        )
+        await db.refresh(intake, attribute_names=["intake_state"])
+        state = _intake_state(intake)
         state["super_admin_intake_started_email"] = {
             "type": "dealer_ai_intake_started",
-            "sent_at": _now().isoformat(),
-            "deliveries": await _send_super_admin_email(db, subject=subject, body_text=body_text, body_html=body_html),
+            "sent_at": record.get("completed_at") or record.get("claimed_at"),
+            "deliveries": record.get("deliveries", []),
             **_request_audit(request),
         }
         intake.intake_state = state
+        await db.commit()
     except Exception as exc:  # noqa: BLE001
         log.warning("dealer_ai_intake: super-admin start notification failed intake=%s: %s", intake.id, exc)
 
@@ -1558,7 +2019,7 @@ async def _record_super_admin_decision_notification(
     intake: PublicUnderwritingIntake,
     result: dict[str, Any],
     *,
-    request: Request,
+    request: Request | None,
     review_id: UUID | None = None,
 ) -> None:
     decision = _dealer_decision_from_result(result)
@@ -1609,18 +2070,88 @@ async def _record_super_admin_decision_notification(
         f'<p><a href="{html.escape(bucket_url)}">Open bucket</a></p>'
     )
     try:
+        event_type = "review_approved" if decision == "approved" else "review_denied"
+        record = await _record_intake_notification_once(
+            db,
+            intake,
+            event_type=event_type,
+            event_key=event_type,
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            request=request,
+        )
+        await db.execute(
+            select(PublicUnderwritingIntake)
+            .where(PublicUnderwritingIntake.id == intake.id)
+            .with_for_update()
+        )
+        await db.refresh(intake, attribute_names=["intake_state"])
+        state = _intake_state(intake)
+        notifications = state.get("super_admin_decision_emails")
+        if not isinstance(notifications, dict):
+            notifications = {}
         notifications[decision] = {
             "type": f"dealer_ai_{decision}",
             "review_id": str(review_id) if review_id else None,
             "probability_status": result.get("probability_status"),
-            "sent_at": _now().isoformat(),
-            "deliveries": await _send_super_admin_email(db, subject=subject, body_text=body_text, body_html=body_html),
-            **_request_audit(request),
+            "sent_at": record.get("completed_at") or record.get("claimed_at"),
+            "deliveries": record.get("deliveries", []),
+            **(_request_audit(request) if request is not None else {}),
         }
         state["super_admin_decision_emails"] = notifications
         intake.intake_state = state
+        await db.commit()
     except Exception as exc:  # noqa: BLE001
         log.warning("dealer_ai_intake: super-admin decision notification failed intake=%s decision=%s: %s", intake.id, decision, exc)
+
+
+async def _record_file_uploaded_notification(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    file: BucketFile,
+    *,
+    actor_name: str,
+    request: Request,
+) -> None:
+    label = _dealer_label(intake)
+    lead_url = _admin_lead_url(intake)
+    subject = f"New AI Intake file: {label}"
+    body_text = (
+        f"{actor_name} uploaded evidence to {label}.\n\n"
+        f"File: {file.file_name}\n"
+        f"Status: {file.status}\n\n"
+        f"Review intake: {lead_url}\n"
+    )
+    body_html = (
+        f"<p>{html.escape(actor_name)} uploaded evidence to "
+        f"<strong>{html.escape(label)}</strong>.</p>"
+        "<ul>"
+        f"<li><strong>File:</strong> {html.escape(file.file_name)}</li>"
+        f"<li><strong>Status:</strong> {html.escape(file.status)}</li>"
+        "</ul>"
+        f'<p><a href="{html.escape(lead_url)}">Review AI Intake file</a></p>'
+    )
+    try:
+        await _record_intake_notification_once(
+            db,
+            intake,
+            event_type="file_uploaded",
+            event_key=f"file_uploaded:{file.id}",
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            request=request,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # The evidence was already validated and accepted. Notification
+        # delivery must never turn a successful upload into a failed upload.
+        log.warning(
+            "dealer_ai_intake: file notification failed intake=%s file=%s: %s",
+            intake.id,
+            file.id,
+            exc,
+        )
 
 
 async def _latest_active_intake_by_email(
@@ -6446,6 +6977,16 @@ async def _complete_upload(
         )
     await db.commit()
     await db.refresh(file)
+    if not merchant_processing.is_offer_document(file):
+        # The accepted evidence transaction is durable before notification
+        # claiming commits and before any external delivery call is attempted.
+        await _record_file_uploaded_notification(
+            db,
+            intake,
+            file,
+            actor_name=actor_name,
+            request=request,
+        )
     return file
 
 
@@ -7495,6 +8036,14 @@ async def _run_review_background(review_id: UUID, intake_id: UUID) -> None:
                     intake.status = "reviewed"
                     intake.completed_at = _now()
                 await db.commit()
+                if isinstance(review.result, dict):
+                    await _record_super_admin_decision_notification(
+                        db,
+                        intake,
+                        review.result,
+                        request=None,
+                        review_id=review.id,
+                    )
         except Exception:  # noqa: BLE001
             await db.rollback()
             log.exception("background review snapshot failed review=%s", review_id)
@@ -7954,6 +8503,87 @@ async def assign_lead_partner(
     await db.commit()
     intake = await _load_admin_dealer_lead(db, intake.id)
     return await _response(db, intake, token=None, include_management=True, admin_thread=True, thread_user=user)
+
+
+@admin_router.get(
+    "/{intake_id}/notification-routing",
+    response_model=IntakeNotificationRoutingRead,
+)
+async def get_intake_notification_routing(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> IntakeNotificationRoutingRead:
+    _require_intake_operator(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    candidates = await _intake_notification_candidates(db, intake)
+    return _notification_routing_read(intake, candidates)
+
+
+@admin_router.put(
+    "/{intake_id}/notification-routing",
+    response_model=IntakeNotificationRoutingRead,
+)
+async def update_intake_notification_routing(
+    intake_id: UUID,
+    payload: IntakeNotificationRoutingUpdate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> IntakeNotificationRoutingRead:
+    _require_intake_operator(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    # Serialize routing edits with relationship/assignment changes. Candidate
+    # validation and persistence must describe the same intake version.
+    await db.execute(
+        select(PublicUnderwritingIntake)
+        .where(PublicUnderwritingIntake.id == intake.id)
+        .with_for_update()
+    )
+    candidates = await _intake_notification_candidates(db, intake)
+    eligible_ids = {candidate.user_id for candidate in candidates}
+    for event_key, rule in payload.events.items():
+        if rule.enabled and (rule.email_enabled or rule.in_app_enabled) and not (
+            rule.to_user_ids or rule.cc_user_ids
+        ):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                f"Choose at least one recipient for {INTAKE_NOTIFICATION_EVENT_DEFINITIONS[event_key][0]}.",
+            )
+        unauthorized = (set(rule.to_user_ids) | set(rule.cc_user_ids)) - eligible_ids
+        if unauthorized:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                (
+                    f"{INTAKE_NOTIFICATION_EVENT_DEFINITIONS[event_key][0]} contains "
+                    "a recipient who is no longer involved in or authorized for this file."
+                ),
+            )
+
+    now = _now()
+    state = _intake_state(intake)
+    state[INTAKE_NOTIFICATION_ROUTING_STATE_KEY] = {
+        "version": INTAKE_NOTIFICATION_ROUTING_VERSION,
+        "events": {
+            event_key: payload.events[event_key].model_dump(mode="json")
+            for event_key in INTAKE_NOTIFICATION_EVENT_DEFINITIONS
+        },
+        "updated_at": now.isoformat(),
+        "updated_by_user_id": str(user.id),
+    }
+    intake.intake_state = state
+    await _log(
+        db,
+        intake.bucket_id,
+        "dealer_ai_notification_routing_updated",
+        request=request,
+        user=user,
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail="Per-event AI Intake notification recipients and CC routing updated",
+    )
+    await db.commit()
+    return _notification_routing_read(intake, candidates)
 
 
 @admin_router.get("/messages", response_model=DealerLeadInboxResponse)

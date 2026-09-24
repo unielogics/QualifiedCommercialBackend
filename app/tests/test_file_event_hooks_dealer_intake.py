@@ -163,6 +163,7 @@ async def _complete(db, intake, payload, *, expect_emit: bool = True):
         patch("app.services.bucket_evidence.reconcile_uploaded_file", AsyncMock()),
         patch("app.services.bucket_ai.enqueue_file_analysis", AsyncMock()),
         patch.object(file_events, "emit", AsyncMock(return_value=None)) as emit,
+        patch.object(intake_router, "_record_file_uploaded_notification", AsyncMock()),
     ):
         # The line must be on the timeline before the request commits.
         db.commit.side_effect = lambda: None if emit.await_count == (1 if expect_emit else 0) else pytest.fail("emit/commit order")
