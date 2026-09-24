@@ -407,7 +407,8 @@ def test_the_migration_chain_has_one_head():
     from alembic.script import ScriptDirectory
 
     heads = ScriptDirectory.from_config(Config("alembic.ini")).get_heads()
-    assert heads == ["0225_booking_delivery_operations"]
+    assert heads == ["0226_marketing_contact_archive"]
+    assert all(len(head) <= 32 for head in heads)
 
 
 def test_marketing_migration_identifiers_fit_postgres():

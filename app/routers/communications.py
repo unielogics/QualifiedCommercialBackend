@@ -950,7 +950,7 @@ async def _own_rep_contacts(db: AsyncSession, user: User) -> list[DealerRepConta
     stmt = select(DealerRepContact).order_by(
         DealerRepContact.last_activity_at.desc().nullslast(),
         DealerRepContact.updated_at.desc(),
-    )
+    ).where(DealerRepContact.archived_at.is_(None))
     if user.role == Role.FIELD_REP:
         stmt = stmt.where(DealerRepContact.owner_user_id == user.id)
     elif user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):

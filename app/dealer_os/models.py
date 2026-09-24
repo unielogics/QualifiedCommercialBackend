@@ -1464,6 +1464,7 @@ class DealerRepContact(TimestampMixin, Base):
     __tablename__ = "dos_rep_contacts"
     __table_args__ = (
         Index("ix_dos_rep_contacts_owner", "owner_user_id", "last_activity_at"),
+        Index("ix_dos_rep_contacts_archived", "archived_at", "updated_at"),
         Index("ix_dos_rep_contacts_email", "owner_user_id", "email"),
         Index("ix_dos_rep_contacts_phone", "owner_user_id", "phone_e164"),
         Index(
@@ -1498,6 +1499,17 @@ class DealerRepContact(TimestampMixin, Base):
     sms_marketing_consented_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sms_consent_meta: Mapped[dict | None] = mapped_column(JSONB)
     sms_opted_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Contact deletion is deliberately recoverable. Historical messages,
+    # appointments, presentations, and funding-file links continue to point
+    # at this row while active CRM surfaces exclude it.
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    restored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    restored_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
 
 
 class DealerRepContactAssignment(TimestampMixin, Base):

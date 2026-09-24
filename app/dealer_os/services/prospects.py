@@ -1740,6 +1740,18 @@ async def resolve_contact_identity(
         )
 
     row = visible[0]
+    if getattr(row, "archived_at", None) is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "contact_archived",
+                "message": (
+                    "An archived contact uses this email address or phone number. "
+                    "Restore the existing contact before continuing."
+                ),
+                "contact_id": str(row.id),
+            },
+        )
     existing_email = normalize_email(row.email) if row.email else None
     existing_phone = normalize_phone(row.phone_e164) if row.phone_e164 else None
     if normalized_email and existing_email and normalized_email != existing_email:

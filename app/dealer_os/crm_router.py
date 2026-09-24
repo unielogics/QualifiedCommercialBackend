@@ -26,6 +26,7 @@ from app.deps import CurrentUser
 from app.enums import Role
 from app.models.application_profile import ApplicationTaxonomyEntry
 from app.models.booking_settings import BookingSettings
+from app.models.dealer_prospect import DealerProspect
 from app.models.user import User
 from app.schemas.application_profile import TaxonomyContributionCreate, TaxonomyEntryRead
 from app.services.email import ses_client
@@ -307,11 +308,25 @@ async def _contact_access_filter(user: User):
     )
 
 
-async def _load_contact(db: AsyncSession, user: User, contact_id: UUID) -> DealerRepContact:
+async def _load_contact(
+    db: AsyncSession,
+    user: User,
+    contact_id: UUID,
+    *,
+    include_archived: bool = False,
+    for_update: bool = False,
+) -> DealerRepContact:
     require_team_or_rep(user)
-    row = (await db.execute(select(DealerRepContact).where(
-        DealerRepContact.id == contact_id, await _contact_access_filter(user)
-    ))).scalar_one_or_none()
+    filters: list[Any] = [
+        DealerRepContact.id == contact_id,
+        await _contact_access_filter(user),
+    ]
+    if not include_archived:
+        filters.append(DealerRepContact.archived_at.is_(None))
+    statement = select(DealerRepContact).where(*filters)
+    if for_update:
+        statement = statement.with_for_update()
+    row = (await db.execute(statement)).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Contact not found")
     if row.dealer_id is not None and user.role != Role.SUPER_ADMIN:
@@ -1253,6 +1268,7 @@ async def start_application(session_id: UUID, user: CurrentUser, db: AsyncSessio
 async def list_contacts(user: CurrentUser, db: AsyncSession = Depends(get_db), q: str = Query("", max_length=160), limit: int = Query(20, ge=1, le=50), offset: int = Query(0, ge=0)) -> dict:
     require_team_or_rep(user); filters = [
         await _contact_access_filter(user),
+        DealerRepContact.archived_at.is_(None),
         or_(
             DealerRepContact.dealer_id.is_(None),
             DealerRepContact.dealer_id.in_(
@@ -1261,7 +1277,9 @@ async def list_contacts(user: CurrentUser, db: AsyncSession = Depends(get_db), q
         ),
     ]
     if q.strip():
-        like = f"%{q.strip().lower()}%"; filters.append(or_(func.lower(DealerRepContact.full_name).like(like), func.lower(func.coalesce(DealerRepContact.company, "")).like(like), func.lower(func.coalesce(DealerRepContact.email, "")).like(like), func.lower(func.coalesce(DealerRepContact.phone_e164, "")).like(like)))
+        for term in q.casefold().split():
+            like = f"%{term}%"
+            filters.append(or_(func.lower(DealerRepContact.full_name).like(like), func.lower(func.coalesce(DealerRepContact.company, "")).like(like), func.lower(func.coalesce(DealerRepContact.email, "")).like(like), func.lower(func.coalesce(DealerRepContact.phone_e164, "")).like(like)))
     total = int((await db.execute(select(func.count()).select_from(DealerRepContact).where(*filters))).scalar_one())
     rows = (await db.execute(select(DealerRepContact).where(*filters).order_by(DealerRepContact.updated_at.desc()).limit(limit).offset(offset))).scalars().all()
     return {"items": [{"id": str(row.id), "company_id": str(row.company_id) if row.company_id else None, "name": row.full_name, "company": row.company, "email": row.email, "phone": row.phone_e164, "source": row.source, "updated_at": row.updated_at} for row in rows], "total": total, "limit": limit, "offset": offset}
@@ -1271,11 +1289,15 @@ async def list_contacts(user: CurrentUser, db: AsyncSession = Depends(get_db), q
 async def list_companies(user: CurrentUser, db: AsyncSession = Depends(get_db), q: str = Query("", max_length=160), limit: int = Query(20, ge=1, le=50), offset: int = Query(0, ge=0)) -> dict:
     require_team_or_rep(user)
     has_contacts = exists(
-        select(DealerRepContact.id).where(DealerRepContact.company_id == DealerRepCompany.id)
+        select(DealerRepContact.id).where(
+            DealerRepContact.company_id == DealerRepCompany.id,
+            DealerRepContact.archived_at.is_(None),
+        )
     )
     has_visible_contacts = exists(
         select(DealerRepContact.id).where(
             DealerRepContact.company_id == DealerRepCompany.id,
+            DealerRepContact.archived_at.is_(None),
             or_(
                 DealerRepContact.dealer_id.is_(None),
                 DealerRepContact.dealer_id.in_(
@@ -1290,7 +1312,11 @@ async def list_companies(user: CurrentUser, db: AsyncSession = Depends(get_db), 
         DealerRepCompany.owner_user_id == user.id,
         exists(select(DealerRepContactAssignment.id).join(
             DealerRepContact, DealerRepContact.id == DealerRepContactAssignment.contact_id
-        ).where(DealerRepContact.company_id == DealerRepCompany.id, DealerRepContactAssignment.user_id == user.id)),
+        ).where(
+            DealerRepContact.company_id == DealerRepCompany.id,
+            DealerRepContact.archived_at.is_(None),
+            DealerRepContactAssignment.user_id == user.id,
+        )),
         ))
     if q.strip():
         like = f"%{q.strip().lower()}%"
@@ -1306,13 +1332,26 @@ async def company_detail(company_id: UUID, user: CurrentUser, db: AsyncSession =
     company = await db.get(DealerRepCompany, company_id)
     shared = False
     if company is not None and is_rep(user):
-        shared = bool((await db.execute(select(exists(select(DealerRepContactAssignment.id).join(
-            DealerRepContact, DealerRepContact.id == DealerRepContactAssignment.contact_id
-        ).where(DealerRepContact.company_id == company.id, DealerRepContactAssignment.user_id == user.id))))).scalar_one())
+        shared_query = select(
+            exists(
+                select(DealerRepContactAssignment.id)
+                .join(
+                    DealerRepContact,
+                    DealerRepContact.id == DealerRepContactAssignment.contact_id,
+                )
+                .where(
+                    DealerRepContact.company_id == company.id,
+                    DealerRepContact.archived_at.is_(None),
+                    DealerRepContactAssignment.user_id == user.id,
+                )
+            )
+        )
+        shared = bool((await db.execute(shared_query)).scalar_one())
     if company is None or (is_rep(user) and company.owner_user_id != user.id and not shared):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found")
     contacts = (await db.execute(select(DealerRepContact).where(
         DealerRepContact.company_id == company.id,
+        DealerRepContact.archived_at.is_(None),
         or_(
             DealerRepContact.dealer_id.is_(None),
             DealerRepContact.dealer_id.in_(
@@ -1321,7 +1360,10 @@ async def company_detail(company_id: UUID, user: CurrentUser, db: AsyncSession =
         ),
     ).order_by(DealerRepContact.updated_at.desc()))).scalars().all()
     company_has_contacts = bool((await db.execute(select(exists(
-        select(DealerRepContact.id).where(DealerRepContact.company_id == company.id)
+        select(DealerRepContact.id).where(
+            DealerRepContact.company_id == company.id,
+            DealerRepContact.archived_at.is_(None),
+        )
     )))).scalar_one())
     if company_has_contacts and not contacts:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found")
@@ -1362,6 +1404,147 @@ async def contact_detail(contact_id: UUID, user: CurrentUser, db: AsyncSession =
         "sessions": [{"id": str(row.id), "status": row.status, "result": row.current_result, "updated_at": row.updated_at} for row in sessions],
         "presentations": [{"id": str(row.id), "program_keys": row.program_keys, "catalog_versions": row.catalog_versions, "pdf_sha256": row.pdf_sha256, "locale": row.locale, "channel": row.channel, "status": row.delivery_status, "created_at": row.created_at} for row in presentations],
         "threads": [{"id": str(row.id), "subject": row.subject, "channel": row.channel, "unread_count": row.unread_count, "updated_at": row.updated_at} for row in threads]}
+
+
+@router.delete("/contacts/{contact_id}")
+async def archive_contact(
+    contact_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Recoverably remove a contact and its active prospect from Marketing.
+
+    Funding files, appointments, messages, presentations, and immutable send
+    history retain their foreign keys.  Assigned users can view a contact but
+    cannot delete another employee's relationship; team roles can act across
+    the firm.
+    """
+
+    contact = await _load_contact(
+        db, user, contact_id, include_archived=True, for_update=True
+    )
+    if user.role not in prospect_service.TEAM_ROLES and contact.owner_user_id != user.id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only the contact owner or an authorized team member can delete this contact",
+        )
+    if contact.archived_at is not None:
+        return {
+            "archived": True,
+            "contact_id": str(contact.id),
+            "archived_prospect_ids": [],
+        }
+
+    prospects = list(
+        (
+            await db.execute(
+                select(DealerProspect)
+                .where(
+                    DealerProspect.primary_contact_id == contact.id,
+                    DealerProspect.archived_at.is_(None),
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    inaccessible = [
+        row
+        for row in prospects
+        if user.role not in prospect_service.TEAM_ROLES and row.owner_user_id != user.id
+    ]
+    if inaccessible:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "prospect_owner_conflict",
+                "message": (
+                    "This contact has an active Marketing prospect assigned to another "
+                    "employee. Ask a Super Admin or Loan Executive to delete it."
+                ),
+            },
+        )
+
+    archived_at = datetime.now(timezone.utc)
+    archived_prospect_ids: list[str] = []
+    for prospect in prospects:
+        version_before = prospect.version
+        prospect.archived_at = archived_at
+        prospect.archived_by_user_id = user.id
+        prospect.next_follow_up_at = None
+        prospect.version += 1
+        await prospect_service.add_activity(
+            db,
+            prospect,
+            user,
+            "contact_archived",
+            metadata={
+                "contact_id": str(contact.id),
+                "version_before": version_before,
+                "version_after": prospect.version,
+            },
+        )
+        archived_prospect_ids.append(str(prospect.id))
+
+    contact.archived_at = archived_at
+    contact.archived_by_user_id = user.id
+    await db.commit()
+    return {
+        "archived": True,
+        "contact_id": str(contact.id),
+        "archived_prospect_ids": archived_prospect_ids,
+    }
+
+
+@router.post("/contacts/{contact_id}/restore")
+async def restore_contact(
+    contact_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Restore an archived contact after rechecking global identity safety."""
+
+    contact = await _load_contact(db, user, contact_id, include_archived=True)
+    if user.role not in prospect_service.TEAM_ROLES and contact.owner_user_id != user.id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only the contact owner or an authorized team member can restore this contact",
+        )
+    await prospect_service.acquire_identity_locks(
+        db,
+        email_normalized=prospect_service.normalize_email(contact.email or "") or None,
+        phone_normalized=prospect_service.normalize_phone(contact.phone_e164 or ""),
+    )
+    contact = await _load_contact(
+        db, user, contact_id, include_archived=True, for_update=True
+    )
+    if contact.archived_at is None:
+        return {"restored": True, "contact_id": str(contact.id)}
+    matches = await prospect_service.find_contact_identity_matches(
+        db,
+        email_normalized=prospect_service.normalize_email(contact.email or ""),
+        phone_normalized=prospect_service.normalize_phone(contact.phone_e164 or "") or "",
+        exclude_contact_id=contact.id,
+        for_update=True,
+    )
+    active_matches = [row for row in matches if row.archived_at is None]
+    if active_matches:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "active_contact_identity_conflict",
+                "message": (
+                    "Another active contact now uses this email address or phone number. "
+                    "Resolve that identity before restoring this contact."
+                ),
+            },
+        )
+    contact.archived_at = None
+    contact.restored_at = datetime.now(timezone.utc)
+    contact.restored_by_user_id = user.id
+    await db.commit()
+    return {"restored": True, "contact_id": str(contact.id)}
 
 
 @router.post("/contacts/{contact_id}/assignments", status_code=status.HTTP_201_CREATED)

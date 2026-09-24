@@ -106,6 +106,27 @@ router = APIRouter(
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 
 
+def _prospect_search_filters(query: str, owner: Any) -> list[Any]:
+    """Return AND-able term predicates across live and snapshot identity fields."""
+
+    filters: list[Any] = []
+    for term in query.casefold().split():
+        like = f"%{term}%"
+        filters.append(
+            or_(
+                func.lower(DealerRepContact.full_name).like(like),
+                func.lower(DealerRepCompany.name).like(like),
+                func.lower(func.coalesce(DealerRepContact.email, "")).like(like),
+                func.lower(func.coalesce(DealerRepContact.phone_e164, "")).like(like),
+                func.lower(DealerProspect.email_normalized).like(like),
+                func.lower(DealerProspect.phone_normalized).like(like),
+                func.lower(func.coalesce(owner.name, "")).like(like),
+                func.lower(func.coalesce(owner.email, "")).like(like),
+            )
+        )
+    return filters
+
+
 def _prospect_access_read(user: User) -> ProspectUserAccessRead:
     eligible = service.is_active_prospect_owner(user)
     assigned = bool(getattr(user, "dealer_prospect_pipeline_enabled", False))
@@ -389,20 +410,15 @@ async def list_prospects(
     last_outcome = aliased(DealerProspectOutcomeDefinition, name="prospect_last_outcome")
     filters: list[Any] = [
         DealerProspect.archived_at.is_(None),
+        DealerRepContact.archived_at.is_(None),
         service.prospect_access_filter(user),
     ]
     if q.strip():
-        like = f"%{q.strip().lower()}%"
-        filters.append(
-            or_(
-                func.lower(DealerRepContact.full_name).like(like),
-                func.lower(DealerRepCompany.name).like(like),
-                func.lower(DealerProspect.email_normalized).like(like),
-                func.lower(DealerProspect.phone_normalized).like(like),
-                func.lower(func.coalesce(owner.name, "")).like(like),
-                func.lower(func.coalesce(owner.email, "")).like(like),
-            )
-        )
+        # Match every pasted term across canonical contact data and the
+        # prospect snapshots. This supports combined searches such as
+        # ``Rocio rocio@dealer.com`` and legacy prospects whose snapshot was
+        # not refreshed after the contact changed.
+        filters.extend(_prospect_search_filters(q, owner))
     if stage_key:
         filters.append(DealerProspectStageDefinition.key == service.definition_key(stage_key))
     if outcome_key:
@@ -679,11 +695,17 @@ async def check_prospect_duplicate(
             phone_normalized=normalized_phone,
         )
         if rows
+        else "archived_match"
+        if contact_rows and all(
+            getattr(row, "archived_at", None) is not None for row in contact_rows
+        )
         else "active_match"
     )
     any_visible = bool(visible or visible_contacts)
     state = actual_state if any_visible or user.role in service.TEAM_ROLES else "hidden_match"
-    active_visible = any(row.archived_at is None for row in visible)
+    active_visible = any(row.archived_at is None for row in visible) or any(
+        getattr(row, "archived_at", None) is None for row in visible_contacts
+    )
     return ProspectDuplicateCheckRead(
         blocked=True,
         state=state,
@@ -694,7 +716,7 @@ async def check_prospect_duplicate(
                 prospect_id=row.id,
                 contact_id=row.primary_contact_id,
                 owner_user_id=row.owner_user_id,
-                archived=row.archived_at is not None,
+                archived=getattr(row, "archived_at", None) is not None,
                 version=row.version,
                 matched_on=service.identity_match_reasons(
                     row,
@@ -710,7 +732,7 @@ async def check_prospect_duplicate(
                 prospect_id=None,
                 contact_id=row.id,
                 owner_user_id=row.owner_user_id,
-                archived=False,
+                archived=getattr(row, "archived_at", None) is not None,
                 version=None,
                 matched_on=service.contact_identity_match_reasons(
                     row,
@@ -721,13 +743,13 @@ async def check_prospect_duplicate(
             for row in visible_contacts
         ],
         assignment_required=not any_visible,
-        can_restore=bool(visible) and not active_visible and not visible_contacts,
+        can_restore=bool(visible or visible_contacts) and not active_visible,
         message=(
             "The email and phone belong to different Marketing prospects. Correct the identity "
             "or ask a Super Admin to review it."
             if state == "identity_conflict"
-            else "A matching archived prospect can be restored."
-            if state == "archived_match" and visible
+            else "A matching archived Marketing contact can be restored."
+            if state == "archived_match" and (visible or visible_contacts)
             else "A matching prospect exists. Request reassignment from an administrator."
             if state == "hidden_match"
             else "A contact already uses this email address or phone number. Open that contact "
@@ -951,6 +973,11 @@ async def restore_prospect(
     version_before = prospect.version
     prospect.archived_at = None
     prospect.archived_by_user_id = None
+    contact = await db.get(DealerRepContact, prospect.primary_contact_id, with_for_update=True)
+    if contact is not None:
+        contact.archived_at = None
+        contact.restored_at = service.now_utc()
+        contact.restored_by_user_id = user.id
     prospect.version += 1
     await service.add_activity(
         db,

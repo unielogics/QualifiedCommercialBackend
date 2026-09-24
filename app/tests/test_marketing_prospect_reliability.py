@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.dealer_os import crm_router, prospect_router
 from app.dealer_os import router as dealer_router
@@ -21,6 +22,7 @@ from app.dealer_os.prospect_schemas import (
 from app.dealer_os.services import prospects
 from app.enums import Role
 from app.models.dealer_prospect import DealerProspect
+from app.models.user import User
 
 
 def _user(role: Role = Role.FIELD_REP):
@@ -171,6 +173,94 @@ def test_archived_duplicate_match_carries_restore_version() -> None:
         matched_on=["email"],
     )
     assert row.version == 7
+
+
+def test_pipeline_search_covers_name_canonical_email_and_mixed_terms() -> None:
+    owner = aliased(User, name="search_owner")
+
+    name_only = prospect_router._prospect_search_filters("Rocio", owner)
+    email_only = prospect_router._prospect_search_filters("rocio@dealer.com", owner)
+    combined = prospect_router._prospect_search_filters(
+        "Rocio rocio@dealer.com", owner
+    )
+
+    assert len(name_only) == 1
+    assert len(email_only) == 1
+    assert len(combined) == 2
+    rendered = " ".join(str(clause) for clause in combined)
+    assert "dos_rep_contacts.full_name" in rendered
+    assert "dos_rep_contacts.email" in rendered
+    assert "dealer_prospects.email_normalized" in rendered
+    assert "dos_rep_companies.name" in rendered
+
+
+@pytest.mark.asyncio
+async def test_contact_delete_archives_linked_prospect_and_clears_follow_up(
+    monkeypatch,
+) -> None:
+    actor = _user()
+    contact = SimpleNamespace(
+        id=uuid4(),
+        owner_user_id=actor.id,
+        dealer_id=None,
+        archived_at=None,
+        archived_by_user_id=None,
+    )
+    prospect = SimpleNamespace(
+        id=uuid4(),
+        owner_user_id=actor.id,
+        archived_at=None,
+        archived_by_user_id=None,
+        next_follow_up_at=datetime.now(UTC),
+        version=3,
+    )
+    result = SimpleNamespace(
+        scalars=lambda: SimpleNamespace(all=lambda: [prospect]),
+    )
+    db = SimpleNamespace(execute=AsyncMock(return_value=result), commit=AsyncMock())
+    monkeypatch.setattr(
+        crm_router, "_load_contact", AsyncMock(return_value=contact)
+    )
+    activity = AsyncMock()
+    monkeypatch.setattr(crm_router.prospect_service, "add_activity", activity)
+
+    response = await crm_router.archive_contact(contact.id, actor, db)
+
+    assert response["archived"] is True
+    assert response["archived_prospect_ids"] == [str(prospect.id)]
+    assert contact.archived_at is not None
+    assert contact.archived_by_user_id == actor.id
+    assert prospect.archived_at == contact.archived_at
+    assert prospect.next_follow_up_at is None
+    assert prospect.version == 4
+    activity.assert_awaited_once()
+    await_args = activity.await_args
+    assert await_args.args[3] == "contact_archived"
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_assigned_contact_viewer_cannot_delete_another_owners_contact(
+    monkeypatch,
+) -> None:
+    actor = _user()
+    contact = SimpleNamespace(
+        id=uuid4(),
+        owner_user_id=uuid4(),
+        dealer_id=None,
+        archived_at=None,
+    )
+    monkeypatch.setattr(
+        crm_router, "_load_contact", AsyncMock(return_value=contact)
+    )
+    db = SimpleNamespace(execute=AsyncMock(), commit=AsyncMock())
+
+    with pytest.raises(HTTPException) as error:
+        await crm_router.archive_contact(contact.id, actor, db)
+
+    assert error.value.status_code == 403
+    db.execute.assert_not_awaited()
+    db.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio

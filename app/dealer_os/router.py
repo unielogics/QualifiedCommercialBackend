@@ -1070,6 +1070,7 @@ async def field_desk_global_search(
             .outerjoin(DealerBusiness, DealerBusiness.id == DealerRepContact.dealer_id)
             .where(
                 _global_search_contact_access_filter(user),
+                DealerRepContact.archived_at.is_(None),
                 or_(DealerBusiness.id.is_(None), DealerBusiness.is_training.is_(False)),
                 or_(
                     func.lower(DealerRepContact.full_name).like(like),
