@@ -173,6 +173,37 @@ def test_archived_duplicate_match_carries_restore_version() -> None:
         matched_on=["email"],
     )
     assert row.version == 7
+    assert row.can_restore is False
+
+
+def test_contact_management_capability_excludes_assignment_only_viewers() -> None:
+    owner = _user()
+    assigned_viewer = _user()
+    team_member = _user(Role.LOAN_EXEC)
+    contact = SimpleNamespace(owner_user_id=owner.id)
+
+    assert crm_router._can_manage_contact(owner, contact) is True
+    assert crm_router._can_manage_contact(team_member, contact) is True
+    assert crm_router._can_manage_contact(assigned_viewer, contact) is False
+
+
+def test_duplicate_match_restore_capability_matches_write_authority() -> None:
+    owner = _user()
+    assigned_viewer = _user()
+    team_member = _user(Role.SUPER_ADMIN)
+    archived_contact = SimpleNamespace(
+        owner_user_id=owner.id,
+        archived_at=datetime.now(UTC),
+    )
+
+    assert prospect_router._can_restore_contact_match(owner, archived_contact) is True
+    assert prospect_router._can_restore_contact_match(team_member, archived_contact) is True
+    assert prospect_router._can_restore_contact_match(assigned_viewer, archived_contact) is False
+
+    archived_prospect = SimpleNamespace(archived_at=datetime.now(UTC))
+    assert prospect_router._can_restore_prospect_match(owner, archived_prospect) is True
+    owner.dealer_prospect_pipeline_enabled = False
+    assert prospect_router._can_restore_prospect_match(owner, archived_prospect) is False
 
 
 def test_pipeline_search_covers_name_canonical_email_and_mixed_terms() -> None:

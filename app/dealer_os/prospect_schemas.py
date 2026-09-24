@@ -295,6 +295,9 @@ class ProspectDuplicateMatchRead(BaseModel):
     contact_id: UUID
     owner_user_id: UUID | None = None
     archived: bool
+    # Capability is record-specific. Assignment can grant visibility without
+    # granting authority to restore the underlying contact relationship.
+    can_restore: bool = False
     version: int | None = None
     matched_on: list[Literal["email", "phone"]] = Field(default_factory=list)
 

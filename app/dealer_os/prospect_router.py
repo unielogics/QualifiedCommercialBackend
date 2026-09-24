@@ -127,6 +127,20 @@ def _prospect_search_filters(query: str, owner: Any) -> list[Any]:
     return filters
 
 
+def _can_restore_prospect_match(user: User, row: DealerProspect) -> bool:
+    return bool(
+        getattr(row, "archived_at", None) is not None
+        and getattr(user, "dealer_prospect_pipeline_enabled", False)
+    )
+
+
+def _can_restore_contact_match(user: User, row: DealerRepContact) -> bool:
+    return bool(
+        getattr(row, "archived_at", None) is not None
+        and (user.role in service.TEAM_ROLES or row.owner_user_id == user.id)
+    )
+
+
 def _prospect_access_read(user: User) -> ProspectUserAccessRead:
     eligible = service.is_active_prospect_owner(user)
     assigned = bool(getattr(user, "dealer_prospect_pipeline_enabled", False))
@@ -717,6 +731,7 @@ async def check_prospect_duplicate(
                 contact_id=row.primary_contact_id,
                 owner_user_id=row.owner_user_id,
                 archived=getattr(row, "archived_at", None) is not None,
+                can_restore=_can_restore_prospect_match(user, row),
                 version=row.version,
                 matched_on=service.identity_match_reasons(
                     row,
@@ -733,6 +748,7 @@ async def check_prospect_duplicate(
                 contact_id=row.id,
                 owner_user_id=row.owner_user_id,
                 archived=getattr(row, "archived_at", None) is not None,
+                can_restore=_can_restore_contact_match(user, row),
                 version=None,
                 matched_on=service.contact_identity_match_reasons(
                     row,
@@ -743,7 +759,17 @@ async def check_prospect_duplicate(
             for row in visible_contacts
         ],
         assignment_required=not any_visible,
-        can_restore=bool(visible or visible_contacts) and not active_visible,
+        can_restore=(
+            not active_visible
+            and (
+                any(
+                    _can_restore_prospect_match(user, row) for row in visible
+                )
+                or any(
+                    _can_restore_contact_match(user, row) for row in visible_contacts
+                )
+            )
+        ),
         message=(
             "The email and phone belong to different Marketing prospects. Correct the identity "
             "or ask a Super Admin to review it."

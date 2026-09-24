@@ -292,7 +292,9 @@ _GENERIC_DETAIL_COPY = {
 }
 
 
-def _can_view_contact(user: User, contact: DealerRepContact) -> bool:
+def _can_manage_contact(user: User, contact: DealerRepContact) -> bool:
+    """Whether ``user`` may archive or restore this contact relationship."""
+
     return user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC} or contact.owner_user_id == user.id
 
 
@@ -1282,7 +1284,7 @@ async def list_contacts(user: CurrentUser, db: AsyncSession = Depends(get_db), q
             filters.append(or_(func.lower(DealerRepContact.full_name).like(like), func.lower(func.coalesce(DealerRepContact.company, "")).like(like), func.lower(func.coalesce(DealerRepContact.email, "")).like(like), func.lower(func.coalesce(DealerRepContact.phone_e164, "")).like(like)))
     total = int((await db.execute(select(func.count()).select_from(DealerRepContact).where(*filters))).scalar_one())
     rows = (await db.execute(select(DealerRepContact).where(*filters).order_by(DealerRepContact.updated_at.desc()).limit(limit).offset(offset))).scalars().all()
-    return {"items": [{"id": str(row.id), "company_id": str(row.company_id) if row.company_id else None, "name": row.full_name, "company": row.company, "email": row.email, "phone": row.phone_e164, "source": row.source, "updated_at": row.updated_at} for row in rows], "total": total, "limit": limit, "offset": offset}
+    return {"items": [{"id": str(row.id), "company_id": str(row.company_id) if row.company_id else None, "name": row.full_name, "company": row.company, "email": row.email, "phone": row.phone_e164, "source": row.source, "updated_at": row.updated_at, "can_archive": _can_manage_contact(user, row)} for row in rows], "total": total, "limit": limit, "offset": offset}
 
 
 @router.get("/companies")
@@ -1399,7 +1401,7 @@ async def contact_detail(contact_id: UUID, user: CurrentUser, db: AsyncSession =
             ),
         ),
     ).order_by(DealerRepInboxThread.updated_at.desc()))).scalars().all()
-    return {"id": str(contact.id), "name": contact.full_name, "company": contact.company, "email": contact.email, "phone": contact.phone_e164,
+    return {"id": str(contact.id), "name": contact.full_name, "company": contact.company, "email": contact.email, "phone": contact.phone_e164, "can_archive": _can_manage_contact(user, contact),
         "applications": [{"id": str(row.id), "name": row.name, "case_ref": row.case_ref, "lifecycle": row.application_lifecycle, "status": row.status, "funding_goal": float(row.funding_goal or 0), "updated_at": row.updated_at} for row in applications],
         "sessions": [{"id": str(row.id), "status": row.status, "result": row.current_result, "updated_at": row.updated_at} for row in sessions],
         "presentations": [{"id": str(row.id), "program_keys": row.program_keys, "catalog_versions": row.catalog_versions, "pdf_sha256": row.pdf_sha256, "locale": row.locale, "channel": row.channel, "status": row.delivery_status, "created_at": row.created_at} for row in presentations],
@@ -1423,7 +1425,7 @@ async def archive_contact(
     contact = await _load_contact(
         db, user, contact_id, include_archived=True, for_update=True
     )
-    if user.role not in prospect_service.TEAM_ROLES and contact.owner_user_id != user.id:
+    if not _can_manage_contact(user, contact):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "Only the contact owner or an authorized team member can delete this contact",
@@ -1506,7 +1508,7 @@ async def restore_contact(
     """Restore an archived contact after rechecking global identity safety."""
 
     contact = await _load_contact(db, user, contact_id, include_archived=True)
-    if user.role not in prospect_service.TEAM_ROLES and contact.owner_user_id != user.id:
+    if not _can_manage_contact(user, contact):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "Only the contact owner or an authorized team member can restore this contact",
