@@ -731,7 +731,9 @@ async def check_prospect_duplicate(
                 contact_id=row.primary_contact_id,
                 owner_user_id=row.owner_user_id,
                 archived=getattr(row, "archived_at", None) is not None,
-                can_restore=_can_restore_prospect_match(user, row),
+                can_restore=(
+                    not active_visible and _can_restore_prospect_match(user, row)
+                ),
                 version=row.version,
                 matched_on=service.identity_match_reasons(
                     row,
@@ -748,7 +750,9 @@ async def check_prospect_duplicate(
                 contact_id=row.id,
                 owner_user_id=row.owner_user_id,
                 archived=getattr(row, "archived_at", None) is not None,
-                can_restore=_can_restore_contact_match(user, row),
+                can_restore=(
+                    not active_visible and _can_restore_contact_match(user, row)
+                ),
                 version=None,
                 matched_on=service.contact_identity_match_reasons(
                     row,
