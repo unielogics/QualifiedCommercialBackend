@@ -20,6 +20,7 @@ from app.dealer_os.prospect_schemas import (
     ProspectGeneralConversionRequest,
     ProspectMoveResult,
     ProspectMoveStage,
+    ProspectOutcomeApply,
     ProspectPatch,
     ProspectPortfolioApplicationCreate,
 )
@@ -856,6 +857,39 @@ def test_default_outcome_action_configs_remain_valid() -> None:
         assert (
             prospects.validate_action_config(outcome["action_config"]) == outcome["action_config"]
         )
+
+
+def test_client_will_call_back_is_non_stage_moving_with_two_day_safety_follow_up() -> None:
+    definition = next(
+        item for item in prospects.DEFAULT_OUTCOMES if item["key"] == "client_will_call_back"
+    )
+    config = definition["action_config"]
+    assert definition["label"] == "Client will call back"
+    assert "target_stage_key" not in config
+    assert "stage_strategy" not in config
+    assert config["increment_call_attempt"] is True
+    assert config["follow_up_business_days"] == 2
+    assert config["email_action"] == "client_will_call_back"
+    assert prospects.outcome_target_stage("emailed", config) is None
+
+
+def test_outcome_contract_normalizes_optional_ai_and_cc_controls() -> None:
+    payload = ProspectOutcomeApply.model_validate(
+        {
+            "outcome_key": " CLIENT_WILL_CALL_BACK ",
+            "expected_version": 3,
+            "ai_draft_instructions": "  Thank them for today's call.  ",
+            "cc_emails": "Broker@Example.com; agent@example.com,broker@example.com",
+            "cc_scope": "this_and_future",
+            "skip_email_draft": True,
+        }
+    )
+
+    assert payload.outcome_key == "client_will_call_back"
+    assert payload.ai_draft_instructions == "Thank them for today's call."
+    assert payload.cc_emails == ["broker@example.com", "agent@example.com"]
+    assert payload.cc_scope == "this_and_future"
+    assert payload.skip_email_draft is True
 
 
 @pytest.mark.parametrize(

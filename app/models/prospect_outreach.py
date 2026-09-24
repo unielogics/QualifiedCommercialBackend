@@ -93,8 +93,14 @@ class DealerProspectEmailDraft(TimestampMixin, Base):
     approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    cancelled_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
 
     recipient_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    cc_emails: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
     from_email: Mapped[str] = mapped_column(String(320), nullable=False)
     from_name: Mapped[str] = mapped_column(String(160), nullable=False)
     reply_to_email: Mapped[str] = mapped_column(String(320), nullable=False)
@@ -126,6 +132,11 @@ class DealerProspectEmailDraft(TimestampMixin, Base):
     catalog_snapshot: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB, nullable=False, default=list, server_default="[]"
     )
+    # Only source identifiers and hashes are retained.  Decrypted reply text
+    # is assembled ephemerally for a single model request and is not copied.
+    ai_context_manifest: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
 
     status: Mapped[str] = mapped_column(
         String(24), nullable=False, default="pending_review", server_default="pending_review"
@@ -136,6 +147,7 @@ class DealerProspectEmailDraft(TimestampMixin, Base):
     )
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancellation_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
     dispatch_started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

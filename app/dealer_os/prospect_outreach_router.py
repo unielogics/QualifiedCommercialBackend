@@ -10,6 +10,7 @@ import io
 import re
 import zipfile
 from datetime import UTC, datetime
+from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import (
@@ -57,6 +58,7 @@ from app.schemas.prospect_outreach import (
     ProspectCollateralOptionList,
     ProspectCollateralOptionRead,
     ProspectDraftAction,
+    ProspectDraftCancelAction,
     ProspectEmailDraftCreate,
     ProspectEmailDraftList,
     ProspectEmailDraftPatch,
@@ -154,7 +156,12 @@ async def _visible_draft(
     prospect = await (
         prospect_service.load_visible_prospect_history(db, user, row.prospect_id)
         if historical
-        else prospect_service.load_visible_prospect(db, user, row.prospect_id)
+        else prospect_service.load_visible_prospect(
+            db,
+            user,
+            row.prospect_id,
+            for_update=lock,
+        )
     )
     return row, prospect
 
@@ -681,7 +688,7 @@ async def start_prospect_email_edit(
     payload: ProspectDraftAction,
     db: AsyncSession = Depends(get_db),
 ) -> ProspectEmailDraftRead:
-    await _visible_draft(db, user, draft_id)
+    await _visible_draft(db, user, draft_id, lock=True)
     try:
         row = await outreach.start_editing(db, draft_id, expected_version=payload.expected_version)
         return await outreach.draft_read(db, row)
@@ -700,7 +707,7 @@ async def patch_prospect_email_draft(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ProspectEmailDraftRead:
-    await _visible_draft(db, user, draft_id)
+    await _visible_draft(db, user, draft_id, lock=True)
     try:
         row = await outreach.edit_draft(
             db,
@@ -708,6 +715,8 @@ async def patch_prospect_email_draft(
             expected_version=payload.expected_version,
             subject=payload.subject,
             body=payload.body,
+            cc_emails=payload.cc_emails,
+            cc_scope=payload.cc_scope,
         )
         return await outreach.draft_read(db, row)
     except Exception as exc:  # noqa: BLE001
@@ -725,7 +734,7 @@ async def approve_prospect_email_draft(
     payload: ProspectDraftAction,
     db: AsyncSession = Depends(get_db),
 ) -> ProspectEmailDraftRead:
-    await _visible_draft(db, user, draft_id)
+    await _visible_draft(db, user, draft_id, lock=True)
     try:
         row = await outreach.dispatch_draft(
             db,
@@ -750,12 +759,18 @@ async def approve_prospect_email_draft(
 async def cancel_prospect_email_draft(
     draft_id: UUID,
     user: CurrentUser,
-    payload: ProspectDraftAction,
+    payload: ProspectDraftCancelAction,
     db: AsyncSession = Depends(get_db),
 ) -> ProspectEmailDraftRead:
-    await _visible_draft(db, user, draft_id)
+    await _visible_draft(db, user, draft_id, lock=True)
     try:
-        row = await outreach.cancel_draft(db, draft_id, expected_version=payload.expected_version)
+        row = await outreach.cancel_draft(
+            db,
+            draft_id,
+            expected_version=payload.expected_version,
+            actor_user_id=user.id,
+            source=payload.source,
+        )
         return await outreach.draft_read(db, row)
     except Exception as exc:  # noqa: BLE001
         _raise_service(exc)
@@ -772,7 +787,7 @@ async def use_secure_bundle_for_prospect_email(
     payload: ProspectDraftAction,
     db: AsyncSession = Depends(get_db),
 ) -> ProspectEmailDraftRead:
-    await _visible_draft(db, user, draft_id)
+    await _visible_draft(db, user, draft_id, lock=True)
     try:
         row = await outreach.select_secure_bundle(
             db,
@@ -1180,17 +1195,35 @@ async def _get_unsubscribe_draft(
     return draft
 
 
-async def _apply_unsubscribe(db: AsyncSession, token: str) -> DealerProspectEmailDraft:
+async def _apply_unsubscribe(
+    db: AsyncSession, token: str, *, target_email: str | None = None
+) -> DealerProspectEmailDraft:
     draft = await _get_unsubscribe_draft(db, token, lock=True)
+    if draft.cc_emails and not target_email:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Enter the email address that should be unsubscribed.",
+        )
+    normalized = outreach.normalize_email(target_email or draft.recipient_email)
+    permitted = {
+        outreach.normalize_email(draft.recipient_email),
+        *(outreach.normalize_email(value) for value in (draft.cc_emails or [])),
+    }
+    if normalized not in permitted:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Enter an email address that received this message.",
+        )
     await outreach.set_suppression(
         db,
-        email=draft.recipient_email,
+        email=normalized,
         reason="unsubscribe",
         source="one_click",
         details={"draft_id": str(draft.id), "prospect_id": str(draft.prospect_id)},
     )
     prospect = await db.get(DealerProspect, draft.prospect_id, with_for_update=True)
-    if prospect is not None:
+    is_primary = normalized == outreach.normalize_email(draft.recipient_email)
+    if prospect is not None and is_primary:
         prospect.do_not_contact = True
         prospect.do_not_contact_reason = "Email unsubscribe"
         prospect.next_follow_up_at = None
@@ -1200,14 +1233,30 @@ async def _apply_unsubscribe(db: AsyncSession, token: str) -> DealerProspectEmai
                 prospect_id=prospect.id,
                 actor_user_id=None,
                 kind="email.unsubscribed",
-                body="Recipient unsubscribed from Dealer Desk email.",
-                metadata_json={"draft_id": str(draft.id)},
+                body="Primary recipient unsubscribed from Dealer Desk email.",
+                metadata_json={"draft_id": str(draft.id), "email": normalized},
+            )
+        )
+    elif prospect is not None:
+        prospect.last_activity_at = datetime.now(UTC)
+        db.add(
+            DealerProspectActivity(
+                prospect_id=prospect.id,
+                actor_user_id=None,
+                kind="email.cc_unsubscribed",
+                body="A CC recipient unsubscribed from Dealer Desk email.",
+                metadata_json={"draft_id": str(draft.id), "email": normalized},
             )
         )
     return draft
 
 
-def _unsubscribe_confirmation_page(*, completed: bool) -> Response:
+def _unsubscribe_confirmation_page(
+    *,
+    completed: bool,
+    require_email: bool = False,
+    form_action: str | None = None,
+) -> Response:
     if completed:
         content = (
             '<!doctype html><html lang="en"><head><meta charset="utf-8">'
@@ -1219,6 +1268,12 @@ def _unsubscribe_confirmation_page(*, completed: bool) -> Response:
             "</main></body></html>"
         )
     else:
+        email_input = (
+            '<label>Email address <input type="email" name="email" required autocomplete="email"></label>'
+            if require_email
+            else ""
+        )
+        action = f' action="{form_action}"' if form_action else ""
         content = (
             '<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -1226,7 +1281,7 @@ def _unsubscribe_confirmation_page(*, completed: bool) -> Response:
             "<h1>Confirm unsubscribe</h1>"
             "<p>Use the button below to stop Dealer Desk marketing email from "
             "Qualified Commercial.</p>"
-            '<form method="post"><button type="submit">Unsubscribe</button></form>'
+            f'<form method="post"{action}>{email_input}<button type="submit">Unsubscribe</button></form>'
             "</main></body></html>"
         )
     return Response(
@@ -1250,8 +1305,17 @@ async def unsubscribe_prospect_email_get(
 ) -> Response:
     # Email-security scanners commonly follow links with GET. Validate the token, but
     # require an explicit POST before changing suppression or prospect state.
-    await _get_unsubscribe_draft(db, token, lock=False)
-    return _unsubscribe_confirmation_page(completed=False)
+    draft = await _get_unsubscribe_draft(db, token, lock=False)
+    return _unsubscribe_confirmation_page(
+        completed=False,
+        require_email=bool(draft.cc_emails),
+        form_action=(
+            "/api/v1/dealer-os/prospect-email-unsubscribe/"
+            f"{quote(token, safe='')}/recipient"
+            if draft.cc_emails
+            else None
+        ),
+    )
 
 
 @router.post("/prospect-email-unsubscribe/{token}", include_in_schema=False)
@@ -1262,6 +1326,19 @@ async def unsubscribe_prospect_email_post(
     await _apply_unsubscribe(db, token)
     # RFC 8058 one-click clients only require a successful POST response; returning
     # the same useful confirmation shown to browser users remains compatible.
+    return _unsubscribe_confirmation_page(completed=True)
+
+
+@router.post(
+    "/prospect-email-unsubscribe/{token}/recipient",
+    include_in_schema=False,
+)
+async def unsubscribe_prospect_email_recipient_post(
+    token: str,
+    email: str = Form(...),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    await _apply_unsubscribe(db, token, target_email=email)
     return _unsubscribe_confirmation_page(completed=True)
 
 

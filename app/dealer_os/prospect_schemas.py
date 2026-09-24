@@ -17,6 +17,7 @@ from pydantic import (
 )
 
 from app.schemas.phone import RequiredPhone
+from app.schemas.prospect_outreach import CCScope, normalize_cc_emails
 
 from .schemas import RepAppointmentRead
 
@@ -95,6 +96,7 @@ class ProspectRead(BaseModel):
     version: int
     owner_name: str | None = None
     marketing_sms_consent: bool = False
+    default_cc_emails: list[str] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
     activities: list[ProspectActivityRead] = Field(default_factory=list)
@@ -372,6 +374,10 @@ class ProspectOutcomeApply(BaseModel):
     next_follow_up_at: datetime | None = None
     follow_up_choice: FollowUpChoice | None = None
     appointment_id: UUID | None = None
+    ai_draft_instructions: str | None = Field(default=None, max_length=1500)
+    cc_emails: list[str] | None = None
+    cc_scope: CCScope = "this_email"
+    skip_email_draft: bool = False
 
     @model_validator(mode="after")
     def validate_follow_up_choice(self) -> ProspectOutcomeApply:
@@ -386,6 +392,17 @@ class ProspectOutcomeApply(BaseModel):
     def normalize_outcome_key(cls, value: object) -> object:
         return str(value).strip().lower() if value is not None else value
 
+    @field_validator("ai_draft_instructions")
+    @classmethod
+    def strip_ai_draft_instructions(cls, value: str | None) -> str | None:
+        clean = (value or "").strip()
+        return clean or None
+
+    @field_validator("cc_emails", mode="before")
+    @classmethod
+    def validate_cc_emails(cls, value: object) -> list[str] | None:
+        return normalize_cc_emails(value)
+
 
 class ProspectOutcomeResult(BaseModel):
     prospect: ProspectRead
@@ -393,6 +410,7 @@ class ProspectOutcomeResult(BaseModel):
     email_action: str | None = None
     workflow_action: str | None = None
     email_draft_id: UUID | None = None
+    email_disposition: Literal["none", "pending_review", "skipped"] = "none"
 
 
 class ProspectStageCreate(BaseModel):

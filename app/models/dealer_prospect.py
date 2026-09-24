@@ -190,6 +190,11 @@ class DealerProspect(TimestampMixin, Base):
     email_normalized: Mapped[str] = mapped_column(String(320), nullable=False)
     phone_normalized: Mapped[str] = mapped_column(String(20), nullable=False)
     dealer_name_normalized: Mapped[str] = mapped_column(String(180), nullable=False)
+    # Prospect-scoped outreach defaults.  A draft always snapshots these
+    # addresses so later preference changes cannot rewrite delivery history.
+    default_cc_emails: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
 
     source: Mapped[str] = mapped_column(
         String(32), nullable=False, default="quick_add", server_default="quick_add"

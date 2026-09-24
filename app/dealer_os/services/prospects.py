@@ -91,12 +91,22 @@ DEFAULT_OUTCOMES: tuple[dict[str, Any], ...] = (
     },
     {
         "key": "call_back",
-        "label": "Not available / call back",
+        "label": "We will call the client back",
         "sort_order": 10,
         "action_config": {
             "increment_call_attempt": True,
             "requires_follow_up": True,
             "email_action": "callback_confirmation",
+        },
+    },
+    {
+        "key": "client_will_call_back",
+        "label": "Client will call back",
+        "sort_order": 15,
+        "action_config": {
+            "increment_call_attempt": True,
+            "follow_up_business_days": 2,
+            "email_action": "client_will_call_back",
         },
     },
     {
@@ -161,11 +171,18 @@ _ACTION_CONFIG_KEYS = frozenset(
         "clear_follow_up",
         "suppress_email",
         "follow_up_delay_hours",
+        "follow_up_business_days",
     }
 )
 _STAGE_STRATEGIES = frozenset({"advance_follow_up"})
 _EMAIL_ACTIONS = frozenset(
-    {"dealer_information_pack", "missed_call", "callback_confirmation", "booking_link"}
+    {
+        "dealer_information_pack",
+        "missed_call",
+        "callback_confirmation",
+        "client_will_call_back",
+        "booking_link",
+    }
 )
 _WORKFLOW_ACTIONS = frozenset({"book_appointment"})
 
@@ -415,6 +432,13 @@ def validate_action_config(value: dict[str, Any] | None) -> dict[str, Any]:
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "follow_up_delay_hours must be a whole number from 1 to 8760",
             )
+    if "follow_up_business_days" in config:
+        days = config["follow_up_business_days"]
+        if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 30:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "follow_up_business_days must be a whole number from 1 to 30",
+            )
     for key in ("email_action", "workflow_action"):
         if config.get(key):
             config[key] = definition_key(str(config[key]))
@@ -440,16 +464,25 @@ def validate_action_config(value: dict[str, Any] | None) -> dict[str, Any]:
         )
 
     if config.get("clear_follow_up") and (
-        config.get("requires_follow_up") or "follow_up_delay_hours" in config
+        config.get("requires_follow_up")
+        or "follow_up_delay_hours" in config
+        or "follow_up_business_days" in config
     ):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "An outcome cannot clear follow-up while requiring or scheduling a follow-up",
         )
-    if config.get("requires_follow_up") and "follow_up_delay_hours" in config:
+    if config.get("requires_follow_up") and (
+        "follow_up_delay_hours" in config or "follow_up_business_days" in config
+    ):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "Choose either a required follow-up time or an automatic follow-up delay, not both",
+        )
+    if "follow_up_delay_hours" in config and "follow_up_business_days" in config:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Choose either an hourly or business-day automatic follow-up, not both",
         )
 
     if target == "converted":
@@ -487,6 +520,7 @@ def booking_outcome_config(value: dict[str, Any] | None) -> dict[str, Any]:
         or config.get("clear_follow_up")
         or config.get("requires_follow_up")
         or config.get("follow_up_delay_hours")
+        or config.get("follow_up_business_days")
         or config.get("stage_strategy")
         or (target is not None and target != "booked")
         or config.get("email_action") not in {None, "booking_link"}
@@ -716,6 +750,7 @@ def _prospect_read_payload(
         "marketing_sms_consent": bool(
             contact.sms_marketing_consented_at and contact.sms_opted_out_at is None
         ),
+        "default_cc_emails": list(getattr(prospect, "default_cc_emails", None) or []),
         "created_at": prospect.created_at,
         "updated_at": prospect.updated_at,
         "activities": activities or [],
@@ -2298,6 +2333,7 @@ async def apply_outcome(
     follow_up_choice: str | None = None,
     timezone_name: str = DEFAULT_FOLLOW_UP_TIMEZONE,
     current_time: datetime | None = None,
+    skip_email_draft: bool = False,
 ) -> tuple[DealerProspect, str | None, str | None]:
     assert_expected_version(prospect, expected_version)
     if not outcome.is_active:
@@ -2315,7 +2351,9 @@ async def apply_outcome(
             },
         )
     needs_follow_up = bool(
-        config.get("requires_follow_up") or config.get("follow_up_delay_hours")
+        config.get("requires_follow_up")
+        or config.get("follow_up_delay_hours")
+        or config.get("follow_up_business_days")
     )
     if next_follow_up_at is not None:
         next_follow_up_at = normalize_custom_follow_up(
@@ -2329,8 +2367,13 @@ async def apply_outcome(
             detail={"code": "follow_up_required", "message": "Choose the next follow-up time."},
         )
     elif follow_up_choice or needs_follow_up:
+        configured_days = config.get("follow_up_business_days")
         next_follow_up_at = business_follow_up_at(
-            business_days=follow_up_business_days(current_stage.key, follow_up_choice),
+            business_days=(
+                int(configured_days)
+                if configured_days and follow_up_choice is None
+                else follow_up_business_days(current_stage.key, follow_up_choice)
+            ),
             timezone_name=timezone_name,
             current_time=current_time,
         )
@@ -2360,7 +2403,7 @@ async def apply_outcome(
             prospect.last_outcome_at.isoformat() if prospect.last_outcome_at else None
         ),
         "reversible": not bool(
-            config.get("email_action")
+            (config.get("email_action") and not skip_email_draft)
             or config.get("workflow_action")
             or config.get("suppress_email")
         ),
@@ -2379,7 +2422,18 @@ async def apply_outcome(
             appointment_id=appointment_id,
             confirm_do_not_contact=bool(config.get("set_do_not_contact")),
             event_kind="outcome_applied",
-            extra_metadata={"outcome_key": outcome.key, "action_config": config, **prior},
+            extra_metadata={
+                "outcome_key": outcome.key,
+                "action_config": config,
+                "email_action_configured": config.get("email_action"),
+                "email_action_effective": (
+                    None if skip_email_draft else config.get("email_action")
+                ),
+                "email_disposition": (
+                    "skipped" if skip_email_draft and config.get("email_action") else "none"
+                ),
+                **prior,
+            },
         )
     else:
         prospect.version += 1
@@ -2396,6 +2450,13 @@ async def apply_outcome(
                 "from_stage_key": current_stage.key,
                 "to_stage_key": current_stage.key,
                 "action_config": config,
+                "email_action_configured": config.get("email_action"),
+                "email_action_effective": (
+                    None if skip_email_draft else config.get("email_action")
+                ),
+                "email_disposition": (
+                    "skipped" if skip_email_draft and config.get("email_action") else "none"
+                ),
                 "version_before": before_version,
                 "version_after": prospect.version,
                 **prior,
@@ -2510,12 +2571,14 @@ async def undo_activity(
                     "message": "The linked email has already entered delivery and cannot be undone.",
                 },
             )
-        if draft.status in {"pending_review", "editing", "blocked", "failed"}:
+        if draft.status in {"pending_review", "editing", "blocked"}:
             try:
                 await outreach_service.cancel_draft(
                     db,
                     draft.id,
                     expected_version=draft.version,
+                    actor_user_id=user.id,
+                    source="outcome_undo",
                 )
             except outreach_service.OutreachConflict as exc:
                 raise HTTPException(

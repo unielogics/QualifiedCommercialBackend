@@ -2,19 +2,50 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
+from pydantic import BaseModel, EmailStr, Field, TypeAdapter, field_validator, model_validator
 
 DraftPurpose = Literal[
     "dealer_information",
     "missed_call",
     "callback_confirmation",
+    "client_will_call_back",
     "booking",
     "general",
 ]
+
+CCScope = Literal["this_email", "this_and_future"]
+_EMAIL_ADAPTER = TypeAdapter(EmailStr)
+
+
+def normalize_cc_emails(value: object) -> list[str] | None:
+    """Accept chips or pasted comma/newline-separated CC addresses."""
+    if value is None:
+        return None
+    raw_values: list[object]
+    if isinstance(value, str):
+        raw_values = re.split(r"[,;\n]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = list(value)
+    else:
+        raise ValueError("cc_emails must be a list or separated email addresses")
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        candidate = str(raw or "").strip().lower()
+        if not candidate:
+            continue
+        normalized = str(_EMAIL_ADAPTER.validate_python(candidate)).lower()
+        if normalized not in seen:
+            seen.add(normalized)
+            cleaned.append(normalized)
+    if len(cleaned) > 10:
+        raise ValueError("No more than 10 CC recipients are allowed")
+    return cleaned
 
 
 class ProspectSenderPreviewRead(BaseModel):
@@ -165,6 +196,10 @@ class ProspectEmailDraftCreate(BaseModel):
     # This value is routed directly to DealerProspectActivity.  It is never
     # stored on the email draft and never included in the model prompt.
     private_note: str | None = Field(default=None, max_length=4000)
+    # None inherits this prospect's saved defaults. An explicit empty list
+    # means this draft has no CC recipients.
+    cc_emails: list[str] | None = None
+    cc_scope: CCScope = "this_email"
     # True snapshots every current active Dealer Outreach PDF. False snapshots
     # exactly the selected ids; false + [] deliberately means no attachments.
     include_collateral: bool = True
@@ -181,6 +216,11 @@ class ProspectEmailDraftCreate(BaseModel):
     def normalize_verified_context(cls, value: str | None) -> str | None:
         clean = " ".join((value or "").split())
         return clean or None
+
+    @field_validator("cc_emails", mode="before")
+    @classmethod
+    def validate_cc_emails(cls, value: object) -> list[str] | None:
+        return normalize_cc_emails(value)
 
     @model_validator(mode="after")
     def validate_collateral_selection(self) -> ProspectEmailDraftCreate:
@@ -206,6 +246,8 @@ class ProspectEmailDraftPatch(BaseModel):
     expected_version: int = Field(ge=1)
     subject: str | None = Field(default=None, min_length=1, max_length=240)
     body: str | None = Field(default=None, min_length=1, max_length=30_000)
+    cc_emails: list[str] | None = None
+    cc_scope: CCScope = "this_email"
 
     @field_validator("subject", "body")
     @classmethod
@@ -217,12 +259,21 @@ class ProspectEmailDraftPatch(BaseModel):
             raise ValueError("value cannot be blank")
         return clean
 
+    @field_validator("cc_emails", mode="before")
+    @classmethod
+    def validate_cc_emails(cls, value: object) -> list[str] | None:
+        return normalize_cc_emails(value)
+
 
 class ProspectDraftAction(BaseModel):
     # Every interactive transition is optimistic-concurrency protected. The
     # scheduler calls the service directly and remains the only versionless
     # path because it acts on the row it just locked.
     expected_version: int = Field(ge=1)
+
+
+class ProspectDraftCancelAction(ProspectDraftAction):
+    source: Literal["composer", "prospect_banner", "marketing_audit"] = "composer"
 
 
 class ProspectEmailAttachmentRead(BaseModel):
@@ -241,6 +292,7 @@ class ProspectEmailDraftRead(BaseModel):
     id: UUID
     prospect_id: UUID
     to_email: str
+    cc_emails: list[str] = Field(default_factory=list)
     from_email: str
     reply_to: str
     sender_display_name: str | None = None
@@ -263,6 +315,8 @@ class ProspectEmailDraftRead(BaseModel):
     approved_at: datetime | None = None
     sent_at: datetime | None = None
     cancelled_at: datetime | None = None
+    cancelled_by_user_id: UUID | None = None
+    cancellation_source: str | None = None
     countdown_seconds: int | None = None
     version: int
     draft_source: Literal["ai", "fallback"]

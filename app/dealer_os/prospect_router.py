@@ -275,6 +275,7 @@ def _outcome_read(row: DealerProspectOutcomeDefinition) -> ProspectOutcomeRead:
         requires_follow_up=bool(
             config.get("requires_follow_up")
             or config.get("follow_up_delay_hours")
+            or config.get("follow_up_business_days")
         ),
         requires_appointment=bool(config.get("requires_appointment")),
         creates_email_draft=bool(config.get("email_action")),
@@ -318,6 +319,7 @@ _EMAIL_PURPOSES = {
     "dealer_information_pack": "dealer_information",
     "missed_call": "missed_call",
     "callback_confirmation": "callback_confirmation",
+    "client_will_call_back": "client_will_call_back",
     "booking_link": "booking",
 }
 
@@ -328,6 +330,9 @@ async def _create_action_draft(
     prospect: DealerProspect,
     user: User,
     action: str,
+    ai_draft_instructions: str | None = None,
+    cc_emails: list[str] | None = None,
+    cc_scope: str = "this_email",
 ):
     purpose = _EMAIL_PURPOSES.get(action, "dealer_information")
     try:
@@ -335,7 +340,12 @@ async def _create_action_draft(
             db,
             prospect=prospect,
             actor=user,
-            payload=ProspectEmailDraftCreate(purpose=purpose),
+            payload=ProspectEmailDraftCreate(
+                purpose=purpose,
+                ai_instructions=ai_draft_instructions,
+                cc_emails=cc_emails,
+                cc_scope=cc_scope,
+            ),
         )
     except outreach_service.OutreachConflict as exc:
         raise HTTPException(
@@ -1989,14 +1999,18 @@ async def apply_prospect_outcome(
         appointment_id=payload.appointment_id,
         follow_up_choice=payload.follow_up_choice,
         timezone_name=follow_up_timezone,
+        skip_email_draft=payload.skip_email_draft,
     )
     email_draft = None
-    if email_action:
+    if email_action and not payload.skip_email_draft:
         email_draft = await _create_action_draft(
             db,
             prospect=prospect,
             user=user,
             action=email_action,
+            ai_draft_instructions=payload.ai_draft_instructions,
+            cc_emails=payload.cc_emails,
+            cc_scope=payload.cc_scope,
         )
         await service.attach_draft_to_transition(
             db,
@@ -2013,6 +2027,13 @@ async def apply_prospect_outcome(
         email_action=email_action,
         workflow_action=workflow_action,
         email_draft_id=email_draft.id if email_draft else None,
+        email_disposition=(
+            "pending_review"
+            if email_draft is not None
+            else "skipped"
+            if email_action and payload.skip_email_draft
+            else "none"
+        ),
     )
 
 
