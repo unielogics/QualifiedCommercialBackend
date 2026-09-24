@@ -8535,10 +8535,22 @@ async def update_intake_notification_routing(
     intake = await _load_admin_dealer_lead(db, intake_id)
     # Serialize routing edits with relationship/assignment changes. Candidate
     # validation and persistence must describe the same intake version.
-    await db.execute(
-        select(PublicUnderwritingIntake)
-        .where(PublicUnderwritingIntake.id == intake.id)
-        .with_for_update()
+    intake = (
+        await db.execute(
+            select(PublicUnderwritingIntake)
+            .where(PublicUnderwritingIntake.id == intake.id)
+            .with_for_update()
+        )
+    ).scalar_one()
+    await db.refresh(
+        intake,
+        attribute_names=[
+            "intake_state",
+            "assigned_underwriter_user_id",
+            "source_user_id",
+            "broker_id",
+            "referral_partner_company_id",
+        ],
     )
     candidates = await _intake_notification_candidates(db, intake)
     eligible_ids = {candidate.user_id for candidate in candidates}

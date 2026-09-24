@@ -290,6 +290,7 @@ async def test_update_rejects_recipient_no_longer_involved_under_lock() -> None:
     assert caught.value.status_code == 422
     assert "no longer involved" in caught.value.detail
     db.execute.assert_awaited_once()
+    db.refresh.assert_awaited_once()
     db.commit.assert_not_awaited()
 
 
