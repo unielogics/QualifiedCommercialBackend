@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import UTC, datetime
 from decimal import Decimal
+from math import isfinite
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -353,6 +354,11 @@ def _money(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _positive_money(value: Any) -> float | None:
+    amount = _money(value)
+    return amount if amount is not None and isfinite(amount) and amount > 0 else None
 
 
 def _money_label(value: Any) -> str | None:
@@ -1213,6 +1219,11 @@ def _normalize_pipeline_source_kind(source_kind: str) -> str:
     return normalized
 
 
+def _loan_stage_value(stage: LoanStage | str) -> str:
+    """Return the persisted lifecycle value for ORM strings and enum instances."""
+    return stage.value if isinstance(stage, LoanStage) else str(stage)
+
+
 async def _sync_pipeline_loan_stage(
     db: AsyncSession,
     *,
@@ -1228,7 +1239,9 @@ async def _sync_pipeline_loan_stage(
     if loan is None:
         return None
     previous = loan.stage
-    if previous == target_stage:
+    previous_value = _loan_stage_value(previous)
+    target_value = _loan_stage_value(target_stage)
+    if previous_value == target_value:
         return loan
     loan.stage = target_stage
     await log_activity(
@@ -1237,12 +1250,12 @@ async def _sync_pipeline_loan_stage(
         actor_id=user.id,
         actor_label=_role_value(user),
         kind="pipeline.lifecycle_stage_sync",
-        summary=f"Pipeline lifecycle synced loan stage {previous.value} -> {target_stage.value}",
+        summary=f"Pipeline lifecycle synced loan stage {previous_value} -> {target_value}",
         payload={
             "profile_id": str(profile.id),
             "underwriting_status": target_status,
-            "from": previous.value,
-            "to": target_stage.value,
+            "from": previous_value,
+            "to": target_value,
             "note": note,
         },
     )
@@ -1274,6 +1287,25 @@ async def move_operator_file_pipeline(
             f"File moved from {payload.expected_status} to {current_status}; refresh and try again",
         )
 
+    approval_note: str | None = None
+    effective_approved_amount: float | None = None
+    if payload.target_status == "approved":
+        approval_note = payload.note.strip() if payload.note and payload.note.strip() else None
+        for candidate in (
+            payload.approved_amount,
+            profile.underwriting_approved_amount,
+            profile.underwriting_term_sheet_amount,
+        ):
+            effective_approved_amount = _positive_money(candidate)
+            if effective_approved_amount is not None:
+                break
+        if effective_approved_amount is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Approval requires a positive approved amount or term-sheet amount",
+            )
+    move_note = approval_note if payload.target_status == "approved" else payload.note
+
     created_loan = False
     if payload.target_status in PIPELINE_PROMOTION_REQUIRED and profile.loan_id is None:
         if profile.intake_id is None:
@@ -1284,7 +1316,7 @@ async def move_operator_file_pipeline(
         promotion = await promote_intake_to_funding(
             profile.intake_id,
             IntakePromotionRequest(
-                notes=payload.note
+                notes=move_note
                 or f"Created funding file from pipeline move to {payload.target_status}",
             ),
             request,
@@ -1298,7 +1330,13 @@ async def move_operator_file_pipeline(
     profile.underwriting_status = payload.target_status
     profile.underwriting_updated_by_user_id = user.id
     profile.underwriting_updated_at = now
-    if payload.target_status == "closed_won":
+    if payload.target_status == "approved":
+        profile.underwriting_approved_amount = effective_approved_amount
+        if "approved_dscr" in payload.model_fields_set:
+            profile.underwriting_approved_dscr = payload.approved_dscr
+        if approval_note is not None:
+            profile.underwriting_notes = approval_note
+    elif payload.target_status == "closed_won":
         profile.underwriting_close_outcome = "won"
     elif payload.target_status in {"closed_lost", "denied"}:
         profile.underwriting_close_outcome = payload.target_status
@@ -1315,8 +1353,29 @@ async def move_operator_file_pipeline(
         profile=profile,
         target_status=payload.target_status,
         user=user,
-        note=payload.note,
+        note=move_note,
     )
+    action_metadata: dict[str, Any] = {
+        "from": current_status,
+        "to": payload.target_status,
+        "source_kind": normalized_kind,
+        "source_id": str(source_id),
+        "loan_id": str(profile.loan_id) if profile.loan_id else None,
+        "loan_stage": _loan_stage_value(loan.stage) if loan else None,
+        "created_loan": created_loan,
+        "note": move_note,
+    }
+    if payload.target_status == "approved":
+        action_metadata.update(
+            {
+                "approved_amount": float(profile.underwriting_approved_amount),
+                "approved_dscr": (
+                    float(profile.underwriting_approved_dscr)
+                    if profile.underwriting_approved_dscr is not None
+                    else None
+                ),
+            }
+        )
     await profiles.log_profile_action(
         db,
         profile,
@@ -1325,16 +1384,7 @@ async def move_operator_file_pipeline(
         f"Pipeline moved {current_status.replace('_', ' ')} -> {payload.target_status.replace('_', ' ')}",
         target_type="loan" if loan else "application_profile",
         target_id=loan.id if loan else profile.id,
-        metadata={
-            "from": current_status,
-            "to": payload.target_status,
-            "source_kind": normalized_kind,
-            "source_id": str(source_id),
-            "loan_id": str(profile.loan_id) if profile.loan_id else None,
-            "loan_stage": loan.stage.value if loan else None,
-            "created_loan": created_loan,
-            "note": payload.note,
-        },
+        metadata=action_metadata,
     )
     if profile.underwriting_status != before_status:
         # Same words as the Underwriting tab's write (apply_underwriting_changes);
@@ -1362,7 +1412,7 @@ async def move_operator_file_pipeline(
         profile_id=profile.id,
         underwriting_status=profile.underwriting_status,  # type: ignore[arg-type]
         loan_id=profile.loan_id,
-        loan_stage=loan.stage.value if loan else None,
+        loan_stage=_loan_stage_value(loan.stage) if loan else None,
         created_loan=created_loan,
     )
 

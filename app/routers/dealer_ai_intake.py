@@ -38,6 +38,7 @@ from app.enums import (
     Role,
 )
 from app.models.activity import Activity
+from app.models.ai_audit_event import AIAuditEvent
 from app.models.application_profile import ApplicationProfile, ApplicationRoomDelivery
 from app.models.booking_settings import BookingSettings
 from app.models.bucket import (
@@ -725,12 +726,19 @@ class RequestLeadDeletionRequest(BaseModel):
 class ConfirmLeadDeletionRequest(BaseModel):
     """The desk's confirmation for an irreversible hard delete — a super admin
     or an underwriter, nobody else (the owner's rule for the intake table). The
-    frontend gates this behind a themed danger confirm dialog, so the API no
-    longer requires a prior deletion-request flag or a typed-name speed bump —
-    a super admin can delete in one action. confirm_name is accepted but
-    optional (kept for backward compatibility / audit)."""
+    frontend gates this behind a themed danger confirm dialog. The exact lead
+    name remains a required server-side speed bump: a stale or scripted client
+    cannot bypass the confirmation by omitting the value."""
 
-    confirm_name: str | None = Field(default=None, max_length=180)
+    confirm_name: str = Field(min_length=1, max_length=180)
+
+    @field_validator("confirm_name")
+    @classmethod
+    def _confirmation_name_is_not_blank(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("Confirmation name is required")
+        return normalized
 
 
 class AdminCreditPullRequest(BaseModel):
@@ -1269,6 +1277,7 @@ class DealerAILeadRow(BaseModel):
     created_at: datetime
     updated_at: datetime
     last_message_at: datetime | None = None
+    archived_at: datetime | None = None
     # Two-step delete state — never null-filtered out of the admin list, so
     # admin always sees pending requests and must separately confirm.
     delete_requested_at: datetime | None = None
@@ -7785,6 +7794,7 @@ def _lead_row(intake: PublicUnderwritingIntake) -> DealerAILeadRow:
         created_at=intake.created_at,
         updated_at=intake.updated_at,
         last_message_at=intake.last_message_at,
+        archived_at=intake.bucket.archived_at,
         delete_requested_at=intake.delete_requested_at,
         delete_requested_by=intake.delete_requested_by.name if intake.delete_requested_by else None,
     )
@@ -7798,6 +7808,8 @@ def _intake_search_clause(query: str):
         func.lower(PublicUnderwritingIntake.email).like(needle),
         func.lower(PublicUnderwritingIntake.business_name).like(needle),
         func.lower(PublicUnderwritingIntake.phone).like(needle),
+        func.lower(Bucket.name).like(needle),
+        func.lower(Bucket.client_name).like(needle),
     ]
     digits = re.sub(r"\D+", "", raw)
     if digits:
@@ -8057,6 +8069,7 @@ async def list_dealer_ai_leads(
     status_filter: str | None = None,
     probability_status: str | None = None,
     variant_filter: str | None = None,
+    archived_filter: Literal["active", "archived", "all"] = "active",
     partner_user_id: UUID | None = None,
     limit: int = 50,
     offset: int = 0,
@@ -8067,7 +8080,6 @@ async def list_dealer_ai_leads(
     stmt = (
         select(PublicUnderwritingIntake)
         .join(Bucket, PublicUnderwritingIntake.bucket_id == Bucket.id)
-        .where(Bucket.archived_at.is_(None))
         .options(
             selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents).selectinload(BucketRequestedDocument.template_file),
             selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),
@@ -8080,6 +8092,10 @@ async def list_dealer_ai_leads(
         )
         .order_by(PublicUnderwritingIntake.updated_at.desc())
     )
+    if archived_filter == "active":
+        stmt = stmt.where(Bucket.archived_at.is_(None))
+    elif archived_filter == "archived":
+        stmt = stmt.where(Bucket.archived_at.is_not(None))
     if status_filter and status_filter != "all":
         stmt = stmt.where(PublicUnderwritingIntake.status == status_filter)
     if partner_user_id is not None:
@@ -8676,6 +8692,62 @@ async def admin_cancel_lead_deletion(
     return await _response(db, intake, token=None, include_management=True, admin_thread=True, thread_user=user)
 
 
+@admin_router.post("/{intake_id}/restore", response_model=DealerAILeadRow)
+async def admin_restore_lead(
+    intake_id: UUID,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerAILeadRow:
+    """Restore a soft-archived AI Intake and its existing bucket/files.
+
+    This is intentionally separate from hard-delete recovery: archived rows
+    and their objects still exist and are safe to restore in place.
+    """
+    _require_intake_operator(user)
+    intake = (
+        await db.execute(
+            select(PublicUnderwritingIntake)
+            .where(PublicUnderwritingIntake.id == intake_id)
+            .options(
+                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents).selectinload(BucketRequestedDocument.template_file),
+                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),
+                selectinload(PublicUnderwritingIntake.latest_review),
+                selectinload(PublicUnderwritingIntake.broker),
+                selectinload(PublicUnderwritingIntake.delete_requested_by),
+                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+            )
+        )
+    ).scalar_one_or_none()
+    if intake is None or intake.bucket is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Dealer AI lead not found")
+    if intake.bucket.archived_at is None:
+        return _lead_row(intake)
+
+    state = dict(intake.intake_state or {})
+    archive_meta = state.pop("_archive", {})
+    prior_status = archive_meta.get("bucket_status") if isinstance(archive_meta, dict) else None
+    intake.intake_state = state
+    intake.bucket.archived_at = None
+    intake.bucket.status = (
+        prior_status
+        if isinstance(prior_status, str) and prior_status and prior_status != "archived"
+        else "collecting_documents"
+    )
+    await _log(
+        db,
+        intake.bucket_id,
+        "dealer_ai_lead_restored",
+        request=request,
+        user=user,
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=intake.business_name or intake.full_name,
+    )
+    await db.commit()
+    return _lead_row(intake)
+
+
 @admin_router.post("/{intake_id}/confirm-deletion", status_code=status.HTTP_204_NO_CONTENT)
 async def admin_confirm_lead_deletion(
     intake_id: UUID,
@@ -8684,37 +8756,16 @@ async def admin_confirm_lead_deletion(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """Irreversible hard delete — only reachable on a lead a broker/admin has
-    already flagged via request-deletion (409 otherwise), and only with the
-    lead's exact name typed as a deliberate speed bump (400 on mismatch).
+    """Compatibility endpoint for removing a file from active work.
 
-    Deletes every BucketFile/artifact object from S3 (best-effort — a failed
-    object delete is logged but never blocks the DB delete, matching
-    _delete_s3_object's own internal exception-swallowing), then deletes the
-    Bucket row. public_underwriting_intakes.bucket_id is itself
-    ondelete="CASCADE" FROM buckets (the intake is the dependent side), so
-    deleting the bucket cascades to the intake and every other
-    bucket-scoped table (requested_documents, files, notes, activity_logs,
-    ai_reviews, ai_messages, upload_links, shares, vendor_access,
-    public_shares, file_analyses) in one statement — see
-    app/models/bucket.py's Bucket relationships, all already
-    cascade="all, delete-orphan" to match.
-
-    Never touches client_id/broker_id (already ON DELETE SET NULL on the
-    intake) or CreditPull rows (keyed to client_id, not intake_id) — a
-    deleted lead never takes its client or bureau history down with it.
-
-    The bucket's own BucketActivityLog is about to be destroyed by
-    definition, so this action is logged to the application logger instead
-    of _log(...) — there is no durable admin-wide audit trail in this
-    codebase to write a cross-bucket entry to.
-
-    Who: a super admin or an underwriter — the owner's rule for the intake
-    table is "delete is only for super admin and underwriting, nobody else"."""
+    The operation is intentionally a reversible archive. It never deletes S3
+    objects or bucket-scoped underwriting history. The exact-name check still
+    protects against archiving the wrong file, and the record remains visible
+    through the archived filter and restore endpoint.
+    """
     _require_intake_operator(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
-    # A sent or executed Production Package is a retained record; the file
-    # cannot be hard-deleted underneath it (409 with the reason).
+    # Preserve the existing retained-record guard for sent/executed packages.
     from app.models.application_profile import ApplicationProfile as _ProfileForGuard
     from app.services.production_signing import delete_guard as _production_delete_guard
 
@@ -8723,29 +8774,67 @@ async def admin_confirm_lead_deletion(
     ).scalar_one_or_none()
     if _guard_profile is not None:
         await _production_delete_guard(db, _guard_profile)
-    # One-click desk delete: no prior request flag and no typed-name
-    # required — the frontend danger dialog is the safeguard. (Brokers still
-    # can only request; only a super admin or an underwriter reaches this
-    # hard-delete.)
-    confirm_target = (intake.business_name or intake.full_name or "").strip().lower()
+    confirm_target = " ".join((intake.business_name or intake.full_name or "").split())
+    if payload.confirm_name.casefold() != confirm_target.casefold():
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Confirmation name does not match this AI Intake file",
+        )
 
-    for file in intake.bucket.files:
-        status_result = _delete_s3_object(file.s3_key)
-        if status_result != "deleted":
-            log.warning("hard-delete: S3 object delete failed for BucketFile id=%s key=%s", file.id, file.s3_key)
-    artifacts = await _management_artifacts(db, intake.id)
-    for artifact in artifacts:
-        if artifact.s3_key:
-            status_result = _delete_s3_object(artifact.s3_key)
-            if status_result != "deleted":
-                log.warning("hard-delete: S3 object delete failed for artifact id=%s key=%s", artifact.id, artifact.s3_key)
+    archived_at = _now()
+    state = dict(intake.intake_state or {})
+    state["_archive"] = {
+        "bucket_status": intake.bucket.status,
+        "archived_at": archived_at.isoformat(),
+        "archived_by_user_id": str(user.id),
+    }
+    intake.intake_state = state
+    intake.bucket.archived_at = archived_at
+    intake.bucket.status = "archived"
 
-    log.warning(
-        "hard-delete: %s=%s (%s) permanently deleted dealer AI lead id=%s bucket_id=%s email=%s name=%s requested_by=%s at=%s ip=%s",
-        str(user.role), user.id, user.email, intake.id, intake.bucket_id, intake.email, confirm_target,
-        intake.delete_requested_by_user_id, intake.delete_requested_at, _client_ip(request),
+    archive_event = AIAuditEvent(
+        event_type="intake_archived",
+        actor_type="user",
+        actor_id=user.id,
+        client_id=intake.client_id,
+        loan_id=(
+            await db.execute(
+                select(_ProfileForGuard.loan_id).where(_ProfileForGuard.intake_id == intake.id)
+            )
+        ).scalar_one_or_none(),
+        payload={
+            "intake_id": str(intake.id),
+            "bucket_id": str(intake.bucket_id),
+            "variant": intake.variant,
+            "business_name": intake.business_name,
+            "full_name": intake.full_name,
+            "email": intake.email,
+            "phone": intake.phone,
+            "status": intake.status,
+            "confirmed_name": payload.confirm_name,
+            "requested_by_user_id": str(intake.delete_requested_by_user_id) if intake.delete_requested_by_user_id else None,
+            "requested_at": intake.delete_requested_at.isoformat() if intake.delete_requested_at else None,
+            "actor_email": user.email,
+            "ip": _client_ip(request),
+            "files": [
+                {"id": str(file.id), "name": file.file_name, "size_bytes": file.size_bytes}
+                for file in intake.bucket.files
+            ],
+        },
     )
-    await db.delete(intake.bucket)
+    intake.delete_requested_at = None
+    intake.delete_requested_by_user_id = None
+    db.add(archive_event)
+    await _log(
+        db,
+        intake.bucket_id,
+        "dealer_ai_lead_archived",
+        request=request,
+        user=user,
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=confirm_target,
+    )
     await db.commit()
 
 

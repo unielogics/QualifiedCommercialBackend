@@ -269,6 +269,8 @@ class PipelineMoveRequest(BaseModel):
     target_status: UnderwritingLifecycleStatus
     note: str | None = Field(default=None, max_length=1000)
     expected_status: UnderwritingLifecycleStatus | None = None
+    approved_amount: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    approved_dscr: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class PipelineMoveResult(BaseModel):
