@@ -2493,7 +2493,11 @@ async def delete_admin_file(
                 BucketFile.id == file_id,
                 BucketFile.bucket_id == bucket_id,
             )
-            .options(selectinload(BucketFile.shares), selectinload(BucketFile.vendor_access))
+            .options(
+                selectinload(BucketFile.shares),
+                selectinload(BucketFile.public_shares),
+                selectinload(BucketFile.vendor_access),
+            )
         )
     ).scalar_one_or_none()
     if file is None:
@@ -2509,8 +2513,15 @@ async def delete_admin_file(
         # the artifact's historical preview/download bytes.
         file.delete_storage_status = "retained_package_artifact"
     else:
-        file.delete_storage_status = _delete_s3_object(file.s3_key)
+        # Evidence removal is a recoverable trash operation. Keep the object in
+        # storage until a separately governed retention purge exists; deleting
+        # S3 here made the soft-deleted database row impossible to restore.
+        file.delete_storage_status = "retained_soft_delete"
     file.shares.clear()
+    # A restored file must not silently regain access through a no-login share
+    # that existed before it was moved to Deleted files. Restoring returns the
+    # evidence to the bucket only; sharing must always be granted explicitly.
+    file.public_shares.clear()
     file.vendor_access.clear()
     await _recalculate_requested_document_status(db, file.requested_document_id)
     await _log(
@@ -2524,6 +2535,73 @@ async def delete_admin_file(
         detail=f"{file.file_name} | storage={file.delete_storage_status}",
     )
     await db.commit()
+
+
+@router.get("/admin/{bucket_id}/deleted-files", response_model=list[BucketFileRead])
+async def list_deleted_admin_files(
+    bucket_id: UUID,
+    _: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> list[BucketFile]:
+    await _load_bucket_or_404(db, bucket_id)
+    return list(
+        (
+            await db.execute(
+                select(BucketFile)
+                .where(
+                    BucketFile.bucket_id == bucket_id,
+                    BucketFile.deleted_at.is_not(None),
+                )
+                .order_by(BucketFile.deleted_at.desc(), BucketFile.created_at.desc())
+            )
+        ).scalars().all()
+    )
+
+
+@router.post(
+    "/admin/{bucket_id}/files/{file_id}/restore",
+    response_model=BucketFileRead,
+)
+async def restore_admin_file(
+    bucket_id: UUID,
+    file_id: UUID,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    await _load_bucket_or_404(db, bucket_id)
+    file = await db.get(BucketFile, file_id)
+    if file is None or file.bucket_id != bucket_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
+    if file.deleted_at is None:
+        return file
+    if file.delete_storage_status not in {
+        "retained_soft_delete",
+        "retained_package_artifact",
+    }:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This historical file predates recovery retention and its stored bytes are unavailable",
+        )
+
+    prior_storage_status = file.delete_storage_status
+    file.deleted_at = None
+    file.deleted_by_user_id = None
+    file.delete_storage_status = None
+    await _recalculate_requested_document_status(db, file.requested_document_id)
+    await _log(
+        db,
+        bucket_id,
+        "file_restored",
+        request=request,
+        user=user,
+        target_type="file",
+        target_id=str(file.id),
+        detail=f"{file.file_name} | storage={prior_storage_status}",
+    )
+    await db.commit()
+    await db.refresh(file)
+    return file
 
 
 @router.get("/admin/{bucket_id}/files/{file_id}/url", response_model=BucketFileUrl)
