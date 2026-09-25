@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from math import isfinite
 from typing import Any
 from uuid import UUID, uuid4
@@ -62,6 +62,8 @@ from app.schemas.operator_file import (
     UnifiedDocumentProgress,
     UnifiedDocumentRequirement,
     UnifiedFileDetail,
+    UnifiedFileEconomicsPatch,
+    UnifiedFileEconomicsRead,
     UnifiedFilePage,
     UnifiedFileRow,
     UnifiedGate,
@@ -144,6 +146,14 @@ OPEN_PIPELINE_LIFECYCLE = [
     "approved",
     "closed_won",
 ]
+PIPELINE_ECONOMICS_GROUPS = {
+    "submitted": "requested",
+    "collecting_docs": "requested",
+    "in_underwriting": "underwriting",
+    "term_sheet_provided": "underwriting",
+    "approved": "approved",
+    "closed_won": "funded",
+}
 LOAN_STAGE_TO_UNDERWRITING = {
     "prequalified": "submitted",
     "collecting_docs": "collecting_docs",
@@ -354,6 +364,55 @@ def _money(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _decimal_amount(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        amount = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not amount.is_finite() or amount < 0:
+        return None
+    return amount
+
+
+def _money_float(value: Decimal | None) -> float | None:
+    if value is None:
+        return None
+    return float(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _forecast_values(
+    *,
+    status_value: str,
+    requested_amount: Any,
+    approved_amount: Any,
+    funded_amount: Any,
+    fee_points: Any,
+) -> tuple[str | None, float | None, float | None]:
+    group = PIPELINE_ECONOMICS_GROUPS.get(status_value)
+    basis = {
+        "requested": "requested",
+        "underwriting": "requested",
+        "approved": "approved",
+        "funded": "funded",
+    }.get(group)
+    amount = _decimal_amount(
+        {
+            "requested": requested_amount,
+            "approved": approved_amount,
+            "funded": funded_amount,
+        }.get(basis)
+    )
+    points = _decimal_amount(fee_points)
+    earnings = (
+        amount * points / Decimal("100")
+        if amount is not None and points is not None
+        else None
+    )
+    return basis, _money_float(amount), _money_float(earnings)
 
 
 def _positive_money(value: Any) -> float | None:
@@ -1068,9 +1127,41 @@ async def _decorate_pipeline_state(
 ) -> None:
     profile_map = await _profile_map_for_rows(rows, db)
     team_map = await _team_names_for_profiles(db, {p.id for p in profile_map.values()})
+    loan_ids = {row.loan_id for row in rows if row.loan_id}
+    loan_amounts = {
+        loan_id: amount
+        for loan_id, amount in (
+            (
+                await db.execute(
+                    select(Loan.id, Loan.amount).where(Loan.id.in_(loan_ids))
+                )
+            ).all()
+            if loan_ids
+            else []
+        )
+    }
+    dealer_ids = {row.dealer_id for row in rows if row.dealer_id}
+    dealer_amounts = {
+        dealer_id: (requested_amount, funding_goal, funded_amount)
+        for dealer_id, requested_amount, funding_goal, funded_amount in (
+            (
+                await db.execute(
+                    select(
+                        DealerBusiness.id,
+                        DealerBusiness.client_requested_amount,
+                        DealerBusiness.funding_goal,
+                        DealerBusiness.funded_amount,
+                    ).where(DealerBusiness.id.in_(dealer_ids))
+                )
+            ).all()
+            if dealer_ids
+            else []
+        )
+    }
     for row in rows:
         profile = _profile_for_row(row, profile_map)
         status_value = _pipeline_status_for_row(row, profile)
+        can_view_economics = user.role in INTERNAL_ROLES
         team = team_map.get(profile.id) if profile else None
         # The file's team (services/file_team). A seat is persisted the first
         # time the desk opens the file; until then the row's own owner/rep
@@ -1081,7 +1172,48 @@ async def _decorate_pipeline_state(
         row.company_name = (team or {}).get("company")
         row.pipeline_status = status_value  # type: ignore[assignment]
         row.underwriting_status = status_value  # type: ignore[assignment]
+        row.profile_id = profile.id if profile and can_view_economics else None
+        requested_amount = row.amount
+        if row.dealer_id in dealer_amounts:
+            dealer_requested, dealer_goal, _dealer_funded = dealer_amounts[row.dealer_id]
+            requested_amount = (
+                dealer_requested if dealer_requested is not None else dealer_goal
+            )
+        row.requested_amount = _money(requested_amount) if can_view_economics else None
         row.approved_amount = _money(profile.underwriting_approved_amount) if profile else None
+        funded_amount = profile.underwriting_funded_amount if profile else None
+        if funded_amount is None and row.dealer_id in dealer_amounts:
+            funded_amount = dealer_amounts[row.dealer_id][2]
+        if (
+            funded_amount is None
+            and status_value == "closed_won"
+            and row.loan_id in loan_amounts
+        ):
+            funded_amount = loan_amounts[row.loan_id]
+        row.funded_amount = _money(funded_amount) if can_view_economics else None
+        row.forecast_fee_points = (
+            float(profile.forecast_fee_points)
+            if can_view_economics and profile and profile.forecast_fee_points is not None
+            else None
+        )
+        row.estimated_close_date = (
+            profile.estimated_close_date if can_view_economics and profile else None
+        )
+        if can_view_economics:
+            basis, forecast_amount, forecast_earnings = _forecast_values(
+                status_value=status_value,
+                requested_amount=row.requested_amount,
+                approved_amount=row.approved_amount,
+                funded_amount=row.funded_amount,
+                fee_points=row.forecast_fee_points,
+            )
+            row.forecast_amount_basis = basis  # type: ignore[assignment]
+            row.forecast_amount = forecast_amount
+            row.forecast_earnings = forecast_earnings
+        else:
+            row.forecast_amount_basis = None
+            row.forecast_amount = None
+            row.forecast_earnings = None
         row.approved_dscr = (
             float(profile.underwriting_approved_dscr)
             if profile and profile.underwriting_approved_dscr is not None
@@ -1170,10 +1302,59 @@ def _apply_filters(
     return filtered
 
 
-def _rollup(rows: list[UnifiedFileRow]) -> UnifiedRollup:
+def _rollup(
+    rows: list[UnifiedFileRow], *, include_pipeline_economics: bool = True
+) -> UnifiedRollup:
     by_vertical = Counter(row.vertical for row in rows)
     by_origin = Counter(row.origin for row in rows)
     by_stage = Counter(row.pipeline_status or row.normalized_stage for row in rows)
+    economics = {
+        key: {
+            "count": 0,
+            "value": Decimal("0"),
+            "forecasted_count": 0,
+            "forecast_earnings": Decimal("0"),
+        }
+        for key in ("requested", "underwriting", "approved", "funded")
+    }
+    seen_files: set[str] = set()
+    for row in rows if include_pipeline_economics else []:
+        # A document room is an operational workspace, not an additional
+        # financial opportunity. Only canonical profile lineage participates
+        # in value and earnings rollups.
+        if row.profile_id is None:
+            continue
+        group = PIPELINE_ECONOMICS_GROUPS.get(row.pipeline_status or "")
+        if group is None:
+            continue
+        logical_id = f"profile:{row.profile_id}"
+        if logical_id in seen_files:
+            continue
+        seen_files.add(logical_id)
+        bucket = economics[group]
+        bucket["count"] += 1
+        amount = _decimal_amount(row.forecast_amount)
+        if amount is not None:
+            bucket["value"] += amount
+        if row.forecast_fee_points is not None:
+            bucket["forecasted_count"] += 1
+            earnings = _decimal_amount(row.forecast_earnings)
+            if earnings is not None:
+                bucket["forecast_earnings"] += earnings
+    pipeline_economics = {
+        key: {
+            "count": int(bucket["count"]),
+            "value": _money_float(bucket["value"]) or 0,
+            "forecasted_count": int(bucket["forecasted_count"]),
+            "forecast_coverage_pct": round(
+                int(bucket["forecasted_count"]) * 100 / int(bucket["count"]), 1
+            )
+            if bucket["count"]
+            else 0,
+            "forecast_earnings": _money_float(bucket["forecast_earnings"]) or 0,
+        }
+        for key, bucket in economics.items()
+    }
     return UnifiedRollup(
         total=len(rows),
         by_vertical=dict(by_vertical),
@@ -1187,6 +1368,7 @@ def _rollup(rows: list[UnifiedFileRow]) -> UnifiedRollup:
                 if row.funding_stage is not None or row.promoted_loan_id is not None
             ]
         ),
+        pipeline_economics=pipeline_economics,
     )
 
 
@@ -1203,9 +1385,123 @@ async def list_operator_files(
     rows = _apply_filters(rows, vertical=vertical, origin=origin, q=q)
     return UnifiedFilePage(
         items=rows[:limit],
-        rollup=_rollup(rows),
+        rollup=_rollup(
+            rows, include_pipeline_economics=user.role in INTERNAL_ROLES
+        ),
         limit=limit,
         filters={"vertical": vertical, "origin": origin, "q": q},
+    )
+
+
+def _economics_read(
+    row: UnifiedFileRow,
+    *,
+    source_kind: str,
+    source_id: UUID,
+    profile: ApplicationProfile,
+) -> UnifiedFileEconomicsRead:
+    return UnifiedFileEconomicsRead(
+        source_kind=source_kind,  # type: ignore[arg-type]
+        source_id=source_id,
+        profile_id=profile.id,
+        pipeline_status=(row.pipeline_status or "collecting_docs"),  # type: ignore[arg-type]
+        requested_amount=row.requested_amount,
+        approved_amount=row.approved_amount,
+        funded_amount=row.funded_amount,
+        forecast_fee_points=row.forecast_fee_points,
+        forecast_amount=row.forecast_amount,
+        forecast_amount_basis=row.forecast_amount_basis,
+        forecast_earnings=row.forecast_earnings,
+        estimated_close_date=row.estimated_close_date,
+        updated_at=profile.updated_at,
+    )
+
+
+@router.patch(
+    "/{source_kind}/{source_id}/economics",
+    response_model=UnifiedFileEconomicsRead,
+)
+async def update_operator_file_economics(
+    source_kind: str,
+    source_id: UUID,
+    payload: UnifiedFileEconomicsPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> UnifiedFileEconomicsRead:
+    """Update the internal revenue forecast on the canonical application profile."""
+
+    _require_internal(user)
+    normalized_kind = _normalize_pipeline_source_kind(source_kind)
+    profile = await profiles.resolve_profile(db, normalized_kind, source_id, user)
+    changes = payload.model_dump(exclude_unset=True)
+    if "forecast_fee_points" in changes:
+        value = changes["forecast_fee_points"]
+        profile.forecast_fee_points = Decimal(str(value)) if value is not None else None
+    if "estimated_close_date" in changes:
+        profile.estimated_close_date = changes["estimated_close_date"]
+    if "funded_amount" in changes:
+        value = changes["funded_amount"]
+        profile.underwriting_funded_amount = (
+            Decimal(str(value)) if value is not None else None
+        )
+    if changes:
+        profile.underwriting_updated_by_user_id = user.id
+        profile.underwriting_updated_at = datetime.now(UTC)
+        audit_changes = {
+            key: value.isoformat() if hasattr(value, "isoformat") else value
+            for key, value in changes.items()
+        }
+        await profiles.log_profile_action(
+            db,
+            profile,
+            user,
+            "pipeline.economics_updated",
+            "Updated QC revenue forecast and estimated closing",
+            target_type="application_profile",
+            target_id=profile.id,
+            metadata={
+                "changes": audit_changes,
+                "source_kind": normalized_kind,
+                "source_id": str(source_id),
+            },
+        )
+        if profile.loan_id:
+            await log_activity(
+                db,
+                loan_id=profile.loan_id,
+                actor_id=user.id,
+                actor_label=_role_value(user),
+                kind="pipeline.economics_updated",
+                summary="Updated QC revenue forecast and estimated closing",
+                payload={
+                    "profile_id": str(profile.id),
+                    "changes": audit_changes,
+                    "source_kind": normalized_kind,
+                    "source_id": str(source_id),
+                },
+            )
+    await db.commit()
+    await db.refresh(profile)
+
+    rows = await _all_rows(user, db)
+    row = next(
+        (
+            item
+            for item in rows
+            if _row_matches_source(item, normalized_kind, source_id)
+        ),
+        None,
+    )
+    if row is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "File forecast was saved, but the file is no longer visible",
+        )
+    return _economics_read(
+        row,
+        source_kind=normalized_kind,
+        source_id=source_id,
+        profile=profile,
     )
 
 

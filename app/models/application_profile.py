@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     Boolean,
@@ -37,6 +38,7 @@ class ApplicationProfile(TimestampMixin, Base):
         Index("ix_application_profiles_client", "client_id"),
         Index("ix_application_profiles_bucket", "primary_bucket_id"),
         Index("ix_application_profiles_underwriting_status", "underwriting_status"),
+        Index("ix_application_profiles_estimated_close_date", "estimated_close_date"),
         CheckConstraint(
             "plaid_assets_enabled OR plaid_statements_enabled",
             name="ck_application_profiles_plaid_product_enabled",
@@ -44,6 +46,15 @@ class ApplicationProfile(TimestampMixin, Base):
         CheckConstraint(
             "program_selection_mode IN ('auto', 'manual')",
             name="ck_application_profiles_program_selection_mode",
+        ),
+        CheckConstraint(
+            "forecast_fee_points IS NULL OR "
+            "(forecast_fee_points >= 0 AND forecast_fee_points <= 100)",
+            name="ck_application_profiles_forecast_fee_points",
+        ),
+        CheckConstraint(
+            "underwriting_funded_amount IS NULL OR underwriting_funded_amount >= 0",
+            name="ck_application_profiles_underwriting_funded_amount",
         ),
     )
 
@@ -139,6 +150,7 @@ class ApplicationProfile(TimestampMixin, Base):
         String(32), nullable=False, default="collecting_docs", server_default="collecting_docs"
     )
     underwriting_approved_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    underwriting_funded_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
     underwriting_term_sheet_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
     underwriting_current_dscr: Mapped[float | None] = mapped_column(Numeric(8, 4))
     underwriting_target_dscr: Mapped[float | None] = mapped_column(Numeric(8, 4))
@@ -149,6 +161,11 @@ class ApplicationProfile(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
     underwriting_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Internal QC revenue forecast. One point is one percent of the lifecycle-
+    # appropriate amount; this is intentionally separate from borrower pricing
+    # and lender discount/origination fields on Loan.
+    forecast_fee_points: Mapped[Decimal | None] = mapped_column(Numeric(7, 4))
+    estimated_close_date: Mapped[date | None] = mapped_column(Date)
     program_selection_mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default="auto", server_default="auto"
     )

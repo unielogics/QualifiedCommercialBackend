@@ -19,8 +19,10 @@ from __future__ import annotations
 
 # FastAPI dependencies and query declarations intentionally use callable defaults.
 # ruff: noqa: B008
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import status as http_status
@@ -30,14 +32,21 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
-from app.dealer_os.models import AppointmentOutcomeDefinition, DealerRepAppointment
+from app.dealer_os.models import (
+    AppointmentOutcomeDefinition,
+    DealerBusiness,
+    DealerRepAppointment,
+)
 from app.deps import CurrentUser
 from app.enums import CalendarEventSource, CalendarEventStatus, Role
 from app.models.activity import Activity
+from app.models.application_profile import ApplicationProfile
 from app.models.booking_settings import BookingSettings
 from app.models.client import Client
+from app.models.deal import Deal
 from app.models.event import CalendarEvent
 from app.models.loan import Loan
+from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.schemas.event import (
     AppointmentOutcomeDefinitionCreate,
@@ -56,6 +65,7 @@ from app.schemas.event import (
 from app.scoping import regional_manager_broker_ids_subquery, scope_loan_query
 from app.services import calendar_v2
 from app.services.activity_log import filter_payload_for_audience, is_visible_to
+from app.services.team_calendar import effective_booking_settings, team_calendar_host
 
 router = APIRouter(prefix="/calendar", tags=["calendar"])
 
@@ -75,6 +85,8 @@ APPOINTMENT_TYPE_KEYS = (
     "signing",
     "lender_call",
 )
+
+TERMINAL_PIPELINE_STATUSES = {"closed_lost", "denied"}
 
 
 def _require_calendar_v2(user: User) -> None:
@@ -112,6 +124,279 @@ def _workspace_color(kind: str, crm_status: str | None) -> str:
     }.get(kind, "blue")
 
 
+def _scope_estimated_closing_profiles(user: User, stmt: Select) -> Select:
+    """Scope projected closing milestones to the operator's actual book.
+
+    These milestones contain internal revenue forecasts.  They intentionally
+    do not inherit the broader client/broker calendar visibility rules.
+    """
+
+    if user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        return stmt
+    if user.role == Role.FIELD_REP:
+        owned_loans = select(Loan.id).where(Loan.assigned_owner_id == user.id)
+        owned_deals = select(Deal.id).where(Deal.assigned_agent_id == user.id)
+        owned_intakes = select(PublicUnderwritingIntake.id).where(
+            or_(
+                PublicUnderwritingIntake.broker_id == user.id,
+                PublicUnderwritingIntake.source_user_id == user.id,
+                PublicUnderwritingIntake.assigned_underwriter_user_id == user.id,
+            )
+        )
+        owned_dealers = select(DealerBusiness.id).where(
+            DealerBusiness.owner_user_id == user.id
+        )
+        return stmt.where(
+            or_(
+                ApplicationProfile.loan_id.in_(owned_loans),
+                ApplicationProfile.deal_id.in_(owned_deals),
+                ApplicationProfile.intake_id.in_(owned_intakes),
+                ApplicationProfile.dealer_id.in_(owned_dealers),
+            )
+        )
+    return stmt.where(sql_false())
+
+
+def _safe_timezone(value: str | None) -> ZoneInfo:
+    try:
+        return ZoneInfo(value or "America/New_York")
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("America/New_York")
+
+
+def _local_calendar_date(value: datetime, timezone: ZoneInfo) -> date:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(timezone).date()
+
+
+def _exclusive_local_calendar_date(value: datetime, timezone: ZoneInfo) -> date:
+    """Translate an API end timestamp into an exclusive local date bound."""
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    local_value = value.astimezone(timezone)
+    if local_value.timetz().replace(tzinfo=None) != time.min:
+        return local_value.date() + timedelta(days=1)
+    return local_value.date()
+
+
+def _forecast_amount(
+    profile: ApplicationProfile,
+    *,
+    requested_amount: Decimal | float | int | None,
+    funded_amount: Decimal | float | int | None,
+) -> tuple[float | None, str]:
+    """Choose the amount represented by this lifecycle stage."""
+
+    def first(*values: Decimal | float | int | None) -> Decimal | float | int | None:
+        return next((value for value in values if value is not None), None)
+
+    if profile.underwriting_status == "closed_won":
+        raw_amount = first(
+            funded_amount,
+            profile.underwriting_approved_amount,
+            profile.underwriting_term_sheet_amount,
+            requested_amount,
+        )
+        basis = "funded"
+    elif profile.underwriting_status == "approved":
+        raw_amount = first(
+            profile.underwriting_approved_amount,
+            profile.underwriting_term_sheet_amount,
+            requested_amount,
+        )
+        basis = "approved"
+    else:
+        raw_amount = requested_amount
+        basis = "requested"
+    return (float(raw_amount) if raw_amount is not None else None, basis)
+
+
+async def _estimated_closing_events(
+    db: AsyncSession,
+    user: User,
+    *,
+    from_: datetime,
+    to_: datetime,
+    timezone_name: str,
+) -> list[CalendarWorkspaceEvent]:
+    """Project profile close dates without creating Google/calendar rows."""
+
+    timezone = _safe_timezone(timezone_name)
+    range_start = _local_calendar_date(from_, timezone)
+    range_end = _exclusive_local_calendar_date(to_, timezone)
+    profile_stmt = select(ApplicationProfile).where(
+        ApplicationProfile.estimated_close_date.is_not(None),
+        ApplicationProfile.estimated_close_date >= range_start,
+        ApplicationProfile.estimated_close_date < range_end,
+        ApplicationProfile.underwriting_status.not_in(TERMINAL_PIPELINE_STATUSES),
+    )
+    profiles = list(
+        (
+            await db.execute(
+                _scope_estimated_closing_profiles(user, profile_stmt).order_by(
+                    ApplicationProfile.estimated_close_date,
+                    ApplicationProfile.updated_at.desc(),
+                )
+            )
+        ).scalars().all()
+    )
+    if not profiles:
+        return []
+
+    loan_ids = {profile.loan_id for profile in profiles if profile.loan_id}
+    deal_ids = {profile.deal_id for profile in profiles if profile.deal_id}
+    intake_ids = {profile.intake_id for profile in profiles if profile.intake_id}
+    dealer_ids = {profile.dealer_id for profile in profiles if profile.dealer_id}
+
+    loans = {
+        row.id: row
+        for row in (
+            (await db.execute(select(Loan).where(Loan.id.in_(loan_ids)))).scalars().all()
+            if loan_ids
+            else []
+        )
+    }
+    deals = {
+        row.id: row
+        for row in (
+            (await db.execute(select(Deal).where(Deal.id.in_(deal_ids)))).scalars().all()
+            if deal_ids
+            else []
+        )
+    }
+    intakes = {
+        row.id: row
+        for row in (
+            (
+                await db.execute(
+                    select(PublicUnderwritingIntake).where(
+                        PublicUnderwritingIntake.id.in_(intake_ids)
+                    )
+                )
+            ).scalars().all()
+            if intake_ids
+            else []
+        )
+    }
+    dealers = {
+        row.id: row
+        for row in (
+            (
+                await db.execute(
+                    select(DealerBusiness).where(DealerBusiness.id.in_(dealer_ids))
+                )
+            ).scalars().all()
+            if dealer_ids
+            else []
+        )
+    }
+    client_ids = {row.client_id for row in loans.values() if row.client_id}
+    clients = {
+        row.id: row
+        for row in (
+            (await db.execute(select(Client).where(Client.id.in_(client_ids)))).scalars().all()
+            if client_ids
+            else []
+        )
+    }
+
+    events: list[CalendarWorkspaceEvent] = []
+    for profile in profiles:
+        loan = loans.get(profile.loan_id)
+        deal = deals.get(profile.deal_id)
+        intake = intakes.get(profile.intake_id)
+        dealer = dealers.get(profile.dealer_id)
+
+        if loan is not None:
+            source_kind, source_id = "loan", loan.id
+            source_url = f"/loans/{loan.id}"
+        elif intake is not None:
+            source_kind, source_id = "intake", intake.id
+            source_url = f"/admin/ai-underwriter-leads?lead={intake.id}"
+        elif dealer is not None:
+            source_kind, source_id = "dealer", dealer.id
+            source_url = "/pipeline"
+        elif deal is not None:
+            source_kind, source_id = "deal", deal.id
+            source_url = f"/deals/{deal.id}"
+        else:
+            # A profile may retain a source UUID after a record is archived.
+            # The projection stays useful, while navigation safely falls back.
+            source_kind = source_id = None
+            source_url = "/pipeline"
+
+        loan_client = clients.get(loan.client_id) if loan is not None else None
+        title = (
+            (dealer.name if dealer is not None else None)
+            or (intake.business_name or intake.full_name if intake is not None else None)
+            or (deal.title if deal is not None else None)
+            or (loan_client.name if loan_client is not None else None)
+            or (f"Loan {loan.deal_id}" if loan is not None else None)
+            or "Funding file"
+        )
+        requested_candidates = [
+            dealer.client_requested_amount if dealer is not None else None,
+            dealer.funding_goal if dealer is not None else None,
+            intake.requested_loan_amount if intake is not None else None,
+            loan.amount if loan is not None else None,
+            deal.target_price if deal is not None else None,
+            deal.list_price if deal is not None else None,
+        ]
+        requested_amount = next(
+            (value for value in requested_candidates if value is not None),
+            None,
+        )
+        funded_amount = dealer.funded_amount if dealer is not None else None
+        forecast_amount, amount_basis = _forecast_amount(
+            profile,
+            requested_amount=requested_amount,
+            funded_amount=funded_amount,
+        )
+        points = (
+            float(profile.forecast_fee_points)
+            if profile.forecast_fee_points is not None
+            else None
+        )
+        earnings = (
+            round(forecast_amount * points / 100, 2)
+            if forecast_amount is not None and points is not None
+            else None
+        )
+        starts_at = datetime.combine(
+            profile.estimated_close_date,
+            time.min,
+            tzinfo=timezone,
+        )
+        events.append(
+            CalendarWorkspaceEvent(
+                id=f"estimated_closing:{profile.id}",
+                event_type="estimated_closing",
+                profile_id=profile.id,
+                loan_id=profile.loan_id,
+                source_kind=source_kind,
+                source_id=source_id,
+                source_url=source_url,
+                title=title,
+                kind="estimated_closing",
+                starts_at=starts_at,
+                ends_at=starts_at + timedelta(days=1),
+                all_day=True,
+                status=profile.underwriting_status,
+                company=title,
+                has_outcome=False,
+                color="teal",
+                can_edit=False,
+                forecast_amount=forecast_amount,
+                forecast_amount_basis=amount_basis,
+                forecast_fee_points=points,
+                forecast_earnings=earnings,
+            )
+        )
+    return events
+
+
 def _scope_calendar_for_audience(user: User, stmt: Select) -> Select:
     """Single source of truth for who-sees-what on the calendar.
     Centralized to make the privacy invariant testable in one place
@@ -142,12 +427,29 @@ def _scope_calendar_for_audience(user: User, stmt: Select) -> Select:
             (CalendarEvent.loan_id.in_(loans_subq))
             | ((CalendarEvent.loan_id == None) & (CalendarEvent.owner_user_id == user.id))  # noqa: E711
         )
+    if user.role == Role.FIELD_REP:
+        assigned_deals = select(Deal.id).where(Deal.assigned_agent_id == user.id)
+        assigned_loans = select(Loan.id).where(
+            or_(
+                Loan.assigned_owner_id == user.id,
+                Loan.source_deal_id.in_(assigned_deals),
+            )
+        )
+        return stmt.where(
+            or_(
+                CalendarEvent.loan_id.in_(assigned_loans),
+                CalendarEvent.owner_user_id == user.id,
+            )
+        )
     if user.role in {Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER}:
         # No book-of-business, no calendar of their own -- deny by default
         # rather than falling through to LOAN_EXEC's firm-wide visibility.
         return stmt.where(sql_false())
-    # LOAN_EXEC keeps firm-wide operator visibility.
-    return stmt
+    if user.role == Role.LOAN_EXEC:
+        return stmt
+    # Never grant firm-wide visibility to a newly added or unsupported role by
+    # falling through this access-control helper.
+    return stmt.where(sql_false())
 
 
 def _actor_label(user: User) -> str:
@@ -171,7 +473,20 @@ def _scope_activity_for_audience(user: User, stmt: Select) -> Select:
         loans_subq = select(Loan.id).where(Loan.broker_id.in_(broker_ids))
         clients_subq = select(Client.id).where(Client.broker_id.in_(regional_manager_broker_ids_subquery(user)))
         return stmt.where(or_(Activity.client_id.in_(clients_subq), Activity.loan_id.in_(loans_subq)))
-    return stmt
+    if user.role == Role.FIELD_REP:
+        assigned_deals = select(Deal.id).where(Deal.assigned_agent_id == user.id)
+        assigned_loans = select(Loan.id).where(
+            or_(
+                Loan.assigned_owner_id == user.id,
+                Loan.source_deal_id.in_(assigned_deals),
+            )
+        )
+        return stmt.where(
+            or_(Activity.actor_id == user.id, Activity.loan_id.in_(assigned_loans))
+        )
+    if user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        return stmt
+    return stmt.where(sql_false())
 
 
 @router.get("", response_model=list[CalendarEventRead])
@@ -213,6 +528,26 @@ async def get_calendar_workspace(
     if to_ - from_ > timedelta(days=370):
         raise HTTPException(http_status.HTTP_422_UNPROCESSABLE_ENTITY, "Calendar range cannot exceed 370 days")
 
+    booking = (
+        await db.execute(select(BookingSettings).where(BookingSettings.user_id == user.id))
+    ).scalar_one_or_none()
+    if booking is not None:
+        effective_booking = await effective_booking_settings(db, booking)
+    else:
+        try:
+            firm_host = await team_calendar_host(db)
+        except RuntimeError:
+            effective_booking = None
+        else:
+            effective_booking = (
+                await db.execute(
+                    select(BookingSettings).where(BookingSettings.user_id == firm_host.id)
+                )
+            ).scalar_one_or_none()
+    timezone_name = (
+        effective_booking.timezone if effective_booking is not None else "America/New_York"
+    )
+
     appointment_stmt = (
         select(DealerRepAppointment)
         .where(
@@ -227,7 +562,12 @@ async def get_calendar_workspace(
             DealerRepAppointment.status != "cancelled",
         )
     if user.role == Role.FIELD_REP:
-        appointment_stmt = appointment_stmt.where(DealerRepAppointment.booked_by_user_id == user.id)
+        appointment_stmt = appointment_stmt.where(
+            or_(
+                DealerRepAppointment.owner_user_id == user.id,
+                DealerRepAppointment.booked_by_user_id == user.id,
+            )
+        )
     appointments = list((await db.execute(appointment_stmt)).scalars().all())
 
     events: list[CalendarWorkspaceEvent] = []
@@ -271,7 +611,11 @@ async def get_calendar_workspace(
                 has_outcome=has_outcome,
                 color=_workspace_color(kind, appointment.crm_status),
                 can_edit=user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}
-                or (user.role == Role.FIELD_REP and appointment.booked_by_user_id == user.id),
+                or (
+                    user.role == Role.FIELD_REP
+                    and user.id
+                    in {appointment.booked_by_user_id, appointment.owner_user_id}
+                ),
             )
         )
 
@@ -305,18 +649,24 @@ async def get_calendar_workspace(
                     can_edit=user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC},
                 )
             )
-    events.sort(key=lambda item: item.starts_at)
 
-    booking = (
-        await db.execute(select(BookingSettings).where(BookingSettings.user_id == user.id))
-    ).scalar_one_or_none()
+    estimated_closings = await _estimated_closing_events(
+        db,
+        user,
+        from_=from_,
+        to_=to_,
+        timezone_name=timezone_name,
+    )
+    events.extend(estimated_closings)
+    events.sort(key=lambda item: item.starts_at)
     return CalendarWorkspaceRead(
         range_start=from_,
         range_end=to_,
-        timezone=booking.timezone if booking else "America/New_York",
+        timezone=timezone_name,
         events=events,
         metrics=CalendarWorkspaceMetrics(
             appointments=len(appointments),
+            estimated_closings=len(estimated_closings),
             outcome_logged=outcome_logged,
             awaiting_outcome=awaiting_outcome,
             files_created=files_created,

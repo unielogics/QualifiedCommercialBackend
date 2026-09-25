@@ -7,7 +7,7 @@ their domain tables, but the dashboard reads them through one normalized shape.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
@@ -128,6 +128,7 @@ class UnifiedFileRow(BaseModel):
     intake_id: UUID | None = None
     bucket_id: UUID | None = None
     dealer_id: UUID | None = None
+    profile_id: UUID | None = None
     vertical: UnifiedVertical
     vertical_label: str
     origin: UnifiedOrigin
@@ -142,6 +143,13 @@ class UnifiedFileRow(BaseModel):
     pipeline_status: UnderwritingLifecycleStatus | None = None
     underwriting_status: UnderwritingLifecycleStatus | None = None
     approved_amount: float | None = None
+    requested_amount: float | None = None
+    funded_amount: float | None = None
+    forecast_fee_points: float | None = None
+    forecast_amount: float | None = None
+    forecast_amount_basis: Literal["requested", "approved", "funded"] | None = None
+    forecast_earnings: float | None = None
+    estimated_close_date: date | None = None
     approved_dscr: float | None = None
     can_move_pipeline: bool = False
     allowed_transitions: list[UnderwritingLifecycleStatus] = Field(default_factory=list)
@@ -224,6 +232,14 @@ class UnifiedFileRow(BaseModel):
         return "missing"
 
 
+class UnifiedPipelineEconomics(BaseModel):
+    count: int = 0
+    value: float = 0
+    forecasted_count: int = 0
+    forecast_coverage_pct: float = 0
+    forecast_earnings: float = 0
+
+
 class UnifiedRollup(BaseModel):
     total: int = 0
     by_vertical: dict[str, int] = Field(default_factory=dict)
@@ -231,6 +247,7 @@ class UnifiedRollup(BaseModel):
     by_stage: dict[str, int] = Field(default_factory=dict)
     needs_attention: int = 0
     promoted: int = 0
+    pipeline_economics: dict[str, UnifiedPipelineEconomics] = Field(default_factory=dict)
 
     @computed_field
     @property
@@ -282,6 +299,30 @@ class PipelineMoveResult(BaseModel):
     loan_stage: str | None = None
     created_loan: bool = False
     audit_id: UUID | None = None
+
+
+class UnifiedFileEconomicsPatch(BaseModel):
+    forecast_fee_points: float | None = Field(
+        default=None, ge=0, le=100, allow_inf_nan=False
+    )
+    estimated_close_date: date | None = None
+    funded_amount: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+
+class UnifiedFileEconomicsRead(BaseModel):
+    source_kind: UnifiedSourceKind
+    source_id: UUID
+    profile_id: UUID
+    pipeline_status: UnderwritingLifecycleStatus
+    requested_amount: float | None = None
+    approved_amount: float | None = None
+    funded_amount: float | None = None
+    forecast_fee_points: float | None = None
+    forecast_amount: float | None = None
+    forecast_amount_basis: Literal["requested", "approved", "funded"] | None = None
+    forecast_earnings: float | None = None
+    estimated_close_date: date | None = None
+    updated_at: datetime | None = None
 
 
 class UnifiedAuditItem(BaseModel):

@@ -10,7 +10,7 @@ from app.dealer_os.models import AppointmentOutcomeDefinition
 from app.enums import Role
 from app.models.user import User
 
-CALENDAR_V2_ROLES = {Role.SUPER_ADMIN, Role.LOAN_EXEC}
+CALENDAR_V2_ROLES = {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.FIELD_REP}
 FUNDING_FILE_ROLES = {Role.SUPER_ADMIN, Role.LOAN_EXEC}
 SHARED_OUTCOME_SCOPE = "shared"
 ALLOWED_OUTCOME_EFFECTS = {

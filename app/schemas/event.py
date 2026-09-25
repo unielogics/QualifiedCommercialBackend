@@ -143,14 +143,19 @@ class AppointmentOutcomeDefinitionRead(AppointmentOutcomeDefinitionBase):
 
 class CalendarWorkspaceEvent(BaseModel):
     id: str
-    event_type: Literal["appointment", "internal"]
+    event_type: Literal["appointment", "internal", "estimated_closing"]
     appointment_id: UUID | None = None
     calendar_event_id: UUID | None = None
     loan_id: UUID | None = None
+    profile_id: UUID | None = None
+    source_kind: Literal["loan", "deal", "intake", "dealer"] | None = None
+    source_id: UUID | None = None
+    source_url: str | None = None
     title: str
     kind: str
     starts_at: datetime
     ends_at: datetime
+    all_day: bool = False
     status: str
     crm_status: AppointmentCrmStatus | None = None
     invitee_name: str | None = None
@@ -160,10 +165,15 @@ class CalendarWorkspaceEvent(BaseModel):
     has_outcome: bool = False
     color: str = "blue"
     can_edit: bool = False
+    forecast_amount: float | None = None
+    forecast_amount_basis: str | None = None
+    forecast_fee_points: float | None = None
+    forecast_earnings: float | None = None
 
 
 class CalendarWorkspaceMetrics(BaseModel):
     appointments: int = 0
+    estimated_closings: int = 0
     outcome_logged: int = 0
     awaiting_outcome: int = 0
     files_created: int = 0

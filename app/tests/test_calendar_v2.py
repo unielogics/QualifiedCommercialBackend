@@ -1,9 +1,11 @@
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import select
 
 from app.dealer_os.router import _booking_review_row, _sort_calendar_file_options
 from app.dealer_os.router import router as dealer_router
@@ -13,6 +15,14 @@ from app.dealer_os.schemas import (
     RepAppointmentFileOption,
 )
 from app.enums import Role
+from app.models.application_profile import ApplicationProfile
+from app.models.event import CalendarEvent
+from app.routers.calendar import (
+    _exclusive_local_calendar_date,
+    _forecast_amount,
+    _scope_calendar_for_audience,
+    _scope_estimated_closing_profiles,
+)
 from app.routers.calendar import router as calendar_router
 from app.schemas.booking_settings import UserBookingSettingsUpdate
 from app.schemas.event import AppointmentOutcomeDefinitionCreate, AppointmentOutcomeDefinitionPatch
@@ -40,10 +50,10 @@ def test_calendar_v2_routes_are_registered() -> None:
     assert ("/dealer-os/calendar/file-options", "GET") in dealer_routes
 
 
-def test_calendar_v2_permissions_are_limited_to_privileged_operators() -> None:
+def test_calendar_v2_permissions_include_owned_field_desk_calendars() -> None:
     assert calendar_v2.can_use_calendar_v2(SimpleNamespace(role=Role.SUPER_ADMIN))
     assert calendar_v2.can_use_calendar_v2(SimpleNamespace(role=Role.LOAN_EXEC))
-    assert not calendar_v2.can_use_calendar_v2(SimpleNamespace(role=Role.FIELD_REP))
+    assert calendar_v2.can_use_calendar_v2(SimpleNamespace(role=Role.FIELD_REP))
     assert not calendar_v2.can_use_calendar_v2(SimpleNamespace(role=Role.CLIENT))
     assert calendar_v2.can_create_funding_file(SimpleNamespace(role=Role.SUPER_ADMIN))
     assert calendar_v2.can_create_funding_file(SimpleNamespace(role=Role.LOAN_EXEC))
@@ -51,6 +61,71 @@ def test_calendar_v2_permissions_are_limited_to_privileged_operators() -> None:
     assert calendar_v2.can_manage_outcome_catalog(SimpleNamespace(role=Role.SUPER_ADMIN))
     assert not calendar_v2.can_manage_outcome_catalog(SimpleNamespace(role=Role.LOAN_EXEC))
     assert not calendar_v2.can_manage_outcome_catalog(SimpleNamespace(role=Role.FIELD_REP))
+
+
+def test_field_rep_calendar_and_closing_forecast_scopes_are_owner_bound() -> None:
+    user = SimpleNamespace(role=Role.FIELD_REP, id=uuid4())
+    event_sql = str(
+        _scope_calendar_for_audience(user, select(CalendarEvent)).compile(
+            compile_kwargs={"literal_binds": False}
+        )
+    )
+    forecast_sql = str(
+        _scope_estimated_closing_profiles(user, select(ApplicationProfile)).compile(
+            compile_kwargs={"literal_binds": False}
+        )
+    )
+    assert "calendar_events.owner_user_id" in event_sql
+    assert "loans.assigned_owner_id" in event_sql
+    assert "application_profiles.loan_id IN" in forecast_sql
+    assert "application_profiles.deal_id IN" in forecast_sql
+    assert "application_profiles.intake_id IN" in forecast_sql
+    assert "application_profiles.dealer_id IN" in forecast_sql
+
+
+def test_unsupported_calendar_role_is_denied_instead_of_falling_through() -> None:
+    sql = str(
+        _scope_calendar_for_audience(
+            SimpleNamespace(role=Role.VENDOR, id=uuid4()),
+            select(CalendarEvent),
+        ).compile(compile_kwargs={"literal_binds": True})
+    )
+    assert "false" in sql.lower()
+
+
+def test_estimated_closing_amount_uses_stage_specific_basis() -> None:
+    profile = SimpleNamespace(
+        underwriting_status="collecting_docs",
+        underwriting_approved_amount=None,
+        underwriting_term_sheet_amount=None,
+    )
+    assert _forecast_amount(profile, requested_amount=250_000, funded_amount=None) == (
+        250_000.0,
+        "requested",
+    )
+    profile.underwriting_status = "approved"
+    profile.underwriting_approved_amount = 225_000
+    assert _forecast_amount(profile, requested_amount=250_000, funded_amount=None) == (
+        225_000.0,
+        "approved",
+    )
+    profile.underwriting_status = "closed_won"
+    assert _forecast_amount(profile, requested_amount=250_000, funded_amount=210_000) == (
+        210_000.0,
+        "funded",
+    )
+
+
+def test_estimated_closing_range_end_is_exclusive_without_dropping_partial_final_day() -> None:
+    eastern = ZoneInfo("America/New_York")
+    assert _exclusive_local_calendar_date(
+        datetime(2026, 9, 30, 0, 0, tzinfo=eastern),
+        eastern,
+    ) == date(2026, 9, 30)
+    assert _exclusive_local_calendar_date(
+        datetime(2026, 9, 30, 23, 59, tzinfo=eastern),
+        eastern,
+    ) == date(2026, 10, 1)
 
 
 def test_default_outcomes_cover_the_review_workflow() -> None:

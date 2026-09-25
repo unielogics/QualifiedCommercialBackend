@@ -84,6 +84,7 @@ class ApplicationProfileRead(BaseModel):
     bank_verification_override_reason: str | None = None
     underwriting_status: UnderwritingLifecycleStatus = "collecting_docs"
     underwriting_approved_amount: float | None = None
+    underwriting_funded_amount: float | None = None
     underwriting_term_sheet_amount: float | None = None
     underwriting_current_dscr: float | None = None
     underwriting_target_dscr: float | None = None
@@ -92,6 +93,8 @@ class ApplicationProfileRead(BaseModel):
     underwriting_notes: str | None = None
     underwriting_updated_by_user_id: UUID | None = None
     underwriting_updated_at: datetime | None = None
+    forecast_fee_points: float | None = None
+    estimated_close_date: date | None = None
     program_selection_mode: Literal["auto", "manual"] = "auto"
     program_selection_locked_at: datetime | None = None
     program_selection_locked_by_user_id: UUID | None = None
@@ -383,12 +386,15 @@ class ApplicationUnderwritingRead(BaseModel):
     loan_id: UUID | None = None
     underwriting_status: UnderwritingLifecycleStatus = "collecting_docs"
     approved_amount: float | None = None
+    funded_amount: float | None = None
     term_sheet_amount: float | None = None
     current_dscr: float | None = None
     target_dscr: float | None = None
     approved_dscr: float | None = None
     close_outcome: str | None = None
     reviewer_notes: str | None = None
+    forecast_fee_points: float | None = None
+    estimated_close_date: date | None = None
     updated_by_user_id: UUID | None = None
     updated_at: datetime | None = None
 
@@ -396,12 +402,17 @@ class ApplicationUnderwritingRead(BaseModel):
 class ApplicationUnderwritingPatch(BaseModel):
     underwriting_status: UnderwritingLifecycleStatus | None = None
     approved_amount: float | None = Field(default=None, ge=0)
+    funded_amount: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     term_sheet_amount: float | None = Field(default=None, ge=0)
     current_dscr: float | None = Field(default=None, ge=0)
     target_dscr: float | None = Field(default=None, ge=0)
     approved_dscr: float | None = Field(default=None, ge=0)
     close_outcome: str | None = Field(default=None, max_length=32)
     reviewer_notes: str | None = Field(default=None, max_length=5000)
+    forecast_fee_points: float | None = Field(
+        default=None, ge=0, le=100, allow_inf_nan=False
+    )
+    estimated_close_date: date | None = None
 
 
 class FileOwnerCreate(BaseModel):

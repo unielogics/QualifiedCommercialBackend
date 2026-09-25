@@ -8,6 +8,7 @@ import logging
 import re
 import secrets
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
@@ -649,12 +650,15 @@ def _underwriting_read(
         loan_id=profile.loan_id,
         underwriting_status=profile.underwriting_status,  # type: ignore[arg-type]
         approved_amount=profile.underwriting_approved_amount,
+        funded_amount=profile.underwriting_funded_amount,
         term_sheet_amount=profile.underwriting_term_sheet_amount,
         current_dscr=profile.underwriting_current_dscr,
         target_dscr=profile.underwriting_target_dscr,
         approved_dscr=profile.underwriting_approved_dscr,
         close_outcome=profile.underwriting_close_outcome,
         reviewer_notes=profile.underwriting_notes,
+        forecast_fee_points=profile.forecast_fee_points,
+        estimated_close_date=profile.estimated_close_date,
         updated_by_user_id=profile.underwriting_updated_by_user_id,
         updated_at=profile.underwriting_updated_at,
     )
@@ -818,6 +822,8 @@ async def apply_underwriting_changes(
             **changes,
             "approved_amount": float(profile.underwriting_term_sheet_amount),
         }
+    if "funded_amount" in changes:
+        profile.underwriting_funded_amount = changes["funded_amount"]
     if "term_sheet_amount" in changes:
         profile.underwriting_term_sheet_amount = changes["term_sheet_amount"]
     if "current_dscr" in changes:
@@ -830,6 +836,10 @@ async def apply_underwriting_changes(
         profile.underwriting_close_outcome = changes["close_outcome"]
     if "reviewer_notes" in changes:
         profile.underwriting_notes = changes["reviewer_notes"]
+    if "forecast_fee_points" in changes:
+        profile.forecast_fee_points = changes["forecast_fee_points"]
+    if "estimated_close_date" in changes:
+        profile.estimated_close_date = changes["estimated_close_date"]
     profile.underwriting_updated_by_user_id = user.id
     profile.underwriting_updated_at = now
 
@@ -849,7 +859,16 @@ async def apply_underwriting_changes(
         target_type="loan" if loan else "application_profile",
         target_id=loan.id if loan else profile.id,
         metadata={
-            "changes": changes,
+            "changes": {
+                key: (
+                    value.isoformat()
+                    if hasattr(value, "isoformat")
+                    else float(value)
+                    if isinstance(value, Decimal)
+                    else value
+                )
+                for key, value in changes.items()
+            },
             "loan_id": str(loan.id) if loan else None,
             "loan_stage": loan.stage.value if loan else None,
         },

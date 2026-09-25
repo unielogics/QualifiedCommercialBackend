@@ -7,6 +7,7 @@ from app.models.application_profile import ApplicationProfile
 from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile
 from app.routers.operator_files import (
     _collapse_logical_rows,
+    _forecast_values,
     _funding_stage,
     _pipeline_status_for_row,
     _reconcile_link_files,
@@ -86,6 +87,105 @@ def test_rollup_counts_pipeline_lifecycle_when_present():
     rollup = _rollup([row])
 
     assert rollup.by_stage == {"in_underwriting": 1}
+
+
+def _economics_row(
+    *,
+    status: str,
+    requested: float | None = None,
+    approved: float | None = None,
+    funded: float | None = None,
+    points: float | None = None,
+    profile_id=None,
+) -> UnifiedFileRow:
+    row = _row(vertical="dealer", origin="ai_intake", stage="Applicant intake")
+    row.profile_id = profile_id or uuid4()
+    row.pipeline_status = status  # type: ignore[assignment]
+    row.requested_amount = requested
+    row.approved_amount = approved
+    row.funded_amount = funded
+    row.forecast_fee_points = points
+    basis, amount, earnings = _forecast_values(
+        status_value=status,
+        requested_amount=requested,
+        approved_amount=approved,
+        funded_amount=funded,
+        fee_points=points,
+    )
+    row.forecast_amount_basis = basis  # type: ignore[assignment]
+    row.forecast_amount = amount
+    row.forecast_earnings = earnings
+    return row
+
+
+def test_pipeline_economics_use_lifecycle_amount_basis_and_one_point_is_one_percent():
+    rows = [
+        _economics_row(status="collecting_docs", requested=100_000, points=2),
+        _economics_row(status="in_underwriting", requested=200_000, points=1.5),
+        _economics_row(status="approved", approved=300_000, points=1),
+        _economics_row(status="closed_won", funded=400_000, points=0.5),
+    ]
+
+    economics = _rollup(rows).pipeline_economics
+
+    assert economics["requested"].count == 1
+    assert economics["requested"].value == 100_000
+    assert economics["requested"].forecast_earnings == 2_000
+    assert economics["underwriting"].value == 200_000
+    assert economics["underwriting"].forecast_earnings == 3_000
+    assert economics["approved"].value == 300_000
+    assert economics["approved"].forecast_earnings == 3_000
+    assert economics["funded"].value == 400_000
+    assert economics["funded"].forecast_earnings == 2_000
+
+
+def test_pipeline_economics_exclude_null_points_from_earnings_and_report_coverage():
+    rows = [
+        _economics_row(status="submitted", requested=100_000, points=2),
+        _economics_row(status="collecting_docs", requested=50_000),
+        _economics_row(status="denied", requested=900_000, points=10),
+    ]
+
+    economics = _rollup(rows).pipeline_economics
+
+    assert economics["requested"].count == 2
+    assert economics["requested"].value == 150_000
+    assert economics["requested"].forecasted_count == 1
+    assert economics["requested"].forecast_coverage_pct == 50
+    assert economics["requested"].forecast_earnings == 2_000
+    assert sum(bucket.count for bucket in economics.values()) == 2
+
+
+def test_pipeline_economics_deduplicate_rows_by_application_profile():
+    profile_id = uuid4()
+    primary = _economics_row(
+        status="approved", approved=125_000, points=2, profile_id=profile_id
+    )
+    duplicate = _economics_row(
+        status="approved", approved=125_000, points=2, profile_id=profile_id
+    )
+
+    approved = _rollup([primary, duplicate]).pipeline_economics["approved"]
+
+    assert approved.count == 1
+    assert approved.value == 125_000
+    assert approved.forecast_earnings == 2_500
+
+
+def test_pipeline_economics_exclude_profileless_bucket_workspaces():
+    bucket = _row(vertical="dealer", origin="console", stage="Applicant intake")
+    bucket.source_kind = "bucket"
+    bucket.pipeline_status = "collecting_docs"
+    bucket.requested_amount = 500_000
+    bucket.forecast_amount = 500_000
+    bucket.forecast_fee_points = 2
+    bucket.forecast_earnings = 10_000
+
+    requested = _rollup([bucket]).pipeline_economics["requested"]
+
+    assert requested.count == 0
+    assert requested.value == 0
+    assert requested.forecast_earnings == 0
 
 
 def test_pipeline_status_prefers_profile_underwriting_lifecycle():
