@@ -88,6 +88,14 @@ class FundingProgramScopeWrite(BaseModel):
     industry_keys: list[str] = Field(default_factory=list, max_length=30)
     required_fact_keys: list[str] = Field(default_factory=list, max_length=20)
 
+    @field_validator("scope_key")
+    @classmethod
+    def _normalize_scope_key(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Routing reference cannot be blank")
+        return normalized
+
     @field_validator("naics_prefixes", "excluded_naics_prefixes")
     @classmethod
     def _valid_naics_prefixes(cls, values: list[str]) -> list[str]:
@@ -131,6 +139,40 @@ class FundingProgramScopeWrite(BaseModel):
         return normalized
 
 
+def _unique_scope_pairs(
+    rows: list[FundingProgramScopeWrite] | None,
+) -> list[FundingProgramScopeWrite] | None:
+    """Reject duplicate routing rows before the database unique constraint does.
+
+    The database protects ``(program_id, vertical, scope_key)``, but surfacing the
+    same rule during request validation gives the editor a useful 422 response
+    instead of an IntegrityError/500 after it has replaced the existing rows.
+    """
+
+    if rows is None:
+        return None
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        pair = (row.vertical, row.scope_key)
+        if pair in seen:
+            raise ValueError(
+                f"Duplicate workspace routing row: {row.vertical} / {row.scope_key}"
+            )
+        seen.add(pair)
+    return rows
+
+
+class _OptionalReviewReason(BaseModel):
+    reason: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _normalize_optional_reason(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+
 class FundingProgramCreate(BaseModel):
     program_key: str = Field(pattern=r"^[a-z0-9_]{2,64}$")
     public_slug: str = Field(pattern=r"^[a-z0-9-]{2,100}$")
@@ -140,6 +182,13 @@ class FundingProgramCreate(BaseModel):
     display_order: int = Field(default=100, ge=0, le=10000)
     scopes: list[FundingProgramScopeWrite] = Field(min_length=1, max_length=20)
     confirmed: Literal[True]
+
+    @field_validator("scopes")
+    @classmethod
+    def _validate_unique_scopes(
+        cls, rows: list[FundingProgramScopeWrite]
+    ) -> list[FundingProgramScopeWrite]:
+        return _unique_scope_pairs(rows) or []
 
 
 class FundingProgramRequirementWrite(BaseModel):
@@ -201,12 +250,11 @@ class FundingProgramRequirementWrite(BaseModel):
         return value
 
 
-class FundingProgramVersionCreate(BaseModel):
+class FundingProgramVersionCreate(_OptionalReviewReason):
     name: str | None = Field(default=None, max_length=160)
     description: str | None = Field(default=None, max_length=4000)
     rules: dict = Field(default_factory=dict)
     requirements: list[FundingProgramRequirementWrite] = Field(default_factory=list, max_length=100)
-    reason: str = Field(min_length=8, max_length=2000)
     confirmed: Literal[True]
 
     @field_validator("requirements")
@@ -223,24 +271,28 @@ class FundingProgramVersionCreate(BaseModel):
         return rows
 
 
-class FundingProgramPublishRequest(BaseModel):
-    reason: str = Field(min_length=8, max_length=2000)
+class FundingProgramPublishRequest(_OptionalReviewReason):
     confirmed: Literal[True]
 
 
-class FundingProgramRetireRequest(BaseModel):
+class FundingProgramRetireRequest(_OptionalReviewReason):
     retired: bool = True
-    reason: str = Field(min_length=8, max_length=2000)
     confirmed: Literal[True]
 
 
-class FundingProgramScopePatch(BaseModel):
+class FundingProgramScopePatch(_OptionalReviewReason):
     name: str | None = Field(default=None, min_length=2, max_length=160)
     short_description: str | None = Field(default=None, max_length=1000)
     display_order: int | None = Field(default=None, ge=0, le=10000)
     scopes: list[FundingProgramScopeWrite] | None = Field(default=None, min_length=1, max_length=20)
-    reason: str = Field(min_length=8, max_length=2000)
     confirmed: Literal[True]
+
+    @field_validator("scopes")
+    @classmethod
+    def _validate_unique_scopes(
+        cls, rows: list[FundingProgramScopeWrite] | None
+    ) -> list[FundingProgramScopeWrite] | None:
+        return _unique_scope_pairs(rows)
 
     @model_validator(mode="after")
     def _has_change(self) -> FundingProgramScopePatch:

@@ -23,11 +23,49 @@ from app.schemas.funding_program import (
     FundingProgramVersionRead,
     PublicFundingProgramCatalogItem,
 )
-from app.services.program_rules import validate_rules
+from app.services.program_rules import ProgramRuleError, validate_rules
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _audit_reason(reason: str | None, fallback: str) -> str:
+    """Keep the audit ledger descriptive without forcing an operator note."""
+
+    return (reason or "").strip() or fallback
+
+
+def _field_validation_detail(
+    *path: str,
+    message: str,
+    input_value: Any = None,
+) -> list[dict[str, Any]]:
+    """Return the same field-addressable shape as FastAPI request validation."""
+
+    return [
+        {
+            "type": "value_error",
+            "loc": ["body", *path],
+            "msg": message,
+            "input": input_value,
+        }
+    ]
+
+
+def _validate_program_rules_or_422(rules: dict[str, Any] | None) -> None:
+    try:
+        validate_rules(rules, enforce_supported_fields=True)
+    except ProgramRuleError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_field_validation_detail(
+                "rules",
+                "fit",
+                message=str(exc),
+                input_value=(rules or {}).get("fit"),
+            ),
+        ) from exc
 
 
 def _version_read(
@@ -376,7 +414,10 @@ async def update_program(
             payload={
                 "program_key": program.program_key,
                 "before": before,
-                "reason": payload.reason,
+                "reason": _audit_reason(
+                    payload.reason,
+                    "Program details and availability updated",
+                ),
             },
         )
     )
@@ -388,7 +429,7 @@ async def create_version(
     payload: FundingProgramVersionCreate,
     user: User,
 ) -> AIPlaybookTemplate:
-    validate_rules(payload.rules, enforce_supported_fields=True)
+    _validate_program_rules_or_422(payload.rules)
     latest_version = (
         await db.execute(
             select(AIPlaybookTemplate.version)
@@ -440,7 +481,10 @@ async def create_version(
             actor_label="super_admin",
             kind="funding_program.version_created",
             summary=f"Created draft version {playbook.version} for {program.name}",
-            payload={"program_key": program.program_key, "reason": payload.reason},
+            payload={
+                "program_key": program.program_key,
+                "reason": _audit_reason(payload.reason, "Criteria draft saved"),
+            },
         )
     )
     return playbook
@@ -450,7 +494,7 @@ async def publish_version(
     db: AsyncSession,
     program: FundingProgramCatalog,
     playbook_id: uuid.UUID,
-    reason: str,
+    reason: str | None,
     user: User,
 ) -> AIPlaybookTemplate:
     playbook = (
@@ -465,16 +509,29 @@ async def publish_version(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Program version not found")
     if playbook.status != "draft":
         raise HTTPException(status.HTTP_409_CONFLICT, "Only a draft version can be published")
-    validate_rules(playbook.rules, enforce_supported_fields=True)
+    _validate_program_rules_or_422(playbook.rules)
     if not (playbook.rules or {}).get("fit"):
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, "Publish requires a validated fit rule"
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_field_validation_detail(
+                "rules",
+                "fit",
+                message="Publish requires at least one validated eligibility rule",
+                input_value=(playbook.rules or {}).get("fit"),
+            ),
         )
     unresolved = (playbook.rules or {}).get("unresolved_review_items") or []
     if unresolved:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "Resolve every imported criteria review item in a new draft before publishing",
+            detail=_field_validation_detail(
+                "rules",
+                "unresolved_review_items",
+                message=(
+                    "Resolve every imported criteria review item in a new draft before publishing"
+                ),
+                input_value=unresolved,
+            ),
         )
     current = list(
         (
@@ -500,7 +557,10 @@ async def publish_version(
             actor_label="super_admin",
             kind="funding_program.published",
             summary=f"Published {program.name} version {playbook.version}",
-            payload={"program_key": program.program_key, "reason": reason},
+            payload={
+                "program_key": program.program_key,
+                "reason": _audit_reason(reason, "Criteria version published"),
+            },
         )
     )
     return playbook
@@ -521,6 +581,12 @@ async def retire_program(
             actor_label="super_admin",
             kind="funding_program.retired" if payload.retired else "funding_program.restored",
             summary=f"{'Retired' if payload.retired else 'Restored'} funding program {program.name}",
-            payload={"program_key": program.program_key, "reason": payload.reason},
+            payload={
+                "program_key": program.program_key,
+                "reason": _audit_reason(
+                    payload.reason,
+                    "Funding program retired" if payload.retired else "Funding program restored",
+                ),
+            },
         )
     )
