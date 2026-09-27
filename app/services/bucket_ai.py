@@ -3784,6 +3784,11 @@ async def _program_context_for_chat(
                         if item.requirement_key in definition_by_key
                         else ""
                     ),
+                    "review_checks": [
+                        dict(check) for definition in definitions
+                        if definition.requirement_key == item.requirement_key
+                        for check in (getattr(definition, "review_checks", None) or [])
+                    ],
                     "ai_request_message_template": (
                         definition_by_key[item.requirement_key].ai_request_message_template
                         if item.requirement_key in definition_by_key

@@ -6,6 +6,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
+from app.schemas.requirement_review import DocumentReviewCheck
+
 ApplicationSourceKind = Literal["deal", "loan", "intake", "dealer"]
 ApplicationVertical = Literal["real_estate", "main_street", "dealer", "mca"]
 UnderwritingLifecycleStatus = Literal[
@@ -203,6 +205,7 @@ class ApplicationRequirementRead(BaseModel):
     verified_coverage_complete: bool = False
     allow_multiple_files: bool = True
     verification_required: bool = False
+    review_checks: list[DocumentReviewCheck] = Field(default_factory=list)
     objective_text: str = ""
     completion_criteria: str = ""
     ai_request_message_template: str | None = None

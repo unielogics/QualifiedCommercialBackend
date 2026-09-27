@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -99,6 +99,11 @@ class AICollectionRequirement(TimestampMixin, Base):
 
     requirement_key: Mapped[str] = mapped_column(String(120), nullable=False)
     """Stable identifier — e.g. "purchase_contract", "buyer_agency_agreement"."""
+
+    review_checks: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    """Version-pinned staff checks. Readability alone never satisfies these checks."""
 
     label: Mapped[str] = mapped_column(String(200), nullable=False)
     category: Mapped[str] = mapped_column(String(40), nullable=False)

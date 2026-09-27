@@ -22,7 +22,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,6 +31,7 @@ from app.deps import CurrentUser
 from app.enums import Role
 from app.models.ai_cadence_rule import AICadenceRule
 from app.models.ai_playbook import AICollectionRequirement, AIPlaybookTemplate
+from app.schemas.requirement_review import DocumentReviewChecks
 from app.services.ai.audit import record_event
 from app.services.program_rules import ProgramRuleError, validate_rules
 
@@ -204,6 +205,7 @@ async def update_funding_playbook(
                 link_kind=r.link_kind,
                 objective_text=r.objective_text,
                 completion_criteria=r.completion_criteria,
+                review_checks=list(getattr(r, "review_checks", None) or []),
                 completion_mode=r.completion_mode,
                 wrong_upload_response_template=r.wrong_upload_response_template,
                 depends_on=list(r.depends_on or []),
@@ -305,6 +307,7 @@ async def duplicate_from_platform(
             link_kind=r.link_kind,
             objective_text=r.objective_text,
             completion_criteria=r.completion_criteria,
+            review_checks=list(getattr(r, "review_checks", None) or []),
             completion_mode=r.completion_mode,
             wrong_upload_response_template=r.wrong_upload_response_template,
             # Timeline + grouping (alembic 0040) — preserve dependency graph on copy
@@ -349,6 +352,7 @@ class RequirementOut(BaseModel):
     link_kind: str | None
     objective_text: str
     completion_criteria: str
+    review_checks: DocumentReviewChecks = Field(default_factory=list)
     completion_mode: str
     wrong_upload_response_template: str | None
     # Timeline + grouping (alembic 0040)
@@ -399,6 +403,7 @@ class RequirementUpsert(BaseModel):
     link_kind: _LinkKindLiteral | None = None
     objective_text: str = ""
     completion_criteria: str = ""
+    review_checks: DocumentReviewChecks = Field(default_factory=list)
     completion_mode: _CompletionModeLiteral = "ai_can_complete"
     wrong_upload_response_template: str | None = None
     # Timeline + grouping (alembic 0040). All optional on upsert.
@@ -473,6 +478,7 @@ async def upsert_requirement(
             link_kind=payload.link_kind,
             objective_text=payload.objective_text,
             completion_criteria=payload.completion_criteria,
+            review_checks=[check.model_dump() for check in payload.review_checks],
             completion_mode=payload.completion_mode,
             wrong_upload_response_template=payload.wrong_upload_response_template,
             # Timeline + grouping (alembic 0040)
@@ -867,6 +873,7 @@ def _serialize_requirement(r: AICollectionRequirement) -> RequirementOut:
         link_kind=r.link_kind,
         objective_text=r.objective_text or "",
         completion_criteria=r.completion_criteria or "",
+        review_checks=list(getattr(r, "review_checks", None) or []),
         completion_mode=r.completion_mode,
         wrong_upload_response_template=r.wrong_upload_response_template,
         # Timeline + grouping (alembic 0040).

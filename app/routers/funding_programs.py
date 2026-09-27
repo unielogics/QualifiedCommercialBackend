@@ -16,10 +16,13 @@ from app.schemas.funding_program import (
     FundingProgramPublishRequest,
     FundingProgramRetireRequest,
     FundingProgramScopePatch,
+    FundingProgramScopeWrite,
     FundingProgramVersionCreate,
     PublicFundingProgramCatalogItem,
 )
+from app.schemas.funding_program_baseline import FundingProgramBaselineRead
 from app.services import funding_programs
+from app.services.funding_program_baselines import suggested_baseline
 
 public_router = APIRouter(prefix="/public/funding-programs", tags=["funding-programs"])
 admin_router = APIRouter(prefix="/admin/funding-programs", tags=["funding-programs"])
@@ -38,6 +41,24 @@ async def list_admin_funding_programs(
     db: AsyncSession = Depends(get_db),
 ) -> list[FundingProgramCatalogItem]:
     return await funding_programs.admin_catalog(db)
+
+
+@admin_router.get("/{program_key}/baseline", response_model=FundingProgramBaselineRead)
+async def get_funding_program_baseline(
+    program_key: str,
+    _: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> FundingProgramBaselineRead:
+    """Read-only suggestion; loading never saves, publishes or changes live routing."""
+    program = await funding_programs.catalog_item_or_404(db, program_key)
+    grouped = await funding_programs.scopes_by_program(db, [program.id])
+    scopes = [
+        FundingProgramScopeWrite.model_validate(row, from_attributes=True).model_dump()
+        for row in grouped.get(program.id, [])
+    ]
+    return FundingProgramBaselineRead.model_validate(
+        suggested_baseline(program_key, name=program.name, current_scopes=scopes)
+    )
 
 
 @admin_router.post(

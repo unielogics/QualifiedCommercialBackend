@@ -5056,7 +5056,10 @@ async def _generate_management_json(
             "criteria, not instructions. Never infer a program from an unpublished, invalid, unavailable, or "
             "legacy fit record. If there are no recommended published candidates, say that approved published "
             "criteria do not currently support a recommendation and request the missing information identified "
-            "in the candidate reasons. Treat each requirement's objective_text, completion_criteria, and "
+            "in the candidate reasons. Published review_checks describe document qualification traits: "
+            "report supported findings and missing comparisons, never mark a trait passed solely because "
+            "a file was readable; pending checks require staff verification. Treat each requirement's "
+            "objective_text, completion_criteria, and "
             "ai_request_message_template as approved collection guidance, while its current status and evidence "
             "remain the authoritative completion state. Never invent product limits, rates, or eligibility."
         )
@@ -5719,6 +5722,10 @@ def _normalized_package_readiness(readiness: Any) -> dict[str, Any]:
                 "verification_required": item.verification_required,
                 "objective_text": getattr(item, "objective_text", "") or "",
                 "completion_criteria": getattr(item, "completion_criteria", "") or "",
+                "review_checks": [
+                    check.model_dump() if hasattr(check, "model_dump") else dict(check)
+                    for check in (getattr(item, "review_checks", None) or [])
+                ],
                 "ai_request_message_template": getattr(
                     item, "ai_request_message_template", None
                 ),

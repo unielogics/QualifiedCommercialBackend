@@ -56,6 +56,7 @@ def _version_read(
                 "display_order": row.display_order,
                 "objective_text": row.objective_text or "",
                 "completion_criteria": row.completion_criteria or "",
+                "review_checks": list(getattr(row, "review_checks", None) or []),
             }
             for row in requirements
         ],
@@ -301,6 +302,7 @@ async def _replace_scopes(
                 intake_variants=list(scope.intake_variants),
                 intent_keys=list(scope.intent_keys),
                 naics_prefixes=list(scope.naics_prefixes),
+                excluded_naics_prefixes=list(scope.excluded_naics_prefixes),
                 industry_keys=list(scope.industry_keys),
                 required_fact_keys=list(scope.required_fact_keys),
             )
@@ -422,13 +424,14 @@ async def create_version(
                 blocks_stage=item.blocks_stage,
                 visibility=list(item.visibility),
                 can_underwriter_waive=item.can_underwriter_waive,
-                verification_required=item.verification_required,
+                verification_required=bool(item.verification_required or item.review_checks),
                 expiration_days=item.expiration_days,
                 ai_request_message_template=item.ai_request_message_template,
                 display_order=item.display_order,
                 objective_text=item.objective_text,
                 completion_criteria=item.completion_criteria,
-                completion_mode=item.completion_mode,
+                review_checks=[check.model_dump() for check in item.review_checks],
+                completion_mode="requires_human_verify" if item.review_checks else item.completion_mode,
             )
         )
     db.add(

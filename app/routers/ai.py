@@ -914,7 +914,8 @@ def _render_plan_block(plan, audience: str = "agent") -> str | None:
     from app.services.ai.visibility_filter import filter_facts as _vis_filter
     open_items_raw = [
         i for i in (plan.required_items or [])
-        if i.get("status") not in ("verified", "uploaded", "not_applicable", "waived")
+        if i.get("status") not in ("verified", "not_applicable", "waived")
+        and (i.get("status") != "uploaded" or i.get("review_checks"))
     ]
     open_items = _vis_filter(open_items_raw, audience)  # type: ignore[arg-type]
     custom_instr = plan.custom_instructions if audience != "borrower" else None
@@ -941,6 +942,11 @@ def _render_plan_block(plan, audience: str = "agent") -> str | None:
                 f"- {it.get('label', it.get('requirement_key'))} "
                 f"({level}, blocks={stage}, src={src}, status={it.get('status')})"
             )
+            if audience != "borrower" and it.get("review_checks"):
+                lines.append("  Staff qualification checks (a readable upload is not a pass):")
+                for check in it["review_checks"][:20]:
+                    if isinstance(check, dict):
+                        lines.append(f"  - {check.get('label', '')}: {check.get('instructions', '')}"[:2200])
 
     if plan.next_best_question:
         lines.append("\n[AI NEXT-BEST QUESTION (computed)]")

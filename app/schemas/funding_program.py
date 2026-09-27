@@ -7,6 +7,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.schemas.requirement_review import DocumentReviewChecks
+
 
 class FundingProgramScopeRead(BaseModel):
     id: UUID
@@ -15,6 +17,7 @@ class FundingProgramScopeRead(BaseModel):
     intake_variants: list[str] = Field(default_factory=list)
     intent_keys: list[str] = Field(default_factory=list)
     naics_prefixes: list[str] = Field(default_factory=list)
+    excluded_naics_prefixes: list[str] = Field(default_factory=list)
     industry_keys: list[str] = Field(default_factory=list)
     required_fact_keys: list[str] = Field(default_factory=list)
     is_active: bool = True
@@ -38,6 +41,7 @@ class FundingProgramRequirementRead(BaseModel):
     objective_text: str = ""
     completion_criteria: str = ""
     completion_mode: str = "ai_can_complete"
+    review_checks: DocumentReviewChecks = Field(default_factory=list)
 
 
 class FundingProgramVersionRead(BaseModel):
@@ -80,10 +84,11 @@ class FundingProgramScopeWrite(BaseModel):
     intake_variants: list[str] = Field(default_factory=list, max_length=20)
     intent_keys: list[str] = Field(default_factory=list, max_length=30)
     naics_prefixes: list[str] = Field(default_factory=list, max_length=30)
+    excluded_naics_prefixes: list[str] = Field(default_factory=list, max_length=30)
     industry_keys: list[str] = Field(default_factory=list, max_length=30)
     required_fact_keys: list[str] = Field(default_factory=list, max_length=20)
 
-    @field_validator("naics_prefixes")
+    @field_validator("naics_prefixes", "excluded_naics_prefixes")
     @classmethod
     def _valid_naics_prefixes(cls, values: list[str]) -> list[str]:
         normalized: list[str] = []
@@ -109,6 +114,8 @@ class FundingProgramScopeWrite(BaseModel):
             for prefix in expanded:
                 if prefix not in normalized:
                     normalized.append(prefix)
+        if len(normalized) > 100:
+            raise ValueError("At most 100 expanded NAICS prefixes are allowed per list")
         return normalized
 
     @field_validator("intake_variants", "intent_keys", "industry_keys", "required_fact_keys")
@@ -177,9 +184,21 @@ class FundingProgramRequirementWrite(BaseModel):
     display_order: int = Field(default=0, ge=0, le=10000)
     objective_text: str = Field(default="", max_length=2000)
     completion_criteria: str = Field(default="", max_length=4000)
+    review_checks: DocumentReviewChecks = Field(default_factory=list)
     completion_mode: Literal["ai_can_complete", "requires_human_verify", "borrower_self_attest"] = (
         "ai_can_complete"
     )
+
+    @field_validator("requirement_key")
+    @classmethod
+    def _bounded_period_key(cls, value: str) -> str:
+        bank = re.fullmatch(r"business_bank_statements_(\d+)_months", value)
+        tax = re.fullmatch(r"business_tax_returns_(\d+)_years", value)
+        if bank and not 1 <= int(bank.group(1)) <= 60:
+            raise ValueError("Bank statement requirements must specify 1 to 60 months")
+        if tax and not 1 <= int(tax.group(1)) <= 10:
+            raise ValueError("Tax return requirements must specify 1 to 10 years")
+        return value
 
 
 class FundingProgramVersionCreate(BaseModel):

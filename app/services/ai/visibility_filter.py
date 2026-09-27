@@ -15,7 +15,8 @@ Public API:
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Literal
+from collections.abc import Iterable
+from typing import Any, Literal
 
 Audience = Literal["borrower", "agent", "underwriter", "system"]
 
@@ -70,7 +71,10 @@ def filter_facts(
         if not isinstance(f, dict):
             continue
         if _is_visible(f.get("visibility"), audience):
-            out.append(f)
+            # An upload request may be borrower-visible while its underwriting
+            # traits remain staff-only. Never forward private policy to client AI.
+            out.append({key: value for key, value in f.items() if key != "review_checks"}
+                       if audience == "borrower" else f)
     return out
 
 

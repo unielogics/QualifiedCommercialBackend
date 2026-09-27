@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import uuid
 from collections import Counter, defaultdict
@@ -22,6 +23,7 @@ from app.models.application_profile import (
     ApplicationProgramSelection,
     ApplicationRequirementEvidence,
     ApplicationRequirementState,
+    ApplicationTaxonomyEntry,
 )
 from app.models.bucket import (
     BucketFile,
@@ -355,6 +357,13 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         equipment_financing_intent = True
     if intake and "mca" in str(intake.variant).casefold():
         mca_obligations = True
+    naics_verified = False
+    if re.fullmatch(r"\d{6}", str(profile.naics_code or "").strip()):
+        naics_verified = (await db.execute(select(ApplicationTaxonomyEntry.id).where(
+            ApplicationTaxonomyEntry.level == 6,
+            ApplicationTaxonomyEntry.code == str(profile.naics_code).strip(),
+            ApplicationTaxonomyEntry.status.in_(["official", "approved"]),
+        ).limit(1))).scalar_one_or_none() is not None
     return {
         "vertical": profile.vertical,
         "intake_variant": intake.variant if intake else None,
@@ -366,6 +375,7 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         "subindustry": profile.subindustry,
         "industry_key": profile.industry,
         "naics_code": profile.naics_code,
+        "naics_code_valid": naics_verified,
         "loan_purpose": intake.loan_purpose if intake else None,
         "requested_amount": _float(intake.requested_loan_amount) if intake else None,
         "business_age_years": business_age,
@@ -399,13 +409,59 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
     }
 
 
+def _expanded_naics_prefixes(values: list[str]) -> tuple[list[str], bool]:
+    prefixes: list[str] = []
+    invalid = False
+    for raw in values:
+        value = str(raw).strip()
+        match = re.fullmatch(r"(\d{2,6})\s*-\s*(\d{2,6})", value)
+        if re.fullmatch(r"\d{2,6}", value):
+            prefixes.append(value)
+        elif match:
+            start_text, end_text = match.groups()
+            start, end = int(start_text), int(end_text)
+            if len(start_text) == len(end_text) and start <= end and end - start <= 20:
+                prefixes.extend(str(item).zfill(len(start_text)) for item in range(start, end + 1))
+            else:
+                invalid = True
+        else:
+            invalid = True
+    return list(dict.fromkeys(prefixes)), invalid
+
+
+def _naics_exclusion_match(
+    scopes: list[FundingProgramScope], context: dict[str, Any]
+) -> tuple[bool | None, list[str]]:
+    """Deny first: another permissive route must not bypass a prohibited industry."""
+    raw_prefixes = [
+        prefix for scope in scopes
+        for prefix in (getattr(scope, "excluded_naics_prefixes", None) or [])
+    ]
+    if not raw_prefixes:
+        return True, []
+    prefixes, invalid = _expanded_naics_prefixes(raw_prefixes)
+    # Prefix/sector-only classification cannot prove absence from an excluded
+    # descendant. Require the authoritative six-digit activity classification.
+    naics = str(context.get("naics_code") or "").strip()
+    if not re.fullmatch(r"\d{6}", naics) or context.get("naics_code_valid") is False:
+        return None, ["Needs a valid six-digit NAICS activity to check prohibited industries"]
+    if any(naics.startswith(prefix) for prefix in prefixes):
+        return False, ["The classified NAICS industry is prohibited for this product"]
+    if invalid:
+        return None, ["Needs valid prohibited NAICS program configuration"]
+    return True, []
+
+
 def _scope_match(
     scope: FundingProgramScope,
     context: dict[str, Any],
 ) -> tuple[bool | None, list[str]]:
     """Return True, False, or unknown for one hard catalog scope."""
 
-    unknown: list[str] = []
+    exclusion_state, exclusion_reasons = _naics_exclusion_match([scope], context)
+    if exclusion_state is False:
+        return False, exclusion_reasons
+    unknown: list[str] = list(exclusion_reasons) if exclusion_state is None else []
     variant = str(context.get("intake_variant") or "").strip().casefold()
     variants = {str(value).strip().casefold() for value in scope.intake_variants or []}
     if variants:
@@ -434,25 +490,9 @@ def _scope_match(
     )
     naics = naics_match.group(1) if naics_match else ""
     industry_keys = {str(value).strip().casefold() for value in scope.industry_keys or []}
-    naics_prefixes: list[str] = []
-    invalid_naics_restriction = False
-    for raw_prefix in scope.naics_prefixes or []:
-        value = str(raw_prefix).strip()
-        direct = re.fullmatch(r"\d{2,6}", value)
-        bounded_range = re.fullmatch(r"(\d{2,6})\s*-\s*(\d{2,6})", value)
-        if direct:
-            naics_prefixes.append(value)
-        elif bounded_range:
-            start_text, end_text = bounded_range.groups()
-            start, end = int(start_text), int(end_text)
-            if len(start_text) == len(end_text) and start <= end and end - start <= 20:
-                naics_prefixes.extend(
-                    str(item).zfill(len(start_text)) for item in range(start, end + 1)
-                )
-            else:
-                invalid_naics_restriction = True
-        else:
-            invalid_naics_restriction = True
+    naics_prefixes, invalid_naics_restriction = _expanded_naics_prefixes(
+        scope.naics_prefixes or []
+    )
     if industry_keys or naics_prefixes or invalid_naics_restriction:
         industry_matched = bool(industry_keys and industry in industry_keys)
         naics_matched = bool(
@@ -489,9 +529,13 @@ def _catalog_scope_match(
     scopes: list[FundingProgramScope],
     context: dict[str, Any],
 ) -> tuple[bool | None, list[str]]:
-    relevant = [scope for scope in scopes if scope.vertical == context.get("vertical")]
+    relevant = [scope for scope in scopes if scope.vertical == context.get("vertical")
+                and getattr(scope, "is_active", True) is not False]
     if not relevant:
         return False, ["Product is not offered for this vertical"]
+    exclusion_state, exclusion_reasons = _naics_exclusion_match(relevant, context)
+    if exclusion_state is not True:
+        return exclusion_state, exclusion_reasons
     outcomes = [_scope_match(scope, context) for scope in relevant]
     matched = next((item for item in outcomes if item[0] is True), None)
     if matched:
@@ -940,6 +984,7 @@ def _requires_human_verification(requirement: AICollectionRequirement) -> bool:
     return bool(
         requirement.verification_required
         or getattr(requirement, "completion_mode", None) == "requires_human_verify"
+        or bool(getattr(requirement, "review_checks", None))
     )
 
 
@@ -1011,9 +1056,40 @@ async def _requested_document(
 
 
 def _expected_classes(requirement: AICollectionRequirement) -> set[str]:
-    return EXPECTED_CLASSIFICATIONS.get(requirement.requirement_key, set()).union(
+    classes = EXPECTED_CLASSIFICATIONS.get(requirement.requirement_key, set()).union(
         classifications_for_requested_doc(requirement.label, requirement.category)
     )
+    if _required_period_count(requirement.requirement_key, "months"):
+        classes.add("bank_statement")
+    if _required_period_count(requirement.requirement_key, "years"):
+        classes.add("tax_return")
+    return classes
+
+
+def _required_period_count(key: str, unit: str) -> int | None:
+    stem = "business_bank_statements" if unit == "months" else "business_tax_returns"
+    match = re.fullmatch(rf"{stem}_(\d{{1,2}})_{unit}", key)
+    count = int(match.group(1)) if match else 0
+    return count if 1 <= count <= (60 if unit == "months" else 10) else None
+
+
+def _business_evidence_requirement(key: str) -> bool:
+    return bool(key in BUSINESS_ENTITY_REQUIREMENTS or _required_period_count(key, "months")
+                or _required_period_count(key, "years"))
+
+
+def _merged_review_checks(requirements: list[AICollectionRequirement]) -> list[dict[str, Any]]:
+    """Preserve all selected/pinned program traits, including same-key differing policies."""
+    unique: dict[str, dict[str, Any]] = {}
+    for requirement in requirements:
+        for check in getattr(requirement, "review_checks", None) or []:
+            if isinstance(check, dict):
+                unique.setdefault(json.dumps(check, sort_keys=True), dict(check))
+    return [unique[key] for key in sorted(unique)]
+
+
+def _review_checks_fingerprint(checks: list[dict[str, Any]]) -> str:
+    return hashlib.sha256(json.dumps(checks, sort_keys=True).encode()).hexdigest()
 
 
 def _tax_years(file: BucketFile, analysis: BucketFileAnalysis | None) -> set[str]:
@@ -1050,7 +1126,9 @@ def _coverage_for_files(
         "unit": "documents",
     }
     complete = bool(files)
-    if requirement.requirement_key == "business_bank_statements_6_months":
+    required_months = _required_period_count(requirement.requirement_key, "months")
+    required_years = _required_period_count(requirement.requirement_key, "years")
+    if required_months:
         months: set[str] = set()
         unknown_period_files = 0
         for file in files:
@@ -1071,14 +1149,14 @@ def _coverage_for_files(
             {
                 "months": sorted(months),
                 "unknown_period_files": unknown_period_files,
-                "required_months": 6,
+                "required_months": required_months,
                 "current": current,
-                "required": 6,
+                "required": required_months,
                 "unit": "months",
             }
         )
-        complete = current >= 6
-    elif requirement.requirement_key == "business_tax_returns_2_years":
+        complete = current >= required_months
+    elif required_years:
         years: set[str] = set()
         unknown_year_files = 0
         for file in files:
@@ -1092,13 +1170,13 @@ def _coverage_for_files(
             {
                 "years": sorted(years),
                 "unknown_year_files": unknown_year_files,
-                "required_years": 2,
+                "required_years": required_years,
                 "current": current,
-                "required": 2,
+                "required": required_years,
                 "unit": "years",
             }
         )
-        complete = current >= 2
+        complete = current >= required_years
     elif requirement.requirement_key == "ytd_p_and_l_balance_sheet":
         classifications = set()
         support_categories: set[str] = set()
@@ -1410,6 +1488,7 @@ def _evidence_decision_context_key(
     expected_entity: object,
     duplicate_content: bool,
     corroborated_entities: set[str],
+    review_checks: list[dict[str, Any]] | None = None,
 ) -> str:
     """Fingerprint every input that can change an automatic decision."""
 
@@ -1425,6 +1504,7 @@ def _evidence_decision_context_key(
             " ".join(_entity_words(expected_entity)) or "none",
             "duplicate" if duplicate_content else "original",
             corroboration,
+            json.dumps(review_checks or [], sort_keys=True),
         )
     )
     return hashlib.sha256(raw_key.encode()).hexdigest()
@@ -1481,6 +1561,7 @@ def _automatic_evidence_decision(
     expected_entity: str | None,
     duplicate_content: bool,
     corroborated_entities: set[str] | None = None,
+    review_checks: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str, str, str | None]:
     if duplicate_content:
         return (
@@ -1609,7 +1690,7 @@ def _automatic_evidence_decision(
             analysis.confidence,
         )
 
-    if requirement.requirement_key == "business_bank_statements_6_months":
+    if _required_period_count(requirement.requirement_key, "months"):
         months = statement_months_from_analysis(analysis.analysis)
         months.update(statement_months_from_filename(file.file_name))
         if file.statement_period:
@@ -1621,13 +1702,20 @@ def _automatic_evidence_decision(
                 "AI could not establish the statement month, so this file cannot increase coverage.",
                 analysis.confidence,
             )
-    if requirement.requirement_key == "business_tax_returns_2_years" and not _tax_years(
+    if _required_period_count(requirement.requirement_key, "years") and not _tax_years(
         file, analysis
     ):
         return (
             "needs_more",
             "wrong_period",
             "AI could not establish the tax year, so this file cannot increase coverage.",
+            analysis.confidence,
+        )
+    if review_checks or getattr(requirement, "review_checks", None):
+        return (
+            "needs_more", "document_review_pending",
+            "Document identity, type, and period were checked. Published qualification traits "
+            "still require staff verification; a readable upload does not establish eligibility.",
             analysis.confidence,
         )
     return (
@@ -1695,6 +1783,8 @@ async def _reconcile_evidence_decisions(
     expected_entity: str | None,
     corroborated_entities: set[str],
     criteria_version: int,
+    review_checks: list[dict[str, Any]] | None = None,
+    review_policy_changed: bool = False,
 ) -> dict[uuid.UUID, ApplicationRequirementEvidenceDecision]:
     latest = await _latest_evidence_decisions(db, links)
     seen_hashes: set[str] = set()
@@ -1712,12 +1802,15 @@ async def _reconcile_evidence_decisions(
         seen_hashes.add(content_hash)
         current = latest.get(link.id)
         analysis_version = analysis.analysis_version if analysis else 0
-        if (
+        retained_staff_review = (
             current is not None
             and current.actor_kind == "staff"
             and current.content_hash == content_hash
             and current.analysis_version == analysis_version
-        ):
+            and not review_policy_changed
+            and (not review_checks or getattr(current, "policy_version", None) == criteria_version)
+        )
+        if retained_staff_review:
             effective[link.id] = current
         else:
             decision, reason_code, explanation, confidence = _automatic_evidence_decision(
@@ -1727,6 +1820,7 @@ async def _reconcile_evidence_decisions(
                 expected_entity=expected_entity,
                 duplicate_content=duplicate,
                 corroborated_entities=corroborated_entities,
+                review_checks=review_checks,
             )
             context_key = _evidence_decision_context_key(
                 link_id=link.id,
@@ -1741,6 +1835,7 @@ async def _reconcile_evidence_decisions(
                 expected_entity=expected_entity,
                 duplicate_content=duplicate,
                 corroborated_entities=corroborated_entities,
+                review_checks=review_checks,
             )
             if (
                 current is not None
@@ -1779,7 +1874,26 @@ async def _reconcile_evidence_decisions(
             effective[link.id] = row
 
         accepted = effective[link.id].decision == "accepted"
-        can_auto_verify = accepted and not _requires_human_verification(requirement)
+        can_auto_verify = accepted and not _requires_human_verification(requirement) and not review_checks
+        newer_evidence = any(
+            isinstance(value, datetime) and isinstance(link.verified_at, datetime)
+            and (value.replace(tzinfo=UTC) if value.tzinfo is None else value)
+            > (link.verified_at.replace(tzinfo=UTC) if link.verified_at.tzinfo is None else link.verified_at)
+            for value in (getattr(analysis, "analyzed_at", None), getattr(file, "created_at", None))
+        )
+        changed_evidence = bool(current and (
+            current.content_hash != content_hash or current.analysis_version != analysis_version
+        )) or newer_evidence
+        if (link.verified_by_user_id is not None and not retained_staff_review
+                and (review_policy_changed or changed_evidence
+                     or (current is not None and current.actor_kind == "staff"))):
+            # Legacy Verify stored timestamps without a decision. Preserve old
+            # unchanged staff work, but discard it when content/analysis or the
+            # review policy demonstrably changed. All new Verify operations are
+            # bound to an immutable content/policy decision below.
+            link.verified_at = None
+            link.verified_by_user_id = None
+            link.reason = effective[link.id].explanation
         if can_auto_verify and link.verified_at is None:
             link.verified_at = timestamp
             link.verified_by_user_id = None
@@ -1787,10 +1901,12 @@ async def _reconcile_evidence_decisions(
         elif (
             not can_auto_verify
             and link.verified_at is not None
-            and link.verified_by_user_id is None
-            and link.reason == "Accepted by AI evidence review"
+            and ((link.verified_by_user_id is None and link.reason == "Accepted by AI evidence review")
+                 or review_policy_changed
+                 or (current is not None and current.actor_kind == "staff" and not retained_staff_review))
         ):
             link.verified_at = None
+            link.verified_by_user_id = None
             link.reason = effective[link.id].explanation
     await db.flush()
     return effective
@@ -1844,6 +1960,7 @@ async def _materialize_requirements(
                 "requirement": requirement,
                 "program_keys": set(),
                 "policy_keys": set(),
+                "definitions": [],
             }
             merged[requirement.requirement_key] = current
         elif (
@@ -1858,6 +1975,7 @@ async def _materialize_requirements(
             current["program_keys"].add(program_key)
         if policy_key:
             current["policy_keys"].add(policy_key)
+        current["definitions"].append(requirement)
 
     for selection in selections:
         for requirement in grouped.get(selection.playbook_id, []):
@@ -1884,6 +2002,7 @@ async def _materialize_requirements(
     result: list[ApplicationRequirementState] = []
     for key, merged_item in merged.items():
         requirement = merged_item["requirement"]
+        review_checks = _merged_review_checks(merged_item["definitions"])
         source_programs = merged_item["program_keys"]
         source_policies = merged_item["policy_keys"]
         requested = await _requested_document(
@@ -1914,7 +2033,7 @@ async def _materialize_requirements(
         state.label = requirement.label
         state.category = requirement.category
         state.required_level = requirement.required_level
-        state.verification_required = _requires_human_verification(requirement)
+        state.verification_required = bool(review_checks) or _requires_human_verification(requirement)
         state.source_program_keys = sorted(source_programs)
         state.source_policy_keys = sorted(source_policies)
         if requested:
@@ -1954,15 +2073,18 @@ async def _materialize_requirements(
             analyses=analyses,
             expected_entity=(
                 expected_entity
-                if requirement.requirement_key in BUSINESS_ENTITY_REQUIREMENTS
+                if _business_evidence_requirement(requirement.requirement_key)
                 else None
             ),
             corroborated_entities=(
                 corroborated_entities
-                if requirement.requirement_key in BUSINESS_ENTITY_REQUIREMENTS
+                if _business_evidence_requirement(requirement.requirement_key)
                 else set()
             ),
             criteria_version=criteria_versions.get(requirement.playbook_id, 1),
+            review_checks=review_checks,
+            review_policy_changed=(bool(review_checks) and _review_checks_fingerprint(review_checks) !=
+                                   (state.provenance or {}).get("review_checks_fingerprint")),
         )
         accepted_links = [
             row
@@ -1992,6 +2114,9 @@ async def _materialize_requirements(
             "coverage": coverage,
             "verified_coverage": accepted_coverage,
             "accepted_file_ids": [str(row.file_id) for row in accepted_links],
+            "review_checks_fingerprint": _review_checks_fingerprint(review_checks),
+            "review_checks_status": "verified" if review_checks and accepted_complete
+            else "pending" if review_checks else "not_required",
         }
         if state.status not in {"waived", "not_applicable"}:
             if linked_files:
@@ -2031,6 +2156,8 @@ async def _materialize_requirements(
                         state.state_reason = "AI evidence analysis is in progress"
                     elif "failed" in decision_values:
                         state.state_reason = "AI evidence analysis failed; retry is available"
+                    elif review_checks:
+                        state.state_reason = "Published document qualification traits are pending staff verification"
                     elif decision_values.intersection({"rejected", "needs_more"}):
                         state.state_reason = f"AI accepted {current} of {required} required {unit}; some evidence needs attention"
                     else:
@@ -2425,9 +2552,11 @@ async def get_program_readiness(
         },
     )
     requirement_definitions: dict[str, AICollectionRequirement] = {}
+    all_requirement_definitions: dict[str, list[AICollectionRequirement]] = defaultdict(list)
     for rows in [*grouped.values(), *grouped_policies.values()]:
         for definition in rows:
             requirement_definitions.setdefault(definition.requirement_key, definition)
+            all_requirement_definitions[definition.requirement_key].append(definition)
 
     def evidence_read(
         state: ApplicationRequirementState,
@@ -2566,6 +2695,7 @@ async def get_program_readiness(
                 ),
                 allow_multiple_files=True,
                 verification_required=item.verification_required,
+                review_checks=_merged_review_checks(all_requirement_definitions[item.requirement_key]),
                 objective_text=(
                     requirement_definitions[item.requirement_key].objective_text or ""
                     if item.requirement_key in requirement_definitions
@@ -2723,11 +2853,64 @@ async def patch_requirement(
             )
         if target_ids.difference(active_links):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Linked evidence file not found")
+        files, analyses, _classes = await _evidence_inventory(db, profile)
+        inventory = {file.id: file for file in files}
+        if target_ids.difference(inventory):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence file not found")
+        decisions = await _latest_evidence_decisions(db, [active_links[file_id] for file_id in target_ids])
         for file_id in target_ids:
             row = active_links[file_id]
+            file = inventory[file_id]
+            analysis = analyses.get(file_id)
+            current = decisions.get(row.id)
+            content_hash = (file.content_hash or (analysis.content_hash if analysis else None)
+                            or hashlib.sha256(f"pending:{file.id}".encode()).hexdigest())
+            analysis_version = analysis.analysis_version if analysis else 0
+            if not (
+                analysis is not None and analysis.status == "completed"
+                and analysis.classification != "unreadable"
+                and analysis.content_hash == content_hash
+                and current is not None and current.content_hash == content_hash
+                and current.analysis_version == analysis_version
+                and (current.decision == "accepted" or (
+                    current.decision == "needs_more" and current.reason_code == "document_review_pending"
+                ))
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "This evidence is still processing, unreadable, or has a substantive review issue. "
+                    "Resolve the issue or use an explicit evidence override with a reviewed reason.",
+                )
+            policy_version = current.policy_version if current else 1
+            reason = payload.reason or "Verified published requirements against this evidence"
+            raw_key = json.dumps({
+                "source": "staff-requirement-verification-v1", "link_id": str(row.id),
+                "content_hash": content_hash, "analysis_version": analysis_version,
+                "policy_version": policy_version, "actor_id": str(user.id), "reason": reason,
+                "review_policy": (state.provenance or {}).get("review_checks_fingerprint"),
+            }, sort_keys=True)
+            context_key = hashlib.sha256(raw_key.encode()).hexdigest()
+            if not (current and current.actor_kind == "staff"
+                    and current.idempotency_key.startswith(f"{context_key}:")):
+                idempotency_key = _evidence_decision_transition_key(context_key, current.id if current else None)
+                decision = (await db.execute(select(ApplicationRequirementEvidenceDecision).where(
+                    ApplicationRequirementEvidenceDecision.idempotency_key == idempotency_key
+                ))).scalar_one_or_none()
+                if decision is None:
+                    db.add(ApplicationRequirementEvidenceDecision(
+                        requirement_evidence_id=row.id,
+                        analysis_id=analysis.id if analysis else None,
+                        content_hash=content_hash, analysis_version=analysis_version,
+                        policy_version=policy_version, decision="accepted",
+                        reason_code="staff_requirement_verified", explanation=reason,
+                        confidence=analysis.confidence if analysis else None,
+                        actor_kind="staff", actor_user_id=user.id,
+                        supersedes_decision_id=current.id if current else None,
+                        idempotency_key=idempotency_key,
+                    ))
             row.verified_at = timestamp
             row.verified_by_user_id = user.id
-            row.reason = payload.reason or "Verified by underwriting staff"
+            row.reason = reason
         # The subsequent deterministic materialization decides whether the
         # verified set meets periods, years, or document-type coverage.
         state.status = "received_unverified"

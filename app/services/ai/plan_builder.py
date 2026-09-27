@@ -394,6 +394,9 @@ def _serialize_requirement(
 ) -> dict[str, Any]:
     """Stable JSONB shape for `client_ai_plan.required_items` /
     `waived_items`. Mirrors what the UI renders."""
+    if r.review_checks and (status in {"uploaded", "provided_unverified"}
+                            or (status == "verified" and source == "ai_detected")):
+        status = "provided_unverified"
     return {
         "requirement_key": r.requirement_key,
         "label": r.label,
@@ -408,6 +411,7 @@ def _serialize_requirement(
         "ai_request_message_template": r.ai_request_message_template,
         "objective_text": r.objective_text,
         "completion_criteria": r.completion_criteria,
+        "review_checks": list(r.review_checks),
         "display_order": r.display_order,
         "status": status,
         "source": source,
@@ -487,5 +491,6 @@ def _compute_readiness_score(required_items: list[dict[str, Any]]) -> int:
     satisfied = sum(
         1 for i in required_only
         if i["status"] in ("verified", "uploaded", "provided_unverified")
+        and (not i.get("review_checks") or i["status"] == "verified")
     )
     return round((satisfied / len(required_only)) * 100)
