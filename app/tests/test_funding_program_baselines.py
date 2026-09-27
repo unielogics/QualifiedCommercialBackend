@@ -14,7 +14,7 @@ from app.routers import funding_programs as routes
 from app.schemas.funding_program import FundingProgramVersionCreate
 from app.schemas.funding_program_baseline import FundingProgramBaselineRead
 from app.services.funding_program_baselines import CATALOG, suggested_baseline
-from app.services.program_rules import validate_rules
+from app.services.program_rules import evaluate_recommendation_preferences, validate_rules
 
 
 @pytest.mark.parametrize("key", CATALOG)
@@ -98,6 +98,14 @@ def test_sba_504_majority_preference_is_ordering_policy_not_eligibility():
     assert any("recommendation ordering only" in note for note in data["source_notes"])
     assert any("not eligibility, approval, or an SBA occupancy test" in note for note in data["source_notes"])
     assert any("separate program and structure review" in note for note in data["source_notes"])
+    assert evaluate_recommendation_preferences(
+        data["rules"],
+        {"use_of_funds_complete": False, "real_estate_equipment_pct": None},
+    ) == (0, [])
+    assert evaluate_recommendation_preferences(
+        data["rules"],
+        {"use_of_funds_complete": True, "real_estate_equipment_pct": 51},
+    ) == (50, ["QC preference: at least 51% real estate or equipment"])
 
 
 def test_sba_express_uses_current_500k_cap_not_outdated_350k_threshold():
