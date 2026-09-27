@@ -68,7 +68,14 @@ from app.services.bucket_evidence import (
 )
 from app.services.extracted_facts import canonical_field_aliases
 from app.services.main_street_programs import intent_kind, normalize_intent
-from app.services.program_rules import ProgramRuleError, evaluate_rules, validate_rules
+from app.services.program_rules import (
+    ProgramRuleError,
+    evaluate_recommendation_preferences,
+    evaluate_rules,
+    validate_rules,
+)
+from app.services.use_of_funds import source_funding_data
+from app.services.use_of_funds import summarize as summarize_use_of_funds
 
 SATISFIED_STATES = {"verified", "waived", "not_applicable"}
 AI_EVIDENCE_DECISION_ALGORITHM = "ai-evidence-v2"
@@ -221,6 +228,10 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
     intake = (
         await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
     )
+    requested_amount, amount_source, loan_purpose, dealer = await source_funding_data(
+        db, profile, intake=intake,
+    )
+    budget = summarize_use_of_funds(profile, requested_amount, amount_source, dealer=dealer)
     files, latest_analyses, _classifications = await _evidence_inventory(db, profile)
     evidence_links = list(
         (
@@ -353,7 +364,7 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
             "vehicle_financing",
         },
     )
-    if "equipment" in str(intake.loan_purpose if intake else "").casefold():
+    if "equipment" in str(loan_purpose or "").casefold() or budget.category_totals["equipment"] > 0:
         equipment_financing_intent = True
     if intake and "mca" in str(intake.variant).casefold():
         mca_obligations = True
@@ -376,8 +387,12 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         "industry_key": profile.industry,
         "naics_code": profile.naics_code,
         "naics_code_valid": naics_verified,
-        "loan_purpose": intake.loan_purpose if intake else None,
-        "requested_amount": _float(intake.requested_loan_amount) if intake else None,
+        "loan_purpose": loan_purpose,
+        "requested_amount": _float(requested_amount),
+        "use_of_funds_total": budget.total if budget.items else None,
+        "real_estate_equipment_amount": budget.real_estate_equipment_amount if budget.items else None,
+        "real_estate_equipment_pct": budget.real_estate_equipment_pct,
+        "use_of_funds_complete": budget.complete,
         "business_age_years": business_age,
         "revenue": revenue,
         "annual_revenue": revenue,
@@ -656,6 +671,10 @@ async def published_candidates(
             recommendation_status = "not_eligible"
             reasons = result.reasons
             eligible = False
+        preference_score, preference_reasons = (
+            evaluate_recommendation_preferences(playbook.rules, context)
+            if eligible else (0, [])
+        )
         candidates.append(
             ProgramFitCandidate(
                 program_key=item.program_key,
@@ -672,6 +691,8 @@ async def published_candidates(
                 fit_score=round((result.confidence if result else 0) * 100, 2),
                 confidence=result.confidence if result else 0,
                 priority=priority,
+                preference_score=preference_score,
+                preference_reasons=preference_reasons,
                 reasons=list(dict.fromkeys(reasons)),
             )
         )
@@ -685,6 +706,7 @@ async def published_candidates(
         candidates,
         key=lambda item: (
             rank[item.recommendation_status],
+            -item.preference_score,
             -item.confidence,
             -item.priority,
             item.program_key,
@@ -792,7 +814,7 @@ async def _auto_select(
         source="ai_auto",
         fit_score=candidate.fit_score,
         fit_confidence=candidate.confidence,
-        fit_reasons=candidate.reasons,
+        fit_reasons=[*candidate.reasons, *candidate.preference_reasons],
     )
     db.add(row)
     await db.flush()
@@ -809,6 +831,8 @@ async def _auto_select(
             "playbook_id": str(candidate.playbook_id),
             "playbook_version": candidate.playbook_version,
             "fit_confidence": candidate.confidence,
+            "preference_score": candidate.preference_score,
+            "preference_reasons": candidate.preference_reasons,
         },
     )
     return [row]

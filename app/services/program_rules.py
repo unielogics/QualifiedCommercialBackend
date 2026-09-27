@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass
 from numbers import Real
 from typing import Any
@@ -30,6 +32,10 @@ SUPPORTED_FIT_FIELDS = frozenset(
         "naics_code",
         "loan_purpose",
         "requested_amount",
+        "use_of_funds_total",
+        "real_estate_equipment_amount",
+        "real_estate_equipment_pct",
+        "use_of_funds_complete",
         "business_age_years",
         "revenue",
         "annual_revenue",
@@ -76,14 +82,14 @@ def validate_rules(
     *,
     enforce_supported_fields: bool = False,
 ) -> None:
-    """Validate only the reserved ``fit`` tree; other metadata is inert.
+    """Validate the reserved fit and recommendation preference trees.
 
     ``enforce_supported_fields`` is used when a catalog draft is created or
     published.  Evaluation deliberately leaves it off so a legacy published
     rule that used a dotted context path remains readable instead of suddenly
     becoming invalid after this validation was introduced.
     """
-    if not rules or "fit" not in rules:
+    if not rules:
         return
     if enforce_supported_fields:
         priority = rules.get("priority", 0)
@@ -94,12 +100,30 @@ def validate_rules(
         ):
             raise ProgramRuleError("Program fit priority must be a bounded integer")
     count = [0]
-    _validate_node(
-        rules["fit"],
-        depth=0,
-        count=count,
-        enforce_supported_fields=enforce_supported_fields,
-    )
+    if "fit" in rules:
+        _validate_node(
+            rules["fit"], depth=0, count=count,
+            enforce_supported_fields=enforce_supported_fields,
+        )
+    preferences = rules.get("recommendation_preferences", [])
+    if not isinstance(preferences, list) or len(preferences) > 10:
+        raise ProgramRuleError("At most 10 recommendation preferences are allowed")
+    keys: set[str] = set()
+    preference_count = [0]
+    for preference in preferences:
+        if not isinstance(preference, dict) or set(preference) != {"key", "label", "when", "score"}:
+            raise ProgramRuleError("Each recommendation preference requires key, label, when, and score")
+        key, label, score = preference["key"], preference["label"], preference["score"]
+        if not isinstance(key, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,79}", key) or key in keys:
+            raise ProgramRuleError("Recommendation preference keys must be unique lowercase identifiers")
+        if not isinstance(label, str) or not 1 <= len(label.strip()) <= 200:
+            raise ProgramRuleError("Recommendation preference labels must contain 1 to 200 characters")
+        if isinstance(score, bool) or not isinstance(score, int) or not 1 <= score <= 100:
+            raise ProgramRuleError("Recommendation preference score must be an integer from 1 to 100")
+        keys.add(key)
+        # Preferences are new: unlike legacy fit rules, there are no unknown
+        # historical field paths that need permissive backwards compatibility.
+        _validate_node(preference["when"], depth=0, count=preference_count, enforce_supported_fields=True)
 
 
 def _validate_node(
@@ -181,6 +205,35 @@ def evaluate_rules(rules: dict[str, Any] | None, context: dict[str, Any]) -> Rul
     return _evaluate_node(rules["fit"], context)
 
 
+def evaluate_recommendation_preferences(
+    rules: dict[str, Any] | None, context: dict[str, Any],
+) -> tuple[int, list[str]]:
+    """Rank-only signals; callers must already establish published eligibility."""
+    validate_rules(rules)
+    score, reasons = 0, []
+    for preference in (rules or {}).get("recommendation_preferences", []):
+        node = preference["when"]
+        # A missing allocation/classification must not become a preference via
+        # `not`, nor via one populated branch of an otherwise unknown `any`.
+        if _has_unknown_preference_input(node, context):
+            continue
+        if _evaluate_node(node, context).matched:
+            score += preference["score"]
+            reasons.append(preference["label"].strip())
+    return score, reasons
+
+
+def _has_unknown_preference_input(node: dict[str, Any], context: dict[str, Any]) -> bool:
+    if "not" in node:
+        return _has_unknown_preference_input(node["not"], context)
+    for key in ("all", "any"):
+        if key in node:
+            return any(_has_unknown_preference_input(child, context) for child in node[key])
+    if node["op"] == "evidence_available":
+        return "evidence_available" not in context
+    return _resolve_field(context, node["field"]) in (None, "", [], {})
+
+
 def _evaluate_node(node: dict[str, Any], context: dict[str, Any]) -> RuleEvaluation:
     if "all" in node:
         children = [_evaluate_node(child, context) for child in node["all"]]
@@ -239,7 +292,12 @@ def _resolve_field(context: dict[str, Any], field: str) -> Any:
 
 
 def _is_number(value: Any) -> bool:
-    return isinstance(value, Real) and not isinstance(value, bool)
+    if not isinstance(value, Real) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, ValueError):
+        return False
 
 
 def _numeric_compare(actual: Any, expected: Any, op: str) -> bool:
@@ -248,7 +306,9 @@ def _numeric_compare(actual: Any, expected: Any, op: str) -> bool:
     try:
         left = float(actual)
         right = float(expected)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(left) or not math.isfinite(right):
         return False
     return {
         "gte": left >= right,

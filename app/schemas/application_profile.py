@@ -121,6 +121,8 @@ class ProgramFitCandidate(BaseModel):
     fit_score: float = 0
     confidence: float = 0
     priority: int = 0
+    preference_score: int = 0
+    preference_reasons: list[str] = Field(default_factory=list)
     reasons: list[str] = Field(default_factory=list)
 
 

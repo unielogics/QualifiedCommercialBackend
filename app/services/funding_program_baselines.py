@@ -167,6 +167,18 @@ CATALOG: dict[str, dict[str, Any]] = {
         "slug": "sba-504",
         "verticals": ["real_estate", "dealer", "main_street"],
         "rules": [rule("business_age_years", 2), rule("credit_score", 680), rule("dscr", 1.2)],
+        "recommendation_preferences": [
+            {
+                "key": "real_estate_equipment_majority",
+                "label": "QC preference: at least 51% real estate or equipment",
+                # This derived percentage is null until the server has an
+                # exact, complete allocation. Keeping the editable policy to
+                # one threshold is therefore just as fail-closed as a second
+                # explicit completeness condition.
+                "when": {"field": "real_estate_equipment_pct", "op": "gte", "value": 51},
+                "score": 50,
+            }
+        ],
         "docs": standard_docs()
         + [
             document(
@@ -176,14 +188,19 @@ CATALOG: dict[str, dict[str, Any]] = {
             )
         ],
         "notes": [
-            "Website: QC's SBA overview lists two operating years, 680 guarantor FICO and 1.20 DSCR for 504; project-specific occupancy and injection require staff verification."
+            "Website: QC's SBA overview lists two operating years, 680 guarantor FICO and 1.20 DSCR for 504; project-specific occupancy and injection require staff verification.",
+            "Proposed QC policy: when a complete itemized use-of-funds total is at least 51% real estate and/or equipment, prefer SBA 504 for staff review. This is recommendation ordering only, not eligibility, approval, or an SBA occupancy test. Any remaining working-capital, inventory, refinancing, fee, or other uses need separate program and structure review.",
         ],
     },
     "sba_express": {
         "name": "SBA Express",
         "slug": "sba-express",
         "verticals": ["real_estate", "dealer", "main_street"],
-        "rules": [rule("business_age_years", 2), rule("credit_score", 660)],
+        "rules": [
+            rule("business_age_years", 2),
+            rule("credit_score", 660),
+            rule("requested_amount", 500_000, "lte"),
+        ],
         "docs": standard_docs()
         + [
             deepcopy(USE),
@@ -195,7 +212,8 @@ CATALOG: dict[str, dict[str, Any]] = {
             ),
         ],
         "notes": [
-            "Website: QC's SBA overview lists two operating years and 660 FICO for Small/Express; the lender's SBA credit screen remains a separate review."
+            "Website: QC's SBA overview lists two operating years and 660 FICO for Small/Express; the lender's SBA credit screen remains a separate review.",
+            "Website: SBA currently caps SBA Express and Export Express loans at $500,000. This is not the $350,000 threshold used for other SBA scoring or pricing contexts.",
         ],
     },
     "dscr": {
@@ -820,6 +838,8 @@ def suggested_baseline(
     sources.append(CENSUS_SOURCE)
     criteria = spec.get("rules", [])
     rules: dict[str, Any] = {"fit": {"all": criteria}} if criteria else {}
+    if spec.get("recommendation_preferences"):
+        rules["recommendation_preferences"] = deepcopy(spec["recommendation_preferences"])
     if not criteria:
         notes.append(
             "Review: the source page does not state sufficient hard fit thresholds. Document traits are prefilled, but add your approved eligibility checks before publishing; no threshold has been invented."

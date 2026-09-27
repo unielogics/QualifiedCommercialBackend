@@ -78,6 +78,42 @@ def test_mca_and_insurance_proposals_are_not_claimed_as_universal_sba_rules():
     assert any("October 1, 2026" in note for note in data["source_notes"])
 
 
+def test_sba_504_majority_preference_is_ordering_policy_not_eligibility():
+    data = suggested_baseline("sba_504")
+    assert data["rules"]["fit"] == {
+        "all": [
+            {"field": "business_age_years", "op": "gte", "value": 2},
+            {"field": "credit_score", "op": "gte", "value": 680},
+            {"field": "dscr", "op": "gte", "value": 1.2},
+        ]
+    }
+    assert data["rules"]["recommendation_preferences"] == [
+        {
+            "key": "real_estate_equipment_majority",
+            "label": "QC preference: at least 51% real estate or equipment",
+            "when": {"field": "real_estate_equipment_pct", "op": "gte", "value": 51},
+            "score": 50,
+        }
+    ]
+    assert any("recommendation ordering only" in note for note in data["source_notes"])
+    assert any("not eligibility, approval, or an SBA occupancy test" in note for note in data["source_notes"])
+    assert any("separate program and structure review" in note for note in data["source_notes"])
+
+
+def test_sba_express_uses_current_500k_cap_not_outdated_350k_threshold():
+    data = suggested_baseline("sba_express")
+    assert {
+        "field": "requested_amount",
+        "op": "lte",
+        "value": 500_000,
+    } in data["rules"]["fit"]["all"]
+    assert not any(
+        item.get("field") == "requested_amount" and item.get("value") == 350_000
+        for item in data["rules"]["fit"]["all"]
+    )
+    assert any("$500,000" in note for note in data["source_notes"])
+
+
 def test_product_specific_website_differences_are_preserved():
     ez = suggested_baseline("ez_term")
     micro = suggested_baseline("microcap")

@@ -23,6 +23,19 @@ def _scope(vertical: str = "dealer", scope_key: str = "default") -> dict[str, st
     return {"vertical": vertical, "scope_key": scope_key}
 
 
+@pytest.mark.asyncio
+async def test_editable_admin_catalog_never_round_trips_inactive_scopes(monkeypatch) -> None:
+    catalog_rows = AsyncMock(return_value=[])
+    scopes_by_program = AsyncMock(return_value={})
+    monkeypatch.setattr(funding_programs, "catalog_rows", catalog_rows)
+    monkeypatch.setattr(funding_programs, "scopes_by_program", scopes_by_program)
+    db = SimpleNamespace()
+
+    assert await funding_programs.admin_catalog(db) == []
+
+    scopes_by_program.assert_awaited_once_with(db, [])
+
+
 @pytest.mark.parametrize(
     ("schema", "extra"),
     [
@@ -174,6 +187,44 @@ async def test_create_version_maps_invalid_fit_rule_to_field_addressable_422() -
 
     assert error.value.status_code == 422
     assert error.value.detail[0]["loc"] == ["body", "rules", "fit"]
+    assert error.value.detail[0]["msg"] == "Unsupported program fit field: made_up_field"
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_version_maps_invalid_preference_to_its_editor_section() -> None:
+    payload = FundingProgramVersionCreate.model_validate(
+        {
+            "rules": {
+                "fit": {"field": "annual_revenue", "op": "gte", "value": 1},
+                "recommendation_preferences": [
+                    {
+                        "key": "fixed_asset_majority",
+                        "label": "Prefer fixed-asset requests",
+                        "when": {"field": "made_up_field", "op": "eq", "value": True},
+                        "score": 50,
+                    }
+                ],
+            },
+            "confirmed": True,
+        }
+    )
+    db = SimpleNamespace(execute=AsyncMock())
+
+    with pytest.raises(HTTPException) as error:
+        await funding_programs.create_version(
+            db,
+            SimpleNamespace(id=uuid4(), name="Test program", program_key="test_program"),
+            payload,
+            SimpleNamespace(id=uuid4()),
+        )
+
+    assert error.value.status_code == 422
+    assert error.value.detail[0]["loc"] == [
+        "body",
+        "rules",
+        "recommendation_preferences",
+    ]
     assert error.value.detail[0]["msg"] == "Unsupported program fit field: made_up_field"
     db.execute.assert_not_awaited()
 

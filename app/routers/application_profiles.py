@@ -149,6 +149,7 @@ from app.schemas.application_profile import (
     WorksheetRowOp,
 )
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
+from app.schemas.use_of_funds import UseOfFundsPatch, UseOfFundsRead
 from app.services import application_profiles as profiles
 from app.services import (
     application_programs,
@@ -768,6 +769,30 @@ async def get_application_profile(
     profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> ApplicationProfileRead:
     return profiles.profile_read(await profiles.load_profile(db, profile_id, user))
+
+
+@router.get("/{profile_id}/use-of-funds", response_model=UseOfFundsRead)
+async def get_application_use_of_funds(
+    profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> UseOfFundsRead:
+    from app.services.use_of_funds import EDIT_ROLES, read_budget
+
+    profile = await profiles.load_profile(db, profile_id, user)
+    return (await read_budget(db, profile)).model_copy(update={"can_edit": user.role in EDIT_ROLES})
+
+
+@router.patch("/{profile_id}/use-of-funds", response_model=UseOfFundsRead)
+async def patch_application_use_of_funds(
+    profile_id: UUID, payload: UseOfFundsPatch, user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> UseOfFundsRead:
+    from app.services.use_of_funds import require_editor, update_budget
+
+    require_editor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    result = await update_budget(db, profile, payload, user)
+    await db.commit()
+    return result
 
 
 @router.get("/{profile_id}/underwriting", response_model=ApplicationUnderwritingRead)

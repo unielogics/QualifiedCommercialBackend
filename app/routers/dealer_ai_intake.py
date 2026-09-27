@@ -5849,6 +5849,12 @@ async def _package_generation_inputs(
 
     readiness = await get_program_readiness(db, profile)
     readiness_snapshot = _normalized_package_readiness(readiness)
+    from app.services.use_of_funds import ai_context, source_funding_data, summarize
+
+    requested_amount, amount_source, _purpose, dealer = await source_funding_data(
+        db, profile, intake=intake,
+    )
+    budget_snapshot = ai_context(summarize(profile, requested_amount, amount_source, dealer=dealer))
     readiness_payload = json.dumps(
         readiness_snapshot,
         sort_keys=True,
@@ -5863,6 +5869,7 @@ async def _package_generation_inputs(
     context_snapshot = {
         **context_snapshot,
         "package_readiness": readiness_snapshot,
+        "use_of_funds": budget_snapshot,
     }
     financials = await _collect_packet_financials(
         db,
@@ -5874,6 +5881,7 @@ async def _package_generation_inputs(
         "program_selection_mode": readiness.selection_mode,
         "selected_programs": readiness_snapshot["selected_programs"],
         "package_readiness": readiness_snapshot,
+        "use_of_funds": budget_snapshot,
     }
     input_fingerprint = _package_input_fingerprint(
         source_metadata=source_metadata,

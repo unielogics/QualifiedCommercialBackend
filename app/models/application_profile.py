@@ -106,6 +106,16 @@ class ApplicationProfile(TimestampMixin, Base):
         String(32), nullable=False, default="main_street", server_default="main_street"
     )
     funding_category: Mapped[str | None] = mapped_column(String(64))
+    use_of_funds: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    use_of_funds_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    use_of_funds_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    use_of_funds_updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
     entity_type: Mapped[str | None] = mapped_column(String(32))
     industry: Mapped[str | None] = mapped_column(String(80))
     subindustry: Mapped[str | None] = mapped_column(String(120))

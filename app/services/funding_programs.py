@@ -57,13 +57,28 @@ def _validate_program_rules_or_422(rules: dict[str, Any] | None) -> None:
     try:
         validate_rules(rules, enforce_supported_fields=True)
     except ProgramRuleError as exc:
+        field = "fit"
+        input_value = (rules or {}).get("fit")
+        if rules and "recommendation_preferences" in rules:
+            fit_only = dict(rules)
+            fit_only.pop("recommendation_preferences", None)
+            try:
+                validate_rules(fit_only, enforce_supported_fields=True)
+            except ProgramRuleError:
+                # Prefer the first actionable eligibility error when both
+                # sections are invalid; a later retry will then address the
+                # preference section.
+                pass
+            else:
+                field = "recommendation_preferences"
+                input_value = rules.get("recommendation_preferences")
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=_field_validation_detail(
                 "rules",
-                "fit",
+                field,
                 message=str(exc),
-                input_value=(rules or {}).get("fit"),
+                input_value=input_value,
             ),
         ) from exc
 
@@ -236,7 +251,11 @@ async def public_catalog(db: AsyncSession) -> list[PublicFundingProgramCatalogIt
 async def admin_catalog(db: AsyncSession) -> list[FundingProgramCatalogItem]:
     rows = await catalog_rows(db, include_retired=True)
     program_ids = [row.id for row in rows]
-    scopes = await scopes_by_program(db, program_ids, active_only=False)
+    # The editable catalog contract intentionally excludes retired scope rows.
+    # Scope writes replace their rows and do not carry an ``is_active`` field;
+    # returning an inactive legacy row here would therefore reactivate it on an
+    # otherwise unrelated save.
+    scopes = await scopes_by_program(db, program_ids)
     playbooks = (
         list(
             (
