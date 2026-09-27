@@ -496,11 +496,11 @@ async def capture_extracted_profile_facts(
                 source_file_id=file.id, source_analysis_id=analysis.id,
             ))
             profile.extraction_reviewed_at = None
-            if field_key in {"entity_type", "naics_code", "naics_label"} and not getattr(profile, field_key, None):
+            if field_key == "entity_type" and not getattr(profile, field_key, None):
                 setattr(profile, field_key, str(value))
         code_raw = facts.get("naics_code") or {}
         code = str(code_raw.get("value") if isinstance(code_raw, dict) else code_raw or "").strip()
-        if re.fullmatch(r"\d{6}", code):
+        if re.fullmatch(r"\d{6}", code) and not getattr(profile, "classified_by_user_id", None):
             entry = (
                 await db.execute(select(ApplicationTaxonomyEntry).where(
                     ApplicationTaxonomyEntry.level == 6,
@@ -511,16 +511,11 @@ async def capture_extracted_profile_facts(
             if entry:
                 subindustry = await db.get(ApplicationTaxonomyEntry, entry.parent_id)
                 industry = await db.get(ApplicationTaxonomyEntry, subindustry.parent_id) if subindustry else None
-                profile.activity_entry_id = profile.activity_entry_id or entry.id
-                profile.subindustry_entry_id = profile.subindustry_entry_id or (subindustry.id if subindustry else None)
-                profile.industry_entry_id = profile.industry_entry_id or (industry.id if industry else None)
-                profile.naics_label = profile.naics_label or entry.label
-                profile.subindustry = profile.subindustry or (subindustry.label if subindustry else None)
-                profile.industry = profile.industry or (industry.label if industry else None)
-                profile.classification_provenance = {
-                    "source": "document_extraction", "source_file_id": str(file.id),
-                    "source_analysis_id": str(analysis.id), "status": "suggested",
-                }
+                if _apply_extracted_taxonomy(profile, entry, subindustry, industry):
+                    profile.classification_provenance = {
+                        "source": "document_extraction", "source_file_id": str(file.id),
+                        "source_analysis_id": str(analysis.id), "status": "suggested",
+                    }
     key_facts = payload.get("key_facts") if isinstance(payload.get("key_facts"), dict) else {}
     period = str(key_facts.get("statement_period") or "")
     month_match = re.search(r"(20\d{2})[-/](0[1-9]|1[0-2])", period)
@@ -528,6 +523,44 @@ async def capture_extracted_profile_facts(
         file.statement_period = f"{month_match.group(1)}-{month_match.group(2)}"
     await db.flush()
     return [profile.id for profile in profiles]
+
+
+def _apply_extracted_taxonomy(profile, activity, subindustry, industry) -> bool:
+    """Fill one coherent taxonomy path, never mix classifications from documents.
+
+    The extracted value remains in the review ledger even if it conflicts with
+    a saved classification. Labels must come from the selected catalog entry,
+    not a separately extracted label that may describe another business.
+    """
+    if (
+        not subindustry or not industry
+        or activity.level != 6 or subindustry.level != 3 or industry.level != 2
+        or activity.parent_id != subindustry.id or subindustry.parent_id != industry.id
+        or any(row.status not in {"official", "approved"} for row in (activity, subindustry, industry))
+        or getattr(profile, "classified_by_user_id", None)
+    ):
+        return False
+    for field, expected in (
+        ("naics_code", activity.code), ("activity_entry_id", activity.id),
+        ("subindustry_entry_id", subindustry.id), ("industry_entry_id", industry.id),
+    ):
+        existing = getattr(profile, field, None)
+        if existing and str(existing).strip() != str(expected):
+            return False
+    for field, row in (("industry", industry), ("subindustry", subindustry)):
+        existing = getattr(profile, field, None)
+        if existing and str(existing).strip().casefold() not in {
+            str(row.code).casefold(), row.label.casefold(),
+        }:
+            return False
+    profile.naics_code = activity.code
+    profile.naics_label = activity.label
+    profile.activity_entry_id = activity.id
+    profile.subindustry_entry_id = subindustry.id
+    profile.industry_entry_id = industry.id
+    profile.subindustry = subindustry.label
+    profile.industry = industry.label
+    return True
 
 
 def profile_read(profile: ApplicationProfile) -> ApplicationProfileRead:

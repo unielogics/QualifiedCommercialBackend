@@ -13,8 +13,12 @@ from pydantic import ValidationError
 
 from app.enums import LoanStage
 from app.schemas.application_profile import ProgramFitCandidate
-from app.schemas.funding_program import FundingProgramVersionCreate
-from app.services import application_programs
+from app.schemas.funding_program import (
+    FundingProgramScopePatch,
+    FundingProgramScopeWrite,
+    FundingProgramVersionCreate,
+)
+from app.services import application_programs, funding_programs
 from app.services.application_programs import (
     AI_EVIDENCE_DECISION_ALGORITHM,
     _accepted_entity_aliases,
@@ -29,6 +33,7 @@ from app.services.application_programs import (
     _is_lending_applicable,
     _requirement_is_effectively_accepted,
     _requirement_needs_client_evidence,
+    _requires_human_verification,
     _scope_match,
     analysis_is_high_confidence_match,
 )
@@ -78,6 +83,123 @@ def test_program_rules_evaluate_bounded_deterministic_criteria() -> None:
 def test_program_rules_reject_executable_or_unbounded_shapes(rules: dict) -> None:
     with pytest.raises(ProgramRuleError):
         validate_rules(rules)
+
+
+def test_catalog_authoring_rejects_unknown_fields_but_legacy_evaluation_remains_readable() -> None:
+    legacy = {"fit": {"field": "facts.annual_revenue", "op": "gte", "value": 500_000}}
+
+    result = evaluate_rules(legacy, {"facts": {"annual_revenue": 750_000}})
+
+    assert result.matched is True
+    with pytest.raises(ProgramRuleError, match="Unsupported program fit field"):
+        validate_rules(legacy, enforce_supported_fields=True)
+    with pytest.raises(ProgramRuleError, match="bounded integer"):
+        validate_rules(
+            {"priority": "first", "fit": {"field": "revenue", "op": "gte", "value": 1}},
+            enforce_supported_fields=True,
+        )
+
+
+def test_scope_authoring_expands_bounded_naics_ranges_and_rejects_free_text() -> None:
+    scope = FundingProgramScopeWrite(
+        vertical="main_street",
+        naics_prefixes=["31-33", "33", " 445 "],
+    )
+
+    assert scope.naics_prefixes == ["31", "32", "33", "445"]
+    with pytest.raises(ValidationError):
+        FundingProgramScopeWrite(vertical="main_street", naics_prefixes=["manufacturing"])
+
+
+@pytest.mark.asyncio
+async def test_catalog_patch_can_explicitly_clear_short_description() -> None:
+    payload = FundingProgramScopePatch(
+        short_description=None,
+        reason="Remove the outdated public description",
+        confirmed=True,
+    )
+    program = SimpleNamespace(
+        id=uuid4(),
+        program_key="working_capital",
+        name="Working capital",
+        short_description="Outdated",
+        display_order=10,
+    )
+    db = SimpleNamespace(add=Mock())
+
+    await funding_programs.update_program(
+        db,
+        program,
+        payload,
+        SimpleNamespace(id=uuid4()),
+    )
+
+    assert program.short_description is None
+
+
+def test_version_read_round_trips_every_requirement_instruction() -> None:
+    playbook = SimpleNamespace(
+        id=uuid4(),
+        version=4,
+        status="published",
+        rules={"fit": {"field": "revenue", "op": "gte", "value": 1}},
+        published_at=datetime.now(UTC),
+    )
+    requirement = SimpleNamespace(
+        requirement_key="debt_schedule",
+        label="Debt schedule",
+        category="financials",
+        required_level="required",
+        applies_when={"field": "revenue", "op": "gte", "value": 1},
+        blocks_stage="underwriting",
+        visibility=["borrower", "underwriter"],
+        can_underwriter_waive=False,
+        verification_required=True,
+        expiration_days=90,
+        ai_request_message_template="Please upload the current debt schedule.",
+        completion_mode="requires_human_verify",
+        display_order=7,
+        objective_text="Collect all current business obligations.",
+        completion_criteria="Every open debt has lender, balance, and payment.",
+    )
+
+    result = funding_programs._version_read(playbook, [requirement])
+    row = result.requirements[0]
+
+    assert row.applies_when == requirement.applies_when
+    assert row.blocks_stage == "underwriting"
+    assert row.can_underwriter_waive is False
+    assert row.expiration_days == 90
+    assert row.ai_request_message_template == requirement.ai_request_message_template
+    assert row.objective_text == requirement.objective_text
+    assert row.completion_criteria == requirement.completion_criteria
+
+
+def test_authoritative_published_version_uses_highest_approved_version() -> None:
+    program_id = uuid4()
+
+    def row(version: int, *, owner_type: str = "platform", status: str = "published"):
+        return SimpleNamespace(
+            id=uuid4(),
+            funding_program_id=program_id,
+            playbook_type="loan_product",
+            status=status,
+            is_active=True,
+            owner_type=owner_type,
+            version=version,
+            published_at=datetime(2026, 1, version, tzinfo=UTC),
+            created_at=datetime(2026, 1, version, tzinfo=UTC),
+        )
+
+    older_funding_owned = row(2, owner_type="funding")
+    newest = row(3)
+    draft = row(9, status="draft")
+
+    selected = funding_programs.authoritative_published_versions(
+        [older_funding_owned, draft, newest]
+    )
+
+    assert selected[program_id] is newest
 
 
 def test_program_version_rejects_invalid_requirement_taxonomy() -> None:
@@ -158,6 +280,21 @@ def test_requirement_advances_only_after_effective_acceptance() -> None:
     assert _requirement_is_effectively_accepted(complete, None) is True
     assert _requirement_needs_client_evidence(partial) is True
     assert _requirement_needs_client_evidence(complete) is False
+
+
+def test_staff_verify_completion_mode_prevents_automatic_verification() -> None:
+    assert _requires_human_verification(
+        SimpleNamespace(
+            verification_required=False,
+            completion_mode="requires_human_verify",
+        )
+    ) is True
+    assert _requires_human_verification(
+        SimpleNamespace(
+            verification_required=False,
+            completion_mode="ai_can_complete",
+        )
+    ) is False
 
 
 def test_catalog_contains_exact_products_and_vertical_placements() -> None:
@@ -246,6 +383,58 @@ def test_hard_scope_requires_industry_or_declared_facts() -> None:
         _scope_match(transportation, {"industry_key": "retail", "naics_code": "445110"})[0] is False
     )
     assert _scope_match(transportation, {"industry_key": "", "naics_code": "484121"})[0] is True
+    assert (
+        _scope_match(
+            SimpleNamespace(
+                intake_variants=[],
+                intent_keys=[],
+                industry_keys=[],
+                naics_prefixes=["31-33"],
+                required_fact_keys=[],
+            ),
+            {"industry_key": "automotive", "naics_code": "32 - Manufacturing"},
+        )[0]
+        is True
+    )
+    assert (
+        _scope_match(
+            SimpleNamespace(
+                intake_variants=[],
+                intent_keys=[],
+                industry_keys=[],
+                naics_prefixes=["44", "45"],
+                required_fact_keys=[],
+            ),
+            {"industry_key": "retail", "naics_code": None},
+        )[0]
+        is None
+    )
+    assert (
+        _scope_match(
+            SimpleNamespace(
+                intake_variants=[],
+                intent_keys=[],
+                industry_keys=[],
+                naics_prefixes=["invalid legacy value"],
+                required_fact_keys=[],
+            ),
+            {"industry_key": "retail", "naics_code": "441110"},
+        )[0]
+        is None
+    )
+    assert (
+        _scope_match(
+            SimpleNamespace(
+                intake_variants=[],
+                intent_keys=[],
+                industry_keys=[],
+                naics_prefixes=["44"],
+                required_fact_keys=[],
+            ),
+            {"industry_key": "retail", "naics_code": "44-45"},
+        )[0]
+        is None
+    )
     assert _scope_match(dealer_collateral, {"declared_collateral": False})[0] is False
     assert _scope_match(dealer_collateral, {"declared_collateral": None})[0] is None
 

@@ -45,10 +45,17 @@ def _version_read(
                 "label": row.label,
                 "category": row.category,
                 "required_level": row.required_level,
+                "applies_when": row.applies_when,
+                "blocks_stage": row.blocks_stage,
                 "visibility": list(row.visibility or []),
+                "can_underwriter_waive": row.can_underwriter_waive,
                 "verification_required": row.verification_required,
+                "expiration_days": row.expiration_days,
+                "ai_request_message_template": row.ai_request_message_template,
                 "completion_mode": row.completion_mode,
                 "display_order": row.display_order,
+                "objective_text": row.objective_text or "",
+                "completion_criteria": row.completion_criteria or "",
             }
             for row in requirements
         ],
@@ -105,6 +112,70 @@ async def scopes_by_program(
     for row in rows:
         grouped[row.program_id].append(row)
     return grouped
+
+
+def authoritative_published_versions(
+    playbooks: list[AIPlaybookTemplate],
+) -> dict[uuid.UUID, AIPlaybookTemplate]:
+    """Resolve one approved version per program consistently for every consumer.
+
+    Normal publication archives older rows, but legacy imports and interrupted
+    transactions can leave more than one published/active row. Version is the
+    primary authority; publication time and id only provide deterministic tie
+    breaking. Owner type must not let an older row shadow a newer approved one.
+    """
+
+    selected: dict[uuid.UUID, AIPlaybookTemplate] = {}
+    for row in playbooks:
+        if (
+            row.funding_program_id is None
+            or row.playbook_type != "loan_product"
+            or row.status != "published"
+            or not row.is_active
+        ):
+            continue
+        current = selected.get(row.funding_program_id)
+        row_timestamp = row.published_at or row.created_at
+        row_key = (
+            int(row.version or 0),
+            row_timestamp.isoformat() if row_timestamp is not None else "",
+            str(row.id),
+        )
+        if current is not None:
+            current_timestamp = current.published_at or current.created_at
+            current_key = (
+                int(current.version or 0),
+                current_timestamp.isoformat() if current_timestamp is not None else "",
+                str(current.id),
+            )
+        else:
+            current_key = None
+        if current_key is None or row_key > current_key:
+            selected[row.funding_program_id] = row
+    return selected
+
+
+async def published_versions_by_program(
+    db: AsyncSession,
+    program_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, AIPlaybookTemplate]:
+    if not program_ids:
+        return {}
+    rows = list(
+        (
+            await db.execute(
+                select(AIPlaybookTemplate).where(
+                    AIPlaybookTemplate.playbook_type == "loan_product",
+                    AIPlaybookTemplate.status == "published",
+                    AIPlaybookTemplate.is_active.is_(True),
+                    AIPlaybookTemplate.funding_program_id.in_(program_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return authoritative_published_versions(rows)
 
 
 async def public_catalog(db: AsyncSession) -> list[PublicFundingProgramCatalogItem]:
@@ -166,14 +237,12 @@ async def admin_catalog(db: AsyncSession) -> list[FundingProgramCatalogItem]:
     playbooks_by_program: dict[uuid.UUID, list[AIPlaybookTemplate]] = defaultdict(list)
     for playbook in playbooks:
         playbooks_by_program[playbook.funding_program_id].append(playbook)
+    published_by_program = authoritative_published_versions(playbooks)
 
     result: list[FundingProgramCatalogItem] = []
     for row in rows:
         versions = playbooks_by_program.get(row.id, [])
-        published = next(
-            (item for item in versions if item.status == "published" and item.is_active),
-            None,
-        )
+        published = published_by_program.get(row.id)
         result.append(
             FundingProgramCatalogItem(
                 id=row.id,
@@ -290,8 +359,8 @@ async def update_program(
     }
     if payload.name is not None:
         program.name = payload.name.strip()
-    if payload.short_description is not None:
-        program.short_description = payload.short_description.strip() or None
+    if "short_description" in payload.model_fields_set:
+        program.short_description = (payload.short_description or "").strip() or None
     if payload.display_order is not None:
         program.display_order = payload.display_order
     if payload.scopes is not None:
@@ -317,7 +386,7 @@ async def create_version(
     payload: FundingProgramVersionCreate,
     user: User,
 ) -> AIPlaybookTemplate:
-    validate_rules(payload.rules)
+    validate_rules(payload.rules, enforce_supported_fields=True)
     latest_version = (
         await db.execute(
             select(AIPlaybookTemplate.version)
@@ -393,7 +462,7 @@ async def publish_version(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Program version not found")
     if playbook.status != "draft":
         raise HTTPException(status.HTTP_409_CONFLICT, "Only a draft version can be published")
-    validate_rules(playbook.rules)
+    validate_rules(playbook.rules, enforce_supported_fields=True)
     if not (playbook.rules or {}).get("fit"):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "Publish requires a validated fit rule"

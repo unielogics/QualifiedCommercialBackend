@@ -116,6 +116,20 @@ def test_readiness_snapshot_hides_program_waived_missing_requirement() -> None:
     selection_id = uuid4()
     readiness = SimpleNamespace(
         selection_mode="manual",
+        candidates=[
+            SimpleNamespace(
+                program_key="business_heloc",
+                program_name="Business-purpose HELOC",
+                playbook_id=uuid4(),
+                playbook_version=2,
+                eligible=True,
+                recommendation_status="recommended",
+                criteria_status="published",
+                fit_score=95,
+                confidence=0.95,
+                reasons=["Approved criteria matched"],
+            )
+        ],
         selections=[
             SimpleNamespace(
                 program_key="business_heloc",
@@ -138,6 +152,9 @@ def test_readiness_snapshot_hides_program_waived_missing_requirement() -> None:
                 coverage_complete=False,
                 verified_coverage_complete=False,
                 verification_required=False,
+                objective_text="Collect a current valuation.",
+                completion_criteria="Valuation is current and names the subject property.",
+                ai_request_message_template="Please upload the current appraisal.",
                 source_program_keys=["business_heloc"],
                 source_policy_keys=[],
                 program_overrides={"business_heloc": "waived"},
@@ -163,6 +180,8 @@ def test_readiness_snapshot_hides_program_waived_missing_requirement() -> None:
     snapshot = dealer_ai_intake._normalized_package_readiness(readiness)
 
     assert snapshot["requirements"][0]["effectively_open"] is False
+    assert snapshot["requirements"][0]["objective_text"] == "Collect a current valuation."
+    assert snapshot["candidates"][0]["criteria_status"] == "published"
     assert snapshot["automatic_stage_status"] == "in_underwriting"
     assert packet_pdf._open_readiness_rows(
         {"package_readiness": snapshot}
@@ -433,6 +452,7 @@ async def test_combined_generation_builds_and_publishes_both_pdfs_once() -> None
             AsyncMock(
                 return_value=SimpleNamespace(
                     selection_mode="manual",
+                    candidates=[],
                     selections=[],
                     programs=[],
                     requirements=[],
@@ -478,6 +498,7 @@ async def test_combined_generation_builds_and_publishes_both_pdfs_once() -> None
     assert create_summary.await_args.kwargs["context_snapshot"]["snapshot"] is True
     assert create_summary.await_args.kwargs["context_snapshot"]["package_readiness"] == {
         "selection_mode": "manual",
+        "candidates": [],
         "selected_programs": [],
         "programs": [],
         "requirements": [],
@@ -603,6 +624,9 @@ async def test_out_of_scope_published_program_remains_available_for_manual_overr
         id=playbook_id,
         funding_program_id=program_id,
         owner_type="funding",
+        playbook_type="loan_product",
+        status="published",
+        is_active=True,
         version=3,
         published_at=None,
         created_at=None,
@@ -779,6 +803,7 @@ async def test_deleting_package_bucket_row_retains_immutable_artifact_bytes() ->
         file_name="Executive Summary.pdf",
         requested_document_id=None,
         shares=[],
+        public_shares=[],
         vendor_access=[],
     )
     db = SimpleNamespace(

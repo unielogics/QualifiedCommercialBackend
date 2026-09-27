@@ -406,33 +406,72 @@ def _scope_match(
     """Return True, False, or unknown for one hard catalog scope."""
 
     unknown: list[str] = []
-    variant = str(context.get("intake_variant") or "").casefold()
-    variants = {str(value).casefold() for value in scope.intake_variants or []}
+    variant = str(context.get("intake_variant") or "").strip().casefold()
+    variants = {str(value).strip().casefold() for value in scope.intake_variants or []}
     if variants:
         if not variant:
             unknown.append("intake variant")
         elif variant not in variants:
             return False, ["Intake variant is outside this product scope"]
 
-    intent = str(context.get("intent") or "").casefold()
-    intents = {str(value).casefold() for value in scope.intent_keys or []}
+    intent = str(context.get("intent") or "").strip().casefold()
+    intents = {str(value).strip().casefold() for value in scope.intent_keys or []}
     if intents:
         if not intent:
             unknown.append("funding purpose")
         elif intent not in intents:
             return False, ["Funding purpose is outside this product scope"]
 
-    industry = str(context.get("industry_key") or "").casefold()
-    naics = str(context.get("naics_code") or "").strip()
-    industry_keys = {str(value).casefold() for value in scope.industry_keys or []}
-    naics_prefixes = [str(value) for value in scope.naics_prefixes or []]
-    if industry_keys or naics_prefixes:
-        if not industry and not naics:
-            unknown.append("industry or NAICS")
-        elif industry not in industry_keys and not any(
-            naics.startswith(prefix) for prefix in naics_prefixes
-        ):
-            return False, ["Industry is outside this product scope"]
+    industry = str(context.get("industry_key") or "").strip().casefold()
+    # Persisted profiles occasionally include a label beside the code. Read one
+    # coherent code rather than concatenating unrelated digits in the label.
+    raw_naics = str(context.get("naics_code") or "").strip()
+    looks_like_range = bool(re.search(r"\d\s*-\s*\d", raw_naics))
+    naics_match = (
+        None
+        if looks_like_range
+        else re.search(r"(?<!\d)(\d{2,6})(?!\d)", raw_naics)
+    )
+    naics = naics_match.group(1) if naics_match else ""
+    industry_keys = {str(value).strip().casefold() for value in scope.industry_keys or []}
+    naics_prefixes: list[str] = []
+    invalid_naics_restriction = False
+    for raw_prefix in scope.naics_prefixes or []:
+        value = str(raw_prefix).strip()
+        direct = re.fullmatch(r"\d{2,6}", value)
+        bounded_range = re.fullmatch(r"(\d{2,6})\s*-\s*(\d{2,6})", value)
+        if direct:
+            naics_prefixes.append(value)
+        elif bounded_range:
+            start_text, end_text = bounded_range.groups()
+            start, end = int(start_text), int(end_text)
+            if len(start_text) == len(end_text) and start <= end and end - start <= 20:
+                naics_prefixes.extend(
+                    str(item).zfill(len(start_text)) for item in range(start, end + 1)
+                )
+            else:
+                invalid_naics_restriction = True
+        else:
+            invalid_naics_restriction = True
+    if industry_keys or naics_prefixes or invalid_naics_restriction:
+        industry_matched = bool(industry_keys and industry in industry_keys)
+        naics_matched = bool(
+            naics_prefixes
+            and naics
+            and any(naics.startswith(prefix) for prefix in naics_prefixes)
+        )
+        if not industry_matched and not naics_matched:
+            missing_dimensions = []
+            if invalid_naics_restriction:
+                missing_dimensions.append("valid NAICS program scope configuration")
+            if industry_keys and not industry:
+                missing_dimensions.append("industry")
+            if naics_prefixes and not naics:
+                missing_dimensions.append("NAICS")
+            if missing_dimensions:
+                unknown.extend(missing_dimensions)
+            else:
+                return False, ["Industry is outside this product scope"]
 
     for key in scope.required_fact_keys or []:
         actual = context.get(str(key))
@@ -492,35 +531,9 @@ async def published_candidates(
 
     catalog = await program_catalog.catalog_rows(db)
     scopes = await program_catalog.scopes_by_program(db, [row.id for row in catalog])
-    playbooks = list(
-        (
-            await db.execute(
-                select(AIPlaybookTemplate).where(
-                    AIPlaybookTemplate.playbook_type == "loan_product",
-                    AIPlaybookTemplate.status == "published",
-                    AIPlaybookTemplate.is_active.is_(True),
-                    AIPlaybookTemplate.funding_program_id.in_([row.id for row in catalog])
-                    if catalog
-                    else False,
-                )
-            )
-        )
-        .scalars()
-        .all()
+    latest = await program_catalog.published_versions_by_program(
+        db, [row.id for row in catalog]
     )
-    playbooks.sort(
-        key=lambda row: (
-            1 if row.owner_type == "funding" else 0,
-            row.version,
-            row.published_at or row.created_at,
-            str(row.id),
-        ),
-        reverse=True,
-    )
-    latest: dict[uuid.UUID, AIPlaybookTemplate] = {}
-    for row in playbooks:
-        if row.funding_program_id is not None:
-            latest.setdefault(row.funding_program_id, row)
 
     candidates: list[ProgramFitCandidate] = []
     for item in catalog:
@@ -535,18 +548,28 @@ async def published_candidates(
                     public_slug=item.public_slug,
                     eligible=False,
                     recommendation_status="criteria_unavailable",
-                    reasons=["Published underwriting criteria are not available"],
+                    criteria_status="not_published",
+                    reasons=["No approved published criteria version is available"],
                 )
             )
             continue
+        rules_valid = True
         try:
             validate_rules(playbook.rules or {})
             has_fit_rule = bool((playbook.rules or {}).get("fit"))
             result = evaluate_rules(playbook.rules or {}, context) if has_fit_rule else None
         except ProgramRuleError:
+            rules_valid = False
             result = None
             has_fit_rule = False
-        priority = int((playbook.rules or {}).get("priority") or 0)
+        raw_priority = (playbook.rules or {}).get("priority", 0)
+        priority = (
+            raw_priority
+            if isinstance(raw_priority, int)
+            and not isinstance(raw_priority, bool)
+            and -10_000 <= raw_priority <= 10_000
+            else 0
+        )
         missing_fields = [
             field
             for field in sorted(_rule_fields((playbook.rules or {}).get("fit")))
@@ -565,7 +588,14 @@ async def published_candidates(
             eligible = False
         elif not has_fit_rule or result is None:
             recommendation_status = "criteria_unavailable"
-            reasons = ["Published fit criteria are unavailable or invalid"]
+            reasons = [
+                f"Published version {playbook.version} has "
+                + (
+                    "invalid structured fit rules"
+                    if not rules_valid
+                    else "no structured fit rule"
+                )
+            ]
             eligible = False
         elif scope_state is None or (not result.matched and missing_fields):
             recommendation_status = "needs_information"
@@ -592,6 +622,9 @@ async def published_candidates(
                 playbook_version=playbook.version,
                 eligible=eligible,
                 recommendation_status=recommendation_status,
+                criteria_status=(
+                    "published" if has_fit_rule and rules_valid else "invalid"
+                ),
                 fit_score=round((result.confidence if result else 0) * 100, 2),
                 confidence=result.confidence if result else 0,
                 priority=priority,
@@ -901,6 +934,13 @@ def _legacy_condition_matches(condition: dict | None, context: dict[str, Any]) -
 
 def _client_visible(requirement: AICollectionRequirement) -> bool:
     return bool({"borrower", "client"}.intersection(set(requirement.visibility or [])))
+
+
+def _requires_human_verification(requirement: AICollectionRequirement) -> bool:
+    return bool(
+        requirement.verification_required
+        or getattr(requirement, "completion_mode", None) == "requires_human_verify"
+    )
 
 
 async def _requested_document(
@@ -1739,7 +1779,7 @@ async def _reconcile_evidence_decisions(
             effective[link.id] = row
 
         accepted = effective[link.id].decision == "accepted"
-        can_auto_verify = accepted and not requirement.verification_required
+        can_auto_verify = accepted and not _requires_human_verification(requirement)
         if can_auto_verify and link.verified_at is None:
             link.verified_at = timestamp
             link.verified_by_user_id = None
@@ -1808,10 +1848,10 @@ async def _materialize_requirements(
             merged[requirement.requirement_key] = current
         elif (
             LEVEL_RANK.get(requirement.required_level, 0),
-            bool(requirement.verification_required),
+            _requires_human_verification(requirement),
         ) > (
             LEVEL_RANK.get(current["requirement"].required_level, 0),
-            bool(current["requirement"].verification_required),
+            _requires_human_verification(current["requirement"]),
         ):
             current["requirement"] = requirement
         if program_key:
@@ -1863,7 +1903,7 @@ async def _materialize_requirements(
                 required_level=requirement.required_level,
                 status="requested" if requested else "missing",
                 requested_document_id=requested.id if requested else None,
-                verification_required=requirement.verification_required,
+                verification_required=_requires_human_verification(requirement),
                 source_program_keys=sorted(source_programs),
                 source_policy_keys=sorted(source_policies),
             )
@@ -1874,7 +1914,7 @@ async def _materialize_requirements(
         state.label = requirement.label
         state.category = requirement.category
         state.required_level = requirement.required_level
-        state.verification_required = requirement.verification_required
+        state.verification_required = _requires_human_verification(requirement)
         state.source_program_keys = sorted(source_programs)
         state.source_policy_keys = sorted(source_policies)
         if requested:
@@ -2526,6 +2566,21 @@ async def get_program_readiness(
                 ),
                 allow_multiple_files=True,
                 verification_required=item.verification_required,
+                objective_text=(
+                    requirement_definitions[item.requirement_key].objective_text or ""
+                    if item.requirement_key in requirement_definitions
+                    else ""
+                ),
+                completion_criteria=(
+                    requirement_definitions[item.requirement_key].completion_criteria or ""
+                    if item.requirement_key in requirement_definitions
+                    else ""
+                ),
+                ai_request_message_template=(
+                    requirement_definitions[item.requirement_key].ai_request_message_template
+                    if item.requirement_key in requirement_definitions
+                    else None
+                ),
                 source_program_keys=list(item.source_program_keys or []),
                 source_policy_keys=list(item.source_policy_keys or []),
                 program_overrides={

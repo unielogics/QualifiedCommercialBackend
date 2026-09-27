@@ -11,6 +11,49 @@ ALLOWED_COMBINATORS = {"all", "any", "not"}
 MAX_DEPTH = 8
 MAX_RULES = 100
 
+# Every ordinary rule field must be materialized by
+# application_programs.profile_fit_context. Keeping this bounded prevents a
+# typo in an approved version from becoming a permanent "needs information"
+# result that no evidence can ever satisfy. Evidence classifications remain
+# extensible through the dedicated evidence_available operator.
+SUPPORTED_FIT_FIELDS = frozenset(
+    {
+        "vertical",
+        "intake_variant",
+        "intent",
+        "intent_kind",
+        "funding_category",
+        "entity_type",
+        "industry",
+        "subindustry",
+        "industry_key",
+        "naics_code",
+        "loan_purpose",
+        "requested_amount",
+        "business_age_years",
+        "revenue",
+        "annual_revenue",
+        "annualized_deposits",
+        "deposits",
+        "bank_statement_months",
+        "tax_return_years",
+        "nsf_or_overdraft_count",
+        "credit_score",
+        "estimated_credit_score",
+        "dscr",
+        "cash_flow",
+        "debt_burden",
+        "liquid_assets",
+        "tax_returns_available",
+        "bank_statements_available",
+        "evidence_count",
+        "declared_collateral",
+        "mca_obligations_present",
+        "floorplan_inventory_present",
+        "equipment_financing_intent",
+    }
+)
+
 
 class ProgramRuleError(ValueError):
     pass
@@ -28,15 +71,44 @@ class RuleEvaluation:
         return 0.0 if self.total == 0 else round(self.passed / self.total, 4)
 
 
-def validate_rules(rules: dict[str, Any] | None) -> None:
-    """Validate only the reserved ``fit`` tree; other playbook metadata is inert."""
+def validate_rules(
+    rules: dict[str, Any] | None,
+    *,
+    enforce_supported_fields: bool = False,
+) -> None:
+    """Validate only the reserved ``fit`` tree; other metadata is inert.
+
+    ``enforce_supported_fields`` is used when a catalog draft is created or
+    published.  Evaluation deliberately leaves it off so a legacy published
+    rule that used a dotted context path remains readable instead of suddenly
+    becoming invalid after this validation was introduced.
+    """
     if not rules or "fit" not in rules:
         return
+    if enforce_supported_fields:
+        priority = rules.get("priority", 0)
+        if (
+            isinstance(priority, bool)
+            or not isinstance(priority, int)
+            or not -10_000 <= priority <= 10_000
+        ):
+            raise ProgramRuleError("Program fit priority must be a bounded integer")
     count = [0]
-    _validate_node(rules["fit"], depth=0, count=count)
+    _validate_node(
+        rules["fit"],
+        depth=0,
+        count=count,
+        enforce_supported_fields=enforce_supported_fields,
+    )
 
 
-def _validate_node(node: Any, *, depth: int, count: list[int]) -> None:
+def _validate_node(
+    node: Any,
+    *,
+    depth: int,
+    count: list[int],
+    enforce_supported_fields: bool,
+) -> None:
     if depth > MAX_DEPTH:
         raise ProgramRuleError("Program fit rules are nested too deeply")
     count[0] += 1
@@ -51,12 +123,22 @@ def _validate_node(node: Any, *, depth: int, count: list[int]) -> None:
         key = combinators[0]
         children = node[key]
         if key == "not":
-            _validate_node(children, depth=depth + 1, count=count)
+            _validate_node(
+                children,
+                depth=depth + 1,
+                count=count,
+                enforce_supported_fields=enforce_supported_fields,
+            )
             return
         if not isinstance(children, list) or not children:
             raise ProgramRuleError(f"{key} must contain at least one rule")
         for child in children:
-            _validate_node(child, depth=depth + 1, count=count)
+            _validate_node(
+                child,
+                depth=depth + 1,
+                count=count,
+                enforce_supported_fields=enforce_supported_fields,
+            )
         return
     allowed = {"field", "op", "value"}
     if set(node) - allowed:
@@ -68,7 +150,23 @@ def _validate_node(node: Any, *, depth: int, count: list[int]) -> None:
     if op not in ALLOWED_OPERATORS:
         raise ProgramRuleError("Unsupported program fit operator")
     value = node.get("value")
-    if op == "in" and (not isinstance(value, list) or len(value) > 100):
+    if (
+        enforce_supported_fields
+        and op != "evidence_available"
+        and field not in SUPPORTED_FIT_FIELDS
+    ):
+        raise ProgramRuleError(f"Unsupported program fit field: {field}")
+    if enforce_supported_fields and op == "present" and "value" in node:
+        raise ProgramRuleError("The present operator does not accept a value")
+    if enforce_supported_fields and op == "evidence_available" and value is not None and (
+        not isinstance(value, str) or not value.strip()
+    ):
+        raise ProgramRuleError("The evidence_available operator requires a classification string")
+    if op == "in" and (
+        not isinstance(value, list)
+        or (enforce_supported_fields and not value)
+        or len(value) > 100
+    ):
         raise ProgramRuleError("The in operator requires a bounded value list")
     if op in {"gte", "lte", "gt", "lt"} and not _is_number(value):
         raise ProgramRuleError(f"The {op} operator requires a numeric value")

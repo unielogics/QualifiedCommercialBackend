@@ -115,6 +115,7 @@ class ProgramFitCandidate(BaseModel):
     playbook_version: int | None = None
     eligible: bool
     recommendation_status: ProgramRecommendationStatus
+    criteria_status: Literal["published", "not_published", "invalid"] = "published"
     fit_score: float = 0
     confidence: float = 0
     priority: int = 0
@@ -202,6 +203,9 @@ class ApplicationRequirementRead(BaseModel):
     verified_coverage_complete: bool = False
     allow_multiple_files: bool = True
     verification_required: bool = False
+    objective_text: str = ""
+    completion_criteria: str = ""
+    ai_request_message_template: str | None = None
     source_program_keys: list[str] = Field(default_factory=list)
     source_policy_keys: list[str] = Field(default_factory=list)
     program_overrides: dict[str, str] = Field(default_factory=dict)

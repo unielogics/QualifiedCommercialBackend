@@ -3697,6 +3697,17 @@ async def _program_context_for_chat(
         return None
     selections = await active_selections(db, profile.id)
     if not selections:
+        if audience == "admin":
+            return {
+                "selection_mode": profile.program_selection_mode,
+                "selected_programs": [],
+                "shared_requirements": [],
+                "instructions": (
+                    "No approved published program is selected. Do not use legacy fit data "
+                    "to recommend a program; report that published criteria are unavailable "
+                    "or that more information is required."
+                ),
+            }
         return None
     states = list(
         (
@@ -3721,6 +3732,15 @@ async def _program_context_for_chat(
         for row in definitions
         if {"borrower", "client"}.intersection(set(row.visibility or []))
     }
+    definition_by_key: dict[str, AICollectionRequirement] = {}
+    public_definition_by_key: dict[str, AICollectionRequirement] = {}
+    for row in sorted(
+        definitions,
+        key=lambda item: (item.display_order, item.requirement_key, str(item.id)),
+    ):
+        definition_by_key.setdefault(row.requirement_key, row)
+        if {"borrower", "client"}.intersection(set(row.visibility or [])):
+            public_definition_by_key.setdefault(row.requirement_key, row)
     overrides = list(
         (
             await db.execute(
@@ -3754,6 +3774,21 @@ async def _program_context_for_chat(
                     "label": item.label,
                     "status": item.status,
                     "required_level": item.required_level,
+                    "objective_text": (
+                        definition_by_key[item.requirement_key].objective_text or ""
+                        if item.requirement_key in definition_by_key
+                        else ""
+                    ),
+                    "completion_criteria": (
+                        definition_by_key[item.requirement_key].completion_criteria or ""
+                        if item.requirement_key in definition_by_key
+                        else ""
+                    ),
+                    "ai_request_message_template": (
+                        definition_by_key[item.requirement_key].ai_request_message_template
+                        if item.requirement_key in definition_by_key
+                        else None
+                    ),
                     "source_program_keys": list(item.source_program_keys or []),
                     "program_overrides": {
                         program_key: disposition
@@ -3777,12 +3812,18 @@ async def _program_context_for_chat(
                     "business_debt_schedule",
                     "ytd_p_and_l_balance_sheet",
                 },
+                "request_message": (
+                    public_definition_by_key[item.requirement_key].ai_request_message_template
+                    if item.requirement_key in public_definition_by_key
+                    else None
+                ),
             }
             for item in states
             if item.requirement_key in client_visible
         ],
         "instructions": (
             "Use these deterministic requirement states to choose one next missing item. "
+            "Request-message guidance may explain how to collect it, but must never change whether it is complete. "
             "Do not disclose program names, fit scores, rankings, or unpublished criteria."
         ),
     }
@@ -3815,6 +3856,13 @@ async def _chat_context(
         "audience": audience,
     }
     if audience == "admin":
+        admin_ai_context = dict(bucket.ai_context or {})
+        if program_context is not None:
+            # Published selections/requirements are authoritative for program
+            # guidance. Keep the stored legacy value for compatibility, but do
+            # not place it beside the approved context in the model prompt.
+            admin_ai_context.pop("loan_program_fit", None)
+            admin_ai_context.pop("program_fit", None)
         primary_files = [
             file for file in bucket.files
             if file.status == "uploaded" and file.deleted_at is None
@@ -3837,7 +3885,7 @@ async def _chat_context(
         ).scalars().all()
         return {
             **base,
-            "ai_context": bucket.ai_context or {},
+            "ai_context": admin_ai_context,
             "requested_documents": [_doc_context(doc) for doc in bucket.requested_documents],
             "document_template_library": [_template_context(template) for template in templates],
             "files": [_file_context(file) for file in visible_files],
@@ -3846,7 +3894,11 @@ async def _chat_context(
             "latest_review": review.result if review else None,
             "program_readiness": program_context,
             "action_items": [_task_context(task) for task in tasks],
-            "instructions": "When the admin asks for tasks or document requests, use the template library where it fits. If no template matches, create a custom action item with route uploader/admin/share.",
+            "instructions": (
+                "When the admin asks for tasks or document requests, use the template library where it fits. "
+                "If no template matches, create a custom action item with route uploader/admin/share. "
+                "Program readiness is authoritative; never replace it with legacy fit data or invent lender criteria."
+            ),
         }
     if upload_link is not None:
         review = await latest_review(db, bucket.id)

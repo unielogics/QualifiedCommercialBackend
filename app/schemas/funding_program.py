@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
@@ -21,12 +22,30 @@ class FundingProgramScopeRead(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class FundingProgramRequirementRead(BaseModel):
+    requirement_key: str
+    label: str
+    category: str
+    required_level: str
+    applies_when: dict | None = None
+    blocks_stage: str | None = None
+    visibility: list[str] = Field(default_factory=list)
+    can_underwriter_waive: bool = True
+    verification_required: bool = False
+    expiration_days: int | None = None
+    ai_request_message_template: str | None = None
+    display_order: int = 0
+    objective_text: str = ""
+    completion_criteria: str = ""
+    completion_mode: str = "ai_can_complete"
+
+
 class FundingProgramVersionRead(BaseModel):
     playbook_id: UUID
     version: int
     status: Literal["draft", "published", "archived"]
     rules: dict = Field(default_factory=dict)
-    requirements: list[dict] = Field(default_factory=list)
+    requirements: list[FundingProgramRequirementRead] = Field(default_factory=list)
     published_at: datetime | None = None
 
 
@@ -63,6 +82,46 @@ class FundingProgramScopeWrite(BaseModel):
     naics_prefixes: list[str] = Field(default_factory=list, max_length=30)
     industry_keys: list[str] = Field(default_factory=list, max_length=30)
     required_fact_keys: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("naics_prefixes")
+    @classmethod
+    def _valid_naics_prefixes(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for raw in values:
+            value = str(raw).strip()
+            direct = re.fullmatch(r"\d{2,6}", value)
+            bounded_range = re.fullmatch(r"(\d{2,6})\s*-\s*(\d{2,6})", value)
+            if direct:
+                expanded = [value]
+            elif bounded_range:
+                start_text, end_text = bounded_range.groups()
+                start, end = int(start_text), int(end_text)
+                if len(start_text) != len(end_text) or end < start or end - start > 20:
+                    raise ValueError("NAICS prefix ranges must be ascending and bounded")
+                expanded = [
+                    str(item).zfill(len(start_text))
+                    for item in range(start, end + 1)
+                ]
+            else:
+                raise ValueError(
+                    "NAICS prefixes must contain 2 to 6 digits or a bounded numeric range"
+                )
+            for prefix in expanded:
+                if prefix not in normalized:
+                    normalized.append(prefix)
+        return normalized
+
+    @field_validator("intake_variants", "intent_keys", "industry_keys", "required_fact_keys")
+    @classmethod
+    def _normalize_scope_keys(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for raw in values:
+            value = str(raw).strip().casefold()
+            if not value:
+                raise ValueError("Scope keys cannot be blank")
+            if value not in normalized:
+                normalized.append(value)
+        return normalized
 
 
 class FundingProgramCreate(BaseModel):
@@ -166,9 +225,8 @@ class FundingProgramScopePatch(BaseModel):
 
     @model_validator(mode="after")
     def _has_change(self) -> FundingProgramScopePatch:
-        if all(
-            value is None
-            for value in (self.name, self.short_description, self.display_order, self.scopes)
+        if not self.model_fields_set.intersection(
+            {"name", "short_description", "display_order", "scopes"}
         ):
             raise ValueError("At least one catalog field must change")
         return self

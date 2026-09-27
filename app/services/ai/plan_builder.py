@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import UUID
 
@@ -34,7 +34,6 @@ from app.services.ai.requirement_resolver import (
     ResolvedRequirement,
     resolve_requirements,
 )
-
 
 # ── Public types ───────────────────────────────────────────────────
 
@@ -246,7 +245,7 @@ async def _compute(
         next_best_question=next_q,
         next_best_action=next_a,
         readiness_score=score,
-        computed_at=datetime.now(timezone.utc),
+        computed_at=datetime.now(UTC),
     )
 
 
@@ -407,6 +406,8 @@ def _serialize_requirement(
         "verification_required": r.verification_required,
         "expiration_days": r.expiration_days,
         "ai_request_message_template": r.ai_request_message_template,
+        "objective_text": r.objective_text,
+        "completion_criteria": r.completion_criteria,
         "display_order": r.display_order,
         "status": status,
         "source": source,

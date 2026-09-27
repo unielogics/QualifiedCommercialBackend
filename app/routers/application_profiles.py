@@ -376,15 +376,22 @@ async def search_application_taxonomy(
         stmt = stmt.where(ApplicationTaxonomyEntry.parent_id == parent_id)
     query = _normalize_label(q)
     if query:
-        like = f"%{query}%"
-        stmt = stmt.where(or_(
-            ApplicationTaxonomyEntry.normalized_label.ilike(like),
-            ApplicationTaxonomyEntry.code.ilike(f"%{q.strip()}%"),
-            func.cast(ApplicationTaxonomyEntry.aliases, sa.Text).ilike(like),
-        ))
+        # Match words independently: "auto dealer" also finds "Automobile
+        # Dealers", and a code plus a name need not be one literal substring.
+        for term in query.split()[:12]:
+            escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like = f"%{escaped}%"
+            stmt = stmt.where(or_(
+                ApplicationTaxonomyEntry.normalized_label.ilike(like, escape="\\"),
+                ApplicationTaxonomyEntry.code.ilike(like, escape="\\"),
+                func.cast(ApplicationTaxonomyEntry.aliases, sa.Text).ilike(like, escape="\\"),
+            ))
     total = (await db.execute(select(func.count()).select_from(stmt.order_by(None).subquery()))).scalar_one()
     rows = list((await db.execute(
-        stmt.order_by(ApplicationTaxonomyEntry.code.asc().nullslast(), ApplicationTaxonomyEntry.label.asc())
+        stmt.order_by(
+            sa.case((ApplicationTaxonomyEntry.code == query, 0), else_=1),
+            ApplicationTaxonomyEntry.code.asc().nullslast(), ApplicationTaxonomyEntry.label.asc(),
+        )
         .offset((page - 1) * page_size).limit(page_size)
     )).scalars().all())
     paths = await _taxonomy_paths(db, rows)
@@ -1888,6 +1895,44 @@ def _extracted_fact_read(fact: ApplicationExtractedFact) -> ExtractedFactRead:
     )
 
 
+async def _apply_reviewed_profile_fact(db, profile, user, canonical_key: str, raw) -> None:
+    if raw in (None, ""):
+        return
+    value = str(raw).strip()
+    if canonical_key == "naics_code":
+        entry = (await db.execute(select(ApplicationTaxonomyEntry).where(
+            ApplicationTaxonomyEntry.level == 6,
+            ApplicationTaxonomyEntry.code == value,
+            ApplicationTaxonomyEntry.status.in_(["official", "approved"]),
+        ).limit(1))).scalar_one_or_none()
+        group = await db.get(ApplicationTaxonomyEntry, entry.parent_id) if entry else None
+        sector = await db.get(ApplicationTaxonomyEntry, group.parent_id) if group else None
+        if not entry or not group or not sector or group.level != 3 or sector.level != 2 or any(
+            row.status not in {"official", "approved"} for row in (entry, group, sector)
+        ):
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "This code is not in the approved industry catalog. Use Edit file classification to select or request the correct business activity.")
+        before = _classification_dict(profile)
+        profile.naics_code, profile.naics_label = entry.code, entry.label
+        profile.activity_entry_id = entry.id
+        profile.subindustry_entry_id, profile.subindustry = group.id, group.label
+        profile.industry_entry_id, profile.industry = sector.id, sector.label
+        profile.custom_industry = None
+        profile.classification_revision = (profile.classification_revision or 0) + 1
+        profile.classified_at = datetime.now(UTC)
+        profile.classified_by_user_id = user.id
+        profile.classification_provenance = {"source": "accepted_extracted_fact", "status": "canonical"}
+        profile.classification_state = {"analysis_status": "stale", "previous": before, "current": _classification_dict(profile)}
+        return
+    identity_field = {"industry": "industry_entry_id", "subindustry": "subindustry_entry_id", "naics_label": "activity_entry_id"}.get(canonical_key)
+    if identity_field and getattr(profile, identity_field, None):
+        entry = await db.get(ApplicationTaxonomyEntry, getattr(profile, identity_field))
+        if not entry or value.casefold() not in {entry.label.casefold(), str(entry.code).casefold()}:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "This suggestion conflicts with the selected business activity. Use Edit file classification to change the complete industry classification.")
+        value = entry.label
+    if canonical_key in {"funding_category", "entity_type", "industry", "subindustry", "naics_label"}:
+        setattr(profile, canonical_key, value)
+
+
 @router.post("/{profile_id}/extracted-facts/{fact_id}/review", response_model=ExtractedFactRead)
 async def review_extracted_fact(
     profile_id: UUID,
@@ -1924,6 +1969,9 @@ async def review_extracted_fact(
             status.HTTP_409_CONFLICT,
             "This field already has an accepted value",
         )
+    if payload.action == "accept":
+        raw = fact.value.get("value") if isinstance(fact.value, dict) else None
+        await _apply_reviewed_profile_fact(db, profile, user, canonical_key, raw)
     reviewed_at = datetime.now(UTC)
     resolved = facts_resolved_by_review(fact_rows, fact, payload.action)
     for row in resolved:
@@ -1934,11 +1982,6 @@ async def review_extracted_fact(
         )
         row.reviewed_by_user_id = user.id
         row.reviewed_at = reviewed_at
-    allowed_profile_fields = {"funding_category", "entity_type", "industry", "subindustry", "naics_code", "naics_label"}
-    if payload.action == "accept" and canonical_key in allowed_profile_fields:
-        raw = fact.value.get("value") if isinstance(fact.value, dict) else None
-        if raw not in (None, ""):
-            setattr(profile, canonical_key, str(raw))
     if not pending_review_group_keys(fact_rows):
         profile.extraction_reviewed_at = datetime.now(UTC)
     await profiles.log_profile_action(
