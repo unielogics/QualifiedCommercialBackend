@@ -49,6 +49,16 @@ class UseOfFundsPatch(BaseModel):
         return rows
 
 
+class UseOfFundsRoomAccess(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    passcode: str = Field(min_length=6, max_length=16)
+
+
+class UseOfFundsRoomPatch(UseOfFundsPatch):
+    passcode: str = Field(min_length=6, max_length=16)
+
+
 class UseOfFundsRead(BaseModel):
     profile_id: UUID
     can_edit: bool = False

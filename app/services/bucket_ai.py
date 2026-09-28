@@ -2853,6 +2853,9 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
             }
         )
 
+    await _set_progress("checking_documents", "Checking published document requirements…", files_done)
+    from app.services.document_qualification_review import review_bucket_checks
+    await review_bucket_checks(db, [file for file in files if file.id not in extracted_zip_parent_ids])
     await _set_progress("synthesizing", "Synthesizing the underwriting breakdown…", files_done)
 
     content.append(

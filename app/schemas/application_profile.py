@@ -285,6 +285,8 @@ class ApplicationRequirementAIReviewResult(BaseModel):
     already_verified_count: int = 0
     retained_for_staff_count: int = 0
     analysis_required_count: int = 0
+    queued_review_id: UUID | None = None
+    review_message: str | None = None
 
 
 class ApplicationProgramsPatch(BaseModel):

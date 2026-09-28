@@ -601,7 +601,7 @@ def test_ai_decision_accepts_grace_legal_name_expansion() -> None:
 
     assert decision[:2] == ("accepted", "validated")
     assert aliases == {"graceautosalesservice"}
-    assert AI_EVIDENCE_DECISION_ALGORITHM == "ai-evidence-v2"
+    assert AI_EVIDENCE_DECISION_ALGORITHM == "ai-evidence-v3"
 
 
 @pytest.mark.asyncio

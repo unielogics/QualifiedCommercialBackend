@@ -149,7 +149,12 @@ from app.schemas.application_profile import (
     WorksheetRowOp,
 )
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
-from app.schemas.use_of_funds import UseOfFundsPatch, UseOfFundsRead
+from app.schemas.use_of_funds import (
+    UseOfFundsPatch,
+    UseOfFundsRead,
+    UseOfFundsRoomAccess,
+    UseOfFundsRoomPatch,
+)
 from app.services import application_profiles as profiles
 from app.services import (
     application_programs,
@@ -2542,6 +2547,8 @@ async def _public_application_room(
     token: str,
     passcode: str,
     request: Request,
+    *,
+    allow_dealer: bool = False,
 ) -> tuple[BucketUploadLink, ApplicationProfile]:
     link = (
         await db.execute(
@@ -2551,7 +2558,7 @@ async def _public_application_room(
             )
         )
     ).scalar_one_or_none()
-    if link is None:
+    if link is None or (link.expires_at is not None and link.expires_at <= datetime.now(UTC)):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Application room not found")
     if not _verify_passcode(
         passcode,
@@ -2566,8 +2573,14 @@ async def _public_application_room(
             )
         )
     ).scalar_one_or_none()
-    # Dealer rooms retain their existing Dealer OS contract and endpoints.
-    if profile is None or profile.dealer_id is not None:
+    # Banking retains the Dealer OS contract; shared budgets explicitly opt in
+    # to a dealer profile bound to this exact secure room's bucket.
+    if profile is None or (profile.dealer_id is not None and not allow_dealer):
+        if allow_dealer:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "Use of funds is not enabled for this room yet. Ask your team to open the funding file.",
+            )
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Application banking is not enabled for this room")
     return link, profile
 
@@ -2730,6 +2743,44 @@ async def _application_room_state(
         signable=await _application_room_signables(db, link.bucket_id),
         merchant_offer=await _room_merchant_offer_summary(db, profile),
     )
+
+
+@router.post("/public/room/{token}/use-of-funds", response_model=UseOfFundsRead)
+async def public_application_room_use_of_funds(
+    token: str,
+    payload: UseOfFundsRoomAccess,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> UseOfFundsRead:
+    from app.services.use_of_funds import read_budget
+
+    _link, profile = await _public_application_room(
+        db, token, payload.passcode, request, allow_dealer=True,
+    )
+    budget = await read_budget(db, profile)
+    # Client views need the saved budget, not the identity of a staff editor.
+    return budget.model_copy(update={"can_edit": True, "updated_by_user_id": None})
+
+
+@router.patch("/public/room/{token}/use-of-funds", response_model=UseOfFundsRead)
+async def public_application_room_update_use_of_funds(
+    token: str,
+    payload: UseOfFundsRoomPatch,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> UseOfFundsRead:
+    from app.services.use_of_funds import update_client_budget
+
+    link, profile = await _public_application_room(
+        db, token, payload.passcode, request, allow_dealer=True,
+    )
+    budget = await update_client_budget(
+        db, profile,
+        UseOfFundsPatch(items=payload.items, expected_revision=payload.expected_revision),
+        room_link=link,
+    )
+    await db.commit()
+    return budget.model_copy(update={"updated_by_user_id": None})
 
 
 @router.post("/public/room/{token}/state", response_model=ApplicationRoomState)

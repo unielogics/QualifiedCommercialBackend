@@ -484,14 +484,14 @@ async def create_version(
                 blocks_stage=item.blocks_stage,
                 visibility=list(item.visibility),
                 can_underwriter_waive=item.can_underwriter_waive,
-                verification_required=bool(item.verification_required or item.review_checks),
+                verification_required=item.verification_required,
                 expiration_days=item.expiration_days,
                 ai_request_message_template=item.ai_request_message_template,
                 display_order=item.display_order,
                 objective_text=item.objective_text,
                 completion_criteria=item.completion_criteria,
                 review_checks=[check.model_dump() for check in item.review_checks],
-                completion_mode="requires_human_verify" if item.review_checks else item.completion_mode,
+                completion_mode=item.completion_mode,
             )
         )
     db.add(

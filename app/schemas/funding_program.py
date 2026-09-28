@@ -249,6 +249,12 @@ class FundingProgramRequirementWrite(BaseModel):
             raise ValueError("Tax return requirements must specify 1 to 10 years")
         return value
 
+    @model_validator(mode="after")
+    def _no_self_attested_document_checks(self):
+        if self.review_checks and self.completion_mode == "borrower_self_attest":
+            raise ValueError("Document checks require AI verification or staff verification, not borrower self-attestation")
+        return self
+
 
 class FundingProgramVersionCreate(_OptionalReviewReason):
     name: str | None = Field(default=None, max_length=160)

@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from uuid import UUID
 
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -18,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.dealer_os.models import DealerBusiness
 from app.enums import Role
 from app.models.application_profile import ApplicationProfile
+from app.models.bucket import BucketUploadLink
 from app.models.deal import Deal
 from app.models.loan import Loan
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
@@ -176,6 +178,36 @@ async def update_budget(
     db: AsyncSession, profile: ApplicationProfile, payload: UseOfFundsPatch, user: User,
 ) -> UseOfFundsRead:
     require_editor(user)
+    return await _persist_budget(db, profile, payload, user=user)
+
+
+async def update_client_budget(
+    db: AsyncSession, profile: ApplicationProfile, payload: UseOfFundsPatch,
+    *, room_link: BucketUploadLink,
+) -> UseOfFundsRead:
+    """Save only after the route has verified this room's token and PIN.
+
+    Keep the room/profile binding explicit so no future caller can reuse a
+    verified room to write another file. Client actors are never impersonated
+    as an assigned staff user, and the passcode never reaches audit metadata.
+    """
+    if (
+        room_link.bucket_id != profile.primary_bucket_id
+        or room_link.status != "active"
+        or (room_link.expires_at is not None and room_link.expires_at <= datetime.now(UTC))
+    ):
+        raise HTTPException(404, "Application room not found")
+    return await _persist_budget(
+        db, profile, payload, user=None, room_link_id=room_link.id,
+        room_bucket_id=room_link.bucket_id,
+    )
+
+
+async def _persist_budget(
+    db: AsyncSession, profile: ApplicationProfile, payload: UseOfFundsPatch,
+    *, user: User | None, room_link_id: UUID | None = None,
+    room_bucket_id: UUID | None = None,
+) -> UseOfFundsRead:
     # Refresh the identity-map object after locking, so simultaneous editors
     # compare with the committed revision rather than an earlier cached value.
     locked = (
@@ -184,6 +216,8 @@ async def update_budget(
             .with_for_update().execution_options(populate_existing=True)
         )
     ).scalar_one()
+    if room_bucket_id is not None and locked.primary_bucket_id != room_bucket_id:
+        raise HTTPException(409, "This room's funding file changed; reload before saving")
     if (locked.use_of_funds_revision or 0) != payload.expected_revision:
         raise HTTPException(409, "Use of funds changed; reload the current budget before saving")
     amount, source, _purpose, dealer = await source_funding_data(db, locked)
@@ -195,12 +229,18 @@ async def update_budget(
     locked.use_of_funds = [item.model_dump(mode="json") for item in payload.items]
     locked.use_of_funds_revision = (locked.use_of_funds_revision or 0) + 1
     locked.use_of_funds_updated_at = datetime.now(UTC)
-    locked.use_of_funds_updated_by_user_id = user.id
+    locked.use_of_funds_updated_by_user_id = user.id if user else None
     from app.services.application_profiles import log_profile_action
 
     await log_profile_action(
-        db, locked, user, "use_of_funds.update", "Updated the shared use-of-funds budget",
+        db, locked, user,
+        "use_of_funds.update.application_room" if room_link_id else "use_of_funds.update",
+        "Client updated the shared use-of-funds budget" if room_link_id else "Updated the shared use-of-funds budget",
+        target_type="upload_link" if room_link_id else None,
+        target_id=room_link_id,
         metadata={"before": before, "after": locked.use_of_funds,
+                  "actor_source": "secure_room_client" if room_link_id else "staff",
+                  "room_link_id": str(room_link_id) if room_link_id else None,
                   "revision": locked.use_of_funds_revision, "requested_amount_source": source,
                   "complete": result.complete, "total": str(exact_total),
                   "category_totals": result.category_totals,

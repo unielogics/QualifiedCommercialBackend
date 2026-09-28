@@ -145,8 +145,8 @@ def test_readable_document_never_satisfies_configured_financial_traits(severity)
         duplicate_content=False,
     )
     assert decision[:2] == ("needs_more", "document_review_pending")
-    assert "staff verification" in decision[2]
-    assert _requires_human_verification(requirement) is True
+    assert "source-page references" in decision[2]
+    assert _requires_human_verification(requirement) is False
 
 
 def test_selected_program_checks_are_unioned_not_overwritten():
@@ -182,7 +182,7 @@ def test_plan_readiness_requires_verification_of_document_traits():
 
 
 @pytest.mark.asyncio
-async def test_funding_version_creation_forces_verification_and_round_trips_traits():
+async def test_funding_version_creation_preserves_explicit_ai_verification_and_round_trips_traits():
     db = SimpleNamespace(
         execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None)),
         add=Mock(),
@@ -209,8 +209,8 @@ async def test_funding_version_creation_forces_verification_and_round_trips_trai
     )
     requirement = db.add.call_args_list[1].args[0]
     assert requirement.review_checks == [CHECK]
-    assert requirement.verification_required is True
-    assert requirement.completion_mode == "requires_human_verify"
+    assert requirement.verification_required is False
+    assert requirement.completion_mode == "ai_can_complete"
     playbook.id = uuid4()
     result = funding_programs._version_read(playbook, [requirement])
     assert result.requirements[0].review_checks[0].model_dump() == CHECK

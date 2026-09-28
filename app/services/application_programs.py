@@ -26,6 +26,8 @@ from app.models.application_profile import (
     ApplicationTaxonomyEntry,
 )
 from app.models.bucket import (
+    Bucket,
+    BucketAIReview,
     BucketFile,
     BucketFileAnalysis,
     BucketRequestedDocument,
@@ -78,7 +80,7 @@ from app.services.use_of_funds import source_funding_data
 from app.services.use_of_funds import summarize as summarize_use_of_funds
 
 SATISFIED_STATES = {"verified", "waived", "not_applicable"}
-AI_EVIDENCE_DECISION_ALGORITHM = "ai-evidence-v2"
+AI_EVIDENCE_DECISION_ALGORITHM = "ai-evidence-v3"
 OPEN_UNDERWRITING_STATES = {
     "submitted",
     "collecting_docs",
@@ -1006,9 +1008,8 @@ def _client_visible(requirement: AICollectionRequirement) -> bool:
 
 def _requires_human_verification(requirement: AICollectionRequirement) -> bool:
     return bool(
-        requirement.verification_required
+        getattr(requirement, "verification_required", False)
         or getattr(requirement, "completion_mode", None) == "requires_human_verify"
-        or bool(getattr(requirement, "review_checks", None))
     )
 
 
@@ -1109,6 +1110,19 @@ def _merged_review_checks(requirements: list[AICollectionRequirement]) -> list[d
         for check in getattr(requirement, "review_checks", None) or []:
             if isinstance(check, dict):
                 unique.setdefault(json.dumps(check, sort_keys=True), dict(check))
+        # Instructions are executable review obligations, not decoration. When
+        # AI completion is selected, it must satisfy the written objective and
+        # completion instructions as well as every individually configured trait.
+        if not _requires_human_verification(requirement):
+            for field, label in (("objective_text", "Document review objective"),
+                                 ("completion_criteria", "Document completion requirements")):
+                instructions = str(getattr(requirement, field, "") or "").strip()
+                if instructions:
+                    for start in range(0, len(instructions), 2000):
+                        part = instructions[start:start + 2000]
+                        check = {"key": "custom_" + hashlib.sha256(part.encode()).hexdigest()[:20],
+                                 "label": label, "instructions": part, "severity": "review"}
+                        unique.setdefault(json.dumps(check, sort_keys=True), check)
     return [unique[key] for key in sorted(unique)]
 
 
@@ -1513,6 +1527,8 @@ def _evidence_decision_context_key(
     duplicate_content: bool,
     corroborated_entities: set[str],
     review_checks: list[dict[str, Any]] | None = None,
+    check_assessment: dict[str, Any] | None = None,
+    requires_human: bool = False,
 ) -> str:
     """Fingerprint every input that can change an automatic decision."""
 
@@ -1529,6 +1545,8 @@ def _evidence_decision_context_key(
             "duplicate" if duplicate_content else "original",
             corroboration,
             json.dumps(review_checks or [], sort_keys=True),
+            json.dumps(check_assessment or {}, sort_keys=True),
+            str(requires_human),
         )
     )
     return hashlib.sha256(raw_key.encode()).hexdigest()
@@ -1586,6 +1604,8 @@ def _automatic_evidence_decision(
     duplicate_content: bool,
     corroborated_entities: set[str] | None = None,
     review_checks: list[dict[str, Any]] | None = None,
+    check_assessment: dict[str, Any] | None = None,
+    requires_human: bool = False,
 ) -> tuple[str, str, str, str | None]:
     if duplicate_content:
         return (
@@ -1736,10 +1756,29 @@ def _automatic_evidence_decision(
             analysis.confidence,
         )
     if review_checks or getattr(requirement, "review_checks", None):
+        if requires_human or _requires_human_verification(requirement):
+            return (
+                "needs_more", "document_review_pending",
+                "Published documentary checks explicitly require staff verification.",
+                analysis.confidence,
+            )
+        if check_assessment and check_assessment.get("status") == "pass":
+            return (
+                "accepted", "document_checks_passed",
+                "AI verified every published documentary check against source pages. "
+                "This is evidence verification, not financing approval.", analysis.confidence,
+            )
+        if check_assessment and check_assessment.get("status") == "blocked":
+            return (
+                "rejected", "document_check_failed",
+                "A published do-not-accept check failed; review the grounded findings and source pages.",
+                analysis.confidence,
+            )
         return (
             "needs_more", "document_review_pending",
-            "Document identity, type, and period were checked. Published qualification traits "
-            "still require staff verification; a readable upload does not establish eligibility.",
+            str((check_assessment or {}).get("reason") or
+                "Document identity, type, and period were checked. Run AI review to verify every "
+                "published documentary check with source-page references; readable alone is not a pass."),
             analysis.confidence,
         )
     return (
@@ -1809,6 +1848,8 @@ async def _reconcile_evidence_decisions(
     criteria_version: int,
     review_checks: list[dict[str, Any]] | None = None,
     review_policy_changed: bool = False,
+    check_assessment: dict[str, Any] | None = None,
+    requires_human: bool = False,
 ) -> dict[uuid.UUID, ApplicationRequirementEvidenceDecision]:
     latest = await _latest_evidence_decisions(db, links)
     seen_hashes: set[str] = set()
@@ -1845,6 +1886,8 @@ async def _reconcile_evidence_decisions(
                 duplicate_content=duplicate,
                 corroborated_entities=corroborated_entities,
                 review_checks=review_checks,
+                check_assessment=check_assessment,
+                requires_human=requires_human,
             )
             context_key = _evidence_decision_context_key(
                 link_id=link.id,
@@ -1860,6 +1903,8 @@ async def _reconcile_evidence_decisions(
                 duplicate_content=duplicate,
                 corroborated_entities=corroborated_entities,
                 review_checks=review_checks,
+                check_assessment=check_assessment,
+                requires_human=requires_human,
             )
             if (
                 current is not None
@@ -1898,7 +1943,7 @@ async def _reconcile_evidence_decisions(
             effective[link.id] = row
 
         accepted = effective[link.id].decision == "accepted"
-        can_auto_verify = accepted and not _requires_human_verification(requirement) and not review_checks
+        can_auto_verify = accepted and not _requires_human_verification(requirement) and not requires_human
         newer_evidence = any(
             isinstance(value, datetime) and isinstance(link.verified_at, datetime)
             and (value.replace(tzinfo=UTC) if value.tzinfo is None else value)
@@ -2027,6 +2072,7 @@ async def _materialize_requirements(
     for key, merged_item in merged.items():
         requirement = merged_item["requirement"]
         review_checks = _merged_review_checks(merged_item["definitions"])
+        requires_human = any(_requires_human_verification(row) for row in merged_item["definitions"])
         source_programs = merged_item["program_keys"]
         source_policies = merged_item["policy_keys"]
         requested = await _requested_document(
@@ -2057,7 +2103,7 @@ async def _materialize_requirements(
         state.label = requirement.label
         state.category = requirement.category
         state.required_level = requirement.required_level
-        state.verification_required = bool(review_checks) or _requires_human_verification(requirement)
+        state.verification_required = requires_human
         state.source_program_keys = sorted(source_programs)
         state.source_policy_keys = sorted(source_policies)
         if requested:
@@ -2089,6 +2135,10 @@ async def _materialize_requirements(
         links = await _sync_requirement_evidence(db, state, inventory, desired_sources)
         linked_files = [inventory[row.file_id] for row in links]
         _coverage_complete, coverage = _coverage_for_files(requirement, linked_files, analyses)
+        from app.services.document_qualification_review import current_assessment
+        check_assessment = current_assessment(
+            (state.provenance or {}).get("ai_document_review"), review_checks, linked_files,
+        ) if review_checks and _coverage_complete and not requires_human else None
         decisions = await _reconcile_evidence_decisions(
             db,
             requirement=requirement,
@@ -2107,8 +2157,11 @@ async def _materialize_requirements(
             ),
             criteria_version=criteria_versions.get(requirement.playbook_id, 1),
             review_checks=review_checks,
-            review_policy_changed=(bool(review_checks) and _review_checks_fingerprint(review_checks) !=
-                                   (state.provenance or {}).get("review_checks_fingerprint")),
+            check_assessment=check_assessment,
+            requires_human=requires_human,
+            review_policy_changed=((bool(review_checks) and _review_checks_fingerprint(review_checks) !=
+                                   (state.provenance or {}).get("review_checks_fingerprint"))
+                                   or (state.provenance or {}).get("requires_human", requires_human) != requires_human),
         )
         accepted_links = [
             row
@@ -2139,6 +2192,8 @@ async def _materialize_requirements(
             "verified_coverage": accepted_coverage,
             "accepted_file_ids": [str(row.file_id) for row in accepted_links],
             "review_checks_fingerprint": _review_checks_fingerprint(review_checks),
+            "requires_human": requires_human,
+            "ai_document_review": check_assessment,
             "review_checks_status": "verified" if review_checks and accepted_complete
             else "pending" if review_checks else "not_required",
         }
@@ -2181,7 +2236,11 @@ async def _materialize_requirements(
                     elif "failed" in decision_values:
                         state.state_reason = "AI evidence analysis failed; retry is available"
                     elif review_checks:
-                        state.state_reason = "Published document qualification traits are pending staff verification"
+                        state.state_reason = (
+                            "Published document checks require staff verification" if requires_human else
+                            str((check_assessment or {}).get("reason") or
+                                "Run AI review to verify the published document checks with source-page references")
+                        )
                     elif decision_values.intersection({"rejected", "needs_more"}):
                         state.state_reason = f"AI accepted {current} of {required} required {unit}; some evidence needs attention"
                     else:
@@ -3080,11 +3139,7 @@ async def accept_high_confidence_ai_evidence(
     requirement_keys: list[str],
     _user: User,
 ) -> dict[str, Any]:
-    """Compatibility refresh for clients that still call the old review route.
-
-    Evidence acceptance is now produced automatically by immutable decisions.
-    This route intentionally performs no staff verification mutation.
-    """
+    """Refresh decisions and durably queue documentary checks without provider latency."""
     readiness = await get_program_readiness(db, profile)
     selected_keys = (
         set(requirement_keys)
@@ -3102,6 +3157,29 @@ async def accept_high_confidence_ai_evidence(
     accepted = sum(row.ai_decision == "accepted" and row.verified for row in evidence)
     retained = sum(row.ai_decision in {"needs_more", "rejected"} for row in evidence)
     analysis_required = sum(row.ai_decision in {"processing", "failed"} for row in evidence)
+    queued_review = None
+    needs_document_review = any(
+        item.review_checks and not item.verification_required
+        and item.status not in {"verified", "waived", "not_applicable"}
+        for item in requirements.values()
+    )
+    if needs_document_review and getattr(profile, "primary_bucket_id", None):
+        # Serialize click/double-clicks on the bucket, not on an expensive
+        # provider call. The normal scheduler drains the queued review.
+        bucket = await db.get(Bucket, profile.primary_bucket_id, with_for_update=True)
+        if bucket is not None:
+            queued_review = (await db.execute(select(BucketAIReview).where(
+                BucketAIReview.bucket_id == bucket.id,
+                BucketAIReview.status.in_(["queued", "running"]),
+            ).order_by(BucketAIReview.created_at.desc()).limit(1))).scalar_one_or_none()
+            if queued_review is None:
+                queued_review = BucketAIReview(
+                    bucket_id=bucket.id, requested_by_user_id=_user.id,
+                    status="queued", provider="bedrock", context_snapshot=bucket.ai_context or {},
+                    file_ids=[str(row.file_id) for row in evidence],
+                )
+                db.add(queued_review)
+                await db.flush()
     return {
         "readiness": readiness,
         "reviewed_file_count": len(evidence),
@@ -3109,6 +3187,11 @@ async def accept_high_confidence_ai_evidence(
         "already_verified_count": accepted,
         "retained_for_staff_count": retained,
         "analysis_required_count": analysis_required,
+        "queued_review_id": queued_review.id if queued_review else None,
+        "review_message": (
+            "AI document review is queued. The full file analysis will check every published "
+            "document requirement and refresh the evidence when complete." if queued_review else None
+        ),
     }
 
 

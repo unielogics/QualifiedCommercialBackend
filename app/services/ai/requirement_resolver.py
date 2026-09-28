@@ -173,7 +173,7 @@ async def resolve_requirements(
                 visibility=list(r.visibility or []),
                 can_agent_override=r.can_agent_override,
                 can_underwriter_waive=r.can_underwriter_waive,
-                verification_required=bool(r.verification_required or getattr(r, "review_checks", None)),
+                verification_required=bool(r.verification_required or getattr(r, "completion_mode", None) == "requires_human_verify"),
                 expiration_days=r.expiration_days,
                 ai_request_message_template=r.ai_request_message_template,
                 display_order=r.display_order,
@@ -187,8 +187,7 @@ async def resolve_requirements(
                 objective_text=getattr(r, "objective_text", "") or "",
                 completion_criteria=getattr(r, "completion_criteria", "") or "",
                 review_checks=list(getattr(r, "review_checks", None) or []),
-                completion_mode=("requires_human_verify" if getattr(r, "review_checks", None)
-                                 else getattr(r, "completion_mode", "ai_can_complete")),
+                completion_mode=getattr(r, "completion_mode", "ai_can_complete"),
                 wrong_upload_response_template=getattr(r, "wrong_upload_response_template", None),
                 source=source,
                 playbook_id=pb.id,
