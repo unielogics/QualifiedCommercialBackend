@@ -1698,11 +1698,11 @@ async def move_operator_file_pipeline(
             target_id=profile.id,
             meta={"from": before_status, "to": profile.underwriting_status},
         )
-    await db.commit()
-    await db.refresh(profile)
     if profile.loan_id and loan is None:
         loan = await db.get(Loan, profile.loan_id)
-    return PipelineMoveResult(
+    # Build and validate the response before commit. A serialization failure
+    # must not make an operator retry a move that was already persisted.
+    result = PipelineMoveResult(
         source_kind=normalized_kind,  # type: ignore[arg-type]
         source_id=source_id,
         profile_id=profile.id,
@@ -1711,6 +1711,8 @@ async def move_operator_file_pipeline(
         loan_stage=_loan_stage_value(loan.stage) if loan else None,
         created_loan=created_loan,
     )
+    await db.commit()
+    return result
 
 
 def _row_matches_source(row: UnifiedFileRow, source_kind: str, source_id: UUID) -> bool:

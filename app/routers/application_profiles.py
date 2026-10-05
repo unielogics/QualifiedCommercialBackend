@@ -274,6 +274,17 @@ def underwriting_status_title(status_value: str | None) -> str:
     return UNDERWRITING_STATUS_TITLES.get(key, f"Your file moved to {key.replace('_', ' ')}")
 
 
+def _loan_stage_value(stage: LoanStage | str) -> str:
+    """Return a stable value for both enum instances and ORM strings.
+
+    ``Loan.stage`` uses a plain ``String`` column, so SQLAlchemy returns a
+    ``str`` for persisted rows even though the model annotation is
+    ``LoanStage``.  Status writes must not assume ``.value`` exists.
+    """
+
+    return stage.value if isinstance(stage, LoanStage) else str(stage)
+
+
 def _normalize_label(value: str) -> str:
     return " ".join(value.casefold().strip().split())
 
@@ -692,7 +703,9 @@ async def _sync_profile_loan_stage(
     if loan is None:
         return None
     old = loan.stage
-    if old == target:
+    old_value = _loan_stage_value(old)
+    target_value = _loan_stage_value(target)
+    if old_value == target_value:
         return loan
     loan.stage = target
     await log_activity(
@@ -701,12 +714,12 @@ async def _sync_profile_loan_stage(
         actor_id=user.id,
         actor_label=_role_value(user),
         kind="underwriting.stage_sync",
-        summary=f"Underwriting lifecycle moved loan stage {old} -> {target}",
+        summary=f"Underwriting lifecycle moved loan stage {old_value} -> {target_value}",
         payload={
             "profile_id": str(profile.id),
             "underwriting_status": status_value,
-            "from": old.value if hasattr(old, "value") else str(old),
-            "to": target.value,
+            "from": old_value,
+            "to": target_value,
             "note": note,
         },
     )
@@ -824,9 +837,11 @@ async def update_application_underwriting(
     if not changes:
         return _underwriting_read(profile)
     await apply_underwriting_changes(db, profile, user, changes)
+    # Validate the exact response before committing. A response-model error
+    # must never report failure after the lifecycle change already persisted.
+    result = _underwriting_read(profile)
     await db.commit()
-    await db.refresh(profile)
-    return _underwriting_read(profile)
+    return result
 
 
 async def apply_underwriting_changes(
@@ -907,7 +922,7 @@ async def apply_underwriting_changes(
                 for key, value in changes.items()
             },
             "loan_id": str(loan.id) if loan else None,
-            "loan_stage": loan.stage.value if loan else None,
+            "loan_stage": _loan_stage_value(loan.stage) if loan else None,
         },
     )
     if profile.underwriting_status != before_status:
@@ -2201,8 +2216,17 @@ async def update_application_owner(
     db: AsyncSession = Depends(get_db),
 ) -> FileOwnerRead:
     profile = await profiles.load_profile(db, profile_id, user)
+    # Serialize owner edits per file so concurrent autosaves cannot pass the
+    # same uniqueness check and then race each other at commit.
+    await db.execute(
+        select(ApplicationProfile.id)
+        .where(ApplicationProfile.id == profile.id)
+        .with_for_update()
+    )
     owner = await _owner_for_profile(db, profile, owner_id)
     patch = payload.model_dump(exclude_unset=True)
+    if not patch:
+        return profiles.owner_read(owner)
     if "email" in patch:
         patch["email"] = profiles.normalized_email(str(patch["email"]) if patch["email"] else None)
         await _assert_unique_email(db, profile, patch["email"], exclude_id=owner.id)
@@ -2213,7 +2237,14 @@ async def update_application_owner(
         db, profile, user, "owner.update", f"Updated owner {owner.full_name}", target_type="owner", target_id=owner.id,
         metadata={"before": {k: str(v) if v is not None else None for k, v in before.items()}, "after": {k: str(v) if v is not None else None for k, v in patch.items()}},
     )
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Owner conflicts with an existing row; refresh the owner list and try again",
+        ) from exc
     await db.refresh(owner)
     return profiles.owner_read(owner)
 

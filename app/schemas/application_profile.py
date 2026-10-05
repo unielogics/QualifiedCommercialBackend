@@ -426,6 +426,39 @@ class ApplicationUnderwritingPatch(BaseModel):
     estimated_close_date: date | None = None
 
 
+_OWNER_BLANKABLE_FIELDS = {
+    "email",
+    "phone",
+    "ownership_pct",
+    "dob",
+    "street",
+    "city",
+    "state",
+    "zip",
+    "notes",
+}
+
+
+def _normalize_owner_optional_blanks(value: object) -> object:
+    """Treat cleared optional form fields as null instead of malformed data.
+
+    Browser forms and older clients can submit an empty string when a user
+    clears a date, percentage, email, or optional contact field.  Those are
+    semantically nullable fields; coercing only whitespace-only values keeps a
+    harmless clear action from ending in a generic request-validation 422.
+    Required owner names deliberately remain strict.
+    """
+
+    if not isinstance(value, dict):
+        return value
+    normalized = dict(value)
+    for field in _OWNER_BLANKABLE_FIELDS:
+        candidate = normalized.get(field)
+        if isinstance(candidate, str) and not candidate.strip():
+            normalized[field] = None
+    return normalized
+
+
 class FileOwnerCreate(BaseModel):
     first_name: str = Field(min_length=1, max_length=80)
     last_name: str = Field(min_length=1, max_length=80)
@@ -440,6 +473,11 @@ class FileOwnerCreate(BaseModel):
     state: str | None = Field(default=None, max_length=8)
     zip: str | None = Field(default=None, max_length=12)
     notes: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_optional_blank_fields(cls, value: object) -> object:
+        return _normalize_owner_optional_blanks(value)
 
     @field_validator("first_name", "last_name")
     @classmethod
@@ -463,6 +501,11 @@ class FileOwnerPatch(BaseModel):
     state: str | None = Field(default=None, max_length=8)
     zip: str | None = Field(default=None, max_length=12)
     notes: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_optional_blank_fields(cls, value: object) -> object:
+        return _normalize_owner_optional_blanks(value)
 
     @field_validator("first_name", "last_name")
     @classmethod

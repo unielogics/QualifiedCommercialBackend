@@ -18,6 +18,8 @@ from app.routers.application_profiles import (
     _application_bank_state,
     _can_review_manual_bank_evidence,
     _require_profile_bank_client,
+    _sync_profile_loan_stage,
+    apply_underwriting_changes,
     get_application_banks,
     get_application_evidence,
     get_application_evidence_file_url,
@@ -66,6 +68,99 @@ def test_owner_patch_allows_omitted_names_but_rejects_clearing_them() -> None:
         FileOwnerPatch(first_name=None)
     with pytest.raises(ValidationError):
         FileOwnerPatch(last_name="   ")
+
+
+def test_owner_patch_treats_cleared_optional_form_fields_as_null() -> None:
+    payload = FileOwnerPatch(
+        email="",  # type: ignore[arg-type]
+        phone="   ",
+        ownership_pct="",  # type: ignore[arg-type]
+        dob="",  # type: ignore[arg-type]
+        street=" ",
+        city="",
+        state=" ",
+        zip="",
+        notes=" ",
+    )
+
+    assert payload.model_dump(exclude_unset=True) == {
+        "email": None,
+        "phone": None,
+        "ownership_pct": None,
+        "dob": None,
+        "street": None,
+        "city": None,
+        "state": None,
+        "zip": None,
+        "notes": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_underwriting_write_handles_string_stage_loaded_by_the_orm() -> None:
+    profile = SimpleNamespace(
+        id=uuid4(),
+        loan_id=uuid4(),
+        underwriting_status="in_underwriting",
+        underwriting_notes=None,
+        underwriting_updated_by_user_id=None,
+        underwriting_updated_at=None,
+        forecast_fee_points=None,
+    )
+    user = SimpleNamespace(
+        id=uuid4(),
+        role=Role.LOAN_EXEC,
+        name="Underwriter",
+        email="underwriter@example.com",
+    )
+    loan = SimpleNamespace(id=profile.loan_id, stage="processing")
+    db = SimpleNamespace(flush=AsyncMock())
+
+    with (
+        patch(
+            "app.routers.application_profiles._sync_profile_loan_stage",
+            AsyncMock(return_value=loan),
+        ),
+        patch(
+            "app.routers.application_profiles.profiles.log_profile_action",
+            AsyncMock(),
+        ) as log_profile_action,
+    ):
+        await apply_underwriting_changes(
+            db,
+            profile,
+            user,
+            {"forecast_fee_points": 2.0},
+        )
+
+    assert log_profile_action.await_args.kwargs["metadata"]["loan_stage"] == "processing"
+    db.flush.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_underwriting_stage_sync_handles_string_stage_loaded_by_the_orm() -> None:
+    loan_id = uuid4()
+    loan = SimpleNamespace(id=loan_id, stage="collecting_docs")
+    profile = SimpleNamespace(id=uuid4(), loan_id=loan_id)
+    user = SimpleNamespace(id=uuid4(), role=Role.LOAN_EXEC)
+    db = SimpleNamespace(get=AsyncMock(return_value=loan))
+
+    with (
+        patch("app.routers.application_profiles.log_activity", AsyncMock()) as log_activity,
+        patch("app.routers.application_profiles.mark_loan_dirty", AsyncMock()) as mark_dirty,
+    ):
+        result = await _sync_profile_loan_stage(
+            db,
+            profile,
+            user,
+            "in_underwriting",
+        )
+
+    assert result is loan
+    assert loan.stage == "processing"
+    assert log_activity.await_args.kwargs["payload"]["from"] == "collecting_docs"
+    assert log_activity.await_args.kwargs["payload"]["to"] == "processing"
+    mark_dirty.assert_awaited_once_with(db, loan_id)
 
 
 def test_requirement_patch_accepts_multiple_evidence_files() -> None:
