@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, EmailStr, Field, TypeAdapter, field_validator, model_validator
 
+from app.lead_types import LeadType
+
 DraftPurpose = Literal[
+    "information",
     "dealer_information",
     "missed_call",
     "callback_confirmation",
@@ -112,21 +115,114 @@ class ProspectOutreachPolicyRead(BaseModel):
     updated_by_user_id: UUID | None = None
 
 
+class ProspectOutreachPurposeTemplate(BaseModel):
+    subject: str = Field(min_length=1, max_length=240)
+    body: str = Field(min_length=1, max_length=12_000)
+
+    @field_validator("subject", "body")
+    @classmethod
+    def strip_template_copy(cls, value: str) -> str:
+        clean = value.strip()
+        if not clean:
+            raise ValueError("template copy cannot be blank")
+        return clean
+
+
+class ProspectOutreachProfilePatch(BaseModel):
+    expected_version: int = Field(ge=1)
+    display_name: str | None = Field(default=None, min_length=1, max_length=80)
+    desk_name: str | None = Field(default=None, min_length=1, max_length=80)
+    audience_label: str | None = Field(default=None, min_length=1, max_length=120)
+    audience_plural: str | None = Field(default=None, min_length=1, max_length=120)
+    website_url: str | None = Field(default=None, min_length=1, max_length=500)
+    drafting_guidance: str | None = Field(default=None, max_length=3000)
+    purpose_templates: dict[str, ProspectOutreachPurposeTemplate] | None = None
+
+    @field_validator(
+        "display_name", "desk_name", "audience_label", "audience_plural", mode="before"
+    )
+    @classmethod
+    def normalize_labels(cls, value: object) -> object:
+        return " ".join(str(value).split()) if value is not None else value
+
+    @field_validator("website_url")
+    @classmethod
+    def require_https_website(cls, value: str | None) -> str | None:
+        clean = (value or "").strip()
+        if value is None:
+            return None
+        if not re.fullmatch(r"https://[^\s]+", clean, re.IGNORECASE):
+            raise ValueError("website_url must be an absolute HTTPS URL")
+        return clean
+
+    @field_validator("drafting_guidance")
+    @classmethod
+    def clean_profile_guidance(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
+
+    @field_validator("purpose_templates")
+    @classmethod
+    def validate_template_purposes(
+        cls, value: dict[str, ProspectOutreachPurposeTemplate] | None
+    ) -> dict[str, ProspectOutreachPurposeTemplate] | None:
+        if value is None:
+            return None
+        allowed = {"information", "missed_call", "callback_confirmation", "client_will_call_back", "booking", "general"}
+        invalid = sorted(set(value) - allowed)
+        if invalid:
+            raise ValueError(f"unsupported purpose templates: {', '.join(invalid)}")
+        if "information" not in value:
+            raise ValueError("purpose_templates must include information")
+        return value
+
+    @model_validator(mode="after")
+    def require_profile_change(self) -> ProspectOutreachProfilePatch:
+        if not (self.model_fields_set - {"expected_version"}):
+            raise ValueError("Provide at least one outreach profile field to update")
+        return self
+
+
+class ProspectOutreachProfileRead(BaseModel):
+    id: UUID | None = None
+    lead_type: LeadType
+    version: int = Field(ge=1)
+    status: Literal["active", "retired"] = "active"
+    display_name: str
+    desk_name: str
+    audience_label: str
+    audience_plural: str
+    website_url: str
+    drafting_guidance: str = ""
+    purpose_templates: dict[str, ProspectOutreachPurposeTemplate] = Field(default_factory=dict)
+    created_by_user_id: UUID | None = None
+    created_at: datetime | None = None
+
+
+class ProspectOutreachProfileList(BaseModel):
+    items: list[ProspectOutreachProfileRead]
+
+
 class ProspectTestEmailRequest(BaseModel):
     idempotency_key: UUID
+    lead_type: LeadType = "dealer"
     purpose: DraftPurpose = "dealer_information"
     sample_contact_name: str = Field(default="Alex Morgan", min_length=1, max_length=160)
     sample_dealer_name: str = Field(default="Example Motors", min_length=1, max_length=180)
+    sample_business_name: str | None = Field(default=None, min_length=1, max_length=180)
     ai_instructions: str | None = Field(default=None, max_length=1500)
     verified_conversation_context: str | None = Field(default=None, max_length=500)
     # True means the complete current active Dealer Outreach library. False
     # means exactly ``collateral_asset_ids`` (an empty list means no PDFs).
     include_collateral: bool = True
     collateral_asset_ids: list[UUID] = Field(default_factory=list, max_length=100)
+    collateral_bundle_id: UUID | None = None
+    collateral_bundle_version: int | None = Field(default=None, ge=1)
 
-    @field_validator("sample_contact_name", "sample_dealer_name")
+    @field_validator("sample_contact_name", "sample_dealer_name", "sample_business_name")
     @classmethod
-    def strip_sample_names(cls, value: str) -> str:
+    def strip_sample_names(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         clean = " ".join(value.split())
         if not clean:
             raise ValueError("sample names cannot be blank")
@@ -152,6 +248,10 @@ class ProspectTestEmailRequest(BaseModel):
             raise ValueError(
                 "collateral_asset_ids must be empty when include_collateral is true"
             )
+        if (self.collateral_bundle_id is None) != (self.collateral_bundle_version is None):
+            raise ValueError(
+                "collateral_bundle_id and collateral_bundle_version must be provided together"
+            )
         return self
 
 
@@ -175,6 +275,8 @@ class ProspectTestEmailResponse(BaseModel):
         "none", "submitted_to_ai", "not_applied_fallback", "unknown"
     ]
     attachment_names: list[str] = Field(default_factory=list)
+    collateral_bundle_id: UUID | None = None
+    collateral_bundle_version: int | None = None
     sender_display_name: str | None = None
     sender_title: str | None = None
     sender_phone: str | None = None
@@ -204,6 +306,8 @@ class ProspectEmailDraftCreate(BaseModel):
     # exactly the selected ids; false + [] deliberately means no attachments.
     include_collateral: bool = True
     collateral_asset_ids: list[UUID] = Field(default_factory=list, max_length=100)
+    collateral_bundle_id: UUID | None = None
+    collateral_bundle_version: int | None = Field(default=None, ge=1)
 
     @field_validator("subject", "body", "ai_instructions", "private_note")
     @classmethod
@@ -229,6 +333,10 @@ class ProspectEmailDraftCreate(BaseModel):
         if self.include_collateral and self.collateral_asset_ids:
             raise ValueError(
                 "collateral_asset_ids must be empty when include_collateral is true"
+            )
+        if (self.collateral_bundle_id is None) != (self.collateral_bundle_version is None):
+            raise ValueError(
+                "collateral_bundle_id and collateral_bundle_version must be provided together"
             )
         if self.compose_mode == "manual":
             if not self.subject or not self.body:
@@ -307,6 +415,15 @@ class ProspectEmailDraftRead(BaseModel):
     editable_body: str
     locked_footer_text: str
     compose_mode: Literal["ai", "manual"] = "ai"
+    lead_type: LeadType = "dealer"
+    funding_intent: str | None = None
+    outreach_profile_key: str = "dealer"
+    outreach_profile_version: int = 1
+    outreach_profile_hash: str
+    outreach_profile_snapshot: dict[str, Any] = Field(default_factory=dict)
+    collateral_bundle_id: UUID | None = None
+    collateral_bundle_version: int | None = None
+    collateral_bundle_snapshot: dict[str, Any] = Field(default_factory=dict)
     status: Literal[
         "pending_review", "editing", "sending", "sent", "cancelled", "failed", "blocked"
     ]
@@ -380,6 +497,9 @@ class ProspectEmailOutboxList(ProspectEmailDraftList):
 class MarketingCollateralRead(BaseModel):
     id: UUID
     assignment: str
+    lead_type: LeadType = "dealer"
+    purposes: list[str] = Field(default_factory=lambda: ["information"])
+    included_by_default: bool = True
     logical_key: str
     name: str
     version: int
@@ -405,10 +525,96 @@ class MarketingCollateralList(BaseModel):
     items: list[MarketingCollateralRead]
 
 
+class MarketingCollateralBundleItemWrite(BaseModel):
+    asset_id: UUID
+    inclusion_mode: Literal["default", "optional"] = "default"
+
+
+class MarketingCollateralBundleCreate(BaseModel):
+    lead_type: LeadType
+    purpose: DraftPurpose
+    name: str = Field(min_length=1, max_length=180)
+    items: list[MarketingCollateralBundleItemWrite] = Field(default_factory=list, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def strip_bundle_name(cls, value: str) -> str:
+        return " ".join(value.split())
+
+    @model_validator(mode="after")
+    def unique_bundle_assets(self) -> MarketingCollateralBundleCreate:
+        ids = [item.asset_id for item in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("bundle items cannot contain duplicate assets")
+        return self
+
+
+class MarketingCollateralBundlePatch(BaseModel):
+    expected_revision: int = Field(ge=1)
+    name: str | None = Field(default=None, min_length=1, max_length=180)
+    items: list[MarketingCollateralBundleItemWrite] | None = Field(default=None, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def strip_optional_bundle_name(cls, value: str | None) -> str | None:
+        return " ".join(value.split()) if value is not None else None
+
+    @model_validator(mode="after")
+    def validate_bundle_patch(self) -> MarketingCollateralBundlePatch:
+        if self.name is None and self.items is None:
+            raise ValueError("Provide a bundle name or ordered items to update")
+        if self.items is not None:
+            ids = [item.asset_id for item in self.items]
+            if len(ids) != len(set(ids)):
+                raise ValueError("bundle items cannot contain duplicate assets")
+        return self
+
+
+class MarketingCollateralBundleAction(BaseModel):
+    expected_revision: int = Field(ge=1)
+
+
+class MarketingCollateralBundleItemRead(BaseModel):
+    id: UUID
+    asset_id: UUID
+    inclusion_mode: Literal["default", "optional"]
+    sort_order: int
+    asset_name: str
+    asset_version: int
+    file_name: str
+    size_bytes: int
+    sha256: str
+
+
+class MarketingCollateralBundleRead(BaseModel):
+    id: UUID
+    lead_type: LeadType
+    purpose: str
+    name: str
+    version: int
+    revision: int
+    status: Literal["draft", "published", "retired"]
+    items: list[MarketingCollateralBundleItemRead] = Field(default_factory=list)
+    created_by_user_id: UUID | None = None
+    published_by_user_id: UUID | None = None
+    retired_by_user_id: UUID | None = None
+    published_at: datetime | None = None
+    retired_at: datetime | None = None
+    created_at: datetime
+
+
+class MarketingCollateralBundleList(BaseModel):
+    items: list[MarketingCollateralBundleRead]
+
+
 class ProspectCollateralOptionRead(BaseModel):
     """Minimum safe metadata exposed to outreach-enabled pipeline actors."""
 
     id: UUID
+    lead_type: LeadType = "dealer"
+    purposes: list[str] = Field(default_factory=lambda: ["information"])
+    included_by_default: bool = True
+    inclusion_mode: Literal["default", "optional"] = "default"
     name: str
     file_name: str
     version: int
@@ -418,6 +624,11 @@ class ProspectCollateralOptionRead(BaseModel):
 
 
 class ProspectCollateralOptionList(BaseModel):
+    bundle_id: UUID | None = None
+    bundle_version: int = Field(default=0, ge=0)
+    bundle_source: Literal["published", "legacy_dealer_library"] = "published"
+    lead_type: LeadType = "dealer"
+    purpose: str = "information"
     items: list[ProspectCollateralOptionRead]
 
 
@@ -428,6 +639,18 @@ class MarketingCollateralAction(BaseModel):
 class MarketingCollateralPatch(BaseModel):
     is_active: bool | None = None
     sort_order: int | None = Field(default=None, ge=0, le=100_000)
+    purposes: list[DraftPurpose] | None = Field(default=None, min_length=1, max_length=7)
+    included_by_default: bool | None = None
+
+    @field_validator("purposes")
+    @classmethod
+    def normalize_purpose_list(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        cleaned = ["information" if item == "dealer_information" else item for item in value]
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("purposes cannot contain duplicates")
+        return cleaned
 
 
 class MarketingCollateralReorder(BaseModel):

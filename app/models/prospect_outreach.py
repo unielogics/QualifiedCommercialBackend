@@ -42,6 +42,7 @@ DRAFT_STATUSES = (
     "blocked",
 )
 COLLATERAL_STATUSES = ("pending_approval", "active", "retired")
+OUTREACH_PROFILE_STATUSES = ("active", "retired")
 SUPPRESSION_REASONS = (
     "unsubscribe",
     "bounce",
@@ -74,6 +75,19 @@ class DealerProspectEmailDraft(TimestampMixin, Base):
         CheckConstraint(
             "compose_mode IN ('ai','manual')",
             name="ck_dealer_prospect_email_draft_compose_mode",
+        ),
+        CheckConstraint(
+            "char_length(outreach_profile_hash) = 64",
+            name="ck_dealer_prospect_email_draft_profile_hash",
+        ),
+        CheckConstraint(
+            "outreach_profile_version >= 1",
+            name="ck_dealer_prospect_email_draft_profile_version",
+        ),
+        CheckConstraint(
+            "(collateral_bundle_id IS NULL AND collateral_bundle_version IS NULL) OR "
+            "(collateral_bundle_id IS NOT NULL AND collateral_bundle_version >= 1)",
+            name="ck_dealer_prospect_email_draft_bundle_identity",
         ),
         Index("ix_dealer_prospect_email_drafts_due", "status", "auto_send_at"),
         Index("ix_dealer_prospect_email_drafts_prospect_created", "prospect_id", "created_at"),
@@ -121,10 +135,38 @@ class DealerProspectEmailDraft(TimestampMixin, Base):
         String(16), nullable=False, default="ai", server_default="ai"
     )
     purpose: Mapped[str] = mapped_column(
-        String(32),
+        String(48),
         nullable=False,
         default="dealer_information",
         server_default="dealer_information",
+    )
+    # The source prospect remains mutable.  Delivery therefore relies on this
+    # immutable audience/profile snapshot, and separately verifies that the
+    # prospect has not changed audience after review began.
+    lead_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="dealer", server_default="dealer"
+    )
+    funding_intent: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    outreach_profile_key: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="dealer", server_default="dealer"
+    )
+    outreach_profile_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    outreach_profile_hash: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
+    outreach_profile_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    collateral_bundle_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("marketing_collateral_bundles.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    collateral_bundle_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    collateral_bundle_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
     draft_source: Mapped[str] = mapped_column(String(16), nullable=False)
     model_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
@@ -187,6 +229,63 @@ class DealerProspectEmailDraft(TimestampMixin, Base):
     )
 
 
+class ProspectOutreachProfile(TimestampMixin, Base):
+    """Versioned writing/audience policy for one Field Desk lead type.
+
+    Updates create a new active version and retire the previous row.  Drafts
+    copy the complete public policy into ``outreach_profile_snapshot`` so a
+    later admin edit cannot silently change reviewed copy or links.
+    """
+
+    __tablename__ = "prospect_outreach_profiles"
+    __table_args__ = (
+        UniqueConstraint(
+            "lead_type", "version", name="uq_prospect_outreach_profile_version"
+        ),
+        CheckConstraint(
+            "status IN ('active','retired')",
+            name="ck_prospect_outreach_profile_status",
+        ),
+        CheckConstraint(
+            "version >= 1", name="ck_prospect_outreach_profile_version"
+        ),
+        Index(
+            "uq_prospect_outreach_profile_active",
+            "lead_type",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+            sqlite_where=text("status = 'active'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    lead_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="active", server_default="active"
+    )
+    display_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    desk_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    audience_label: Mapped[str] = mapped_column(String(120), nullable=False)
+    audience_plural: Mapped[str] = mapped_column(String(120), nullable=False)
+    website_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    drafting_guidance: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=""
+    )
+    purpose_templates: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retired_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+
 class MarketingCollateralAsset(TimestampMixin, Base):
     """Admin-approved, versioned PDF collateral.
 
@@ -197,7 +296,11 @@ class MarketingCollateralAsset(TimestampMixin, Base):
     __tablename__ = "marketing_collateral_assets"
     __table_args__ = (
         UniqueConstraint(
-            "assignment", "logical_key", "version", name="uq_marketing_collateral_version"
+            "assignment",
+            "lead_type",
+            "logical_key",
+            "version",
+            name="uq_marketing_collateral_version",
         ),
         CheckConstraint(
             "status IN ('pending_approval','active','retired')",
@@ -205,10 +308,17 @@ class MarketingCollateralAsset(TimestampMixin, Base):
         ),
         CheckConstraint("size_bytes > 0", name="ck_marketing_collateral_size"),
         CheckConstraint("char_length(sha256) = 64", name="ck_marketing_collateral_sha"),
-        Index("ix_marketing_collateral_active_order", "assignment", "status", "sort_order"),
+        Index(
+            "ix_marketing_collateral_active_order",
+            "assignment",
+            "lead_type",
+            "status",
+            "sort_order",
+        ),
         Index(
             "uq_marketing_collateral_one_active_version",
             "assignment",
+            "lead_type",
             "logical_key",
             unique=True,
             postgresql_where=text("status = 'active'"),
@@ -221,6 +331,20 @@ class MarketingCollateralAsset(TimestampMixin, Base):
     )
     assignment: Mapped[str] = mapped_column(
         String(48), nullable=False, default="dealer_outreach", server_default="dealer_outreach"
+    )
+    lead_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="dealer", server_default="dealer"
+    )
+    # A PDF may be offered for several composer purposes.  ``information`` is
+    # the canonical form of the legacy ``dealer_information`` alias.
+    purposes: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=lambda: ["information"],
+        server_default=text("'[\"information\"]'::jsonb"),
+    )
+    included_by_default: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
     )
     logical_key: Mapped[str] = mapped_column(String(120), nullable=False)
     name: Mapped[str] = mapped_column(String(180), nullable=False)
@@ -249,6 +373,110 @@ class MarketingCollateralAsset(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MarketingCollateralBundle(TimestampMixin, Base):
+    """Versioned collateral publication for one audience and email purpose."""
+
+    __tablename__ = "marketing_collateral_bundles"
+    __table_args__ = (
+        UniqueConstraint(
+            "lead_type",
+            "purpose",
+            "version",
+            name="uq_marketing_collateral_bundle_version",
+        ),
+        CheckConstraint(
+            "status IN ('draft','published','retired')",
+            name="ck_marketing_collateral_bundle_status",
+        ),
+        CheckConstraint("version >= 1", name="ck_marketing_collateral_bundle_version"),
+        CheckConstraint("revision >= 1", name="ck_marketing_collateral_bundle_revision"),
+        Index(
+            "uq_marketing_collateral_bundle_published",
+            "lead_type",
+            "purpose",
+            unique=True,
+            postgresql_where=text("status = 'published'"),
+            sqlite_where=text("status = 'published'"),
+        ),
+        Index(
+            "ix_marketing_collateral_bundle_lookup",
+            "lead_type",
+            "purpose",
+            "status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    lead_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(48), nullable=False)
+    name: Mapped[str] = mapped_column(String(180), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="draft", server_default="draft"
+    )
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retired_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+
+class MarketingCollateralBundleItem(Base):
+    """Ordered asset identity frozen into a bundle publication version."""
+
+    __tablename__ = "marketing_collateral_bundle_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "bundle_id", "asset_id", name="uq_marketing_collateral_bundle_item_asset"
+        ),
+        UniqueConstraint(
+            "bundle_id", "sort_order", name="uq_marketing_collateral_bundle_item_order"
+        ),
+        CheckConstraint(
+            "inclusion_mode IN ('default','optional')",
+            name="ck_marketing_collateral_bundle_item_mode",
+        ),
+        CheckConstraint("sort_order >= 0", name="ck_marketing_collateral_bundle_item_order"),
+        CheckConstraint("size_bytes > 0", name="ck_marketing_collateral_bundle_item_size"),
+        CheckConstraint(
+            "char_length(sha256) = 64", name="ck_marketing_collateral_bundle_item_sha"
+        ),
+        Index("ix_marketing_collateral_bundle_items_order", "bundle_id", "sort_order"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    bundle_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("marketing_collateral_bundles.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    asset_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("marketing_collateral_assets.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    inclusion_mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    asset_name: Mapped[str] = mapped_column(String(180), nullable=False)
+    asset_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    file_name: Mapped[str] = mapped_column(String(240), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
 
 
 class MarketingCollateralAssetEvent(Base):

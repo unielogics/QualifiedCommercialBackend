@@ -179,6 +179,9 @@ from app.models.prospect_outreach import (  # noqa: F401
     EmailSuppression,
     MarketingCollateralAsset,
     MarketingCollateralAssetEvent,
+    MarketingCollateralBundle,
+    MarketingCollateralBundleItem,
+    ProspectOutreachProfile,
 )
 from app.models.professional_partner_application import ProfessionalPartnerApplication  # noqa: F401
 from app.models.production_package import (  # noqa: F401

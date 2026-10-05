@@ -27,15 +27,20 @@ from app.models.notification import Notification
 from app.models.prospect_outreach import (
     DealerProspectEmailDraft,
     DealerProspectEmailDraftAsset,
+    MarketingCollateralAsset,
+    MarketingCollateralBundle,
+    MarketingCollateralBundleItem,
 )
 from app.models.user import User
 from app.routers import settings as settings_router
 from app.schemas.prospect_outreach import (
+    MarketingCollateralBundleCreate,
     ProspectDraftAction,
     ProspectDraftCancelAction,
     ProspectEmailDraftCreate,
     ProspectEmailDraftPatch,
     ProspectOutreachPolicyPatch,
+    ProspectOutreachProfilePatch,
     ProspectTestEmailRequest,
 )
 from app.schemas.settings import (
@@ -773,6 +778,10 @@ async def test_agent_collateral_options_expose_only_safe_selection_metadata(monk
     dumped = result.items[0].model_dump()
     assert dumped == {
         "id": row.id,
+        "lead_type": "dealer",
+        "purposes": list(outreach.ALL_CANONICAL_PURPOSES),
+        "included_by_default": True,
+        "inclusion_mode": "default",
         "name": "Dealer guide",
         "file_name": "dealer-guide.pdf",
         "version": 3,
@@ -2851,3 +2860,343 @@ async def test_unsubscribe_post_applies_suppression_and_returns_confirmation(mon
     assert set(
         inspect.signature(prospect_outreach_router.unsubscribe_prospect_email_post).parameters
     ) == {"token", "db"}
+
+
+def test_seeded_outreach_profiles_are_versioned_and_render_type_specific_copy(monkeypatch):
+    assert tuple(outreach.DEFAULT_OUTREACH_PROFILE_SEEDS) == (
+        "dealer",
+        "main_street",
+        "real_estate",
+    )
+    assert all(
+        profile["version"] == 1
+        for profile in outreach.DEFAULT_OUTREACH_PROFILE_SEEDS.values()
+    )
+    assert outreach.normalize_lead_type("main st") == "main_street"
+    assert outreach.normalize_lead_type("CRE") == "real_estate"
+
+    main_street = outreach.default_outreach_profile("main_street")
+    fallback = outreach._purpose_fallback(
+        purpose="dealer_information",
+        contact_name="Alex Morgan",
+        dealer_name="Morgan Bakery",
+        profile=main_street,
+    )
+    assert "Morgan Bakery" in fallback.subject
+    assert "business-focused programs" in fallback.body
+    assert "dealership" not in fallback.body.casefold()
+
+    monkeypatch.setattr(
+        outreach,
+        "get_settings",
+        lambda: SimpleNamespace(
+            prospect_mailing_address="14 53rd St #408N, Brooklyn, NY 11232",
+            prospect_reply_to_email="support@qualifiedcommercial.com",
+            prospect_alternate_contact_email="",
+        ),
+    )
+    footer = outreach._locked_footer(
+        signature=["Alex Rep"],
+        attachment_names=[],
+        unsubscribe_url="https://api.qualifiedcommercial.com/unsubscribe/token",
+        profile=main_street,
+    )
+    assert "industries/main-street" in footer
+    assert "Unsubscribe from Business Desk email:" in footer
+
+
+def test_outreach_profile_patch_requires_https_and_known_template_placeholders():
+    with pytest.raises(ValidationError, match="absolute HTTPS"):
+        ProspectOutreachProfilePatch(expected_version=1, website_url="http://example.com")
+
+    patch = ProspectOutreachProfilePatch(
+        expected_version=1,
+        purpose_templates={
+            "information": {
+                "subject": "Resources for {business_name}",
+                "body": "Hi {first_name}, welcome to the {desk_name}.",
+            }
+        },
+    )
+    outreach._validate_profile_templates(
+        {key: value.model_dump() for key, value in patch.purpose_templates.items()}
+    )
+    with pytest.raises(outreach.OutreachBlocked, match="unsupported placeholder"):
+        outreach._validate_profile_templates(
+            {
+                "information": {
+                    "subject": "Resources for {unknown_value}",
+                    "body": "Hi {first_name}",
+                }
+            }
+        )
+
+
+def _bundle_asset(*, lead_type: str, name: str, order: int) -> MarketingCollateralAsset:
+    raw = f"%PDF-{name}".encode()
+    return MarketingCollateralAsset(
+        id=uuid.uuid4(),
+        assignment=outreach.COLLATERAL_ASSIGNMENT,
+        lead_type=lead_type,
+        purposes=["information"],
+        included_by_default=True,
+        logical_key=name.casefold().replace(" ", "-"),
+        name=name,
+        version=1,
+        sort_order=order,
+        status="active",
+        file_name=f"{name.casefold().replace(' ', '-')}.pdf",
+        content_type="application/pdf",
+        size_bytes=len(raw),
+        sha256=hashlib.sha256(raw).hexdigest(),
+        document_bytes=raw,
+        validation_status="passed_antivirus",
+    )
+
+
+@pytest.mark.asyncio
+async def test_published_bundle_selects_defaults_or_explicit_optional_in_bundle_order():
+    default_asset = _bundle_asset(lead_type="main_street", name="Overview", order=20)
+    optional_asset = _bundle_asset(lead_type="main_street", name="Checklist", order=10)
+    bundle = MarketingCollateralBundle(
+        id=uuid.uuid4(),
+        lead_type="main_street",
+        purpose="information",
+        name="Main Street information",
+        version=4,
+        revision=2,
+        status="published",
+        published_at=datetime.now(UTC),
+    )
+    default_item = MarketingCollateralBundleItem(
+        id=uuid.uuid4(),
+        bundle_id=bundle.id,
+        asset_id=default_asset.id,
+        inclusion_mode="default",
+        sort_order=0,
+        asset_name=default_asset.name,
+        asset_version=default_asset.version,
+        file_name=default_asset.file_name,
+        size_bytes=default_asset.size_bytes,
+        sha256=default_asset.sha256,
+    )
+    optional_item = MarketingCollateralBundleItem(
+        id=uuid.uuid4(),
+        bundle_id=bundle.id,
+        asset_id=optional_asset.id,
+        inclusion_mode="optional",
+        sort_order=10,
+        asset_name=optional_asset.name,
+        asset_version=optional_asset.version,
+        file_name=optional_asset.file_name,
+        size_bytes=optional_asset.size_bytes,
+        sha256=optional_asset.sha256,
+    )
+
+    class ScalarResult:
+        def scalar_one_or_none(self):
+            return bundle
+
+    class PairResult:
+        def all(self):
+            return [(default_item, default_asset), (optional_item, optional_asset)]
+
+    db = SimpleNamespace(execute=AsyncMock(side_effect=[ScalarResult(), PairResult()]))
+    defaults = await outreach._published_bundle_selection(
+        db,
+        lead_type="main_street",
+        purpose="dealer_information",
+        include_all_active=True,
+        asset_ids=[],
+        expected_bundle_id=bundle.id,
+        expected_bundle_version=bundle.version,
+    )
+    assert list(defaults) == [default_asset]
+    assert defaults.bundle_snapshot["bundle_id"] == str(bundle.id)
+    assert defaults.bundle_snapshot["version"] == 4
+    assert [item["inclusion_mode"] for item in defaults.bundle_snapshot["items"]] == [
+        "default",
+        "optional",
+    ]
+
+    db = SimpleNamespace(execute=AsyncMock(side_effect=[ScalarResult(), PairResult()]))
+    selected = await outreach._published_bundle_selection(
+        db,
+        lead_type="main_street",
+        purpose="information",
+        include_all_active=False,
+        asset_ids=[optional_asset.id],
+        expected_bundle_id=bundle.id,
+        expected_bundle_version=bundle.version,
+    )
+    assert list(selected) == [optional_asset]
+
+
+@pytest.mark.asyncio
+async def test_bundle_publish_atomically_retires_previous(monkeypatch):
+    asset = _bundle_asset(lead_type="real_estate", name="Property guide", order=0)
+    row = MarketingCollateralBundle(
+        id=uuid.uuid4(),
+        lead_type="real_estate",
+        purpose="information",
+        name="CRE information",
+        version=2,
+        revision=3,
+        status="draft",
+    )
+    item = MarketingCollateralBundleItem(
+        id=uuid.uuid4(),
+        bundle_id=row.id,
+        asset_id=asset.id,
+        inclusion_mode="default",
+        sort_order=0,
+        asset_name=asset.name,
+        asset_version=asset.version,
+        file_name=asset.file_name,
+        size_bytes=asset.size_bytes,
+        sha256=asset.sha256,
+    )
+    previous = MarketingCollateralBundle(
+        id=uuid.uuid4(),
+        lead_type="real_estate",
+        purpose="information",
+        name="CRE information",
+        version=1,
+        revision=2,
+        status="published",
+    )
+
+    class PreviousResult:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [previous]
+
+    db = SimpleNamespace(execute=AsyncMock(return_value=PreviousResult()), flush=AsyncMock())
+    monkeypatch.setattr(
+        outreach, "collateral_bundle_items", AsyncMock(return_value=[item])
+    )
+    monkeypatch.setattr(
+        outreach, "_bundle_assets_by_id", AsyncMock(return_value={asset.id: asset})
+    )
+
+    published = await outreach.publish_collateral_bundle(
+        db,
+        row,
+        actor_user_id=uuid.uuid4(),
+        expected_revision=3,
+    )
+
+    assert published.status == "published"
+    assert published.revision == 4
+    assert published.published_at is not None
+    assert previous.status == "retired"
+    assert previous.retired_at == published.published_at
+
+
+def test_bundle_contract_rejects_duplicate_assets():
+    asset_id = uuid.uuid4()
+    with pytest.raises(ValidationError, match="duplicate assets"):
+        MarketingCollateralBundleCreate(
+            lead_type="dealer",
+            purpose="dealer_information",
+            name="Dealer information",
+            items=[
+                {"asset_id": asset_id, "inclusion_mode": "default"},
+                {"asset_id": asset_id, "inclusion_mode": "optional"},
+            ],
+        )
+
+
+def test_profile_snapshot_key_version_and_hash_are_immutable_dispatch_inputs():
+    row = _draft()
+    snapshot = outreach.outreach_profile_snapshot(
+        outreach.default_outreach_profile("real_estate")
+    )
+    row.lead_type = "real_estate"
+    row.outreach_profile_key = "real_estate"
+    row.outreach_profile_version = snapshot["version"]
+    row.outreach_profile_snapshot = snapshot
+    row.outreach_profile_hash = outreach.outreach_profile_snapshot_hash(snapshot)
+
+    outreach.validate_draft_profile_snapshot(row)
+
+    row.outreach_profile_snapshot = {**snapshot, "desk_name": "Tampered Desk"}
+    with pytest.raises(outreach.OutreachBlocked) as blocked:
+        outreach.validate_draft_profile_snapshot(row)
+    assert blocked.value.code == "outreach_profile_snapshot_changed"
+
+
+def test_draft_bundle_pin_requires_id_and_version_together():
+    with pytest.raises(ValidationError, match="must be provided together"):
+        ProspectEmailDraftCreate(collateral_bundle_id=uuid.uuid4())
+    with pytest.raises(ValidationError, match="must be provided together"):
+        ProspectTestEmailRequest(
+            idempotency_key=uuid.uuid4(),
+            collateral_bundle_version=2,
+        )
+
+
+@pytest.mark.asyncio
+async def test_non_dealer_published_bundle_requires_reviewed_version_pin():
+    bundle = MarketingCollateralBundle(
+        id=uuid.uuid4(),
+        lead_type="main_street",
+        purpose="information",
+        name="Main Street information",
+        version=1,
+        revision=2,
+        status="published",
+    )
+
+    class ScalarResult:
+        def scalar_one_or_none(self):
+            return bundle
+
+    db = SimpleNamespace(execute=AsyncMock(return_value=ScalarResult()))
+    with pytest.raises(outreach.OutreachBlocked) as blocked:
+        await outreach._published_bundle_selection(
+            db,
+            lead_type="main_street",
+            purpose="information",
+            include_all_active=True,
+            asset_ids=[],
+        )
+    assert blocked.value.code == "collateral_bundle_pin_required"
+
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[ScalarResult(), SimpleNamespace(all=lambda: [])])
+    )
+    options = await outreach._published_bundle_selection(
+        db,
+        lead_type="main_street",
+        purpose="information",
+        include_all_active=False,
+        asset_ids=[],
+        select_all=True,
+        lock=False,
+    )
+    assert options.bundle_snapshot["bundle_id"] == str(bundle.id)
+
+
+def test_test_email_fingerprint_binds_sample_business_name():
+    actor = User(
+        id=uuid.uuid4(),
+        clerk_id="business-name-fingerprint-actor",
+        email="agent@qualifiedcommercial.com",
+        name="Agent One",
+        role="loan_exec",
+        account_status="active",
+    )
+    branding = _branding(actor)
+    original = ProspectTestEmailRequest(
+        idempotency_key=uuid.uuid4(),
+        lead_type="main_street",
+        sample_business_name="Morgan Bakery",
+    )
+    changed = original.model_copy(update={"sample_business_name": "River Cafe"})
+
+    assert outreach.test_request_fingerprint(
+        actor, original, branding=branding
+    ) != outreach.test_request_fingerprint(actor, changed, branding=branding)

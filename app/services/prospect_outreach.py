@@ -34,7 +34,7 @@ from botocore.exceptions import ClientError
 from fastapi import HTTPException
 from pydantic import ValidationError
 from pypdf import PdfReader
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
@@ -45,6 +45,15 @@ from app.dealer_os.models import (
     DealerRepCompany,
     DealerRepContact,
     DealerRepInboxMessage,
+)
+from app.lead_types import (
+    LEAD_TYPES,
+)
+from app.lead_types import (
+    normalize_funding_intent as normalize_field_funding_intent,
+)
+from app.lead_types import (
+    normalize_lead_type as normalize_field_lead_type,
 )
 from app.models.activity import Activity
 from app.models.app_settings import AppSettings
@@ -64,13 +73,19 @@ from app.models.prospect_outreach import (
     EmailSuppression,
     MarketingCollateralAsset,
     MarketingCollateralAssetEvent,
+    MarketingCollateralBundle,
+    MarketingCollateralBundleItem,
+    ProspectOutreachProfile,
 )
 from app.models.user import User
 from app.schemas.prospect_outreach import (
+    MarketingCollateralBundleCreate,
+    MarketingCollateralBundlePatch,
     ProspectEmailAttachmentRead,
     ProspectEmailDraftCreate,
     ProspectEmailDraftRead,
     ProspectOutreachPolicyPatch,
+    ProspectOutreachProfilePatch,
     ProspectTestEmailRequest,
     ProspectTestEmailResponse,
 )
@@ -82,6 +97,141 @@ log = logging.getLogger(__name__)
 DEALER_WEBSITE = "https://qualifiedcommercial.com/industries/auto"
 COLLATERAL_ASSIGNMENT = "dealer_outreach"
 DEFAULT_PURPOSE = "dealer_information"
+SUPPORTED_LEAD_TYPES = tuple(LEAD_TYPES)
+LEAD_TYPE_ALIASES = {
+    "dealer": "dealer",
+    "dealership": "dealer",
+    "auto": "dealer",
+    "auto_dealer": "dealer",
+    "main_st": "main_street",
+    "main_street": "main_street",
+    "business": "main_street",
+    "small_business": "main_street",
+    "real_estate": "real_estate",
+    "commercial_real_estate": "real_estate",
+    "cre": "real_estate",
+}
+ALL_CANONICAL_PURPOSES = (
+    "information",
+    "missed_call",
+    "callback_confirmation",
+    "client_will_call_back",
+    "booking",
+    "general",
+)
+
+
+def _default_purpose_templates(*, audience: str, desk: str) -> dict[str, dict[str, str]]:
+    return {
+        "information": {
+            "subject": "Commercial financing resources for {business_name}",
+            "body": (
+                "Hi {first_name},\n\nI am following up with an overview of {audience}-focused "
+                "programs Qualified Commercial can discuss with {business_name}.\n\nReply with "
+                "what you are planning and we can help identify practical next steps."
+            ),
+        },
+        "missed_call": {
+            "subject": "Sorry we missed you — {business_name}",
+            "body": (
+                "Hi {first_name},\n\nI tried to reach you and wanted to leave a quick note. "
+                f"Qualified Commercial's {desk} is available to learn about what your "
+                "{audience} is planning. Reply when it is convenient and we can discuss "
+                "practical next steps."
+            ),
+        },
+        "callback_confirmation": {
+            "subject": "Following up with {business_name}",
+            "body": (
+                "Hi {first_name},\n\nThank you for speaking with me. I will follow up at the time "
+                "we discussed. If anything changes, reply here and we can find a better time."
+            ),
+        },
+        "client_will_call_back": {
+            "subject": "Thank you for the update — {business_name}",
+            "body": (
+                "Hi {first_name},\n\nThank you for the update. I will watch for your call and am "
+                "happy to discuss what your {audience} is planning when the timing works for you. "
+                "You can also reply here with any questions."
+            ),
+        },
+        "booking": {
+            "subject": "Next steps for {business_name}",
+            "body": (
+                "Hi {first_name},\n\nThank you for your interest. Choose a time below that works "
+                "for you, and we can discuss what your {audience} is planning and the information "
+                "lender review may require."
+            ),
+        },
+        "general": {
+            "subject": "Following up with {business_name}",
+            "body": (
+                "Hi {first_name},\n\nI wanted to follow up and learn more about what your "
+                "{audience} is planning. Reply when it is convenient and we can discuss practical "
+                "next steps."
+            ),
+        },
+    }
+
+
+DEFAULT_OUTREACH_PROFILE_SEEDS: dict[str, dict[str, Any]] = {
+    "dealer": {
+        "lead_type": "dealer",
+        "version": 1,
+        "status": "active",
+        "display_name": "Dealer",
+        "desk_name": "Dealer Desk",
+        "audience_label": "dealership",
+        "audience_plural": "dealers",
+        "website_url": DEALER_WEBSITE,
+        "drafting_guidance": (
+            "Use concise, practical language for a dealership owner or operator. "
+            "Focus on inventory, property, equipment, or working-capital plans only when supplied."
+        ),
+        "purpose_templates": _default_purpose_templates(
+            audience="dealership", desk="Dealer Desk"
+        ),
+    },
+    "main_street": {
+        "lead_type": "main_street",
+        "version": 1,
+        "status": "active",
+        "display_name": "Main Street Business",
+        "desk_name": "Business Desk",
+        "audience_label": "business",
+        "audience_plural": "business owners",
+        "website_url": "https://qualifiedcommercial.com/industries/main-street",
+        "drafting_guidance": (
+            "Use approachable, plain language for an owner-operated business. "
+            "Keep the message practical and avoid dealership or property-investor terminology."
+        ),
+        "purpose_templates": _default_purpose_templates(
+            audience="business", desk="Business Desk"
+        ),
+    },
+    "real_estate": {
+        "lead_type": "real_estate",
+        "version": 1,
+        "status": "active",
+        "display_name": "Commercial Real Estate",
+        "desk_name": "Real Estate Desk",
+        "audience_label": "property business",
+        "audience_plural": "property owners and investors",
+        "website_url": "https://qualifiedcommercial.com/industries/commercial-real-estate",
+        "drafting_guidance": (
+            "Use professional commercial-real-estate language for an owner, investor, or operator. "
+            "Do not assume a property type, transaction, value, leverage, or occupancy."
+        ),
+        "purpose_templates": _default_purpose_templates(
+            audience="property business", desk="Real Estate Desk"
+        ),
+    },
+}
+# Legacy Dealer Desk treated ``general`` as the information follow-up.  Keep
+# that exact copy while the other audiences use their dedicated general note.
+DEFAULT_OUTREACH_PROFILE_SEEDS["dealer"]["purpose_templates"]["general"] = dict(
+    DEFAULT_OUTREACH_PROFILE_SEEDS["dealer"]["purpose_templates"]["information"]
+)
 # A provider call normally resolves in seconds.  A claimed draft with no
 # ledger after this grace period represents the deliberate at-most-once crash
 # window: its delivery outcome is unknown and must never be shown as actively
@@ -274,6 +424,284 @@ class AgentBranding:
         }
 
 
+def normalize_lead_type(value: object | None) -> str:
+    try:
+        return normalize_field_lead_type(value)
+    except ValueError:
+        pass
+    raw = getattr(value, "value", value)
+    key = re.sub(r"[^a-z0-9]+", "_", str(raw or "dealer").strip().casefold()).strip("_")
+    lead_type = LEAD_TYPE_ALIASES.get(key)
+    if lead_type is None:
+        raise OutreachBlocked(
+            "unsupported_lead_type",
+            "Choose Dealer, Main Street, or Commercial Real Estate before drafting outreach.",
+        )
+    return lead_type
+
+
+def canonical_purpose(value: str | None) -> str:
+    purpose = str(value or DEFAULT_PURPOSE).strip().casefold()
+    return "information" if purpose in {"dealer_information", "information"} else purpose
+
+
+def prospect_lead_type(prospect: Any) -> str:
+    return normalize_lead_type(
+        getattr(prospect, "lead_type", None) or getattr(prospect, "vertical", None) or "dealer"
+    )
+
+
+def prospect_funding_intent(prospect: Any) -> str | None:
+    raw = getattr(prospect, "funding_intent", None)
+    raw = getattr(raw, "value", raw)
+    try:
+        return normalize_field_funding_intent(raw)
+    except ValueError as exc:
+        raise OutreachBlocked(
+            "unsupported_funding_intent",
+            "Choose a supported funding intent before drafting outreach.",
+        ) from exc
+
+
+def _profile_value(profile: Any, key: str, default: Any = None) -> Any:
+    return profile.get(key, default) if isinstance(profile, dict) else getattr(profile, key, default)
+
+
+def default_outreach_profile(lead_type: str) -> SimpleNamespace:
+    canonical = normalize_lead_type(lead_type)
+    return SimpleNamespace(id=None, created_at=None, created_by_user_id=None, **DEFAULT_OUTREACH_PROFILE_SEEDS[canonical])
+
+
+def outreach_profile_snapshot(profile: Any) -> dict[str, Any]:
+    lead_type = normalize_lead_type(_profile_value(profile, "lead_type", "dealer"))
+    seed = DEFAULT_OUTREACH_PROFILE_SEEDS[lead_type]
+    templates = _profile_value(profile, "purpose_templates", None) or seed["purpose_templates"]
+    return {
+        "lead_type": lead_type,
+        "version": int(_profile_value(profile, "version", 1) or 1),
+        "display_name": _clean_label(
+            _profile_value(profile, "display_name", None), seed["display_name"]
+        ),
+        "desk_name": _clean_label(
+            _profile_value(profile, "desk_name", None), seed["desk_name"]
+        ),
+        "audience_label": _clean_label(
+            _profile_value(profile, "audience_label", None), seed["audience_label"]
+        ),
+        "audience_plural": _clean_label(
+            _profile_value(profile, "audience_plural", None), seed["audience_plural"]
+        ),
+        "website_url": str(
+            _profile_value(profile, "website_url", None) or seed["website_url"]
+        ).strip(),
+        "drafting_guidance": str(
+            _profile_value(profile, "drafting_guidance", None) or ""
+        ).strip()[:3000],
+        "purpose_templates": json.loads(json.dumps(templates)),
+    }
+
+
+def outreach_profile_snapshot_hash(snapshot: dict[str, Any]) -> str:
+    """Canonical digest pinned to every reviewed draft and audit record."""
+    return hashlib.sha256(
+        json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _outreach_profile_advisory_key(lead_type: str) -> int:
+    return int.from_bytes(
+        hashlib.sha256(
+            f"prospect-outreach-profile:{normalize_lead_type(lead_type)}".encode()
+        ).digest()[:8],
+        byteorder="big",
+        signed=True,
+    )
+
+
+def validate_draft_profile_snapshot(row: DealerProspectEmailDraft) -> None:
+    lead_type = normalize_lead_type(getattr(row, "lead_type", None) or "dealer")
+    raw_snapshot = getattr(row, "outreach_profile_snapshot", None)
+    snapshot = raw_snapshot or outreach_profile_snapshot(default_outreach_profile("dealer"))
+    profile_key = normalize_lead_type(
+        getattr(row, "outreach_profile_key", None) or lead_type
+    )
+    version = int(getattr(row, "outreach_profile_version", None) or 1)
+    expected_hash = outreach_profile_snapshot_hash(snapshot)
+    stored_hash = getattr(row, "outreach_profile_hash", None) or expected_hash
+    if (
+        profile_key != lead_type
+        or normalize_lead_type(snapshot.get("lead_type")) != lead_type
+        or int(snapshot.get("version") or 0) != version
+        or not secrets.compare_digest(str(stored_hash), expected_hash)
+    ):
+        raise OutreachBlocked(
+            "outreach_profile_snapshot_changed",
+            "The immutable outreach profile snapshot failed validation; nothing was sent.",
+        )
+
+
+async def load_outreach_profile(
+    db: AsyncSession, lead_type: str, *, lock: bool = False
+) -> Any:
+    """Load the editable active policy, with code seeds as a safe bootstrap.
+
+    The migration seeds all three rows.  The bootstrap keeps unit tests and a
+    partially deployed worker deterministic, but updates still write a new
+    durable version and every draft snapshots the resolved policy.
+    """
+    canonical = normalize_lead_type(lead_type)
+    if not isinstance(db, AsyncSession):
+        return default_outreach_profile(canonical)
+    statement = select(ProspectOutreachProfile).where(
+        ProspectOutreachProfile.lead_type == canonical,
+        ProspectOutreachProfile.status == "active",
+    )
+    if lock:
+        statement = statement.with_for_update()
+    row = (await db.execute(statement)).scalar_one_or_none()
+    return row or default_outreach_profile(canonical)
+
+
+async def list_outreach_profiles(db: AsyncSession) -> list[Any]:
+    if not isinstance(db, AsyncSession):
+        return [default_outreach_profile(value) for value in SUPPORTED_LEAD_TYPES]
+    rows = list(
+        (
+            await db.execute(
+                select(ProspectOutreachProfile)
+                .where(ProspectOutreachProfile.status == "active")
+                .order_by(ProspectOutreachProfile.lead_type)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_type = {normalize_lead_type(row.lead_type): row for row in rows}
+    return [by_type.get(value) or default_outreach_profile(value) for value in SUPPORTED_LEAD_TYPES]
+
+
+def _validate_profile_templates(templates: dict[str, Any]) -> None:
+    allowed_fields = {"first_name", "business_name", "audience", "desk_name"}
+    formatter = __import__("string").Formatter()
+    if "information" not in templates:
+        raise OutreachBlocked(
+            "invalid_outreach_profile", "An information-purpose template is required."
+        )
+    for purpose, template in templates.items():
+        if purpose not in ALL_CANONICAL_PURPOSES or not isinstance(template, dict):
+            raise OutreachBlocked(
+                "invalid_outreach_profile", f"Unsupported outreach template: {purpose}."
+            )
+        for part in ("subject", "body"):
+            value = str(template.get(part) or "").strip()
+            if not value:
+                raise OutreachBlocked(
+                    "invalid_outreach_profile", f"Template {purpose}.{part} cannot be blank."
+                )
+            fields = {name for _, name, _, _ in formatter.parse(value) if name}
+            if not fields.issubset(allowed_fields):
+                raise OutreachBlocked(
+                    "invalid_outreach_profile",
+                    f"Template {purpose}.{part} contains an unsupported placeholder.",
+                )
+
+
+async def update_outreach_profile(
+    db: AsyncSession,
+    *,
+    lead_type: str,
+    actor: User,
+    payload: ProspectOutreachProfilePatch,
+) -> ProspectOutreachProfile:
+    canonical = normalize_lead_type(lead_type)
+    if isinstance(db, AsyncSession):
+        await db.execute(
+            select(func.pg_advisory_xact_lock(_outreach_profile_advisory_key(canonical)))
+        )
+    current = await load_outreach_profile(db, canonical, lock=True)
+    current_snapshot = outreach_profile_snapshot(current)
+    if int(current_snapshot["version"]) != payload.expected_version:
+        raise OutreachConflict(
+            "The outreach profile changed in another session. Refresh before saving."
+        )
+    next_data = dict(current_snapshot)
+    for field in (
+        "display_name",
+        "desk_name",
+        "audience_label",
+        "audience_plural",
+        "website_url",
+        "drafting_guidance",
+    ):
+        value = getattr(payload, field)
+        if value is not None:
+            next_data[field] = value
+    if payload.purpose_templates is not None:
+        next_data["purpose_templates"] = {
+            key: value.model_dump() for key, value in payload.purpose_templates.items()
+        }
+    _validate_profile_templates(next_data["purpose_templates"])
+    try:
+        for purpose in next_data["purpose_templates"]:
+            sample = _purpose_fallback(
+                purpose=purpose,
+                contact_name="Alex Morgan",
+                dealer_name="Example Business",
+                profile=next_data,
+            )
+            validate_generated_copy(
+                subject=sample.subject,
+                body=sample.body,
+                catalog_snapshot=[],
+            )
+    except ValueError as exc:
+        raise OutreachBlocked(
+            "invalid_outreach_profile",
+            f"An outreach fallback template violates the immutable copy rules: {exc}",
+        ) from exc
+    if not re.fullmatch(r"https://[^\s]+", next_data["website_url"], re.IGNORECASE):
+        raise OutreachBlocked(
+            "invalid_outreach_profile", "The profile website must be an absolute HTTPS URL."
+        )
+    if isinstance(current, ProspectOutreachProfile):
+        current.status = "retired"
+        current.retired_at = utcnow()
+        current.retired_by_user_id = actor.id
+        await db.flush()
+    row = ProspectOutreachProfile(
+        lead_type=canonical,
+        version=payload.expected_version + 1,
+        status="active",
+        display_name=next_data["display_name"],
+        desk_name=next_data["desk_name"],
+        audience_label=next_data["audience_label"],
+        audience_plural=next_data["audience_plural"],
+        website_url=next_data["website_url"],
+        drafting_guidance=next_data["drafting_guidance"],
+        purpose_templates=next_data["purpose_templates"],
+        created_by_user_id=actor.id,
+    )
+    db.add(row)
+    await db.flush()
+    db.add(
+        Activity(
+            loan_id=None,
+            actor_id=actor.id,
+            actor_label=str(getattr(getattr(actor, "role", None), "value", actor.role)),
+            kind="prospect.outreach_profile_updated",
+            summary=f"Updated {next_data['display_name']} outreach profile",
+            payload={
+                "lead_type": canonical,
+                "version_before": payload.expected_version,
+                "version_after": row.version,
+                "changed_fields": sorted(payload.model_fields_set - {"expected_version"}),
+            },
+        )
+    )
+    await db.flush()
+    return row
+
+
 async def load_outreach_ai_settings(
     db: AsyncSession, *, lock: bool = False
 ) -> ProspectOutreachAISettings:
@@ -350,33 +778,39 @@ def utcnow() -> datetime:
 
 
 def _notification_copy(row: DealerProspectEmailDraft) -> tuple[str, str, str]:
+    lead_type = normalize_lead_type(getattr(row, "lead_type", None) or "dealer")
+    audience = (
+        "Dealer"
+        if lead_type == "dealer"
+        else DEFAULT_OUTREACH_PROFILE_SEEDS[lead_type]["display_name"]
+    )
     if row.status == "pending_review":
         when = row.auto_send_at.isoformat() if row.auto_send_at else "the scheduled time"
         return (
-            "Dealer email awaiting review",
+            f"{audience} email awaiting review",
             f"“{row.subject}” will send automatically at {when}.",
             "high",
         )
     if row.status == "editing":
         return (
-            "Dealer email review paused",
+            f"{audience} email review paused",
             f"“{row.subject}” requires explicit approval after editing.",
             "medium",
         )
     if row.status == "sending":
-        return "Dealer email sending", f"“{row.subject}” is being delivered.", "medium"
+        return f"{audience} email sending", f"“{row.subject}” is being delivered.", "medium"
     if row.status == "sent":
-        return "Dealer email sent", f"“{row.subject}” was sent.", "low"
+        return f"{audience} email sent", f"“{row.subject}” was sent.", "low"
     if row.status == "cancelled":
-        return "Dealer email cancelled", f"“{row.subject}” was cancelled.", "low"
+        return f"{audience} email cancelled", f"“{row.subject}” was cancelled.", "low"
     if row.status == "blocked":
         return (
-            "Dealer email blocked",
+            f"{audience} email blocked",
             (row.failure_detail or f"“{row.subject}” cannot be sent.")[:500],
             "high",
         )
     return (
-        "Dealer email failed",
+        f"{audience} email failed",
         (row.failure_detail or f"“{row.subject}” could not be delivered.")[:500],
         "high",
     )
@@ -502,6 +936,8 @@ def request_fingerprint(
         "email": normalize_email(
             getattr(prospect, "email", None) or getattr(prospect, "email_normalized", None)
         ),
+        "lead_type": prospect_lead_type(prospect),
+        "funding_intent": prospect_funding_intent(prospect),
         "purpose": payload.purpose,
         "compose_mode": payload.compose_mode,
         "subject": payload.subject,
@@ -514,6 +950,10 @@ def request_fingerprint(
         "ai_context_manifest": list(context_manifest or []),
         "include_collateral": payload.include_collateral,
         "collateral_asset_ids": sorted(str(value) for value in payload.collateral_asset_ids),
+        "collateral_bundle_id": (
+            str(payload.collateral_bundle_id) if payload.collateral_bundle_id else None
+        ),
+        "collateral_bundle_version": payload.collateral_bundle_version,
         "sender_branding": branding.snapshot(),
     }
     return hashlib.sha256(
@@ -531,13 +971,19 @@ def test_request_fingerprint(
     raw = {
         "actor_id": str(actor.id),
         "recipient": normalize_email(actor.email),
+        "lead_type": payload.lead_type,
         "purpose": payload.purpose,
         "sample_contact_name": payload.sample_contact_name,
         "sample_dealer_name": payload.sample_dealer_name,
+        "sample_business_name": payload.sample_business_name,
         "ai_instructions": payload.ai_instructions,
         "verified_conversation_context": payload.verified_conversation_context,
         "include_collateral": payload.include_collateral,
         "collateral_asset_ids": sorted(str(value) for value in payload.collateral_asset_ids),
+        "collateral_bundle_id": (
+            str(payload.collateral_bundle_id) if payload.collateral_bundle_id else None
+        ),
+        "collateral_bundle_version": payload.collateral_bundle_version,
         "sender_branding": branding.snapshot(),
     }
     return hashlib.sha256(
@@ -586,73 +1032,69 @@ def _insert_verified_conversation_context(body: str, context: str | None) -> str
     return f"{clean_context}" + (f"\n\n{without_context}" if without_context else "")
 
 
-def _purpose_fallback(*, purpose: str, contact_name: str, dealer_name: str) -> ComposedCopy:
-    first = _first_name(contact_name)
-    dealer = _clean_label(dealer_name, "your dealership")
-    if purpose == "missed_call":
-        return ComposedCopy(
-            subject=f"Sorry we missed you — {dealer}",
-            body=(
-                f"Hi {first},\n\nI tried to reach you and wanted to leave a quick note. "
-                "Qualified Commercial's Dealer Desk is available to learn about what your "
-                "dealership is planning. Reply when it is convenient and we can discuss "
-                "practical next steps."
-            ),
-            source="fallback",
+def _purpose_fallback(
+    *,
+    purpose: str,
+    contact_name: str,
+    dealer_name: str,
+    profile: Any | None = None,
+) -> ComposedCopy:
+    snapshot = outreach_profile_snapshot(profile or default_outreach_profile("dealer"))
+    canonical = canonical_purpose(purpose)
+    templates = snapshot["purpose_templates"]
+    template = templates.get(canonical) or templates.get("general") or templates.get("information")
+    if not isinstance(template, dict):
+        raise OutreachBlocked(
+            "invalid_outreach_profile",
+            f"The {snapshot['display_name']} outreach profile has no usable {canonical} template.",
         )
-    if purpose == "callback_confirmation":
-        return ComposedCopy(
-            subject=f"Following up with {dealer}",
-            body=(
-                f"Hi {first},\n\nThank you for speaking with me. I will follow up at the time "
-                "we discussed. If anything changes, reply here and we can find a better time."
-            ),
-            source="fallback",
+    business_fallback = {
+        "dealer": "your dealership",
+        "main_street": "your business",
+        "real_estate": "your property business",
+    }[snapshot["lead_type"]]
+    values = {
+        "first_name": _first_name(contact_name),
+        "business_name": _clean_label(dealer_name, business_fallback),
+        "audience": snapshot["audience_label"],
+        "desk_name": snapshot["desk_name"],
+    }
+    try:
+        subject = str(template.get("subject") or "").format_map(values).strip()
+        body = str(template.get("body") or "").format_map(values).strip()
+    except (KeyError, ValueError) as exc:
+        raise OutreachBlocked(
+            "invalid_outreach_profile",
+            f"The {snapshot['display_name']} outreach template contains an invalid placeholder.",
+        ) from exc
+    if not subject or not body:
+        raise OutreachBlocked(
+            "invalid_outreach_profile",
+            f"The {snapshot['display_name']} outreach template is incomplete.",
         )
-    if purpose == "client_will_call_back":
-        return ComposedCopy(
-            subject=f"Thank you for the update — {dealer}",
-            body=(
-                f"Hi {first},\n\nThank you for the update. I will watch for your call and am "
-                "happy to discuss what your dealership is planning when the timing works for you. "
-                "You can also reply here with any questions."
-            ),
-            source="fallback",
-        )
-    if purpose == "booking":
-        return ComposedCopy(
-            subject=f"Next steps for {dealer}",
-            body=(
-                f"Hi {first},\n\nThank you for your interest. Choose a time below that works "
-                "for you, and we can discuss what your dealership is planning and the information "
-                "lender review may require."
-            ),
-            source="fallback",
-        )
-    return ComposedCopy(
-        subject=f"Commercial financing resources for {dealer}",
-        body=(
-            f"Hi {first},\n\nI am following up with an overview of dealer-focused programs "
-            f"Qualified Commercial can discuss with {dealer}.\n\nReply with what you are "
-            "planning and we can help identify practical next steps."
-        ),
-        source="fallback",
-    )
+    return ComposedCopy(subject=subject[:240], body=body[:12_000], source="fallback")
 
 
-def _dealer_catalog_snapshot(
+def _catalog_snapshot(
     rows: Iterable[tuple[FundingProgramCatalog, FundingProgramScope]],
+    *,
+    lead_type: str,
+    funding_intent: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Snapshot active canonical programs and the dealer scopes admitting them."""
+    """Snapshot active canonical programs admitted for one outreach audience."""
+    canonical_lead_type = normalize_lead_type(lead_type)
+    canonical_intent = prospect_funding_intent(SimpleNamespace(funding_intent=funding_intent))
+    scopes_key = "dealer_scopes" if canonical_lead_type == "dealer" else "scopes"
     grouped: dict[uuid.UUID, dict[str, Any]] = {}
     for program, scope in rows:
+        scope_intents = sorted(set(scope.intent_keys or []))
         # Keep this defensive check even though the SQL query has the same
-        # predicates: callers and tests cannot accidentally turn a Main Street
-        # or retired program into Dealer Desk marketing copy.
+        # predicates: callers and tests cannot cross audience boundaries.
         if (
             program.status != "active"
-            or scope.vertical != "dealer"
+            or scope.vertical != canonical_lead_type
             or not scope.is_active
+            or (canonical_intent and scope_intents and canonical_intent not in scope_intents)
         ):
             continue
         item = grouped.setdefault(
@@ -669,15 +1111,15 @@ def _dealer_catalog_snapshot(
                 "catalog_updated_at": (
                     program.updated_at.isoformat() if program.updated_at is not None else None
                 ),
-                "dealer_scopes": [],
+                scopes_key: [],
             },
         )
-        item["dealer_scopes"].append(
+        item[scopes_key].append(
             {
                 "scope_key": scope.scope_key,
                 "required_fact_keys": sorted(set(scope.required_fact_keys or [])),
                 "intake_variants": sorted(set(scope.intake_variants or [])),
-                "intent_keys": sorted(set(scope.intent_keys or [])),
+                "intent_keys": scope_intents,
                 "naics_prefixes": sorted(set(scope.naics_prefixes or [])),
                 "industry_keys": sorted(set(scope.industry_keys or [])),
                 "scope_updated_at": (
@@ -688,15 +1130,15 @@ def _dealer_catalog_snapshot(
 
     snapshot: list[dict[str, Any]] = []
     for item in grouped.values():
-        item["dealer_scopes"].sort(key=lambda value: value["scope_key"])
+        item[scopes_key].sort(key=lambda value: value["scope_key"])
         required = sorted(
             {
                 key
-                for scope in item["dealer_scopes"]
+                for scope in item[scopes_key]
                 for key in scope["required_fact_keys"]
             }
         )
-        # An unconditioned dealer scope makes the program generally available
+        # An unconditioned audience scope makes the program generally available
         # for discussion. Otherwise it belongs under specialized options.
         unrestricted_scope = any(
             not any(
@@ -709,7 +1151,7 @@ def _dealer_catalog_snapshot(
                     "intent_keys",
                 )
             )
-            for scope in item["dealer_scopes"]
+            for scope in item[scopes_key]
         )
         item["required_fact_keys"] = [] if unrestricted_scope else required
         item["is_specialized"] = not unrestricted_scope
@@ -717,7 +1159,20 @@ def _dealer_catalog_snapshot(
     return sorted(snapshot, key=lambda row: (row["display_order"], row["name"], row["program_key"]))
 
 
-async def _active_catalog_snapshot(db: AsyncSession) -> list[dict[str, Any]]:
+def _dealer_catalog_snapshot(
+    rows: Iterable[tuple[FundingProgramCatalog, FundingProgramScope]],
+) -> list[dict[str, Any]]:
+    """Compatibility alias for existing Dealer Desk callers and tests."""
+    return _catalog_snapshot(rows, lead_type="dealer")
+
+
+async def _active_catalog_snapshot(
+    db: AsyncSession,
+    *,
+    lead_type: str = "dealer",
+    funding_intent: str | None = None,
+) -> list[dict[str, Any]]:
+    canonical_lead_type = normalize_lead_type(lead_type)
     rows = list(
         (
             await db.execute(
@@ -728,7 +1183,7 @@ async def _active_catalog_snapshot(db: AsyncSession) -> list[dict[str, Any]]:
                 )
                 .where(
                     FundingProgramCatalog.status == "active",
-                    FundingProgramScope.vertical == "dealer",
+                    FundingProgramScope.vertical == canonical_lead_type,
                     FundingProgramScope.is_active.is_(True),
                 )
                 .order_by(
@@ -739,11 +1194,21 @@ async def _active_catalog_snapshot(db: AsyncSession) -> list[dict[str, Any]]:
             )
         ).all()
     )
-    snapshot = _dealer_catalog_snapshot(rows)
+    snapshot = _catalog_snapshot(
+        rows,
+        lead_type=canonical_lead_type,
+        funding_intent=funding_intent,
+    )
     if not snapshot:
+        label = DEFAULT_OUTREACH_PROFILE_SEEDS[canonical_lead_type]["display_name"]
+        code = (
+            "dealer_program_catalog_not_configured"
+            if canonical_lead_type == "dealer"
+            else "outreach_program_catalog_not_configured"
+        )
         raise OutreachBlocked(
-            "dealer_program_catalog_not_configured",
-            "No active dealer-scoped funding programs are configured. Activate at least one canonical Dealer program before sending outreach.",
+            code,
+            f"No active {label}-scoped funding programs are configured. Activate at least one canonical {label} program before sending outreach.",
         )
     return snapshot
 
@@ -754,8 +1219,13 @@ def catalog_version(snapshot: list[dict[str, Any]]) -> str:
     ).hexdigest()
 
 
-def _approved_program_section(snapshot: list[dict[str, Any]]) -> str:
-    """Render canonical dealer program names, never model-authored prose."""
+def _approved_program_section(
+    snapshot: list[dict[str, Any]], *, profile: Any | None = None
+) -> str:
+    """Render canonical program names, never model-authored prose."""
+    profile_snapshot = outreach_profile_snapshot(
+        profile or default_outreach_profile("dealer")
+    )
     standard: list[str] = []
     specialized: list[str] = []
     seen: set[str] = set()
@@ -770,15 +1240,25 @@ def _approved_program_section(snapshot: list[dict[str, Any]]) -> str:
         target = specialized if row.get("is_specialized", bool(row.get("required_fact_keys"))) else standard
         target.append(clean)
     if not standard and not specialized:
+        lead_type = profile_snapshot["lead_type"]
+        code = (
+            "dealer_program_catalog_not_configured"
+            if lead_type == "dealer"
+            else "outreach_program_catalog_not_configured"
+        )
         raise OutreachBlocked(
-            "dealer_program_catalog_not_configured",
-            "The active Dealer program catalog contains no displayable program names.",
+            code,
+            f"The active {profile_snapshot['display_name']} program catalog contains no displayable program names.",
         )
     sections: list[str] = []
     if standard:
+        heading = (
+            "Dealer-focused programs we can discuss:"
+            if profile_snapshot["lead_type"] == "dealer"
+            else f"{profile_snapshot['display_name']}-focused programs we can discuss:"
+        )
         sections.append(
-            "Dealer-focused programs we can discuss:\n"
-            + "\n".join(f"- {name}" for name in standard)
+            heading + "\n" + "\n".join(f"- {name}" for name in standard)
         )
     if specialized:
         sections.append(
@@ -791,8 +1271,10 @@ def _approved_program_section(snapshot: list[dict[str, Any]]) -> str:
     return "\n\n".join(sections)
 
 
-def _with_approved_program_section(body: str, snapshot: list[dict[str, Any]]) -> str:
-    section = _approved_program_section(snapshot)
+def _with_approved_program_section(
+    body: str, snapshot: list[dict[str, Any]], *, profile: Any | None = None
+) -> str:
+    section = _approved_program_section(snapshot, profile=profile)
     return f"{body.rstrip()}\n\n{section}" if section else body.rstrip()
 
 
@@ -1196,8 +1678,12 @@ async def _compose_with_nova(
     catalog_snapshot: list[dict[str, Any]],
     actor_user_id: uuid.UUID,
     safe_context: SafeAIContext | None = None,
+    profile: Any | None = None,
 ) -> ComposedCopy:
     policy = await load_outreach_ai_settings(db)
+    profile_snapshot = outreach_profile_snapshot(
+        profile or default_outreach_profile(prospect_lead_type(prospect))
+    )
     safe_context = safe_context or await _safe_ai_context(
         db,
         prospect.id,
@@ -1207,6 +1693,7 @@ async def _compose_with_nova(
         purpose=purpose,
         contact_name=identity.contact_name,
         dealer_name=identity.dealer_name,
+        profile=profile_snapshot,
     )
     settings = get_settings()
     if not settings.ai_provider_enabled:
@@ -1232,7 +1719,8 @@ async def _compose_with_nova(
 
     model_id = settings.prospect_bedrock_model
     system = (
-        "You draft concise, professional B2B email copy for Qualified Commercial's Dealer Desk. "
+        f"You draft concise, professional B2B email copy for Qualified Commercial's {profile_snapshot['desk_name']}. "
+        f"The recipient audience is {profile_snapshot['audience_plural']}. "
         "Write only a personalized greeting, conversational introduction, and call to action. "
         "Do not name, describe, summarize, or imply any product, program, service, or company "
         "capability; the application renders approved program names separately from APPROVED_CATALOG. "
@@ -1256,7 +1744,15 @@ async def _compose_with_nova(
             "purpose": purpose,
             "recipient": {
                 "first_name": _first_name(identity.contact_name),
-                "dealer_name": _clean_label(identity.dealer_name, "the dealership"),
+                "business_name": _clean_label(
+                    identity.dealer_name, f"the {profile_snapshot['audience_label']}"
+                ),
+                # Legacy key retained for the Dealer profile and old prompt
+                # evaluation fixtures; it carries the same company value.
+                "dealer_name": _clean_label(
+                    identity.dealer_name, f"the {profile_snapshot['audience_label']}"
+                ),
+                "lead_type": profile_snapshot["lead_type"],
             },
             "PERSONALIZATION_INSTRUCTIONS": (ai_instructions or "")[:1500],
             "CURRENT_AGENT_INSTRUCTIONS": (ai_instructions or "")[:1500],
@@ -1265,12 +1761,16 @@ async def _compose_with_nova(
                 "structured_activity": list(safe_context.activities),
             },
             "FIRM_DRAFTING_GUIDANCE": policy.drafting_guidance,
+            "AUDIENCE_DRAFTING_GUIDANCE": profile_snapshot["drafting_guidance"],
             "FIRM_BLOCKED_PHRASES": policy.additional_blocked_phrases,
             "APPROVED_CATALOG": catalog_snapshot,
             "requirements": {
                 "language": "English",
                 "format": "Use concise short paragraphs; follow compatible firm style guidance",
-                "call_to_action": "Ask the dealer to reply with their plans or questions",
+                "call_to_action": (
+                    f"Ask the {profile_snapshot['audience_label']} contact to reply with "
+                    "their plans or questions"
+                ),
             },
         },
         sort_keys=True,
@@ -1322,7 +1822,12 @@ async def _compose_with_nova(
             input_tokens=int(usage.get("inputTokens") or 0),
             output_tokens=int(usage.get("outputTokens") or 0),
             user_id=actor_user_id,
-            metadata={"prospect_id": str(prospect.id), "purpose": purpose},
+            metadata={
+                "prospect_id": str(prospect.id),
+                "purpose": purpose,
+                "lead_type": profile_snapshot["lead_type"],
+                "outreach_profile_version": profile_snapshot["version"],
+            },
         )
         return ComposedCopy(
             subject=subject,
@@ -1438,13 +1943,17 @@ def _locked_footer(
     unsubscribe_url: str | None,
     booking_url: str | None = None,
     test_mode: bool = False,
+    profile: Any | None = None,
 ) -> str:
+    profile_snapshot = outreach_profile_snapshot(
+        profile or default_outreach_profile("dealer")
+    )
     settings = get_settings()
     mailing_address = " ".join(str(getattr(settings, "prospect_mailing_address", "") or "").split())
     if not mailing_address:
         raise OutreachBlocked(
             "mailing_address_not_configured",
-            "A valid company mailing address is required before Dealer Desk email can be sent.",
+            f"A valid company mailing address is required before {profile_snapshot['desk_name']} email can be sent.",
         )
     reply_contact = reply_contact_email(settings.prospect_reply_to_email)
     alternate_contact = normalize_email(getattr(settings, "prospect_alternate_contact_email", ""))
@@ -1464,7 +1973,11 @@ def _locked_footer(
         if alternate_contact and alternate_contact != reply_contact:
             reply_note += f" You may also contact {alternate_contact}."
         parts.extend([reply_note, ""])
-    parts.append(f"Learn more: {DEALER_WEBSITE}")
+    if test_mode and profile_snapshot["lead_type"] != "dealer":
+        parts[0] = (
+            "TEST EMAIL — no prospect was contacted and no pipeline automation was changed."
+        )
+    parts.append(f"Learn more: {profile_snapshot['website_url']}")
     if booking_url:
         parts.append(f"Book a time: {booking_url}")
     if attachment_names:
@@ -1480,7 +1993,7 @@ def _locked_footer(
                 "underwriting, and documentation; no approval or terms are guaranteed."
             ),
             (
-                f"Unsubscribe from Dealer Desk email: {unsubscribe_url}"
+                f"Unsubscribe from {profile_snapshot['desk_name']} email: {unsubscribe_url}"
                 if unsubscribe_url
                 else "Test email only — live outreach includes a one-click unsubscribe link."
             ),
@@ -1498,12 +2011,26 @@ def _render_body(editable_body: str, locked_footer: str) -> str:
     return f"{editable}\n\n{locked_footer}".strip()
 
 
-def _footer_with_secure_bundle(footer: str, *, bundle_url: str, expires_at: datetime) -> str:
+def _footer_with_secure_bundle(
+    footer: str,
+    *,
+    bundle_url: str,
+    expires_at: datetime,
+    profile: Any | None = None,
+) -> str:
+    profile_snapshot = outreach_profile_snapshot(
+        profile or default_outreach_profile("dealer")
+    )
+    bundle_label = (
+        "Secure dealer information bundle"
+        if profile_snapshot["lead_type"] == "dealer"
+        else f"Secure {profile_snapshot['display_name']} information bundle"
+    )
     lines = [
         line
         for line in (footer or "").splitlines()
         if not line.startswith("Attached for reference:")
-        and not line.startswith("Secure dealer information bundle")
+        and not re.match(r"^Secure .+ information bundle", line)
     ]
     learn_more_at = next(
         (index for index, line in enumerate(lines) if line.startswith("Learn more:")),
@@ -1514,7 +2041,7 @@ def _footer_with_secure_bundle(footer: str, *, bundle_url: str, expires_at: date
         insert_at += 1
     lines.insert(
         insert_at,
-        f"Secure dealer information bundle (expires {expires_at.date().isoformat()}): {bundle_url}",
+        f"{bundle_label} (expires {expires_at.date().isoformat()}): {bundle_url}",
     )
     return "\n".join(lines).strip()
 
@@ -1664,13 +2191,519 @@ async def revoke_suppression(
     return row
 
 
-async def _active_collateral(db: AsyncSession) -> list[MarketingCollateralAsset]:
-    return list(
+class ResolvedCollateralSelection(list[MarketingCollateralAsset]):
+    """List-compatible result carrying the immutable publication audit data."""
+
+    def __init__(
+        self,
+        values: Iterable[MarketingCollateralAsset] = (),
+        *,
+        bundle_snapshot: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(values)
+        self.bundle_snapshot = bundle_snapshot or {}
+
+
+def collateral_bundle_snapshot(
+    bundle: MarketingCollateralBundle,
+    items: Iterable[MarketingCollateralBundleItem],
+    *,
+    selected_asset_ids: Iterable[uuid.UUID] = (),
+) -> dict[str, Any]:
+    selected = {str(value) for value in selected_asset_ids}
+    return {
+        "bundle_id": str(bundle.id),
+        "lead_type": normalize_lead_type(bundle.lead_type),
+        "purpose": canonical_purpose(bundle.purpose),
+        "name": bundle.name,
+        "version": int(bundle.version),
+        "published_at": bundle.published_at.isoformat() if bundle.published_at else None,
+        "items": [
+            {
+                "asset_id": str(item.asset_id),
+                "asset_name": item.asset_name,
+                "asset_version": int(item.asset_version),
+                "file_name": item.file_name,
+                "size_bytes": int(item.size_bytes),
+                "sha256": item.sha256,
+                "inclusion_mode": item.inclusion_mode,
+                "sort_order": int(item.sort_order),
+                "selected": str(item.asset_id) in selected,
+            }
+            for item in items
+        ],
+    }
+
+
+def validate_draft_collateral_bundle_snapshot(
+    row: DealerProspectEmailDraft,
+    assets: Iterable[DealerProspectEmailDraftAsset],
+) -> None:
+    snapshot = dict(getattr(row, "collateral_bundle_snapshot", None) or {})
+    draft_assets = list(assets)
+    raw_bundle_id = snapshot.get("bundle_id")
+    if not raw_bundle_id:
+        if getattr(row, "collateral_bundle_id", None) is not None:
+            raise OutreachBlocked(
+                "collateral_bundle_snapshot_changed",
+                "The collateral publication identity is incomplete; nothing was sent.",
+            )
+        legacy_ids = [str(value) for value in snapshot.get("selected_asset_ids", [])]
+        if legacy_ids and legacy_ids != [str(asset.asset_id) for asset in draft_assets]:
+            raise OutreachBlocked(
+                "collateral_bundle_snapshot_changed",
+                "The legacy collateral selection no longer matches its immutable draft snapshot.",
+            )
+        return
+    try:
+        snapshot_bundle_id = uuid.UUID(str(raw_bundle_id))
+    except ValueError as exc:
+        raise OutreachBlocked(
+            "collateral_bundle_snapshot_changed",
+            "The collateral publication identity is invalid; nothing was sent.",
+        ) from exc
+    if (
+        snapshot_bundle_id != getattr(row, "collateral_bundle_id", None)
+        or int(snapshot.get("version") or 0)
+        != int(getattr(row, "collateral_bundle_version", None) or 0)
+        or normalize_lead_type(snapshot.get("lead_type"))
+        != normalize_lead_type(getattr(row, "lead_type", None) or "dealer")
+        or canonical_purpose(snapshot.get("purpose"))
+        != canonical_purpose(getattr(row, "purpose", None))
+    ):
+        raise OutreachBlocked(
+            "collateral_bundle_snapshot_changed",
+            "The collateral publication snapshot no longer matches this draft; nothing was sent.",
+        )
+    selected_items = sorted(
+        [item for item in snapshot.get("items", []) if item.get("selected")],
+        key=lambda item: (int(item.get("sort_order") or 0), str(item.get("asset_id") or "")),
+    )
+    draft_identity = [
+        (
+            str(asset.asset_id),
+            int(asset.asset_version),
+            asset.file_name,
+            int(asset.size_bytes),
+            asset.sha256,
+        )
+        for asset in draft_assets
+    ]
+    bundle_identity = [
+        (
+            str(item.get("asset_id")),
+            int(item.get("asset_version") or 0),
+            str(item.get("file_name") or ""),
+            int(item.get("size_bytes") or 0),
+            str(item.get("sha256") or ""),
+        )
+        for item in selected_items
+    ]
+    if draft_identity != bundle_identity:
+        raise OutreachBlocked(
+            "collateral_bundle_snapshot_changed",
+            "The selected bundle items no longer match the exact attachment snapshots.",
+        )
+
+
+def _validate_bundle_asset(asset: MarketingCollateralAsset, *, lead_type: str) -> None:
+    if (
+        asset.assignment != COLLATERAL_ASSIGNMENT
+        or normalize_lead_type(getattr(asset, "lead_type", None) or "dealer")
+        != normalize_lead_type(lead_type)
+        or asset.status != "active"
+        or asset.validation_status != "passed_antivirus"
+        or asset.content_type != "application/pdf"
+    ):
+        raise OutreachBlocked(
+            "collateral_bundle_asset_unavailable",
+            "Every bundle item must be an active, antivirus-approved PDF for the same business type.",
+        )
+    raw = bytes(asset.document_bytes)
+    if len(raw) != int(asset.size_bytes) or hashlib.sha256(raw).hexdigest() != asset.sha256:
+        raise OutreachBlocked(
+            "collateral_bundle_asset_corrupt",
+            "A bundle asset failed its byte length or SHA-256 integrity check.",
+        )
+
+
+async def _bundle_assets_by_id(
+    db: AsyncSession,
+    asset_ids: Iterable[uuid.UUID],
+    *,
+    lead_type: str,
+) -> dict[uuid.UUID, MarketingCollateralAsset]:
+    requested = list(asset_ids)
+    if not requested:
+        return {}
+    rows = list(
+        (
+            await db.execute(
+                select(MarketingCollateralAsset)
+                .where(MarketingCollateralAsset.id.in_(requested))
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(rows) != len(requested):
+        raise OutreachBlocked(
+            "collateral_bundle_asset_unavailable",
+            "One or more bundle assets no longer exist.",
+        )
+    for asset in rows:
+        _validate_bundle_asset(asset, lead_type=lead_type)
+    return {asset.id: asset for asset in rows}
+
+
+def _collateral_bundle_advisory_key(lead_type: str, purpose: str) -> int:
+    return int.from_bytes(
+        hashlib.sha256(
+            f"collateral-bundle:{normalize_lead_type(lead_type)}:{canonical_purpose(purpose)}".encode()
+        ).digest()[:8],
+        byteorder="big",
+        signed=True,
+    )
+
+
+async def create_collateral_bundle(
+    db: AsyncSession,
+    *,
+    actor_user_id: uuid.UUID,
+    payload: MarketingCollateralBundleCreate,
+) -> MarketingCollateralBundle:
+    lead_type = normalize_lead_type(payload.lead_type)
+    purpose = canonical_purpose(payload.purpose)
+    if isinstance(db, AsyncSession):
+        await db.execute(
+            select(func.pg_advisory_xact_lock(_collateral_bundle_advisory_key(lead_type, purpose)))
+        )
+    next_version = int(
+        (
+            await db.execute(
+                select(func.coalesce(func.max(MarketingCollateralBundle.version), 0)).where(
+                    MarketingCollateralBundle.lead_type == lead_type,
+                    MarketingCollateralBundle.purpose == purpose,
+                )
+            )
+        ).scalar_one()
+        or 0
+    ) + 1
+    assets = await _bundle_assets_by_id(
+        db,
+        [item.asset_id for item in payload.items],
+        lead_type=lead_type,
+    )
+    row = MarketingCollateralBundle(
+        lead_type=lead_type,
+        purpose=purpose,
+        name=_clean_label(payload.name, f"{lead_type} {purpose}"),
+        version=next_version,
+        revision=1,
+        status="draft",
+        created_by_user_id=actor_user_id,
+    )
+    db.add(row)
+    await db.flush()
+    for index, item in enumerate(payload.items):
+        asset = assets[item.asset_id]
+        db.add(
+            MarketingCollateralBundleItem(
+                bundle_id=row.id,
+                asset_id=asset.id,
+                inclusion_mode=item.inclusion_mode,
+                sort_order=index * 10,
+                asset_name=asset.name,
+                asset_version=asset.version,
+                file_name=asset.file_name,
+                size_bytes=asset.size_bytes,
+                sha256=asset.sha256,
+            )
+        )
+    await db.flush()
+    return row
+
+
+async def load_collateral_bundle(
+    db: AsyncSession,
+    bundle_id: uuid.UUID,
+    *,
+    lock: bool = False,
+) -> MarketingCollateralBundle:
+    statement = select(MarketingCollateralBundle).where(
+        MarketingCollateralBundle.id == bundle_id
+    )
+    if lock:
+        statement = statement.with_for_update()
+    row = (await db.execute(statement)).scalar_one_or_none()
+    if row is None:
+        raise OutreachNotFound("Collateral bundle not found.")
+    return row
+
+
+async def collateral_bundle_items(
+    db: AsyncSession,
+    bundle_id: uuid.UUID,
+    *,
+    lock: bool = False,
+) -> list[MarketingCollateralBundleItem]:
+    statement = (
+        select(MarketingCollateralBundleItem)
+        .where(MarketingCollateralBundleItem.bundle_id == bundle_id)
+        .order_by(
+            MarketingCollateralBundleItem.sort_order,
+            MarketingCollateralBundleItem.id,
+        )
+    )
+    if lock:
+        statement = statement.with_for_update()
+    return list((await db.execute(statement)).scalars().all())
+
+
+async def update_collateral_bundle(
+    db: AsyncSession,
+    row: MarketingCollateralBundle,
+    *,
+    actor_user_id: uuid.UUID,
+    payload: MarketingCollateralBundlePatch,
+) -> MarketingCollateralBundle:
+    if row.status != "draft":
+        raise OutreachConflict("Published collateral bundles are immutable; create a new version.")
+    if row.revision != payload.expected_revision:
+        raise OutreachConflict("Collateral bundle changed in another session. Refresh before saving.")
+    if payload.name is not None:
+        row.name = _clean_label(payload.name, row.name)
+    if payload.items is not None:
+        assets = await _bundle_assets_by_id(
+            db,
+            [item.asset_id for item in payload.items],
+            lead_type=row.lead_type,
+        )
+        await db.execute(
+            delete(MarketingCollateralBundleItem).where(
+                MarketingCollateralBundleItem.bundle_id == row.id
+            )
+        )
+        for index, item in enumerate(payload.items):
+            asset = assets[item.asset_id]
+            db.add(
+                MarketingCollateralBundleItem(
+                    bundle_id=row.id,
+                    asset_id=asset.id,
+                    inclusion_mode=item.inclusion_mode,
+                    sort_order=index * 10,
+                    asset_name=asset.name,
+                    asset_version=asset.version,
+                    file_name=asset.file_name,
+                    size_bytes=asset.size_bytes,
+                    sha256=asset.sha256,
+                )
+            )
+    row.revision += 1
+    await db.flush()
+    return row
+
+
+async def publish_collateral_bundle(
+    db: AsyncSession,
+    row: MarketingCollateralBundle,
+    *,
+    actor_user_id: uuid.UUID,
+    expected_revision: int,
+) -> MarketingCollateralBundle:
+    if isinstance(db, AsyncSession):
+        await db.execute(
+            select(
+                func.pg_advisory_xact_lock(
+                    _collateral_bundle_advisory_key(row.lead_type, row.purpose)
+                )
+            )
+        )
+    if row.status == "published":
+        if row.revision == expected_revision or row.revision == expected_revision + 1:
+            return row
+        raise OutreachConflict("Collateral bundle changed in another session.")
+    if row.status != "draft":
+        raise OutreachConflict("Only a draft collateral bundle can be published.")
+    if row.revision != expected_revision:
+        raise OutreachConflict("Collateral bundle changed in another session. Refresh before publishing.")
+    items = await collateral_bundle_items(db, row.id, lock=True)
+    assets = await _bundle_assets_by_id(
+        db,
+        [item.asset_id for item in items],
+        lead_type=row.lead_type,
+    )
+    for item in items:
+        asset = assets[item.asset_id]
+        if (
+            item.asset_version != asset.version
+            or item.sha256 != asset.sha256
+            or item.size_bytes != asset.size_bytes
+            or item.file_name != asset.file_name
+        ):
+            raise OutreachBlocked(
+                "collateral_bundle_snapshot_changed",
+                "A bundle item's version or byte identity changed before publication.",
+            )
+    previous = list(
+        (
+            await db.execute(
+                select(MarketingCollateralBundle)
+                .where(
+                    MarketingCollateralBundle.lead_type == row.lead_type,
+                    MarketingCollateralBundle.purpose == row.purpose,
+                    MarketingCollateralBundle.status == "published",
+                    MarketingCollateralBundle.id != row.id,
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    now = utcnow()
+    if any(int(old.version) >= int(row.version) for old in previous):
+        raise OutreachConflict(
+            "A newer collateral bundle version is already published. Refresh and create a new version."
+        )
+    for old in previous:
+        old.status = "retired"
+        old.retired_at = now
+        old.retired_by_user_id = actor_user_id
+        old.revision += 1
+    if previous:
+        # Retire first so the partial unique index can never observe two
+        # published versions, while both changes remain in this transaction.
+        await db.flush()
+    row.status = "published"
+    row.published_at = now
+    row.published_by_user_id = actor_user_id
+    row.retired_at = None
+    row.retired_by_user_id = None
+    row.revision += 1
+    await db.flush()
+    return row
+
+
+async def retire_collateral_bundle(
+    db: AsyncSession,
+    row: MarketingCollateralBundle,
+    *,
+    actor_user_id: uuid.UUID,
+    expected_revision: int,
+) -> MarketingCollateralBundle:
+    if row.status == "retired":
+        return row
+    if row.revision != expected_revision:
+        raise OutreachConflict("Collateral bundle changed in another session. Refresh before retiring.")
+    row.status = "retired"
+    row.retired_at = utcnow()
+    row.retired_by_user_id = actor_user_id
+    row.revision += 1
+    await db.flush()
+    return row
+
+
+async def backfill_legacy_dealer_bundles(
+    db: AsyncSession,
+    *,
+    actor_user_id: uuid.UUID,
+) -> list[MarketingCollateralBundle]:
+    """Publish missing v1-compatible Dealer bundles from the legacy library.
+
+    This is intentionally idempotent and is suitable for the migration/data
+    backfill as well as an administrator repair action during rollout.
+    """
+    published: list[MarketingCollateralBundle] = []
+    for purpose in ALL_CANONICAL_PURPOSES:
+        current = (
+            await db.execute(
+                select(MarketingCollateralBundle).where(
+                    MarketingCollateralBundle.lead_type == "dealer",
+                    MarketingCollateralBundle.purpose == purpose,
+                    MarketingCollateralBundle.status == "published",
+                )
+            )
+        ).scalar_one_or_none()
+        if current is not None:
+            published.append(current)
+            continue
+        assets = await _active_collateral(
+            db,
+            lead_type="dealer",
+            purpose=purpose,
+            default_only=False,
+        )
+        bundle = await create_collateral_bundle(
+            db,
+            actor_user_id=actor_user_id,
+            payload=MarketingCollateralBundleCreate.model_validate(
+                {
+                    "lead_type": "dealer",
+                    "purpose": purpose,
+                    "name": f"Dealer {purpose.replace('_', ' ').title()}",
+                    "items": [
+                        {
+                            "asset_id": asset.id,
+                            "inclusion_mode": (
+                                "default"
+                                if getattr(asset, "included_by_default", True)
+                                else "optional"
+                            ),
+                        }
+                        for asset in assets
+                    ],
+                }
+            ),
+        )
+        published.append(
+            await publish_collateral_bundle(
+                db,
+                bundle,
+                actor_user_id=actor_user_id,
+                expected_revision=bundle.revision,
+            )
+        )
+    return published
+
+
+def _asset_matches_outreach(
+    row: MarketingCollateralAsset,
+    *,
+    lead_type: str,
+    purpose: str,
+    default_only: bool = False,
+) -> bool:
+    row_lead_type = normalize_lead_type(getattr(row, "lead_type", None) or "dealer")
+    raw_purposes = getattr(row, "purposes", None)
+    purposes = (
+        {canonical_purpose(value) for value in raw_purposes}
+        if isinstance(raw_purposes, list) and raw_purposes
+        else set(ALL_CANONICAL_PURPOSES)
+    )
+    return (
+        row_lead_type == normalize_lead_type(lead_type)
+        and canonical_purpose(purpose) in purposes
+        and (not default_only or bool(getattr(row, "included_by_default", True)))
+    )
+
+
+async def _active_collateral(
+    db: AsyncSession,
+    *,
+    lead_type: str = "dealer",
+    purpose: str = DEFAULT_PURPOSE,
+    default_only: bool = False,
+) -> list[MarketingCollateralAsset]:
+    canonical_lead_type = normalize_lead_type(lead_type)
+    rows = list(
         (
             await db.execute(
                 select(MarketingCollateralAsset)
                 .where(
                     MarketingCollateralAsset.assignment == COLLATERAL_ASSIGNMENT,
+                    MarketingCollateralAsset.lead_type == canonical_lead_type,
                     MarketingCollateralAsset.status == "active",
                     MarketingCollateralAsset.validation_status == "passed_antivirus",
                     MarketingCollateralAsset.content_type == "application/pdf",
@@ -1685,6 +2718,160 @@ async def _active_collateral(db: AsyncSession) -> list[MarketingCollateralAsset]
         .scalars()
         .all()
     )
+    return [
+        row
+        for row in rows
+        if _asset_matches_outreach(
+            row,
+            lead_type=canonical_lead_type,
+            purpose=purpose,
+            default_only=default_only,
+        )
+    ]
+
+
+async def _published_bundle_selection(
+    db: AsyncSession,
+    *,
+    lead_type: str,
+    purpose: str,
+    include_all_active: bool,
+    asset_ids: list[uuid.UUID],
+    select_all: bool = False,
+    expected_bundle_id: uuid.UUID | None = None,
+    expected_bundle_version: int | None = None,
+    lock: bool = True,
+) -> ResolvedCollateralSelection | None:
+    canonical_lead_type = normalize_lead_type(lead_type)
+    bundle_statement = select(MarketingCollateralBundle).where(
+        MarketingCollateralBundle.lead_type == canonical_lead_type,
+        MarketingCollateralBundle.purpose == canonical_purpose(purpose),
+        MarketingCollateralBundle.status == "published",
+    )
+    if lock:
+        bundle_statement = bundle_statement.with_for_update()
+    bundle = (await db.execute(bundle_statement)).scalar_one_or_none()
+    if bundle is None:
+        return None
+    if expected_bundle_id is None and canonical_lead_type != "dealer" and not select_all:
+        raise OutreachBlocked(
+            "collateral_bundle_pin_required",
+            "Refresh the attachment list before drafting so the reviewed collateral bundle version can be pinned.",
+        )
+    if (
+        expected_bundle_id is not None
+        and (
+            bundle.id != expected_bundle_id
+            or int(bundle.version) != int(expected_bundle_version or 0)
+        )
+    ):
+        raise OutreachBlocked(
+            "collateral_bundle_changed",
+            "The published collateral bundle changed after the composer loaded. Refresh the attachment list before drafting.",
+        )
+    item_statement = (
+        select(MarketingCollateralBundleItem, MarketingCollateralAsset)
+        .join(
+            MarketingCollateralAsset,
+            MarketingCollateralAsset.id == MarketingCollateralBundleItem.asset_id,
+        )
+        .where(MarketingCollateralBundleItem.bundle_id == bundle.id)
+        .order_by(
+            MarketingCollateralBundleItem.sort_order,
+            MarketingCollateralBundleItem.id,
+        )
+    )
+    if lock:
+        item_statement = item_statement.with_for_update()
+    pairs = list((await db.execute(item_statement)).all())
+    by_asset: dict[uuid.UUID, tuple[MarketingCollateralBundleItem, MarketingCollateralAsset]] = {}
+    for item, asset in pairs:
+        _validate_bundle_asset(asset, lead_type=lead_type)
+        if (
+            item.asset_version != asset.version
+            or item.sha256 != asset.sha256
+            or item.size_bytes != asset.size_bytes
+            or item.file_name != asset.file_name
+        ):
+            raise OutreachBlocked(
+                "collateral_bundle_snapshot_changed",
+                "A published collateral bundle no longer matches its approved asset identity.",
+            )
+        by_asset[asset.id] = (item, asset)
+    if select_all:
+        selected_pairs = pairs
+    elif include_all_active:
+        selected_pairs = [pair for pair in pairs if pair[0].inclusion_mode == "default"]
+    else:
+        if any(asset_id not in by_asset for asset_id in asset_ids):
+            raise OutreachBlocked(
+                "collateral_selection_unavailable",
+                "One or more selected PDFs are not in the published bundle for this business type and email purpose.",
+            )
+        selected_pairs = [by_asset[asset_id] for asset_id in asset_ids]
+        selected_pairs.sort(key=lambda pair: (pair[0].sort_order, str(pair[0].id)))
+    selected_assets = [asset for _, asset in selected_pairs]
+    all_items = [item for item, _ in pairs]
+    return ResolvedCollateralSelection(
+        selected_assets,
+        bundle_snapshot=collateral_bundle_snapshot(
+            bundle,
+            all_items,
+            selected_asset_ids=[asset.id for asset in selected_assets],
+        ),
+    )
+
+
+async def collateral_options(
+    db: AsyncSession,
+    *,
+    lead_type: str,
+    purpose: str,
+) -> ResolvedCollateralSelection:
+    canonical_lead_type = normalize_lead_type(lead_type)
+    if isinstance(db, AsyncSession):
+        published = await _published_bundle_selection(
+            db,
+            lead_type=canonical_lead_type,
+            purpose=purpose,
+            include_all_active=False,
+            asset_ids=[],
+            select_all=True,
+            lock=False,
+        )
+        if published is not None:
+            return published
+        if canonical_lead_type != "dealer":
+            raise OutreachBlocked(
+                "collateral_bundle_not_published",
+                "Publish a collateral bundle for this business type and email purpose before selecting collateral.",
+            )
+    rows = await _active_collateral(
+        db,
+        lead_type="dealer",
+        purpose=purpose,
+        default_only=False,
+    )
+    return ResolvedCollateralSelection(
+        rows,
+        bundle_snapshot={
+            "source": "legacy_dealer_library",
+            "lead_type": "dealer",
+            "purpose": canonical_purpose(purpose),
+            "version": 0,
+            "items": [
+                {
+                    "asset_id": str(row.id),
+                    "inclusion_mode": (
+                        "default" if getattr(row, "included_by_default", True) else "optional"
+                    ),
+                    "sort_order": int(row.sort_order),
+                    "selected": bool(getattr(row, "included_by_default", True)),
+                }
+                for row in rows
+            ],
+        },
+    )
 
 
 async def resolve_collateral_selection(
@@ -1692,6 +2879,10 @@ async def resolve_collateral_selection(
     *,
     include_all_active: bool,
     asset_ids: Iterable[uuid.UUID],
+    lead_type: str = "dealer",
+    purpose: str = DEFAULT_PURPOSE,
+    expected_bundle_id: uuid.UUID | None = None,
+    expected_bundle_version: int | None = None,
 ) -> list[MarketingCollateralAsset]:
     """Resolve an all/selected/none request without silently dropping files.
 
@@ -1701,21 +2892,64 @@ async def resolve_collateral_selection(
     test delivery can be created.
     """
     requested = list(asset_ids)
-    if include_all_active:
-        if requested:
-            raise OutreachBlocked(
-                "ambiguous_collateral_selection",
-                "Choose every active PDF or selected PDFs, not both.",
-            )
-        return await _active_collateral(db)
-    if not requested:
-        return []
+    if include_all_active and requested:
+        raise OutreachBlocked(
+            "ambiguous_collateral_selection",
+            "Choose every default PDF or selected PDFs, not both.",
+        )
     if len(set(requested)) != len(requested):
         raise OutreachBlocked(
             "duplicate_collateral_selection",
             "The selected PDF list contains a duplicate.",
         )
-
+    canonical_lead_type = normalize_lead_type(lead_type)
+    if isinstance(db, AsyncSession):
+        published = await _published_bundle_selection(
+            db,
+            lead_type=canonical_lead_type,
+            purpose=purpose,
+            include_all_active=include_all_active,
+            asset_ids=requested,
+            expected_bundle_id=expected_bundle_id,
+            expected_bundle_version=expected_bundle_version,
+        )
+        if published is not None:
+            return published
+        if expected_bundle_id is not None:
+            raise OutreachBlocked(
+                "collateral_bundle_changed",
+                "The selected collateral bundle is no longer published. Refresh the attachment list before drafting.",
+            )
+        if canonical_lead_type != "dealer":
+            raise OutreachBlocked(
+                "collateral_bundle_not_published",
+                "Publish a collateral bundle for this business type and email purpose before drafting outreach.",
+            )
+    if include_all_active:
+        legacy = await _active_collateral(
+            db, lead_type="dealer", purpose=purpose, default_only=True
+        )
+        return ResolvedCollateralSelection(
+            legacy,
+            bundle_snapshot={
+                "source": "legacy_dealer_library",
+                "lead_type": "dealer",
+                "purpose": canonical_purpose(purpose),
+                "version": 0,
+                "selected_asset_ids": [str(asset.id) for asset in legacy],
+            },
+        )
+    if not requested:
+        return ResolvedCollateralSelection(
+            [],
+            bundle_snapshot={
+                "source": "legacy_dealer_library",
+                "lead_type": "dealer",
+                "purpose": canonical_purpose(purpose),
+                "version": 0,
+                "selected_asset_ids": [],
+            },
+        )
     rows = list(
         (
             await db.execute(
@@ -1731,6 +2965,11 @@ async def resolve_collateral_selection(
         row.id: row
         for row in rows
         if row.assignment == COLLATERAL_ASSIGNMENT
+        and _asset_matches_outreach(
+            row,
+            lead_type=lead_type,
+            purpose=purpose,
+        )
         and row.status == "active"
         and row.validation_status == "passed_antivirus"
         and row.content_type == "application/pdf"
@@ -1741,9 +2980,19 @@ async def resolve_collateral_selection(
             "One or more selected PDFs are no longer active and approved. Refresh the collateral list and choose again.",
         )
     # Preserve library order rather than trusting client-controlled ordering.
-    return sorted(
+    selected = sorted(
         eligible.values(),
         key=lambda row: (row.sort_order, row.logical_key, row.version, str(row.id)),
+    )
+    return ResolvedCollateralSelection(
+        selected,
+        bundle_snapshot={
+            "source": "legacy_dealer_library",
+            "lead_type": "dealer",
+            "purpose": canonical_purpose(purpose),
+            "version": 0,
+            "selected_asset_ids": [str(asset.id) for asset in selected],
+        },
     )
 
 
@@ -1806,6 +3055,8 @@ async def create_draft(
         if locked_prospect is None:
             raise OutreachNotFound("Prospect not found.")
         prospect = locked_prospect
+    lead_type = prospect_lead_type(prospect)
+    funding_intent = prospect_funding_intent(prospect)
     requested_cc = (
         list(payload.cc_emails)
         if payload.cc_emails is not None
@@ -1841,6 +3092,9 @@ async def create_draft(
             raise OutreachConflict("Idempotency key was already used with a different request.")
         return existing
 
+    profile = await load_outreach_profile(db, lead_type)
+    profile_snapshot = outreach_profile_snapshot(profile)
+    profile_hash = outreach_profile_snapshot_hash(profile_snapshot)
     identity = identity or await prospect_identity(db, prospect)
     recipient = identity.email
     if prospect.do_not_contact:
@@ -1872,7 +3126,11 @@ async def create_draft(
                 "Enable a booking page for the sender or prospect owner before drafting this email.",
             )
 
-    catalog = await _active_catalog_snapshot(db)
+    catalog = await _active_catalog_snapshot(
+        db,
+        lead_type=lead_type,
+        funding_intent=funding_intent,
+    )
     if payload.compose_mode == "manual":
         # Schema validation guarantees both values are present. Manual copy is
         # never submitted to a model and never starts an automatic countdown.
@@ -1894,14 +3152,19 @@ async def create_draft(
             catalog_snapshot=catalog,
             actor_user_id=actor.id,
             safe_context=safe_context,
+            profile=profile_snapshot,
         )
         body_with_context = _insert_verified_conversation_context(
             composed.body,
             payload.verified_conversation_context,
         )
         editable_body = (
-            _with_approved_program_section(body_with_context, catalog)
-            if payload.purpose == "dealer_information"
+            _with_approved_program_section(
+                body_with_context,
+                catalog,
+                profile=profile_snapshot,
+            )
+            if canonical_purpose(payload.purpose) == "information"
             else body_with_context
         )
     await validate_current_draft_copy(
@@ -1915,6 +3178,16 @@ async def create_draft(
         db,
         include_all_active=payload.include_collateral,
         asset_ids=payload.collateral_asset_ids,
+        lead_type=lead_type,
+        purpose=payload.purpose,
+        expected_bundle_id=payload.collateral_bundle_id,
+        expected_bundle_version=payload.collateral_bundle_version,
+    )
+    bundle_snapshot = dict(getattr(assets, "bundle_snapshot", None) or {})
+    bundle_id = (
+        uuid.UUID(str(bundle_snapshot["bundle_id"]))
+        if bundle_snapshot.get("bundle_id")
+        else None
     )
     attachment_names = [asset.file_name for asset in assets]
     total_bytes = sum(int(asset.size_bytes) for asset in assets)
@@ -1938,6 +3211,7 @@ async def create_draft(
         attachment_names=attachment_names,
         unsubscribe_url=unsubscribe_url,
         booking_url=booking_url,
+        profile=profile_snapshot,
     )
     rendered_body = _render_body(editable_body, locked_footer)
     oversized = attachment_bundle_too_large(total_bytes)
@@ -1961,6 +3235,19 @@ async def create_draft(
         ai_instructions=payload.ai_instructions,
         compose_mode=payload.compose_mode,
         purpose=payload.purpose,
+        lead_type=lead_type,
+        funding_intent=funding_intent,
+        outreach_profile_key=lead_type,
+        outreach_profile_version=profile_snapshot["version"],
+        outreach_profile_hash=profile_hash,
+        outreach_profile_snapshot=profile_snapshot,
+        collateral_bundle_id=bundle_id,
+        collateral_bundle_version=(
+            int(bundle_snapshot["version"])
+            if bundle_id is not None and bundle_snapshot.get("version") is not None
+            else None
+        ),
+        collateral_bundle_snapshot=bundle_snapshot,
         draft_source=composed.source,
         model_id=composed.model_id,
         catalog_version=catalog_version(catalog),
@@ -2050,6 +3337,13 @@ async def create_draft(
                 "draft_id": str(draft.id),
                 "source": draft.draft_source,
                 "compose_mode": draft.compose_mode,
+                "lead_type": lead_type,
+                "funding_intent": funding_intent,
+                "outreach_profile_key": lead_type,
+                "outreach_profile_version": profile_snapshot["version"],
+                "outreach_profile_hash": profile_hash,
+                "collateral_bundle_id": str(bundle_id) if bundle_id else None,
+                "collateral_bundle_version": bundle_snapshot.get("version"),
                 "generation_reason": composed.generation_reason,
                 "instruction_disposition": composed.instruction_disposition,
                 "send_after": draft.auto_send_at.isoformat() if draft.auto_send_at else None,
@@ -2296,30 +3590,39 @@ async def send_test_email(
             f"Up to {TEST_EMAIL_HOURLY_LIMIT} dealer outreach tests may be sent per hour.",
         )
 
+    lead_type = normalize_lead_type(payload.lead_type)
+    profile = await load_outreach_profile(db, lead_type)
+    profile_snapshot = outreach_profile_snapshot(profile)
+    profile_hash = outreach_profile_snapshot_hash(profile_snapshot)
     identity = ProspectIdentity(
         contact_id=uuid.uuid4(),
         contact_name=payload.sample_contact_name,
-        dealer_name=payload.sample_dealer_name,
+        dealer_name=payload.sample_business_name or payload.sample_dealer_name,
         email=recipient,
         owner_user_id=actor.id,
     )
-    catalog = await _active_catalog_snapshot(db)
+    catalog = await _active_catalog_snapshot(db, lead_type=lead_type)
     composed = await _compose_with_nova(
         db,
-        prospect=SimpleNamespace(id=uuid.uuid4()),
+        prospect=SimpleNamespace(id=uuid.uuid4(), lead_type=lead_type),
         identity=identity,
         purpose=payload.purpose,
         ai_instructions=payload.ai_instructions,
         catalog_snapshot=catalog,
         actor_user_id=actor.id,
+        profile=profile_snapshot,
     )
     body_with_context = _insert_verified_conversation_context(
         composed.body,
         payload.verified_conversation_context,
     )
     editable_body = (
-        _with_approved_program_section(body_with_context, catalog)
-        if payload.purpose == "dealer_information"
+        _with_approved_program_section(
+            body_with_context,
+            catalog,
+            profile=profile_snapshot,
+        )
+        if canonical_purpose(payload.purpose) == "information"
         else body_with_context
     )
     await validate_current_draft_copy(
@@ -2333,7 +3636,12 @@ async def send_test_email(
         db,
         include_all_active=payload.include_collateral,
         asset_ids=payload.collateral_asset_ids,
+        lead_type=lead_type,
+        purpose=payload.purpose,
+        expected_bundle_id=payload.collateral_bundle_id,
+        expected_bundle_version=payload.collateral_bundle_version,
     )
+    test_bundle_snapshot = dict(getattr(assets, "bundle_snapshot", None) or {})
     total_bytes = sum(int(asset.size_bytes) for asset in assets)
     if attachment_bundle_too_large(total_bytes):
         raise OutreachBlocked(
@@ -2369,6 +3677,7 @@ async def send_test_email(
         unsubscribe_url=None,
         booking_url=booking_url,
         test_mode=True,
+        profile=profile_snapshot,
     )
     body_text = f"{_test_generation_banner(composed)}\n\n{_render_body(editable_body, footer)}"
     subject = f"[TEST] {composed.subject}"[:240]
@@ -2465,6 +3774,12 @@ async def send_test_email(
             payload={
                 "recipient": recipient,
                 "purpose": payload.purpose,
+                "lead_type": lead_type,
+                "outreach_profile_key": lead_type,
+                "outreach_profile_version": profile_snapshot["version"],
+                "outreach_profile_hash": profile_hash,
+                "collateral_bundle_id": test_bundle_snapshot.get("bundle_id"),
+                "collateral_bundle_version": test_bundle_snapshot.get("version"),
                 "draft_source": composed.source,
                 "generation_reason": composed.generation_reason,
                 "instruction_disposition": composed.instruction_disposition,
@@ -2493,6 +3808,12 @@ async def send_test_email(
         generation_reason=composed.generation_reason,
         instruction_disposition=composed.instruction_disposition,
         attachment_names=attachment_names,
+        collateral_bundle_id=(
+            uuid.UUID(str(test_bundle_snapshot["bundle_id"]))
+            if test_bundle_snapshot.get("bundle_id")
+            else None
+        ),
+        collateral_bundle_version=test_bundle_snapshot.get("version"),
         sender_display_name=branding.display_name,
         sender_title=branding.title,
         sender_phone=branding.phone,
@@ -2730,7 +4051,10 @@ async def select_secure_bundle(
     row.secure_bundle_selected_at = now
     row.secure_bundle_selected_by_user_id = actor_user_id
     row.locked_footer_text = _footer_with_secure_bundle(
-        row.locked_footer_text, bundle_url=bundle_url, expires_at=expires
+        row.locked_footer_text,
+        bundle_url=bundle_url,
+        expires_at=expires,
+        profile=getattr(row, "outreach_profile_snapshot", None) or None,
     )
     row.body_text = _render_body(row.editable_body, row.locked_footer_text)
     row.body_html = _plain_html(row.body_text)
@@ -2933,6 +4257,7 @@ async def dispatch_draft(
             ),
         )
     try:
+        validate_draft_profile_snapshot(row)
         await validate_current_draft_copy(
             db,
             subject=row.subject,
@@ -2956,6 +4281,21 @@ async def dispatch_draft(
     if prospect is None or prospect.archived_at is not None:
         return await _block_draft(
             db, row, code="prospect_unavailable", detail="Prospect is archived or unavailable."
+        )
+    draft_lead_type = normalize_lead_type(getattr(row, "lead_type", None) or "dealer")
+    if prospect_lead_type(prospect) != draft_lead_type:
+        return await _block_draft(
+            db,
+            row,
+            code="lead_type_changed",
+            detail="Prospect business type changed after this draft was created; nothing was sent.",
+        )
+    if prospect_funding_intent(prospect) != (getattr(row, "funding_intent", None) or None):
+        return await _block_draft(
+            db,
+            row,
+            code="funding_intent_changed",
+            detail="Prospect funding intent changed after this draft was created; nothing was sent.",
         )
     await _lock_suppression_addresses(
         db,
@@ -3031,6 +4371,10 @@ async def dispatch_draft(
         .scalars()
         .all()
     )
+    try:
+        validate_draft_collateral_bundle_snapshot(row, snapshots)
+    except OutreachBlocked as exc:
+        return await _block_draft(db, row, code=exc.code, detail=exc.detail)
     actual_total = sum(int(item.size_bytes) for item in snapshots)
     if actual_total != int(row.attachment_total_bytes) or len(snapshots) != int(
         row.attachment_count
@@ -3119,6 +4463,7 @@ async def dispatch_draft(
             detail="Dealer Prospect outreach was disabled before provider delivery.",
         )
     try:
+        validate_draft_profile_snapshot(current)
         await validate_current_draft_copy(
             db,
             subject=current.subject,
@@ -3150,6 +4495,24 @@ async def dispatch_draft(
                 if latest_prospect is not None and latest_prospect.do_not_contact_reason
                 else "Prospect is marked do not contact, archived, or unavailable."
             ),
+        )
+    if prospect_lead_type(latest_prospect) != normalize_lead_type(
+        getattr(current, "lead_type", None) or "dealer"
+    ):
+        return await _block_draft(
+            db,
+            current,
+            code="lead_type_changed",
+            detail="Prospect business type changed immediately before delivery; nothing was sent.",
+        )
+    if prospect_funding_intent(latest_prospect) != (
+        getattr(current, "funding_intent", None) or None
+    ):
+        return await _block_draft(
+            db,
+            current,
+            code="funding_intent_changed",
+            detail="Prospect funding intent changed immediately before delivery; nothing was sent.",
         )
     # Primary prospect locks precede address locks everywhere. The address
     # locks additionally serialize CC-only addresses and absent suppression
@@ -3224,6 +4587,10 @@ async def dispatch_draft(
         .scalars()
         .all()
     )
+    try:
+        validate_draft_collateral_bundle_snapshot(current, latest_snapshots)
+    except OutreachBlocked as exc:
+        return await _block_draft(db, current, code=exc.code, detail=exc.detail)
     latest_total = sum(int(item.size_bytes) for item in latest_snapshots)
     if (
         latest_total != int(current.attachment_total_bytes)
@@ -3354,10 +4721,10 @@ async def dispatch_draft(
 
 
 def _unsubscribe_url_from_footer(footer: str) -> str:
-    marker = "Unsubscribe from Dealer Desk email: "
     for line in (footer or "").splitlines():
-        if line.startswith(marker):
-            value = line[len(marker) :].strip()
+        match = re.match(r"^Unsubscribe from [^\r\n]{1,100} email:\s*(.+)$", line)
+        if match:
+            value = match.group(1).strip()
             if value.startswith("https://") or value.startswith("http://"):
                 return value
     raise OutreachBlocked("unsubscribe_link_missing", "Required unsubscribe link is missing.")
@@ -3470,6 +4837,10 @@ def _draft_read(
     ledger: MessageSend | None = None,
 ) -> ProspectEmailDraftRead:
     names = [asset.file_name for asset in assets]
+    profile_snapshot = (
+        getattr(row, "outreach_profile_snapshot", None)
+        or outreach_profile_snapshot(default_outreach_profile("dealer"))
+    )
     countdown: int | None = None
     if row.status == "pending_review" and row.auto_send_at is not None:
         countdown = max(0, int((row.auto_send_at - utcnow()).total_seconds()))
@@ -3502,6 +4873,26 @@ def _draft_read(
         editable_body=row.editable_body,
         locked_footer_text=row.locked_footer_text,
         compose_mode=(getattr(row, "compose_mode", None) or "ai"),
+        lead_type=normalize_lead_type(getattr(row, "lead_type", None) or "dealer"),
+        funding_intent=getattr(row, "funding_intent", None),
+        outreach_profile_key=normalize_lead_type(
+            getattr(row, "outreach_profile_key", None)
+            or getattr(row, "lead_type", None)
+            or "dealer"
+        ),
+        outreach_profile_version=int(
+            getattr(row, "outreach_profile_version", None) or 1
+        ),
+        outreach_profile_hash=(
+            getattr(row, "outreach_profile_hash", None)
+            or outreach_profile_snapshot_hash(profile_snapshot)
+        ),
+        outreach_profile_snapshot=profile_snapshot,
+        collateral_bundle_id=getattr(row, "collateral_bundle_id", None),
+        collateral_bundle_version=getattr(row, "collateral_bundle_version", None),
+        collateral_bundle_snapshot=(
+            getattr(row, "collateral_bundle_snapshot", None) or {}
+        ),
         status=row.status,
         send_after=row.auto_send_at,
         review_stopped_at=row.review_stopped_at,
@@ -3776,7 +5167,19 @@ async def upload_collateral(
     file_name: str,
     data: bytes,
     sort_order: int = 0,
+    lead_type: str = "dealer",
+    purposes: Iterable[str] = ("information",),
+    included_by_default: bool = True,
 ) -> MarketingCollateralAsset:
+    canonical_lead_type = normalize_lead_type(lead_type)
+    canonical_purposes = list(dict.fromkeys(canonical_purpose(value) for value in purposes))
+    if not canonical_purposes or any(
+        value not in ALL_CANONICAL_PURPOSES for value in canonical_purposes
+    ):
+        raise OutreachBlocked(
+            "invalid_collateral_purpose",
+            "Collateral requires at least one supported outreach purpose.",
+        )
     static_validation = validate_pdf(data)
     scan_detail = await scan_pdf_with_clamd(data)
     validation = PdfValidation(
@@ -3792,6 +5195,7 @@ async def upload_collateral(
                 await db.execute(
                     select(func.coalesce(func.max(MarketingCollateralAsset.version), 0)).where(
                         MarketingCollateralAsset.assignment == COLLATERAL_ASSIGNMENT,
+                        MarketingCollateralAsset.lead_type == canonical_lead_type,
                         MarketingCollateralAsset.logical_key == key,
                     )
                 )
@@ -3805,6 +5209,9 @@ async def upload_collateral(
         safe_file += ".pdf"
     row = MarketingCollateralAsset(
         assignment=COLLATERAL_ASSIGNMENT,
+        lead_type=canonical_lead_type,
+        purposes=canonical_purposes,
+        included_by_default=included_by_default,
         logical_key=key,
         name=_clean_label(name, safe_file),
         version=next_version,
@@ -3834,6 +5241,9 @@ async def upload_collateral(
             "sha256": row.sha256,
             "validation_status": row.validation_status,
             "sort_order": row.sort_order,
+            "lead_type": canonical_lead_type,
+            "purposes": canonical_purposes,
+            "included_by_default": included_by_default,
         },
     )
     await db.flush()
@@ -3860,6 +5270,8 @@ async def approve_collateral(
                 select(MarketingCollateralAsset)
                 .where(
                     MarketingCollateralAsset.assignment == row.assignment,
+                    MarketingCollateralAsset.lead_type
+                    == normalize_lead_type(getattr(row, "lead_type", None) or "dealer"),
                     MarketingCollateralAsset.logical_key == row.logical_key,
                     MarketingCollateralAsset.status == "active",
                     MarketingCollateralAsset.id != row.id,
@@ -3967,20 +5379,67 @@ async def update_collateral_order(
     return row
 
 
+async def update_collateral_curation(
+    db: AsyncSession,
+    row: MarketingCollateralAsset,
+    *,
+    actor_user_id: uuid.UUID,
+    purposes: Iterable[str] | None = None,
+    included_by_default: bool | None = None,
+) -> MarketingCollateralAsset:
+    before_purposes = list(getattr(row, "purposes", None) or ALL_CANONICAL_PURPOSES)
+    before_default = bool(getattr(row, "included_by_default", True))
+    if purposes is not None:
+        next_purposes = list(dict.fromkeys(canonical_purpose(value) for value in purposes))
+        if not next_purposes or any(
+            value not in ALL_CANONICAL_PURPOSES for value in next_purposes
+        ):
+            raise OutreachBlocked(
+                "invalid_collateral_purpose",
+                "Collateral requires at least one supported outreach purpose.",
+            )
+        row.purposes = next_purposes
+    if included_by_default is not None:
+        row.included_by_default = included_by_default
+    after_purposes = list(getattr(row, "purposes", None) or ALL_CANONICAL_PURPOSES)
+    after_default = bool(getattr(row, "included_by_default", True))
+    if before_purposes != after_purposes or before_default != after_default:
+        _record_collateral_event(
+            db,
+            row,
+            actor_user_id=actor_user_id,
+            event_type="curation_updated",
+            details={
+                "lead_type": normalize_lead_type(
+                    getattr(row, "lead_type", None) or "dealer"
+                ),
+                "purposes_before": before_purposes,
+                "purposes_after": after_purposes,
+                "included_by_default_before": before_default,
+                "included_by_default_after": after_default,
+            },
+        )
+    await db.flush()
+    return row
+
+
 async def reorder_collateral(
     db: AsyncSession,
     *,
     actor_user_id: uuid.UUID,
     expected_ids: list[uuid.UUID],
     ordered_ids: list[uuid.UUID],
+    lead_type: str = "dealer",
 ) -> list[MarketingCollateralAsset]:
-    """Atomically reorder the complete non-retired Dealer Outreach library."""
+    """Atomically reorder one audience's complete non-retired library."""
+    canonical_lead_type = normalize_lead_type(lead_type)
     rows = list(
         (
             await db.execute(
                 select(MarketingCollateralAsset)
                 .where(
                     MarketingCollateralAsset.assignment == COLLATERAL_ASSIGNMENT,
+                    MarketingCollateralAsset.lead_type == canonical_lead_type,
                     MarketingCollateralAsset.status != "retired",
                 )
                 .order_by(

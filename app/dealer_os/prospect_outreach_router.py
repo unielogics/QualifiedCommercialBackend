@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import re
 import zipfile
 from datetime import UTC, datetime
@@ -43,12 +44,20 @@ from app.models.prospect_outreach import (
     EmailSuppression,
     MarketingCollateralAsset,
     MarketingCollateralAssetEvent,
+    MarketingCollateralBundle,
 )
 from app.models.user import User
 from app.schemas.prospect_outreach import (
     EmailSuppressionCreate,
     EmailSuppressionRead,
+    LeadType,
     MarketingCollateralAction,
+    MarketingCollateralBundleAction,
+    MarketingCollateralBundleCreate,
+    MarketingCollateralBundleItemRead,
+    MarketingCollateralBundleList,
+    MarketingCollateralBundlePatch,
+    MarketingCollateralBundleRead,
     MarketingCollateralEventRead,
     MarketingCollateralHistory,
     MarketingCollateralList,
@@ -66,6 +75,9 @@ from app.schemas.prospect_outreach import (
     ProspectEmailOutboxList,
     ProspectOutreachPolicyPatch,
     ProspectOutreachPolicyRead,
+    ProspectOutreachProfileList,
+    ProspectOutreachProfilePatch,
+    ProspectOutreachProfileRead,
     ProspectReplyIngest,
     ProspectReplyIngestResult,
     ProspectReplyList,
@@ -90,6 +102,7 @@ def _require_outreach_enabled(request: Request) -> None:
     # ``require_config_admin``.
     path = request.url.path
     collateral_root = "/dealer-os/marketing-collateral"
+    collateral_bundle_root = "/dealer-os/marketing-collateral-bundles"
     outreach_config_root = "/dealer-os/prospect-outreach"
     historical_read = getattr(request, "method", "GET").upper() == "GET" and (
         "/prospect-email-drafts" in path
@@ -102,6 +115,8 @@ def _require_outreach_enabled(request: Request) -> None:
         or "/prospect-email-bundles/" in path
         or path.endswith(collateral_root)
         or f"{collateral_root}/" in path
+        or path.endswith(collateral_bundle_root)
+        or f"{collateral_bundle_root}/" in path
         or path.endswith(outreach_config_root)
         or f"{outreach_config_root}/" in path
     ):
@@ -170,6 +185,9 @@ def _collateral_read(row: MarketingCollateralAsset) -> MarketingCollateralRead:
     return MarketingCollateralRead(
         id=row.id,
         assignment=row.assignment,
+        lead_type=outreach.normalize_lead_type(getattr(row, "lead_type", None) or "dealer"),
+        purposes=list(getattr(row, "purposes", None) or outreach.ALL_CANONICAL_PURPOSES),
+        included_by_default=bool(getattr(row, "included_by_default", True)),
         logical_key=row.logical_key,
         name=row.name,
         version=row.version,
@@ -206,6 +224,17 @@ def _sender_preview(
         envelope_from_email=branding.envelope_from_email,
         reply_contact_email=branding.reply_contact_email,
         alternate_contact_email=alternate_contact_email,
+    )
+
+
+def _outreach_profile_read(row) -> ProspectOutreachProfileRead:
+    snapshot = outreach.outreach_profile_snapshot(row)
+    return ProspectOutreachProfileRead(
+        id=getattr(row, "id", None),
+        status=getattr(row, "status", "active"),
+        created_by_user_id=getattr(row, "created_by_user_id", None),
+        created_at=getattr(row, "created_at", None),
+        **snapshot,
     )
 
 
@@ -260,6 +289,43 @@ async def patch_prospect_outreach_policy(
 
 
 @router.get(
+    "/prospect-outreach/profiles",
+    response_model=ProspectOutreachProfileList,
+)
+async def get_prospect_outreach_profiles(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ProspectOutreachProfileList:
+    prospect_service.require_config_admin(user)
+    rows = await outreach.list_outreach_profiles(db)
+    return ProspectOutreachProfileList(items=[_outreach_profile_read(row) for row in rows])
+
+
+@router.patch(
+    "/prospect-outreach/profiles/{lead_type}",
+    response_model=ProspectOutreachProfileRead,
+)
+async def patch_prospect_outreach_profile(
+    lead_type: LeadType,
+    payload: ProspectOutreachProfilePatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ProspectOutreachProfileRead:
+    prospect_service.require_config_admin(user)
+    try:
+        row = await outreach.update_outreach_profile(
+            db,
+            lead_type=lead_type,
+            actor=user,
+            payload=payload,
+        )
+        return _outreach_profile_read(row)
+    except Exception as exc:  # noqa: BLE001
+        _raise_service(exc)
+        raise
+
+
+@router.get(
     "/prospect-outreach/sender-preview",
     response_model=ProspectSenderPreviewRead,
 )
@@ -290,14 +356,52 @@ async def get_prospect_outreach_sender_preview(
 async def list_prospect_outreach_collateral_options(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
+    lead_type: LeadType = "dealer",
+    purpose: str = "dealer_information",
 ) -> ProspectCollateralOptionList:
     """List only PDFs an outreach-enabled actor may attach right now."""
     _require_outreach_reader_or_config_admin(user)
-    rows = await outreach._active_collateral(db)
+    try:
+        rows = await outreach.collateral_options(
+            db,
+            lead_type=lead_type,
+            purpose=purpose,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _raise_service(exc)
+        raise
+    snapshot = dict(getattr(rows, "bundle_snapshot", None) or {})
+    item_by_asset = {
+        str(item.get("asset_id")): item
+        for item in snapshot.get("items", [])
+        if isinstance(item, dict) and item.get("asset_id")
+    }
     return ProspectCollateralOptionList(
+        bundle_id=snapshot.get("bundle_id"),
+        bundle_version=int(snapshot.get("version") or 0),
+        bundle_source=(
+            "legacy_dealer_library"
+            if snapshot.get("source") == "legacy_dealer_library"
+            else "published"
+        ),
+        lead_type=lead_type,
+        purpose=outreach.canonical_purpose(purpose),
         items=[
             ProspectCollateralOptionRead(
                 id=row.id,
+                lead_type=outreach.normalize_lead_type(
+                    getattr(row, "lead_type", None) or "dealer"
+                ),
+                purposes=list(
+                    getattr(row, "purposes", None) or outreach.ALL_CANONICAL_PURPOSES
+                ),
+                included_by_default=(
+                    item_by_asset.get(str(row.id), {}).get("inclusion_mode", "default")
+                    == "default"
+                ),
+                inclusion_mode=item_by_asset.get(str(row.id), {}).get(
+                    "inclusion_mode", "default"
+                ),
                 name=row.name,
                 file_name=row.file_name,
                 version=row.version,
@@ -832,6 +936,12 @@ async def download_prospect_email_bundle(
                 index += 1
             used.add(candidate.lower())
             archive.writestr(candidate, bytes(asset.document_bytes))
+    lead_type = outreach.normalize_lead_type(getattr(draft, "lead_type", None) or "dealer")
+    audience = (
+        "Dealer"
+        if lead_type == "dealer"
+        else outreach.DEFAULT_OUTREACH_PROFILE_SEEDS[lead_type]["display_name"]
+    )
     if draft.secure_bundle_downloaded_at is None:
         draft.secure_bundle_downloaded_at = datetime.now(UTC)
         db.add(
@@ -839,7 +949,11 @@ async def download_prospect_email_bundle(
                 prospect_id=draft.prospect_id,
                 actor_user_id=None,
                 kind="email.secure_bundle_downloaded",
-                body="Dealer downloaded the secure collateral bundle.",
+                body=(
+                    "Dealer downloaded the secure collateral bundle."
+                    if lead_type == "dealer"
+                    else f"{audience} prospect downloaded the secure collateral bundle."
+                ),
                 metadata_json={"draft_id": str(draft.id)},
             )
         )
@@ -847,7 +961,10 @@ async def download_prospect_email_bundle(
         content=output.getvalue(),
         media_type="application/zip",
         headers={
-            "Content-Disposition": f'attachment; filename="dealer-information-{draft.prospect_id}.zip"',
+            "Content-Disposition": (
+                f'attachment; filename="{lead_type.replace("_", "-")}-information-'
+                f'{draft.prospect_id}.zip"'
+            ),
             "Cache-Control": "private, no-store",
             "X-Content-Type-Options": "nosniff",
         },
@@ -860,12 +977,14 @@ async def list_marketing_collateral(
     db: AsyncSession = Depends(get_db),
     include_retired: bool = False,
     scope: str = Query(default="dealer_outreach", max_length=48),
+    lead_type: LeadType = "dealer",
 ) -> MarketingCollateralList:
     prospect_service.require_config_admin(user)
-    if scope != outreach.COLLATERAL_ASSIGNMENT:
+    if scope not in {outreach.COLLATERAL_ASSIGNMENT, "prospect_outreach"}:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unsupported collateral scope.")
     stmt = select(MarketingCollateralAsset).where(
-        MarketingCollateralAsset.assignment == outreach.COLLATERAL_ASSIGNMENT
+        MarketingCollateralAsset.assignment == outreach.COLLATERAL_ASSIGNMENT,
+        MarketingCollateralAsset.lead_type == lead_type,
     )
     if not include_retired:
         stmt = stmt.where(MarketingCollateralAsset.status != "retired")
@@ -886,11 +1005,185 @@ async def list_marketing_collateral(
     return MarketingCollateralList(items=[_collateral_read(row) for row in rows])
 
 
+async def _collateral_bundle_read(
+    db: AsyncSession,
+    row: MarketingCollateralBundle,
+) -> MarketingCollateralBundleRead:
+    items = await outreach.collateral_bundle_items(db, row.id)
+    return MarketingCollateralBundleRead(
+        id=row.id,
+        lead_type=outreach.normalize_lead_type(row.lead_type),
+        purpose=outreach.canonical_purpose(row.purpose),
+        name=row.name,
+        version=row.version,
+        revision=row.revision,
+        status=row.status,
+        items=[
+            MarketingCollateralBundleItemRead(
+                id=item.id,
+                asset_id=item.asset_id,
+                inclusion_mode=item.inclusion_mode,
+                sort_order=item.sort_order,
+                asset_name=item.asset_name,
+                asset_version=item.asset_version,
+                file_name=item.file_name,
+                size_bytes=item.size_bytes,
+                sha256=item.sha256,
+            )
+            for item in items
+        ],
+        created_by_user_id=row.created_by_user_id,
+        published_by_user_id=row.published_by_user_id,
+        retired_by_user_id=row.retired_by_user_id,
+        published_at=row.published_at,
+        retired_at=row.retired_at,
+        created_at=row.created_at,
+    )
+
+
+@router.get(
+    "/marketing-collateral-bundles",
+    response_model=MarketingCollateralBundleList,
+)
+async def list_marketing_collateral_bundles(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    lead_type: LeadType | None = Query(default=None),
+    purpose: str | None = Query(default=None, max_length=48),
+    include_retired: bool = False,
+) -> MarketingCollateralBundleList:
+    prospect_service.require_config_admin(user)
+    statement = select(MarketingCollateralBundle)
+    if lead_type is not None:
+        statement = statement.where(MarketingCollateralBundle.lead_type == lead_type)
+    if purpose is not None:
+        statement = statement.where(
+            MarketingCollateralBundle.purpose == outreach.canonical_purpose(purpose)
+        )
+    if not include_retired:
+        statement = statement.where(MarketingCollateralBundle.status != "retired")
+    rows = list(
+        (
+            await db.execute(
+                statement.order_by(
+                    MarketingCollateralBundle.lead_type,
+                    MarketingCollateralBundle.purpose,
+                    MarketingCollateralBundle.version.desc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return MarketingCollateralBundleList(
+        items=[await _collateral_bundle_read(db, row) for row in rows]
+    )
+
+
+@router.post(
+    "/marketing-collateral-bundles",
+    response_model=MarketingCollateralBundleRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_marketing_collateral_bundle(
+    payload: MarketingCollateralBundleCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> MarketingCollateralBundleRead:
+    prospect_service.require_config_admin(user)
+    try:
+        row = await outreach.create_collateral_bundle(
+            db,
+            actor_user_id=user.id,
+            payload=payload,
+        )
+        return await _collateral_bundle_read(db, row)
+    except Exception as exc:  # noqa: BLE001
+        _raise_service(exc)
+        raise
+
+
+@router.patch(
+    "/marketing-collateral-bundles/{bundle_id}",
+    response_model=MarketingCollateralBundleRead,
+)
+async def patch_marketing_collateral_bundle(
+    bundle_id: UUID,
+    payload: MarketingCollateralBundlePatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> MarketingCollateralBundleRead:
+    prospect_service.require_config_admin(user)
+    try:
+        row = await outreach.load_collateral_bundle(db, bundle_id, lock=True)
+        row = await outreach.update_collateral_bundle(
+            db,
+            row,
+            actor_user_id=user.id,
+            payload=payload,
+        )
+        return await _collateral_bundle_read(db, row)
+    except Exception as exc:  # noqa: BLE001
+        _raise_service(exc)
+        raise
+
+
+@router.post(
+    "/marketing-collateral-bundles/{bundle_id}/publish",
+    response_model=MarketingCollateralBundleRead,
+)
+async def publish_marketing_collateral_bundle(
+    bundle_id: UUID,
+    payload: MarketingCollateralBundleAction,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> MarketingCollateralBundleRead:
+    prospect_service.require_config_admin(user)
+    try:
+        row = await outreach.load_collateral_bundle(db, bundle_id, lock=True)
+        row = await outreach.publish_collateral_bundle(
+            db,
+            row,
+            actor_user_id=user.id,
+            expected_revision=payload.expected_revision,
+        )
+        return await _collateral_bundle_read(db, row)
+    except Exception as exc:  # noqa: BLE001
+        _raise_service(exc)
+        raise
+
+
+@router.post(
+    "/marketing-collateral-bundles/{bundle_id}/retire",
+    response_model=MarketingCollateralBundleRead,
+)
+async def retire_marketing_collateral_bundle(
+    bundle_id: UUID,
+    payload: MarketingCollateralBundleAction,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> MarketingCollateralBundleRead:
+    prospect_service.require_config_admin(user)
+    try:
+        row = await outreach.load_collateral_bundle(db, bundle_id, lock=True)
+        row = await outreach.retire_collateral_bundle(
+            db,
+            row,
+            actor_user_id=user.id,
+            expected_revision=payload.expected_revision,
+        )
+        return await _collateral_bundle_read(db, row)
+    except Exception as exc:  # noqa: BLE001
+        _raise_service(exc)
+        raise
+
+
 @router.post("/marketing-collateral/reorder", response_model=MarketingCollateralList)
 async def reorder_marketing_collateral(
     payload: MarketingCollateralReorder,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
+    lead_type: LeadType = "dealer",
 ) -> MarketingCollateralList:
     prospect_service.require_config_admin(user)
     try:
@@ -899,6 +1192,7 @@ async def reorder_marketing_collateral(
             actor_user_id=user.id,
             expected_ids=payload.expected_ids,
             ordered_ids=payload.ordered_ids,
+            lead_type=lead_type,
         )
         return MarketingCollateralList(items=[_collateral_read(row) for row in rows])
     except Exception as exc:  # noqa: BLE001
@@ -918,11 +1212,28 @@ async def upload_marketing_collateral(
     title: str | None = Form(default=None, max_length=180),
     name: str | None = Form(default=None, max_length=180),
     scope: str = Form(default="dealer_outreach", max_length=48),
+    lead_type: LeadType = Form(default="dealer"),
+    purposes: str = Form(default='["information"]', max_length=500),
+    included_by_default: bool = Form(default=True),
     sort_order: int = Form(default=0, ge=0, le=100_000),
 ) -> MarketingCollateralRead:
     prospect_service.require_config_admin(user)
-    if scope != outreach.COLLATERAL_ASSIGNMENT:
+    if scope not in {outreach.COLLATERAL_ASSIGNMENT, "prospect_outreach"}:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unsupported collateral scope.")
+    try:
+        parsed_purposes = json.loads(purposes)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "purposes must be a JSON string array.",
+        ) from exc
+    if not isinstance(parsed_purposes, list) or not all(
+        isinstance(value, str) for value in parsed_purposes
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "purposes must be a JSON string array.",
+        )
     selected_name = (title or name or "").strip()
     if not selected_name:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Collateral title is required.")
@@ -935,9 +1246,12 @@ async def upload_marketing_collateral(
             db,
             actor_user_id=user.id,
             name=selected_name,
-            file_name=file.filename or "dealer-outreach.pdf",
+            file_name=file.filename or f"{lead_type}-outreach.pdf",
             data=data,
             sort_order=sort_order,
+            lead_type=lead_type,
+            purposes=parsed_purposes,
+            included_by_default=included_by_default,
         )
         return _collateral_read(row)
     except IntegrityError as exc:
@@ -1071,12 +1385,15 @@ async def patch_marketing_collateral(
     """Compatibility endpoint for the admin library's active toggle."""
     prospect_service.require_config_admin(user)
     row = await _collateral(db, asset_id, lock=True)
+    changed = False
     if payload.is_active is True:
         row = await outreach.approve_collateral(
             db, row, actor_user_id=user.id, sort_order=payload.sort_order
         )
+        changed = True
     elif payload.is_active is False:
         row = await outreach.retire_collateral(db, row, actor_user_id=user.id)
+        changed = True
     elif payload.sort_order is not None:
         row = await outreach.update_collateral_order(
             db,
@@ -1084,7 +1401,17 @@ async def patch_marketing_collateral(
             actor_user_id=user.id,
             sort_order=payload.sort_order,
         )
-    else:
+        changed = True
+    if payload.purposes is not None or payload.included_by_default is not None:
+        row = await outreach.update_collateral_curation(
+            db,
+            row,
+            actor_user_id=user.id,
+            purposes=payload.purposes,
+            included_by_default=payload.included_by_default,
+        )
+        changed = True
+    if not changed:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "No collateral changes provided.")
     return _collateral_read(row)
 
