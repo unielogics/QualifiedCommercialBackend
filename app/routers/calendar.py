@@ -65,6 +65,7 @@ from app.schemas.event import (
 from app.scoping import regional_manager_broker_ids_subquery, scope_loan_query
 from app.services import calendar_v2
 from app.services.activity_log import filter_payload_for_audience, is_visible_to
+from app.services.deal_economics import calculate_deal_earnings, optional_float
 from app.services.team_calendar import effective_booking_settings, team_calendar_host
 
 router = APIRouter(prefix="/calendar", tags=["calendar"])
@@ -359,10 +360,10 @@ async def _estimated_closing_events(
             if profile.forecast_fee_points is not None
             else None
         )
-        earnings = (
-            round(forecast_amount * points / 100, 2)
-            if forecast_amount is not None and points is not None
-            else None
+        earnings = calculate_deal_earnings(
+            accepted_amount=profile.underwriting_accepted_amount,
+            origination_points=profile.forecast_fee_points,
+            consulting_fee=profile.forecast_consulting_fee,
         )
         starts_at = datetime.combine(
             profile.estimated_close_date,
@@ -390,8 +391,14 @@ async def _estimated_closing_events(
                 can_edit=False,
                 forecast_amount=forecast_amount,
                 forecast_amount_basis=amount_basis,
+                accepted_amount=optional_float(earnings.accepted_amount),
                 forecast_fee_points=points,
-                forecast_earnings=earnings,
+                origination_fee_points=points,
+                forecast_consulting_fee=optional_float(earnings.consulting_fee),
+                forecast_origination_earnings=optional_float(
+                    earnings.origination_earnings
+                ),
+                forecast_earnings=optional_float(earnings.total),
             )
         )
     return events

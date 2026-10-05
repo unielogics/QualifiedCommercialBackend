@@ -30,6 +30,7 @@ from app.schemas.application_profile import (
     ApplicationRequirementAIReview,
     ApplicationRequirementBatchReminder,
     ApplicationRequirementPatch,
+    ApplicationUnderwritingPatch,
     BusinessBankEvidence,
     ClientEvidenceBankingSummary,
     ClientEvidenceRequirementRead,
@@ -135,6 +136,55 @@ async def test_underwriting_write_handles_string_stage_loaded_by_the_orm() -> No
 
     assert log_profile_action.await_args.kwargs["metadata"]["loan_stage"] == "processing"
     db.flush.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_underwriting_write_uses_same_accepted_economics_fields_as_intake() -> None:
+    profile = SimpleNamespace(
+        id=uuid4(),
+        loan_id=uuid4(),
+        underwriting_status="in_underwriting",
+        underwriting_notes=None,
+        underwriting_accepted_amount=None,
+        underwriting_updated_by_user_id=None,
+        underwriting_updated_at=None,
+        forecast_fee_points=None,
+        forecast_consulting_fee=None,
+    )
+    user = SimpleNamespace(
+        id=uuid4(),
+        role=Role.LOAN_EXEC,
+        name="Underwriter",
+        email="underwriter@example.com",
+    )
+    loan = SimpleNamespace(id=profile.loan_id, stage="processing")
+    db = SimpleNamespace(flush=AsyncMock())
+    payload = ApplicationUnderwritingPatch(
+        accepted_amount=325_000,
+        origination_fee_points=2.5,
+        forecast_consulting_fee=1_500,
+    )
+
+    with (
+        patch(
+            "app.routers.application_profiles._sync_profile_loan_stage",
+            AsyncMock(return_value=loan),
+        ),
+        patch(
+            "app.routers.application_profiles.profiles.log_profile_action",
+            AsyncMock(),
+        ),
+    ):
+        await apply_underwriting_changes(
+            db,
+            profile,
+            user,
+            payload.model_dump(exclude_unset=True),
+        )
+
+    assert profile.underwriting_accepted_amount == 325_000
+    assert profile.forecast_fee_points == 2.5
+    assert profile.forecast_consulting_fee == 1_500
 
 
 @pytest.mark.asyncio

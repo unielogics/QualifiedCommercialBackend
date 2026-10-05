@@ -56,6 +56,14 @@ class ApplicationProfile(TimestampMixin, Base):
             "underwriting_funded_amount IS NULL OR underwriting_funded_amount >= 0",
             name="ck_application_profiles_underwriting_funded_amount",
         ),
+        CheckConstraint(
+            "underwriting_accepted_amount IS NULL OR underwriting_accepted_amount >= 0",
+            name="ck_application_profiles_underwriting_accepted_amount",
+        ),
+        CheckConstraint(
+            "forecast_consulting_fee IS NULL OR forecast_consulting_fee >= 0",
+            name="ck_application_profiles_forecast_consulting_fee",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -160,6 +168,7 @@ class ApplicationProfile(TimestampMixin, Base):
         String(32), nullable=False, default="collecting_docs", server_default="collecting_docs"
     )
     underwriting_approved_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    underwriting_accepted_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
     underwriting_funded_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
     underwriting_term_sheet_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
     underwriting_current_dscr: Mapped[float | None] = mapped_column(Numeric(8, 4))
@@ -171,10 +180,11 @@ class ApplicationProfile(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
     underwriting_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    # Internal QC revenue forecast. One point is one percent of the lifecycle-
-    # appropriate amount; this is intentionally separate from borrower pricing
-    # and lender discount/origination fields on Loan.
+    # Internal QC revenue forecast. One point is one percent of the amount the
+    # client accepted. This is intentionally separate from borrower pricing and
+    # lender discount/origination fields on Loan.
     forecast_fee_points: Mapped[Decimal | None] = mapped_column(Numeric(7, 4))
+    forecast_consulting_fee: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     estimated_close_date: Mapped[date | None] = mapped_column(Date)
     program_selection_mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default="auto", server_default="auto"

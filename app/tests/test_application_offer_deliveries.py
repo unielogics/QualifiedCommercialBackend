@@ -394,6 +394,84 @@ async def test_repeated_identical_response_is_an_idempotent_noop() -> None:
     assert changed is False
 
 
+def test_accepted_amount_reads_typed_and_legacy_immutable_snapshots() -> None:
+    typed = SimpleNamespace(
+        kind="application_term_sheet",
+        canonical_summary={"accepted_amount": "275000.00", "lines": []},
+    )
+    legacy = SimpleNamespace(
+        kind="production_term_sheet",
+        canonical_summary={"lines": ["Approved amount: $325,000.00"]},
+    )
+    ambiguous = SimpleNamespace(
+        kind="production_term_sheet",
+        canonical_summary={
+            "lines": [
+                "Approved amount: $325,000.00",
+                "Credit limit: $400,000.00",
+            ]
+        },
+    )
+
+    assert offers.accepted_amount_from_snapshot(typed) == 275_000
+    assert offers.accepted_amount_from_snapshot(legacy) == 325_000
+    assert offers.accepted_amount_from_snapshot(ambiguous) is None
+
+
+@pytest.mark.asyncio
+async def test_accepting_immutable_term_sheet_syncs_profile_accepted_amount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent_at = datetime.now(UTC) - timedelta(minutes=10)
+    delivery_id = uuid4()
+    item = SimpleNamespace(
+        id=uuid4(),
+        delivery_id=delivery_id,
+        kind="application_term_sheet",
+        source_id=uuid4(),
+        source_version=4,
+        sha256="a" * 64,
+        canonical_summary={"accepted_amount": "285000.00", "lines": []},
+        decision_status="pending",
+        expires_at=sent_at + timedelta(hours=48),
+    )
+    delivery = SimpleNamespace(
+        id=delivery_id,
+        profile_id=uuid4(),
+        sent_at=sent_at,
+        status="sent",
+        items=[item],
+    )
+    profile = SimpleNamespace(
+        id=delivery.profile_id,
+        dealer_id=None,
+        primary_bucket_id=None,
+        underwriting_accepted_amount=None,
+        underwriting_updated_at=None,
+    )
+    audit = AsyncMock()
+    monkeypatch.setattr(offers.application_profiles, "log_profile_action", audit)
+
+    changed = await offers.record_response(
+        SimpleNamespace(),
+        profile=profile,
+        delivery=delivery,
+        item=item,
+        response="accepted",
+        responder_name="Alex Client",
+        reason=None,
+        channel="authenticated_client",
+        responded_at=datetime.now(UTC),
+        ip_address=None,
+        user_agent=None,
+        user_id=uuid4(),
+    )
+
+    assert changed is True
+    assert profile.underwriting_accepted_amount == 285_000
+    assert audit.await_args.kwargs["metadata"]["source_version"] == 4
+
+
 @pytest.mark.asyncio
 async def test_delivery_pin_snapshot_survives_room_rotation(
     monkeypatch: pytest.MonkeyPatch,

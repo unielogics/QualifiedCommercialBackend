@@ -9,6 +9,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from html import escape
 from typing import Any
 from uuid import UUID
@@ -174,6 +175,22 @@ class ResolvedOffer:
 
     def section(self) -> OfferCanonicalSection:
         return OfferCanonicalSection(item_key=self.key, title=self.title, lines=self.lines)
+
+    def canonical_summary(self) -> dict[str, Any]:
+        """Structured values frozen alongside the exact client-visible lines."""
+
+        summary: dict[str, Any] = {"lines": list(self.lines)}
+        if self.kind == "production_term_sheet":
+            summary.update(
+                accepted_amount=str(self.source.approved_amount),
+                accepted_amount_field="approved_amount",
+            )
+        elif self.kind == "application_term_sheet":
+            summary.update(
+                accepted_amount=str(self.source.amount),
+                accepted_amount_field="amount",
+            )
+        return summary
 
     def draft_item(self, profile_id: UUID) -> OfferDraftItem:
         # This authenticated current-version preview is useful during final
@@ -859,6 +876,49 @@ def delivery_read(delivery: ApplicationOfferDelivery, *, base_url: str) -> Offer
     )
 
 
+def accepted_amount_from_snapshot(
+    item: ApplicationOfferDeliveryItem,
+) -> Decimal | None:
+    """Read the financing amount only from the immutable client snapshot.
+
+    New snapshots carry a typed value.  The strict line parser supports older
+    snapshots without consulting a mutable current term-sheet row.
+    """
+
+    if item.kind not in {"production_term_sheet", "application_term_sheet"}:
+        return None
+    summary = item.canonical_summary if isinstance(item.canonical_summary, dict) else {}
+    raw = summary.get("accepted_amount")
+    if raw is not None:
+        try:
+            amount = Decimal(str(raw))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        return (
+            amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if amount.is_finite() and amount > 0
+            else None
+        )
+
+    allowed_labels = (
+        {"Approved amount", "Credit limit"}
+        if item.kind == "production_term_sheet"
+        else {"Amount"}
+    )
+    matches: list[Decimal] = []
+    for line in summary.get("lines") or []:
+        if not isinstance(line, str) or ":" not in line:
+            continue
+        label, value = line.split(":", 1)
+        if label.strip() not in allowed_labels:
+            continue
+        match = re.fullmatch(r"\s*\$([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)\.([0-9]{2})\s*", value)
+        if match:
+            matches.append(Decimal(match.group(1).replace(",", "") + "." + match.group(2)))
+    unique = {amount for amount in matches if amount > 0}
+    return next(iter(unique)) if len(unique) == 1 else None
+
+
 async def record_response(
     db: AsyncSession,
     *,
@@ -949,6 +1009,37 @@ async def record_response(
                 profile=profile,
                 intake=intake,
                 business_name=business_name,
+            )
+    elif response == "accepted" and item.kind in {
+        "production_term_sheet",
+        "application_term_sheet",
+    }:
+        accepted_amount = accepted_amount_from_snapshot(item)
+        if accepted_amount is not None:
+            previous = profile.underwriting_accepted_amount
+            profile.underwriting_accepted_amount = accepted_amount
+            profile.underwriting_updated_at = responded_at
+            await application_profiles.log_profile_action(
+                db,
+                profile,
+                None,
+                "underwriting.accepted_amount_synced",
+                "Synced accepted amount from the client's immutable term-sheet response",
+                target_type="application_offer_delivery_item",
+                target_id=item.id,
+                metadata={
+                    "delivery_id": str(delivery.id),
+                    "item_kind": item.kind,
+                    "source_id": str(item.source_id),
+                    "source_version": item.source_version,
+                    "snapshot_sha256": item.sha256,
+                    "accepted_amount": float(accepted_amount),
+                    "previous_accepted_amount": (
+                        float(previous) if previous is not None else None
+                    ),
+                    "response_channel": channel,
+                    "response_user_id": str(user_id) if user_id else None,
+                },
             )
     refresh_delivery_status(delivery)
     return True

@@ -77,6 +77,7 @@ from app.scoping import regional_manager_broker_ids_subquery, scope_client_query
 from app.services import application_profiles as profiles
 from app.services import file_events
 from app.services.activity_log import log_activity, mark_loan_dirty
+from app.services.deal_economics import calculate_deal_earnings, optional_float
 from app.services.dealer_partner_access import (
     DEALER_INTAKE_VARIANT,
     require_dealer_partner_standing,
@@ -391,6 +392,8 @@ def _forecast_values(
     approved_amount: Any,
     funded_amount: Any,
     fee_points: Any,
+    accepted_amount: Any = None,
+    consulting_fee: Any = None,
 ) -> tuple[str | None, float | None, float | None]:
     group = PIPELINE_ECONOMICS_GROUPS.get(status_value)
     basis = {
@@ -406,13 +409,12 @@ def _forecast_values(
             "funded": funded_amount,
         }.get(basis)
     )
-    points = _decimal_amount(fee_points)
-    earnings = (
-        amount * points / Decimal("100")
-        if amount is not None and points is not None
-        else None
+    earnings = calculate_deal_earnings(
+        accepted_amount=accepted_amount,
+        origination_points=fee_points,
+        consulting_fee=consulting_fee,
     )
-    return basis, _money_float(amount), _money_float(earnings)
+    return basis, _money_float(amount), optional_float(earnings.total)
 
 
 def _positive_money(value: Any) -> float | None:
@@ -1181,6 +1183,11 @@ async def _decorate_pipeline_state(
             )
         row.requested_amount = _money(requested_amount) if can_view_economics else None
         row.approved_amount = _money(profile.underwriting_approved_amount) if profile else None
+        row.accepted_amount = (
+            _money(profile.underwriting_accepted_amount)
+            if can_view_economics and profile
+            else None
+        )
         funded_amount = profile.underwriting_funded_amount if profile else None
         if funded_amount is None and row.dealer_id in dealer_amounts:
             funded_amount = dealer_amounts[row.dealer_id][2]
@@ -1196,6 +1203,20 @@ async def _decorate_pipeline_state(
             if can_view_economics and profile and profile.forecast_fee_points is not None
             else None
         )
+        row.origination_fee_points = row.forecast_fee_points
+        row.forecast_consulting_fee = (
+            _money(profile.forecast_consulting_fee)
+            if can_view_economics and profile
+            else None
+        )
+        earnings = calculate_deal_earnings(
+            accepted_amount=row.accepted_amount,
+            origination_points=row.forecast_fee_points,
+            consulting_fee=row.forecast_consulting_fee,
+        )
+        row.forecast_origination_earnings = optional_float(
+            earnings.origination_earnings
+        )
         row.estimated_close_date = (
             profile.estimated_close_date if can_view_economics and profile else None
         )
@@ -1206,6 +1227,8 @@ async def _decorate_pipeline_state(
                 approved_amount=row.approved_amount,
                 funded_amount=row.funded_amount,
                 fee_points=row.forecast_fee_points,
+                accepted_amount=row.accepted_amount,
+                consulting_fee=row.forecast_consulting_fee,
             )
             row.forecast_amount_basis = basis  # type: ignore[assignment]
             row.forecast_amount = forecast_amount
@@ -1336,7 +1359,7 @@ def _rollup(
         amount = _decimal_amount(row.forecast_amount)
         if amount is not None:
             bucket["value"] += amount
-        if row.forecast_fee_points is not None:
+        if row.forecast_earnings is not None:
             bucket["forecasted_count"] += 1
             earnings = _decimal_amount(row.forecast_earnings)
             if earnings is not None:
@@ -1407,8 +1430,12 @@ def _economics_read(
         pipeline_status=(row.pipeline_status or "collecting_docs"),  # type: ignore[arg-type]
         requested_amount=row.requested_amount,
         approved_amount=row.approved_amount,
+        accepted_amount=row.accepted_amount,
         funded_amount=row.funded_amount,
         forecast_fee_points=row.forecast_fee_points,
+        origination_fee_points=row.forecast_fee_points,
+        forecast_consulting_fee=row.forecast_consulting_fee,
+        forecast_origination_earnings=row.forecast_origination_earnings,
         forecast_amount=row.forecast_amount,
         forecast_amount_basis=row.forecast_amount_basis,
         forecast_earnings=row.forecast_earnings,
@@ -1428,15 +1455,28 @@ async def update_operator_file_economics(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> UnifiedFileEconomicsRead:
-    """Update the internal revenue forecast on the canonical application profile."""
+    """Update accepted deal economics on the canonical application profile."""
 
     _require_internal(user)
     normalized_kind = _normalize_pipeline_source_kind(source_kind)
     profile = await profiles.resolve_profile(db, normalized_kind, source_id, user)
     changes = payload.model_dump(exclude_unset=True)
+    if "origination_fee_points" in changes:
+        alias_value = changes.pop("origination_fee_points")
+        changes.setdefault("forecast_fee_points", alias_value)
+    if "accepted_amount" in changes:
+        value = changes["accepted_amount"]
+        profile.underwriting_accepted_amount = (
+            Decimal(str(value)) if value is not None else None
+        )
     if "forecast_fee_points" in changes:
         value = changes["forecast_fee_points"]
         profile.forecast_fee_points = Decimal(str(value)) if value is not None else None
+    if "forecast_consulting_fee" in changes:
+        value = changes["forecast_consulting_fee"]
+        profile.forecast_consulting_fee = (
+            Decimal(str(value)) if value is not None else None
+        )
     if "estimated_close_date" in changes:
         profile.estimated_close_date = changes["estimated_close_date"]
     if "funded_amount" in changes:
@@ -1456,7 +1496,7 @@ async def update_operator_file_economics(
             profile,
             user,
             "pipeline.economics_updated",
-            "Updated QC revenue forecast and estimated closing",
+            "Updated accepted deal economics and estimated closing",
             target_type="application_profile",
             target_id=profile.id,
             metadata={
@@ -1472,7 +1512,7 @@ async def update_operator_file_economics(
                 actor_id=user.id,
                 actor_label=_role_value(user),
                 kind="pipeline.economics_updated",
-                summary="Updated QC revenue forecast and estimated closing",
+                summary="Updated accepted deal economics and estimated closing",
                 payload={
                     "profile_id": str(profile.id),
                     "changes": audit_changes,

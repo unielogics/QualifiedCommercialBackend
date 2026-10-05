@@ -175,6 +175,7 @@ from app.services import (
 )
 from app.services.activity_log import log_activity, mark_loan_dirty
 from app.services.application_plaid_sync import sync_item_background
+from app.services.deal_economics import calculate_deal_earnings, optional_float
 from app.services.extracted_facts import (
     accepted_review_group_keys,
     canonical_field_key,
@@ -667,6 +668,11 @@ def _underwriting_read(
     source_kind: str | None = None,
     source_id: UUID | None = None,
 ) -> ApplicationUnderwritingRead:
+    earnings = calculate_deal_earnings(
+        accepted_amount=profile.underwriting_accepted_amount,
+        origination_points=profile.forecast_fee_points,
+        consulting_fee=profile.forecast_consulting_fee,
+    )
     return ApplicationUnderwritingRead(
         profile_id=profile.id,
         source_kind=source_kind,  # type: ignore[arg-type]
@@ -674,6 +680,7 @@ def _underwriting_read(
         loan_id=profile.loan_id,
         underwriting_status=profile.underwriting_status,  # type: ignore[arg-type]
         approved_amount=profile.underwriting_approved_amount,
+        accepted_amount=profile.underwriting_accepted_amount,
         funded_amount=profile.underwriting_funded_amount,
         term_sheet_amount=profile.underwriting_term_sheet_amount,
         current_dscr=profile.underwriting_current_dscr,
@@ -682,6 +689,10 @@ def _underwriting_read(
         close_outcome=profile.underwriting_close_outcome,
         reviewer_notes=profile.underwriting_notes,
         forecast_fee_points=profile.forecast_fee_points,
+        origination_fee_points=profile.forecast_fee_points,
+        forecast_consulting_fee=profile.forecast_consulting_fee,
+        forecast_origination_earnings=optional_float(earnings.origination_earnings),
+        forecast_earnings=optional_float(earnings.total),
         estimated_close_date=profile.estimated_close_date,
         updated_by_user_id=profile.underwriting_updated_by_user_id,
         updated_at=profile.underwriting_updated_at,
@@ -852,6 +863,9 @@ async def apply_underwriting_changes(
     now = datetime.now(UTC)
     before_status = profile.underwriting_status
     before_notes = profile.underwriting_notes
+    if "origination_fee_points" in changes:
+        alias_value = changes.pop("origination_fee_points")
+        changes.setdefault("forecast_fee_points", alias_value)
     status_value = changes.get("underwriting_status")
     if status_value is not None:
         profile.underwriting_status = status_value
@@ -874,6 +888,8 @@ async def apply_underwriting_changes(
             **changes,
             "approved_amount": float(profile.underwriting_term_sheet_amount),
         }
+    if "accepted_amount" in changes:
+        profile.underwriting_accepted_amount = changes["accepted_amount"]
     if "funded_amount" in changes:
         profile.underwriting_funded_amount = changes["funded_amount"]
     if "term_sheet_amount" in changes:
@@ -890,6 +906,8 @@ async def apply_underwriting_changes(
         profile.underwriting_notes = changes["reviewer_notes"]
     if "forecast_fee_points" in changes:
         profile.forecast_fee_points = changes["forecast_fee_points"]
+    if "forecast_consulting_fee" in changes:
+        profile.forecast_consulting_fee = changes["forecast_consulting_fee"]
     if "estimated_close_date" in changes:
         profile.estimated_close_date = changes["estimated_close_date"]
     profile.underwriting_updated_by_user_id = user.id

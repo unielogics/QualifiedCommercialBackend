@@ -167,7 +167,11 @@ class CalendarWorkspaceEvent(BaseModel):
     can_edit: bool = False
     forecast_amount: float | None = None
     forecast_amount_basis: str | None = None
+    accepted_amount: float | None = None
     forecast_fee_points: float | None = None
+    origination_fee_points: float | None = None
+    forecast_consulting_fee: float | None = None
+    forecast_origination_earnings: float | None = None
     forecast_earnings: float | None = None
 
 

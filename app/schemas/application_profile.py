@@ -86,6 +86,7 @@ class ApplicationProfileRead(BaseModel):
     bank_verification_override_reason: str | None = None
     underwriting_status: UnderwritingLifecycleStatus = "collecting_docs"
     underwriting_approved_amount: float | None = None
+    underwriting_accepted_amount: float | None = None
     underwriting_funded_amount: float | None = None
     underwriting_term_sheet_amount: float | None = None
     underwriting_current_dscr: float | None = None
@@ -96,6 +97,10 @@ class ApplicationProfileRead(BaseModel):
     underwriting_updated_by_user_id: UUID | None = None
     underwriting_updated_at: datetime | None = None
     forecast_fee_points: float | None = None
+    origination_fee_points: float | None = None
+    forecast_consulting_fee: float | None = None
+    forecast_origination_earnings: float | None = None
+    forecast_earnings: float | None = None
     estimated_close_date: date | None = None
     program_selection_mode: Literal["auto", "manual"] = "auto"
     program_selection_locked_at: datetime | None = None
@@ -397,6 +402,7 @@ class ApplicationUnderwritingRead(BaseModel):
     loan_id: UUID | None = None
     underwriting_status: UnderwritingLifecycleStatus = "collecting_docs"
     approved_amount: float | None = None
+    accepted_amount: float | None = None
     funded_amount: float | None = None
     term_sheet_amount: float | None = None
     current_dscr: float | None = None
@@ -405,6 +411,10 @@ class ApplicationUnderwritingRead(BaseModel):
     close_outcome: str | None = None
     reviewer_notes: str | None = None
     forecast_fee_points: float | None = None
+    origination_fee_points: float | None = None
+    forecast_consulting_fee: float | None = None
+    forecast_origination_earnings: float | None = None
+    forecast_earnings: float | None = None
     estimated_close_date: date | None = None
     updated_by_user_id: UUID | None = None
     updated_at: datetime | None = None
@@ -413,6 +423,7 @@ class ApplicationUnderwritingRead(BaseModel):
 class ApplicationUnderwritingPatch(BaseModel):
     underwriting_status: UnderwritingLifecycleStatus | None = None
     approved_amount: float | None = Field(default=None, ge=0)
+    accepted_amount: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     funded_amount: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     term_sheet_amount: float | None = Field(default=None, ge=0)
     current_dscr: float | None = Field(default=None, ge=0)
@@ -423,7 +434,25 @@ class ApplicationUnderwritingPatch(BaseModel):
     forecast_fee_points: float | None = Field(
         default=None, ge=0, le=100, allow_inf_nan=False
     )
+    origination_fee_points: float | None = Field(
+        default=None, ge=0, le=100, allow_inf_nan=False
+    )
+    forecast_consulting_fee: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
     estimated_close_date: date | None = None
+
+    @model_validator(mode="after")
+    def matching_origination_point_aliases(self) -> ApplicationUnderwritingPatch:
+        if (
+            "forecast_fee_points" in self.model_fields_set
+            and "origination_fee_points" in self.model_fields_set
+            and self.forecast_fee_points != self.origination_fee_points
+        ):
+            raise ValueError(
+                "forecast_fee_points and origination_fee_points must match when both are supplied"
+            )
+        return self
 
 
 _OWNER_BLANKABLE_FIELDS = {

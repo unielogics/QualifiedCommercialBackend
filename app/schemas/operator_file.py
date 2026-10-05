@@ -11,7 +11,7 @@ from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 UnifiedVertical = Literal["real_estate", "main_street", "dealer", "mca"]
 UnifiedOrigin = Literal["console", "agent", "rep", "dealer", "ai_intake"]
@@ -143,9 +143,13 @@ class UnifiedFileRow(BaseModel):
     pipeline_status: UnderwritingLifecycleStatus | None = None
     underwriting_status: UnderwritingLifecycleStatus | None = None
     approved_amount: float | None = None
+    accepted_amount: float | None = None
     requested_amount: float | None = None
     funded_amount: float | None = None
     forecast_fee_points: float | None = None
+    origination_fee_points: float | None = None
+    forecast_consulting_fee: float | None = None
+    forecast_origination_earnings: float | None = None
     forecast_amount: float | None = None
     forecast_amount_basis: Literal["requested", "approved", "funded"] | None = None
     forecast_earnings: float | None = None
@@ -302,11 +306,30 @@ class PipelineMoveResult(BaseModel):
 
 
 class UnifiedFileEconomicsPatch(BaseModel):
+    accepted_amount: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     forecast_fee_points: float | None = Field(
         default=None, ge=0, le=100, allow_inf_nan=False
     )
+    origination_fee_points: float | None = Field(
+        default=None, ge=0, le=100, allow_inf_nan=False
+    )
+    forecast_consulting_fee: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
     estimated_close_date: date | None = None
     funded_amount: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def matching_origination_point_aliases(self) -> UnifiedFileEconomicsPatch:
+        if (
+            "forecast_fee_points" in self.model_fields_set
+            and "origination_fee_points" in self.model_fields_set
+            and self.forecast_fee_points != self.origination_fee_points
+        ):
+            raise ValueError(
+                "forecast_fee_points and origination_fee_points must match when both are supplied"
+            )
+        return self
 
 
 class UnifiedFileEconomicsRead(BaseModel):
@@ -316,8 +339,12 @@ class UnifiedFileEconomicsRead(BaseModel):
     pipeline_status: UnderwritingLifecycleStatus
     requested_amount: float | None = None
     approved_amount: float | None = None
+    accepted_amount: float | None = None
     funded_amount: float | None = None
     forecast_fee_points: float | None = None
+    origination_fee_points: float | None = None
+    forecast_consulting_fee: float | None = None
+    forecast_origination_earnings: float | None = None
     forecast_amount: float | None = None
     forecast_amount_basis: Literal["requested", "approved", "funded"] | None = None
     forecast_earnings: float | None = None

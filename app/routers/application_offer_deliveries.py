@@ -1017,7 +1017,7 @@ async def send_combined_offer_delivery(
             source_version=resolved_item.version,
             label=resolved_item.label,
             title=resolved_item.title,
-            canonical_summary={"lines": resolved_item.lines},
+            canonical_summary=resolved_item.canonical_summary(),
             file_name=resolved_item.file_name,
             content_type="application/pdf",
             size_bytes=len(pdf),

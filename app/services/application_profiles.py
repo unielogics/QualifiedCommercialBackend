@@ -77,6 +77,7 @@ from app.services.bucket_evidence import (
     statement_months_from_analysis,
     statement_months_from_filename,
 )
+from app.services.deal_economics import calculate_deal_earnings, optional_float
 from app.services.dealer_partner_access import (
     DEALER_INTAKE_VARIANT,
     dealer_partner_intake_is_owned,
@@ -565,6 +566,11 @@ def _apply_extracted_taxonomy(profile, activity, subindustry, industry) -> bool:
 
 
 def profile_read(profile: ApplicationProfile) -> ApplicationProfileRead:
+    earnings = calculate_deal_earnings(
+        accepted_amount=profile.underwriting_accepted_amount,
+        origination_points=profile.forecast_fee_points,
+        consulting_fee=profile.forecast_consulting_fee,
+    )
     return ApplicationProfileRead(
         id=profile.id,
         client_id=profile.client_id,
@@ -601,6 +607,7 @@ def profile_read(profile: ApplicationProfile) -> ApplicationProfileRead:
         bank_verification_override_reason=profile.bank_verification_override_reason,
         underwriting_status=profile.underwriting_status,
         underwriting_approved_amount=profile.underwriting_approved_amount,
+        underwriting_accepted_amount=profile.underwriting_accepted_amount,
         underwriting_funded_amount=profile.underwriting_funded_amount,
         underwriting_term_sheet_amount=profile.underwriting_term_sheet_amount,
         underwriting_current_dscr=profile.underwriting_current_dscr,
@@ -611,6 +618,10 @@ def profile_read(profile: ApplicationProfile) -> ApplicationProfileRead:
         underwriting_updated_by_user_id=profile.underwriting_updated_by_user_id,
         underwriting_updated_at=profile.underwriting_updated_at,
         forecast_fee_points=profile.forecast_fee_points,
+        origination_fee_points=profile.forecast_fee_points,
+        forecast_consulting_fee=profile.forecast_consulting_fee,
+        forecast_origination_earnings=optional_float(earnings.origination_earnings),
+        forecast_earnings=optional_float(earnings.total),
         estimated_close_date=profile.estimated_close_date,
         program_selection_mode=profile.program_selection_mode,
         program_selection_locked_at=profile.program_selection_locked_at,

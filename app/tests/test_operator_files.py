@@ -94,8 +94,10 @@ def _economics_row(
     status: str,
     requested: float | None = None,
     approved: float | None = None,
+    accepted: float | None = None,
     funded: float | None = None,
     points: float | None = None,
+    consulting_fee: float | None = None,
     profile_id=None,
 ) -> UnifiedFileRow:
     row = _row(vertical="dealer", origin="ai_intake", stage="Applicant intake")
@@ -103,14 +105,18 @@ def _economics_row(
     row.pipeline_status = status  # type: ignore[assignment]
     row.requested_amount = requested
     row.approved_amount = approved
+    row.accepted_amount = accepted
     row.funded_amount = funded
     row.forecast_fee_points = points
+    row.forecast_consulting_fee = consulting_fee
     basis, amount, earnings = _forecast_values(
         status_value=status,
         requested_amount=requested,
         approved_amount=approved,
         funded_amount=funded,
         fee_points=points,
+        accepted_amount=accepted,
+        consulting_fee=consulting_fee,
     )
     row.forecast_amount_basis = basis  # type: ignore[assignment]
     row.forecast_amount = amount
@@ -118,30 +124,34 @@ def _economics_row(
     return row
 
 
-def test_pipeline_economics_use_lifecycle_amount_basis_and_one_point_is_one_percent():
+def test_pipeline_values_follow_lifecycle_but_earnings_use_accepted_amount():
     rows = [
-        _economics_row(status="collecting_docs", requested=100_000, points=2),
-        _economics_row(status="in_underwriting", requested=200_000, points=1.5),
-        _economics_row(status="approved", approved=300_000, points=1),
-        _economics_row(status="closed_won", funded=400_000, points=0.5),
+        _economics_row(
+            status="collecting_docs", requested=100_000, accepted=80_000, points=2
+        ),
+        _economics_row(
+            status="in_underwriting", requested=200_000, accepted=150_000, points=1.5
+        ),
+        _economics_row(status="approved", approved=300_000, accepted=275_000, points=1),
+        _economics_row(status="closed_won", funded=400_000, accepted=350_000, points=0.5),
     ]
 
     economics = _rollup(rows).pipeline_economics
 
     assert economics["requested"].count == 1
     assert economics["requested"].value == 100_000
-    assert economics["requested"].forecast_earnings == 2_000
+    assert economics["requested"].forecast_earnings == 1_600
     assert economics["underwriting"].value == 200_000
-    assert economics["underwriting"].forecast_earnings == 3_000
+    assert economics["underwriting"].forecast_earnings == 2_250
     assert economics["approved"].value == 300_000
-    assert economics["approved"].forecast_earnings == 3_000
+    assert economics["approved"].forecast_earnings == 2_750
     assert economics["funded"].value == 400_000
-    assert economics["funded"].forecast_earnings == 2_000
+    assert economics["funded"].forecast_earnings == 1_750
 
 
 def test_pipeline_economics_exclude_null_points_from_earnings_and_report_coverage():
     rows = [
-        _economics_row(status="submitted", requested=100_000, points=2),
+        _economics_row(status="submitted", requested=100_000, accepted=100_000, points=2),
         _economics_row(status="collecting_docs", requested=50_000),
         _economics_row(status="denied", requested=900_000, points=10),
     ]
@@ -159,10 +169,10 @@ def test_pipeline_economics_exclude_null_points_from_earnings_and_report_coverag
 def test_pipeline_economics_deduplicate_rows_by_application_profile():
     profile_id = uuid4()
     primary = _economics_row(
-        status="approved", approved=125_000, points=2, profile_id=profile_id
+        status="approved", approved=125_000, accepted=125_000, points=2, profile_id=profile_id
     )
     duplicate = _economics_row(
-        status="approved", approved=125_000, points=2, profile_id=profile_id
+        status="approved", approved=125_000, accepted=125_000, points=2, profile_id=profile_id
     )
 
     approved = _rollup([primary, duplicate]).pipeline_economics["approved"]
@@ -170,6 +180,21 @@ def test_pipeline_economics_deduplicate_rows_by_application_profile():
     assert approved.count == 1
     assert approved.value == 125_000
     assert approved.forecast_earnings == 2_500
+
+
+def test_pipeline_economics_include_fixed_consulting_fee_without_accepted_amount():
+    row = _economics_row(
+        status="in_underwriting",
+        requested=200_000,
+        points=2,
+        consulting_fee=1_250,
+    )
+
+    underwriting = _rollup([row]).pipeline_economics["underwriting"]
+
+    assert underwriting.value == 200_000
+    assert underwriting.forecasted_count == 1
+    assert underwriting.forecast_earnings == 1_250
 
 
 def test_pipeline_economics_exclude_profileless_bucket_workspaces():
