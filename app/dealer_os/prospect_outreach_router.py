@@ -357,7 +357,7 @@ async def list_prospect_outreach_collateral_options(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     lead_type: LeadType = "dealer",
-    purpose: str = "dealer_information",
+    purpose: str = "information",
 ) -> ProspectCollateralOptionList:
     """List only PDFs an outreach-enabled actor may attach right now."""
     _require_outreach_reader_or_config_admin(user)
@@ -578,6 +578,7 @@ async def list_prospect_email_outbox(
     draft_statuses: list[str] | None = Query(default=None, alias="draft_status"),
     delivery_statuses: list[str] | None = Query(default=None, alias="delivery_status"),
     source: str | None = Query(default=None, pattern="^(ai|manual)$"),
+    lead_type: LeadType | None = Query(default=None),
     owner_user_id: UUID | None = Query(default=None),
     q: str | None = Query(default=None, max_length=200),
     due: str = Query(default="all", pattern="^(all|scheduled|due)$"),
@@ -609,6 +610,8 @@ async def list_prospect_email_outbox(
         conditions.append(or_(*[_delivery_filter(value) for value in selected_delivery]))
     if source:
         conditions.append(DealerProspectEmailDraft.compose_mode == source)
+    if lead_type:
+        conditions.append(DealerProspectEmailDraft.lead_type == lead_type)
     if owner_user_id is not None:
         conditions.append(DealerProspect.owner_user_id == owner_user_id)
     search = (q or "").strip()

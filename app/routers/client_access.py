@@ -24,6 +24,11 @@ from app.db import get_db
 from app.dealer_os.models import DealerBusiness
 from app.deps import CurrentUser
 from app.enums import ProductAccountType, Role
+from app.lead_types import (
+    legacy_funding_purpose,
+    normalize_funding_intent,
+    normalize_lead_type,
+)
 from app.models.application_profile import ApplicationProfile
 from app.models.client import Client
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
@@ -841,8 +846,38 @@ async def _assign_audit_scopes(
                 or (client.name if client else None)
                 or target.name
             )
+            intake_state = source_intake.intake_state if source_intake else {}
+            try:
+                lead_type = normalize_lead_type(
+                    (intake_state or {}).get("lead_type")
+                    or (source_intake.variant if source_intake else profile.vertical)
+                )
+            except ValueError:
+                lead_type = "dealer"
+            raw_funding_intent = (
+                (intake_state or {}).get("funding_intent")
+                or profile.funding_category
+            )
+            classification_source = str(
+                (source_intake.variant if source_intake else None)
+                or profile.vertical
+                or ""
+            ).casefold()
+            is_legacy_mca = lead_type == "main_street" and "mca" in classification_source
+            try:
+                funding_intent = (
+                    "mca_refinance"
+                    if is_legacy_mca
+                    else normalize_funding_intent(raw_funding_intent)
+                )
+            except ValueError:
+                # Older profiles can contain catalog display values. They stay
+                # in the legacy column rather than polluting the canonical enum.
+                funding_intent = "mca_refinance" if is_legacy_mca else None
             dealer = DealerBusiness(
                 name=label,
+                lead_type=lead_type,
+                funding_intent=funding_intent,
                 legal_name=label,
                 email=(source_intake.email if source_intake else client.email if client else target.email),
                 phone=(source_intake.phone if source_intake else client.phone if client else None),
@@ -851,7 +886,11 @@ async def _assign_audit_scopes(
                 owner_user_id=actor.id,
                 dealer_user_id=target.id,
                 audit_client_since=datetime.now(UTC),
-                funding_purpose=profile.funding_category,
+                funding_purpose=(
+                    legacy_funding_purpose(funding_intent)
+                    if funding_intent is not None
+                    else profile.funding_category
+                ),
                 industry=profile.industry or "other",
                 entity_type=profile.entity_type,
                 naics_code=profile.naics_code,

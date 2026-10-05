@@ -16,6 +16,12 @@ from pydantic import (
     model_validator,
 )
 
+from app.lead_types import (
+    FundingIntent,
+    LeadType,
+    normalize_funding_intent,
+    normalize_lead_type,
+)
 from app.schemas.phone import RequiredPhone
 from app.schemas.prospect_outreach import CCScope, normalize_cc_emails
 
@@ -71,7 +77,10 @@ class ProspectRead(BaseModel):
     contact_id: UUID
     contact_name: str
     name: str
+    business_name: str = Field(validation_alias=AliasChoices("business_name", "dealer_name"))
     dealer_name: str
+    lead_type: LeadType = "dealer"
+    funding_intent: FundingIntent | None = None
     email: str
     phone: str
     stage_id: UUID
@@ -205,14 +214,20 @@ class ProspectCreate(BaseModel):
         max_length=160,
         validation_alias=AliasChoices("contact_name", "name"),
     )
-    dealer_name: str = Field(min_length=1, max_length=180)
+    business_name: str = Field(
+        min_length=1,
+        max_length=180,
+        validation_alias=AliasChoices("business_name", "dealer_name"),
+    )
+    lead_type: LeadType
+    funding_intent: FundingIntent | None = None
     email: EmailStr
     phone: RequiredPhone
     source: str = Field(default="quick_add", min_length=1, max_length=32)
     owner_user_id: UUID | None = None
     initial_note: str | None = Field(default=None, max_length=4000)
 
-    @field_validator("contact_name", "dealer_name", "source", mode="before")
+    @field_validator("contact_name", "business_name", "source", mode="before")
     @classmethod
     def strip_required(cls, value: object) -> object:
         return str(value).strip() if value is not None else value
@@ -224,20 +239,65 @@ class ProspectCreate(BaseModel):
             return None
         return str(value).strip() or None
 
+    @field_validator("lead_type", mode="before")
+    @classmethod
+    def normalize_type(cls, value: object) -> LeadType:
+        return normalize_lead_type(value, default=None)
+
+    @field_validator("funding_intent", mode="before")
+    @classmethod
+    def normalize_intent(cls, value: object) -> FundingIntent | None:
+        return normalize_funding_intent(value)
+
+    @property
+    def dealer_name(self) -> str:
+        """One-release compatibility alias for existing Field Desk clients."""
+
+        return self.business_name
+
 
 class ProspectPatch(BaseModel):
     expected_version: int = Field(ge=1)
     contact_name: str | None = Field(default=None, min_length=1, max_length=160)
-    dealer_name: str | None = Field(default=None, min_length=1, max_length=180)
+    business_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=180,
+        validation_alias=AliasChoices("business_name", "dealer_name"),
+    )
+    lead_type: LeadType | None = None
+    funding_intent: FundingIntent | None = None
+    reclassification_reason: str | None = Field(default=None, max_length=1000)
+    override_converted_reclassification: bool = False
     email: EmailStr | None = None
     phone: RequiredPhone | None = None
     owner_user_id: UUID | None = None
     next_follow_up_at: datetime | None = None
 
-    @field_validator("contact_name", "dealer_name", mode="before")
+    @field_validator("contact_name", "business_name", mode="before")
     @classmethod
     def strip_optional(cls, value: object) -> object:
         return str(value).strip() if value is not None else value
+
+    @field_validator("lead_type", mode="before")
+    @classmethod
+    def normalize_type(cls, value: object) -> LeadType | None:
+        return normalize_lead_type(value, default=None)
+
+    @field_validator("funding_intent", mode="before")
+    @classmethod
+    def normalize_intent(cls, value: object) -> FundingIntent | None:
+        return normalize_funding_intent(value)
+
+    @field_validator("reclassification_reason", mode="before")
+    @classmethod
+    def strip_reclassification_reason(cls, value: object) -> str | None:
+        clean = str(value or "").strip()
+        return clean or None
+
+    @property
+    def dealer_name(self) -> str | None:
+        return self.business_name
 
 
 ProspectMoveAction = Literal["none", "draft_email", "book_appointment"]
@@ -302,6 +362,8 @@ class ProspectDuplicateMatchRead(BaseModel):
     can_restore: bool = False
     version: int | None = None
     matched_on: list[Literal["email", "phone"]] = Field(default_factory=list)
+    business_name_normalized: str | None = None
+    lead_type: LeadType | None = None
 
 
 class ProspectDuplicateCheckRead(BaseModel):
@@ -315,6 +377,8 @@ class ProspectDuplicateCheckRead(BaseModel):
     ]
     email_normalized: str | None = None
     phone_normalized: str | None = None
+    business_name_normalized: str | None = None
+    lead_type: LeadType | None = None
     visible_matches: list[ProspectDuplicateMatchRead] = Field(default_factory=list)
     assignment_required: bool = False
     can_restore: bool = False
@@ -467,9 +531,9 @@ class ProspectConversionRequest(BaseModel):
 class ProspectPortfolioApplicationCreate(BaseModel):
     entity_type: str = Field(min_length=1, max_length=32)
     requested_amount: float = Field(gt=0, le=999_999_999_999.99)
-    funding_purpose: Literal[
-        "working_capital", "equipment", "real_estate", "refinance", "floorplan", "other"
-    ]
+    funding_intent: FundingIntent = Field(
+        validation_alias=AliasChoices("funding_intent", "funding_purpose")
+    )
     use_of_proceeds_note: str = Field(min_length=1, max_length=4000)
     secure_room_pin: str = Field(pattern=r"^[0-9]{6}$")
 
@@ -477,6 +541,19 @@ class ProspectPortfolioApplicationCreate(BaseModel):
     @classmethod
     def strip_portfolio_text(cls, value: object) -> object:
         return str(value).strip() if value is not None else value
+
+    @field_validator("funding_intent", mode="before")
+    @classmethod
+    def normalize_intent(cls, value: object) -> FundingIntent:
+        normalized = normalize_funding_intent(value, allow_none=False)
+        assert normalized is not None
+        return normalized
+
+    @property
+    def funding_purpose(self) -> FundingIntent:
+        """Compatibility alias for callers still reading the old field."""
+
+        return self.funding_intent
 
 
 class ProspectGeneralConversionRequest(BaseModel):
@@ -507,6 +584,8 @@ class ProspectConversionCandidate(BaseModel):
     status: str
     archived: bool = False
     display_name: str
+    lead_type: LeadType = "dealer"
+    funding_intent: FundingIntent | None = None
     email: str | None = None
     phone: str | None = None
     created_at: datetime
@@ -527,6 +606,8 @@ class ProspectIntakeCandidate(BaseModel):
     outcome_status: str
     full_name: str
     business_name: str | None
+    lead_type: LeadType = "dealer"
+    funding_intent: FundingIntent | None = None
     email: str
     phone: str | None
     created_at: datetime

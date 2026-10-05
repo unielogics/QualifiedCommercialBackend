@@ -19,6 +19,11 @@ from fastapi import HTTPException, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.lead_types import (
+    legacy_funding_purpose,
+    normalize_funding_intent,
+    normalize_lead_type,
+)
 from app.models.dealer_prospect import DealerProspect
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
@@ -138,6 +143,8 @@ async def portfolio_candidates(
         select(DealerBusiness)
         .where(
             DealerBusiness.is_training.is_(False),
+            DealerBusiness.lead_type
+            == normalize_lead_type(getattr(prospect, "lead_type", None)),
             _portfolio_identity_match(prospect),
         )
         .order_by(DealerBusiness.created_at.desc())
@@ -174,6 +181,8 @@ async def portfolio_restricted_match_exists(
         select(DealerBusiness.id)
         .where(
             DealerBusiness.is_training.is_(False),
+            DealerBusiness.lead_type
+            == normalize_lead_type(getattr(prospect, "lead_type", None)),
             _portfolio_identity_match(prospect),
             hidden_owner,
         )
@@ -219,18 +228,34 @@ async def create_portfolio_application(
         raise HTTPException(status.HTTP_409_CONFLICT, "Prospect contact is incomplete")
 
     owner_id = prospect.owner_user_id or user.id
+    lead_type = normalize_lead_type(getattr(prospect, "lead_type", None))
+    prospect_intent = normalize_funding_intent(getattr(prospect, "funding_intent", None))
+    payload_intent = normalize_funding_intent(payload.funding_intent, allow_none=False)
+    if prospect_intent is not None and prospect_intent != payload_intent:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "funding_intent_mismatch",
+                "message": "The application funding intent must match the prospect.",
+            },
+        )
+    funding_intent = prospect_intent or payload_intent
     application = DealerBusiness(
         name=company.name,
+        lead_type=lead_type,
+        funding_intent=funding_intent,
         legal_name=company.name,
         email=contact.email or prospect.email_normalized,
         phone=contact.phone_e164 or prospect.phone_normalized,
         entity_type=payload.entity_type,
         funding_goal=Decimal(str(payload.requested_amount)),
         client_requested_amount=Decimal(str(payload.requested_amount)),
-        funding_purpose=payload.funding_purpose,
+        funding_purpose=legacy_funding_purpose(funding_intent),
         use_of_proceeds_note=payload.use_of_proceeds_note,
-        industry="auto_dealer",
-        industry_label="Auto dealer",
+        industry=("auto_dealer" if lead_type == "dealer" else getattr(company, "industry", None)),
+        industry_label=(
+            "Auto dealer" if lead_type == "dealer" else getattr(company, "industry_label", None)
+        ),
         application_lifecycle="active",
         status="active",
         owner_user_id=owner_id,

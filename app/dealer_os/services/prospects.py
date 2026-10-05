@@ -25,6 +25,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.enums import Role
+from app.lead_types import (
+    intake_variant_for,
+    main_street_intent,
+    normalize_funding_intent,
+    normalize_lead_type,
+)
 from app.models.booking_notification import (
     BookingDeliveryEffect,
     BookingDeliveryOperation,
@@ -40,7 +46,7 @@ from app.models.dealer_prospect import (
 )
 from app.models.event import CalendarEvent
 from app.models.message_send import MessageSend
-from app.models.prospect_outreach import DealerProspectInboundReply
+from app.models.prospect_outreach import DealerProspectEmailDraft, DealerProspectInboundReply
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.services.payment_authorization import primary_super_admin
@@ -133,7 +139,7 @@ DEFAULT_OUTCOMES: tuple[dict[str, Any], ...] = (
         "sort_order": 40,
         "action_config": {
             "target_stage_key": "emailed",
-            "email_action": "dealer_information_pack",
+            "email_action": "information_pack",
         },
     },
     {
@@ -177,6 +183,7 @@ _ACTION_CONFIG_KEYS = frozenset(
 _STAGE_STRATEGIES = frozenset({"advance_follow_up"})
 _EMAIL_ACTIONS = frozenset(
     {
+        "information_pack",
         "dealer_information_pack",
         "missed_call",
         "callback_confirmation",
@@ -720,7 +727,12 @@ def _prospect_read_payload(
         "contact_id": prospect.primary_contact_id,
         "contact_name": contact.full_name,
         "name": contact.full_name,
+        "business_name": company.name,
         "dealer_name": company.name,
+        "lead_type": normalize_lead_type(getattr(prospect, "lead_type", None)),
+        "funding_intent": normalize_funding_intent(
+            getattr(prospect, "funding_intent", None)
+        ),
         "email": contact.email or prospect.email_normalized,
         "phone": contact.phone_e164 or prospect.phone_normalized,
         "stage_id": stage.id,
@@ -1445,6 +1457,92 @@ async def prospect_timeline(
     return page, next_cursor
 
 
+async def assert_reclassification_allowed(
+    db: AsyncSession,
+    prospect: DealerProspect,
+    *,
+    actor: User,
+    lead_type: str,
+    funding_intent: str | None,
+    reason: str | None,
+    override_converted: bool = False,
+) -> tuple[str, str | None, list[dict[str, str]]]:
+    """Validate and prepare an atomic prospect classification edit.
+
+    Sent/delivery-started drafts retain their immutable audience snapshots.
+    Every draft that has not started delivery is permanently cancelled while
+    locked in the same transaction as the prospect update.
+    """
+
+    normalized_type = normalize_lead_type(lead_type)
+    normalized_intent = normalize_funding_intent(funding_intent)
+    current_type = normalize_lead_type(getattr(prospect, "lead_type", None))
+    current_intent = normalize_funding_intent(getattr(prospect, "funding_intent", None))
+    if (normalized_type, normalized_intent) == (current_type, current_intent):
+        return normalized_type, normalized_intent, []
+    if not (reason or "").strip():
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "reclassification_reason_required",
+                "message": "Explain why the business type or funding intent is changing.",
+            },
+        )
+    converted = (
+        getattr(prospect, "conversion_target", None) is not None
+        or getattr(prospect, "converted_application_id", None) is not None
+        or getattr(prospect, "converted_intake_id", None) is not None
+    )
+    if override_converted and actor.role != Role.SUPER_ADMIN:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "prospect_reclassification_override_forbidden",
+                "message": "Only a super admin can override a converted classification.",
+            },
+        )
+    if converted and not override_converted:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "prospect_reclassification_locked",
+                "message": "A converted prospect requires a super-admin override to reclassify.",
+                "override_available": actor.role == Role.SUPER_ADMIN,
+            },
+        )
+    drafts = list(
+        (
+            await db.execute(
+                select(DealerProspectEmailDraft)
+                .where(
+                    DealerProspectEmailDraft.prospect_id == prospect.id,
+                    DealerProspectEmailDraft.status.in_(
+                        {"drafting", "pending_review", "editing", "queued", "blocked"}
+                    ),
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    cancelled_at = now_utc()
+    voided: list[dict[str, str]] = []
+    for draft in drafts:
+        previous_status = draft.status
+        draft.status = "cancelled"
+        draft.auto_send_at = None
+        draft.review_stopped_at = cancelled_at
+        draft.cancelled_at = cancelled_at
+        draft.cancelled_by_user_id = actor.id
+        draft.cancellation_source = "prospect_reclassified"
+        draft.secure_bundle_token_hash = None
+        draft.secure_bundle_expires_at = None
+        draft.version += 1
+        voided.append({"draft_id": str(draft.id), "previous_status": previous_status})
+    return normalized_type, normalized_intent, voided
+
+
 async def attach_draft_to_transition(
     db: AsyncSession,
     prospect: DealerProspect,
@@ -1492,17 +1590,35 @@ async def find_duplicates(
     email_normalized: str,
     phone_normalized: str,
     primary_contact_id: UUID | None = None,
+    lead_type: str | None = None,
+    opportunity_aware: bool = False,
     include_archived: bool = False,
     for_update: bool = False,
 ) -> list[DealerProspect]:
-    """Find identity matches globally by email OR phone.
+    """Find identity matches globally by email OR phone unless opportunity-scoped.
 
-    Dealer spelling and ownership are deliberately not identity boundaries.
-    ``dealer_name_normalized`` remains accepted during the compatibility
-    window so older callers do not need a coordinated deploy.
+    Generic identity entry remains global and directs the operator to the
+    canonical contact. An explicit All Contacts selection may open another
+    opportunity only when business name or lead type differs.
     """
 
-    del dealer_name_normalized
+    if (
+        opportunity_aware
+        and primary_contact_id is not None
+        and dealer_name_normalized
+        and lead_type
+    ):
+        normalized_type = normalize_lead_type(lead_type)
+        stmt = select(DealerProspect).where(
+            DealerProspect.primary_contact_id == primary_contact_id,
+            DealerProspect.dealer_name_normalized == dealer_name_normalized,
+            DealerProspect.lead_type == normalized_type,
+        )
+        if not include_archived:
+            stmt = stmt.where(DealerProspect.archived_at.is_(None))
+        if for_update:
+            stmt = stmt.with_for_update()
+        return list((await db.execute(stmt)).scalars().all())
     matches: list[Any] = []
     if email_normalized:
         matches.append(DealerProspect.email_normalized == email_normalized)
@@ -1880,6 +1996,10 @@ def duplicate_detail(
             {
                 "prospect_id": str(row.id),
                 "owner_user_id": str(row.owner_user_id) if row.owner_user_id else None,
+                "business_name_normalized": getattr(
+                    row, "dealer_name_normalized", None
+                ),
+                "lead_type": normalize_lead_type(getattr(row, "lead_type", None)),
             }
             for row in visible
         ],
@@ -1901,18 +2021,27 @@ async def create_prospect(
     owner_user_id: UUID | None,
     contact_id: UUID | None = None,
     initial_note: str | None = None,
+    lead_type: str = "dealer",
+    funding_intent: str | None = None,
 ) -> DealerProspect:
     require_prospect_actor(user)
+    normalized_lead_type = normalize_lead_type(lead_type)
+    normalized_funding_intent = normalize_funding_intent(funding_intent)
+    requested_business_name = dealer_name.strip()
     contact: DealerRepContact | None = None
     company: DealerRepCompany | None = None
     if contact_id is not None:
         contact = await load_visible_contact(db, user, contact_id)
         if contact.company_id is not None:
-            company = await db.get(DealerRepCompany, contact.company_id)
-            if company is None:
+            affiliated_company = await db.get(DealerRepCompany, contact.company_id)
+            if affiliated_company is None:
                 raise HTTPException(status.HTTP_409_CONFLICT, "Contact company is incomplete")
+            if normalize_dealer_name(affiliated_company.name) == normalize_dealer_name(
+                requested_business_name
+            ):
+                company = affiliated_company
         contact_name = contact.full_name
-        dealer_name = company.name if company else (contact.company or dealer_name)
+        dealer_name = requested_business_name
         if contact.email:
             if normalize_email(contact.email) != normalize_email(email):
                 raise HTTPException(
@@ -1973,6 +2102,8 @@ async def create_prospect(
         email_normalized=normalized_email,
         phone_normalized=normalized_phone,
         primary_contact_id=contact.id if contact else None,
+        lead_type=normalized_lead_type,
+        opportunity_aware=contact_id is not None,
         include_archived=True,
         for_update=True,
     )
@@ -2063,13 +2194,14 @@ async def create_prospect(
             .first()
         )
     if company is None:
-        company = DealerRepCompany(
-            owner_user_id=effective_owner_id,
-            name=dealer_name.strip(),
-            industry="auto_dealer",
-            industry_label="Auto dealer",
-            status="active",
-        )
+        company_fields: dict[str, Any] = {
+            "owner_user_id": effective_owner_id,
+            "name": dealer_name.strip(),
+            "status": "active",
+        }
+        if normalized_lead_type == "dealer":
+            company_fields.update(industry="auto_dealer", industry_label="Auto dealer")
+        company = DealerRepCompany(**company_fields)
         db.add(company)
         await db.flush()
 
@@ -2108,8 +2240,9 @@ async def create_prospect(
         db.add(contact)
         await db.flush()
     else:
-        contact.company_id = contact.company_id or company.id
-        contact.company = contact.company or company.name
+        if contact_id is None:
+            contact.company_id = contact.company_id or company.id
+            contact.company = contact.company or company.name
         contact.email = contact.email or normalized_email
         contact.phone_e164 = contact.phone_e164 or normalized_phone
         contact.last_activity_at = at
@@ -2122,6 +2255,8 @@ async def create_prospect(
         email_normalized=normalized_email,
         phone_normalized=normalized_phone,
         dealer_name_normalized=normalized_dealer,
+        lead_type=normalized_lead_type,
+        funding_intent=normalized_funding_intent,
         source=source,
         last_activity_at=at,
         version=1,
@@ -2137,6 +2272,8 @@ async def create_prospect(
             "stage_key": "new",
             "owner_user_id": str(effective_owner_id),
             "source": source,
+            "lead_type": normalized_lead_type,
+            "funding_intent": normalized_funding_intent,
         },
     )
     if initial_note:
@@ -2640,7 +2777,11 @@ async def intake_candidates(
     stmt = (
         select(PublicUnderwritingIntake)
         .where(
-            PublicUnderwritingIntake.variant == "dealer_gatekeeper_v1",
+            PublicUnderwritingIntake.variant
+            == intake_variant_for(
+                getattr(prospect, "lead_type", None),
+                getattr(prospect, "funding_intent", None),
+            ),
             identity_match,
         )
         .order_by(PublicUnderwritingIntake.created_at.desc())
@@ -2709,7 +2850,11 @@ async def intake_restricted_match_exists(
     stmt = select(
         select(PublicUnderwritingIntake.id)
         .where(
-            PublicUnderwritingIntake.variant == "dealer_gatekeeper_v1",
+            PublicUnderwritingIntake.variant
+            == intake_variant_for(
+                getattr(prospect, "lead_type", None),
+                getattr(prospect, "funding_intent", None),
+            ),
             _intake_identity_match(prospect),
             ~_intake_visible_to_user(prospect, user),
         )
@@ -2745,31 +2890,90 @@ async def create_intake_from_prospect(
     if contact is None or company is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "Prospect contact is incomplete")
 
-    # Lazy imports keep the dealer CRM independent at startup while reusing the
-    # exact bucket/checklist implementation used by the existing AI Intake.
+    # Lazy imports keep the CRM independent at startup while reusing the exact
+    # bucket/checklist implementations used by each public AI Intake.
     from app.routers.dealer_ai_intake import (
-        DEALER_VARIANT,
+        MCA_VARIANT,
         DealerIntakeStart,
+        FundingReviewStart,
+        McaRefiStart,
+        _create_bucket_for_funding_review,
         _create_bucket_for_intake,
+        _create_bucket_for_main_street,
+        _create_bucket_for_mca_refi,
         _find_or_create_client,
+        _find_or_create_funding_client,
+        _find_or_create_mca_client,
         _hash_token,
         _new_public_token,
     )
+    from app.services.application_profiles import provision_profile_for_intake
+    from app.services.main_street_programs import normalize_industry
 
-    adapter = DealerIntakeStart(
-        full_name=contact.full_name,
-        email=prospect.email_normalized,
-        phone=prospect.phone_normalized,
-        business_name=company.name,
-    )
-    client: Client = await _find_or_create_client(db, adapter)
+    lead_type = normalize_lead_type(getattr(prospect, "lead_type", None))
+    funding_intent = normalize_funding_intent(getattr(prospect, "funding_intent", None))
+    variant = intake_variant_for(lead_type, funding_intent)
+    intake_state: dict[str, Any] = {
+        "source": "dealer_prospect",
+        "prospect_id": str(prospect.id),
+        "lead_type": lead_type,
+        "funding_intent": funding_intent,
+        "messages": [],
+    }
+    if lead_type == "real_estate":
+        transaction_type = "refinance" if funding_intent == "debt_refinance" else None
+        adapter = FundingReviewStart(
+            full_name=contact.full_name,
+            email=prospect.email_normalized,
+            phone=prospect.phone_normalized,
+            investor_name=company.name,
+            transaction_type=transaction_type,
+        )
+        client = await _find_or_create_funding_client(db, adapter)
+        bucket, link = await _create_bucket_for_funding_review(db, client, adapter, request)
+        intake_state["source"] = "funding_review"
+        intake_state["funding_review_basics"] = {
+            "investor_name": company.name,
+            "transaction_type": transaction_type,
+        }
+    elif lead_type == "main_street" and variant == MCA_VARIANT:
+        adapter = McaRefiStart(
+            full_name=contact.full_name,
+            email=prospect.email_normalized,
+            phone=prospect.phone_normalized,
+            business_name=company.name,
+        )
+        client = await _find_or_create_mca_client(db, adapter)
+        bucket, link = await _create_bucket_for_mca_refi(db, client, adapter, request)
+        intake_state["source"] = "mca_refinance"
+    else:
+        adapter = DealerIntakeStart(
+            full_name=contact.full_name,
+            email=prospect.email_normalized,
+            phone=prospect.phone_normalized,
+            business_name=company.name,
+        )
+        client = await _find_or_create_client(db, adapter)
+        if lead_type == "main_street":
+            intent = main_street_intent(funding_intent)
+            industry = normalize_industry(company.industry)
+            bucket, link = await _create_bucket_for_main_street(
+                db, client, adapter, request, intent=intent, industry=industry
+            )
+            intake_state["source"] = "main_street_intake"
+            intake_state["main_street_details"] = {
+                "intent": intent,
+                "industry": industry,
+                "funding_intent": funding_intent,
+            }
+        else:
+            bucket, link = await _create_bucket_for_intake(db, client, adapter, request)
     # Preserve rep attribution without stealing a client already assigned to
     # someone else.
     if client.originating_agent_id is None:
         client.originating_agent_id = prospect.owner_user_id or user.id
     if client.current_agent_id is None:
         client.current_agent_id = prospect.owner_user_id or user.id
-    bucket, link = await _create_bucket_for_intake(db, client, adapter, request)
     token = _new_public_token()
     intake = PublicUnderwritingIntake(
         source_kind="dealer_prospect",
@@ -2781,20 +2985,18 @@ async def create_intake_from_prospect(
         bucket_upload_link_id=link.id,
         broker_id=None,
         token_hash=_hash_token(token),
-        variant=DEALER_VARIANT,
+        variant=variant,
         full_name=contact.full_name,
         email=prospect.email_normalized,
         phone=prospect.phone_normalized,
         business_name=company.name,
+        loan_purpose=funding_intent,
         asset_rows=[],
-        intake_state={
-            "source": "dealer_prospect",
-            "prospect_id": str(prospect.id),
-            "messages": [],
-        },
+        intake_state=intake_state,
     )
     db.add(intake)
     await db.flush()
+    await provision_profile_for_intake(db, intake)
     return intake
 
 

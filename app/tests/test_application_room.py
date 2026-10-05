@@ -33,6 +33,7 @@ def test_new_room_passcodes_are_six_numeric_digits() -> None:
 def test_field_desk_file_requires_one_six_digit_initial_room_pin() -> None:
     data = {
         "name": "Example LLC",
+        "lead_type": "main_street",
         "entity_type": "Limited liability company",
         "funding_goal": 250_000,
         "funding_purpose": "working_capital",

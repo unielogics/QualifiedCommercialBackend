@@ -46,6 +46,13 @@ from starlette.concurrency import run_in_threadpool
 
 from app.db import get_db
 from app.deps import CurrentUser
+from app.lead_types import (
+    application_vertical_for,
+    legacy_funding_purpose,
+    main_street_intent,
+    normalize_funding_intent,
+    normalize_lead_type,
+)
 from app.services.provider_secrets import provider_settings_status
 from app.config import get_settings
 from app.models.user import User
@@ -4084,6 +4091,9 @@ async def update_dealer(
         r.notes = None
         return r
     changes = payload.model_dump(exclude_unset=True)
+    if {"funding_intent", "funding_purpose"}.intersection(payload.model_fields_set):
+        changes["funding_intent"] = payload.funding_intent
+        changes["funding_purpose"] = legacy_funding_purpose(payload.funding_intent)
     if "status" in changes and user.role != Role.SUPER_ADMIN:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
@@ -4102,6 +4112,46 @@ async def update_dealer(
         }
         taxonomy = await application_taxonomy.canonicalize_selection(db, current, required=False)
         changes.update({key: value for key, value in taxonomy.items() if key != "taxonomy_status"})
+    current_funding_intent = None
+    if "funding_intent" in changes:
+        try:
+            current_funding_intent = normalize_funding_intent(
+                getattr(dealer, "funding_intent", None) or dealer.funding_purpose
+            )
+        except ValueError:
+            # Legacy rows may hold a catalog label in funding_purpose. Treat
+            # the first canonical write as a classification change.
+            current_funding_intent = None
+    classification_changed = (
+        (
+            "lead_type" in changes
+            and changes["lead_type"] != getattr(dealer, "lead_type", "dealer")
+        )
+        or (
+            "funding_intent" in changes
+            and normalize_funding_intent(changes["funding_intent"])
+            != current_funding_intent
+        )
+    )
+    if classification_changed:
+        has_profile = bool(
+            (
+                await db.execute(
+                    select(exists().where(ApplicationProfile.dealer_id == dealer.id))
+                )
+            ).scalar_one()
+        )
+        if has_profile or dealer.handoff_intake_id is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "application_reclassification_locked",
+                    "message": (
+                        "Business type and funding intent cannot change after the "
+                        "application workflow has started."
+                    ),
+                },
+            )
     before = {k: getattr(dealer, k) for k in changes}
     bucket_changed = (
         "bucket_id" in changes and changes["bucket_id"] != dealer.bucket_id
@@ -7436,6 +7486,31 @@ def _booking_description(
     return "\n".join(lines), program, amount, address
 
 
+def _standalone_booking_classification(
+    payload: RepAppointmentCreate, *, origin: str
+) -> tuple[str, str | None, bool]:
+    """Resolve classification without silently typing a new Field Desk lead."""
+
+    lead_type_was_explicit = "lead_type" in payload.model_fields_set
+    if origin == "field_desk" and not lead_type_was_explicit:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "lead_type_required",
+                "message": "Choose the business type before booking this new lead.",
+            },
+        )
+    if lead_type_was_explicit:
+        return payload.lead_type, payload.funding_intent, True
+    # The operator calendar predates the shared selector. Preserve its
+    # explicit pre-call vertical until every client sends lead_type.
+    return (
+        normalize_lead_type(payload.precall_variant),
+        "mca_refinance" if payload.precall_variant == "mca_refinance" else None,
+        False,
+    )
+
+
 async def _load_owned_appointment(
     db: AsyncSession,
     appointment_id: UUID,
@@ -7646,6 +7721,8 @@ def _appointment_payload(
     appt: DealerRepAppointment, *, transactional_sms_consent: bool = False
 ) -> RepAppointmentCreate:
     return RepAppointmentCreate(
+        lead_type=appt.lead_type,
+        funding_intent=appt.funding_intent,
         kind=appt.kind,
         title=appt.title,
         starts_at=appt.starts_at,
@@ -8470,6 +8547,9 @@ async def _appointment_workspace(
                 )
             ).scalars().all()
         )
+        candidate_rows = [
+            row for row in candidate_rows if _intake_matches_appointment(row, appointment)
+        ]
         application_candidates = [
             RepAppointmentApplicationCandidate(
                 intake_id=row.id,
@@ -8523,7 +8603,10 @@ async def _appointment_workspace(
             can_manage_outcomes=manages,
             can_manage_outcome_catalog=calendar_v2.can_manage_outcome_catalog(user),
             can_link_files=manages,
-            can_create_funding_loan=calendar_v2.can_create_funding_file(user),
+            can_create_funding_loan=(
+                calendar_v2.can_create_funding_file(user)
+                and _appointment_classification(appointment)[0] == "real_estate"
+            ),
             can_manage_precall=(manages or user.role == Role.FIELD_REP) and appointment.status != "cancelled",
         ),
     )
@@ -9207,6 +9290,126 @@ async def create_rep_appointment_note(
     )
 
 
+def _appointment_classification(
+    appointment: DealerRepAppointment,
+) -> tuple[str, str | None]:
+    return (
+        normalize_lead_type(getattr(appointment, "lead_type", None)),
+        normalize_funding_intent(getattr(appointment, "funding_intent", None)),
+    )
+
+
+def _appointment_admin_intake_variant(appointment: DealerRepAppointment) -> str:
+    lead_type, funding_intent = _appointment_classification(appointment)
+    if lead_type == "main_street" and funding_intent == "mca_refinance":
+        return "mca_refinance"
+    return lead_type
+
+
+def _validate_appointment_conversion_classification(
+    appointment: DealerRepAppointment,
+    *,
+    variant: str | None,
+    lead_type: str | None,
+    funding_intent: str | None,
+) -> str:
+    persisted_type, persisted_intent = _appointment_classification(appointment)
+    expected_variant = _appointment_admin_intake_variant(appointment)
+    mismatched = (
+        (variant is not None and variant != expected_variant)
+        or (
+            lead_type is not None
+            and normalize_lead_type(lead_type, default=None) != persisted_type
+        )
+        or (
+            funding_intent is not None
+            and normalize_funding_intent(funding_intent) != persisted_intent
+        )
+    )
+    if mismatched:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "appointment_classification_mismatch",
+                "message": (
+                    "The requested application type no longer matches this appointment. "
+                    "Refresh before starting the application."
+                ),
+                "lead_type": persisted_type,
+                "funding_intent": persisted_intent,
+                "variant": expected_variant,
+            },
+        )
+    return expected_variant
+
+
+def _assert_intake_matches_appointment(
+    intake: PublicUnderwritingIntake,
+    appointment: DealerRepAppointment,
+) -> None:
+    lead_type, funding_intent = _appointment_classification(appointment)
+    state = intake.intake_state or {}
+    try:
+        intake_type = normalize_lead_type(state.get("lead_type") or intake.variant)
+        intake_intent = normalize_funding_intent(
+            state.get("funding_intent")
+            or ("mca_refinance" if "mca" in str(intake.variant).casefold() else None)
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "application_classification_unknown",
+                "message": "The existing application has an unsupported business type.",
+            },
+        ) from exc
+    if intake_type != lead_type or (
+        funding_intent is not None
+        and intake_intent is not None
+        and intake_intent != funding_intent
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "application_classification_mismatch",
+                "message": "The existing application belongs to another business type.",
+            },
+        )
+
+
+def _intake_matches_appointment(
+    intake: PublicUnderwritingIntake,
+    appointment: DealerRepAppointment,
+) -> bool:
+    try:
+        _assert_intake_matches_appointment(intake, appointment)
+    except HTTPException:
+        return False
+    return True
+
+
+async def _persist_appointment_intake_classification(
+    db: AsyncSession,
+    appointment: DealerRepAppointment,
+    intake: PublicUnderwritingIntake,
+) -> None:
+    lead_type, funding_intent = _appointment_classification(appointment)
+    state = dict(intake.intake_state or {})
+    state["lead_type"] = lead_type
+    state["funding_intent"] = funding_intent
+    intake.intake_state = state
+    if funding_intent is not None:
+        intake.loan_purpose = funding_intent
+    profile = (
+        await db.execute(
+            select(ApplicationProfile).where(ApplicationProfile.intake_id == intake.id)
+        )
+    ).scalar_one_or_none()
+    if profile is not None:
+        profile.vertical = application_vertical_for(lead_type)
+        profile.funding_category = funding_intent
+
+
 async def _start_rep_appointment_application(
     appointment_id: UUID,
     payload: RepAppointmentStartApplication,
@@ -9232,6 +9435,15 @@ async def _start_rep_appointment_application(
         raise HTTPException(status.HTTP_409_CONFLICT, "A cancelled appointment cannot start an application.")
     if not appointment.invitee_email:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "A client email is required.")
+    authorized_variant = _validate_appointment_conversion_classification(
+        appointment,
+        variant=payload.variant,
+        lead_type=payload.lead_type,
+        funding_intent=payload.funding_intent,
+    )
+    appointment_lead_type, appointment_funding_intent = _appointment_classification(
+        appointment
+    )
 
     from app.routers import dealer_ai_intake as intake_api
 
@@ -9246,9 +9458,10 @@ async def _start_rep_appointment_application(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "AI intake not found.")
         if user.role == Role.FIELD_REP and existing.broker_id != user.id:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "AI intake not found.")
-        expected_variant = intake_api._ADMIN_VARIANT_CONSTANTS[payload.variant]
+        expected_variant = intake_api._ADMIN_VARIANT_CONSTANTS[authorized_variant]
         if existing.variant != expected_variant:
             raise HTTPException(status.HTTP_409_CONFLICT, "The existing intake uses another vertical.")
+        _assert_intake_matches_appointment(existing, appointment)
         if (existing.email or "").strip().lower() != appointment.invitee_email.strip().lower():
             raise HTTPException(status.HTTP_409_CONFLICT, "The existing intake belongs to another email.")
         intake_id = existing.id
@@ -9256,18 +9469,25 @@ async def _start_rep_appointment_application(
     elif intake_id is None:
         result = await intake_api._create_admin_ai_lead_core(
             intake_api.AdminLeadCreate(
-                variant=payload.variant,
+                variant=authorized_variant,
                 full_name=appointment.invitee_name,
                 email=appointment.invitee_email,
                 phone=appointment.invitee_phone,
                 business_name=appointment.company,
-                loan_purpose=appointment.program_name,
-                investor_name=appointment.company if payload.variant == "real_estate" else None,
+                loan_purpose=appointment_funding_intent or appointment.program_name,
+                intent=(
+                    main_street_intent(appointment_funding_intent)
+                    if appointment_lead_type == "main_street"
+                    else None
+                ),
+                investor_name=(
+                    appointment.company if authorized_variant == "real_estate" else None
+                ),
                 target_property_address=(
-                    appointment.full_address if payload.variant == "real_estate" else None
+                    appointment.full_address if authorized_variant == "real_estate" else None
                 ),
                 transaction_type=(
-                    appointment.program_name if payload.variant == "real_estate" else None
+                    appointment.program_name if authorized_variant == "real_estate" else None
                 ),
                 requested_amount=_appointment_amount(appointment.requested_amount),
                 notify_client=payload.notify_client,
@@ -9283,6 +9503,12 @@ async def _start_rep_appointment_application(
         created = True
         delivery_status = result.room_delivery_status
         delivery_detail = result.room_delivery_detail
+
+    intake = await db.get(PublicUnderwritingIntake, intake_id)
+    if intake is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "AI intake creation did not persist.")
+    _assert_intake_matches_appointment(intake, appointment)
+    await _persist_appointment_intake_classification(db, appointment, intake)
 
     appointment = await _load_owned_appointment(
         db, appointment_id, user, for_update=True
@@ -9312,7 +9538,7 @@ async def _start_rep_appointment_application(
         appointment,
         event_type="application_started" if created else "application_linked",
         user=user,
-        body=f"{payload.variant.replace('_', ' ').title()} application",
+        body=f"{authorized_variant.replace('_', ' ').title()} application",
         before={"crm_status": before_status},
         after={
             "crm_status": "converted",
@@ -9391,6 +9617,35 @@ async def _load_calendar_loan_file(
     return loan
 
 
+async def _loan_matches_appointment_classification(
+    db: AsyncSession,
+    loan_id: UUID,
+    appointment: DealerRepAppointment,
+) -> bool:
+    profile = (
+        await db.execute(
+            select(ApplicationProfile).where(ApplicationProfile.loan_id == loan_id)
+        )
+    ).scalar_one_or_none()
+    if profile is None:
+        return False
+    try:
+        profile_type = normalize_lead_type(profile.vertical, default=None)
+    except ValueError:
+        return False
+    return profile_type == _appointment_classification(appointment)[0]
+
+
+def _raise_cross_type_file_link() -> None:
+    raise HTTPException(
+        status.HTTP_409_CONFLICT,
+        detail={
+            "code": "appointment_file_classification_mismatch",
+            "message": "That file belongs to another business type.",
+        },
+    )
+
+
 async def _link_calendar_file(
     db: AsyncSession,
     appointment: DealerRepAppointment,
@@ -9403,24 +9658,44 @@ async def _link_calendar_file(
         "converted_intake_id": appointment.converted_intake_id,
         "linked_loan_id": appointment.linked_loan_id,
     }
+    dealer: DealerBusiness | None = None
+    intake: PublicUnderwritingIntake | None = None
+    loan: Loan | None = None
+    if kind == "dealer":
+        dealer = await resolve_dealer_scope(db, user, file_id)
+        if normalize_lead_type(getattr(dealer, "lead_type", None)) != _appointment_classification(
+            appointment
+        )[0]:
+            _raise_cross_type_file_link()
+    elif kind == "intake":
+        intake = await _load_calendar_intake_file(db, file_id, user)
+        try:
+            _assert_intake_matches_appointment(intake, appointment)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_409_CONFLICT:
+                _raise_cross_type_file_link()
+            raise
+    else:
+        loan = await _load_calendar_loan_file(db, file_id, user)
+        if not await _loan_matches_appointment_classification(db, loan.id, appointment):
+            _raise_cross_type_file_link()
+
     # Linking a different file replaces the draft this booking opened. An
     # untouched draft is archived; one the client already worked in is kept
     # (409) so nothing the client did is orphaned — promote it instead.
     if kind != "dealer" or file_id != appointment.dealer_id:
         await _supersede_booking_draft(db, appointment, user)
-    if kind == "dealer":
-        dealer = await resolve_dealer_scope(db, user, file_id)
+    if dealer is not None:
         appointment.dealer_id = dealer.id
         href = _appointment_dealer_href(dealer.id)
-    elif kind == "intake":
-        intake = await _load_calendar_intake_file(db, file_id, user)
+    elif intake is not None:
         appointment.converted_intake_id = intake.id
         profile = await application_profile_service.resolve_profile(db, "intake", intake.id, user)
         if profile.loan_id:
             appointment.linked_loan_id = profile.loan_id
         href = _appointment_intake_href(intake.id)
     else:
-        loan = await _load_calendar_loan_file(db, file_id, user)
+        assert loan is not None
         appointment.linked_loan_id = loan.id
         href = _appointment_loan_href(loan.id)
     if appointment.calendar_event_id and appointment.linked_loan_id:
@@ -9460,6 +9735,7 @@ async def _list_calendar_file_options(
     *,
     q: str,
     limit: int,
+    appointment: DealerRepAppointment | None = None,
 ) -> RepAppointmentFileOptions:
     needle = q.strip()
     pattern = f"%{needle}%"
@@ -9483,6 +9759,10 @@ async def _list_calendar_file_options(
             )
         ).scalars().all()
     )
+    if appointment is not None:
+        intakes = [
+            row for row in intakes if _intake_matches_appointment(row, appointment)
+        ]
     ranked: list[tuple[datetime | None, RepAppointmentFileOption]] = [
         (
             row.created_at,
@@ -9517,6 +9797,14 @@ async def _list_calendar_file_options(
                 )
             ).all()
         )
+        if appointment is not None:
+            loan_rows = [
+                (loan, client)
+                for loan, client in loan_rows
+                if await _loan_matches_appointment_classification(
+                    db, loan.id, appointment
+                )
+            ]
         ranked.extend(
             (
                 loan.created_at,
@@ -9546,8 +9834,14 @@ async def list_rep_appointment_file_options(
     limit: int = Query(default=200, ge=1, le=500),
 ) -> RepAppointmentFileOptions:
     _require_appointment_crm(user)
-    await _load_owned_appointment(db, appointment_id, user)
-    return await _list_calendar_file_options(db, user, q=q, limit=limit)
+    appointment = await _load_owned_appointment(db, appointment_id, user)
+    return await _list_calendar_file_options(
+        db,
+        user,
+        q=q,
+        limit=limit,
+        appointment=appointment,
+    )
 
 
 @router.get("/calendar/file-options", response_model=RepAppointmentFileOptions)
@@ -9593,6 +9887,17 @@ async def _create_calendar_funding_file(
 ) -> tuple[Loan, ApplicationProfile]:
     if not calendar_v2.can_create_funding_file(user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Underwriters create canonical funding files.")
+    if _appointment_classification(appointment)[0] != "real_estate":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "appointment_funding_file_classification_mismatch",
+                "message": (
+                    "A canonical real-estate funding file cannot be created "
+                    "for this appointment's business type."
+                ),
+            },
+        )
     client = Client(
         name=appointment.invitee_name,
         email=(appointment.invitee_email or "").strip().lower() or None,
@@ -9663,8 +9968,10 @@ async def _apply_calendar_booking_data(
         intake.email = (appointment.invitee_email or intake.email).strip().lower()
         intake.phone = appointment.invitee_phone
         intake.business_name = appointment.company
-        intake.loan_purpose = appointment.program_name
+        _, funding_intent = _appointment_classification(appointment)
+        intake.loan_purpose = funding_intent or appointment.program_name
         intake.requested_loan_amount = _appointment_amount(appointment.requested_amount)
+        await _persist_appointment_intake_classification(db, appointment, intake)
         bucket = await db.get(Bucket, intake.bucket_id)
         if bucket is not None and bucket.name_sync_mode == "linked":
             linked_name = (intake.business_name or intake.full_name or "Application").strip()[:180]
@@ -9756,6 +10063,8 @@ async def _create_calendar_follow_up(
     await db.flush()
     follow_up = DealerRepAppointment(
         dealer_id=appointment.dealer_id,
+        lead_type=appointment.lead_type,
+        funding_intent=appointment.funding_intent,
         origin=appointment.origin,
         owner_user_id=(host or user).id,
         calendar_event_id=event.id,
@@ -10049,6 +10358,8 @@ async def apply_rep_appointment_outcome(
                 appointment.id,
                 RepAppointmentStartApplication(
                     variant=payload.variant,
+                    lead_type=payload.lead_type,
+                    funding_intent=payload.funding_intent,
                     secure_room_pin=payload.secure_room_pin,
                     notify_client=payload.notify_client,
                 ),
@@ -10616,6 +10927,11 @@ async def create_standalone_rep_appointment(
     duration = payload.duration_min or booking.duration_min or 20
     phone = consent_delivery.normalize_phone(payload.invitee_phone)
     origin = precall.origin_for(payload.origin, is_rep=is_rep(user))
+    (
+        appointment_lead_type,
+        appointment_funding_intent,
+        classification_was_explicit,
+    ) = _standalone_booking_classification(payload, origin=origin)
     request_fingerprint = booking_operations.creation_request_fingerprint(
         {
             "surface": "standalone",
@@ -10761,6 +11077,8 @@ async def create_standalone_rep_appointment(
     await db.flush()
     appt = DealerRepAppointment(
         dealer_id=None,
+        lead_type=appointment_lead_type,
+        funding_intent=appointment_funding_intent,
         owner_user_id=host.id,
         calendar_event_id=ev.id,
         kind=payload.kind,
@@ -10847,16 +11165,32 @@ async def create_standalone_rep_appointment(
         marketing=False,
         method="in_person_device",
     )
+    precall_variant = payload.precall_variant
+    if classification_was_explicit:
+        precall_variant = (
+            "mca_refinance"
+            if payload.lead_type == "main_street"
+            and payload.funding_intent == "mca_refinance"
+            else payload.lead_type
+        )
     draft = await _open_booking_draft(
         db, notice=notice, event=ev, booking=booking, host=host, appointment=appt, contact=contact,
         booked_by=user, company=payload.company, notes=payload.notes, kind=payload.kind, origin=appt.origin,
         request=request,
         start_precall_preparation=payload.start_precall_preparation,
-        precall_variant=payload.precall_variant,
+        precall_variant=precall_variant,
         application_data={
             "requested_amount": requested_amount,
             "program_name": program,
             "source": "manual_calendar",
+            **(
+                {
+                    "lead_type": payload.lead_type,
+                    "funding_intent": payload.funding_intent,
+                }
+                if classification_was_explicit
+                else {}
+            ),
         },
     )
     thread = await _ensure_rep_thread(
@@ -11137,6 +11471,10 @@ async def create_rep_appointment(
     await db.flush()
     appt = DealerRepAppointment(
         dealer_id=dealer.id,
+        lead_type=normalize_lead_type(getattr(dealer, "lead_type", None)),
+        funding_intent=normalize_funding_intent(
+            getattr(dealer, "funding_intent", None) or dealer.funding_purpose
+        ),
         owner_user_id=host.id,
         calendar_event_id=ev.id,
         kind=payload.kind,
@@ -12176,6 +12514,19 @@ def _precall_readiness_payload(ready) -> dict:
 async def _convert_appointment_to_field_desk(
     db: AsyncSession, appt: DealerRepAppointment, user: User
 ) -> DealerBusiness:
+    source_prospect = (
+        await db.get(DealerProspect, appt.prospect_id) if appt.prospect_id else None
+    )
+    lead_type = normalize_lead_type(
+        getattr(source_prospect, "lead_type", None)
+        if source_prospect is not None
+        else getattr(appt, "lead_type", None)
+    )
+    funding_intent = normalize_funding_intent(
+        getattr(source_prospect, "funding_intent", None)
+        if source_prospect is not None
+        else getattr(appt, "funding_intent", None)
+    )
     if appt.converted_dealer_id:
         existing = await db.get(DealerBusiness, appt.converted_dealer_id)
         if existing:
@@ -12187,10 +12538,16 @@ async def _convert_appointment_to_field_desk(
             # in place: owners, bank consent, Plaid items, credit pulls and
             # uploads are already on the row, so nothing is copied.
             await precall.promote_draft(db, existing, user, source="appointment_conversion")
+            if source_prospect is not None:
+                existing.lead_type = lead_type
+                existing.funding_intent = funding_intent
+                existing.funding_purpose = legacy_funding_purpose(funding_intent)
             return existing
     owner_id = appt.booked_by_user_id or user.id
     dealer = DealerBusiness(
         name=appt.company or appt.invitee_name,
+        lead_type=lead_type,
+        funding_intent=funding_intent,
         legal_name=appt.company or appt.invitee_name,
         email=appt.invitee_email,
         phone=appt.invitee_phone,
@@ -12200,7 +12557,8 @@ async def _convert_appointment_to_field_desk(
         zip=appt.zip,
         funding_goal=_appointment_amount(appt.requested_amount),
         client_requested_amount=_appointment_amount(appt.requested_amount),
-        funding_purpose=(appt.program_name or "other")[:48],
+        funding_purpose=legacy_funding_purpose(funding_intent)
+        or (appt.program_name or "other")[:48],
         notes="\n\n".join(part for part in [appt.notes, "Created from converted appointment."] if part),
         application_lifecycle="draft",
         owner_user_id=owner_id,
@@ -12252,12 +12610,21 @@ async def _convert_appointment_to_ai_intake(
     appt: DealerRepAppointment,
     user: User,
     request: Request,
-    variant: str,
+    variant: str | None,
+    lead_type: str | None,
+    funding_intent: str | None,
     notify_client: bool,
     secure_room_pin: str,
 ) -> UUID:
     if appt.converted_intake_id:
         return appt.converted_intake_id
+    authorized_variant = _validate_appointment_conversion_classification(
+        appt,
+        variant=variant,
+        lead_type=lead_type,
+        funding_intent=funding_intent,
+    )
+    appointment_lead_type, appointment_funding_intent = _appointment_classification(appt)
     await _supersede_booking_draft(db, appt, user)
     # Reuse the production admin-intake path so bucket setup, access controls,
     # requested documents, client ownership, and notification behavior stay
@@ -12268,14 +12635,24 @@ async def _convert_appointment_to_ai_intake(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "An email is required to create an AI intake.")
     result = await intake_api._create_admin_ai_lead_core(
         intake_api.AdminLeadCreate(
-            variant=variant,
+            variant=authorized_variant,
             full_name=appt.invitee_name,
             email=appt.invitee_email,
             phone=appt.invitee_phone,
             business_name=appt.company,
-            investor_name=appt.company if variant == "real_estate" else None,
-            target_property_address=appt.full_address if variant == "real_estate" else None,
-            transaction_type=appt.program_name if variant == "real_estate" else None,
+            loan_purpose=appointment_funding_intent or appt.program_name,
+            intent=(
+                main_street_intent(appointment_funding_intent)
+                if appointment_lead_type == "main_street"
+                else None
+            ),
+            investor_name=appt.company if authorized_variant == "real_estate" else None,
+            target_property_address=(
+                appt.full_address if authorized_variant == "real_estate" else None
+            ),
+            transaction_type=(
+                appt.program_name if authorized_variant == "real_estate" else None
+            ),
             requested_amount=_appointment_amount(appt.requested_amount),
             notify_client=notify_client,
             secure_room_pin=secure_room_pin,
@@ -12285,6 +12662,7 @@ async def _convert_appointment_to_ai_intake(
         user=user,
         db=db,
     )
+    await _persist_appointment_intake_classification(db, appt, result.intake)
     return result.intake.id
 
 
@@ -12324,7 +12702,9 @@ async def set_rep_appointment_outcome(
                 appt=appt,
                 user=user,
                 request=request,
-                variant=payload.ai_variant or "dealer",
+                variant=payload.ai_variant,
+                lead_type=payload.lead_type,
+                funding_intent=payload.funding_intent,
                 notify_client=payload.notify_client,
                 secure_room_pin=payload.secure_room_pin or "",
             )
@@ -12679,6 +13059,10 @@ async def book_underwriting_review_preference(
         program_name=payload.program_name,
     )
     appointment_payload = RepAppointmentCreate(
+        lead_type=normalize_lead_type(getattr(dealer, "lead_type", None)),
+        funding_intent=normalize_funding_intent(
+            getattr(dealer, "funding_intent", None) or dealer.funding_purpose
+        ),
         kind="underwriting_review",
         starts_at=starts_at,
         duration_min=booking.duration_min,
@@ -12718,6 +13102,8 @@ async def book_underwriting_review_preference(
     await db.flush()
     appointment = DealerRepAppointment(
         dealer_id=dealer.id,
+        lead_type=appointment_payload.lead_type,
+        funding_intent=appointment_payload.funding_intent,
         origin="field_desk",
         owner_user_id=host.id,
         calendar_event_id=event.id,

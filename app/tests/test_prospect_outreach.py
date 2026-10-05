@@ -1296,7 +1296,7 @@ async def test_final_suppression_check_follows_prospect_row_lock(monkeypatch):
         execute=AsyncMock(return_value=assets_result),
         commit=AsyncMock(),
     )
-    monkeypatch.setattr(outreach, "load_draft", AsyncMock(side_effect=[row, row]))
+    monkeypatch.setattr(outreach, "load_draft", AsyncMock(side_effect=[row, row, row]))
     monkeypatch.setattr(outreach, "validate_current_draft_copy", AsyncMock())
     monkeypatch.setattr(outreach, "is_suppressed", check_suppression)
     monkeypatch.setattr(outreach, "sync_draft_notifications", AsyncMock())
@@ -1484,6 +1484,91 @@ def test_program_section_is_rendered_only_from_the_canonical_dealer_catalog():
     assert rendered.count("Availability and terms depend") == 1
 
 
+@pytest.mark.parametrize(
+    ("lead_type", "audience_copy"),
+    [
+        ("main_street", "We would like to learn more about your dealership."),
+        ("real_estate", "We help automotive dealers plan their next step."),
+        ("dealer", "This is for your Main Street business."),
+    ],
+)
+def test_generated_copy_rejects_cross_audience_terminology(
+    lead_type: str, audience_copy: str
+) -> None:
+    with pytest.raises(ValueError, match="audience terminology"):
+        outreach.validate_generated_copy(
+            subject="Following up",
+            body=f"Hi Alex,\n\n{audience_copy}",
+            catalog_snapshot=[],
+            lead_type=lead_type,
+        )
+
+
+def test_manual_copy_guard_does_not_apply_audience_style_restrictions() -> None:
+    outreach.validate_generated_copy(
+        subject="Following up",
+        body="Hi Alex,\n\nThank you for speaking with your dealership.",
+        catalog_snapshot=[],
+    )
+
+
+def test_seeded_fallbacks_pass_their_own_audience_guard() -> None:
+    for lead_type in outreach.SUPPORTED_LEAD_TYPES:
+        profile = outreach.outreach_profile_snapshot(
+            outreach.default_outreach_profile(lead_type)
+        )
+        for purpose in outreach.ALL_CANONICAL_PURPOSES:
+            fallback = outreach._purpose_fallback(
+                purpose=purpose,
+                contact_name="Alex Morgan",
+                dealer_name="Example Business",
+                profile=profile,
+            )
+            outreach.validate_generated_copy(
+                subject=fallback.subject,
+                body=fallback.body,
+                catalog_snapshot=[],
+                lead_type=lead_type,
+            )
+
+
+@pytest.mark.asyncio
+async def test_draft_persistence_rejects_reclassification_after_ai_generation() -> None:
+    prospect = DealerProspect(
+        id=uuid.uuid4(),
+        owner_user_id=uuid.uuid4(),
+        company_id=uuid.uuid4(),
+        primary_contact_id=uuid.uuid4(),
+        stage_definition_id=uuid.uuid4(),
+        email_normalized="alex@example.com",
+        phone_normalized="+12025550100",
+        dealer_name_normalized="example business",
+        lead_type="dealer",
+        funding_intent="general_capital",
+        version=4,
+        source="quick_add",
+    )
+    reclassified = SimpleNamespace(
+        id=prospect.id,
+        version=5,
+        lead_type="main_street",
+        funding_intent="working_capital",
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=reclassified))
+
+    with pytest.raises(outreach.OutreachConflict, match="changed while this email"):
+        await outreach._lock_prospect_draft_snapshot(
+            db,
+            prospect=prospect,
+            expected_version=4,
+            expected_lead_type="dealer",
+            expected_funding_intent="general_capital",
+        )
+
+    db.get.assert_awaited_once_with(
+        DealerProspect, prospect.id, with_for_update=True
+    )
+
 def test_dealer_information_fallback_has_only_one_availability_disclaimer():
     fallback = outreach._purpose_fallback(
         purpose="dealer_information",
@@ -1659,7 +1744,10 @@ async def test_manual_edit_cannot_bypass_current_firm_policy(monkeypatch):
 async def test_new_policy_blocks_an_already_pending_draft_at_dispatch(monkeypatch):
     row = _draft(status="pending_review", version=2)
     row.editable_body = "Hi Alex, ask about our special phrase."
-    db = SimpleNamespace(commit=AsyncMock())
+    db = SimpleNamespace(
+        get=AsyncMock(return_value=SimpleNamespace()),
+        commit=AsyncMock(),
+    )
     monkeypatch.setattr(outreach, "load_draft", AsyncMock(return_value=row))
     monkeypatch.setattr(outreach, "sync_draft_notifications", AsyncMock())
     monkeypatch.setattr(
@@ -2743,6 +2831,7 @@ async def test_marketing_email_log_filters_and_paginates_without_general_audit(m
         draft_statuses=["sent"],
         delivery_statuses=["delivered"],
         source="manual",
+        lead_type="main_street",
         owner_user_id=owner_id,
         q="Example Motors",
         due="all",
@@ -2758,6 +2847,7 @@ async def test_marketing_email_log_filters_and_paginates_without_general_audit(m
     rows_sql = str(db.execute.await_args_list[1].args[0])
     for statement in (count_sql, rows_sql):
         assert "dealer_prospect_email_drafts.compose_mode" in statement
+        assert "dealer_prospect_email_drafts.lead_type" in statement
         assert "message_sends.prospect_draft_id" in statement
         assert "message_sends.status" in statement
         assert "dealer_prospects.owner_user_id" in statement
@@ -2788,6 +2878,7 @@ async def test_marketing_email_log_rejects_unknown_delivery_state_before_query()
             draft_statuses=[],
             delivery_statuses=["opened"],
             source=None,
+            lead_type=None,
             owner_user_id=None,
             q=None,
             due="all",
@@ -2901,7 +2992,7 @@ def test_seeded_outreach_profiles_are_versioned_and_render_type_specific_copy(mo
         unsubscribe_url="https://api.qualifiedcommercial.com/unsubscribe/token",
         profile=main_street,
     )
-    assert "industries/main-street" in footer
+    assert "industries/business" in footer
     assert "Unsubscribe from Business Desk email:" in footer
 
 

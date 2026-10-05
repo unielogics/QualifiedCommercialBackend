@@ -205,7 +205,7 @@ class ProspectOutreachProfileList(BaseModel):
 class ProspectTestEmailRequest(BaseModel):
     idempotency_key: UUID
     lead_type: LeadType = "dealer"
-    purpose: DraftPurpose = "dealer_information"
+    purpose: DraftPurpose = "information"
     sample_contact_name: str = Field(default="Alex Morgan", min_length=1, max_length=160)
     sample_dealer_name: str = Field(default="Example Motors", min_length=1, max_length=180)
     sample_business_name: str | None = Field(default=None, min_length=1, max_length=180)
@@ -290,7 +290,7 @@ class ProspectTestEmailResponse(BaseModel):
 class ProspectEmailDraftCreate(BaseModel):
     idempotency_key: UUID = Field(default_factory=uuid4)
     compose_mode: Literal["ai", "manual"] = "ai"
-    purpose: DraftPurpose = "dealer_information"
+    purpose: DraftPurpose = "information"
     subject: str | None = Field(default=None, min_length=1, max_length=240)
     body: str | None = Field(default=None, min_length=1, max_length=30_000)
     ai_instructions: str | None = Field(default=None, max_length=1500)

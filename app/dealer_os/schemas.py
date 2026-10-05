@@ -7,8 +7,15 @@ from typing import Literal
 from datetime import date, datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
+from app.lead_types import (
+    FundingIntent,
+    LeadType,
+    legacy_funding_purpose,
+    normalize_funding_intent,
+    normalize_lead_type,
+)
 from app.schemas.booking_settings import UserBookingSettingsRead
 
 
@@ -31,7 +38,13 @@ class UseOfProceedsRow(BaseModel):
 
 
 class DealerCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=180)
+    name: str = Field(
+        min_length=1,
+        max_length=180,
+        validation_alias=AliasChoices("business_name", "name"),
+    )
+    lead_type: LeadType
+    funding_intent: FundingIntent | None = None
     entity_type: str = Field(min_length=1, max_length=32)
     legal_name: str | None = None
     ein: str | None = None
@@ -52,7 +65,7 @@ class DealerCreate(BaseModel):
     naics_label: str | None = Field(default=None, min_length=1, max_length=180)
     notes: str | None = None
     funding_goal: float = Field(gt=0, le=999_999_999_999.99)
-    funding_purpose: str = Field(pattern=_FUNDING_PURPOSES)
+    funding_purpose: str | None = None
     use_of_proceeds_note: str = Field(min_length=1, max_length=4000)
     secure_room_pin: str = Field(pattern=r"^[0-9]{6}$")
     group_id: UUID | None = None  # 0120: client file this LLC belongs to
@@ -62,6 +75,32 @@ class DealerCreate(BaseModel):
     # Consent captured in the same moment as the file. Optional, because a rep
     # may have only an email, or the owner may decline: a file must still open.
     sms_consent: "SmsConsentIn | None" = None
+
+    @field_validator("lead_type", mode="before")
+    @classmethod
+    def normalize_type(cls, value: object) -> LeadType:
+        return normalize_lead_type(value, default=None)
+
+    @field_validator("funding_intent", mode="before")
+    @classmethod
+    def normalize_intent(cls, value: object) -> FundingIntent | None:
+        return normalize_funding_intent(value)
+
+    @model_validator(mode="after")
+    def normalize_funding_classification(self) -> "DealerCreate":
+        new_intent = normalize_funding_intent(self.funding_intent)
+        legacy_intent = normalize_funding_intent(self.funding_purpose)
+        if new_intent is None and legacy_intent is None:
+            raise ValueError("funding_intent is required")
+        if new_intent is not None and legacy_intent is not None and new_intent != legacy_intent:
+            raise ValueError("funding_intent and funding_purpose disagree")
+        self.funding_intent = new_intent or legacy_intent
+        self.funding_purpose = legacy_funding_purpose(self.funding_intent)
+        return self
+
+    @property
+    def business_name(self) -> str:
+        return self.name
 
 
 class SmsConsentIn(BaseModel):
@@ -118,7 +157,11 @@ class SmsDisclosureOut(BaseModel):
 
 
 class DealerUpdate(BaseModel):
-    name: str | None = None
+    name: str | None = Field(
+        default=None, validation_alias=AliasChoices("business_name", "name")
+    )
+    lead_type: LeadType | None = None
+    funding_intent: FundingIntent | None = None
     bucket_id: UUID | None = None  # manual bucket link/unlink (PATCH with null unlinks)
     legal_name: str | None = None
     ein: str | None = None
@@ -144,10 +187,45 @@ class DealerUpdate(BaseModel):
     naics_code: str | None = None
     naics_label: str | None = None
     funding_goal: float | None = Field(default=None, gt=0, le=999_999_999_999.99)
-    funding_purpose: str | None = Field(default=None, pattern=_FUNDING_PURPOSES)
+    funding_purpose: str | None = None
     group_id: UUID | None = None  # 0120: client file link (PATCH null detaches)
     use_of_proceeds: list[UseOfProceedsRow] | None = None
     use_of_proceeds_note: str | None = Field(default=None, max_length=4000)
+
+    @field_validator("lead_type", mode="before")
+    @classmethod
+    def normalize_type(cls, value: object) -> LeadType | None:
+        return normalize_lead_type(value, default=None)
+
+    @field_validator("funding_intent", mode="before")
+    @classmethod
+    def normalize_intent(cls, value: object) -> FundingIntent | None:
+        return normalize_funding_intent(value)
+
+    @model_validator(mode="after")
+    def normalize_funding_classification(self) -> "DealerUpdate":
+        has_intent = "funding_intent" in self.model_fields_set
+        has_legacy = "funding_purpose" in self.model_fields_set
+        if not has_intent and not has_legacy:
+            return self
+        new_intent = normalize_funding_intent(self.funding_intent)
+        legacy_intent = normalize_funding_intent(self.funding_purpose)
+        if (
+            has_intent
+            and has_legacy
+            and new_intent is not None
+            and legacy_intent is not None
+            and new_intent != legacy_intent
+        ):
+            raise ValueError("funding_intent and funding_purpose disagree")
+        resolved = new_intent if has_intent else legacy_intent
+        self.funding_intent = resolved
+        self.funding_purpose = legacy_funding_purpose(resolved)
+        return self
+
+    @property
+    def business_name(self) -> str | None:
+        return self.name
 
 
 class DealerWorkflowSettingsPatch(BaseModel):
@@ -166,6 +244,9 @@ class DealerWorkflowSettingsPatch(BaseModel):
 class DealerRead(ORM):
     id: UUID
     name: str
+    business_name: str = Field(validation_alias=AliasChoices("business_name", "name"))
+    lead_type: LeadType = "dealer"
+    funding_intent: FundingIntent | None = None
     email: str | None = None
     phone: str | None = None
     case_ref: str | None = None
@@ -240,6 +321,9 @@ class ConvertToAuditResult(BaseModel):
 class DealerListItem(ORM):
     id: UUID
     name: str
+    business_name: str = Field(validation_alias=AliasChoices("business_name", "name"))
+    lead_type: LeadType = "dealer"
+    funding_intent: FundingIntent | None = None
     email: str | None = None
     phone: str | None = None
     case_ref: str | None = None
@@ -801,6 +885,8 @@ class RepAppointmentRead(ORM):
     id: UUID
     dealer_id: UUID | None = None
     prospect_id: UUID | None = None
+    lead_type: LeadType | None = None
+    funding_intent: FundingIntent | None = None
     return_stage_id: UUID | None = None
     owner_user_id: UUID | None = None
     owner_name: str | None = None
@@ -971,6 +1057,8 @@ class RepAppointmentCreate(BaseModel):
     creation_idempotency_key: str | None = Field(
         default=None, min_length=8, max_length=80
     )
+    lead_type: LeadType = "dealer"
+    funding_intent: FundingIntent | None = None
     kind: Literal[
         "callback",
         "program_intro",
@@ -1019,6 +1107,16 @@ class RepAppointmentCreate(BaseModel):
             "entity_documents",
         ]
     ] = Field(default_factory=list, max_length=4)
+
+    @field_validator("lead_type", mode="before")
+    @classmethod
+    def normalize_appointment_type(cls, value: object) -> LeadType:
+        return normalize_lead_type(value, default=None)
+
+    @field_validator("funding_intent", mode="before")
+    @classmethod
+    def normalize_appointment_intent(cls, value: object) -> FundingIntent | None:
+        return normalize_funding_intent(value)
 
     @model_validator(mode="before")
     @classmethod
@@ -1088,6 +1186,8 @@ class RepAppointmentOutcomePatch(BaseModel):
     note: str | None = Field(default=None, max_length=2000)
     conversion_target: Literal["field_desk", "ai_intake"] | None = None
     ai_variant: Literal["dealer", "real_estate", "main_street", "mca_refinance"] | None = None
+    lead_type: LeadType | None = None
+    funding_intent: FundingIntent | None = None
     notify_client: bool = False
     secure_room_pin: str | None = Field(default=None, pattern=r"^[0-9]{6}$")
 
@@ -1095,8 +1195,6 @@ class RepAppointmentOutcomePatch(BaseModel):
     def _conversion_requires_destination(self) -> "RepAppointmentOutcomePatch":
         if self.outcome == "converted" and self.conversion_target is None:
             raise ValueError("Choose a conversion destination.")
-        if self.conversion_target == "ai_intake" and self.ai_variant is None:
-            raise ValueError("Choose an AI intake type.")
         if self.conversion_target == "ai_intake" and self.secure_room_pin is None:
             raise ValueError("Create a six-digit secure room PIN.")
         return self
@@ -1224,7 +1322,9 @@ class RepAppointmentNoteCreate(BaseModel):
 
 
 class RepAppointmentStartApplication(BaseModel):
-    variant: Literal["dealer", "real_estate", "main_street", "mca_refinance"]
+    variant: Literal["dealer", "real_estate", "main_street", "mca_refinance"] | None = None
+    lead_type: LeadType | None = None
+    funding_intent: FundingIntent | None = None
     secure_room_pin: str | None = Field(default=None, pattern=r"^[0-9]{6}$")
     notify_client: bool = False
     existing_intake_id: UUID | None = None
@@ -1307,6 +1407,8 @@ class RepAppointmentApplyOutcome(BaseModel):
     existing_file_kind: AppointmentFileKind | None = None
     existing_file_id: UUID | None = None
     variant: Literal["dealer", "real_estate", "main_street", "mca_refinance"] | None = None
+    lead_type: LeadType | None = None
+    funding_intent: FundingIntent | None = None
     secure_room_pin: str | None = Field(default=None, pattern=r"^[0-9]{6}$")
     notify_client: bool = False
     apply_booking_data: bool = False

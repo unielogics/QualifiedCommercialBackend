@@ -92,7 +92,12 @@ class DealerProspect(TimestampMixin, Base):
 
     __tablename__ = "dealer_prospects"
     __table_args__ = (
-        UniqueConstraint("primary_contact_id", name="uq_dealer_prospect_primary_contact"),
+        UniqueConstraint(
+            "primary_contact_id",
+            "dealer_name_normalized",
+            "lead_type",
+            name="uq_dealer_prospect_contact_opportunity",
+        ),
         Index("ix_dealer_prospect_owner_stage", "owner_user_id", "stage_definition_id"),
         Index("ix_dealer_prospect_follow_up", "next_follow_up_at"),
         Index("ix_dealer_prospect_activity", "last_activity_at"),
@@ -111,6 +116,7 @@ class DealerProspect(TimestampMixin, Base):
         Index(
             "uq_dealer_prospect_email_active",
             "dealer_name_normalized",
+            "lead_type",
             "email_normalized",
             unique=True,
             postgresql_where=text("archived_at IS NULL AND email_normalized IS NOT NULL"),
@@ -118,11 +124,22 @@ class DealerProspect(TimestampMixin, Base):
         Index(
             "uq_dealer_prospect_phone_active",
             "dealer_name_normalized",
+            "lead_type",
             "phone_normalized",
             unique=True,
             postgresql_where=text("archived_at IS NULL AND phone_normalized IS NOT NULL"),
         ),
         CheckConstraint("version > 0", name="ck_dealer_prospect_version_positive"),
+        CheckConstraint(
+            "lead_type IN ('dealer','main_street','real_estate')",
+            name="ck_dealer_prospect_lead_type",
+        ),
+        CheckConstraint(
+            "funding_intent IS NULL OR funding_intent IN "
+            "('general_capital','working_capital','equipment','business_acquisition',"
+            "'real_estate','debt_refinance','mca_refinance','other')",
+            name="ck_dealer_prospect_funding_intent",
+        ),
         CheckConstraint(
             "conversion_target IS NULL OR conversion_target IN "
             "('portfolio_application','dealer_ai_intake')",
@@ -182,6 +199,14 @@ class DealerProspect(TimestampMixin, Base):
         ForeignKey("dos_dealers.id", ondelete="RESTRICT"),
         nullable=True,
     )
+
+    # Canonical Field Desk classification.  Existing rows and omitted API
+    # values remain dealers for backwards compatibility with the original
+    # single-vertical pipeline.
+    lead_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="dealer", server_default="dealer", index=True
+    )
+    funding_intent: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # Normalized identity is stored on the prospect as a race-safe duplicate
     # guard.  Contact rows predate this pipeline and do not have global unique

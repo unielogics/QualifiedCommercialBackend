@@ -24,6 +24,7 @@ from app.dealer_os.models import (
 )
 from app.dealer_os.services import plaid_client
 from app.enums import Role
+from app.lead_types import application_vertical_for, normalize_funding_intent
 from app.models.activity import Activity
 from app.models.application_profile import (
     ApplicationExtractedFact,
@@ -764,6 +765,9 @@ async def _load_source(
 
 
 def _vertical_for_intake(intake: PublicUnderwritingIntake) -> str:
+    classified_type = (getattr(intake, "intake_state", None) or {}).get("lead_type")
+    if classified_type:
+        return application_vertical_for(classified_type)
     variant = (intake.variant or "").lower()
     if "mca" in variant:
         return "mca"
@@ -776,6 +780,15 @@ def _vertical_for_intake(intake: PublicUnderwritingIntake) -> str:
     ):
         return "real_estate"
     return "main_street"
+
+
+def _canonical_funding_category(value: object | None) -> str | None:
+    """Normalize known intent keys while preserving old catalog labels."""
+
+    try:
+        return normalize_funding_intent(value)
+    except ValueError:
+        return str(value).strip() or None if value is not None else None
 
 
 def _split_name(name: str) -> tuple[str, str]:
@@ -822,7 +835,8 @@ async def provision_profile_for_intake(
         client_id=intake.client_id,
         primary_bucket_id=intake.bucket_id,
         vertical=_vertical_for_intake(intake),
-        funding_category=intake.loan_purpose,
+        funding_category=(intake.intake_state or {}).get("funding_intent")
+        or intake.loan_purpose,
         industry=((intake.intake_state or {}).get("main_street_details") or {}).get("industry"),
     )
     db.add(profile)
@@ -1044,15 +1058,21 @@ async def resolve_profile(
             profile.client_id = source.client_id
             profile.primary_bucket_id = source.bucket_id
             profile.vertical = _vertical_for_intake(source)
-            profile.funding_category = source.loan_purpose
+            profile.funding_category = (source.intake_state or {}).get(
+                "funding_intent"
+            ) or source.loan_purpose
             detail = (source.intake_state or {}).get("main_street_details") or {}
             profile.industry = detail.get("industry")
         else:
             profile.dealer_id = source.id
             profile.intake_id = source.handoff_intake_id
             profile.primary_bucket_id = source.bucket_id
-            profile.vertical = "dealer"
-            profile.funding_category = source.funding_purpose
+            profile.vertical = application_vertical_for(
+                getattr(source, "lead_type", None)
+            )
+            profile.funding_category = _canonical_funding_category(
+                getattr(source, "funding_intent", None) or source.funding_purpose
+            )
             profile.entity_type = source.entity_type
             profile.industry = source.industry
             profile.naics_code = source.naics_code

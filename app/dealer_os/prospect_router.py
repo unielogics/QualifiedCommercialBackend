@@ -19,6 +19,7 @@ from sqlalchemy.orm import aliased
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Role
+from app.lead_types import FundingIntent, LeadType
 from app.models.dealer_prospect import (
     DealerProspect,
     DealerProspectActivity,
@@ -316,7 +317,8 @@ async def _validate_outcome_target(
 
 
 _EMAIL_PURPOSES = {
-    "dealer_information_pack": "dealer_information",
+    "information_pack": "information",
+    "dealer_information_pack": "information",
     "missed_call": "missed_call",
     "callback_confirmation": "callback_confirmation",
     "client_will_call_back": "client_will_call_back",
@@ -334,7 +336,7 @@ async def _create_action_draft(
     cc_emails: list[str] | None = None,
     cc_scope: str = "this_email",
 ):
-    purpose = _EMAIL_PURPOSES.get(action, "dealer_information")
+    purpose = _EMAIL_PURPOSES.get(action, "information")
     try:
         return await outreach_service.create_draft(
             db,
@@ -408,9 +410,12 @@ async def list_prospects(
     q: str = Query(default="", max_length=160),
     stage_key: str | None = Query(default=None, max_length=64),
     outcome_key: str | None = Query(default=None, max_length=64),
+    lead_type: LeadType | None = None,
+    funding_intent: FundingIntent | None = None,
     owner_user_id: UUID | None = None,
     follow_up_before: datetime | None = None,
     sort_by: Literal[
+        "business_name",
         "dealer_name",
         "contact_name",
         "stage",
@@ -465,6 +470,10 @@ async def list_prospects(
                 follow_up_timezone=follow_up_timezone,
             )
         filters.append(DealerProspect.last_outcome_definition_id == outcome_id)
+    if lead_type:
+        filters.append(DealerProspect.lead_type == lead_type)
+    if funding_intent:
+        filters.append(DealerProspect.funding_intent == funding_intent)
     if owner_user_id:
         # Reps may ask for their own value, but never use this filter to probe
         # another rep's book.
@@ -512,6 +521,7 @@ async def list_prospects(
         ).scalar_one()
     )
     sort_columns = {
+        "business_name": func.lower(DealerRepCompany.name),
         "dealer_name": func.lower(DealerRepCompany.name),
         "contact_name": func.lower(DealerRepContact.full_name),
         "stage": DealerProspectStageDefinition.sort_order,
@@ -569,13 +579,15 @@ async def quick_add_prospect(
             db,
             user,
             contact_name=payload.contact_name,
-            dealer_name=payload.dealer_name,
+            dealer_name=payload.business_name,
             email=str(payload.email),
             phone=payload.phone,
             source=payload.source,
             owner_user_id=payload.owner_user_id,
             contact_id=payload.contact_id,
             initial_note=payload.initial_note,
+            lead_type=payload.lead_type,
+            funding_intent=payload.funding_intent,
         )
     except IntegrityError as exc:
         # The scoped unique indexes are the race-proof second line after the
@@ -583,10 +595,12 @@ async def quick_add_prospect(
         await db.rollback()
         duplicates = await service.find_duplicates(
             db,
-            dealer_name_normalized=service.normalize_dealer_name(payload.dealer_name),
+            dealer_name_normalized=service.normalize_dealer_name(payload.business_name),
             email_normalized=service.normalize_email(str(payload.email)),
             phone_normalized=payload.phone,
             primary_contact_id=payload.contact_id,
+            lead_type=payload.lead_type,
+            opportunity_aware=payload.contact_id is not None,
             include_archived=True,
         )
         raise HTTPException(
@@ -612,6 +626,8 @@ async def check_prospect_duplicate(
     email: Annotated[EmailStr | None, Query()] = None,
     phone: Annotated[str | None, Query(max_length=48)] = None,
     contact_id: UUID | None = None,
+    business_name: Annotated[str | None, Query(max_length=180)] = None,
+    lead_type: LeadType | None = None,
 ) -> ProspectDuplicateCheckRead:
     """Privacy-preserving, advisory identity check for quick-add forms.
 
@@ -624,6 +640,9 @@ async def check_prospect_duplicate(
     service.require_team_or_rep(user)
     normalized_email = service.normalize_email(str(email)) if email else None
     normalized_phone = service.normalize_phone(phone) if phone and phone.strip() else None
+    normalized_business = (
+        service.normalize_dealer_name(business_name) if business_name else None
+    )
     if not normalized_email and not normalized_phone and contact_id is None:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -644,6 +663,13 @@ async def check_prospect_duplicate(
         email_normalized=normalized_email or "",
         phone_normalized=normalized_phone or "",
         primary_contact_id=contact_id,
+        dealer_name_normalized=normalized_business,
+        lead_type=lead_type,
+        opportunity_aware=(
+            contact_id is not None
+            and normalized_business is not None
+            and lead_type is not None
+        ),
         include_archived=True,
     )
     prospect_contact_ids = {row.primary_contact_id for row in rows}
@@ -663,6 +689,8 @@ async def check_prospect_duplicate(
             state="clear",
             email_normalized=normalized_email,
             phone_normalized=normalized_phone,
+            business_name_normalized=normalized_business,
+            lead_type=lead_type,
             message="No matching Marketing prospect was found.",
         )
 
@@ -735,6 +763,8 @@ async def check_prospect_duplicate(
         state=state,
         email_normalized=normalized_email,
         phone_normalized=normalized_phone,
+        business_name_normalized=normalized_business,
+        lead_type=lead_type,
         visible_matches=[
             ProspectDuplicateMatchRead(
                 prospect_id=row.id,
@@ -750,6 +780,8 @@ async def check_prospect_duplicate(
                     email_normalized=normalized_email,
                     phone_normalized=normalized_phone,
                 ),
+                business_name_normalized=row.dealer_name_normalized,
+                lead_type=getattr(row, "lead_type", "dealer"),
             )
             for row in visible
         ]
@@ -994,9 +1026,12 @@ async def restore_prospect(
         )
     active_matches = await service.find_duplicates(
         db,
+        dealer_name_normalized=prospect.dealer_name_normalized,
         email_normalized=prospect.email_normalized,
         phone_normalized=prospect.phone_normalized,
         primary_contact_id=prospect.primary_contact_id,
+        lead_type=getattr(prospect, "lead_type", "dealer"),
+        opportunity_aware=True,
         for_update=True,
     )
     active_matches = [row for row in active_matches if row.id != prospect.id]
@@ -1119,6 +1154,8 @@ async def _prospect_appointment_result(
     await _refresh_for_read(db, prospect)
     await db.refresh(appointment)
     appointment_read = (await _appointment_read_rows(db, [appointment]))[0]
+    appointment_read["lead_type"] = getattr(prospect, "lead_type", "dealer")
+    appointment_read["funding_intent"] = getattr(prospect, "funding_intent", None)
     prospect_read = ProspectRead.model_validate(
         await service.prospect_read(db, prospect, include_activities=True)
     )
@@ -1163,7 +1200,11 @@ async def list_prospect_appointments(
         .scalars()
         .all()
     )
-    return await _appointment_read_rows(db, appointments)
+    payloads = await _appointment_read_rows(db, appointments)
+    for item in payloads:
+        item["lead_type"] = getattr(prospect, "lead_type", "dealer")
+        item["funding_intent"] = getattr(prospect, "funding_intent", None)
+    return payloads
 
 
 @router.post(
@@ -1445,6 +1486,8 @@ async def create_prospect_appointment(
     appointment = DealerRepAppointment(
         dealer_id=None,
         prospect_id=prospect.id,
+        lead_type=getattr(prospect, "lead_type", "dealer"),
+        funding_intent=getattr(prospect, "funding_intent", None),
         creation_idempotency_key=payload.idempotency_key,
         return_stage_id=current_stage.id,
         owner_user_id=host.id,
@@ -1604,7 +1647,14 @@ async def patch_prospect(
     # either signal while this update is in flight.
     prospect = await service.load_visible_prospect(db, user, prospect_id)
     service.assert_expected_version(prospect, payload.expected_version)
-    changes = payload.model_dump(exclude_unset=True, exclude={"expected_version"})
+    changes = payload.model_dump(
+        exclude_unset=True,
+        exclude={
+            "expected_version",
+            "reclassification_reason",
+            "override_converted_reclassification",
+        },
+    )
     proposed_email = (
         service.normalize_email(str(changes["email"]))
         if "email" in changes
@@ -1632,6 +1682,32 @@ async def patch_prospect(
     if contact is None or company is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "Prospect contact is incomplete")
     changed_fields: list[str] = []
+    classification_before = {
+        "lead_type": getattr(prospect, "lead_type", "dealer"),
+        "funding_intent": getattr(prospect, "funding_intent", None),
+    }
+    voided_drafts: list[dict[str, str]] = []
+
+    if "lead_type" in changes or "funding_intent" in changes:
+        proposed_type, proposed_intent, voided_drafts = (
+            await service.assert_reclassification_allowed(
+                db,
+                prospect,
+                actor=user,
+                lead_type=changes.get("lead_type", getattr(prospect, "lead_type", "dealer")),
+                funding_intent=changes.get(
+                    "funding_intent", getattr(prospect, "funding_intent", None)
+                ),
+                reason=payload.reclassification_reason,
+                override_converted=payload.override_converted_reclassification,
+            )
+        )
+        if proposed_type != getattr(prospect, "lead_type", "dealer"):
+            prospect.lead_type = proposed_type
+            changed_fields.append("lead_type")
+        if proposed_intent != getattr(prospect, "funding_intent", None):
+            prospect.funding_intent = proposed_intent
+            changed_fields.append("funding_intent")
 
     if "owner_user_id" in changes:
         owner_id = changes["owner_user_id"]
@@ -1679,11 +1755,15 @@ async def patch_prospect(
     if "contact_name" in changes:
         contact.full_name = changes["contact_name"]
         changed_fields.append("contact_name")
-    if "dealer_name" in changes:
-        company.name = changes["dealer_name"]
-        contact.company = changes["dealer_name"]
-        prospect.dealer_name_normalized = service.normalize_dealer_name(changes["dealer_name"])
-        changed_fields.append("dealer_name")
+    if "business_name" in changes:
+        company.name = changes["business_name"]
+        # A canonical contact may now have multiple business opportunities.
+        # Renaming a secondary opportunity must not rewrite the contact's
+        # primary company affiliation display.
+        if contact.company_id == prospect.company_id:
+            contact.company = changes["business_name"]
+        prospect.dealer_name_normalized = service.normalize_dealer_name(changes["business_name"])
+        changed_fields.append("business_name")
     if "email" in changes:
         prospect.email_normalized = service.normalize_email(str(changes["email"]))
         contact.email = prospect.email_normalized
@@ -1727,6 +1807,9 @@ async def patch_prospect(
         dealer_name_normalized=prospect.dealer_name_normalized,
         email_normalized=prospect.email_normalized,
         phone_normalized=prospect.phone_normalized,
+        primary_contact_id=prospect.primary_contact_id,
+        lead_type=getattr(prospect, "lead_type", "dealer"),
+        opportunity_aware=True,
         include_archived=True,
         for_update=True,
     )
@@ -1743,13 +1826,24 @@ async def patch_prospect(
         )
     before = prospect.version
     prospect.version += 1
+    classification_changed = bool(
+        {"lead_type", "funding_intent"}.intersection(changed_fields)
+    )
     await service.add_activity(
         db,
         prospect,
         user,
-        "prospect_updated",
+        "prospect_reclassified" if classification_changed else "prospect_updated",
         metadata={
             "changed_fields": changed_fields,
+            "classification_before": classification_before,
+            "classification_after": {
+                "lead_type": getattr(prospect, "lead_type", "dealer"),
+                "funding_intent": getattr(prospect, "funding_intent", None),
+            },
+            "reclassification_reason": payload.reclassification_reason,
+            "converted_override": payload.override_converted_reclassification,
+            "voided_drafts": voided_drafts,
             "version_before": before,
             "version_after": prospect.version,
         },
@@ -1799,7 +1893,7 @@ async def move_prospect_stage(
             db,
             prospect=prospect,
             user=user,
-            action="dealer_information_pack",
+            action="information_pack",
         )
         await service.attach_draft_to_transition(
             db,
@@ -2044,6 +2138,8 @@ def _candidate_read(row: PublicUnderwritingIntake, *, prospect: DealerProspect) 
         "outcome_status": row.outcome_status,
         "full_name": row.full_name,
         "business_name": row.business_name,
+        "lead_type": getattr(prospect, "lead_type", "dealer"),
+        "funding_intent": getattr(prospect, "funding_intent", None),
         "email": row.email,
         "phone": row.phone,
         "created_at": row.created_at,
@@ -2066,6 +2162,15 @@ def _conversion_candidate_read(
             status="archived" if application.archived_at else application.status,
             archived=application.archived_at is not None,
             display_name=application.name,
+            lead_type=(
+                getattr(application, "lead_type", None)
+                or getattr(prospect, "lead_type", None)
+                or "dealer"
+            ),
+            funding_intent=(
+                getattr(application, "funding_intent", None)
+                or getattr(prospect, "funding_intent", None)
+            ),
             email=application.email,
             phone=application.phone,
             created_at=application.created_at,
@@ -2082,6 +2187,8 @@ def _conversion_candidate_read(
         status=intake.status,
         archived=conversion_service.intake_archived(intake),
         display_name=intake.business_name or intake.full_name,
+        lead_type=getattr(prospect, "lead_type", "dealer"),
+        funding_intent=getattr(prospect, "funding_intent", None),
         email=intake.email,
         phone=intake.phone,
         created_at=intake.created_at,
@@ -2365,6 +2472,8 @@ async def convert_prospect_to_ai_intake(
                             "status": row.status,
                             "outcome_status": row.outcome_status,
                             "created_at": row.created_at.isoformat(),
+                            "lead_type": getattr(prospect, "lead_type", "dealer"),
+                            "funding_intent": getattr(prospect, "funding_intent", None),
                             "match_reasons": service.intake_candidate_match_reasons(prospect, row),
                         }
                         for row in candidates

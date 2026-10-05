@@ -56,10 +56,30 @@ class DealerBusiness(TimestampMixin, Base):
             "plaid_assets_enabled OR plaid_statements_enabled",
             name="ck_dos_dealers_plaid_product_enabled",
         ),
+        CheckConstraint(
+            "lead_type IN ('dealer','main_street','real_estate')",
+            name="ck_dos_dealers_lead_type",
+        ),
+        CheckConstraint(
+            "funding_intent IS NULL OR funding_intent IN "
+            "('general_capital','working_capital','equipment','business_acquisition',"
+            "'real_estate','debt_refinance','mca_refinance','other')",
+            name="ck_dos_dealers_funding_intent",
+        ),
     )
 
     id: Mapped[uuid.UUID] = _pk()
     name: Mapped[str] = mapped_column(String(180), nullable=False)
+    lead_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="dealer", server_default="dealer", index=True
+    )
+    funding_intent: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    @property
+    def business_name(self) -> str:
+        """Neutral API alias while legacy consumers continue using ``name``."""
+
+        return self.name
     # 0133: the reference a rep reads down a phone. Unique and immutable once
     # assigned, because it goes on contracts and into the client's inbox; a
     # file whose reference can change is a file two people can be looking at
@@ -654,6 +674,16 @@ class DealerRepAppointment(TimestampMixin, Base):
             "crm_status IN ('scheduled','confirmed','completed','follow_up','no_show','not_qualified','converted','cancelled')",
             name="ck_dos_rep_appointment_crm_status",
         ),
+        CheckConstraint(
+            "lead_type IN ('dealer','main_street','real_estate')",
+            name="ck_dos_rep_appointment_lead_type",
+        ),
+        CheckConstraint(
+            "funding_intent IS NULL OR funding_intent IN "
+            "('general_capital','working_capital','equipment','business_acquisition',"
+            "'real_estate','debt_refinance','mca_refinance','other')",
+            name="ck_dos_rep_appointment_funding_intent",
+        ),
     )
 
     id: Mapped[uuid.UUID] = _pk()
@@ -675,6 +705,10 @@ class DealerRepAppointment(TimestampMixin, Base):
     prospect_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("dealer_prospects.id", ondelete="SET NULL")
     )
+    lead_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="dealer", server_default="dealer", index=True
+    )
+    funding_intent: Mapped[str | None] = mapped_column(String(64), nullable=True)
     creation_idempotency_key: Mapped[str | None] = mapped_column(
         String(80), unique=True
     )

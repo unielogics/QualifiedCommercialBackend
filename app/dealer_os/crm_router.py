@@ -24,6 +24,7 @@ from app.config import get_settings
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import Role
+from app.lead_types import legacy_funding_purpose
 from app.models.application_profile import ApplicationTaxonomyEntry
 from app.models.booking_settings import BookingSettings
 from app.models.dealer_prospect import DealerProspect
@@ -1146,7 +1147,10 @@ async def create_finder_session(payload: CompanyContactIn, user: CurrentUser, db
         DealerProductFinderSession.contact_id == contact.id,
         DealerProductFinderSession.status.in_(["screening", "draft"]),
         DealerProductFinderSession.dealer_id.in_(
-            select(DealerBusiness.id).where(DealerBusiness.is_training.is_(False))
+            select(DealerBusiness.id).where(
+                DealerBusiness.is_training.is_(False),
+                DealerBusiness.lead_type == payload.lead_type,
+            )
         ),
     ).order_by(DealerProductFinderSession.updated_at.desc()))).scalars().first()
     if existing:
@@ -1165,12 +1169,17 @@ async def create_finder_session(payload: CompanyContactIn, user: CurrentUser, db
             _apply_taxonomy_to_record(dealer, taxonomy_answers)
             dealer.client_requested_amount = Decimal(str(payload.requested_amount))
             dealer.funding_goal = Decimal(str(payload.requested_amount))
+            dealer.funding_intent = payload.funding_intent
+            dealer.funding_purpose = (
+                legacy_funding_purpose(payload.funding_intent) or "other"
+            )
             dealer.use_of_proceeds_note = payload.use_of_funds
         await db.commit()
         return {"id": str(existing.id), "dealer_id": str(existing.dealer_id), "contact_id": str(contact.id),
             "company_id": str(company.id), "answers": existing.answers, "result": existing.current_result,
             "client_requested_amount": float(existing.client_requested_amount or 0), "reused": True}
     dealer = DealerBusiness(name=company.name, legal_name=company.name, email=contact.email, phone=contact.phone_e164,
+        lead_type=payload.lead_type, funding_intent=payload.funding_intent,
         address=company.address, city=company.city, state=company.state, zip=company.zip, industry=payload.industry or "other",
         industry_label=payload.industry_label, subindustry=payload.subindustry,
         subindustry_label=payload.subindustry_label,
@@ -1180,7 +1189,8 @@ async def create_finder_session(payload: CompanyContactIn, user: CurrentUser, db
         subindustry_entry_id=payload.subindustry_entry_id,
         activity_entry_id=payload.activity_entry_id,
         entity_type="unknown", funding_goal=Decimal(str(payload.requested_amount)),
-        client_requested_amount=Decimal(str(payload.requested_amount)), funding_purpose="other",
+        client_requested_amount=Decimal(str(payload.requested_amount)),
+        funding_purpose=legacy_funding_purpose(payload.funding_intent) or "other",
         use_of_proceeds_note=payload.use_of_funds, owner_user_id=user.id, case_ref=await _next_case_ref(db),
         application_lifecycle="draft", status="draft")
     db.add(dealer); await db.flush()

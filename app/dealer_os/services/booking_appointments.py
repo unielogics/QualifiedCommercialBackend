@@ -13,8 +13,10 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.lead_types import normalize_funding_intent, normalize_lead_type
 from app.models.booking_settings import BookingSettings
 from app.models.event import CalendarEvent
+from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 
 from ..models import DealerRepAppointment
@@ -44,6 +46,8 @@ async def create_booking_appointment(
     booked_by_user_id: UUID | None = None,
     converted_intake_id: UUID | None = None,
     precall_intake_id: UUID | None = None,
+    lead_type: str | None = None,
+    funding_intent: str | None = None,
     contact_source: str = "public_booking",
     creation_idempotency_key: str | None = None,
     meeting_mode: str = "video",
@@ -56,8 +60,37 @@ async def create_booking_appointment(
 
     phone = consent_delivery.normalize_phone(invitee_phone)
     email = (invitee_email or "").strip().lower() or None
+    resolved_lead_type = normalize_lead_type(lead_type) if lead_type is not None else "dealer"
+    resolved_funding_intent = normalize_funding_intent(funding_intent)
+    source_intake_id = converted_intake_id or precall_intake_id
+    if source_intake_id is not None:
+        source_intake = await db.get(PublicUnderwritingIntake, source_intake_id)
+        if source_intake is not None:
+            state = source_intake.intake_state or {}
+            legacy_mca = "mca" in str(source_intake.variant or "").casefold()
+            try:
+                resolved_lead_type = normalize_lead_type(
+                    state.get("lead_type") or source_intake.variant
+                )
+            except ValueError:
+                resolved_lead_type = "dealer"
+            try:
+                resolved_funding_intent = (
+                    "mca_refinance"
+                    if legacy_mca
+                    else normalize_funding_intent(
+                        state.get("funding_intent") or source_intake.loan_purpose
+                    )
+                )
+            except ValueError:
+                # Older intake programs used presentation labels here. Keep
+                # their appointment usable without writing that value into the
+                # canonical enum.
+                resolved_funding_intent = None
     appt = DealerRepAppointment(
         dealer_id=None,
+        lead_type=resolved_lead_type,
+        funding_intent=resolved_funding_intent,
         origin=origin,
         owner_user_id=host.id,
         calendar_event_id=event.id,

@@ -63,6 +63,7 @@ def test_owner_email_normalization_is_stable() -> None:
 def test_new_application_requires_request_but_not_ein_address_or_trading_since() -> None:
     payload = DealerCreate(
         name="Optional Fields LLC",
+        lead_type="main_street",
         entity_type="Limited liability company",
         funding_goal=250_000,
         funding_purpose="working_capital",
@@ -78,6 +79,7 @@ def test_new_application_requires_request_but_not_ein_address_or_trading_since()
 def test_new_application_rejects_missing_required_request_fields(field: str) -> None:
     data = {
         "name": "Incomplete LLC",
+        "lead_type": "main_street",
         "entity_type": "Limited liability company",
         "funding_goal": 250_000,
         "funding_purpose": "working_capital",

@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import CalendarEventStatus
+from app.lead_types import normalize_funding_intent, normalize_lead_type
 from app.models.application_profile import ApplicationOwner, ApplicationProfile
 from app.models.booking_notification import BookingNotification, BookingNotificationReminder
 from app.models.booking_settings import BookingSettings
@@ -199,6 +200,13 @@ async def create_draft_for_booking(
     if intake is None:
         raise RuntimeError("AI Intake creation did not return a persisted intake")
     state = dict(intake.intake_state or {})
+    state["lead_type"] = normalize_lead_type(
+        data.get("lead_type") or selected_variant
+    )
+    state["funding_intent"] = normalize_funding_intent(
+        data.get("funding_intent")
+        or ("mca_refinance" if selected_variant == "mca_refinance" else None)
+    )
     state["booking_preparation"] = {
         "event_id": str(event.id),
         "notification_id": str(notice.id),

@@ -48,6 +48,7 @@ def test_quick_add_accepts_frontend_name_alias_and_normalizes_phone() -> None:
         contact_id=contact_id,
         name="  Rocio Martinez  ",
         dealer_name=" Grace Auto Sales ",
+        lead_type="dealer",
         email="ROCIO@EXAMPLE.COM",
         phone="(973) 555-0148",
         initial_note="  Spoke about dealership working capital.  ",
@@ -64,6 +65,7 @@ def test_quick_add_normalizes_blank_initial_note_to_none() -> None:
     payload = ProspectCreate(
         contact_name="Rocio Martinez",
         dealer_name="Grace Auto Sales",
+        lead_type="dealer",
         email="rocio@example.com",
         phone="(973) 555-0148",
         initial_note="   ",
@@ -73,10 +75,64 @@ def test_quick_add_normalizes_blank_initial_note_to_none() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pipeline_list_filters_business_contact_type_and_intent(monkeypatch) -> None:
+    class CountResult:
+        @staticmethod
+        def scalar_one():
+            return 0
+
+    class RowsResult:
+        def scalars(self):
+            return self
+
+        @staticmethod
+        def all():
+            return []
+
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[CountResult(), RowsResult()])
+    )
+    monkeypatch.setattr(prospects, "ensure_default_definitions", AsyncMock())
+    monkeypatch.setattr(
+        prospects, "firm_booking_timezone", AsyncMock(return_value="America/New_York")
+    )
+    monkeypatch.setattr(prospects, "prospects_read", AsyncMock(return_value=[]))
+    monkeypatch.setattr(prospects, "active_stages", AsyncMock(return_value=[]))
+    monkeypatch.setattr(prospects, "active_outcomes", AsyncMock(return_value=[]))
+
+    result = await prospect_router.list_prospects(
+        user=_user(Role.LOAN_EXEC),
+        db=db,
+        q="Alex Plumbing",
+        stage_key=None,
+        outcome_key=None,
+        lead_type="main_street",
+        funding_intent="working_capital",
+        owner_user_id=None,
+        follow_up_before=None,
+        sort_by="business_name",
+        sort_dir="asc",
+        limit=50,
+        offset=0,
+    )
+
+    assert result.total == 0
+    for call in db.execute.await_args_list:
+        statement = str(call.args[0])
+        assert "dealer_prospects.lead_type" in statement
+        assert "dealer_prospects.funding_intent" in statement
+        assert "dos_rep_companies.name" in statement
+        assert "dos_rep_contacts.full_name" in statement
+        assert "dos_rep_contacts.email" in statement
+        assert "dos_rep_contacts.phone_e164" in statement
+
+
+@pytest.mark.asyncio
 async def test_quick_add_route_forwards_private_initial_note(monkeypatch) -> None:
     payload = ProspectCreate(
         contact_name="Rocio Martinez",
         dealer_name="Grace Auto Sales",
+        lead_type="dealer",
         email="rocio@example.com",
         phone="(973) 555-0148",
         initial_note="Spoke about dealership working capital.",
@@ -152,6 +208,231 @@ async def test_create_prospect_records_private_initial_note_after_created_activi
         "source": "prospect_creation",
     }
     assert prospect.last_activity_at is not None
+
+
+@pytest.mark.asyncio
+async def test_explicit_contact_can_open_distinct_business_opportunity_without_reaffiliation(
+    monkeypatch,
+) -> None:
+    user = _user(Role.LOAN_EXEC)
+    affiliated_company = SimpleNamespace(
+        id=uuid4(), owner_user_id=user.id, name="Original Auto Group"
+    )
+    contact = SimpleNamespace(
+        id=uuid4(),
+        owner_user_id=user.id,
+        company_id=affiliated_company.id,
+        company=affiliated_company.name,
+        full_name="Alex Owner",
+        email="alex@example.com",
+        phone_e164="+12125550123",
+        last_activity_at=None,
+    )
+    stage = SimpleNamespace(id=uuid4(), key="new")
+    added: list[object] = []
+
+    class ScalarResult:
+        @staticmethod
+        def scalar_one_or_none():
+            return stage
+
+    class EmptyRowsResult:
+        def scalars(self):
+            return self
+
+        @staticmethod
+        def first():
+            return None
+
+    async def get(_model, row_id):
+        if row_id == affiliated_company.id:
+            return affiliated_company
+        if row_id == user.id:
+            return user
+        return None
+
+    async def flush() -> None:
+        for row in added:
+            if hasattr(row, "id") and row.id is None:
+                row.id = uuid4()
+
+    db = SimpleNamespace(
+        get=AsyncMock(side_effect=get),
+        execute=AsyncMock(side_effect=[ScalarResult(), EmptyRowsResult()]),
+        add=Mock(side_effect=added.append),
+        flush=AsyncMock(side_effect=flush),
+    )
+    find_duplicates = AsyncMock(return_value=[])
+    monkeypatch.setattr(prospects, "load_visible_contact", AsyncMock(return_value=contact))
+    monkeypatch.setattr(prospects, "find_duplicates", find_duplicates)
+    monkeypatch.setattr(prospects, "ensure_default_definitions", AsyncMock())
+
+    prospect = await prospects.create_prospect(
+        db,
+        user,
+        contact_id=contact.id,
+        contact_name="Ignored because the contact is canonical",
+        dealer_name="New Retail Property LLC",
+        email=contact.email,
+        phone=contact.phone_e164,
+        source="all_contacts",
+        owner_user_id=None,
+        lead_type="real_estate",
+        funding_intent="real_estate",
+    )
+
+    assert prospect.primary_contact_id == contact.id
+    assert prospect.company_id != affiliated_company.id
+    assert prospect.lead_type == "real_estate"
+    assert contact.company_id == affiliated_company.id
+    assert contact.company == "Original Auto Group"
+    duplicate_args = find_duplicates.await_args.kwargs
+    assert duplicate_args["opportunity_aware"] is True
+    assert duplicate_args["primary_contact_id"] == contact.id
+    assert duplicate_args["dealer_name_normalized"] == "new retail property llc"
+    assert duplicate_args["lead_type"] == "real_estate"
+
+
+@pytest.mark.asyncio
+async def test_explicit_contact_blocks_same_business_and_type_opportunity(monkeypatch) -> None:
+    user = _user(Role.LOAN_EXEC)
+    company = SimpleNamespace(id=uuid4(), owner_user_id=user.id, name="Alex Plumbing")
+    contact = SimpleNamespace(
+        id=uuid4(),
+        owner_user_id=user.id,
+        company_id=company.id,
+        company=company.name,
+        full_name="Alex Owner",
+        email="alex@example.com",
+        phone_e164="+12125550123",
+    )
+    existing = SimpleNamespace(
+        id=uuid4(),
+        owner_user_id=user.id,
+        primary_contact_id=contact.id,
+        dealer_name_normalized="alex plumbing",
+        lead_type="main_street",
+        archived_at=None,
+    )
+
+    async def get(_model, row_id):
+        return company if row_id == company.id else user
+
+    db = SimpleNamespace(get=AsyncMock(side_effect=get))
+    monkeypatch.setattr(prospects, "load_visible_contact", AsyncMock(return_value=contact))
+    monkeypatch.setattr(prospects, "find_duplicates", AsyncMock(return_value=[existing]))
+
+    with pytest.raises(HTTPException) as error:
+        await prospects.create_prospect(
+            db,
+            user,
+            contact_id=contact.id,
+            contact_name=contact.full_name,
+            dealer_name=company.name,
+            email=contact.email,
+            phone=contact.phone_e164,
+            source="all_contacts",
+            owner_user_id=None,
+            lead_type="main_street",
+            funding_intent="working_capital",
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "duplicate_prospect"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_preflight_allows_explicit_distinct_opportunity(monkeypatch) -> None:
+    user = _user(Role.LOAN_EXEC)
+    contact_id = uuid4()
+    find_duplicates = AsyncMock(return_value=[])
+    monkeypatch.setattr(prospects, "load_visible_contact", AsyncMock(return_value=object()))
+    monkeypatch.setattr(prospects, "find_duplicates", find_duplicates)
+    monkeypatch.setattr(
+        prospects, "find_contact_identity_matches", AsyncMock(return_value=[])
+    )
+
+    result = await prospect_router.check_prospect_duplicate(
+        user=user,
+        db=SimpleNamespace(),
+        email="alex@example.com",
+        phone="+12125550123",
+        contact_id=contact_id,
+        business_name=" Alex Plumbing ",
+        lead_type="main_street",
+    )
+
+    assert result.blocked is False
+    assert result.business_name_normalized == "alex plumbing"
+    assert result.lead_type == "main_street"
+    assert find_duplicates.await_args.kwargs == {
+        "email_normalized": "alex@example.com",
+        "phone_normalized": "+12125550123",
+        "primary_contact_id": contact_id,
+        "dealer_name_normalized": "alex plumbing",
+        "lead_type": "main_street",
+        "opportunity_aware": True,
+        "include_archived": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_secondary_opportunity_rename_preserves_contact_company_affiliation(
+    monkeypatch,
+) -> None:
+    user = _user(Role.LOAN_EXEC)
+    prospect = SimpleNamespace(
+        id=uuid4(),
+        version=2,
+        owner_user_id=user.id,
+        primary_contact_id=uuid4(),
+        company_id=uuid4(),
+        stage_definition_id=uuid4(),
+        email_normalized="alex@example.com",
+        phone_normalized="+12125550123",
+        dealer_name_normalized="secondary business",
+        lead_type="main_street",
+        funding_intent="working_capital",
+    )
+    contact = SimpleNamespace(
+        id=prospect.primary_contact_id,
+        company_id=uuid4(),
+        company="Primary Business",
+        owner_user_id=user.id,
+    )
+    company = SimpleNamespace(id=prospect.company_id, name="Secondary Business")
+
+    async def get(model, _row_id):
+        return contact if model.__name__ == "DealerRepContact" else company
+
+    db = SimpleNamespace(get=get, flush=AsyncMock())
+    monkeypatch.setattr(
+        prospects, "load_visible_prospect", AsyncMock(return_value=prospect)
+    )
+    monkeypatch.setattr(
+        prospects,
+        "resolve_contact_identity",
+        AsyncMock(return_value=(None, prospect.email_normalized, prospect.phone_normalized)),
+    )
+    monkeypatch.setattr(prospects, "find_duplicates", AsyncMock(return_value=[prospect]))
+    monkeypatch.setattr(prospects, "add_activity", AsyncMock())
+    monkeypatch.setattr(
+        prospect_router,
+        "_refresh_for_read",
+        AsyncMock(side_effect=RuntimeError("stop after mutation")),
+    )
+
+    with pytest.raises(RuntimeError, match="stop after mutation"):
+        await prospect_router.patch_prospect(
+            prospect.id,
+            ProspectPatch(expected_version=2, business_name="Renamed Opportunity"),
+            user,
+            db,
+        )
+
+    assert company.name == "Renamed Opportunity"
+    assert prospect.dealer_name_normalized == "renamed opportunity"
+    assert contact.company == "Primary Business"
 
 
 @pytest.mark.asyncio
@@ -938,12 +1219,23 @@ def test_duplicate_response_does_not_leak_another_reps_record() -> None:
 
 def test_duplicate_response_can_name_an_explicitly_selected_contact() -> None:
     contact_id = uuid4()
-    row = SimpleNamespace(id=uuid4(), owner_user_id=uuid4(), primary_contact_id=contact_id)
+    row = SimpleNamespace(
+        id=uuid4(),
+        owner_user_id=uuid4(),
+        primary_contact_id=contact_id,
+        dealer_name_normalized="alex plumbing",
+        lead_type="main_street",
+    )
 
     detail = prospects.duplicate_detail([row], _user(Role.FIELD_REP), known_contact_id=contact_id)
 
     assert detail["candidates"] == [
-        {"prospect_id": str(row.id), "owner_user_id": str(row.owner_user_id)}
+        {
+            "prospect_id": str(row.id),
+            "owner_user_id": str(row.owner_user_id),
+            "business_name_normalized": "alex plumbing",
+            "lead_type": "main_street",
+        }
     ]
     assert detail["assignment_required"] is False
 
@@ -1118,16 +1410,39 @@ async def test_admin_can_enable_one_eligible_pipeline_user(monkeypatch) -> None:
     assert event.reason == "Pilot cohort"
 
 
-def test_unique_identity_indexes_are_scoped_to_dealer() -> None:
+def test_unique_identity_guards_are_scoped_to_business_opportunity() -> None:
     indexes = {index.name: index for index in DealerProspect.__table__.indexes}
     assert [column.name for column in indexes["uq_dealer_prospect_email_active"].columns] == [
         "dealer_name_normalized",
+        "lead_type",
         "email_normalized",
     ]
     assert [column.name for column in indexes["uq_dealer_prospect_phone_active"].columns] == [
         "dealer_name_normalized",
+        "lead_type",
         "phone_normalized",
     ]
+    constraints = {
+        constraint.name: constraint for constraint in DealerProspect.__table__.constraints
+    }
+    assert [
+        column.name
+        for column in constraints["uq_dealer_prospect_contact_opportunity"].columns
+    ] == ["primary_contact_id", "dealer_name_normalized", "lead_type"]
+
+
+@pytest.mark.parametrize("action", ["information_pack", "dealer_information_pack"])
+def test_information_pack_action_preserves_legacy_alias(action: str) -> None:
+    assert prospects.validate_action_config({"email_action": action}) == {
+        "email_action": action
+    }
+
+
+def test_default_information_outcome_uses_generic_action() -> None:
+    outcome = next(
+        item for item in prospects.DEFAULT_OUTCOMES if item["key"] == "interested_send_information"
+    )
+    assert outcome["action_config"]["email_action"] == "information_pack"
 
 
 def test_conversion_schema_preserves_exactly_one_immutable_destination() -> None:

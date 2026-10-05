@@ -46,6 +46,7 @@ from app.dealer_os.schemas import BookingAvailabilityRead
 from app.dealer_os.services import consent_delivery
 from app.dealer_os.services import sms_consent as sms_consent_service
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus
+from app.lead_types import normalize_lead_type
 from app.models.activity import Activity
 from app.models.booking_notification import BookingDeliveryOperation, BookingNotification
 from app.models.booking_settings import BookingSettings, BookingSlugAlias
@@ -549,10 +550,12 @@ async def public_booking_profile(
             "dealer" if field_desk_page else booking.precall_default_variant or "main_street"
         ),
         precall_allowed_variants=(
-            ["dealer"] if field_desk_page else list(booking.precall_allowed_variants or [])
+            ["dealer", "main_street", "real_estate"]
+            if field_desk_page
+            else list(booking.precall_allowed_variants or [])
         ),
         precall_allow_vertical_choice=(
-            False if field_desk_page else bool(booking.precall_allow_vertical_choice)
+            True if field_desk_page else bool(booking.precall_allow_vertical_choice)
         ),
     )
 
@@ -596,7 +599,19 @@ async def public_booking_create(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Requested amount is required.")
     if questions.get("bank_statement") and payload.preferred_bank_method is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Choose a banking evidence method.")
-    selected_variant = "dealer" if host_is_rep else booking.precall_default_variant or "main_street"
+    if host_is_rep and payload.vertical is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "lead_type_required",
+                "message": "Choose the business type for this Field Desk booking.",
+            },
+        )
+    selected_variant = (
+        payload.vertical
+        if host_is_rep
+        else booking.precall_default_variant or "main_street"
+    )
     if booking.precall_enabled and not host_is_rep:
         if (
             payload.vertical
@@ -820,6 +835,10 @@ async def public_booking_create(
         notes=payload.notes,
         requested_amount=(str(payload.requested_amount) if payload.requested_amount is not None else None),
         booked_by_user_id=user.id if host_is_rep else None,
+        lead_type=normalize_lead_type(selected_variant),
+        funding_intent=(
+            "mca_refinance" if selected_variant == "mca_refinance" else None
+        ),
         contact_source="public_booking",
         creation_idempotency_key=creation_key,
         meeting_mode="video" if booking.google_meet_enabled else "phone",

@@ -92,6 +92,7 @@ def test_super_admin_inherits_all_operator_accounts() -> None:
 def test_new_files_default_to_live_and_gated() -> None:
     payload = DealerCreate(
         name="Example LLC",
+        lead_type="main_street",
         entity_type="Limited liability company",
         funding_goal=100_000,
         funding_purpose="working_capital",

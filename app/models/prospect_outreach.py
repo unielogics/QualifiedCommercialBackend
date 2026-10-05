@@ -137,8 +137,8 @@ class DealerProspectEmailDraft(TimestampMixin, Base):
     purpose: Mapped[str] = mapped_column(
         String(48),
         nullable=False,
-        default="dealer_information",
-        server_default="dealer_information",
+        default="information",
+        server_default="information",
     )
     # The source prospect remains mutable.  Delivery therefore relies on this
     # immutable audience/profile snapshot, and separately verifies that the

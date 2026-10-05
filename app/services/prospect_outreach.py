@@ -96,7 +96,7 @@ log = logging.getLogger(__name__)
 
 DEALER_WEBSITE = "https://qualifiedcommercial.com/industries/auto"
 COLLATERAL_ASSIGNMENT = "dealer_outreach"
-DEFAULT_PURPOSE = "dealer_information"
+DEFAULT_PURPOSE = "information"
 SUPPORTED_LEAD_TYPES = tuple(LEAD_TYPES)
 LEAD_TYPE_ALIASES = {
     "dealer": "dealer",
@@ -200,7 +200,7 @@ DEFAULT_OUTREACH_PROFILE_SEEDS: dict[str, dict[str, Any]] = {
         "desk_name": "Business Desk",
         "audience_label": "business",
         "audience_plural": "business owners",
-        "website_url": "https://qualifiedcommercial.com/industries/main-street",
+        "website_url": "https://qualifiedcommercial.com/industries/business",
         "drafting_guidance": (
             "Use approachable, plain language for an owner-operated business. "
             "Keep the message practical and avoid dealership or property-investor terminology."
@@ -217,7 +217,7 @@ DEFAULT_OUTREACH_PROFILE_SEEDS: dict[str, dict[str, Any]] = {
         "desk_name": "Real Estate Desk",
         "audience_label": "property business",
         "audience_plural": "property owners and investors",
-        "website_url": "https://qualifiedcommercial.com/industries/commercial-real-estate",
+        "website_url": "https://qualifiedcommercial.com/industries/realestate",
         "drafting_guidance": (
             "Use professional commercial-real-estate language for an owner, investor, or operator. "
             "Do not assume a property type, transaction, value, leverage, or occupancy."
@@ -315,6 +315,51 @@ _AI_CAPABILITY_CLAIM_RE = re.compile(
     r"help(?:s|ed)?\s+with|support(?:s|ed)?\s+with|have)\b",
     re.IGNORECASE,
 )
+# Narrow audience-identity guards for system/AI-authored prose. Product and
+# collateral language has separate catalog enforcement; these patterns only
+# stop the model from addressing a non-dealer as a dealership (or swapping the
+# two other desk identities). Manual copy intentionally does not opt into this
+# style guard.
+_AUDIENCE_TERM_GUARDS: dict[str, tuple[tuple[re.Pattern[str], str], ...]] = {
+    "dealer": (
+        (re.compile(r"\bmain[ -]?street business(?:es)?\b", re.IGNORECASE), "Main Street"),
+        (
+            re.compile(
+                r"\b(?:commercial real estate|property)\s+(?:owner|investor)s?\b",
+                re.IGNORECASE,
+            ),
+            "real-estate",
+        ),
+    ),
+    "main_street": (
+        (
+            re.compile(
+                r"\b(?:car|auto(?:motive)?)\s+dealer(?:ship)?s?\b|\bdealerships?\b|"
+                r"\bautomotive\s+(?:dealer|dealership|retailer|showroom)s?\b",
+                re.IGNORECASE,
+            ),
+            "dealer",
+        ),
+        (
+            re.compile(
+                r"\bcommercial real estate\s+(?:owner|investor)s?\b",
+                re.IGNORECASE,
+            ),
+            "real-estate",
+        ),
+    ),
+    "real_estate": (
+        (
+            re.compile(
+                r"\b(?:car|auto(?:motive)?)\s+dealer(?:ship)?s?\b|\bdealerships?\b|"
+                r"\bautomotive\s+(?:dealer|dealership|retailer|showroom)s?\b",
+                re.IGNORECASE,
+            ),
+            "dealer",
+        ),
+        (re.compile(r"\bmain[ -]?street business(?:es)?\b", re.IGNORECASE), "Main Street"),
+    ),
+}
 _GENERIC_PRODUCT_PHRASES = {
     "commercial financing",
     "dealer financing",
@@ -653,6 +698,7 @@ async def update_outreach_profile(
                 subject=sample.subject,
                 body=sample.body,
                 catalog_snapshot=[],
+                lead_type=canonical,
             )
     except ValueError as exc:
         raise OutreachBlocked(
@@ -1330,12 +1376,24 @@ def _validate_additional_blocked_phrases(
             raise ValueError(f"copy contains firm-blocked phrase: {raw}")
 
 
+def _validate_audience_copy(*, subject: str, body: str, lead_type: str) -> None:
+    canonical = normalize_lead_type(lead_type)
+    combined = f"{subject}\n{body}"
+    for pattern, leaked_audience in _AUDIENCE_TERM_GUARDS[canonical]:
+        if pattern.search(combined):
+            raise ValueError(
+                "model response contains "
+                f"{leaked_audience} audience terminology for a {canonical} recipient"
+            )
+
+
 def validate_generated_copy(
     *,
     subject: str,
     body: str,
     catalog_snapshot: list[dict[str, Any]],
     additional_blocked_phrases: Iterable[str] = (),
+    lead_type: str | None = None,
 ) -> None:
     if not subject or len(subject) > 240 or not body or len(body) > 12_000:
         raise ValueError("model response has invalid subject/body length")
@@ -1343,6 +1401,8 @@ def validate_generated_copy(
         raise ValueError("email subject must be a single line")
     combined = f"{subject}\n{body}"
     lower = combined.lower()
+    if lead_type is not None:
+        _validate_audience_copy(subject=subject, body=body, lead_type=lead_type)
     if any(phrase in lower for phrase in _FORBIDDEN_COPY):
         raise ValueError("model response contains an unsupported claim")
     if _UNSUPPORTED_FUNDING_TIMELINE_RE.search(combined):
@@ -1698,10 +1758,12 @@ async def _compose_with_nova(
     settings = get_settings()
     if not settings.ai_provider_enabled:
         try:
-            _validate_additional_blocked_phrases(
+            validate_generated_copy(
                 subject=fallback.subject,
                 body=fallback.body,
-                phrases=policy.additional_blocked_phrases,
+                catalog_snapshot=catalog_snapshot,
+                additional_blocked_phrases=policy.additional_blocked_phrases,
+                lead_type=profile_snapshot["lead_type"],
             )
         except ValueError as exc:
             raise OutreachBlocked(
@@ -1812,6 +1874,7 @@ async def _compose_with_nova(
             body=body,
             catalog_snapshot=catalog_snapshot,
             additional_blocked_phrases=policy.additional_blocked_phrases,
+            lead_type=profile_snapshot["lead_type"],
         )
         usage = response.get("usage") or {}
         failure_reason = "ai_usage_record_failed"
@@ -1860,15 +1923,17 @@ async def _compose_with_nova(
         else:
             log.warning("prospect outreach: Nova draft failed; using safe fallback: %s", exc)
         try:
-            _validate_additional_blocked_phrases(
+            validate_generated_copy(
                 subject=fallback.subject,
                 body=fallback.body,
-                phrases=policy.additional_blocked_phrases,
+                catalog_snapshot=catalog_snapshot,
+                additional_blocked_phrases=policy.additional_blocked_phrases,
+                lead_type=profile_snapshot["lead_type"],
             )
         except ValueError as policy_exc:
             raise OutreachBlocked(
                 "drafting_policy_conflict",
-                "The safe fallback conflicts with a firm-blocked phrase. Update the rule or wording before sending.",
+                "The safe fallback conflicts with an outreach copy guard. Update the profile or policy before sending.",
             ) from policy_exc
         return ComposedCopy(
             subject=fallback.subject,
@@ -3042,6 +3107,36 @@ async def booking_url_for_draft(
     return f"{base}/book/{quote(selected.slug or '', safe='')}" if base else None
 
 
+async def _lock_prospect_draft_snapshot(
+    db: AsyncSession,
+    *,
+    prospect: DealerProspect,
+    expected_version: int,
+    expected_lead_type: str,
+    expected_funding_intent: str | None,
+) -> DealerProspect:
+    """Serialize persistence against classification edits after AI drafting."""
+
+    current = await db.get(DealerProspect, prospect.id, with_for_update=True)
+    if current is None:
+        raise OutreachNotFound("Prospect not found.")
+    current_snapshot = (
+        int(current.version),
+        prospect_lead_type(current),
+        prospect_funding_intent(current),
+    )
+    expected_snapshot = (
+        expected_version,
+        normalize_lead_type(expected_lead_type),
+        normalize_field_funding_intent(expected_funding_intent),
+    )
+    if current_snapshot != expected_snapshot:
+        raise OutreachConflict(
+            "The prospect changed while this email was being drafted. Refresh and create a new draft."
+        )
+    return current
+
+
 async def create_draft(
     db: AsyncSession,
     *,
@@ -3050,11 +3145,7 @@ async def create_draft(
     payload: ProspectEmailDraftCreate,
 ) -> DealerProspectEmailDraft:
     branding = await load_agent_branding(db, actor)
-    if payload.cc_scope == "this_and_future" and isinstance(prospect, DealerProspect):
-        locked_prospect = await db.get(DealerProspect, prospect.id, with_for_update=True)
-        if locked_prospect is None:
-            raise OutreachNotFound("Prospect not found.")
-        prospect = locked_prospect
+    prospect_version = int(getattr(prospect, "version", 1) or 1)
     lead_type = prospect_lead_type(prospect)
     funding_intent = prospect_funding_intent(prospect)
     requested_cc = (
@@ -3111,8 +3202,6 @@ async def create_draft(
     cc_emails = await validate_cc_snapshot(
         db, requested_cc, recipient_email=recipient
     )
-    if payload.cc_scope == "this_and_future":
-        prospect.default_cc_emails = list(cc_emails)
     booking_url = None
     if payload.purpose == "booking":
         booking_url = await booking_url_for_draft(
@@ -3215,6 +3304,16 @@ async def create_draft(
     )
     rendered_body = _render_body(editable_body, locked_footer)
     oversized = attachment_bundle_too_large(total_bytes)
+    if isinstance(db, AsyncSession) and isinstance(prospect, DealerProspect):
+        prospect = await _lock_prospect_draft_snapshot(
+            db,
+            prospect=prospect,
+            expected_version=prospect_version,
+            expected_lead_type=lead_type,
+            expected_funding_intent=funding_intent,
+        )
+    if payload.cc_scope == "this_and_future":
+        prospect.default_cc_emails = list(cc_emails)
     draft = DealerProspectEmailDraft(
         id=draft_id,
         prospect_id=prospect.id,
@@ -4236,6 +4335,15 @@ async def dispatch_draft(
     automatic: bool = False,
 ) -> DealerProspectEmailDraft:
     """Claim, commit, and deliver one draft at most once."""
+    # Reclassification locks the prospect before it locks/voids its drafts.
+    # Follow the same order here so a send cannot deadlock against that
+    # transaction or slip a stale-classification draft through it.
+    draft_hint = await load_draft(db, draft_id)
+    prospect = await db.get(
+        DealerProspect,
+        draft_hint.prospect_id,
+        with_for_update=True,
+    )
     row = await load_draft(db, draft_id, lock=True)
     _check_version(row, expected_version)
     if row.status in {"sent", "sending"}:
@@ -4277,7 +4385,6 @@ async def dispatch_draft(
         return await _block_draft(
             db, row, code="invalid_recipient", detail="Recipient address is no longer valid."
         )
-    prospect = await db.get(DealerProspect, row.prospect_id, with_for_update=True)
     if prospect is None or prospect.archived_at is not None:
         return await _block_draft(
             db, row, code="prospect_unavailable", detail="Prospect is archived or unavailable."
@@ -4452,6 +4559,11 @@ async def dispatch_draft(
     # recipient, policy, and attachment fact in a fresh transaction immediately
     # before the provider call. Keep the draft/prospect locks through delivery,
     # so an administrative change cannot slip between this check and SES.
+    latest_prospect = await db.get(
+        DealerProspect,
+        row.prospect_id,
+        with_for_update=True,
+    )
     current = await load_draft(db, row.id, lock=True)
     if current.status != "sending":
         return current
@@ -4480,7 +4592,6 @@ async def dispatch_draft(
             code="compliance_footer_missing",
             detail="Required company mailing address is missing from the locked email footer.",
         )
-    latest_prospect = await db.get(DealerProspect, current.prospect_id, with_for_update=True)
     if (
         latest_prospect is None
         or latest_prospect.archived_at is not None

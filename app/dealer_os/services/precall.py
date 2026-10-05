@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.enums import CalendarEventStatus
+from app.lead_types import legacy_funding_purpose, normalize_funding_intent, normalize_lead_type
 from app.models.booking_notification import BookingNotification, BookingNotificationReminder
 from app.models.booking_settings import BookingSettings
 from app.models.event import CalendarEvent
@@ -467,7 +468,12 @@ class DraftResult:
 
 
 async def _find_reusable_draft(
-    db: AsyncSession, *, owner_user_id: UUID, email: str | None, phone: str | None
+    db: AsyncSession,
+    *,
+    owner_user_id: UUID,
+    email: str | None,
+    phone: str | None,
+    lead_type: str,
 ) -> DealerBusiness | None:
     """A public rebook by the same person should land on their existing draft."""
     since = datetime.now(UTC) - timedelta(days=90)
@@ -483,6 +489,7 @@ async def _find_reusable_draft(
             select(DealerBusiness)
             .where(
                 DealerBusiness.owner_user_id == owner_user_id,
+                DealerBusiness.lead_type == normalize_lead_type(lead_type),
                 DealerBusiness.archived_at.is_(None),
                 DealerBusiness.draft_source == "booking",
                 DealerBusiness.created_at >= since,
@@ -515,18 +522,40 @@ async def create_draft_for_booking(
     PIN only when the room was minted here.
     """
     owner_user_id = (booked_by.id if booked_by is not None else None) or host.id
+    appointment_lead_type = normalize_lead_type(
+        getattr(appointment, "lead_type", None)
+    )
     created = False
+    if (
+        dealer is not None
+        and appointment is not None
+        and normalize_lead_type(getattr(dealer, "lead_type", None))
+        != appointment_lead_type
+    ):
+        dealer = None
     if dealer is None and appointment is not None and appointment.dealer_id:
         dealer = await db.get(DealerBusiness, appointment.dealer_id)
-        if dealer is not None and dealer.archived_at is not None:
+        if dealer is not None and (
+            dealer.archived_at is not None
+            or normalize_lead_type(getattr(dealer, "lead_type", None))
+            != appointment_lead_type
+        ):
             dealer = None
     if dealer is None and contact is not None and contact.dealer_id:
         dealer = await db.get(DealerBusiness, contact.dealer_id)
-        if dealer is not None and dealer.archived_at is not None:
+        if dealer is not None and (
+            dealer.archived_at is not None
+            or normalize_lead_type(getattr(dealer, "lead_type", None))
+            != appointment_lead_type
+        ):
             dealer = None
     if dealer is None:
         dealer = await _find_reusable_draft(
-            db, owner_user_id=owner_user_id, email=notice.invitee_email, phone=notice.invitee_phone
+            db,
+            owner_user_id=owner_user_id,
+            email=notice.invitee_email,
+            phone=notice.invitee_phone,
+            lead_type=appointment_lead_type,
         )
     if dealer is None:
         created = True
@@ -540,6 +569,10 @@ async def create_draft_for_booking(
         zip_code = (appointment.zip or None) if appointment is not None else None
         dealer = DealerBusiness(
             name=business_name[:180],
+            lead_type=appointment_lead_type,
+            funding_intent=normalize_funding_intent(
+                getattr(appointment, "funding_intent", None)
+            ),
             legal_name=business_name[:180],
             email=notice.invitee_email,
             phone=notice.invitee_phone,
@@ -550,6 +583,9 @@ async def create_draft_for_booking(
             funding_goal=_amount(notice.requested_amount),
             client_requested_amount=_amount(notice.requested_amount),
             client_requested_program=(notice.program_name or "")[:80] or None,
+            funding_purpose=legacy_funding_purpose(
+                getattr(appointment, "funding_intent", None)
+            ),
             notes="\n\n".join(p for p in [notes, "Draft opened from a booked call."] if p),
             application_lifecycle="draft",
             status="draft",

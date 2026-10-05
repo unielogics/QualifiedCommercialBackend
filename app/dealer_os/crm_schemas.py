@@ -6,8 +6,17 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
+from app.lead_types import (
+    FundingIntent,
+    LeadType,
+    normalize_funding_intent,
+    normalize_lead_type,
+)
+
 
 class CompanyContactIn(BaseModel):
+    lead_type: LeadType
+    funding_intent: FundingIntent | None = None
     company_name: str = Field(min_length=1, max_length=180)
     contact_name: str = Field(min_length=1, max_length=160)
     email: str | None = Field(default=None, max_length=320)
@@ -28,6 +37,18 @@ class CompanyContactIn(BaseModel):
     requested_amount: float = Field(gt=0, le=10_000_000)
     use_of_funds: str = Field(min_length=3, max_length=4000)
     locale: Literal["en", "es"] = "en"
+
+    @field_validator("lead_type", mode="before")
+    @classmethod
+    def normalize_business_type(cls, value: object) -> LeadType:
+        return normalize_lead_type(value, default=None)
+
+    @field_validator("funding_intent", mode="before")
+    @classmethod
+    def normalize_business_funding_intent(
+        cls, value: object | None
+    ) -> FundingIntent | None:
+        return normalize_funding_intent(value)
 
 
 class FinderAnswersIn(BaseModel):
