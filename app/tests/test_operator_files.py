@@ -6,6 +6,8 @@ from uuid import uuid4
 from app.models.application_profile import ApplicationProfile
 from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile
 from app.routers.operator_files import (
+    INTAKE_STATUS_TO_UNDERWRITING,
+    PIPELINE_TO_INTAKE_STATUS,
     _collapse_logical_rows,
     _forecast_values,
     _funding_stage,
@@ -48,6 +50,17 @@ def test_variant_verticals_match_unified_operator_taxonomy():
     assert _variant_vertical("dealer_gatekeeper_v1") == "dealer"
     assert _variant_vertical("mca_refi_v1") == "mca"
     assert _variant_vertical("unknown") == "real_estate"
+
+
+def test_terminal_pipeline_statuses_keep_their_business_meaning():
+    assert PIPELINE_TO_INTAKE_STATUS["approved"] == "approved"
+    assert PIPELINE_TO_INTAKE_STATUS["closed_won"] == "completed"
+    assert PIPELINE_TO_INTAKE_STATUS["closed_lost"] == "closed_lost"
+    assert PIPELINE_TO_INTAKE_STATUS["denied"] == "denied"
+
+    assert INTAKE_STATUS_TO_UNDERWRITING["completed"] == "closed_won"
+    assert INTAKE_STATUS_TO_UNDERWRITING["closed_lost"] == "closed_lost"
+    assert INTAKE_STATUS_TO_UNDERWRITING["denied"] == "denied"
 
 
 def test_stage_shapes_keep_working_and_funding_ladders_separate():

@@ -176,8 +176,13 @@ INTAKE_STATUS_TO_UNDERWRITING = {
     "submitted": "collecting_docs",
     "reviewing": "collecting_docs",
     "reviewed": "in_underwriting",
-    "completed": "approved",
+    # ``completed`` is reserved for a file that actually closed/funded.  The
+    # former mapping collapsed approval, loss, and denial into the same green
+    # terminal state and made the intake header disagree with the pipeline.
+    "approved": "approved",
+    "completed": "closed_won",
     "closed": "closed_lost",
+    "closed_lost": "closed_lost",
     "denied": "denied",
 }
 WORKING_STAGE_TO_UNDERWRITING = {
@@ -196,10 +201,10 @@ PIPELINE_TO_INTAKE_STATUS = {
     "collecting_docs": "reviewing",
     "in_underwriting": "reviewed",
     "term_sheet_provided": "reviewed",
-    "approved": "completed",
+    "approved": "approved",
     "closed_won": "completed",
-    "closed_lost": "completed",
-    "denied": "completed",
+    "closed_lost": "closed_lost",
+    "denied": "denied",
 }
 PIPELINE_TO_INTAKE_OUTCOME = {
     "submitted": "submitted",
