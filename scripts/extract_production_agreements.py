@@ -366,6 +366,10 @@ def build(key: str, spec: dict[str, Any], artifact_dir: Path) -> tuple[str, dict
 
     css = "\n".join([PAGE_CSS, fix_fonts(doc_css).strip(), EXTRA_CSS])
     html = DOCUMENT.format(title=spec["title"], css=css, body=docpage.decode_contents())
+    # The manifest is a legal-content integrity check, not an operating-system
+    # newline check.  Pin a canonical LF representation and write those same
+    # bytes on every platform.
+    html = html.replace("\r\n", "\n").replace("\r", "\n")
 
     for forbidden in ("<sc-raw-", "@font-face", "<img", "<helmet", "<doc-page", "<script", "<link", "sc-camel-view-box"):
         if forbidden in html:
@@ -399,11 +403,15 @@ def main(argv: list[str]) -> int:
     manifest: dict[str, Any] = {"templates": {}, "version": MANIFEST_VERSION}
     for key, spec in SOURCES.items():
         html, entry = build(key, spec, artifact_dir)
-        (OUT_DIR / f"{key}.html").write_text(html, encoding="utf-8")
+        (OUT_DIR / f"{key}.html").write_text(html, encoding="utf-8", newline="\n")
         manifest["templates"][key] = entry
         print(f"{key}: {len(entry['fields'])} fields, {len(entry['checks'])} checks, "
               f"anchors {entry['anchors']}, initials {entry['initials']}, sha256 {entry['sha256'][:16]}")
-    (OUT_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    (OUT_DIR / "manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     print(f"wrote {OUT_DIR / 'manifest.json'}")
     return 0
 

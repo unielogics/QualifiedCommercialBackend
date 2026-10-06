@@ -127,6 +127,17 @@ def test_manifest_inventories(key: str):
 
 
 @pytest.mark.parametrize("key", tpl.TEMPLATE_KEYS)
+def test_template_integrity_is_stable_across_checkout_line_endings(key: str):
+    html, sha = tpl.load_template(key)
+    lf = html.encode("utf-8")
+    crlf = html.replace("\n", "\r\n").encode("utf-8")
+
+    assert tpl._canonical_template_bytes(lf) == lf
+    assert tpl._canonical_template_bytes(crlf) == lf
+    assert hashlib.sha256(tpl._canonical_template_bytes(crlf)).hexdigest() == sha
+
+
+@pytest.mark.parametrize("key", tpl.TEMPLATE_KEYS)
 def test_template_is_print_ready(key: str):
     html, _ = tpl.load_template(key)
     for forbidden in ("sc-raw-", "@font-face", "<img", "<helmet", "<doc-page", "<script", "<link", "sc-camel-view-box", "'Archivo'", "'IBM Plex Sans'"):
@@ -513,7 +524,7 @@ def test_rendered_pdfs_carry_every_anchor():
         assert not re.search(r"\[\[(SIG|DATE|INI):", tpl.strip_anchors(text))
 
 
-ACTIVATION_SHA_WITH_PHASED_PAYMENTS = "f8496c5bf62222489dc1e5b27b488e4bd12636199ae73886326b10d4d965f60e"
+ACTIVATION_SHA_WITH_PHASED_PAYMENTS = "4e6faef25e14f075597812902015378513236383ce562c256df9f3e8ccc13545"
 
 
 def test_the_breach_fee_changed_the_commitment_and_nothing_else():

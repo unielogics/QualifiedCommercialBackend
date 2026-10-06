@@ -1,7 +1,7 @@
 {
   "templates": {
     "commitment_v1": {
-      "sha256": "78840b85e1000671899fcf3bbe674747c94fa074c9a036b7ebc1896626e2d59c",
+      "sha256": "1d97a273347aff1d446e1a0242b3b18449a72bb26b752267cef738832ef23125",
       "fields": [
         "sponsor_logo_text",
         "agreement_no",
@@ -200,7 +200,7 @@
       "source_artifact": "artifact-633d324a-1788403760-21c1.html"
     },
     "activation_v1": {
-      "sha256": "f8496c5bf62222489dc1e5b27b488e4bd12636199ae73886326b10d4d965f60e",
+      "sha256": "4e6faef25e14f075597812902015378513236383ce562c256df9f3e8ccc13545",
       "fields": [
         "sponsor_logo_text",
         "agreement_no",

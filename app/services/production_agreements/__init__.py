@@ -44,6 +44,19 @@ class TemplateIntegrityError(RuntimeError):
     """The template on disk does not match the sha256 pinned in the manifest."""
 
 
+def _canonical_template_bytes(raw: bytes) -> bytes:
+    """Normalize checkout-specific newlines before integrity verification.
+
+    Git checks these HTML templates out with platform-native line endings on
+    Windows, while the production image uses LF.  The signed content is the
+    same in both environments, so the manifest pins one canonical LF byte
+    representation instead of treating newline conversion as a legal-text
+    edit.
+    """
+
+    return raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+
 def anchor(kind: str, party: str, n: int) -> str:
     """The literal token placed on a template for a signature, date or initials line."""
     if kind not in ANCHOR_KINDS:
@@ -71,7 +84,7 @@ def template_entry(key: str) -> dict[str, Any]:
 @functools.lru_cache(maxsize=len(TEMPLATE_KEYS))
 def _load(key: str) -> tuple[str, str]:
     entry = template_entry(key)
-    raw = (TEMPLATE_DIR / f"{key}.html").read_bytes()
+    raw = _canonical_template_bytes((TEMPLATE_DIR / f"{key}.html").read_bytes())
     sha = hashlib.sha256(raw).hexdigest()
     if sha != entry["sha256"]:
         raise TemplateIntegrityError(
