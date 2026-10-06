@@ -68,6 +68,29 @@ def _date(value: date | datetime | None) -> str:
     return value.strftime("%B %d, %Y")
 
 
+def _readiness_as_of(context: dict[str, Any]) -> date:
+    """Return the date against which a generated package was evaluated.
+
+    A master application is an audit snapshot. Re-opening an older package
+    must not make bank evidence that was current when the package was produced
+    look stale merely because wall-clock time advanced. JSON-backed snapshots
+    can carry the timestamp as an ISO string, while newly built contexts use a
+    timezone-aware ``datetime``.
+    """
+
+    generated_at = context.get("generated_at")
+    if isinstance(generated_at, datetime):
+        return generated_at.date()
+    if isinstance(generated_at, date):
+        return generated_at
+    if isinstance(generated_at, str):
+        try:
+            return datetime.fromisoformat(generated_at.replace("Z", "+00:00")).date()
+        except ValueError:
+            pass
+    return date.today()
+
+
 def _address(*parts: Any) -> str:
     cleaned = [_text(part) for part in parts if _text(part)]
     return ", ".join(cleaned) if cleaned else "Awaiting evidence"
@@ -597,7 +620,7 @@ def build_readiness(context: dict[str, Any]) -> dict[str, Any]:
     accepted_target = int(financial.get("accepted_statement_target") or STATEMENT_MONTH_TARGET)
     accepted_freshness = recurrence.compute_freshness(
         financial.get("statement_months") or [],
-        date.today(),
+        _readiness_as_of(context),
         window=accepted_target,
     )
     statement_complete = bool(

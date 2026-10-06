@@ -28,6 +28,7 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
+from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -169,6 +170,11 @@ async def soft_delete_mirrored_file(
     """Remove a mirror from active bucket views while retaining its archive."""
     if bucket_file.deleted_at is not None:
         return
+    if bucket_file.is_deletion_prohibited():
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This ACH or agreement artifact is protected by retention or legal hold",
+        )
     now = datetime.now(UTC)
     bucket_file.deleted_at = now
     bucket_file.deleted_by_user_id = user.id

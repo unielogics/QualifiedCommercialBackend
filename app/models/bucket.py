@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
@@ -27,6 +27,17 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app import request_context
 from app.db import Base
 from app.models._mixins import TimestampMixin
+
+# A protected compliance artifact without an expiry is an incomplete record,
+# not an unprotected one.  Keeping this vocabulary next to the enforcement
+# primitive makes every deletion path fail closed in the same way.
+PROTECTED_RETENTION_CLASSES = frozenset(
+    {
+        "ach_authorization_proof",
+        "ach_debit_notice",
+        "payment_agreement",
+    }
+)
 
 if TYPE_CHECKING:
     from app.models.user import User
@@ -230,6 +241,24 @@ class BucketUploadLink(TimestampMixin, Base):
 
 class BucketFile(TimestampMixin, Base):
     __tablename__ = "bucket_files"
+    __table_args__ = (
+        Index("ix_bucket_files_retention", "retention_class", "protected_until"),
+        Index("ix_bucket_files_source_entity", "source_entity_type", "source_entity_id"),
+        Index(
+            "uq_bucket_files_protected_source_ref",
+            "source_entity_type",
+            "source_entity_id",
+            "retention_class",
+            "source_immutable_ref",
+            unique=True,
+            postgresql_where=text(
+                "source_entity_type IS NOT NULL "
+                "AND source_entity_id IS NOT NULL "
+                "AND retention_class IS NOT NULL "
+                "AND source_immutable_ref IS NOT NULL"
+            ),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     #: How this document got here, decided by the route rather than the request
@@ -237,6 +266,19 @@ class BucketFile(TimestampMixin, Base):
     #: existed, which reads as "not recorded".
     source_kind: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
     source_detail: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Compliance artifacts remain ordinary bucket files for preview/download,
+    # but these fields let every deletion path enforce the same retention
+    # policy.  ``source_entity_id`` intentionally has no foreign key: proof of
+    # authorization must remain reproducible even when its workflow record is
+    # later archived or removed under a different retention policy.
+    retention_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    protected_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    legal_hold: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    source_entity_type: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    source_entity_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    source_immutable_ref: Mapped[str | None] = mapped_column(String(160), nullable=True)
     #: Set whenever a signed-in user of ours put it here. uploaded_by_name is a
     #: display string the client's own browser can supply; this one cannot be.
     uploaded_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -249,6 +291,33 @@ class BucketFile(TimestampMixin, Base):
         from app.services import provenance
 
         return provenance.describe_document(self)
+
+    def is_deletion_prohibited(self, *, at: datetime | None = None) -> bool:
+        """Return whether soft or storage deletion is currently forbidden.
+
+        This model-level primitive keeps time comparison policy in one place;
+        API and background deletion paths must call it before mutating the row
+        or its S3 object.  A legal hold has no expiry.  Naive legacy timestamps
+        are treated as UTC.
+        """
+
+        if self.legal_hold:
+            return True
+        if (
+            self.retention_class in PROTECTED_RETENTION_CLASSES
+            and self.protected_until is None
+        ):
+            return True
+        if self.protected_until is None:
+            return False
+        protected_until = self.protected_until
+        if protected_until.tzinfo is None:
+            protected_until = protected_until.replace(tzinfo=UTC)
+        checked_at = at or datetime.now(UTC)
+        if checked_at.tzinfo is None:
+            checked_at = checked_at.replace(tzinfo=UTC)
+        return protected_until > checked_at
+
     bucket_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -265,6 +334,10 @@ class BucketFile(TimestampMixin, Base):
     statement_period: Mapped[str | None] = mapped_column(String(7), nullable=True)
     file_name: Mapped[str] = mapped_column(String(255), nullable=False)
     s3_key: Mapped[str] = mapped_column(String(700), nullable=False)
+    # S3 object version captured from PutObject/HeadObject.  Protected proof
+    # downloads bind to this version so enabling bucket versioning cannot make
+    # a later object version silently replace the evidence that was signed.
+    s3_version_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     content_type: Mapped[str] = mapped_column(String(160), nullable=False, default="application/octet-stream")
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     uploaded_by_name: Mapped[str | None] = mapped_column(String(180), nullable=True)

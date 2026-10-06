@@ -12,9 +12,10 @@ import html
 from datetime import datetime
 from decimal import Decimal
 
-from app.models.payments import AchMandate, PaymentFundingSource
+from app.models.payments import AchMandate, PaymentDebitNotice, PaymentFundingSource
 
 AUTHORIZATION_TEXT_VERSION = "ach-fee-2026-10-05-v1"
+ONE_TIME_CCD_AUTHORIZATION_TEXT_VERSION = "ach-one-time-ccd-2026-10-06-v1"
 PRIVATE_SCHEDULE_AUTHORIZATION_TEXT_VERSION = "ach-private-schedule-2026-10-05-v1"
 
 
@@ -32,6 +33,51 @@ def authorization_text(*, ach_class: str, maximum_amount_cents: int) -> str:
         "debit. I consent to electronic records and signatures and may request a "
         "copy of this authorization. Once a transfer has been submitted it cannot "
         "be recalled through revocation of this authorization."
+    )
+
+
+def one_time_fee_authorization_text(
+    *,
+    amount_cents: int,
+    scheduled_debit_at: datetime,
+    debit_window_start_at: datetime,
+    debit_window_end_at: datetime,
+    account_mask: str | None,
+    revocation_cutoff_at: datetime,
+    agreement_sha256: str,
+    obligation_sha256: str,
+    business_name: str | None = None,
+    payer_name: str | None = None,
+) -> str:
+    """Exact CCD consent: one amount, one account, and one dated window."""
+
+    from zoneinfo import ZoneInfo
+
+    eastern = ZoneInfo("America/New_York")
+    scheduled = scheduled_debit_at.astimezone(eastern)
+    window_start = debit_window_start_at.astimezone(eastern)
+    window_end = debit_window_end_at.astimezone(eastern)
+    cutoff = revocation_cutoff_at.astimezone(eastern)
+    return (
+        f"I, {payer_name or 'the authorized signer'}, certify that I am authorized to act for "
+        f"{business_name or 'the payer business'}, that the connected account is its business "
+        "bank account, and authorize Qualified Commercial LLC, as originator, to originate "
+        "exactly one CCD ACH debit of "
+        f"${amount_cents / 100:,.2f} from the business account ending "
+        f"{account_mask or '----'} on {scheduled.strftime('%B %d, %Y')}. The debit may be "
+        f"submitted only during the business-day Eastern Time window from "
+        f"{window_start.isoformat()} through {window_end.isoformat()}. This is not a recurring, "
+        "variable, installment, or consumer authorization, and it cannot be used for any other "
+        f"amount, date, account, agreement, or obligation. Agreement SHA-256: {agreement_sha256}. "
+        f"Obligation SHA-256: {obligation_sha256}. I may revoke this unsubmitted debit in the "
+        f"secure application room or by emailing support@qualifiedcommercial.com through "
+        f"{cutoff.isoformat()} (5:00 PM Eastern Time one business day before the scheduled debit). "
+        "Revocation cannot recall a debit already submitted and does not cancel an underlying fee "
+        "that has otherwise been earned and remains due under the signed agreement. The account "
+        "was connected through Plaid; Qualified Commercial does not receive or store my online-"
+        "banking credentials. Qualified Commercial must separately send advance notice and an "
+        "authorized staff member must separately release the debit after the notice period. I "
+        "consent to electronic records and signatures and may download or request another copy."
     )
 
 
@@ -121,10 +167,13 @@ def render_certificate_pdf(
         "</tr>"
         for label, amount_cents, reference in fee_lines
     )
-    terms = html.escape(authorization_text(
-        ach_class=mandate.ach_class,
-        maximum_amount_cents=mandate.authorized_amount_cents,
-    ))
+    terms = html.escape(
+        mandate.authorization_text_snapshot
+        or authorization_text(
+            ach_class=mandate.ach_class,
+            maximum_amount_cents=mandate.authorized_amount_cents,
+        )
+    )
     body = f"""
     <html><head><style>
       @page {{ size: letter; margin: 0.65in; }}
@@ -148,6 +197,69 @@ def render_certificate_pdf(
     pdf = HTML(string=body).write_pdf()
     if not pdf:
         raise RuntimeError("ACH authorization certificate generation failed")
+    return pdf
+
+
+def render_debit_notice_pdf(
+    *,
+    notice: PaymentDebitNotice,
+    mandate: AchMandate,
+    funding_source: PaymentFundingSource,
+    authorization_text: str,
+) -> bytes:
+    """Render the immutable notice sent separately from the signed mandate."""
+
+    from zoneinfo import ZoneInfo
+
+    from weasyprint import HTML
+
+    eastern = ZoneInfo("America/New_York")
+    rows = [
+        ("Notice ID", str(notice.id)),
+        ("Authorization ID", str(mandate.id)),
+        ("Notice type", "Exact one-time business CCD debit"),
+        ("Amount", f"${notice.amount_cents / 100:,.2f} {notice.currency.upper()}"),
+        ("Business account", f"{funding_source.account_name or 'Bank account'} ending {notice.account_mask or '----'}"),
+        ("Scheduled debit date", notice.scheduled_debit_at.astimezone(eastern).strftime("%B %d, %Y")),
+        ("Submission window starts", notice.debit_window_start_at.astimezone(eastern).isoformat()),
+        ("Submission window ends", notice.debit_window_end_at.astimezone(eastern).isoformat()),
+        ("Advance-notice period", f"{notice.notice_business_days} business days"),
+        ("Revocation cutoff", notice.revocation_cutoff_at.astimezone(eastern).isoformat()),
+        ("Authorization text SHA-256", notice.authorization_text_sha256 or ""),
+        ("Agreement SHA-256", mandate.agreement_sha256 or ""),
+        ("Obligation SHA-256", mandate.obligation_sha256),
+        ("Notice snapshot SHA-256", notice.notice_sha256),
+    ]
+    row_html = "".join(
+        f"<tr><th>{html.escape(label)}</th><td>{html.escape(str(value))}</td></tr>"
+        for label, value in rows
+    )
+    terms = html.escape(authorization_text)
+    body = f"""
+    <html><head><style>
+      @page {{ size: letter; margin: 0.7in; }}
+      body {{ font-family: Arial, sans-serif; color: #111827; font-size: 11px; }}
+      h1 {{ color: #1e3a8a; font-size: 21px; margin: 0 0 4px; }}
+      h2 {{ font-size: 14px; margin: 24px 0 8px; }}
+      .muted {{ color: #64748b; }}
+      .warning {{ border: 2px solid #1e3a8a; padding: 14px; margin-top: 18px; font-size: 13px; }}
+      table {{ width: 100%; border-collapse: collapse; margin-top: 14px; }}
+      th {{ width: 34%; text-align: left; background: #f1f5f9; }}
+      th, td {{ border: 1px solid #cbd5e1; padding: 7px 9px; vertical-align: top; }}
+      .terms {{ border: 1px solid #cbd5e1; background: #f8fafc; padding: 14px; line-height: 1.5; }}
+    </style></head><body>
+      <h1>Advance Notice of One-Time ACH Debit</h1>
+      <div class="muted">Qualified Commercial LLC · separate debit notice</div>
+      <div class="warning">Qualified Commercial intends to submit exactly one business CCD debit
+      of <strong>${notice.amount_cents / 100:,.2f}</strong> on
+      <strong>{notice.scheduled_debit_at.astimezone(eastern).strftime('%B %d, %Y')}</strong>.</div>
+      <h2>Exact notice record</h2><table>{row_html}</table>
+      <h2>Authorization tied to this notice</h2><div class="terms">{terms}</div>
+    </body></html>
+    """
+    pdf = HTML(string=body).write_pdf()
+    if not pdf:
+        raise RuntimeError("ACH advance-notice PDF generation failed")
     return pdf
 
 

@@ -30,7 +30,7 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass
-from datetime import UTC
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -415,6 +415,22 @@ def verify_passcode(passcode: str, passcode_hash: str | None) -> bool:
     return False
 
 
+def link_is_usable(link: BucketUploadLink, *, now: datetime | None = None) -> bool:
+    """Return whether a room invitation may still authorize public access."""
+
+    checked_at = now or datetime.now(UTC)
+    expires_at = getattr(link, "expires_at", None)
+    completed_single_use = bool(
+        getattr(link, "completed_at", None)
+        and not getattr(link, "allow_multiple_sessions", True)
+    )
+    return bool(
+        getattr(link, "status", None) == "active"
+        and (expires_at is None or expires_at > checked_at)
+        and not completed_single_use
+    )
+
+
 async def resolve_room(
     db: AsyncSession, token: str, passcode: str
 ) -> tuple[BucketUploadLink, DealerBusiness]:
@@ -431,14 +447,10 @@ async def resolve_room(
     Raises LookupError for anything that fails, so callers cannot accidentally
     distinguish "wrong token" from "wrong code" and turn this into an oracle.
     """
-    from datetime import datetime
-
     link = (
         await db.execute(select(BucketUploadLink).where(BucketUploadLink.token == token))
     ).scalar_one_or_none()
-    if link is None or link.status != "active":
-        raise LookupError("room not found")
-    if link.expires_at is not None and link.expires_at < datetime.now(UTC):
+    if link is None or not link_is_usable(link):
         raise LookupError("room not found")
     if not verify_passcode(passcode or "", link.passcode_hash):
         raise LookupError("room not found")

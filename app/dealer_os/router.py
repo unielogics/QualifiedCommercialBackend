@@ -17173,6 +17173,38 @@ async def plaid_exchange(
     )
 
 
+def _room_signable_reads(
+    signable: list[BucketRequestedDocument],
+    *,
+    include_payment_agreements: bool,
+) -> list[RoomSignableRead]:
+    from app.services import document_signature as sig_service
+
+    rows = []
+    for r in signable:
+        if (
+            r.signature_kind == "success_fee_agreement"
+            and not include_payment_agreements
+        ):
+            continue
+        text = r.signature_document_text or (
+            sig_service.credit_authorization_document_text()
+            if r.signature_kind == "credit_authorization"
+            else ""
+        )
+        rows.append(
+            RoomSignableRead(
+                id=r.id,
+                name=r.name,
+                kind=r.signature_kind,
+                signed=r.status == "uploaded",
+                document_text=text,
+                signable=bool(text),
+            )
+        )
+    return rows
+
+
 @router.post("/public/room/{token}/features", response_model=RoomFeaturesRead)
 async def public_room_features(
     token: str, payload: RoomPasscode, db: AsyncSession = Depends(get_db)
@@ -17201,25 +17233,29 @@ async def public_room_features(
         .scalars()
         .all()
     )
-    from app.services import document_signature as sig_service
-
-    rows = []
-    for r in signable:
-        text = r.signature_document_text or (
-            sig_service.credit_authorization_document_text()
-            if r.signature_kind == "credit_authorization"
-            else ""
-        )
-        rows.append(
-            RoomSignableRead(
-                id=r.id,
-                name=r.name,
-                kind=r.signature_kind,
-                signed=r.status == "uploaded",
-                document_text=text,
-                signable=bool(text),
+    payment_agreements_visible = False
+    payment_profile = (
+        await db.execute(
+            select(ApplicationProfile).where(
+                ApplicationProfile.primary_bucket_id == link.bucket_id
             )
         )
+    ).scalar_one_or_none()
+    if payment_profile is not None:
+        from app.services import payments as payment_service
+
+        try:
+            await payment_service.assert_payment_room_identity(
+                db, link=link, profile=payment_profile
+            )
+        except HTTPException:
+            pass
+        else:
+            payment_agreements_visible = True
+    rows = _room_signable_reads(
+        list(signable),
+        include_payment_agreements=payment_agreements_visible,
+    )
     # Agreements out for signature (and already-executed ones, so the room can
     # show Signed instead of silently dropping them). The FULL text rides
     # along: what is shown in Agreement mode is extracted from the exact PDF
@@ -17649,6 +17685,30 @@ async def public_room_sign(
         esign_consent=payload.esign_consent,
         signature_data_url=payload.signature_data_url,
     )
+    requested = await db.get(BucketRequestedDocument, payload.requested_document_id)
+    is_success_fee_agreement = bool(
+        requested and requested.signature_kind == "success_fee_agreement"
+    )
+    payment_profile = None
+    if is_success_fee_agreement:
+        from app.services import ach_fee_workflow, payments as payment_service
+
+        ach_fee_workflow.require_fee_workflow_enabled()
+        payment_profile = (
+            await db.execute(
+                select(ApplicationProfile).where(
+                    ApplicationProfile.primary_bucket_id == link.bucket_id
+                )
+            )
+        ).scalar_one_or_none()
+        if payment_profile is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "The payment file for this agreement is unavailable",
+            )
+        await payment_service.assert_payment_room_identity(
+            db, link=link, profile=payment_profile
+        )
     result_file = await _sign_requested_document(
         db,
         shim,  # type: ignore[arg-type] — duck-typed on the two fields the engine reads
@@ -17656,18 +17716,51 @@ async def public_room_sign(
         request,
         actor_name=payload.typed_name,
         actor_email=(link.recipient_email or dealer.email or ""),
+        allow_success_fee_agreement=is_success_fee_agreement,
     )
+    if is_success_fee_agreement and payment_profile and requested:
+        from app.services import ach_fee_workflow
+
+        await ach_fee_workflow.finalize_success_fee_agreement(
+            db,
+            profile=payment_profile,
+            requested=requested,
+            result_file=result_file,
+        )
+        await ach_fee_workflow.ensure_success_fee_agreement_copy_queued(
+            db,
+            profile=payment_profile,
+            requested=requested,
+            result_file=result_file,
+            recipient_email=(link.recipient_email or dealer.email),
+            signer_name=payload.typed_name,
+        )
     await log_action(
         db, dealer.id, None, "document.signed.client", "doc_request",
         entity_id=payload.requested_document_id,
         after={"signer": payload.typed_name, "via": "client_room", "file_id": str(result_file.id)},
     )
     await db.commit()
+    delivery_ok = True
+    if is_success_fee_agreement and payment_profile and requested:
+        delivery_ok = await ach_fee_workflow.deliver_success_fee_agreement_copy(
+            db,
+            profile=payment_profile,
+            requested=requested,
+            result_file=result_file,
+            recipient_email=(link.recipient_email or dealer.email),
+            signer_name=payload.typed_name,
+        )
+        await db.commit()
     return RoomSignResult(
         signed=True,
         certificate_file_id=result_file.id,
-        message="Signed. A copy of the executed document has been emailed to you.",
-        execution_status="executed",
+        message=(
+            "Signed. Your executed copy is available and has been emailed to you."
+            if delivery_ok
+            else "Signed. Your executed copy is available; email delivery needs attention."
+        ),
+        execution_status="executed" if delivery_ok else "delivery_warning",
     )
 
 

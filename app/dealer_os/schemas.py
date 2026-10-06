@@ -1195,6 +1195,8 @@ class RepAppointmentOutcomePatch(BaseModel):
     def _conversion_requires_destination(self) -> "RepAppointmentOutcomePatch":
         if self.outcome == "converted" and self.conversion_target is None:
             raise ValueError("Choose a conversion destination.")
+        if self.conversion_target == "ai_intake" and self.ai_variant is None:
+            raise ValueError("Choose an AI intake type.")
         if self.conversion_target == "ai_intake" and self.secure_room_pin is None:
             raise ValueError("Create a six-digit secure room PIN.")
         return self

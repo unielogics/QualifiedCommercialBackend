@@ -21,8 +21,9 @@ from fastapi import HTTPException, status
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.enums import Role
-from app.models.application_profile import ApplicationProfile
+from app.models.application_profile import ApplicationProfile, ApplicationRoomDelivery
 from app.models.bucket import BucketDocumentSignature, BucketFile, BucketRequestedDocument
 from app.models.client import Client
 from app.models.document import Document
@@ -34,6 +35,7 @@ from app.models.payments import (
     FeeObligation,
     FeeObligationLine,
     PaymentAuditEvent,
+    PaymentDebitNotice,
     PaymentFundingSource,
     PaymentInstallment,
     PaymentRefund,
@@ -60,6 +62,7 @@ from app.schemas.payments import (
     FeeObligationLineResponse,
     FeeObligationResponse,
     FundingConfirmationCreate,
+    PaymentDebitNoticeRead,
     PaymentFundingSourceCreate,
     PaymentFundingSourceResponse,
     PaymentPermissions,
@@ -179,6 +182,10 @@ def _canonical_hash(value: Any) -> str:
 
 
 def _funding_source_snapshot(source: PaymentFundingSource) -> dict[str, Any]:
+    source_metadata = source.metadata_json if isinstance(source.metadata_json, dict) else {}
+    business_attestation = source_metadata.get("business_account_attestation")
+    if not isinstance(business_attestation, dict):
+        business_attestation = None
     return {
         "funding_source_id": str(source.id),
         "owner_type": source.owner_type,
@@ -189,7 +196,22 @@ def _funding_source_snapshot(source: PaymentFundingSource) -> dict[str, Any]:
         "institution_name": source.institution_name,
         "holder_name": source.holder_name,
         "verified_at": source.verified_at.isoformat() if source.verified_at else None,
+        "business_account_attestation": business_attestation,
     }
+
+
+def _business_account_attested(source: PaymentFundingSource | None) -> bool:
+    """Require affirmative, auditable customer ownership/authority evidence for CCD."""
+
+    if source is None or not isinstance(source.metadata_json, dict):
+        return False
+    attestation = source.metadata_json.get("business_account_attestation")
+    return bool(
+        isinstance(attestation, dict)
+        and attestation.get("attested") is True
+        and str(attestation.get("attested_at") or "").strip()
+        and str(attestation.get("room_link_id") or "").strip()
+    )
 
 
 def _mandate_matches_source(
@@ -204,6 +226,41 @@ def _mandate_matches_source(
         and mandate.funding_source_snapshot == snapshot
         and mandate.funding_source_sha256 == _canonical_hash(snapshot)
     )
+
+
+async def fee_mandate_is_current(
+    db: AsyncSession,
+    *,
+    mandate: AchMandate | None,
+    obligation: FeeObligation | None,
+    source: PaymentFundingSource | None,
+    notice: PaymentDebitNotice | None,
+) -> bool:
+    """Canonical usability check shared by client display and staff release gates."""
+
+    if not mandate or not obligation or not source or not notice:
+        return False
+    now = _now()
+    if (
+        mandate.status != "active"
+        or mandate.revoked_at is not None
+        or (mandate.expires_at is not None and mandate.expires_at <= now)
+        or mandate.authorization_type != "one_time_business_ccd"
+        or mandate.authorized_amount_cents != obligation.client_ach_cents
+        or mandate.obligation_sha256 != await fee_obligation_sha256(db, obligation)
+        or mandate.agreement_document_id != obligation.agreement_document_id
+        or mandate.agreement_sha256 != obligation.agreement_sha256
+        or not mandate.authorization_text_sha256
+        or notice.revoked_at is not None
+        or notice.mandate_id != mandate.id
+        or notice.amount_cents != obligation.client_ach_cents
+        or notice.authorization_text_sha256 != mandate.authorization_text_sha256
+        or notice.scheduled_debit_at != mandate.scheduled_debit_at
+        or not _business_account_attested(source)
+        or not _mandate_matches_source(mandate, source)
+    ):
+        return False
+    return True
 
 
 def _provider_refund_idempotency_key(refund_id: UUID) -> str:
@@ -367,6 +424,33 @@ def _patch_component_client_ach(
         origination_client_ach_cents=origination,
         consulting_client_ach_cents=consulting,
     )
+
+
+async def assert_payment_room_identity(
+    db: AsyncSession,
+    *,
+    link: Any,
+    profile: ApplicationProfile,
+) -> None:
+    """Limit payment authority to the canonical room owned by the client identity."""
+
+    from app.dealer_os.services import client_room
+    from app.services import application_profiles as profile_service
+
+    _business_name, _client_name, client_email = await _profile_identity(db, profile)
+    current_link = await client_room.active_link(db, link.bucket_id)
+    if (
+        not client_room.link_is_usable(link)
+        or current_link is None
+        or current_link.id != link.id
+        or not profile_service.normalized_email(link.recipient_email)
+        or profile_service.normalized_email(link.recipient_email)
+        != profile_service.normalized_email(client_email)
+    ):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "This secure room invitation is not authorized for payment actions",
+        )
 
 
 def validate_allocation(gross_fee_cents: int, payload: FeeAllocationInput) -> dict[str, int]:
@@ -544,10 +628,18 @@ async def save_fee_allocation(
                 ).with_for_update()
             )
         ).scalars().all()
+        terminated_at = _now()
         for mandate in active_mandates:
             mandate.status = "superseded"
-            mandate.revoked_at = _now()
+            mandate.revoked_at = terminated_at
             mandate.revoked_by_user_id = actor.id
+            mandate.terminated_at = terminated_at
+            mandate.termination_reason = "Fee allocation changed"
+            from app.services import ach_fee_workflow
+
+            await ach_fee_workflow.extend_mandate_retention(
+                db, mandate, anchor=terminated_at
+            )
         await cancel_unclaimed_transfer_intents(
             db,
             mandate_ids=[mandate.id for mandate in active_mandates],
@@ -791,7 +883,7 @@ async def _resolve_fee_agreement(
     profile: ApplicationProfile,
     payload: FeeObligationCreate,
     actor: User,
-) -> tuple[BucketFile, str, str, dict[str, Any]]:
+) -> tuple[BucketFile, str, str, dict[str, Any], dict[str, Any]]:
     if payload.agreement_document_id is None:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -825,13 +917,37 @@ async def _resolve_fee_agreement(
             .limit(1)
         )
     ).first()
-    if signature_row is None and not payload.agreement_attested_signed:
+    if signature_row is None:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "Confirm that the selected uploaded agreement is fully executed",
+            "Use the deal-specific Success Fee Agreement prepare and signing flow",
         )
     signature, requested = signature_row if signature_row else (None, None)
-    now = _now()
+    if requested is None or requested.signature_kind != "success_fee_agreement":
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Only an executed deal-specific Success Fee Agreement may govern fee collection",
+        )
+    # A cryptographically valid historical PDF is not authority to collect
+    # fees calculated from newer economics or a newer allocation.  The
+    # document-signing flow snapshots both, so every entry point (including
+    # the compatibility obligation endpoint) must revalidate that snapshot.
+    from app.services import ach_fee_workflow
+
+    if not await ach_fee_workflow.prepared_agreement_is_current(
+        db, profile=profile, requested=requested
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This Success Fee Agreement no longer matches the current deal economics or fee allocation. Prepare and sign a replacement agreement.",
+        )
+    source = requested.requirement_source or {}
+    signed_terms = source.get("snapshot") if isinstance(source, dict) else None
+    if not isinstance(signed_terms, dict):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The executed Success Fee Agreement has no verifiable fee snapshot",
+        )
     snapshot: dict[str, Any] = {
         "artifact_type": "bucket_file",
         "bucket_file_id": str(file.id),
@@ -842,11 +958,93 @@ async def _resolve_fee_agreement(
         "signature_id": str(signature.id) if signature else None,
         "signed_at": signature.signed_at.isoformat() if signature and signature.signed_at else None,
         "signature_kind": requested.signature_kind if requested else None,
-        "attested_signed": signature is None,
-        "attested_by_user_id": str(actor.id) if signature is None else None,
-        "attested_at": now.isoformat() if signature is None else None,
+        "attested_signed": False,
+        "attested_by_user_id": None,
+        "attested_at": None,
     }
-    return file, f"bucket-file:{file.id}", str(file.content_hash).lower(), snapshot
+    return (
+        file,
+        f"bucket-file:{file.id}",
+        str(file.content_hash).lower(),
+        snapshot,
+        signed_terms,
+    )
+
+
+def _require_obligation_matches_signed_fee_terms(
+    *,
+    payload: FeeObligationCreate,
+    signed_terms: dict[str, Any],
+    origination_fee_cents: int,
+    consulting_fee_cents: int,
+    gross_fee_cents: int,
+    allocation: dict[str, int],
+    origination_client_ach_cents: int,
+    consulting_client_ach_cents: int,
+) -> dict[str, Any]:
+    """Bind compatibility obligation creation to the exact executed agreement.
+
+    The signing workflow normally creates the obligation itself.  This guard
+    keeps the compatibility endpoint idempotent without allowing a caller to
+    reuse that signed PDF for different components, economics, or allocation.
+    The returned subset is persisted with the obligation as durable evidence
+    of the comparison made here.
+    """
+
+    integer_fields = (
+        "origination_fee_cents",
+        "consulting_fee_cents",
+        "gross_fee_cents",
+        "client_ach_cents",
+        "origination_client_ach_cents",
+        "consulting_client_ach_cents",
+        "bank_direct_cents",
+        "external_cents",
+        "deferred_cents",
+        "waived_cents",
+    )
+    try:
+        expected = {
+            "include_origination_fee": bool(
+                signed_terms.get("include_origination_fee")
+            ),
+            "include_consulting_fee": bool(
+                signed_terms.get("include_consulting_fee")
+            ),
+            "consulting_milestone_confirmed": bool(
+                signed_terms.get("consulting_milestone_confirmed")
+            ),
+            **{
+                field: int(signed_terms.get(field) or 0)
+                for field in integer_fields
+            },
+        }
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The executed Success Fee Agreement has an invalid fee snapshot. Prepare and sign a replacement agreement.",
+        ) from exc
+    actual = {
+        "include_origination_fee": payload.include_origination_fee,
+        "include_consulting_fee": payload.include_consulting_fee,
+        "consulting_milestone_confirmed": payload.consulting_milestone_confirmed,
+        "origination_fee_cents": origination_fee_cents,
+        "consulting_fee_cents": consulting_fee_cents,
+        "gross_fee_cents": gross_fee_cents,
+        "client_ach_cents": allocation["client_ach_cents"],
+        "origination_client_ach_cents": origination_client_ach_cents,
+        "consulting_client_ach_cents": consulting_client_ach_cents,
+        "bank_direct_cents": allocation["bank_direct_cents"],
+        "external_cents": allocation["external_cents"],
+        "deferred_cents": allocation["deferred_cents"],
+        "waived_cents": allocation["waived_cents"],
+    }
+    if actual != expected:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The requested fee components or allocation do not exactly match the executed Success Fee Agreement. Prepare and sign a replacement agreement.",
+        )
+    return expected
 
 
 async def _fee_agreement_is_current(db: AsyncSession, obligation: FeeObligation) -> bool:
@@ -870,7 +1068,7 @@ async def _fee_agreement_is_current(db: AsyncSession, obligation: FeeObligation)
         or str(file.content_hash or "").lower() != str(obligation.agreement_sha256 or "").lower()
     ):
         return False
-    if snapshot.get("system_signed"):
+    if snapshot.get("system_signed") and snapshot.get("signature_kind") == "success_fee_agreement":
         signature_id = snapshot.get("signature_id")
         if not signature_id:
             return False
@@ -884,11 +1082,87 @@ async def _fee_agreement_is_current(db: AsyncSession, obligation: FeeObligation)
             and signature.signed_at
             and signature.esign_consent
         )
-    return bool(
-        snapshot.get("attested_signed")
-        and snapshot.get("attested_by_user_id")
-        and snapshot.get("attested_at")
-    )
+    return False
+
+
+async def fee_lines_have_current_governing_agreements(
+    db: AsyncSession,
+    obligation: FeeObligation,
+    *,
+    lines: list[FeeObligationLine] | None = None,
+) -> bool:
+    """Validate each fee component against its exact signed agreement.
+
+    Origination is governed by the deal-specific Success Fee Agreement.
+    Consulting is governed by the separately executed Consulting and Fee
+    Schedule Addendum. Both artifacts must remain hash verified and belong to
+    the same application bucket.
+    """
+
+    profile = await db.get(ApplicationProfile, obligation.application_profile_id)
+    if profile is None or profile.primary_bucket_id is None:
+        return False
+    if lines is None:
+        lines = list(
+            (
+                await db.execute(
+                    select(FeeObligationLine).where(
+                        FeeObligationLine.obligation_id == obligation.id
+                    )
+                )
+            ).scalars().all()
+        )
+    expected_components = {
+        component
+        for component, amount in (
+            ("origination", obligation.origination_fee_cents),
+            ("consulting", obligation.consulting_fee_cents),
+        )
+        if amount
+    }
+    if {line.line_type for line in lines} != expected_components:
+        return False
+    expected_signature_kind = {
+        "origination": "success_fee_agreement",
+        "consulting": "contract_consulting_addendum",
+    }
+    for line in lines:
+        if (
+            line.agreement_component_scope != line.line_type
+            or line.governing_agreement_document_id is None
+            or not _is_sha256(line.governing_agreement_sha256)
+        ):
+            return False
+        file = await db.get(BucketFile, line.governing_agreement_document_id)
+        if (
+            file is None
+            or file.bucket_id != profile.primary_bucket_id
+            or file.deleted_at is not None
+            or str(file.content_hash or "").lower()
+            != str(line.governing_agreement_sha256).lower()
+        ):
+            return False
+        signature_exists = (
+            await db.execute(
+                select(BucketDocumentSignature.id)
+                .join(
+                    BucketRequestedDocument,
+                    BucketRequestedDocument.id
+                    == BucketDocumentSignature.requested_document_id,
+                )
+                .where(
+                    BucketDocumentSignature.result_file_id == file.id,
+                    BucketDocumentSignature.signed_at.is_not(None),
+                    BucketDocumentSignature.esign_consent.is_(True),
+                    BucketRequestedDocument.signature_kind
+                    == expected_signature_kind[line.line_type],
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if signature_exists is None:
+            return False
+    return True
 
 
 def economics_snapshot(profile: ApplicationProfile) -> DealEconomicsSnapshot:
@@ -929,7 +1203,13 @@ async def create_fee_obligation(
     gross = origination_cents + consulting_cents
     if gross <= 0:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The selected fee components total zero")
-    agreement_file, agreement_reference, agreement_sha256, agreement_snapshot = (
+    (
+        agreement_file,
+        agreement_reference,
+        agreement_sha256,
+        agreement_snapshot,
+        signed_fee_terms,
+    ) = (
         await _resolve_fee_agreement(
             db,
             profile=profile,
@@ -937,6 +1217,13 @@ async def create_fee_obligation(
             actor=actor,
         )
     )
+    consulting_agreement_file: BucketFile | None = None
+    if consulting_cents:
+        from app.services import ach_fee_workflow
+
+        consulting_agreement_file, _, _ = (
+            await ach_fee_workflow._current_signed_consulting_addendum(db, profile)
+        )
     latest_plan = await latest_allocation(db, profile.id, for_update=True)
     direct_allocation = _allocation_dict(payload)
     if any(direct_allocation.values()):
@@ -986,10 +1273,24 @@ async def create_fee_obligation(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "Confirm the consulting-fee earning milestone before adding it to an obligation",
         )
+    agreement_snapshot["signed_fee_terms"] = _require_obligation_matches_signed_fee_terms(
+        payload=payload,
+        signed_terms=signed_fee_terms,
+        origination_fee_cents=origination_cents,
+        consulting_fee_cents=consulting_cents,
+        gross_fee_cents=gross,
+        allocation=allocation,
+        origination_client_ach_cents=origination_client_ach_cents,
+        consulting_client_ach_cents=consulting_client_ach_cents,
+    )
 
     # Preparing an obligation is semantically idempotent.  A browser retry
     # after a lost response must return the immutable snapshot that was just
     # created, not supersede it and invalidate the client's future mandate.
+    existing_line_agreements_current = bool(
+        existing
+        and await fee_lines_have_current_governing_agreements(db, existing)
+    )
     if existing and (
         existing.accepted_amount == profile.underwriting_accepted_amount
         and existing.funded_amount == profile.underwriting_funded_amount
@@ -1009,13 +1310,42 @@ async def create_fee_obligation(
         and existing.agreement_sha256 == agreement_sha256
         and bool(existing.consulting_milestone_confirmed_at)
         == bool(payload.include_consulting_fee)
+        and existing_line_agreements_current
     ):
         return existing
 
     version = 1
     if existing:
+        active_mandates = (
+            await db.execute(
+                select(AchMandate)
+                .where(
+                    AchMandate.fee_obligation_id == existing.id,
+                    AchMandate.status == "active",
+                    AchMandate.revoked_at.is_(None),
+                )
+                .with_for_update()
+            )
+        ).scalars().all()
+        await cancel_unclaimed_transfer_intents(
+            db,
+            mandate_ids=[mandate.id for mandate in active_mandates],
+            reason="fee_obligation_replaced",
+        )
+        terminated_at = _now()
+        for mandate in active_mandates:
+            mandate.status = "superseded"
+            mandate.revoked_at = terminated_at
+            mandate.revoked_by_user_id = actor.id
+            mandate.terminated_at = terminated_at
+            mandate.termination_reason = "Fee obligation replaced"
+            from app.services import ach_fee_workflow
+
+            await ach_fee_workflow.extend_mandate_retention(
+                db, mandate, anchor=terminated_at
+            )
         version = existing.version + 1
-        existing.superseded_at = _now()
+        existing.superseded_at = terminated_at
         existing.superseded_by_user_id = actor.id
         existing.status = "superseded"
         existing.record_version += 1
@@ -1058,21 +1388,60 @@ async def create_fee_obligation(
             line_type="origination",
             amount_cents=origination_cents,
             client_ach_cents=origination_client_ach_cents,
+            governing_agreement_document_id=agreement_file.id,
+            governing_agreement_sha256=agreement_sha256,
+            agreement_component_scope="origination",
+            earning_milestone="actual financing funding",
             calculation_snapshot={
                 "accepted_amount": str(economics.accepted_amount or "0"),
                 "origination_points": str(economics.origination_points or "0"),
             },
         ))
     if consulting_cents:
+        if consulting_agreement_file is None or not _is_sha256(
+            consulting_agreement_file.content_hash
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "The signed Consulting and Fee Schedule Addendum is unavailable",
+            )
         db.add(FeeObligationLine(
             obligation_id=obligation.id,
             line_type="consulting",
             amount_cents=consulting_cents,
             client_ach_cents=consulting_client_ach_cents,
+            governing_agreement_document_id=consulting_agreement_file.id,
+            governing_agreement_sha256=str(
+                consulting_agreement_file.content_hash
+            ).lower(),
+            agreement_component_scope="consulting",
+            earning_milestone=(
+                "the milestone defined in the Consulting and Fee Schedule Addendum, "
+                "confirmed by staff"
+            ),
             calculation_snapshot={"fixed_fee": str(economics.consulting_fee or "0")},
             earned_confirmed_at=obligation.consulting_milestone_confirmed_at,
             earned_confirmed_by_user_id=actor.id,
         ))
+    from app.services import ach_fee_workflow
+
+    ach_fee_workflow.protect_bucket_file(
+        agreement_file,
+        retention_class="payment_agreement",
+        anchor=agreement_file.created_at or _now(),
+        entity_type="fee_obligation",
+        entity_id=obligation.id,
+        immutable_ref=agreement_sha256,
+    )
+    if consulting_agreement_file is not None and consulting_agreement_file.content_hash:
+        ach_fee_workflow.protect_bucket_file(
+            consulting_agreement_file,
+            retention_class="payment_agreement",
+            anchor=consulting_agreement_file.created_at or _now(),
+            entity_type="fee_obligation",
+            entity_id=obligation.id,
+            immutable_ref=consulting_agreement_file.content_hash,
+        )
     allocation_row = FeeAllocationVersion(
         application_profile_id=profile.id,
         obligation_id=obligation.id,
@@ -1282,8 +1651,69 @@ async def create_ach_mandate(
         ).scalar_one_or_none()
         if not obligation or obligation.application_profile_id != profile.id:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Fee obligation not found")
-        if payload.authorized_amount_cents < obligation.client_ach_cents:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Authorized amount is below client ACH allocation")
+        if (
+            source.owner_type != "business"
+            or str(source.ach_class).upper() != "CCD"
+            or not _business_account_attested(source)
+        ):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "One-time fee debits require a verified and customer-attested business CCD account",
+            )
+        if not (source.account_mask or "").strip():
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "The business account must have a verified masked account number",
+            )
+        if payload.authorized_amount_cents != obligation.client_ach_cents:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "The one-time authorization amount must exactly match the client ACH allocation",
+            )
+        if payload.authorization_type != "one_time_business_ccd":
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Fee collection requires an exact one-time business CCD authorization",
+            )
+        if (
+            not payload.authorization_text_snapshot
+            or not payload.authorization_text_sha256
+            or hashlib.sha256(payload.authorization_text_snapshot.encode("utf-8")).hexdigest()
+            != payload.authorization_text_sha256
+        ):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "The exact authorization text and digest are required",
+            )
+        if (
+            payload.agreement_document_id != obligation.agreement_document_id
+            or payload.agreement_sha256 != obligation.agreement_sha256
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "The authorization must reference the exact signed fee agreement",
+            )
+        if not all(
+            (
+                payload.scheduled_debit_at,
+                payload.debit_window_start_at,
+                payload.debit_window_end_at,
+                payload.revocation_cutoff_at,
+            )
+        ) or payload.notice_business_days is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "The exact scheduled debit window and advance-notice terms are required",
+            )
+        if not (
+            payload.debit_window_start_at
+            <= payload.scheduled_debit_at
+            <= payload.debit_window_end_at
+        ) or payload.revocation_cutoff_at > payload.scheduled_debit_at:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "The scheduled debit and revocation cutoff do not match the authorized window",
+            )
     if payload.private_plan_id:
         plan = (
             await db.execute(
@@ -1294,7 +1724,11 @@ async def create_ach_mandate(
         ).scalar_one_or_none()
         if not plan or plan.application_profile_id != profile.id:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Private payment plan not found")
-        if source.owner_type != "business" or source.ach_class != "CCD":
+        if (
+            source.owner_type != "business"
+            or source.ach_class != "CCD"
+            or not _business_account_attested(source)
+        ):
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Private-funding schedules require a business account")
         if payload.authorized_amount_cents < plan.total_amount_cents:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Authorized amount is below plan total")
@@ -1317,6 +1751,13 @@ async def create_ach_mandate(
     for old in active:
         old.status = "superseded"
         old.revoked_at = _now()
+        old.terminated_at = old.revoked_at
+        old.termination_reason = "Superseded by a new ACH authorization"
+        from app.services import ach_fee_workflow
+
+        await ach_fee_workflow.extend_mandate_retention(
+            db, old, anchor=old.revoked_at
+        )
     version = max((m.version for m in mandates), default=0) + 1
     source_snapshot = _funding_source_snapshot(source)
     row = AchMandate(
@@ -1329,7 +1770,12 @@ async def create_ach_mandate(
         ach_class=source.ach_class,
         authorized_amount_cents=payload.authorized_amount_cents,
         authorization_text_version=payload.authorization_text_version,
+        authorization_type=payload.authorization_type,
+        authorization_text_snapshot=payload.authorization_text_snapshot,
+        authorization_text_sha256=payload.authorization_text_sha256,
         obligation_sha256=payload.obligation_sha256,
+        agreement_document_id=payload.agreement_document_id,
+        agreement_sha256=payload.agreement_sha256,
         funding_source_snapshot=source_snapshot,
         funding_source_sha256=_canonical_hash(source_snapshot),
         typed_name=payload.typed_name,
@@ -1338,6 +1784,14 @@ async def create_ach_mandate(
         signature_sha256=payload.signature_sha256,
         certificate_s3_key=payload.certificate_s3_key,
         certificate_sha256=payload.certificate_sha256,
+        certificate_bucket_file_id=payload.certificate_bucket_file_id,
+        scheduled_debit_at=payload.scheduled_debit_at,
+        debit_window_start_at=payload.debit_window_start_at,
+        debit_window_end_at=payload.debit_window_end_at,
+        notice_business_days=payload.notice_business_days,
+        revocation_method=payload.revocation_method,
+        revocation_cutoff_at=payload.revocation_cutoff_at,
+        signer_session_id=payload.signer_session_id,
         ip_address=ip_address,
         user_agent=user_agent,
         signed_at=_now(),
@@ -1372,22 +1826,21 @@ async def _current_confirmation(db: AsyncSession, profile_id: UUID) -> ActualFun
     ).scalar_one_or_none()
 
 
-async def fee_release_readiness(
-    db: AsyncSession,
-    obligation: FeeObligation,
-    *,
-    ignore_transfer_id: UUID | None = None,
-) -> tuple[PaymentReadiness, PaymentFundingSource | None, AchMandate | None]:
+async def fee_obligation_snapshot_blockers(
+    db: AsyncSession, obligation: FeeObligation
+) -> list[str]:
+    """Return reasons an obligation no longer matches its signed economic snapshot."""
+
     blockers: list[str] = []
-    economics_current = True
-    allocation_current = True
-    if obligation.client_ach_cents <= 0:
-        blockers.append("No fee amount is allocated to client ACH")
-    agreement_current = await _fee_agreement_is_current(db, obligation)
-    if not agreement_current:
+    if obligation.superseded_at is not None or obligation.status in {"cancelled", "superseded"}:
+        blockers.append("The fee obligation is no longer current")
+    if not await _fee_agreement_is_current(db, obligation):
         blockers.append("The signed fee agreement artifact is missing, changed, or no longer verified")
-    if obligation.consulting_fee_cents and not obligation.consulting_milestone_confirmed_at:
-        blockers.append("Consulting fee earning milestone is not confirmed")
+    if not await fee_lines_have_current_governing_agreements(db, obligation):
+        blockers.append(
+            "A fee component is missing its exact signed governing agreement"
+        )
+
     profile = await db.get(ApplicationProfile, obligation.application_profile_id)
     if profile is None:
         blockers.append("Application file is unavailable")
@@ -1399,13 +1852,12 @@ async def fee_release_readiness(
             != Decimal(str(current.origination_points or 0)).quantize(Decimal("0.0001"))
             or obligation.origination_fee_cents != current.origination_fee_cents
         ):
-            economics_current = False
             blockers.append("Accepted amount or origination percentage changed; prepare a new fee obligation")
         if obligation.consulting_fee_cents != (
             _cents(current.consulting_fee) if obligation.consulting_fee_cents else 0
         ):
-            economics_current = False
             blockers.append("Consulting fee changed; prepare a new fee obligation")
+
     allocation = await latest_allocation(db, obligation.application_profile_id)
     expected_allocation = {
         "client_ach_cents": obligation.client_ach_cents,
@@ -1418,15 +1870,34 @@ async def fee_release_readiness(
         allocation is None
         or allocation.obligation_id != obligation.id
         or allocation.gross_fee_cents != obligation.gross_fee_cents
-        or {key: int((allocation.allocation or {}).get(key, 0) or 0) for key in expected_allocation}
+        or {
+            key: int((allocation.allocation or {}).get(key, 0) or 0)
+            for key in expected_allocation
+        }
         != expected_allocation
         or allocation.origination_client_ach_cents
         != obligation.origination_client_ach_cents
         or allocation.consulting_client_ach_cents
         != obligation.consulting_client_ach_cents
     ):
-        allocation_current = False
         blockers.append("Fee allocation changed; prepare a new fee obligation")
+    return blockers
+
+
+async def fee_release_readiness(
+    db: AsyncSession,
+    obligation: FeeObligation,
+    *,
+    ignore_transfer_id: UUID | None = None,
+) -> tuple[PaymentReadiness, PaymentFundingSource | None, AchMandate | None]:
+    blockers: list[str] = []
+    if obligation.client_ach_cents <= 0:
+        blockers.append("No fee amount is allocated to client ACH")
+    agreement_current = await _fee_agreement_is_current(db, obligation)
+    snapshot_blockers = await fee_obligation_snapshot_blockers(db, obligation)
+    blockers.extend(snapshot_blockers)
+    if obligation.consulting_fee_cents and not obligation.consulting_milestone_confirmed_at:
+        blockers.append("Consulting fee earning milestone is not confirmed")
     confirmation = await _current_confirmation(db, obligation.application_profile_id)
     if not confirmation:
         blockers.append("Actual funding is not confirmed")
@@ -1444,16 +1915,72 @@ async def fee_release_readiness(
         blockers.append("Client ACH authorization is required")
     elif mandate.expires_at and mandate.expires_at <= _now():
         blockers.append("Client ACH authorization expired")
-    elif mandate.authorized_amount_cents < obligation.client_ach_cents:
-        blockers.append("Authorized amount is below the client ACH allocation")
+    elif mandate.authorized_amount_cents != obligation.client_ach_cents:
+        blockers.append("Authorization amount does not exactly match the client ACH allocation")
     elif mandate.obligation_sha256 != await fee_obligation_sha256(db, obligation):
         blockers.append("Client authorization does not match the current fee obligation")
+    elif mandate.authorization_type != "one_time_business_ccd":
+        blockers.append("Client authorization is not an exact one-time business CCD mandate")
+    elif (
+        mandate.agreement_document_id != obligation.agreement_document_id
+        or mandate.agreement_sha256 != obligation.agreement_sha256
+    ):
+        blockers.append("Client authorization does not reference the exact signed agreement")
     if not source or source.status != "verified" or source.revoked_at:
         blockers.append("Verified payment bank account is required")
+    elif source.owner_type != "business" or str(source.ach_class).upper() != "CCD":
+        blockers.append("A verified business CCD payment account is required")
+    elif not _business_account_attested(source):
+        blockers.append("The client must attest that the connected account is an authorized business account")
     elif mandate and not _mandate_matches_source(mandate, source):
         blockers.append(
             "Payment account evidence or classification changed; client must authorize again"
         )
+    notice = None
+    notice_message = None
+    notice_delivered = False
+    proof_delivered = False
+    if mandate:
+        from app.services import ach_fee_workflow
+
+        proof_message = await ach_fee_workflow.sync_mandate_proof_delivery(db, mandate)
+        proof_status = (
+            proof_message.status
+            if proof_message is not None
+            else (mandate.proof_copy_delivery_status or "")
+        ).lower()
+        proof_delivered = bool(
+            mandate.proof_copy_sent_at
+            and mandate.proof_copy_message_send_id
+            and proof_status in {"sent", "delivered"}
+        )
+        if not proof_delivered:
+            blockers.append(
+                "The executed ACH authorization copy was not accepted for customer delivery"
+            )
+        notice = await ach_fee_workflow.current_debit_notice(db, obligation.id)
+        notice_message = await ach_fee_workflow.sync_notice_delivery(db, notice)
+        notice_delivery_status = (
+            notice_message.status
+            if notice_message is not None
+            else (notice.delivery_status if notice is not None else None)
+        )
+        notice_delivered = bool(
+            notice
+            and notice.provider_accepted_at
+            and notice_delivery_status in {"sent", "delivered"}
+        )
+        if notice and (
+            notice.mandate_id != mandate.id
+            or notice.amount_cents != obligation.client_ach_cents
+            or notice.authorization_text_sha256 != mandate.authorization_text_sha256
+            or notice.scheduled_debit_at != mandate.scheduled_debit_at
+        ):
+            blockers.append("Advance debit notice does not match the signed authorization")
+        else:
+            blockers.extend(
+                ach_fee_workflow.notice_release_blockers(notice, notice_message)
+            )
     transfer_filters = [PaymentTransfer.fee_obligation_id == obligation.id]
     if ignore_transfer_id is not None:
         current_transfer = await db.get(PaymentTransfer, ignore_transfer_id)
@@ -1477,17 +2004,24 @@ async def fee_release_readiness(
         blockers.append("A transfer already exists for this obligation")
     return PaymentReadiness(
         fee_obligation_current=(
-            obligation.superseded_at is None
-            and obligation.status != "cancelled"
-            and economics_current
-            and allocation_current
+            not snapshot_blockers
         ),
         agreement_signed=agreement_current,
+        fee_agreement_signed=agreement_current,
         consulting_fee_earned=not obligation.consulting_fee_cents or bool(obligation.consulting_milestone_confirmed_at),
         client_authorized=bool(mandate and mandate.status == "active" and not mandate.revoked_at),
         funding_confirmed=confirmation is not None,
-        amount_covered=bool(mandate and mandate.authorized_amount_cents >= obligation.client_ach_cents),
-        account_eligible=bool(source and source.status == "verified" and not source.revoked_at),
+        amount_covered=bool(mandate and mandate.authorized_amount_cents == obligation.client_ach_cents),
+        account_eligible=bool(
+            source
+            and source.status == "verified"
+            and not source.revoked_at
+            and source.owner_type == "business"
+            and str(source.ach_class).upper() == "CCD"
+            and _business_account_attested(source)
+        ),
+        authorization_proof_delivered=proof_delivered,
+        debit_notice_delivered=notice_delivered,
         no_existing_claim=existing is None,
         ready_for_release=not blockers,
         blockers=blockers,
@@ -1536,6 +2070,17 @@ async def prepare_fee_transfer(
     obligation.status = "processing"
     obligation.record_version += 1
     await db.flush()
+    from app.services import ach_fee_workflow
+
+    notice = await ach_fee_workflow.current_debit_notice(db, obligation.id)
+    if notice is None or notice.mandate_id != mandate.id:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The exact advance debit notice is unavailable",
+        )
+    notice.transfer_id = row.id
+    notice.status = "consumed"
+    await ach_fee_workflow.extend_mandate_retention(db, mandate, anchor=_now())
     await log_event(
         db,
         profile_id=obligation.application_profile_id,
@@ -1708,6 +2253,7 @@ async def transfer_dispatch_readiness(
             or mandate.private_plan_id != plan.id
             or str(source.ach_class).upper() != "CCD"
             or str(mandate.ach_class).upper() != "CCD"
+            or not _business_account_attested(source)
             or mandate.obligation_sha256 != plan.schedule_sha256
         ):
             return source, mandate, "Private-funding schedule is no longer active or authorized"
@@ -1945,6 +2491,11 @@ async def retry_transfer(
     code = (original.provider_failure_code or "").upper()
     if original.status not in {"failed", "returned", "action_required"}:
         raise HTTPException(status.HTTP_409_CONFLICT, "Only a failed or returned transfer can be retried")
+    if original.fee_obligation_id is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "A returned one-time fee debit requires a new exact mandate, date, and advance notice",
+        )
     if code not in RETRYABLE_RETURN_CODES:
         raise HTTPException(status.HTTP_409_CONFLICT, "This return reason is not eligible for retry")
     if original.attempt_no >= 3:
@@ -2346,6 +2897,13 @@ async def apply_plaid_transfer_event(db: AsyncSession, event: dict[str, Any]) ->
             return row
         transfer.status = new_status
         transfer.provider_status = new_status
+        mandate = await db.get(AchMandate, transfer.mandate_id)
+        if mandate is not None:
+            from app.services import ach_fee_workflow
+
+            await ach_fee_workflow.extend_mandate_retention(
+                db, mandate, anchor=event_time or _now()
+            )
         if new_status == "funds_available":
             transfer.funds_available_at = event_time or _now()
             if transfer.fee_obligation_id:
@@ -3093,6 +3651,7 @@ async def _private_plan_runtime_blocker(
         or source.status != "verified"
         or source.revoked_at is not None
         or source.owner_type != "business"
+        or not _business_account_attested(source)
         or not _mandate_matches_source(mandate, source)
         or str(source.ach_class).upper() != "CCD"
         or str(mandate.ach_class).upper() != "CCD"
@@ -3495,6 +4054,7 @@ async def activate_private_plan(
         or source.revoked_at is not None
         or source.owner_type != "business"
         or str(source.ach_class).upper() != "CCD"
+        or not _business_account_attested(source)
         or not _mandate_matches_source(mandate, source)
     ):
         raise HTTPException(
@@ -3694,6 +4254,17 @@ async def build_summary(
 ) -> PaymentSummary:
     economics = economics_snapshot(profile)
     agreement_candidates = await agreement_document_candidates(db, profile)
+    authorization_delivery = (
+        await db.execute(
+            select(ApplicationRoomDelivery)
+            .where(
+                ApplicationRoomDelivery.profile_id == profile.id,
+                ApplicationRoomDelivery.action_kind == "payment_authorization_request",
+            )
+            .order_by(ApplicationRoomDelivery.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
     allocation_row = await latest_allocation(db, profile.id)
     obligation = await current_obligation(db, profile.id)
     confirmation = await _current_confirmation(db, profile.id)
@@ -3709,6 +4280,7 @@ async def build_summary(
     transfers: list[PaymentTransfer] = []
     receipts: list[BankDirectFeeReceipt] = []
     readiness = PaymentReadiness()
+    debit_notice: PaymentDebitNotice | None = None
     if obligation:
         mandates = (
             await db.execute(
@@ -3726,6 +4298,10 @@ async def build_summary(
             )
         ).scalars().all()
         readiness, _, _ = await fee_release_readiness(db, obligation)
+        from app.services import ach_fee_workflow
+
+        debit_notice = await ach_fee_workflow.current_debit_notice(db, obligation.id)
+        await ach_fee_workflow.sync_notice_delivery(db, debit_notice)
     plans = (
         await db.execute(
             select(PrivateFundingPaymentPlan)
@@ -3780,6 +4356,14 @@ async def build_summary(
     lines: list[FeeObligationLine] = []
     obligation_response = None
     active_mandate = next((row for row in mandates if row.status == "active" and not row.revoked_at), None)
+    displayed_mandate = active_mandate or (mandates[0] if mandates else None)
+    displayed_mandate_current = await fee_mandate_is_current(
+        db,
+        mandate=displayed_mandate,
+        obligation=obligation,
+        source=funding_source,
+        notice=debit_notice,
+    )
     transfer = transfers[0] if transfers else None
     if obligation:
         lines = (
@@ -3789,15 +4373,46 @@ async def build_summary(
                 .order_by(FeeObligationLine.line_type)
             )
         ).scalars().all()
+        governing_ids = {
+            line.governing_agreement_document_id
+            for line in lines
+            if line.governing_agreement_document_id is not None
+        }
+        governing_files = {
+            file.id: file
+            for file in (
+                (
+                    await db.execute(
+                        select(BucketFile).where(BucketFile.id.in_(governing_ids))
+                    )
+                ).scalars().all()
+                if governing_ids
+                else []
+            )
+        }
         line_responses: list[FeeObligationLineResponse] = []
         for line in sorted(lines, key=lambda item: 0 if item.line_type == "origination" else 1):
+            governing_file = governing_files.get(line.governing_agreement_document_id)
+            agreement_reference = (
+                obligation.agreement_reference
+                if line.line_type == "origination"
+                else (
+                    f"{governing_file.file_name} ({governing_file.id})"
+                    if governing_file is not None
+                    else "Consulting and Fee Schedule Addendum"
+                )
+            )
             line_responses.append(FeeObligationLineResponse(
                 id=line.id,
                 component=line.line_type,
                 label="Origination fee" if line.line_type == "origination" else "Consulting fee",
                 amount=line.amount_cents / 100,
                 collection_amount=line.client_ach_cents / 100,
-                agreement_reference=obligation.agreement_reference,
+                agreement_reference=agreement_reference,
+                governing_agreement_document_id=line.governing_agreement_document_id,
+                governing_agreement_sha256=line.governing_agreement_sha256,
+                agreement_component_scope=line.agreement_component_scope,
+                earning_milestone=line.earning_milestone,
                 agreement_verified=readiness.agreement_signed,
                 earned=line.line_type == "origination" or bool(line.earned_confirmed_at),
             ))
@@ -3890,6 +4505,7 @@ async def build_summary(
             or plan_source.revoked_at
             or plan_source.owner_type != "business"
             or str(plan_source.ach_class).upper() != "CCD"
+            or not _business_account_attested(plan_source)
             or not plan_mandate
             or not _mandate_matches_source(plan_mandate, plan_source)
         ):
@@ -4013,6 +4629,34 @@ async def build_summary(
     ) for row in audit_rows]
 
     display_name, _, _ = await _profile_identity(db, profile)
+    from app.services import ach_fee_workflow, plaid_transfer
+
+    agreement_state = await ach_fee_workflow.fee_agreement_state(db, profile)
+    legal_gate = ach_fee_workflow.legal_approval_required()
+    ach_enabled = bool(
+        get_settings().payments_enabled and plaid_transfer.enabled() and not legal_gate
+    )
+    mandate_artifact = None
+    if displayed_mandate and displayed_mandate.certificate_bucket_file_id:
+        proof_file = await db.get(BucketFile, displayed_mandate.certificate_bucket_file_id)
+        if proof_file and proof_file.deleted_at is None:
+            try:
+                proof_download_url = await ach_fee_workflow.verified_protected_download_url(
+                    proof_file,
+                    download_filename="QC-one-time-ACH-authorization.pdf",
+                )
+            except HTTPException:
+                proof_download_url = None
+
+            mandate_artifact = {
+                "bucket_file_id": str(proof_file.id),
+                "name": proof_file.file_name,
+                "download_url": proof_download_url,
+                "sha256": proof_file.content_hash,
+                "retention_class": proof_file.retention_class,
+                "protected_until": proof_file.protected_until,
+                "legal_hold": proof_file.legal_hold,
+            }
     return PaymentSummary(
         profile_id=profile.id,
         client_id=profile.client_id,
@@ -4041,24 +4685,62 @@ async def build_summary(
         funding_source=PaymentFundingSourceResponse(
             id=funding_source.id,
             ownership_type=funding_source.owner_type,
+            ach_class=funding_source.ach_class,
             institution_name=funding_source.institution_name,
             account_name=funding_source.account_name,
             account_mask=funding_source.account_mask,
             account_subtype=funding_source.account_subtype,
             status="connected" if funding_source.status == "verified" else funding_source.status,
             connected_at=funding_source.verified_at,
+            business_account_attested=_business_account_attested(funding_source),
         ) if funding_source else None,
         mandate=AchMandateResponse(
-            id=active_mandate.id,
-            status="signed" if active_mandate.status == "active" else active_mandate.status,
-            authorized_amount=active_mandate.authorized_amount_cents / 100,
-            sec_code=active_mandate.ach_class,
-            payer_name=active_mandate.payer_name,
-            signed_at=active_mandate.signed_at,
-            revoked_at=active_mandate.revoked_at,
-            certificate_available=bool(active_mandate.certificate_s3_key),
-        ) if active_mandate else None,
+            id=displayed_mandate.id,
+            status="signed" if displayed_mandate_current else displayed_mandate.status,
+            current=displayed_mandate_current,
+            authorized_amount=displayed_mandate.authorized_amount_cents / 100,
+            sec_code=displayed_mandate.ach_class,
+            payer_name=displayed_mandate.payer_name,
+            authorization_type=displayed_mandate.authorization_type,
+            scheduled_debit_at=displayed_mandate.scheduled_debit_at,
+            revocation_cutoff_at=displayed_mandate.revocation_cutoff_at,
+            proof_copy_delivery_status=displayed_mandate.proof_copy_delivery_status,
+            proof_copy_sent_at=displayed_mandate.proof_copy_sent_at,
+            proof_copy_delivered_at=displayed_mandate.proof_copy_delivered_at,
+            signed_at=displayed_mandate.signed_at,
+            revoked_at=displayed_mandate.revoked_at,
+            certificate_available=bool(displayed_mandate.certificate_s3_key),
+            can_revoke=bool(
+                displayed_mandate.status == "active"
+                and displayed_mandate.revoked_at is None
+                and not (transfer and (transfer.claimed_at or transfer.submitted_at))
+            ),
+            can_resend_proof=bool(displayed_mandate.certificate_s3_key),
+            artifact=mandate_artifact,
+        ) if displayed_mandate else None,
+        authorization_request_delivery=({
+            "status": authorization_delivery.status,
+            "sent_at": (
+                authorization_delivery.updated_at
+                if authorization_delivery.status == "sent"
+                else None
+            ),
+            "delivered_at": None,
+            "failed_reason": (
+                authorization_delivery.detail
+                if authorization_delivery.status == "failed"
+                else None
+            ),
+        } if authorization_delivery is not None else None),
+        debit_notice=(
+            PaymentDebitNoticeRead.model_validate(debit_notice)
+            if debit_notice is not None
+            else None
+        ),
         transfer=transfer_response,
+        fee_agreement=agreement_state,
+        ach_authorization_enabled=ach_enabled,
+        legal_approval_required=legal_gate,
         private_funding_eligible=private_eligible,
         private_funding_reason=private_reason,
         private_plan=private_plan_response,

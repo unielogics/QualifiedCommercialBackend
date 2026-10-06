@@ -153,6 +153,21 @@ class FeeObligationLine(TimestampMixin, Base):
             "client_ach_cents >= 0 AND client_ach_cents <= amount_cents",
             name="ck_fee_obligation_lines_client_ach",
         ),
+        CheckConstraint(
+            "(governing_agreement_document_id IS NULL "
+            "AND governing_agreement_sha256 IS NULL "
+            "AND agreement_component_scope IS NULL) OR "
+            "(governing_agreement_document_id IS NOT NULL "
+            "AND governing_agreement_sha256 IS NOT NULL "
+            "AND agreement_component_scope IS NOT NULL)",
+            name="ck_fee_obligation_lines_governing_agreement_complete",
+        ),
+        CheckConstraint(
+            "agreement_component_scope IS NULL OR "
+            "(agreement_component_scope IN ('origination', 'consulting') "
+            "AND agreement_component_scope = line_type)",
+            name="ck_fee_obligation_lines_agreement_scope",
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -164,6 +179,15 @@ class FeeObligationLine(TimestampMixin, Base):
     client_ach_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
     calculation_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     agreement_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    governing_agreement_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("bucket_files.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    governing_agreement_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    agreement_component_scope: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    earning_milestone: Mapped[str | None] = mapped_column(Text, nullable=True)
     earned_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     earned_confirmed_by_user_id: Mapped[uuid.UUID | None] = _user_ref()
 
@@ -287,7 +311,22 @@ class AchMandate(TimestampMixin, Base):
             name="ck_ach_mandates_one_target",
         ),
         CheckConstraint("authorized_amount_cents > 0", name="ck_ach_mandates_amount"),
+        CheckConstraint(
+            "notice_business_days IS NULL OR notice_business_days >= 0",
+            name="ck_ach_mandates_notice_days",
+        ),
+        CheckConstraint(
+            "debit_window_start_at IS NULL OR debit_window_end_at IS NULL "
+            "OR debit_window_end_at >= debit_window_start_at",
+            name="ck_ach_mandates_debit_window",
+        ),
+        CheckConstraint(
+            "(agreement_document_id IS NULL AND agreement_sha256 IS NULL) OR "
+            "(agreement_document_id IS NOT NULL AND agreement_sha256 IS NOT NULL)",
+            name="ck_ach_mandates_agreement_complete",
+        ),
         Index("ix_ach_mandates_status", "status"),
+        Index("ix_ach_mandates_retention_until", "retention_until"),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -295,7 +334,10 @@ class AchMandate(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("application_profiles.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     funding_source_id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("payment_funding_sources.id", ondelete="RESTRICT"), nullable=False
+        PG_UUID(as_uuid=True),
+        ForeignKey("payment_funding_sources.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
     )
     fee_obligation_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("fee_obligations.id", ondelete="RESTRICT"), index=True
@@ -315,7 +357,17 @@ class AchMandate(TimestampMixin, Base):
     ach_class: Mapped[str] = mapped_column(String(8), nullable=False)
     authorized_amount_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
     authorization_text_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    authorization_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    authorization_text_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    authorization_text_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     obligation_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    agreement_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("bucket_files.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    agreement_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     funding_source_snapshot: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
@@ -326,11 +378,181 @@ class AchMandate(TimestampMixin, Base):
     signature_sha256: Mapped[str | None] = mapped_column(String(64))
     certificate_s3_key: Mapped[str | None] = mapped_column(String(512))
     certificate_sha256: Mapped[str | None] = mapped_column(String(64))
+    certificate_bucket_file_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("bucket_files.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    scheduled_debit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    debit_window_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    debit_window_end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    notice_business_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    revocation_method: Mapped[str | None] = mapped_column(Text, nullable=True)
+    revocation_cutoff_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    signer_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    proof_copy_delivery_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    proof_copy_message_send_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("message_sends.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    proof_copy_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    proof_copy_delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    proof_copy_last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     ip_address: Mapped[str | None] = mapped_column(String(64))
     user_agent: Mapped[str | None] = mapped_column(String(512))
     signed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_by_user_id: Mapped[uuid.UUID | None] = _user_ref()
+    terminated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    termination_reason: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    retention_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PaymentDebitNotice(TimestampMixin, Base):
+    """Exact, durable advance notice for one ACH debit.
+
+    A notice is prepared before the mandate is signed, so ``mandate_id`` is
+    deliberately nullable.  The immutable snapshot and digest are the record
+    of what the payer was told; delivery lifecycle is tracked separately from
+    the business lifecycle in ``status``.
+    """
+
+    __tablename__ = "payment_debit_notices"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_payment_debit_notices_idempotency"),
+        Index("ix_payment_debit_notices_digest", "notice_sha256"),
+        Index("ix_payment_debit_notices_due", "status", "scheduled_debit_at"),
+        Index("ix_payment_debit_notices_delivery", "delivery_status", "created_at"),
+        Index("ix_payment_debit_notices_created_by_user_id", "created_by_user_id"),
+        Index("ix_payment_debit_notices_superseded_by_user_id", "superseded_by_user_id"),
+        Index("ix_payment_debit_notices_revoked_by_user_id", "revoked_by_user_id"),
+        Index(
+            "uq_payment_debit_notices_current_obligation",
+            "fee_obligation_id",
+            unique=True,
+            postgresql_where=text(
+                "superseded_at IS NULL AND revoked_at IS NULL "
+                "AND status NOT IN ('cancelled', 'consumed')"
+            ),
+        ),
+        CheckConstraint("amount_cents > 0", name="ck_payment_debit_notices_amount"),
+        CheckConstraint(
+            "notice_business_days IS NULL OR notice_business_days >= 0",
+            name="ck_payment_debit_notices_notice_days",
+        ),
+        CheckConstraint(
+            "debit_window_start_at IS NULL OR debit_window_end_at IS NULL "
+            "OR debit_window_end_at >= debit_window_start_at",
+            name="ck_payment_debit_notices_window",
+        ),
+        CheckConstraint(
+            "notice_type != 'one_time_fee' OR "
+            "(notice_business_days IS NOT NULL "
+            "AND debit_window_start_at IS NOT NULL "
+            "AND debit_window_end_at IS NOT NULL)",
+            name="ck_payment_debit_notices_one_time_fee_window_required",
+        ),
+        CheckConstraint(
+            "notice_type != 'one_time_fee' OR "
+            "(revocation_cutoff_at <= scheduled_debit_at "
+            "AND debit_window_start_at <= scheduled_debit_at "
+            "AND scheduled_debit_at <= debit_window_end_at)",
+            name="ck_payment_debit_notices_one_time_fee_timing",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    application_profile_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("application_profiles.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    fee_obligation_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fee_obligations.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    mandate_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("ach_mandates.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    transfer_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("payment_transfers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    installment_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("payment_installments.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    message_send_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("message_sends.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    notice_bucket_file_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("bucket_files.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="draft", server_default="draft"
+    )
+    delivery_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    notice_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="one_time_fee", server_default="one_time_fee"
+    )
+    amount_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    currency: Mapped[str] = mapped_column(
+        String(3), nullable=False, default="usd", server_default="usd"
+    )
+    recipient_name: Mapped[str | None] = mapped_column(String(180), nullable=True)
+    recipient_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    account_mask: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    scheduled_debit_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    debit_window_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    debit_window_end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    notice_business_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    revocation_cutoff_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    authorization_text_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    notice_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    notice_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    provider_message_id: Mapped[str | None] = mapped_column(
+        String(320), nullable=True, index=True
+    )
+    rfc_message_id: Mapped[str | None] = mapped_column(
+        String(320), nullable=True, index=True
+    )
+    delivery_evidence_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    provider_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    bounced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = _user_ref()
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    superseded_by_user_id: Mapped[uuid.UUID | None] = _user_ref()
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_by_user_id: Mapped[uuid.UUID | None] = _user_ref()
 
 

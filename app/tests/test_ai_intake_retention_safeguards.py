@@ -47,5 +47,6 @@ def test_legacy_delete_route_archives_without_destroying_storage() -> None:
     assert "Confirmation name does not match" in source
     assert 'event_type="intake_archived"' in source
     assert 'intake.bucket.status = "archived"' in source
+    assert "delete_guard" not in source
     assert "_delete_s3_object" not in source
     assert "db.delete" not in source

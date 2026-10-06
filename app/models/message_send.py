@@ -28,7 +28,18 @@ from app.db import Base
 
 #: Extends the SMS vocabulary rather than inventing a second one, so the two
 #: tables read as one list. `blocked` means we refused to send it.
-STATUSES = ("queued", "sent", "delivered", "bounced", "complained", "failed", "blocked", "received")
+STATUSES = (
+    "queued",
+    "sending",
+    "uncertain",
+    "sent",
+    "delivered",
+    "bounced",
+    "complained",
+    "failed",
+    "blocked",
+    "received",
+)
 
 
 class MessageSend(Base):

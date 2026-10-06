@@ -41,6 +41,7 @@ from app.deps import require_role
 from app.enums import Role
 from app.models.application_profile import ApplicationProfile
 from app.models.bucket import (
+    PROTECTED_RETENTION_CLASSES,
     Bucket,
     BucketActivityLog,
     BucketAIActionItem,
@@ -504,9 +505,18 @@ def _upload_url(s3_key: str, content_type: str) -> tuple[str, dict[str, str]]:
     return url, headers
 
 
-def _download_url(s3_key: str, *, disposition: str = "inline", ttl: int = 900, content_type: str | None = None) -> str:
+def _download_url(
+    s3_key: str,
+    *,
+    disposition: str = "inline",
+    ttl: int = 900,
+    content_type: str | None = None,
+    version_id: str | None = None,
+) -> str:
     bucket, _, _ = _bucket_storage_config()
     params: dict[str, str] = {"Bucket": bucket, "Key": s3_key}
+    if version_id:
+        params["VersionId"] = version_id
     # Defense-in-depth for historical objects: only let known-safe types render
     # inline; force anything else to download so it cannot execute in the browser.
     if disposition == "inline" and content_type is not None and _sanitize_upload_content_type(content_type) not in _INLINE_SAFE_CONTENT_TYPES:
@@ -629,7 +639,12 @@ def _file_belongs_to_vendor_access(access: BucketVendorAccess, file_id: UUID) ->
 def _review_response(file: BucketFile, annotations: list[BucketFileAnnotation], *, preview: bool = True) -> BucketFileReviewRead:
     return BucketFileReviewRead(
         file=BucketFileRead.model_validate(file),
-        preview_url=_download_url(file.s3_key, disposition="inline", content_type=file.content_type) if preview else None,
+        preview_url=_download_url(
+            file.s3_key,
+            disposition="inline",
+            content_type=file.content_type,
+            version_id=getattr(file, "s3_version_id", None),
+        ) if preview else None,
         annotations=[BucketFileAnnotationRead.model_validate(annotation) for annotation in annotations],
     )
 
@@ -1538,6 +1553,10 @@ async def delete_bucket(
     db: AsyncSession = Depends(get_db),
 ) -> None:
     bucket = await _load_bucket_or_404(db, bucket_id)
+    # Archiving the workspace is allowed even when it contains protected
+    # payment evidence. It does not delete a BucketFile or its private object,
+    # and retained artifacts remain available through the Payments,
+    # Agreements, and archived-file views.
     bucket.archived_at = _now()
     bucket.status = "archived"
     await _log(db, bucket_id, "bucket_deleted", request=request, user=user, detail=bucket.name)
@@ -2504,6 +2523,11 @@ async def delete_admin_file(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
     if file.deleted_at is not None:
         return
+    if getattr(file, "is_deletion_prohibited", lambda: False)():
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This ACH or agreement artifact is protected by retention or legal hold",
+        )
 
     file.deleted_at = _now()
     file.deleted_by_user_id = user.id
@@ -2619,7 +2643,21 @@ async def admin_file_url(
     disposition = "attachment" if download else "inline"
     await _log(db, bucket_id, "file_download_url_created" if download else "file_preview_url_created", request=request, user=user, target_type="file", target_id=str(file.id), detail=file.file_name)
     await db.commit()
-    return BucketFileUrl(url=_download_url(file.s3_key, disposition=disposition, content_type=file.content_type), expires_in=900)
+    if file.retention_class in PROTECTED_RETENTION_CLASSES:
+        from app.services import ach_fee_workflow
+
+        url = await ach_fee_workflow.verified_protected_download_url(
+            file,
+            download_filename=file.file_name if download else None,
+            ttl_seconds=900,
+        )
+    else:
+        url = _download_url(
+            file.s3_key,
+            disposition=disposition,
+            content_type=file.content_type,
+        )
+    return BucketFileUrl(url=url, expires_in=900)
 
 
 @router.get("/admin/{bucket_id}/files/{file_id}/review", response_model=BucketFileReviewRead)
@@ -2719,9 +2757,18 @@ async def get_vendor_bucket(
     for file in _vendor_access_files(access):
         item = BucketShareFileRead.model_validate(file)
         if access.can_preview:
-            item.preview_url = _download_url(file.s3_key, disposition="inline", content_type=file.content_type)
+            item.preview_url = _download_url(
+                file.s3_key,
+                disposition="inline",
+                content_type=file.content_type,
+                version_id=getattr(file, "s3_version_id", None),
+            )
         if access.can_download:
-            item.download_url = _download_url(file.s3_key, disposition="attachment")
+            item.download_url = _download_url(
+                file.s3_key,
+                disposition="attachment",
+                version_id=getattr(file, "s3_version_id", None),
+            )
         files.append(item)
     notes = [
         note for note in access.bucket.notes
@@ -2874,7 +2921,14 @@ async def vendor_file_download(
     access.download_count += 1
     await _log(db, bucket_id, "vendor_file_download_requested", request=request, user=user, actor_role="vendor", target_type="file", target_id=str(file.id), detail=file.file_name)
     await db.commit()
-    return BucketFileUrl(url=_download_url(file.s3_key, disposition="attachment"), expires_in=900)
+    return BucketFileUrl(
+        url=_download_url(
+            file.s3_key,
+            disposition="attachment",
+            version_id=getattr(file, "s3_version_id", None),
+        ),
+        expires_in=900,
+    )
 
 
 @router.post("/vendor/{bucket_id}/files/{file_id}/annotations", response_model=BucketFileAnnotationRead)
@@ -3063,6 +3117,29 @@ async def _request_access_read(
         .scalars()
         .first()
     )
+    payment_documents_visible = False
+    if profile is not None:
+        # A bucket may have several upload invitations for accountants,
+        # assistants, or other collaborators.  Those links can contribute
+        # ordinary requested documents, but only the canonical client-owned
+        # room may see payment agreements and retained ACH evidence.
+        from app.services import payments as payment_service
+
+        try:
+            await payment_service.assert_payment_room_identity(
+                db, link=link, profile=profile
+            )
+        except HTTPException:
+            payment_documents_visible = False
+        else:
+            payment_documents_visible = True
+    if not payment_documents_visible:
+        files = [
+            file
+            for file in files
+            if file.retention_class not in PROTECTED_RETENTION_CLASSES
+            and file.source_detail != "payment_agreement"
+        ]
     room_kind = await _request_room_kind(db, link.bucket_id, profile)
     evidence_banking_summary = (
         await profiles.client_evidence_banking_summary(db, profile)
@@ -3099,6 +3176,10 @@ async def _request_access_read(
             _public_requested_document_read(d, file_reads)
             for d in current_requested_documents
             if d.status != "not_applicable"
+            and (
+                payment_documents_visible
+                or d.signature_kind != "success_fee_agreement"
+            )
         ],
         files=file_reads,
         ai_summary=upload_link_visible_summary(review, link.bucket),
@@ -3594,9 +3675,18 @@ async def share_access(
             continue
         item = BucketShareFileRead.model_validate(file)
         if share.can_preview:
-            item.preview_url = _download_url(file.s3_key, disposition="inline", content_type=file.content_type)
+            item.preview_url = _download_url(
+                file.s3_key,
+                disposition="inline",
+                content_type=file.content_type,
+                version_id=getattr(file, "s3_version_id", None),
+            )
         if share.can_download:
-            item.download_url = _download_url(file.s3_key, disposition="attachment")
+            item.download_url = _download_url(
+                file.s3_key,
+                disposition="attachment",
+                version_id=getattr(file, "s3_version_id", None),
+            )
         files.append(item)
     # A "shared" note is visible to this recipient only if it was authored by
     # the operator (no share/vendor owner) or by this same share — not by other
@@ -3649,9 +3739,18 @@ async def public_share_access(token: str, request: Request, db: AsyncSession = D
             continue
         item = BucketPublicShareFileRead.model_validate(file)
         if share.can_preview:
-            item.preview_url = _download_url(file.s3_key, disposition="inline", content_type=file.content_type)
+            item.preview_url = _download_url(
+                file.s3_key,
+                disposition="inline",
+                content_type=file.content_type,
+                version_id=getattr(file, "s3_version_id", None),
+            )
         if share.can_download:
-            item.download_url = _download_url(file.s3_key, disposition="attachment")
+            item.download_url = _download_url(
+                file.s3_key,
+                disposition="attachment",
+                version_id=getattr(file, "s3_version_id", None),
+            )
         files.append(item)
     await _log(db, share.bucket_id, "public_share_accessed", request=request, actor_name=share.recipient_name, actor_role="public_share_recipient", target_type="public_share", target_id=str(share.id))
     await db.commit()
@@ -3682,7 +3781,14 @@ async def public_share_file_download(
     share.download_count += 1
     await _log(db, share.bucket_id, "public_share_download_requested", request=request, actor_name=share.recipient_name, actor_role="public_share_recipient", target_type="file", target_id=str(file.id), detail=file.file_name)
     await db.commit()
-    return BucketFileUrl(url=_download_url(file.s3_key, disposition="attachment"), expires_in=900)
+    return BucketFileUrl(
+        url=_download_url(
+            file.s3_key,
+            disposition="attachment",
+            version_id=getattr(file, "s3_version_id", None),
+        ),
+        expires_in=900,
+    )
 
 
 @router.get("/share/{token}/ai-summary", response_model=BucketAISummaryRead)
@@ -3803,7 +3909,14 @@ async def shared_file_download(
     share.download_count += 1
     await _log(db, share.bucket_id, "shared_file_download_requested", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="file", target_id=str(file.id), detail=file.file_name)
     await db.commit()
-    return BucketFileUrl(url=_download_url(file.s3_key, disposition="attachment"), expires_in=900)
+    return BucketFileUrl(
+        url=_download_url(
+            file.s3_key,
+            disposition="attachment",
+            version_id=getattr(file, "s3_version_id", None),
+        ),
+        expires_in=900,
+    )
 
 
 @router.post("/share/{token}/files/{file_id}/annotations", response_model=BucketFileAnnotationRead)

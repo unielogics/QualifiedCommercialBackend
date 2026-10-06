@@ -14,13 +14,13 @@ uploading a file. No new satisfaction/status-flip logic is needed anywhere.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import html
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.models.bucket import BucketDocumentSignature
-
 from app.services.payment_authorization import (  # noqa: F401 re-exported for callers
     client_ip,
     decode_signature_data_url,
@@ -67,13 +67,14 @@ def render_signature_certificate_pdf(
     title: str,
     document_text: str,
     extra_rows: list[tuple[str, str]] | None = None,
+    qc_signature_png: bytes | None = None,
 ) -> bytes:
     """Render a generic signed-document certificate PDF. `extra_rows` lets a
     caller (e.g. the credit-authorization flow) append applicant identity rows
     without this module needing to know about credit-pull-specific fields."""
     from weasyprint import HTML
 
-    signed_at = signature.signed_at or datetime.now(timezone.utc)
+    signed_at = signature.signed_at or datetime.now(UTC)
     rows = [
         ("Signer", signature.typed_name),
         ("Signature ID", str(signature.id)),
@@ -89,6 +90,14 @@ def render_signature_certificate_pdf(
         for label, value in rows
     )
     doc_html = html.escape(document_text).replace("\n", "<br>")
+    if qc_signature_png:
+        exact_qc_datauri = "data:image/png;base64," + base64.b64encode(
+            qc_signature_png
+        ).decode("ascii")
+        doc_html = doc_html.replace(
+            html.escape("[[QC_SIGNATURE]]"),
+            f'<img class="qc-sig" src="{exact_qc_datauri}" alt="Qualified Commercial signature"/>',
+        )
     # The 3 client-facing contract types (SBA/Client Engagement, Consulting
     # Addendum) reach this generic certificate renderer with their rendered
     # plain text already flattened into document_text -- replace Qualified
@@ -102,7 +111,7 @@ def render_signature_certificate_pdf(
     qc_field = get_template_spec(ContractType.SBA_ENGAGEMENT).fields.get("qc_signatory_name")
     qc_name_default = qc_field.default if qc_field else None
     signature_datauri = qc_signature_datauri()
-    if signature_datauri and qc_name_default:
+    if not qc_signature_png and signature_datauri and qc_name_default:
         escaped_by_line = html.escape(f"By: {qc_name_default}")
         doc_html = doc_html.replace(
             escaped_by_line,

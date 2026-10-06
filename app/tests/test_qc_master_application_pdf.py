@@ -18,6 +18,7 @@ from app.dealer_os.services.lender_neutral_routing import (
 
 def _sample_context() -> dict:
     completed_at = datetime(2026, 8, 25, 14, 30, tzinfo=UTC)
+    generated_at = datetime(2026, 9, 1, 14, 30, tzinfo=UTC)
     profile = SimpleNamespace(
         human_review_status="fundable",
         human_review_note="Cash flow, ownership, and direct-program eligibility reviewed.",
@@ -78,7 +79,7 @@ def _sample_context() -> dict:
         "calculated_metrics": {"dscr": 1.42, "dscr_source": "verified cash flow and debt schedule"},
     }
     return {
-        "generated_at": completed_at,
+        "generated_at": generated_at,
         "template_version": qc_master_application.MASTER_VERSION,
         "rules_version": RULES_VERSION,
         "case_ref": "QC-2026-SAMPLE",
@@ -254,6 +255,27 @@ def test_qc_master_application_readiness_and_pdf_security() -> None:
     assert "$1,200,000" in rendered
     assert "Negative-balance days / 90" in rendered
     assert "Returned items" in rendered
+
+
+def test_bank_statement_readiness_is_reproducible_as_of_package_generation() -> None:
+    context = _sample_context()
+
+    original = qc_master_application.build_readiness(context)
+    assert next(
+        item
+        for item in original["items"]
+        if item["requirement"] == "Six current verified bank-evidence months"
+    )["status"] == "complete"
+
+    # Stored package snapshots are commonly loaded back from JSON, so exercise
+    # the serialized timestamp form as well as the live-datetime form above.
+    context["generated_at"] = "2026-10-06T12:00:00Z"
+    later = qc_master_application.build_readiness(context)
+    assert next(
+        item
+        for item in later["items"]
+        if item["requirement"] == "Six current verified bank-evidence months"
+    )["status"] == "missing"
 
 
 def test_underwriting_summary_is_a_persistent_pdf_without_signature_block() -> None:

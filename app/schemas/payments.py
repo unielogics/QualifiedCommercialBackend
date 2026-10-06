@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import AliasChoices, BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, computed_field, model_validator
 
 from app.schemas.common import ORMModel
 
@@ -115,13 +115,26 @@ class AchMandateCreate(BaseModel):
     private_plan_id: UUID | None = None
     authorized_amount_cents: int = Field(gt=0)
     authorization_text_version: str = Field(min_length=1, max_length=32)
+    authorization_type: str | None = Field(default=None, max_length=32)
+    authorization_text_snapshot: str | None = None
+    authorization_text_sha256: str | None = Field(default=None, min_length=64, max_length=64)
     obligation_sha256: str = Field(min_length=64, max_length=64)
+    agreement_document_id: UUID | None = None
+    agreement_sha256: str | None = Field(default=None, min_length=64, max_length=64)
     typed_name: str = Field(min_length=1, max_length=180)
     payer_name: str = Field(min_length=1, max_length=180)
     payer_email: str | None = Field(default=None, max_length=320)
     signature_sha256: str | None = Field(default=None, min_length=64, max_length=64)
     certificate_s3_key: str | None = Field(default=None, max_length=512)
     certificate_sha256: str | None = Field(default=None, min_length=64, max_length=64)
+    certificate_bucket_file_id: UUID | None = None
+    scheduled_debit_at: datetime | None = None
+    debit_window_start_at: datetime | None = None
+    debit_window_end_at: datetime | None = None
+    notice_business_days: int | None = Field(default=None, ge=0, le=30)
+    revocation_method: str | None = Field(default=None, max_length=1000)
+    revocation_cutoff_at: datetime | None = None
+    signer_session_id: str | None = Field(default=None, max_length=128)
     expires_at: datetime | None = None
 
     @model_validator(mode="after")
@@ -332,12 +345,107 @@ class AchMandateRead(ORMModel):
     ach_class: str
     authorized_amount_cents: int
     authorization_text_version: str
+    authorization_type: str | None = None
+    authorization_text_snapshot: str | None = None
+    authorization_text_sha256: str | None = None
+    agreement_document_id: UUID | None = None
+    agreement_sha256: str | None = None
+    funding_source_snapshot: dict[str, Any] = Field(default_factory=dict)
+    funding_source_sha256: str | None = None
+    signature_sha256: str | None = None
+    certificate_s3_key: str | None = None
+    certificate_sha256: str | None = None
+    certificate_bucket_file_id: UUID | None = None
+    scheduled_debit_at: datetime | None = None
+    debit_window_start_at: datetime | None = None
+    debit_window_end_at: datetime | None = None
+    notice_business_days: int | None = None
+    revocation_method: str | None = None
+    revocation_cutoff_at: datetime | None = None
+    signer_session_id: str | None = None
+    proof_copy_delivery_status: str | None = None
+    proof_copy_message_send_id: UUID | None = None
+    proof_copy_sent_at: datetime | None = None
+    proof_copy_delivered_at: datetime | None = None
+    proof_copy_last_error: str | None = None
+    ip_address: str | None = None
+    user_agent: str | None = None
     typed_name: str
     payer_name: str
     payer_email: str | None
     signed_at: datetime
     expires_at: datetime | None
     revoked_at: datetime | None
+    terminated_at: datetime | None = None
+    termination_reason: str | None = None
+    retention_until: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class PaymentDebitNoticeRead(ORMModel):
+    id: UUID
+    application_profile_id: UUID
+    fee_obligation_id: UUID
+    mandate_id: UUID | None
+    transfer_id: UUID | None
+    installment_id: UUID | None
+    message_send_id: UUID | None
+    notice_bucket_file_id: UUID | None = None
+    status: str
+    delivery_status: str | None
+    notice_type: str
+    amount_cents: int
+    currency: str
+    recipient_name: str | None
+    recipient_email: str
+    account_mask: str | None
+    scheduled_debit_at: datetime
+    debit_window_start_at: datetime | None
+    debit_window_end_at: datetime | None
+    notice_business_days: int | None
+    revocation_cutoff_at: datetime
+    authorization_text_sha256: str | None
+    notice_snapshot: dict[str, Any] = Field(default_factory=dict)
+    notice_sha256: str
+    idempotency_key: str
+    provider: str | None = None
+    provider_message_id: str | None = None
+    rfc_message_id: str | None = None
+    delivery_evidence_snapshot: dict[str, Any] = Field(default_factory=dict)
+    sent_at: datetime | None
+    provider_accepted_at: datetime | None
+    delivered_at: datetime | None
+    bounced_at: datetime | None
+    failed_at: datetime | None
+    last_error: str | None = None
+    created_by_user_id: UUID | None = None
+    superseded_at: datetime | None
+    superseded_by_user_id: UUID | None = None
+    revoked_at: datetime | None
+    revoked_by_user_id: UUID | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    @computed_field
+    @property
+    def amount(self) -> float:
+        return self.amount_cents / 100
+
+    @computed_field
+    @property
+    def submission_window(self) -> str:
+        return "business_day_et"
+
+    @computed_field
+    @property
+    def advance_notice_business_days(self) -> int:
+        return int(self.notice_business_days or 0)
+
+    @computed_field
+    @property
+    def failed_reason(self) -> str | None:
+        return self.last_error
 
 
 class PaymentTransferRead(ORMModel):
@@ -445,6 +553,10 @@ class FeeObligationLineResponse(BaseModel):
     amount: float
     collection_amount: float
     agreement_reference: str | None = None
+    governing_agreement_document_id: UUID | None = None
+    governing_agreement_sha256: str | None = None
+    agreement_component_scope: str | None = None
+    earning_milestone: str | None = None
     agreement_verified: bool = False
     earned: bool = False
 
@@ -480,23 +592,45 @@ class ActualFundingConfirmationResponse(BaseModel):
 class PaymentFundingSourceResponse(BaseModel):
     id: UUID
     ownership_type: str
+    ach_class: str | None = None
     institution_name: str | None = None
     account_name: str | None = None
     account_mask: str | None = None
     account_subtype: str | None = None
     status: str
     connected_at: datetime | None = None
+    business_account_attested: bool = False
 
 
 class AchMandateResponse(BaseModel):
     id: UUID
     status: str
+    current: bool = False
     authorized_amount: float
     sec_code: str
     payer_name: str
+    authorization_type: str | None = None
+    scheduled_debit_at: datetime | None = None
+    revocation_cutoff_at: datetime | None = None
+    proof_copy_delivery_status: str | None = None
+    proof_copy_sent_at: datetime | None = None
+    proof_copy_delivered_at: datetime | None = None
     signed_at: datetime | None = None
     revoked_at: datetime | None = None
     certificate_available: bool = False
+    can_revoke: bool = False
+    can_resend_proof: bool = False
+    artifact: dict[str, Any] | None = None
+
+    @computed_field
+    @property
+    def proof_email_status(self) -> str | None:
+        return self.proof_copy_delivery_status
+
+    @computed_field
+    @property
+    def proof_delivered_at(self) -> datetime | None:
+        return self.proof_copy_delivered_at
 
 
 class PaymentTransferResponse(BaseModel):
@@ -572,9 +706,12 @@ class PaymentPermissions(BaseModel):
     can_view: bool = True
     can_edit_allocation: bool = False
     can_prepare_obligation: bool = False
+    can_prepare_fee_agreement: bool = False
     can_confirm_funding: bool = False
     can_send_authorization: bool = False
     can_release_ach: bool = False
+    can_manage_mandate_proof: bool = False
+    can_revoke_mandate: bool = False
     can_retry: bool = False
     can_refund: bool = False
     can_reconcile_bank_direct: bool = False
@@ -601,11 +738,14 @@ class AgreementDocumentCandidate(BaseModel):
 class PaymentReadiness(BaseModel):
     fee_obligation_current: bool = False
     agreement_signed: bool = False
+    fee_agreement_signed: bool = False
     consulting_fee_earned: bool = False
     client_authorized: bool = False
     funding_confirmed: bool = False
     amount_covered: bool = False
     account_eligible: bool = False
+    authorization_proof_delivered: bool = False
+    debit_notice_delivered: bool = False
     no_existing_claim: bool = False
     ready_for_release: bool = False
     blockers: list[str] = Field(default_factory=list)
@@ -642,7 +782,12 @@ class PaymentSummary(BaseModel):
     funding_confirmation: ActualFundingConfirmationResponse | None = None
     funding_source: PaymentFundingSourceResponse | None = None
     mandate: AchMandateResponse | None = None
+    authorization_request_delivery: dict[str, Any] | None = None
+    debit_notice: PaymentDebitNoticeRead | None = None
     transfer: PaymentTransferResponse | None = None
+    fee_agreement: dict[str, Any] | None = None
+    ach_authorization_enabled: bool = False
+    legal_approval_required: bool = False
     private_funding_eligible: bool = False
     private_funding_reason: str | None = None
     private_plan: PrivateFundingPlanResponse | None = None

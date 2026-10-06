@@ -1060,7 +1060,7 @@ class ApplicationRoomSignRequest(ApplicationRoomAccess):
     requested_document_id: UUID
     typed_name: str = Field(min_length=1, max_length=160)
     esign_consent: bool
-    signature_data_url: str = Field(min_length=1)
+    signature_data_url: str | None = Field(default=None, min_length=1)
     applicant_legal_first_name: str | None = Field(default=None, max_length=120)
     applicant_legal_last_name: str | None = Field(default=None, max_length=120)
     applicant_dob: str | None = Field(default=None, max_length=32)

@@ -3,10 +3,13 @@ from __future__ import annotations
 # FastAPI dependency declarations intentionally call Depends/Query in defaults.
 # ruff: noqa: B008
 import hashlib
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,12 +19,14 @@ from app.deps import CurrentUser
 from app.enums import Role
 from app.models.application_profile import ApplicationProfile, ApplicationRoomDelivery
 from app.models.broker import Broker
+from app.models.bucket import BucketFile
 from app.models.client import Client
 from app.models.loan import Loan
 from app.models.payments import (
     AchMandate,
     BankDirectFeeReceipt,
     FeeObligation,
+    PaymentDebitNotice,
     PaymentInstallment,
     PaymentRefund,
     PaymentTransfer,
@@ -51,9 +56,9 @@ from app.schemas.payments import (
     ServicingAuthorityCreate,
     TransferRetryRequest,
 )
+from app.services import ach_fee_workflow, plaid_transfer
 from app.services import application_profiles as profiles
 from app.services import payments as pay
-from app.services import plaid_transfer
 
 router = APIRouter(tags=["payments"])
 
@@ -68,6 +73,7 @@ def _write_gate(*, private: bool = False, provider: bool = False) -> None:
     if not enabled:
         label = "Private-funding payments" if private else "ACH payments"
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, f"{label} are not enabled")
+    ach_fee_workflow.require_legal_approval()
     if provider and not plaid_transfer.enabled():
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -75,36 +81,67 @@ def _write_gate(*, private: bool = False, provider: bool = False) -> None:
         )
 
 
+class FeeAgreementPrepareRequest(BaseModel):
+    expected_allocation_version: int | None = Field(default=None, ge=1)
+    include_origination_fee: bool = True
+    include_consulting_fee: bool = False
+    consulting_milestone_confirmed: bool = False
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
+
+
+class FeeAuthorizationSendRequest(BaseModel):
+    scheduled_debit_date: date
+    submission_window: Literal["business_day_et"] = "business_day_et"
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
+
+
+class AchMandateRevokeRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=240)
+
+
 def _permissions(user: CurrentUser) -> PaymentPermissions:
     settings = get_settings()
     manager = user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}
-    provider_ready = settings.payments_enabled and plaid_transfer.enabled()
+    workflow_ready = (
+        settings.payments_enabled
+        and not ach_fee_workflow.legal_approval_required()
+    )
+    provider_ready = (
+        workflow_ready
+        and plaid_transfer.enabled()
+    )
     return PaymentPermissions(
         can_view=True,
-        can_edit_allocation=manager and settings.payments_enabled,
-        can_prepare_obligation=manager and settings.payments_enabled,
-        can_confirm_funding=manager and settings.payments_enabled,
+        can_edit_allocation=manager and workflow_ready,
+        can_prepare_obligation=manager and workflow_ready,
+        can_prepare_fee_agreement=manager and workflow_ready,
+        can_confirm_funding=manager and workflow_ready,
         can_send_authorization=manager and provider_ready,
         can_release_ach=manager and provider_ready,
+        # Existing proof retrieval and revocation are safety controls, not
+        # new money movement. They remain available while ACH creation is
+        # paused by a feature, provider, or legal kill gate.
+        can_manage_mandate_proof=manager,
+        can_revoke_mandate=manager,
         can_retry=manager and provider_ready,
         can_refund=(
             user.role == Role.SUPER_ADMIN
             and provider_ready
             and settings.payment_refunds_enabled
         ),
-        can_reconcile_bank_direct=manager and settings.payments_enabled,
+        can_reconcile_bank_direct=manager and workflow_ready,
         can_manage_private_schedule=(
             manager
-            and settings.payments_enabled
+            and workflow_ready
             and settings.private_funding_payments_enabled
         ),
         can_manage_servicing_authority=(
             user.role == Role.SUPER_ADMIN
-            and settings.payments_enabled
+            and workflow_ready
             and settings.private_funding_payments_enabled
         ),
-        can_waive=user.role == Role.SUPER_ADMIN and settings.payments_enabled,
-        can_request_review=(user.role in pay.READ_ROLES and settings.payments_enabled),
+        can_waive=user.role == Role.SUPER_ADMIN and workflow_ready,
+        can_request_review=(user.role in pay.READ_ROLES and workflow_ready),
     )
 
 
@@ -127,7 +164,68 @@ def _enforce_waiver_change_permission(
 
 
 async def _summary(db: AsyncSession, profile: ApplicationProfile, user: CurrentUser) -> PaymentSummary:
-    return await pay.build_summary(db, profile=profile, permissions=_permissions(user))
+    summary = await pay.build_summary(
+        db,
+        profile=profile,
+        permissions=_permissions(user),
+    )
+    if user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        return summary
+
+    # Assigned brokers and field representatives may follow collection status,
+    # but bank identity, payer identity, proof artifacts, notice snapshots, and
+    # agreement hashes are manager-only payment operations data.
+    funding_source = (
+        summary.funding_source.model_copy(
+            update={
+                "institution_name": None,
+                "account_name": None,
+                "account_mask": None,
+                "account_subtype": None,
+            }
+        )
+        if summary.funding_source
+        else None
+    )
+    mandate = (
+        summary.mandate.model_copy(
+            update={
+                "payer_name": "Client",
+                "certificate_available": False,
+                "can_revoke": False,
+                "can_resend_proof": False,
+                "artifact": None,
+            }
+        )
+        if summary.mandate
+        else None
+    )
+    fee_agreement = None
+    if summary.fee_agreement:
+        fee_agreement = {
+            key: summary.fee_agreement.get(key)
+            for key in (
+                "id",
+                "status",
+                "template_version",
+                "prepared_at",
+                "sent_at",
+                "signed_at",
+                "countersigned_at",
+                "proof_email_status",
+                "current",
+            )
+        }
+    return summary.model_copy(
+        update={
+            "funding_source": funding_source,
+            "mandate": mandate,
+            "debit_notice": None,
+            "fee_agreement": fee_agreement,
+            "agreement_documents": [],
+            "servicing_authorities": [],
+        }
+    )
 
 
 async def _profile_for_obligation(db: AsyncSession, obligation_id: UUID, user: CurrentUser) -> tuple[FeeObligation, ApplicationProfile]:
@@ -156,6 +254,7 @@ async def _send_authorization_email_once(
     idempotency_key: str,
     action_kind: str,
     purpose: str,
+    path: str = "/buckets/request/{token}?tab=payments",
 ) -> tuple[ApplicationRoomDelivery, object, str, bool]:
     """Claim, commit, and deliver one secure-room email per durable key.
 
@@ -165,6 +264,7 @@ async def _send_authorization_email_once(
     """
 
     link = await profile_routes._profile_room_link(db, profile)
+    await pay.assert_payment_room_identity(db, link=link, profile=profile)
     email = profiles.normalized_email(link.recipient_email)
     if not email:
         raise HTTPException(
@@ -208,7 +308,7 @@ async def _send_authorization_email_once(
             to_phone=None,
             business_name=business_name,
             purpose=purpose,
-            path=f"/buckets/request/{link.token}?tab=payments",
+            path=path.format(token=link.token),
             rep_name=user.name,
             origin=get_settings().frontend_app_url,
         )
@@ -332,9 +432,75 @@ async def prepare_fee_obligation(
     return await _summary(db, profile, user)
 
 
+@router.post(
+    "/application-profiles/{profile_id}/payments/fee-agreements/prepare",
+    response_model=PaymentSummary,
+)
+async def prepare_success_fee_agreement(
+    profile_id: UUID,
+    payload: FeeAgreementPrepareRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    idempotency_header: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> PaymentSummary:
+    _write_gate()
+    pay.require_manager(user)
+    key = idempotency_header or payload.idempotency_key
+    if not key:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Idempotency-Key header is required",
+        )
+    profile = await profiles.load_profile(db, profile_id, user)
+    requested = await ach_fee_workflow.prepare_success_fee_agreement(
+        db,
+        profile=profile,
+        actor=user,
+        include_origination_fee=payload.include_origination_fee,
+        include_consulting_fee=payload.include_consulting_fee,
+        consulting_milestone_confirmed=payload.consulting_milestone_confirmed,
+        expected_allocation_version=payload.expected_allocation_version,
+        idempotency_key=key,
+    )
+    delivery_key = (
+        f"fee-agreement:{requested.id}:"
+        f"{hashlib.sha256(key.encode('utf-8')).hexdigest()[:32]}"
+    )
+    delivery, _link, email, replay = await _send_authorization_email_once(
+        db,
+        profile=profile,
+        user=user,
+        idempotency_key=delivery_key,
+        action_kind="success_fee_agreement_signature_request",
+        purpose="review and sign the deal-specific Success Fee Agreement",
+        path=(
+            f"/buckets/request/{{token}}?tab=agreements&request={requested.id}"
+        ),
+    )
+    source = dict(requested.requirement_source or {})
+    source["signature_request_delivery_id"] = str(delivery.id)
+    source["signature_request_delivery_status"] = delivery.status
+    source["signature_request_recipient"] = email
+    requested.requirement_source = source
+    if delivery.status != "sent" and not replay:
+        await pay.log_event(
+            db,
+            profile_id=profile.id,
+            actor_id=user.id,
+            event_type="success_fee_agreement.delivery_failed",
+            entity_type="bucket_requested_document",
+            entity_id=requested.id,
+            summary="Success Fee Agreement signature request was not accepted",
+            metadata={"delivery_id": str(delivery.id)},
+        )
+    await db.commit()
+    return await _summary(db, profile, user)
+
+
 @router.post("/fee-obligations/{obligation_id}/send-authorization", response_model=PaymentSummary)
 async def send_fee_authorization(
     obligation_id: UUID,
+    payload: FeeAuthorizationSendRequest,
     request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
@@ -352,15 +518,25 @@ async def send_fee_authorization(
         )
     if obligation.status in {"processing", "collected", "cancelled", "superseded"}:
         raise HTTPException(status.HTTP_409_CONFLICT, "Authorization cannot be requested in the current state")
-    if not idempotency_key or not (8 <= len(idempotency_key) <= 128):
+    request_key = idempotency_key or payload.idempotency_key
+    if not request_key or not (8 <= len(request_key) <= 128):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "Idempotency-Key header (8-128 characters) is required",
         )
+    notice = await ach_fee_workflow.prepare_debit_notice(
+        db,
+        profile=profile,
+        obligation=obligation,
+        actor=user,
+        scheduled_debit_date=payload.scheduled_debit_date,
+        submission_window=payload.submission_window,
+        idempotency_key=request_key,
+    )
     del request
     delivery_key = (
         f"fee-ach:{obligation.id}:"
-        f"{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:32]}"
+        f"{hashlib.sha256(request_key.encode('utf-8')).hexdigest()[:32]}"
     )
     delivery, link, email, replay = await _send_authorization_email_once(
         db,
@@ -405,9 +581,11 @@ async def send_fee_authorization(
                 "recipient": email,
                 "room_link_id": str(link.id),
                 "delivery_id": str(delivery.id),
+                "debit_notice_id": str(notice.id),
+                "scheduled_debit_at": notice.scheduled_debit_at.isoformat(),
             },
         )
-        await db.commit()
+    await db.commit()
     return await _summary(db, profile, user)
 
 
@@ -452,6 +630,171 @@ async def release_fee_ach(
         idempotency_key=key,
         actor=user,
     )
+    await db.commit()
+    return await _summary(db, profile, user)
+
+
+@router.get("/ach-mandates/{mandate_id}/certificate")
+async def download_ach_mandate_proof(
+    mandate_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    pay.require_reader(user)
+    mandate = await db.get(AchMandate, mandate_id)
+    if mandate is None or not mandate.certificate_s3_key:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "ACH authorization proof not found")
+    await profiles.load_profile(db, mandate.application_profile_id, user)
+    await ach_fee_workflow.extend_mandate_retention(
+        db, mandate, anchor=datetime.now(UTC)
+    )
+    await db.commit()
+    proof_file = (
+        await db.get(BucketFile, mandate.certificate_bucket_file_id)
+        if mandate.certificate_bucket_file_id
+        else None
+    )
+    if proof_file is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "ACH authorization proof has no protected file record",
+        )
+    url = await ach_fee_workflow.verified_protected_download_url(
+        proof_file,
+        download_filename="QC-one-time-ACH-authorization.pdf",
+    )
+    return RedirectResponse(url, status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.post("/ach-mandates/{mandate_id}/resend-proof", response_model=PaymentSummary)
+async def resend_ach_mandate_proof(
+    mandate_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PaymentSummary:
+    pay.require_manager(user)
+    mandate = await db.get(AchMandate, mandate_id)
+    if mandate is None or mandate.fee_obligation_id is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "ACH authorization not found")
+    profile = await profiles.load_profile(db, mandate.application_profile_id, user)
+    proof_message = await ach_fee_workflow.ensure_mandate_proof_queued(
+        db,
+        mandate=mandate,
+        profile=profile,
+        force_new=True,
+    )
+    # Persist the new audited attempt before the provider handoff so a process
+    # interruption cannot produce an unrecorded customer copy.
+    await db.commit()
+    await ach_fee_workflow.deliver_mandate_proof(
+        db,
+        mandate=mandate,
+        profile=profile,
+        recorded_row=proof_message,
+    )
+    await ach_fee_workflow.extend_mandate_retention(
+        db, mandate, anchor=datetime.now(UTC)
+    )
+    await db.commit()
+    return await _summary(db, profile, user)
+
+
+@router.post(
+    "/ach-mandates/{mandate_id}/resend-debit-notice",
+    response_model=PaymentSummary,
+)
+async def resend_ach_debit_notice(
+    mandate_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PaymentSummary:
+    """Send a fresh audited copy of the already-bound exact debit notice."""
+
+    pay.require_manager(user)
+    mandate = (
+        await db.execute(
+            select(AchMandate)
+            .where(AchMandate.id == mandate_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if mandate is None or mandate.fee_obligation_id is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "ACH authorization not found")
+    profile = await profiles.load_profile(db, mandate.application_profile_id, user)
+    notice = (
+        await db.execute(
+            select(PaymentDebitNotice)
+            .where(
+                PaymentDebitNotice.fee_obligation_id == mandate.fee_obligation_id,
+                PaymentDebitNotice.mandate_id == mandate.id,
+                PaymentDebitNotice.superseded_at.is_(None),
+                PaymentDebitNotice.revoked_at.is_(None),
+            )
+            .order_by(PaymentDebitNotice.created_at.desc())
+            .limit(1)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if notice is None or not notice.notice_bucket_file_id:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The exact protected debit notice is not available to resend",
+        )
+    notice_message = await ach_fee_workflow.ensure_debit_notice_queued(
+        db,
+        notice=notice,
+        mandate=mandate,
+        profile=profile,
+        force_new=True,
+    )
+    if notice_message is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "The exact protected debit notice could not be queued",
+        )
+    await db.commit()
+    await ach_fee_workflow.deliver_debit_notice(
+        db,
+        notice=notice,
+        mandate=mandate,
+        profile=profile,
+        recorded_row=notice_message,
+    )
+    await ach_fee_workflow.extend_mandate_retention(
+        db,
+        mandate,
+        anchor=max(datetime.now(UTC), notice.scheduled_debit_at),
+    )
+    await db.commit()
+    return await _summary(db, profile, user)
+
+
+@router.post("/ach-mandates/{mandate_id}/revoke", response_model=PaymentSummary)
+async def revoke_ach_mandate(
+    mandate_id: UUID,
+    payload: AchMandateRevokeRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PaymentSummary:
+    pay.require_manager(user)
+    mandate = (
+        await db.execute(
+            select(AchMandate).where(AchMandate.id == mandate_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if mandate is None or mandate.fee_obligation_id is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "ACH authorization not found")
+    profile = await profiles.load_profile(db, mandate.application_profile_id, user)
+    await ach_fee_workflow.revoke_mandate(
+        db,
+        mandate=mandate,
+        actor_user_id=user.id,
+        reason=payload.reason,
+    )
+    # The revocation and its queued notification ledger row must be durable
+    # before any external provider receives the confirmation email.
+    await db.commit()
+    await ach_fee_workflow.deliver_revocation_confirmation(db, mandate)
     await db.commit()
     return await _summary(db, profile, user)
 

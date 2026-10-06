@@ -292,6 +292,12 @@ async def accounts(access_token: str) -> list[dict[str, Any]]:
     return result
 
 
+async def remove_item(access_token: str) -> None:
+    """Revoke a just-created Item when its access token could not be persisted."""
+
+    await _post("/item/remove", {"access_token": access_token})
+
+
 def _amount(value: Decimal | str | int | float) -> str:
     parsed = Decimal(str(value)).quantize(Decimal("0.01"))
     if parsed <= 0:

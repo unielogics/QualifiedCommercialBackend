@@ -101,6 +101,10 @@ class Settings(BaseSettings):
     # available when disabled, while obligation creation, authorization,
     # release, retries, and refunds fail closed at the API boundary.
     payments_enabled: bool = False
+    payments_ach_legal_approved: bool = False
+    payments_counter_signatory_name: str = ""
+    payments_counter_signatory_title: str = ""
+    payments_counter_signatory_email: str = ""
     # Refunds are a separate outgoing movement. Keep them dark until the
     # production return/refund simulation and reconciliation policy pass.
     payment_refunds_enabled: bool = False

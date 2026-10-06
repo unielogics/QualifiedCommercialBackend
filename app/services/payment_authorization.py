@@ -5,10 +5,11 @@ import hashlib
 import html
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID
 
 import boto3
+from botocore.exceptions import ClientError
 from fastapi import HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -177,7 +178,20 @@ def decode_signature_data_url(value: str | None) -> tuple[bytes | None, str | No
     return raw, hashlib.sha256(raw).hexdigest(), content_type
 
 
-def put_private_s3_object(*, key: str, body: bytes, content_type: str) -> None:
+def put_private_s3_object(
+    *,
+    key: str,
+    body: bytes,
+    content_type: str,
+    prevent_overwrite: bool = False,
+) -> dict:
+    """Write a private object and return immutable storage metadata.
+
+    Compliance artifacts pass ``prevent_overwrite=True``.  A retry against an
+    already-created content-addressed key is treated as an idempotent replay;
+    callers still verify the stored bytes before trusting the result.
+    """
+
     settings = get_settings()
     if not settings.s3_bucket:
         raise RuntimeError("S3 bucket is not configured")
@@ -192,7 +206,27 @@ def put_private_s3_object(*, key: str, body: bytes, content_type: str) -> None:
         params["SSEKMSKeyId"] = settings.buckets_kms_key_id
     else:
         params["ServerSideEncryption"] = "AES256"
-    _private_s3_client().put_object(**params)
+    if prevent_overwrite:
+        params["IfNoneMatch"] = "*"
+    client = _private_s3_client()
+    try:
+        response = client.put_object(**params)
+        return {
+            "created": True,
+            "version_id": response.get("VersionId"),
+            "etag": response.get("ETag"),
+        }
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code") or "")
+        status_code = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if not prevent_overwrite or (code not in {"PreconditionFailed", "412"} and status_code != 412):
+            raise
+        existing = client.head_object(Bucket=settings.s3_bucket, Key=key)
+        return {
+            "created": False,
+            "version_id": existing.get("VersionId"),
+            "etag": existing.get("ETag"),
+        }
 
 
 def _private_s3_client():
@@ -214,6 +248,7 @@ def presign_private_s3_object(
     *,
     ttl_seconds: int = 900,
     download_filename: str | None = None,
+    version_id: str | None = None,
 ) -> str | None:
     if not key:
         return None
@@ -222,6 +257,8 @@ def presign_private_s3_object(
         return None
     try:
         params = {"Bucket": settings.s3_bucket, "Key": key}
+        if version_id:
+            params["VersionId"] = version_id
         if download_filename:
             safe_filename = re.sub(r"[^A-Za-z0-9._-]", "_", download_filename).strip("._") or "document.pdf"
             params["ResponseContentDisposition"] = f'attachment; filename="{safe_filename}"'
@@ -244,7 +281,7 @@ def render_certificate_pdf(
 ) -> bytes:
     from weasyprint import HTML
 
-    signed_at = authorization.signed_at or datetime.now(timezone.utc)
+    signed_at = authorization.signed_at or datetime.now(UTC)
     rows = [
         ("Signer", authorization.typed_name or user.name),
         ("Client email", user.email),

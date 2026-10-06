@@ -196,6 +196,28 @@ async def test_room_expiry_rejected_before_pin_and_dealer_opt_in_is_local():
 
 
 @pytest.mark.asyncio
+async def test_completed_single_use_room_is_rejected_before_pin():
+    profile = saved_profile()
+    link = room_link(
+        profile,
+        completed_at=datetime.now(UTC),
+        allow_multiple_sessions=False,
+    )
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            return_value=SimpleNamespace(scalar_one_or_none=lambda: link)
+        )
+    )
+    with patch.object(rooms, "_verify_passcode", return_value=True) as verify:
+        with pytest.raises(HTTPException) as error:
+            await rooms._public_application_room(
+                db, "token", "123456", request(), allow_dealer=True
+            )
+    assert error.value.status_code == 404
+    verify.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_invalid_pin_stops_before_loading_any_funding_profile():
     profile = saved_profile()
     link = room_link(profile)

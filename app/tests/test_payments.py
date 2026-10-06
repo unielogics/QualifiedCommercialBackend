@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import pytest
@@ -53,8 +53,98 @@ class _AsyncSessionContext:
         return None
 
 
+class _Copyable(SimpleNamespace):
+    def model_copy(self, *, update: dict | None = None):
+        return _Copyable(**{**vars(self), **(update or {})})
+
+
+@pytest.mark.asyncio
+async def test_read_only_payment_summary_redacts_sensitive_ach_details() -> None:
+    sensitive = _Copyable(
+        funding_source=_Copyable(
+            institution_name="Secret Bank",
+            account_name="Operating Account",
+            account_mask="1234",
+            account_subtype="checking",
+        ),
+        mandate=_Copyable(
+            payer_name="Private Signer",
+            certificate_available=True,
+            can_revoke=True,
+            can_resend_proof=True,
+            artifact={"download_url": "signed-proof"},
+        ),
+        debit_notice={"recipient": "private@example.com"},
+        fee_agreement={
+            "id": "agreement-1",
+            "status": "signed",
+            "current": True,
+            "document_sha256": "secret-hash",
+            "artifact": {"download_url": "agreement-proof"},
+        },
+        agreement_documents=[{"sha256": "secret"}],
+        servicing_authorities=[{"destination": "secret"}],
+        aggregate_status="ready",
+    )
+    with patch.object(
+        payment_routes.pay,
+        "build_summary",
+        AsyncMock(return_value=sensitive),
+    ):
+        redacted = await payment_routes._summary(
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(role=Role.BROKER),
+        )
+        manager = await payment_routes._summary(
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(role=Role.LOAN_EXEC),
+        )
+
+    assert redacted.aggregate_status == "ready"
+    assert redacted.funding_source.institution_name is None
+    assert redacted.funding_source.account_name is None
+    assert redacted.funding_source.account_mask is None
+    assert redacted.mandate.payer_name == "Client"
+    assert redacted.mandate.artifact is None
+    assert redacted.debit_notice is None
+    assert redacted.fee_agreement == {
+        "id": "agreement-1",
+        "status": "signed",
+        "template_version": None,
+        "prepared_at": None,
+        "sent_at": None,
+        "signed_at": None,
+        "countersigned_at": None,
+        "proof_email_status": None,
+        "current": True,
+    }
+    assert redacted.agreement_documents == []
+    assert redacted.servicing_authorities == []
+    assert manager is sensitive
+
+
 def test_private_funder_registry_includes_normalized_production_values() -> None:
     assert {"private_credit", "family_office", "balance_sheet"} <= PRIVATE_FUNDER_TYPES
+
+
+def test_private_schedule_authorization_remains_phase_two_disabled() -> None:
+    with (
+        patch.object(
+            public_payments,
+            "get_settings",
+            return_value=SimpleNamespace(
+                payments_enabled=True,
+                private_funding_payments_enabled=False,
+            ),
+        ),
+        patch.object(public_payments.plaid_transfer, "enabled", return_value=True),
+        patch.object(public_payments.ach_fee_workflow, "require_legal_approval"),
+    ):
+        with pytest.raises(HTTPException) as error:
+            public_payments._private_enabled()
+    assert error.value.status_code == 503
 
 
 def test_fee_allocation_accepts_dollars_and_preserves_component_split() -> None:
@@ -373,6 +463,7 @@ async def test_fee_repair_link_token_keeps_fee_transfer(monkeypatch) -> None:
             passcode="123456",
             owner_type="business",
             purpose="fee",
+            business_account_attested=True,
         ),
         SimpleNamespace(),
         SimpleNamespace(),
@@ -425,6 +516,7 @@ async def test_active_private_plan_allows_repair_link_token(monkeypatch) -> None
             passcode="123456",
             owner_type="business",
             purpose="private_schedule",
+            business_account_attested=True,
         ),
         SimpleNamespace(),
         SimpleNamespace(),

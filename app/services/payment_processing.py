@@ -29,7 +29,7 @@ from app.models.payments import (
     PaymentRefund,
     PaymentTransfer,
 )
-from app.services import payments, plaid_transfer
+from app.services import ach_fee_workflow, payments, plaid_transfer
 
 log = logging.getLogger(__name__)
 FIRM_TIMEZONE = ZoneInfo("America/New_York")
@@ -180,7 +180,11 @@ async def dispatch_payment_transfers(*, limit: int = 25) -> int:
     settings = get_settings()
     # This flag is the kill switch for new provider handoffs. Reconciliation
     # stays live elsewhere so already-submitted transfers continue to update.
-    if not settings.payments_enabled or not plaid_transfer.enabled():
+    if (
+        not settings.payments_enabled
+        or not plaid_transfer.enabled()
+        or ach_fee_workflow.legal_approval_required()
+    ):
         return 0
     async with SessionLocal() as db:
         claimed = await payments.claim_due_transfers(
@@ -567,6 +571,7 @@ async def dispatch_payment_refunds(*, limit: int = 10) -> int:
         settings.payments_enabled
         and settings.payment_refunds_enabled
         and plaid_transfer.enabled()
+        and not ach_fee_workflow.legal_approval_required()
     ):
         return 0
     stale_before = datetime.now(UTC) - timedelta(minutes=10)

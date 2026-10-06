@@ -25,7 +25,9 @@ data volume.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+# FastAPI dependency declarations intentionally call Depends in defaults.
+# ruff: noqa: B008
+from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -36,15 +38,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import ContractSubjectType, ContractType, Role
+from app.models.agreement_counterparty import AgreementCounterparty
 from app.models.billing import PaymentAuthorization
-from app.models.bucket import Bucket, BucketDocumentSignature, BucketRequestedDocument
+from app.models.bucket import Bucket, BucketDocumentSignature, BucketFile, BucketRequestedDocument
 from app.models.client import Client
 from app.models.contract_agreement import ContractAgreement
-from app.models.agreement_counterparty import AgreementCounterparty
 from app.models.deal_registration import DealRegistration
+from app.models.payments import AchMandate, FeeObligation
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.referral_partner_company import ReferralPartnerCompany
 from app.models.user import User
+from app.services import ach_fee_workflow
 from app.services import contract_templates as tpl
 from app.services import payment_authorization as pay_auth
 
@@ -91,6 +95,7 @@ _SIGNATURE_KIND_TITLE: dict[str, str] = {
     "contract_sba_engagement": tpl.CONTRACT_TITLES[ContractType.SBA_ENGAGEMENT],
     "contract_client_engagement": tpl.CONTRACT_TITLES[ContractType.CLIENT_ENGAGEMENT],
     "contract_consulting_addendum": tpl.CONTRACT_TITLES[ContractType.CONSULTING_ADDENDUM],
+    "success_fee_agreement": "Deal-Specific Success Fee Agreement",
 }
 
 
@@ -331,6 +336,82 @@ async def _rows_from_payment_authorizations(db: AsyncSession) -> list[AgreementR
     return rows
 
 
+async def _rows_from_ach_mandates(db: AsyncSession) -> list[AgreementRow]:
+    mandates = list(
+        (
+            await db.execute(
+                select(AchMandate).where(
+                    AchMandate.authorization_type == "one_time_business_ccd"
+                )
+            )
+        ).scalars().all()
+    )
+    if not mandates:
+        return []
+    obligation_ids = {
+        row.fee_obligation_id for row in mandates if row.fee_obligation_id is not None
+    }
+    obligations = {
+        row.id: row
+        for row in (
+            await db.execute(
+                select(FeeObligation).where(FeeObligation.id.in_(obligation_ids))
+            )
+        ).scalars().all()
+    } if obligation_ids else {}
+    proof_ids = {
+        row.certificate_bucket_file_id
+        for row in mandates
+        if row.certificate_bucket_file_id is not None
+    }
+    proof_files = (
+        {
+            row.id: row
+            for row in (
+                await db.execute(select(BucketFile).where(BucketFile.id.in_(proof_ids)))
+            ).scalars().all()
+        }
+        if proof_ids
+        else {}
+    )
+    rows: list[AgreementRow] = []
+    for mandate in mandates:
+        proof_file = proof_files.get(mandate.certificate_bucket_file_id)
+        proof_url = None
+        if proof_file and proof_file.deleted_at is None:
+            try:
+                proof_url = await ach_fee_workflow.verified_protected_download_url(
+                    proof_file,
+                    download_filename="QC-one-time-ACH-authorization.pdf",
+                )
+            except HTTPException:
+                proof_url = None
+        rows.append(
+            AgreementRow(
+                id=mandate.id,
+                source="ach_mandate",
+                agreement_type="ach_one_time_business_ccd",
+                title="Exact One-Time Business CCD Authorization",
+                contract_number=None,
+                party_name=mandate.payer_name,
+                party_email=mandate.payer_email,
+                party_company=(
+                    obligations[mandate.fee_obligation_id].business_name_snapshot
+                    if mandate.fee_obligation_id in obligations
+                    else None
+                ),
+                party_kind="client",
+                typed_name=mandate.typed_name,
+                signed_at=mandate.signed_at,
+                document_version=mandate.authorization_text_version,
+                certificate_available=proof_url is not None,
+                certificate_download_url=proof_url,
+                detail_url=f"/payments?profile_id={mandate.application_profile_id}",
+            )
+        )
+    return rows
+
+
 @router.get("", response_model=AgreementListResponse)
 async def list_agreements(
     user: CurrentUser,
@@ -348,8 +429,9 @@ async def list_agreements(
         *(await _rows_from_contract_agreements(db)),
         *(await _rows_from_bucket_signatures(db)),
         *(await _rows_from_payment_authorizations(db)),
+        *(await _rows_from_ach_mandates(db)),
     ]
-    rows.sort(key=lambda r: r.signed_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    rows.sort(key=lambda r: r.signed_at or datetime.min.replace(tzinfo=UTC), reverse=True)
 
     if agreement_type and agreement_type != "all":
         rows = [r for r in rows if r.agreement_type == agreement_type]
@@ -444,7 +526,7 @@ async def _next_deal_registration_number(db: AsyncSession) -> tuple[str, str, st
     the zero-padded sequence value, matching Exhibit 1's existing two-blank
     "QC-$prefix-$suffix" template convention."""
     seq = (await db.execute(text("SELECT nextval('deal_registration_number_seq')"))).scalar_one()
-    prefix = str(datetime.now(timezone.utc).year)
+    prefix = str(datetime.now(UTC).year)
     suffix = f"{seq:05d}"
     return f"QC-{prefix}-{suffix}", prefix, suffix
 

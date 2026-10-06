@@ -2607,7 +2607,7 @@ async def _public_application_room(
             )
         )
     ).scalar_one_or_none()
-    if link is None or (link.expires_at is not None and link.expires_at <= datetime.now(UTC)):
+    if link is None or not client_room.link_is_usable(link):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Application room not found")
     if not _verify_passcode(
         passcode,
@@ -2702,7 +2702,10 @@ async def _application_bank_state(
 
 
 async def _application_room_signables(
-    db: AsyncSession, bucket_id: UUID
+    db: AsyncSession,
+    bucket_id: UUID,
+    *,
+    include_payment_agreements: bool = False,
 ) -> list[ApplicationRoomSignable]:
     rows = list(
         (
@@ -2738,6 +2741,8 @@ async def _application_room_signables(
             ),
         )
         for row in rows
+        if include_payment_agreements
+        or row.signature_kind != "success_fee_agreement"
     ]
 
 
@@ -2779,6 +2784,17 @@ async def _application_room_state(
         verification=verification,
         banking=banking,
     )
+    payment_agreements_visible = False
+    from app.services import payments as payment_service
+
+    try:
+        await payment_service.assert_payment_room_identity(
+            db, link=link, profile=profile
+        )
+    except HTTPException:
+        pass
+    else:
+        payment_agreements_visible = True
     return ApplicationRoomState(
         profile_id=profile.id,
         business_name=_business_label(profile, intake, client),
@@ -2789,7 +2805,11 @@ async def _application_room_state(
         precall=room_precall,
         banking=banking,
         evidence_banking_summary=evidence_banking_summary,
-        signable=await _application_room_signables(db, link.bucket_id),
+        signable=await _application_room_signables(
+            db,
+            link.bucket_id,
+            include_payment_agreements=payment_agreements_visible,
+        ),
         merchant_offer=await _room_merchant_offer_summary(db, profile),
     )
 
@@ -3167,6 +3187,16 @@ async def public_application_room_sign(
         _sign_requested_document,
     )
 
+    requested = await db.get(BucketRequestedDocument, payload.requested_document_id)
+    if requested and requested.signature_kind == "success_fee_agreement":
+        from app.services import ach_fee_workflow
+        from app.services import payments as payment_service
+
+        ach_fee_workflow.require_fee_workflow_enabled()
+        await payment_service.assert_payment_room_identity(
+            db, link=link, profile=profile
+        )
+
     result_file = await _sign_requested_document(
         db,
         SimpleNamespace(bucket_id=link.bucket_id, bucket_upload_link_id=link.id),
@@ -3191,22 +3221,79 @@ async def public_application_room_sign(
             or (client.email if client else None)
             or ""
         ),
+        allow_success_fee_agreement=True,
     )
-    await profiles.log_profile_action(
-        db,
-        profile,
-        None,
-        "document.signed.application_room",
-        "Client signed an application-room document",
-        target_type="requested_document",
-        target_id=payload.requested_document_id,
-        metadata={"signer": payload.typed_name, "file_id": str(result_file.id)},
-    )
+    if requested and requested.signature_kind == "success_fee_agreement":
+        from app.services import ach_fee_workflow
+
+        await ach_fee_workflow.finalize_success_fee_agreement(
+            db,
+            profile=profile,
+            requested=requested,
+            result_file=result_file,
+        )
+        await ach_fee_workflow.ensure_success_fee_agreement_copy_queued(
+            db,
+            profile=profile,
+            requested=requested,
+            result_file=result_file,
+            recipient_email=(
+                link.recipient_email
+                or (intake.email if intake else None)
+                or (client.email if client else None)
+            ),
+            signer_name=payload.typed_name,
+        )
+        await profiles.log_profile_action(
+            db,
+            profile,
+            None,
+            "document.signed.application_room",
+            "Client signed an application-room document",
+            target_type="requested_document",
+            target_id=payload.requested_document_id,
+            metadata={"signer": payload.typed_name, "file_id": str(result_file.id)},
+        )
+        # The executed PDF, signature evidence, governing obligation, and
+        # retention metadata become durable as one transaction. Copy delivery
+        # is deliberately attempted only after that commit.
+        await db.commit()
+        delivery_ok = await ach_fee_workflow.deliver_success_fee_agreement_copy(
+            db,
+            profile=profile,
+            requested=requested,
+            result_file=result_file,
+            recipient_email=(
+                link.recipient_email
+                or (intake.email if intake else None)
+                or (client.email if client else None)
+            ),
+            signer_name=payload.typed_name,
+        )
+    else:
+        await profiles.log_profile_action(
+            db,
+            profile,
+            None,
+            "document.signed.application_room",
+            "Client signed an application-room document",
+            target_type="requested_document",
+            target_id=payload.requested_document_id,
+            metadata={"signer": payload.typed_name, "file_id": str(result_file.id)},
+        )
     await db.commit()
     return ApplicationRoomSignResult(
         signed=True,
         certificate_file_id=result_file.id,
-        message="Signed. A copy of the executed document has been emailed to you.",
+        message=(
+            "Signed. Your executed copy is available and has been emailed to you."
+            if requested
+            and requested.signature_kind == "success_fee_agreement"
+            and delivery_ok
+            else "Signed. Your executed copy is available; email delivery needs attention."
+            if requested and requested.signature_kind == "success_fee_agreement"
+            else "Signed. A copy of the executed document has been emailed to you."
+        ),
     )
 
 

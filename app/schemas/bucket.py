@@ -326,6 +326,12 @@ class BucketFileRead(ORMModel):
     source_kind: str | None = None
     source_detail: str | None = None
     source_label: str | None = None
+    retention_class: str | None = None
+    protected_until: datetime | None = None
+    legal_hold: bool = False
+    source_entity_type: str | None = None
+    source_entity_id: UUID | None = None
+    source_immutable_ref: str | None = None
     status: str
     deleted_at: datetime | None = None
     deleted_by_user_id: UUID | None = None

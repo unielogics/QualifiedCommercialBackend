@@ -24,6 +24,7 @@ def _db():
     db = SimpleNamespace(added=[])
     db.add = db.added.append
     db.flush = AsyncMock()
+    db.commit = AsyncMock()
     return db
 
 
@@ -67,6 +68,82 @@ async def test_a_transport_that_raises_still_leaves_the_attempt_on_record():
         out = await outbox.deliver_email(db, _draft(), context="invite")
     assert out.ok is False and "boom" in out.detail
     assert db.added[0].status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_durable_handoff_never_auto_retries_an_uncertain_send():
+    row = SimpleNamespace(
+        status="queued",
+        detail="",
+        provider="",
+        provider_message_id=None,
+        failed_at=None,
+    )
+    db = _db()
+    db.commit = AsyncMock(side_effect=[None, RuntimeError("result commit failed")])
+    with patch(
+        "app.services.email.ses_client.send_email",
+        return_value=SesSendResult(True, "SES-accepted", "sent"),
+    ) as send:
+        with pytest.raises(RuntimeError, match="result commit failed"):
+            await outbox.deliver_email(
+                db,
+                _draft(),
+                context="ach_mandate_proof",
+                recorded_row=row,
+                durable_handoff=True,
+            )
+    send.assert_called_once()
+
+    # A fresh session reloads the last committed pre-handoff state. It must
+    # not call the provider again because the first outcome is unknowable.
+    reloaded = SimpleNamespace(
+        status="sending",
+        detail="provider handoff in progress",
+        provider="",
+        provider_message_id=None,
+        failed_at=None,
+    )
+    retry_db = _db()
+    with patch("app.services.email.ses_client.send_email") as retry_send:
+        retry = await outbox.deliver_email(
+            retry_db,
+            _draft(),
+            context="ach_mandate_proof",
+            recorded_row=reloaded,
+            durable_handoff=True,
+        )
+    assert retry.ok is False
+    assert "fresh audited resend" in retry.detail
+    retry_send.assert_not_called()
+    retry_db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_explicit_durable_resend_uses_a_fresh_attempt_row():
+    fresh = SimpleNamespace(
+        status="queued",
+        detail="",
+        provider="",
+        provider_message_id=None,
+        failed_at=None,
+    )
+    db = _db()
+    with patch(
+        "app.services.email.ses_client.send_email",
+        return_value=SesSendResult(True, "SES-new", "sent"),
+    ) as send:
+        outcome = await outbox.deliver_email(
+            db,
+            _draft(),
+            context="ach_mandate_proof",
+            recorded_row=fresh,
+            durable_handoff=True,
+        )
+    assert outcome.ok is True
+    assert fresh.status == "sent"
+    assert db.commit.await_count == 2
+    send.assert_called_once()
 
 
 @pytest.mark.asyncio

@@ -179,6 +179,7 @@ from app.models.payments import (  # noqa: F401
     FeeObligation,
     FeeObligationLine,
     PaymentAuditEvent,
+    PaymentDebitNotice,
     PaymentFundingSource,
     PaymentInstallment,
     PaymentRefund,

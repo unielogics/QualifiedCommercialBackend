@@ -917,7 +917,9 @@ class DealerDocumentSignRequest(BaseModel):
     requested_document_id: UUID
     typed_name: str = Field(min_length=1, max_length=160)
     esign_consent: bool
-    signature_data_url: str = Field(min_length=1)
+    # Typed-name + E-SIGN is intentionally allowed only for the deal-specific
+    # Success Fee Agreement. Every other signable still requires a drawing.
+    signature_data_url: str | None = Field(default=None, min_length=1)
     applicant_legal_first_name: str | None = Field(default=None, max_length=120)
     applicant_legal_last_name: str | None = Field(default=None, max_length=120)
     applicant_dob: str | None = Field(default=None, max_length=32)
@@ -6662,9 +6664,15 @@ def _read_bucket_object(s3_key: str, *, max_bytes: int | None = None) -> bytes |
             body.close()
 
 
-def _put_bucket_object(s3_key: str, content_type: str, data: bytes) -> None:
+def _put_bucket_object(
+    s3_key: str,
+    content_type: str,
+    data: bytes,
+    *,
+    prevent_overwrite: bool = False,
+) -> str | None:
     bucket, _, kms_key_id = _bucket_storage_config()
-    _s3_client().put_object(
+    params = dict(
         Bucket=bucket,
         Key=s3_key,
         Body=data,
@@ -6672,6 +6680,10 @@ def _put_bucket_object(s3_key: str, content_type: str, data: bytes) -> None:
         ServerSideEncryption="aws:kms",
         SSEKMSKeyId=kms_key_id,
     )
+    if prevent_overwrite:
+        params["IfNoneMatch"] = "*"
+    response = _s3_client().put_object(**params)
+    return response.get("VersionId")
 
 
 def _zip_directory_metadata(raw: bytes) -> tuple[int, int] | None:
@@ -7049,6 +7061,7 @@ async def _sign_requested_document(
     *,
     actor_name: str,
     actor_email: str,
+    allow_success_fee_agreement: bool = False,
 ) -> BucketFile:
     """Generic e-sign fulfillment for a requires_signature BucketRequestedDocument.
     Shared by BOTH the dealer and funding-review public routers — identical
@@ -7059,12 +7072,40 @@ async def _sign_requested_document(
     from app.services import document_signature as sig_service
     from app.services.payment_authorization import client_ip
 
-    req = await db.get(BucketRequestedDocument, payload.requested_document_id)
+    req = (
+        await db.execute(
+            select(BucketRequestedDocument)
+            .where(BucketRequestedDocument.id == payload.requested_document_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
     if req is None or req.bucket_id != intake.bucket_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Requested document not found")
     if not req.requires_signature:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "This requested document does not require a signature")
+    is_success_fee = req.signature_kind == "success_fee_agreement"
+    if is_success_fee and not allow_success_fee_agreement:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Sign this fee agreement from the authenticated application room",
+        )
     if req.status == "uploaded":
+        if is_success_fee:
+            existing_signature = (
+                await db.execute(
+                    select(BucketDocumentSignature)
+                    .where(BucketDocumentSignature.requested_document_id == req.id)
+                    .order_by(BucketDocumentSignature.signed_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            existing_file = (
+                await db.get(BucketFile, existing_signature.result_file_id)
+                if existing_signature and existing_signature.result_file_id
+                else None
+            )
+            if existing_file is not None and existing_file.deleted_at is None:
+                return existing_file
         raise HTTPException(status.HTTP_409_CONFLICT, "This document has already been signed")
     if not payload.esign_consent:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "E-SIGN consent is required")
@@ -7076,7 +7117,9 @@ async def _sign_requested_document(
     if not document_text:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "This requested document has no signable text configured")
     doc_version = (
-        sig_service.CREDIT_AUTHORIZATION_DOCUMENT_VERSION if is_credit_auth else "custom-1"
+        sig_service.CREDIT_AUTHORIZATION_DOCUMENT_VERSION if is_credit_auth
+        else "success-fee-2026-10-06-v1" if is_success_fee
+        else "custom-1"
     )
     doc_hash = sig_service.document_hash(document_text)
 
@@ -7114,8 +7157,37 @@ async def _sign_requested_document(
             ),
         ]
 
-    sig_bytes, sig_hash, sig_content_type = sig_service.decode_signature_data_url(payload.signature_data_url)
-    if not sig_bytes:
+    if is_success_fee:
+        from app.services import ach_fee_workflow
+
+        profile = (
+            await db.execute(
+                select(ApplicationProfile).where(
+                    ApplicationProfile.primary_bucket_id == intake.bucket_id
+                )
+            )
+        ).scalar_one_or_none()
+        if profile is None or not await ach_fee_workflow.prepared_agreement_is_current(
+            db, profile=profile, requested=req
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "The fee agreement is stale; ask QC to prepare a current agreement",
+            )
+        _qc_signature, qc_signature_png = (
+            await ach_fee_workflow.qc_signature_for_prepared_agreement(db, req)
+        )
+    else:
+        qc_signature_png = None
+
+    sig_bytes = b""
+    sig_hash = None
+    sig_content_type = "image/png"
+    if payload.signature_data_url:
+        sig_bytes, sig_hash, sig_content_type = sig_service.decode_signature_data_url(
+            payload.signature_data_url
+        )
+    elif not is_success_fee:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "A drawn signature is required")
 
     now = _now()
@@ -7134,18 +7206,39 @@ async def _sign_requested_document(
     await db.flush()
 
     _, prefix, kms_key_id = _bucket_storage_config()
-    sig_ext = "png" if "png" in sig_content_type else "bin"
-    sig_key = f"{prefix}/signatures/{intake.bucket_id}/{signature.id}/signature.{sig_ext}"
-    _put_bucket_object(sig_key, sig_content_type, sig_bytes)
-    signature.signature_s3_key = sig_key
-    signature.signature_hash = sig_hash
+    if sig_bytes:
+        sig_ext = "png" if "png" in sig_content_type else "bin"
+        sig_key = f"{prefix}/signatures/{intake.bucket_id}/{signature.id}/signature.{sig_ext}"
+        _put_bucket_object(sig_key, sig_content_type, sig_bytes)
+        signature.signature_s3_key = sig_key
+        signature.signature_hash = sig_hash
+    else:
+        signature.signature_hash = hashlib.sha256(
+            "|".join(
+                (
+                    signature.document_hash,
+                    signature.typed_name,
+                    signature.signed_at.isoformat(),
+                    signature.ip_address or "",
+                )
+            ).encode("utf-8")
+        ).hexdigest()
 
     title = "Credit Report Authorization Certificate" if is_credit_auth else f"{req.name} — Signed Certificate"
     pdf_bytes = sig_service.render_signature_certificate_pdf(
-        signature=signature, title=title, document_text=document_text, extra_rows=extra_rows
+        signature=signature,
+        title=title,
+        document_text=document_text,
+        extra_rows=extra_rows,
+        qc_signature_png=qc_signature_png,
     )
     cert_key = f"{prefix}/signatures/{intake.bucket_id}/{signature.id}/certificate.pdf"
-    _put_bucket_object(cert_key, "application/pdf", pdf_bytes)
+    cert_version_id = _put_bucket_object(
+        cert_key,
+        "application/pdf",
+        pdf_bytes,
+        prevent_overwrite=True,
+    )
     signature.certificate_s3_key = cert_key
     signature.certificate_hash = hashlib.sha256(pdf_bytes).hexdigest()
 
@@ -7155,11 +7248,15 @@ async def _sign_requested_document(
         upload_link_id=intake.bucket_upload_link_id,
         file_name=f"{req.name} - Signed Certificate.pdf"[:255],
         s3_key=cert_key,
+        s3_version_id=cert_version_id,
         content_type="application/pdf",
         size_bytes=len(pdf_bytes),
         uploaded_by_name=actor_name,
         uploaded_by_email=actor_email,
+        source_kind="generated",
+        source_detail=("payment_agreement" if is_success_fee else "signed_document"),
         status="uploaded",
+        content_hash=hashlib.sha256(pdf_bytes).hexdigest(),
     )
     db.add(result_file)
     await db.flush()
@@ -7178,10 +7275,11 @@ async def _sign_requested_document(
         target_id=str(req.id),
         detail=req.name,
     )
-    await db.commit()
+    if not is_success_fee:
+        await db.commit()
     await db.refresh(result_file)
 
-    if actor_email:
+    if actor_email and not is_success_fee:
         _send_signed_document_copy_email(
             to_email=actor_email,
             typed_name=actor_name,
@@ -8807,22 +8905,12 @@ async def admin_confirm_lead_deletion(
     """
     _require_intake_operator(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
-    # Preserve the existing retained-record guard for sent/executed packages.
-    from app.models.application_profile import ApplicationProfile as _ProfileForGuard
-    from app.services.production_signing import delete_guard as _production_delete_guard
-
-    _guard_profile = (
-        await db.execute(select(_ProfileForGuard.id).where(_ProfileForGuard.intake_id == intake.id))
-    ).scalar_one_or_none()
-    if _guard_profile is not None:
-        await _production_delete_guard(db, _guard_profile)
     confirm_target = " ".join((intake.business_name or intake.full_name or "").split())
     if payload.confirm_name.casefold() != confirm_target.casefold():
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             "Confirmation name does not match this AI Intake file",
         )
-
     archived_at = _now()
     state = dict(intake.intake_state or {})
     state["_archive"] = {
@@ -8841,7 +8929,9 @@ async def admin_confirm_lead_deletion(
         client_id=intake.client_id,
         loan_id=(
             await db.execute(
-                select(_ProfileForGuard.loan_id).where(_ProfileForGuard.intake_id == intake.id)
+                select(ApplicationProfile.loan_id).where(
+                    ApplicationProfile.intake_id == intake.id
+                )
             )
         ).scalar_one_or_none(),
         payload={

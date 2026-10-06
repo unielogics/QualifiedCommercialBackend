@@ -190,6 +190,8 @@ async def deliver_email(
     template_key: str | None = None,
     subject: Subject | None = None,
     sender_user_id: Any = None,
+    recorded_row: MessageSend | None = None,
+    durable_handoff: bool = False,
 ) -> SendOutcome:
     """Send one email and record it, whatever happens.
 
@@ -199,18 +201,69 @@ async def deliver_email(
     """
     to = (draft.to or "").strip()
     if not to or "@" not in to:
-        row = await record(
-            db, channel="email", status="blocked", draft=draft, context=context,
-            template_key=template_key, detail=f"bad recipient: {draft.to!r}", subject=subject,
-        )
+        row = recorded_row
+        if row is None:
+            row = await record(
+                db, channel="email", status="blocked", draft=draft, context=context,
+                template_key=template_key, detail=f"bad recipient: {draft.to!r}", subject=subject,
+            )
+        else:
+            row.status = "blocked"
+            row.detail = f"bad recipient: {draft.to!r}"[:500]
+            await db.flush()
         return SendOutcome(False, "bad recipient", row=row)
 
     # The row goes in first, so a transport that dies mid-call still leaves
     # evidence that we tried.
-    row = await record(
-        db, channel="email", status="queued", draft=draft, context=context,
-        template_key=template_key, subject=subject,
-    )
+    row = recorded_row
+    if row is None:
+        row = await record(
+            db,
+            channel="email",
+            status="sending" if durable_handoff else "queued",
+            draft=draft,
+            context=context,
+            template_key=template_key, subject=subject,
+        )
+    elif row.status in {"sent", "delivered"}:
+        return SendOutcome(
+            True,
+            row.detail or "already sent",
+            row.provider_message_id,
+            row=row,
+        )
+    elif durable_handoff and row.status in {"sending", "uncertain"}:
+        return SendOutcome(
+            False,
+            "delivery outcome is uncertain; create a fresh audited resend attempt",
+            row.provider_message_id,
+            row=row,
+        )
+    elif durable_handoff and row.status != "queued":
+        return SendOutcome(
+            False,
+            "delivery attempt is closed; create a fresh audited resend attempt",
+            row.provider_message_id,
+            row=row,
+        )
+    else:
+        row.status = "sending" if durable_handoff else "queued"
+        row.detail = (
+            "provider handoff in progress" if durable_handoff else ""
+        )
+        await db.flush()
+
+    if durable_handoff:
+        if row is None:
+            return SendOutcome(
+                False,
+                "durable delivery claim is unavailable",
+                row=None,
+            )
+        # Commit the claim before provider handoff. If the process or the
+        # result commit fails after acceptance, the durable `sending` state
+        # blocks an automatic duplicate; an explicit resend creates a new row.
+        await db.commit()
 
     provider, message_id, provider_thread_id, ok, detail = "ses", None, None, False, ""
     try:
@@ -274,11 +327,15 @@ async def deliver_email(
     if row is not None:
         row.provider = provider
         row.provider_message_id = message_id
-        row.status = "sent" if ok else "failed"
+        row.status = "sent" if ok else (
+            "uncertain" if durable_handoff else "failed"
+        )
         row.detail = (detail or "")[:500]
         if not ok:
             row.failed_at = datetime.now(UTC)
         await db.flush()
+        if durable_handoff:
+            await db.commit()
     return SendOutcome(ok, detail, message_id, provider_thread_id, row)
 
 
