@@ -207,6 +207,27 @@ def start_scheduler() -> None:
         coalesce=True,
         max_instances=1,
     )
+    # Payments jobs consume durable database intents. They no-op while the
+    # feature flag is dark, and they never hold a database row lock while
+    # waiting on Plaid.
+    scheduler.add_job(
+        _wrap(job_payment_dispatch),
+        "interval",
+        seconds=10,
+        id="payment_dispatch",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+    scheduler.add_job(
+        _wrap(job_payment_transfer_sync),
+        "interval",
+        minutes=1,
+        id="payment_transfer_sync",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
     # The financial forms' PDFs, redrawn once the typing stops (0206). Saves
     # queue a deadline 120 seconds out and push it further out on every further
     # edit, so this tick is a no-op for a form somebody is still working in and
@@ -586,6 +607,22 @@ async def job_prospect_email_dispatch() -> None:
     sent = await dispatch_due_drafts()
     if sent:
         log.info("prospect_email_dispatch sent=%d", sent)
+
+
+async def job_payment_dispatch() -> None:
+    from app.services.payment_processing import run_payment_jobs
+
+    result = await run_payment_jobs()
+    if any(result.values()):
+        log.info("payment_dispatch: %s", result)
+
+
+async def job_payment_transfer_sync() -> None:
+    from app.services.payment_processing import sync_payment_transfer_events
+
+    applied = await sync_payment_transfer_events()
+    if applied:
+        log.info("payment_transfer_sync: applied %s event(s)", applied)
 
 
 async def job_archive_stale_booking_drafts() -> None:

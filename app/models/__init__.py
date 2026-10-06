@@ -171,6 +171,23 @@ from app.models.inline_image import InlineImage  # noqa: F401
 from app.models.message_attachment import MessageAttachment  # noqa: F401
 from app.models.notification import Notification  # noqa: F401
 from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile  # noqa: F401
+from app.models.payments import (  # noqa: F401
+    AchMandate,
+    ActualFundingConfirmation,
+    BankDirectFeeReceipt,
+    FeeAllocationVersion,
+    FeeObligation,
+    FeeObligationLine,
+    PaymentAuditEvent,
+    PaymentFundingSource,
+    PaymentInstallment,
+    PaymentRefund,
+    PaymentServicingAuthority,
+    PaymentTransfer,
+    PaymentTransferEvent,
+    PlaidTransferCursor,
+    PrivateFundingPaymentPlan,
+)
 from app.models.prequal_request import PrequalRequest  # noqa: F401
 from app.models.prospect_outreach import (  # noqa: F401
     DealerProspectEmailDraft,

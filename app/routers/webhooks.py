@@ -840,7 +840,7 @@ async def stripe_webhook(request: Request) -> dict[str, bool]:
 
 @router.post("/plaid")
 async def plaid_webhook(request: Request, background_tasks: BackgroundTasks) -> Response:
-    """Plaid item and statement events.
+    """Plaid evidence events and Transfer reconciliation wake-ups.
 
     Verified by signature, not by a URL secret. The body carries an item_id and
     nothing else identifying, so an unverified endpoint would let anyone who
@@ -853,13 +853,27 @@ async def plaid_webhook(request: Request, background_tasks: BackgroundTasks) -> 
     storm with no upside. Genuine rejections (bad signature) return 403.
     """
     from app.dealer_os.services import plaid_client, plaid_webhook
+    from app.services import plaid_transfer
 
     raw = await request.body()
     header = request.headers.get("Plaid-Verification", "")
 
+    # Parse once only to select the credential set used for signature
+    # verification. Nothing in this untrusted payload is acted on until the
+    # ES256 signature, freshness, and raw-body hash all pass.
     try:
-        ok = await plaid_client.verify_webhook(raw, header)
-    except plaid_client.PlaidUnavailable:
+        untrusted_payload = json.loads(raw.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+    is_transfer = str(untrusted_payload.get("webhook_type") or "").upper() == "TRANSFER"
+
+    try:
+        ok = (
+            await plaid_transfer.verify_webhook(raw, header)
+            if is_transfer
+            else await plaid_client.verify_webhook(raw, header)
+        )
+    except (plaid_client.PlaidUnavailable, plaid_transfer.PlaidTransferError):
         # Keys unreachable — we cannot prove this is genuine, so we must not act
         # on it. 503 asks Plaid to retry rather than dropping the event.
         log.warning("plaid webhook: verification key unavailable")
@@ -869,11 +883,20 @@ async def plaid_webhook(request: Request, background_tasks: BackgroundTasks) -> 
         log.warning("plaid webhook: rejected unverified delivery")
         return Response(status_code=status.HTTP_403_FORBIDDEN)
 
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except Exception:  # noqa: BLE001
-        log.warning("plaid webhook: verified but unparseable body")
-        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+    payload = untrusted_payload
+
+    if is_transfer:
+        # Plaid Transfer webhooks intentionally contain no complete transfer
+        # state. They only wake ordered /transfer/event/sync reconciliation.
+        from app.services.payment_processing import sync_payment_transfer_events
+
+        background_tasks.add_task(sync_payment_transfer_events)
+        log.info(
+            "plaid webhook: %s/%s -> transfer event sync queued",
+            payload.get("webhook_type"),
+            payload.get("webhook_code"),
+        )
+        return Response(status_code=status.HTTP_200_OK)
 
     async with SessionLocal() as db:
         outcome = await plaid_webhook.handle(db, payload)

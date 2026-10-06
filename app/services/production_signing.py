@@ -371,6 +371,8 @@ async def send(
     comparison: dict[str, Any] | None = None
     if stage == 2:
         funding = await _stage_two_gates(db, access, arrangement, attestation)
+        # Persist the attestation in the frozen revision. Payments may consume
+        # it only after this exact stage-two package becomes fully executed.
         source = await db.get(ProductionPackageRevision, package.source_revision_id) if package.source_revision_id else None
         if source is not None:
             original = {"package_id": str(package.parent_package_id), "revision_id": str(source.id), "revision_no": source.revision_no,
@@ -1125,6 +1127,26 @@ async def _assemble_execution(
     if stage == 1:
         await pkgs.revoke_all_share_links(db, package, actor) if actor else None
     await db.flush()
+    if stage == 2 and revision.funding:
+        from app.schemas.payments import FundingConfirmationCreate
+        from app.services import payments as payment_service
+
+        funding_actor = actor or SimpleNamespace(id=package.sent_by_user_id)
+        await payment_service.confirm_actual_funding(
+            db,
+            profile=profile,
+            payload=FundingConfirmationCreate(
+                actual_funding_date=revision.funding["actual_funding_date"],
+                actual_funded_amount=revision.funding["amount_funded"],
+                funding_party_name=revision.funding["funding_party_name"],
+                funding_reference=revision.funding.get("funding_reference"),
+                note=revision.funding.get("note"),
+                production_package_id=package.id,
+                source="production_attestation",
+            ),
+            actor=funding_actor,
+            trusted_production_attestation=True,
+        )
     await profiles.log_profile_action(
         db, profile, actor, "production_package.executed" if stage == 1 else "production_package.final_executed",
         f"{revision.document_title} fully executed",

@@ -97,6 +97,14 @@ class Settings(BaseSettings):
     stripe_secret_key: str = ""
     stripe_publishable_key: str = ""
     stripe_webhook_secret: str = ""
+    # ACH money movement ships dark. Historical payment reads remain
+    # available when disabled, while obligation creation, authorization,
+    # release, retries, and refunds fail closed at the API boundary.
+    payments_enabled: bool = False
+    # Refunds are a separate outgoing movement. Keep them dark until the
+    # production return/refund simulation and reconciliation policy pass.
+    payment_refunds_enabled: bool = False
+    private_funding_payments_enabled: bool = False
     primary_super_admin_email: str = "franco@qualifiedcommercial.com"
     primary_super_admin_emails: str = ""
 
