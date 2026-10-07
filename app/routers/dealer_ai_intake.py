@@ -131,7 +131,10 @@ from app.services.dealer_partner_access import (
 )
 from app.services.email.ses_client import send_email, send_raw_email
 from app.services.email.user_mailer import send_as_user
-from app.services.foreclosure_rescue import FORECLOSURE_RESCUE_VARIANT
+from app.services.foreclosure_rescue import (
+    FORECLOSURE_RESCUE_VARIANT,
+    is_above_published_program_max,
+)
 from app.services.intake_chat_actions import (
     actions_for_messages,
     execute_room_action,
@@ -4308,6 +4311,15 @@ def _apply_updates(intake: PublicUnderwritingIntake, updates: DealerIntakePatch 
     if "asset_rows" in data:
         intake.asset_rows = [row.model_dump() if isinstance(row, DealerAssetRow) else row for row in updates.asset_rows or []]
     state = dict(intake.intake_state or {})
+    if intake.variant == FORECLOSURE_RESCUE_VARIANT and "requested_loan_amount" in data:
+        above_published_program_max = is_above_published_program_max(data["requested_loan_amount"] or 0)
+        rescue_details = dict(state.get("foreclosure_rescue") or {})
+        rescue_details["requested_loan_amount"] = data["requested_loan_amount"]
+        rescue_details["above_published_program_max"] = above_published_program_max
+        rescue_details["request_classification"] = (
+            "custom_high_dollar_review" if above_published_program_max else "published_program"
+        )
+        state["foreclosure_rescue"] = rescue_details
     if "entity_structure" in data:
         state["entity_structure"] = updates.entity_structure.model_dump() if updates.entity_structure else {}
     state["last_updates"] = data
@@ -4318,6 +4330,12 @@ def _apply_updates(intake: PublicUnderwritingIntake, updates: DealerIntakePatch 
     # across the variant-normalization migration.
     context_fn = _context_fn_for(intake)
     intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **context_fn(intake)}
+    if intake.variant == FORECLOSURE_RESCUE_VARIANT and "requested_loan_amount" in data:
+        intake.bucket.ai_context = {
+            **(intake.bucket.ai_context or {}),
+            "above_published_program_max": rescue_details["above_published_program_max"],
+            "request_classification": rescue_details["request_classification"],
+        }
 
 
 async def _log_dealer_update_events(

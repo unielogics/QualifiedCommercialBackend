@@ -11,6 +11,7 @@ NOTE_RATE_PCT = Decimal("12.99")
 TERM_MONTHS = 24
 AMORTIZATION_MONTHS = 480
 MAX_LTV_PCT = Decimal("75")
+MAX_PUBLISHED_LOAN_AMOUNT = Decimal("1500000")
 PROCEEDS_POLICY = "payoff_only"
 
 
@@ -22,15 +23,23 @@ def program_terms() -> dict[str, str | int | float]:
         "term_months": TERM_MONTHS,
         "amortization_months": AMORTIZATION_MONTHS,
         "max_ltv_pct": float(MAX_LTV_PCT),
+        "max_loan_amount": float(MAX_PUBLISHED_LOAN_AMOUNT),
         "proceeds_policy": PROCEEDS_POLICY,
     }
 
 
+def is_above_published_program_max(requested_amount: Decimal | float | str) -> bool:
+    """Return whether a request needs custom review outside the published program."""
+
+    return Decimal(str(requested_amount)) > MAX_PUBLISHED_LOAN_AMOUNT
+
+
 def maximum_rescue_amount(estimated_market_value: Decimal | float | str) -> Decimal:
-    """Preliminary collateral ceiling before file-specific underwriting adjustments."""
+    """Lower of the published program cap and preliminary collateral ceiling."""
 
     value = Decimal(str(estimated_market_value))
-    return (value * MAX_LTV_PCT / Decimal("100")).quantize(Decimal("0.01"))
+    collateral_ceiling = value * MAX_LTV_PCT / Decimal("100")
+    return min(collateral_ceiling, MAX_PUBLISHED_LOAN_AMOUNT).quantize(Decimal("0.01"))
 
 
 def minimum_value_for_payoff(payoff_amount: Decimal | float | str) -> Decimal:

@@ -7,18 +7,22 @@ from pydantic import ValidationError
 from app.routers.foreclosure_rescue import (
     ForeclosureRescueIntakeCreate,
     RescueDocumentStatusUpdate,
+    RescueTermSheetIssue,
     operator_router,
     partner_router,
 )
 from app.services.foreclosure_rescue import (
     AMORTIZATION_MONTHS,
     MAX_LTV_PCT,
+    MAX_PUBLISHED_LOAN_AMOUNT,
     NOTE_RATE_PCT,
     TERM_MONTHS,
     balloon_balance,
+    is_above_published_program_max,
     maximum_rescue_amount,
     minimum_value_for_payoff,
     monthly_principal_and_interest,
+    program_terms,
     urgency_for,
     validate_term_sheet_note_rate,
 )
@@ -60,13 +64,25 @@ def test_program_terms_and_amortization_fixture():
     assert TERM_MONTHS == 24
     assert AMORTIZATION_MONTHS == 480
     assert MAX_LTV_PCT == Decimal("75")
+    assert MAX_PUBLISHED_LOAN_AMOUNT == Decimal("1500000")
+    assert program_terms()["max_loan_amount"] == 1_500_000
     assert maximum_rescue_amount(2_000_000) == Decimal("1500000.00")
+    assert maximum_rescue_amount(4_000_000) == Decimal("1500000.00")
     assert minimum_value_for_payoff(1_500_000) == Decimal("2000000.00")
     assert monthly_principal_and_interest(1_000_000) == Decimal("10887.01")
     assert balloon_balance(1_000_000) == Decimal("998310.99")
     validate_term_sheet_note_rate("12.99")
     with pytest.raises(ValueError):
         validate_term_sheet_note_rate("13.00")
+
+
+def test_published_program_cap_routes_larger_requests_to_custom_review():
+    assert is_above_published_program_max(1_500_000) is False
+    assert is_above_published_program_max(1_500_000.01) is True
+    assert _intake(requested_loan_amount=2_000_000).requested_loan_amount == 2_000_000
+    assert RescueTermSheetIssue(approved_amount=1_500_000).approved_amount == 1_500_000
+    with pytest.raises(ValidationError):
+        RescueTermSheetIssue(approved_amount=1_500_000.01)
 
 
 def test_urgency_bands_and_missing_date_warning():

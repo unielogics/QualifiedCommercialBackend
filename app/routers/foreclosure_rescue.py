@@ -40,10 +40,12 @@ from app.services.foreclosure_rescue import (
     FORECLOSURE_RESCUE_VARIANT,
     INITIAL_REVIEW_DOCUMENTS,
     MAX_LTV_PCT,
+    MAX_PUBLISHED_LOAN_AMOUNT,
     NOTE_RATE_PCT,
     PROCEEDS_POLICY,
     STATUS_LABELS,
     TERM_MONTHS,
+    is_above_published_program_max,
     program_terms,
     urgency_for,
 )
@@ -231,7 +233,7 @@ class ProfessionalPartnerDecision(BaseModel):
 
 
 class RescueTermSheetIssue(BaseModel):
-    approved_amount: float = Field(gt=0)
+    approved_amount: float = Field(gt=0, le=float(MAX_PUBLISHED_LOAN_AMOUNT))
     conditions: list[str] = Field(default_factory=list, max_length=50)
 
 
@@ -265,6 +267,9 @@ class ForeclosureRescueRead(BaseModel):
     estimated_market_value: float
     calculated_ltv_pct: float
     requested_loan_amount: float
+    request_classification: str
+    above_published_program_max: bool
+    published_program_max: float
     submitter_type: str
     submitter_name: str
     submitter_email: str
@@ -351,6 +356,13 @@ def _read(intake: PublicUnderwritingIntake) -> ForeclosureRescueRead:
         estimated_market_value=value,
         calculated_ltv_pct=round((payoff / value) * 100, 2) if value else 0,
         requested_loan_amount=float(intake.requested_loan_amount or 0),
+        request_classification=(
+            "custom_high_dollar_review"
+            if is_above_published_program_max(intake.requested_loan_amount or 0)
+            else "published_program"
+        ),
+        above_published_program_max=is_above_published_program_max(intake.requested_loan_amount or 0),
+        published_program_max=float(MAX_PUBLISHED_LOAN_AMOUNT),
         submitter_type=str(details.get("submitter_type") or "owner_direct"),
         submitter_name=intake.full_name,
         submitter_email=intake.email,
@@ -412,6 +424,8 @@ async def _create_foreclosure_rescue(
         else matching_user if matching_user and matching_user.role == Role.PROFESSIONAL_REFERRAL_PARTNER else None
     )
     owner = actor or await primary_super_admin(db)
+    above_published_program_max = is_above_published_program_max(payload.requested_loan_amount)
+    request_classification = "custom_high_dollar_review" if above_published_program_max else "published_program"
     bucket = Bucket(
         name=f"{payload.holding_entity} Foreclosure Rescue",
         bucket_type="commercial_foreclosure_rescue",
@@ -425,7 +439,10 @@ async def _create_foreclosure_rescue(
             "term_months": TERM_MONTHS,
             "amortization_months": AMORTIZATION_MONTHS,
             "max_ltv_pct": float(MAX_LTV_PCT),
+            "max_loan_amount": float(MAX_PUBLISHED_LOAN_AMOUNT),
             "proceeds_policy": PROCEEDS_POLICY,
+            "request_classification": request_classification,
+            "above_published_program_max": above_published_program_max,
             "client_contact_suppressed": payload.submitter_type != "owner_direct",
         },
         created_by_id=owner.id if owner else None,
@@ -470,6 +487,8 @@ async def _create_foreclosure_rescue(
     token = _new_public_token()
     rescue_details = payload.model_dump(mode="json")
     rescue_details["client_email"] = str(payload.client_email) if payload.client_email else None
+    rescue_details["request_classification"] = request_classification
+    rescue_details["above_published_program_max"] = above_published_program_max
     if actor is not None:
         for acknowledgment in ("authority_attested", "owner_contact_consent", "terms_accepted", "privacy_accepted"):
             rescue_details.pop(acknowledgment, None)
@@ -520,7 +539,15 @@ async def _create_foreclosure_rescue(
         intake,
         actor or partner_user,
         "foreclosure_rescue_created",
-        "Internal foreclosure rescue file created" if actor else "Five-minute foreclosure rescue intake submitted",
+        (
+            "Internal custom high-dollar foreclosure review created"
+            if actor and above_published_program_max
+            else "Custom high-dollar foreclosure review submitted"
+            if above_published_program_max
+            else "Internal foreclosure rescue file created"
+            if actor
+            else "Five-minute foreclosure rescue intake submitted"
+        ),
     )
     await db.commit()
     if send_resume_email:
