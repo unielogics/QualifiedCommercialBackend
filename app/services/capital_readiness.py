@@ -430,7 +430,7 @@ async def _current_evidence_sources(
         return {}, {}
 
     analyses = list(
-        
+        (
             await db.execute(
                 select(BucketFileAnalysis)
                 .join(BucketFile, BucketFile.id == BucketFileAnalysis.bucket_file_id)
@@ -447,9 +447,9 @@ async def _current_evidence_sources(
                     BucketFileAnalysis.id.desc(),
                 )
             )
-            .scalars()
-            .all()
-        
+        )
+        .scalars()
+        .all()
     )
     newest: dict[UUID, BucketFileAnalysis] = {}
     for analysis in analyses:

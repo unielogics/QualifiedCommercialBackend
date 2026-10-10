@@ -16,6 +16,7 @@ from app.models.capital_readiness import (
 )
 from app.schemas.capital_readiness import FinancialPeriodCreate
 from app.services.capital_readiness import (
+    _current_evidence_sources,
     _policy_lineage,
     aggregate_period_window,
     build_ai_context,
@@ -368,6 +369,44 @@ def test_current_evidence_filter_preserves_history_but_excludes_stale_sources() 
         files=files,  # type: ignore[arg-type]
         newest_analyses=analyses,  # type: ignore[arg-type]
     ) == [manual, current]
+
+
+@pytest.mark.asyncio
+async def test_current_evidence_sources_awaits_async_session_result() -> None:
+    """Keep the production AsyncSession coroutine boundary under regression test."""
+
+    file_id = uuid4()
+    bucket_id = uuid4()
+    analysis_id = uuid4()
+    file_row = SimpleNamespace(id=file_id, content_hash="a" * 64)
+    analysis_row = SimpleNamespace(id=analysis_id, bucket_file_id=file_id)
+
+    class CoroutineExecuteSession:
+        def __init__(self) -> None:
+            self._results = iter(
+                [
+                    SimpleNamespace(
+                        scalars=lambda: SimpleNamespace(all=lambda: [file_row])
+                    ),
+                    SimpleNamespace(
+                        scalars=lambda: SimpleNamespace(all=lambda: [analysis_row])
+                    ),
+                ]
+            )
+
+        async def execute(self, _statement: object) -> object:
+            return next(self._results)
+
+    files, analyses = await _current_evidence_sources(
+        CoroutineExecuteSession(),  # type: ignore[arg-type]
+        SimpleNamespace(  # type: ignore[arg-type]
+            primary_bucket_id=bucket_id,
+            intake_id=None,
+        ),
+    )
+
+    assert files == {file_id: file_row}
+    assert analyses == {file_id: analysis_row}
 
 
 def test_monthly_window_stops_at_first_gap() -> None:
