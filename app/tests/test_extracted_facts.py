@@ -116,6 +116,7 @@ async def test_review_accepts_one_canonical_field_and_supersedes_its_siblings() 
     db = SimpleNamespace(
         execute=AsyncMock(return_value=result),
         commit=AsyncMock(),
+        flush=AsyncMock(),
         refresh=AsyncMock(),
     )
     user = SimpleNamespace(id=uuid4(), role=Role.SUPER_ADMIN)
@@ -129,6 +130,10 @@ async def test_review_accepts_one_canonical_field_and_supersedes_its_siblings() 
             "app.routers.application_profiles.profiles.log_profile_action",
             AsyncMock(),
         ) as log_action,
+        patch(
+            "app.routers.application_profiles.capital_readiness.advisory_recompute_profiles",
+            AsyncMock(),
+        ) as readiness_recompute,
     ):
         response = await review_extracted_fact(
             profile.id,
@@ -148,8 +153,10 @@ async def test_review_accepts_one_canonical_field_and_supersedes_its_siblings() 
     assert profile.extraction_reviewed_at is None
     assert all(row.reviewed_by_user_id == user.id for row in rows[:3])
     db.commit.assert_awaited_once()
+    db.flush.assert_awaited_once()
     db.refresh.assert_any_await(profile, with_for_update=True)
     log_action.assert_awaited_once()
+    readiness_recompute.assert_awaited_once()
 
 
 @pytest.mark.asyncio

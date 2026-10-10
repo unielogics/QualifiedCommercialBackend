@@ -145,6 +145,8 @@ def test_spanish_instruction_composes_with_main_street():
     prompt = ai.build_chat_system(MAIN_STREET, client_language="es")
     assert "operating business" in prompt
     assert "Spanish" in prompt
+    assert "reply in English" not in prompt
+    assert "saved file language is authoritative" in prompt
 
 
 def test_main_street_classification_tokens_are_in_both_enums():

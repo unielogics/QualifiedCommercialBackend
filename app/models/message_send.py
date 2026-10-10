@@ -55,6 +55,9 @@ class MessageSend(Base):
     direction: Mapped[str] = mapped_column(String(16), nullable=False, default="outbound")
     context: Mapped[str] = mapped_column(String(48), nullable=False, default="")
     template_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    artifact_locale: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="en", server_default="en"
+    )
 
     to_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     to_phone: Mapped[str | None] = mapped_column(String(48), nullable=True)

@@ -87,6 +87,7 @@ from app.models.dealer_prospect import DealerProspect, DealerProspectStageDefini
 from app.models.google_account import GoogleAccount
 from app.schemas.booking_settings import UserBookingSettingsUpdate
 from app.services import application_profiles as application_profile_service
+from app.services import capital_readiness as capital_readiness_service
 from app.services import inline_images
 from app.services import calendar_v2
 from app.services.activity_log import log_activity
@@ -14953,6 +14954,23 @@ async def _build_lender_package(db: AsyncSession, dealer: DealerBusiness) -> Len
         .scalars()
         .all()
     )
+    application_profile = (
+        await db.execute(
+            select(ApplicationProfile)
+            .where(ApplicationProfile.dealer_id == dealer.id)
+            .order_by(
+                ApplicationProfile.updated_at.desc(),
+                ApplicationProfile.created_at.desc(),
+                ApplicationProfile.id.desc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    readiness_snapshot = (
+        await capital_readiness_service.latest_snapshot(db, application_profile.id)
+        if application_profile is not None
+        else None
+    )
 
     forecast: ForecastRead | None = None
     paths: PathsRead | None = None
@@ -14982,6 +15000,13 @@ async def _build_lender_package(db: AsyncSession, dealer: DealerBusiness) -> Len
         plan=[PlanActionRead.model_validate(a) for a in plan],
         forecast=forecast,
         paths=paths,
+        capital_readiness=(
+            capital_readiness_service.read_snapshot(
+                readiness_snapshot, client_safe=True
+            ).model_dump(mode="json")
+            if readiness_snapshot is not None
+            else None
+        ),
     )
 
 

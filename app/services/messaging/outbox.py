@@ -94,6 +94,7 @@ class Draft:
     from_name: str | None = None
     reply_to: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
+    artifact_locale: str = "en"
     #: Credentials this message carries — the token or PIN the caller just
     #: minted. Declared secrets are removed by exact match, which is the only
     #: layer that cannot miss.
@@ -139,6 +140,11 @@ async def record(
             direction="outbound",
             context=(context or "")[:48],
             template_key=(template_key or None),
+            artifact_locale=(
+                draft.artifact_locale
+                if draft is not None and draft.artifact_locale in {"en", "es"}
+                else "en"
+            ),
             to_email=(draft.to[:320] if draft else None),
             to_phone=to_phone,
             from_email=((draft.from_email or "")[:320] or None) if draft else None,

@@ -39,6 +39,8 @@ from app.routers import (
     brokers,
     buckets,
     calendar,
+    capital_readiness,
+    capital_readiness_policies,
     client_access,
     clients,
     closing_costs,
@@ -257,6 +259,8 @@ for r in [
     application_offer_deliveries.router,
     application_communications.router,
     application_terms.router,
+    capital_readiness.router,
+    capital_readiness_policies.router,
     application_profiles.router,
     merchant_offers.router,
     production_packages.link_router,  # before the package router: /link/{token} is not a package id

@@ -523,6 +523,10 @@ class DealEconomicsSnapshot(BaseModel):
     origination_fee_cents: int = 0
     gross_fee_cents: int = 0
     estimated_close_date: date | None = None
+    qc_fee_cap_percent: Decimal | None = None
+    qc_fee_review_required: bool = False
+    qc_fee_review_reason: str | None = None
+    fee_label: str = "QC origination/success fee"
 
 
 class FeeAllocationResponse(BaseModel):

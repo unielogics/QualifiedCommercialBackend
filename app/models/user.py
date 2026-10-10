@@ -27,6 +27,7 @@ class User(TimestampMixin, Base):
             "account_status IN ('active', 'suspended')",
             name="ck_users_account_status",
         ),
+        CheckConstraint("ui_locale IN ('en', 'es')", name="ck_users_ui_locale"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -41,6 +42,10 @@ class User(TimestampMixin, Base):
     # had nowhere to read one from: it lives in Clerk, which we never read.
     phone: Mapped[str | None] = mapped_column(String(40), nullable=True)
     title: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # Personal application chrome language. Never drives client communications.
+    ui_locale: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="en", server_default="en"
+    )
     role: Mapped[Role] = mapped_column(String(32), nullable=False, default=Role.CLIENT)
     # Additional console entry points for operator identities. ``role`` remains
     # the primary permission profile; these values add narrowly scoped access.

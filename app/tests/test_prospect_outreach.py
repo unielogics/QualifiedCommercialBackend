@@ -2995,6 +2995,37 @@ def test_seeded_outreach_profiles_are_versioned_and_render_type_specific_copy(mo
     assert "industries/business" in footer
     assert "Unsubscribe from Business Desk email:" in footer
 
+    spanish_fallback = outreach._purpose_fallback(
+        purpose="information",
+        contact_name="Alex Morgan",
+        dealer_name="Panadería Morgan",
+        profile=main_street,
+        artifact_locale="es",
+    )
+    assert spanish_fallback.subject.startswith("Opciones de financiamiento")
+    assert "Hola Alex" in spanish_fallback.body
+    assert "business-focused" not in spanish_fallback.body
+    spanish_programs = outreach._approved_program_section(
+        [{"name": "SBA 7(a)", "is_specialized": False}],
+        profile=main_street,
+        artifact_locale="es",
+    )
+    assert "Programas que podemos analizar:" in spanish_programs
+    assert "Availability and terms" not in spanish_programs
+    spanish_footer = outreach._locked_footer(
+        signature=["Alex Rep"],
+        attachment_names=["Guía.pdf"],
+        unsubscribe_url="https://api.qualifiedcommercial.com/unsubscribe/token",
+        booking_url="https://app.qualifiedcommercial.com/book/alex-rep",
+        profile=main_street,
+        artifact_locale="es",
+    )
+    assert "Más información:" in spanish_footer
+    assert "Reserve una cita:" in spanish_footer
+    assert "Documentos adjuntos para referencia:" in spanish_footer
+    assert "Cancelar la suscripción" in spanish_footer
+    assert "This is a commercial message" not in spanish_footer
+
 
 def test_outreach_profile_patch_requires_https_and_known_template_placeholders():
     with pytest.raises(ValidationError, match="absolute HTTPS"):

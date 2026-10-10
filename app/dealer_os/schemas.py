@@ -1985,6 +1985,7 @@ class LenderPackageRead(BaseModel):
     plan: list[PlanActionRead] = []
     forecast: ForecastRead | None = None
     paths: PathsRead | None = None
+    capital_readiness: dict | None = None
 
 
 # --- Stream 7: document ingestion --------------------------------------------

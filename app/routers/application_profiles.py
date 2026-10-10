@@ -161,10 +161,12 @@ from app.services import (
     bucket_ai,
     business_statement_schema,
     business_statements,
+    capital_readiness,
     dealer_forms_pdf,
     drafted_forms,
     file_events,
     financial_statements,
+    funding_programs,
     locked_file_requests,
     merchant_processing,
     missing_item_automation,
@@ -667,7 +669,9 @@ def _underwriting_read(
     *,
     source_kind: str | None = None,
     source_id: UUID | None = None,
+    fee_cap_review: dict[str, object] | None = None,
 ) -> ApplicationUnderwritingRead:
+    fee_cap_review = fee_cap_review or {}
     earnings = calculate_deal_earnings(
         accepted_amount=profile.underwriting_accepted_amount,
         origination_points=profile.forecast_fee_points,
@@ -694,6 +698,10 @@ def _underwriting_read(
         forecast_origination_earnings=optional_float(earnings.origination_earnings),
         forecast_earnings=optional_float(earnings.total),
         estimated_close_date=profile.estimated_close_date,
+        qc_fee_cap_percent=fee_cap_review.get("qc_fee_cap_percent"),  # type: ignore[arg-type]
+        qc_fee_review_required=bool(fee_cap_review.get("review_required")),
+        qc_fee_review_reason=fee_cap_review.get("reason"),  # type: ignore[arg-type]
+        fee_label=str(fee_cap_review.get("fee_label") or "QC origination/success fee"),
         updated_by_user_id=profile.underwriting_updated_by_user_id,
         updated_at=profile.underwriting_updated_at,
     )
@@ -820,6 +828,11 @@ async def patch_application_use_of_funds(
     require_editor(user)
     profile = await profiles.load_profile(db, profile_id, user)
     result = await update_budget(db, profile, payload, user)
+    await capital_readiness.advisory_recompute_profiles(
+        db,
+        [profile],
+        event_key=f"use-of-funds:{profile.id}:{profile.use_of_funds_revision}",
+    )
     await db.commit()
     return result
 
@@ -832,7 +845,8 @@ async def get_application_underwriting(
 ) -> ApplicationUnderwritingRead:
     _require_underwriting_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
-    return _underwriting_read(profile)
+    fee_cap_review = await funding_programs.qc_fee_cap_review_for_profile(db, profile)
+    return _underwriting_read(profile, fee_cap_review=fee_cap_review)
 
 
 @router.patch("/{profile_id}/underwriting", response_model=ApplicationUnderwritingRead)
@@ -846,11 +860,22 @@ async def update_application_underwriting(
     profile = await profiles.load_profile(db, profile_id, user)
     changes = payload.model_dump(exclude_unset=True)
     if not changes:
-        return _underwriting_read(profile)
+        fee_cap_review = await funding_programs.qc_fee_cap_review_for_profile(db, profile)
+        return _underwriting_read(profile, fee_cap_review=fee_cap_review)
     await apply_underwriting_changes(db, profile, user, changes)
     # Validate the exact response before committing. A response-model error
     # must never report failure after the lifecycle change already persisted.
-    result = _underwriting_read(profile)
+    fee_cap_review = await funding_programs.qc_fee_cap_review_for_profile(db, profile)
+    result = _underwriting_read(profile, fee_cap_review=fee_cap_review)
+    if "current_dscr" in changes:
+        await capital_readiness.advisory_recompute_profiles(
+            db,
+            [profile],
+            event_key=(
+                f"underwriting-dscr:{profile.id}:"
+                f"{profile.underwriting_updated_at.isoformat()}"
+            ),
+        )
     await db.commit()
     return result
 
@@ -866,6 +891,10 @@ async def apply_underwriting_changes(
     if "origination_fee_points" in changes:
         alias_value = changes.pop("origination_fee_points")
         changes.setdefault("forecast_fee_points", alias_value)
+    if changes.get("forecast_fee_points") is not None:
+        await funding_programs.enforce_qc_fee_cap_for_profile(
+            db, profile, changes["forecast_fee_points"]
+        )
     status_value = changes.get("underwriting_status")
     if status_value is not None:
         profile.underwriting_status = status_value
@@ -2060,6 +2089,12 @@ async def review_extracted_fact(
             "resolved_suggestion_count": len(resolved),
         },
     )
+    await db.flush()
+    await capital_readiness.advisory_recompute_profiles(
+        db,
+        [profile],
+        event_key=f"fact-review:{fact.id}:{requested_status}:{reviewed_at.isoformat()}",
+    )
     await db.commit()
     await db.refresh(fact)
     return _extracted_fact_read(fact)
@@ -2795,10 +2830,21 @@ async def _application_room_state(
         pass
     else:
         payment_agreements_visible = True
+    readiness_snapshot = await capital_readiness.latest_snapshot(db, profile.id)
     return ApplicationRoomState(
         profile_id=profile.id,
         business_name=_business_label(profile, intake, client),
         room_url=_room_url(link),
+        communication_locale=(
+            profile.communication_locale
+            if profile.communication_locale in {"en", "es"}
+            else "en"
+        ),
+        capital_readiness=(
+            capital_readiness.read_snapshot(readiness_snapshot, client_safe=True)
+            if readiness_snapshot is not None
+            else None
+        ),
         capabilities=["documents", "ownership", "owner_credit", "business_banking", "agreements"],
         owners=[profiles.owner_read(owner) for owner in owner_rows],
         verification=verification,
@@ -2847,6 +2893,11 @@ async def public_application_room_update_use_of_funds(
         db, profile,
         UseOfFundsPatch(items=payload.items, expected_revision=payload.expected_revision),
         room_link=link,
+    )
+    await capital_readiness.advisory_recompute_profiles(
+        db,
+        [profile],
+        event_key=f"use-of-funds:{profile.id}:{profile.use_of_funds_revision}",
     )
     await db.commit()
     return budget.model_copy(update={"updated_by_user_id": None})

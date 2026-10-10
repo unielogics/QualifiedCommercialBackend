@@ -64,6 +64,10 @@ class ApplicationProfile(TimestampMixin, Base):
             "forecast_consulting_fee IS NULL OR forecast_consulting_fee >= 0",
             name="ck_application_profiles_forecast_consulting_fee",
         ),
+        CheckConstraint(
+            "communication_locale IN ('en', 'es')",
+            name="ck_application_profiles_communication_locale",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -88,6 +92,21 @@ class ApplicationProfile(TimestampMixin, Base):
     primary_bucket_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="SET NULL")
     )
+    # File-scoped client language. This is deliberately independent from an
+    # operator's UI locale and must be snapshotted by generated artifacts.
+    communication_locale: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="en", server_default="en"
+    )
+    communication_locale_source: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="system_default", server_default="system_default"
+    )
+    communication_locale_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    communication_locale_updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    self_reported_readiness_diagnostic: Mapped[dict | None] = mapped_column(JSONB)
     # The company on the file: the agent's referral partner company, derived
     # from the agent's link unless the desk set it (company_set_by_user_id).
     # The house row is never a company on a file. See services/file_team.py.

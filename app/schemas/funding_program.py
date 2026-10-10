@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
@@ -53,6 +53,56 @@ class FundingProgramVersionRead(BaseModel):
     published_at: datetime | None = None
 
 
+class FundingProgramCommercialTermsRead(BaseModel):
+    id: UUID
+    version: int
+    status: Literal["draft", "published", "retired"]
+    minimum_amount: float | None = None
+    maximum_amount: float | None = None
+    minimum_term_months: int | None = None
+    maximum_term_months: int | None = None
+    pricing_basis: Literal["apr", "interest_rate", "factor_rate", "file_specific"] | None = None
+    minimum_pricing: float | None = None
+    maximum_pricing: float | None = None
+    qc_fee_cap_percent: float | None = None
+    qc_fee_default_percent: float | None = None
+    disclosures: list[str] = Field(default_factory=list)
+    source_reference: str | None = None
+    effective_date: date | None = None
+    published_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class FundingProgramCommercialTermsCreate(BaseModel):
+    reason: str | None = Field(default=None, max_length=2000)
+    minimum_amount: float | None = Field(default=None, ge=0)
+    maximum_amount: float | None = Field(default=None, ge=0)
+    minimum_term_months: int | None = Field(default=None, ge=1, le=600)
+    maximum_term_months: int | None = Field(default=None, ge=1, le=600)
+    pricing_basis: Literal["apr", "interest_rate", "factor_rate", "file_specific"] | None = None
+    minimum_pricing: float | None = Field(default=None, ge=0)
+    maximum_pricing: float | None = Field(default=None, ge=0)
+    qc_fee_cap_percent: float | None = Field(default=None, ge=0, le=100)
+    qc_fee_default_percent: float | None = Field(default=None, ge=0, le=100)
+    disclosures: list[str] = Field(default_factory=list, max_length=20)
+    source_reference: str | None = Field(default=None, max_length=1000)
+    effective_date: date | None = None
+    confirmed: Literal[True]
+
+    @model_validator(mode="after")
+    def _ordered_ranges(self):
+        if self.minimum_amount is not None and self.maximum_amount is not None and self.minimum_amount > self.maximum_amount:
+            raise ValueError("minimum_amount cannot exceed maximum_amount")
+        if self.minimum_term_months is not None and self.maximum_term_months is not None and self.minimum_term_months > self.maximum_term_months:
+            raise ValueError("minimum_term_months cannot exceed maximum_term_months")
+        if self.minimum_pricing is not None and self.maximum_pricing is not None and self.minimum_pricing > self.maximum_pricing:
+            raise ValueError("minimum_pricing cannot exceed maximum_pricing")
+        if self.qc_fee_cap_percent is not None and self.qc_fee_default_percent is not None and self.qc_fee_default_percent > self.qc_fee_cap_percent:
+            raise ValueError("QC fee default cannot exceed the published cap")
+        return self
+
+
 class FundingProgramCatalogItem(BaseModel):
     id: UUID
     program_key: str
@@ -65,6 +115,8 @@ class FundingProgramCatalogItem(BaseModel):
     scopes: list[FundingProgramScopeRead] = Field(default_factory=list)
     published_version: FundingProgramVersionRead | None = None
     draft_versions: list[FundingProgramVersionRead] = Field(default_factory=list)
+    published_commercial_terms: FundingProgramCommercialTermsRead | None = None
+    draft_commercial_terms: list[FundingProgramCommercialTermsRead] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
@@ -76,6 +128,7 @@ class PublicFundingProgramCatalogItem(BaseModel):
     short_description: str | None = None
     display_order: int
     verticals: list[Literal["real_estate", "dealer", "main_street", "mca"]]
+    commercial_terms: FundingProgramCommercialTermsRead | None = None
 
 
 class FundingProgramScopeWrite(BaseModel):

@@ -15,12 +15,13 @@ import struct
 import time
 import zipfile
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, with_loader_criteria
@@ -98,6 +99,7 @@ from app.schemas.bucket import (
     IntakeChatActionRead,
     IntakeChatActionResult,
 )
+from app.schemas.capital_readiness import CapitalReadinessRead
 from app.schemas.common import ORMModel
 from app.schemas.phone import OptionalPhone, RequiredPhone
 from app.services import application_profiles as profiles_service
@@ -112,6 +114,7 @@ from app.services import (
     provenance,
     upload_validation,
 )
+from app.services import capital_readiness as capital_readiness_service
 from app.services.ai import engagement
 from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import json_safe_metadata, tracked_messages_create
@@ -464,6 +467,112 @@ class PublicIntakeAttribution(BaseModel):
         return str(value).strip() if value is not None and str(value).strip() else None
 
 
+class CapitalReadinessDiagnosticAnswers(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    business_type: Literal["dealer", "main_street", "real_estate", ""] = Field(
+        default="", alias="businessType"
+    )
+    years: Literal["under_1", "one_two", "over_2", ""] = ""
+    revenue: str = Field(default="", max_length=40)
+    gross_profit: str = Field(default="", alias="grossProfit", max_length=40)
+    net_income: str = Field(default="", alias="netIncome", max_length=40)
+    revenue_trend: Literal["growing", "stable", "uneven", "declining", ""] = Field(
+        default="", alias="revenueTrend"
+    )
+    debt_burden: Literal[
+        "under_10", "ten_twenty", "twenty_thirty", "over_30", ""
+    ] = Field(default="", alias="debtBurden")
+    cash_runway: Literal["under_1", "one_two", "two_three", "over_3", ""] = Field(
+        default="", alias="cashRunway"
+    )
+    credit: Literal["strong", "fair", "rebuilding", "unknown", ""] = ""
+    records: Literal["current", "partial", "behind", ""] = ""
+    banking_behavior: Literal["clean", "occasional", "frequent", "unknown", ""] = Field(
+        default="", alias="bankingBehavior"
+    )
+    collateral: Literal["strong", "some", "none", "unknown", ""] = ""
+    funding_purpose: Literal[
+        "working_capital",
+        "equipment",
+        "acquisition",
+        "real_estate",
+        "debt_refinance",
+        "mca_refinance",
+        "other",
+        "",
+    ] = Field(default="", alias="fundingPurpose")
+    property_debt_service: str = Field(default="", alias="propertyDebtService", max_length=40)
+    occupancy: str = Field(default="", max_length=40)
+
+    @field_validator(
+        "revenue",
+        "gross_profit",
+        "net_income",
+        "property_debt_service",
+        "occupancy",
+    )
+    @classmethod
+    def finite_numeric_string_or_blank(cls, value: str) -> str:
+        normalized = str(value).strip().replace(",", "").replace("$", "")
+        if not normalized:
+            return ""
+        try:
+            number = Decimal(normalized)
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("Enter a valid numeric amount") from exc
+        if not number.is_finite():
+            raise ValueError("Enter a finite numeric amount")
+        return normalized
+
+
+class CapitalReadinessDiagnosticResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    band: Literal["insufficient", "ready_soon", "three_six", "six_twelve", "one_plus"]
+    score: float | None = Field(default=None, ge=0, le=100, allow_inf_nan=False)
+    coverage: float = Field(ge=0, le=100, allow_inf_nan=False)
+    grossMargin: float | None = Field(default=None, allow_inf_nan=False)
+    netMargin: float | None = Field(default=None, allow_inf_nan=False)
+    propertyDscr: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    occupancy: float | None = Field(default=None, ge=0, le=100, allow_inf_nan=False)
+
+
+class CapitalReadinessDiagnostic(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1]
+    source: Literal["capital_readiness_diagnostic"]
+    verification_status: Literal["self_reported_unverified"]
+    locale: Literal["en", "es"]
+    answers: CapitalReadinessDiagnosticAnswers
+    result: CapitalReadinessDiagnosticResult
+
+
+class CapitalReadinessClaimRequest(BaseModel):
+    """Consent-bound handoff from the public diagnostic after authentication."""
+
+    idempotency_key: UUID
+    capital_readiness_diagnostic: CapitalReadinessDiagnostic
+    business_name: str = Field(min_length=1, max_length=180)
+    phone: RequiredPhone
+    full_name: str | None = Field(default=None, max_length=180)
+    industry: str = Field(default="other", max_length=64)
+    intent: str | None = Field(default=None, max_length=64)
+    terms_accepted: bool
+    privacy_accepted: bool
+    terms_version: str = Field(default=TERMS_VERSION, max_length=32)
+    privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
+
+
+class CapitalReadinessClaimResponse(BaseModel):
+    intake_id: UUID
+    profile_id: UUID
+    created: bool
+    communication_locale: Literal["en", "es"]
+    readiness: CapitalReadinessRead
+
+
 class DealerIntakeStart(PublicIntakeAttribution):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
@@ -474,6 +583,7 @@ class DealerIntakeStart(PublicIntakeAttribution):
     terms_version: str = Field(default=TERMS_VERSION, max_length=32)
     privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
     preferred_language: Language = Language.EN
+    capital_readiness_diagnostic: CapitalReadinessDiagnostic | None = None
 
     @field_validator("business_name", "phone", mode="before")
     @classmethod
@@ -497,6 +607,7 @@ class FundingReviewStart(PublicIntakeAttribution):
     terms_version: str = Field(default=TERMS_VERSION, max_length=32)
     privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
     preferred_language: Language = Language.EN
+    capital_readiness_diagnostic: CapitalReadinessDiagnostic | None = None
 
     @field_validator("phone", "investor_name", "target_property_address", "transaction_type", "estimated_credit_tier", mode="before")
     @classmethod
@@ -548,6 +659,7 @@ class AdminLeadCreate(BaseModel):
     notify_client: bool = False  # email the client a secure resume/login link now
     force_new: bool = False  # create a second lead even if one already exists for this email
     preferred_language: Language = Language.EN
+    capital_readiness_diagnostic: CapitalReadinessDiagnostic | None = None
     # Optionally assign the file to a dealer partner at creation, so the team's
     # first message on it reaches that partner's channel. Must be a dealer_partner.
     broker_user_id: UUID | None = None
@@ -1224,6 +1336,8 @@ async def _secure_room_handoff(
 
 class DealerIntakeResponse(BaseModel):
     intake: DealerIntakeRead
+    communication_locale: Literal["en", "es"] = "en"
+    capital_readiness: CapitalReadinessRead | None = None
     # Set while the desk has taken the conversation over: the room shows the
     # underwriter is replying instead of rendering assistant_message as an AI turn.
     ai_paused_until: datetime | None = None
@@ -6358,6 +6472,24 @@ async def _response(
     room_delivery_status: str | None = None,
     room_delivery_detail: str | None = None,
 ) -> DealerIntakeResponse:
+    # Read-only hydration only: opening/resuming an intake must never create a
+    # profile or a new financial interpretation as a side effect.
+    readiness_profile = (
+        await db.execute(
+            select(ApplicationProfile)
+            .where(ApplicationProfile.intake_id == intake.id)
+            .order_by(
+                ApplicationProfile.updated_at.desc(),
+                ApplicationProfile.created_at.desc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    readiness_snapshot = (
+        await capital_readiness_service.latest_snapshot(db, readiness_profile.id)
+        if readiness_profile is not None
+        else None
+    )
     review = intake.latest_review if intake.latest_review else None
     latest_result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
     widget = prequalification_widget
@@ -6478,6 +6610,22 @@ async def _response(
     )
     return DealerIntakeResponse(
         intake=intake_read,
+        communication_locale=(
+            readiness_profile.communication_locale
+            if readiness_profile is not None
+            and readiness_profile.communication_locale in {"en", "es"}
+            else getattr(intake.preferred_language, "value", intake.preferred_language)
+            if getattr(intake.preferred_language, "value", intake.preferred_language)
+            in {"en", "es"}
+            else "en"
+        ),
+        capital_readiness=(
+            capital_readiness_service.read_snapshot(
+                readiness_snapshot, client_safe=not include_management
+            )
+            if readiness_snapshot is not None
+            else None
+        ),
         ai_paused_until=_link.ai_paused_until if _link is not None and engagement.is_paused(_link) else None,
         token=token,
         session_token=session_token,
@@ -7662,6 +7810,15 @@ async def start_dealer_intake(
         intake_state={
             "messages": [],
             "source": "dealer_ai_intake",
+            **(
+                {
+                    "capital_readiness_diagnostic": payload.capital_readiness_diagnostic.model_dump(
+                        mode="json", by_alias=True
+                    )
+                }
+                if payload.capital_readiness_diagnostic
+                else {}
+            ),
             **({"signup_attribution": attribution} if attribution else {}),
             "legal_acceptance": {
                 "terms_accepted": payload.terms_accepted,
@@ -9108,6 +9265,23 @@ async def update_lead_language(
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     intake.preferred_language = payload.preferred_language
+    linked_profile = (
+        await db.execute(
+            select(ApplicationProfile)
+            .where(ApplicationProfile.intake_id == intake.id)
+            .order_by(
+                ApplicationProfile.updated_at.desc(),
+                ApplicationProfile.created_at.desc(),
+                ApplicationProfile.id.desc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if linked_profile is not None:
+        linked_profile.communication_locale = payload.preferred_language.value
+        linked_profile.communication_locale_source = "staff_selection"
+        linked_profile.communication_locale_updated_at = _now()
+        linked_profile.communication_locale_updated_by_user_id = user.id
     await _log(
         db, intake.bucket_id, "dealer_ai_lead_language_changed", request=request, user=user,
         target_type="public_underwriting_intake", target_id=str(intake.id), detail=payload.preferred_language,
@@ -9204,14 +9378,15 @@ async def _create_admin_ai_lead_core(
                 },
             )
 
+    actor_is_client = user.role == Role.CLIENT
     provenance = {
-        "created_by_admin": {
+        ("created_by_client" if actor_is_client else "created_by_admin"): {
             "user_id": str(user.id),
             "name": user.name,
             "email": user.email,
             "at": _now().isoformat(),
         },
-        "on_behalf_of_client": True,
+        "on_behalf_of_client": not actor_is_client,
     }
 
     if is_re:
@@ -9276,7 +9451,7 @@ async def _create_admin_ai_lead_core(
         )
 
     # CRM traceability: mark that this client/lead originated from an admin action.
-    if isinstance(client.lead_intake, dict):
+    if not actor_is_client and isinstance(client.lead_intake, dict):
         client.lead_intake = {**client.lead_intake, "created_by_admin": str(user.id)}
 
     token = _new_public_token()
@@ -9300,6 +9475,10 @@ async def _create_admin_ai_lead_core(
             "intent": ms_intent,
             "industry": ms_industry,
         }
+    if payload.capital_readiness_diagnostic is not None:
+        intake_state["capital_readiness_diagnostic"] = (
+            payload.capital_readiness_diagnostic.model_dump(mode="json", by_alias=True)
+        )
     if is_re:
         intake_state["funding_review_basics"] = {
             "investor_name": payload.investor_name,
@@ -9351,13 +9530,25 @@ async def _create_admin_ai_lead_core(
     await _log(
         db,
         bucket.id,
-        "dealer_ai_lead_created_by_admin",
+        "capital_readiness_claim_created"
+        if actor_is_client
+        else "dealer_ai_lead_created_by_admin",
         request=request,
         user=user,
-        actor_role="super_admin" if user.role == Role.SUPER_ADMIN else "underwriter",
+        actor_role=(
+            "client"
+            if actor_is_client
+            else "super_admin"
+            if user.role == Role.SUPER_ADMIN
+            else "underwriter"
+        ),
         target_type="public_underwriting_intake",
         target_id=str(intake.id),
-        detail=f"Admin created {payload.variant} lead for {intake.email}",
+        detail=(
+            f"Client claimed a Capital Readiness diagnostic for {intake.email}"
+            if actor_is_client
+            else f"Admin created {payload.variant} lead for {intake.email}"
+        ),
     )
     welcome_text = _admin_created_welcome(variant_const)
     db.add(_persist_admin_welcome_message(bucket.id, welcome_text))
@@ -12521,6 +12712,174 @@ async def book_dealer_call(
     )
 
 
+@client_router.post(
+    "/capital-readiness/claim",
+    response_model=CapitalReadinessClaimResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def claim_capital_readiness_diagnostic(
+    payload: CapitalReadinessClaimRequest,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> CapitalReadinessClaimResponse:
+    """Create one real Main Street intake from a consented public diagnostic.
+
+    The browser-computed result is retained only as self-reported evidence. It
+    never becomes the canonical score; the readiness engine recalculates from
+    the typed answers and gives them lower confidence until reviewed evidence
+    arrives.
+    """
+
+    if user.role != Role.CLIENT:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Client account required")
+    if not payload.terms_accepted or not payload.privacy_accepted:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Terms and Privacy Policy acceptance is required.",
+        )
+    diagnostic = payload.capital_readiness_diagnostic
+    if diagnostic.answers.business_type != "main_street":
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "This claim endpoint accepts Main Street diagnostics only.",
+        )
+    # A client row may not exist yet for invited/legacy accounts.  Lock the
+    # durable parent first so two first-use claim requests cannot both observe
+    # no Client and race the unique clients.user_id constraint.
+    locked_user = (
+        await db.execute(select(User).where(User.id == user.id).with_for_update())
+    ).scalar_one()
+    client = (
+        await db.execute(
+            select(Client).where(Client.user_id == user.id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if client is None:
+        client = Client(
+            user_id=user.id,
+            name=(
+                payload.full_name
+                or locked_user.name
+                or locked_user.email.split("@", 1)[0]
+            ).strip(),
+            email=locked_user.email.lower(),
+            phone=payload.phone,
+            language="Spanish" if diagnostic.locale == "es" else "English",
+            referral_source="capital_readiness_diagnostic",
+        )
+        db.add(client)
+        await db.flush()
+
+    claim_hash = hashlib.sha256(
+        json.dumps(
+            payload.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    existing_rows = list(
+        (
+            await db.execute(
+                select(PublicUnderwritingIntake)
+                .where(
+                    PublicUnderwritingIntake.client_id == client.id,
+                    PublicUnderwritingIntake.variant == MAIN_STREET_VARIANT,
+                )
+                .order_by(PublicUnderwritingIntake.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for existing in existing_rows:
+        claim = (existing.intake_state or {}).get("capital_readiness_claim") or {}
+        if claim.get("idempotency_key") != str(payload.idempotency_key):
+            continue
+        if claim.get("request_hash") != claim_hash:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "That idempotency key was already used with different answers.",
+            )
+        profile = await profiles_service.provision_profile_for_intake(db, existing)
+        snapshot = await capital_readiness_service.recompute(
+            db,
+            profile,
+            idempotency_key=f"claim:{payload.idempotency_key}",
+            expected_snapshot_version=None,
+        )
+        await db.commit()
+        return CapitalReadinessClaimResponse(
+            intake_id=existing.id,
+            profile_id=profile.id,
+            created=False,
+            communication_locale=profile.communication_locale,
+            readiness=capital_readiness_service.read_snapshot(
+                snapshot, client_safe=True
+            ),
+        )
+
+    purpose = diagnostic.answers.funding_purpose
+    intent = payload.intent or {
+        "working_capital": "working_capital",
+        "equipment": "equipment",
+        "debt_refinance": "refinance_debt",
+        "mca_refinance": "refinance_debt",
+    }.get(purpose, "not_sure")
+    create_payload = AdminLeadCreate(
+        variant="main_street",
+        full_name=(payload.full_name or locked_user.name or client.name).strip(),
+        email=client.email or locked_user.email,
+        phone=payload.phone,
+        business_name=payload.business_name,
+        industry=payload.industry,
+        intent=intent,
+        preferred_language=Language(diagnostic.locale),
+        capital_readiness_diagnostic=diagnostic,
+        secure_room_pin=_generate_passcode(),
+        notify_client=False,
+        force_new=False,
+    )
+    created_response = await _create_admin_ai_lead_core(
+        create_payload,
+        request=request,
+        user=user,
+        db=db,
+        commit=False,
+        client_override=client,
+    )
+    intake = await db.get(PublicUnderwritingIntake, created_response.intake.id)
+    if intake is None:  # pragma: no cover - defensive transactional invariant
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Intake creation failed")
+    state = dict(intake.intake_state or {})
+    state["capital_readiness_claim"] = {
+        "idempotency_key": str(payload.idempotency_key),
+        "request_hash": claim_hash,
+        "consented_at": _now().isoformat(),
+        "user_id": str(user.id),
+        "terms_version": payload.terms_version,
+        "privacy_version": payload.privacy_version,
+    }
+    intake.intake_state = state
+    intake.source_kind = "client_capital_readiness"
+    intake.source_detail = "Consented Capital Readiness diagnostic"
+    profile = await profiles_service.provision_profile_for_intake(db, intake)
+    snapshot = await capital_readiness_service.recompute(
+        db,
+        profile,
+        idempotency_key=f"claim:{payload.idempotency_key}",
+        expected_snapshot_version=None,
+    )
+    await db.commit()
+    return CapitalReadinessClaimResponse(
+        intake_id=intake.id,
+        profile_id=profile.id,
+        created=True,
+        communication_locale=profile.communication_locale,
+        readiness=capital_readiness_service.read_snapshot(snapshot, client_safe=True),
+    )
+
+
 @client_router.get("", response_model=list[DealerIntakeRead])
 async def list_my_dealer_intakes(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> list[DealerIntakeRead]:
     if user.role != Role.CLIENT or user.client is None:
@@ -12841,6 +13200,15 @@ async def start_funding_review(
         intake_state={
             "messages": [],
             "source": "funding_review",
+            **(
+                {
+                    "capital_readiness_diagnostic": payload.capital_readiness_diagnostic.model_dump(
+                        mode="json", by_alias=True
+                    )
+                }
+                if payload.capital_readiness_diagnostic
+                else {}
+            ),
             **({"signup_attribution": attribution} if attribution else {}),
             "funding_review_basics": basics,
             "legal_acceptance": {

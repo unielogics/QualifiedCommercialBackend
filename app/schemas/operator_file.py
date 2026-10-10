@@ -155,6 +155,14 @@ class UnifiedFileRow(BaseModel):
     forecast_earnings: float | None = None
     estimated_close_date: date | None = None
     approved_dscr: float | None = None
+    capital_readiness: dict | None = None
+    capital_readiness_score: float | None = None
+    capital_readiness_band: str | None = None
+    capital_readiness_review_status: str | None = None
+    capital_readiness_evidence_coverage_pct: float | None = None
+    capital_readiness_confidence_pct: float | None = None
+    capital_readiness_top_blocker: str | None = None
+    capital_readiness_as_of: datetime | None = None
     can_move_pipeline: bool = False
     allowed_transitions: list[UnderwritingLifecycleStatus] = Field(default_factory=list)
     health: str
@@ -349,6 +357,10 @@ class UnifiedFileEconomicsRead(BaseModel):
     forecast_amount_basis: Literal["requested", "approved", "funded"] | None = None
     forecast_earnings: float | None = None
     estimated_close_date: date | None = None
+    qc_fee_cap_percent: float | None = None
+    qc_fee_review_required: bool = False
+    qc_fee_review_reason: str | None = None
+    fee_label: str = "QC origination/success fee"
     updated_at: datetime | None = None
 
 

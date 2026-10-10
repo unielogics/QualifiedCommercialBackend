@@ -33,6 +33,7 @@ from app.models.bucket import (
     BucketRequestedDocument,
     BucketUploadLink,
 )
+from app.models.capital_readiness import ApplicationCapitalReadinessSnapshot
 from app.models.client import Client
 from app.models.client_ai_plan import ClientAIPlan
 from app.models.funding_program import (
@@ -123,6 +124,28 @@ def _float(value: Any) -> float | None:
         return float(str(value).replace("$", "").replace(",", "").replace("x", "").strip())
     except (TypeError, ValueError):
         return None
+
+
+def reviewed_profitability_facts(snapshot: ApplicationCapitalReadinessSnapshot | None) -> dict[str, float | None]:
+    """Only QC-reviewed source periods can drive an explicit program rule.
+
+    These values never become implicit eligibility criteria. A program must
+    publish a rule using them; educational/self-reported readiness is excluded.
+    """
+    result: dict[str, float | None] = {"gross_margin_pct": None, "net_margin_pct": None}
+    if snapshot is None or snapshot.review_status not in {"confirmed", "revised"}:
+        return result
+    for metric in snapshot.metrics or []:
+        if metric.get("key") not in result or metric.get("status") == "unavailable":
+            continue
+        source = metric.get("source") or {}
+        reviews = source.get("review_statuses")
+        if source.get("verification_status") == "self_reported_unverified" or source.get("needs_reconciliation_review") or source.get("not_applicable"):
+            continue
+        if not reviews or any(review != "confirmed" for review in reviews):
+            continue
+        result[metric["key"]] = _float(metric.get("value"))
+    return result
 
 
 def _deep_values(value: Any, wanted_keys: set[str]) -> list[Any]:
@@ -377,7 +400,16 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
             ApplicationTaxonomyEntry.code == str(profile.naics_code).strip(),
             ApplicationTaxonomyEntry.status.in_(["official", "approved"]),
         ).limit(1))).scalar_one_or_none() is not None
+    readiness_snapshot = (
+        await db.execute(
+            select(ApplicationCapitalReadinessSnapshot)
+            .where(ApplicationCapitalReadinessSnapshot.profile_id == profile.id)
+            .order_by(ApplicationCapitalReadinessSnapshot.snapshot_version.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
     return {
+        **reviewed_profitability_facts(readiness_snapshot),
         "vertical": profile.vertical,
         "intake_variant": intake.variant if intake else None,
         "intent": stated_intent if profile.vertical == "main_street" else None,
@@ -585,9 +617,18 @@ def _context_field(context: dict[str, Any], field: str) -> Any:
 
 
 async def published_candidates(
-    db: AsyncSession, profile: ApplicationProfile
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    *,
+    readiness_metric_overrides: dict[str, float | None] | None = None,
 ) -> list[ProgramFitCandidate]:
     context = await profile_fit_context(db, profile)
+    # Recalculation can evaluate the current source facts before inserting the
+    # next snapshot. Only these two explicit, reviewed margin fields can be
+    # overridden; neither a score nor arbitrary context comes from the caller.
+    if readiness_metric_overrides is not None:
+        for key in ("gross_margin_pct", "net_margin_pct"):
+            context[key] = readiness_metric_overrides.get(key)
     intent_outside_lending = context.get("intent_kind") in {"non_lending", "route_out"}
 
     catalog = await program_catalog.catalog_rows(db)

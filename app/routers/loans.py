@@ -3,26 +3,35 @@
 Recalc is the hot path for the desktop HUD sim and mobile Simulator slider.
 """
 
+# FastAPI dependency injection intentionally uses callable defaults.
+# ruff: noqa: B008
+
 from __future__ import annotations
 
 import logging
 import secrets
+from datetime import UTC
 from uuid import UUID
-
-log = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.deps import CurrentUser, GatedUser
-from app.enums import AmortizationStyle, LoanStage, LoanType, LoanPurpose, MessageFrom, PropertyType, Role
+from app.enums import (
+    AmortizationStyle,
+    LoanPurpose,
+    LoanStage,
+    LoanType,
+    PropertyType,
+    Role,
+)
 from app.models.activity import Activity
+from app.models.app_settings import AppSettings
+from app.models.application_profile import ApplicationProfile
 from app.models.loan import Loan
-from app.models.message import Message
-from app.scoping import scope_loan_query
 from app.schemas.activity import ActivityRead
 from app.schemas.document import (
     DocumentCustomCreate,
@@ -31,21 +40,34 @@ from app.schemas.document import (
     WorkflowDocRead,
     WorkflowRunResult,
 )
-from app.schemas.loan import FreeCalcRequest, LoanCreate, LoanRead, LoanUpdate, PropertyUpdate, RecalcRequest, RecalcResponse, SizingBreakdown, StageTransition, TodoItemRead
-from app.models.app_settings import AppSettings
+from app.schemas.loan import (
+    FreeCalcRequest,
+    LoanCreate,
+    LoanRead,
+    LoanUpdate,
+    PropertyUpdate,
+    RecalcRequest,
+    RecalcResponse,
+    SizingBreakdown,
+    StageTransition,
+    TodoItemRead,
+)
+from app.scoping import scope_loan_query
 from app.services import calendar_emitter, file_events, upload_validation
 from app.services.activity_log import mark_loan_dirty
 from app.services.ai.vector_store import log_event as vector_log
+from app.services.email.parser import inject_deal_id
+from app.services.hud_template import build_hud_draft
 from app.services.lender_connect import (
     LenderConnectError,
     NotifyToggle,
     connect_lender,
     disconnect_lender,
 )
+from app.services.lender_matrix import validate_loan
 from app.services.lender_send import LenderSendError, draft_lender_send
 from app.services.lender_thread import (
     LenderThreadError,
-    ReplyMode,
     load_entry_audit,
     load_thread,
     post_reply,
@@ -53,14 +75,13 @@ from app.services.lender_thread import (
     summarize_thread,
 )
 from app.services.loan_intake_automation import kickoff_loan
-from app.services.email.parser import inject_deal_id
-from app.services.hud_template import build_hud_draft
-from app.services.lender_matrix import validate_loan
-from app.services.math import compute_loan_amount, dscr as dscr_calc
-from app.services.math import monthly_payment, pricing_quote
-from app.services.math.cash_to_close import borrower_equity_required, total_cash_to_close as compute_total_cash_to_close
+from app.services.math import compute_loan_amount, monthly_payment, pricing_quote
+from app.services.math import dscr as dscr_calc
+from app.services.math.cash_to_close import borrower_equity_required
+from app.services.math.cash_to_close import total_cash_to_close as compute_total_cash_to_close
 from app.services.math.sizing import SizingResult
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/loans", tags=["loans"])
 
 
@@ -80,9 +101,6 @@ async def list_loans(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> l
     owner reference in its header without an extra round-trip per row."""
     from sqlalchemy.orm import selectinload
 
-    from app.models.broker import Broker
-    from app.models.client import Client as _Client
-
     stmt = _scope_query(
         user,
         select(Loan)
@@ -93,6 +111,28 @@ async def list_loans(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> l
         .order_by(Loan.created_at.desc()),
     )
     rows = (await db.execute(stmt)).scalars().all()
+    profiles_by_loan: dict[UUID, UUID | None] = {}
+    if rows:
+        loan_ids = [row.id for row in rows]
+        intake_ids = [row.source_intake_id for row in rows if row.source_intake_id]
+        deal_ids = [row.source_deal_id for row in rows if row.source_deal_id]
+        profile_clauses = [ApplicationProfile.loan_id.in_(loan_ids)]
+        if intake_ids:
+            profile_clauses.append(ApplicationProfile.intake_id.in_(intake_ids))
+        if deal_ids:
+            profile_clauses.append(ApplicationProfile.deal_id.in_(deal_ids))
+        existing_profiles = (
+            await db.execute(select(ApplicationProfile).where(or_(*profile_clauses)))
+        ).scalars().all()
+        direct = {profile.loan_id: profile.id for profile in existing_profiles if profile.loan_id}
+        by_intake = {profile.intake_id: profile.id for profile in existing_profiles if profile.intake_id}
+        by_deal = {profile.deal_id: profile.id for profile in existing_profiles if profile.deal_id}
+        profiles_by_loan = {
+            row.id: direct.get(row.id)
+            or (by_intake.get(row.source_intake_id) if row.source_intake_id else None)
+            or (by_deal.get(row.source_deal_id) if row.source_deal_id else None)
+            for row in rows
+        }
     out: list[LoanRead] = []
     for r in rows:
         d = LoanRead.model_validate(r).model_dump()
@@ -102,6 +142,7 @@ async def list_loans(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> l
         d["broker_name"] = getattr(broker_obj, "display_name", None) if broker_obj else None
         d["client_name"] = getattr(client_obj, "name", None) if client_obj else None
         d["client_fico"] = getattr(client_obj, "fico", None) if client_obj else None
+        d["application_profile_id"] = profiles_by_loan.get(r.id)
         out.append(LoanRead.model_validate(d))
     return out
 
@@ -112,7 +153,26 @@ async def get_loan(loan_id: UUID, user: CurrentUser, db: AsyncSession = Depends(
     row = (await db.execute(stmt)).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
-    return LoanRead.model_validate(row)
+    profile_clauses = [ApplicationProfile.loan_id == row.id]
+    if row.source_intake_id:
+        profile_clauses.append(ApplicationProfile.intake_id == row.source_intake_id)
+    if row.source_deal_id:
+        profile_clauses.append(ApplicationProfile.deal_id == row.source_deal_id)
+    profile_id = (
+        await db.execute(
+            select(ApplicationProfile.id)
+            .where(or_(*profile_clauses))
+            .order_by(
+                (ApplicationProfile.loan_id == row.id).desc(),
+                ApplicationProfile.updated_at.desc(),
+                ApplicationProfile.id.desc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    payload = LoanRead.model_validate(row).model_dump()
+    payload["application_profile_id"] = profile_id
+    return LoanRead.model_validate(payload)
 
 
 @router.get("/{loan_id}/required-documents", response_model=list[RequiredDocumentRead])
@@ -226,7 +286,6 @@ async def list_loan_todo(
       - "all"                → both
     """
     from datetime import datetime as _dt
-    from datetime import timezone as _tz
 
     from app.enums import (
         AITaskStatus as _TaskStatus,
@@ -290,7 +349,7 @@ async def list_loan_todo(
 
     # Calls on THIS loan, audience-scoped (clients never see AI-source
     # or other clients' events — enforced by _scope_calendar_for_audience).
-    now = _dt.now(_tz.utc)
+    now = _dt.now(UTC)
     cal_where = [_Cal.loan_id == loan_id, _Cal.kind == _CalKind.CALL]
     if sf == "pending":
         cal_where += [_Cal.status != _CalStatus.DONE, _Cal.starts_at >= now]
@@ -1210,7 +1269,7 @@ class LenderThreadEntryRead(BaseModel):
     to_email: str | None = None
     # Round-4: committed attachments on this entry. Empty list when
     # there are none; download_urls are short-lived (1h).
-    attachments: list["LenderThreadAttachmentRead"] = []
+    attachments: list[LenderThreadAttachmentRead] = []
 
 
 class GmailPayloadRead(BaseModel):

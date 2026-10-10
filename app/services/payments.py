@@ -78,7 +78,7 @@ from app.schemas.payments import (
     ServicingAuthorityCreate,
     ServicingAuthorityResponse,
 )
-from app.services import notifications
+from app.services import funding_programs, notifications
 from app.services import production_term_structure as term_structure
 from app.services.deal_economics import calculate_deal_earnings
 
@@ -1191,11 +1191,21 @@ async def create_fee_obligation(
     actor: User,
 ) -> FeeObligation:
     await _lock_profile(db, profile.id)
+    fee_cap_review = await funding_programs.enforce_qc_fee_cap_for_profile(
+        db, profile, profile.forecast_fee_points
+    )
     existing = await current_obligation(db, profile.id, for_update=True)
     if existing and existing.status in {"processing", "partially_collected", "collected"}:
         raise HTTPException(status.HTTP_409_CONFLICT, "A collected or processing obligation cannot be replaced")
 
-    economics = economics_snapshot(profile)
+    economics = economics_snapshot(profile).model_copy(
+        update={
+            "qc_fee_cap_percent": fee_cap_review["qc_fee_cap_percent"],
+            "qc_fee_review_required": fee_cap_review["review_required"],
+            "qc_fee_review_reason": fee_cap_review["reason"],
+            "fee_label": fee_cap_review["fee_label"],
+        }
+    )
     full_origination_cents = economics.origination_fee_cents
     full_consulting_cents = _cents(economics.consulting_fee)
     origination_cents = full_origination_cents if payload.include_origination_fee else 0
@@ -1845,6 +1855,13 @@ async def fee_obligation_snapshot_blockers(
     if profile is None:
         blockers.append("Application file is unavailable")
     else:
+        cap_review = await funding_programs.qc_fee_cap_review_for_profile(
+            db, profile, proposed_points=obligation.origination_points
+        )
+        if obligation.origination_fee_cents and cap_review["review_required"]:
+            blockers.append(
+                "QC origination/success fee exceeds the published program cap; review and replace the fee obligation"
+            )
         current = economics_snapshot(profile)
         if obligation.origination_fee_cents and (
             _cents(obligation.accepted_amount) != _cents(current.accepted_amount)
@@ -4252,7 +4269,13 @@ async def build_summary(
     profile: ApplicationProfile,
     permissions: PaymentPermissions,
 ) -> PaymentSummary:
-    economics = economics_snapshot(profile)
+    cap_review = await funding_programs.qc_fee_cap_review_for_profile(db, profile)
+    economics = economics_snapshot(profile).model_copy(update={
+        "qc_fee_cap_percent": cap_review["qc_fee_cap_percent"],
+        "qc_fee_review_required": cap_review["review_required"],
+        "qc_fee_review_reason": cap_review["reason"],
+        "fee_label": cap_review["fee_label"],
+    })
     agreement_candidates = await agreement_document_candidates(db, profile)
     authorization_delivery = (
         await db.execute(

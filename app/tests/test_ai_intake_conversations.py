@@ -84,6 +84,7 @@ async def test_private_underwriter_context_includes_selected_linked_evidence(mon
     db = AsyncMock()
     db.execute = AsyncMock(
         return_value=SimpleNamespace(
+            scalar_one_or_none=lambda: None,
             scalars=lambda: SimpleNamespace(all=lambda: []),
         )
     )

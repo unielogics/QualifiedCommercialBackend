@@ -128,8 +128,14 @@ from app.schemas.bucket import (
     IntakeChatActionResult,
 )
 from app.services import application_profiles as profiles
+from app.services import (
+    capital_readiness,
+    file_events,
+    locked_file_requests,
+    provenance,
+    upload_validation,
+)
 from app.services import clerk as clerk_service
-from app.services import file_events, locked_file_requests, provenance, upload_validation
 from app.services.ai import engagement
 from app.services.bucket_ai import (
     CHAT_TURN_ORDER,
@@ -2558,6 +2564,13 @@ async def delete_admin_file(
         target_id=str(file.id),
         detail=f"{file.file_name} | storage={file.delete_storage_status}",
     )
+    await db.flush()
+    affected_profiles = await profiles.affected_profiles_for_file(db, file)
+    await capital_readiness.advisory_recompute_profiles(
+        db,
+        affected_profiles,
+        event_key=f"file-deleted:{file.id}:{file.deleted_at.isoformat()}",
+    )
     await db.commit()
 
 
@@ -2622,6 +2635,13 @@ async def restore_admin_file(
         target_type="file",
         target_id=str(file.id),
         detail=f"{file.file_name} | storage={prior_storage_status}",
+    )
+    await db.flush()
+    affected_profiles = await profiles.affected_profiles_for_file(db, file)
+    await capital_readiness.advisory_recompute_profiles(
+        db,
+        affected_profiles,
+        event_key=f"file-restored:{file.id}:{file.updated_at.isoformat()}",
     )
     await db.commit()
     await db.refresh(file)

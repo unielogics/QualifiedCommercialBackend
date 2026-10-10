@@ -13,15 +13,16 @@ every screen, so this router projects them into one normalized file shape.
 from __future__ import annotations
 
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from math import isfinite
 from typing import Any
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import false as sql_false
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -38,6 +39,7 @@ from app.models.bucket import (
     BucketRequestedDocument,
     BucketVendorAccess,
 )
+from app.models.capital_readiness import ApplicationCapitalReadinessSnapshot
 from app.models.client import Client
 from app.models.deal import Deal
 from app.models.loan import Loan
@@ -75,7 +77,7 @@ from app.schemas.operator_file import (
 )
 from app.scoping import regional_manager_broker_ids_subquery, scope_client_query, scope_loan_query
 from app.services import application_profiles as profiles
-from app.services import file_events
+from app.services import capital_readiness, file_events, funding_programs
 from app.services.activity_log import log_activity, mark_loan_dirty
 from app.services.deal_economics import calculate_deal_earnings, optional_float
 from app.services.dealer_partner_access import (
@@ -1133,6 +1135,40 @@ async def _decorate_pipeline_state(
     db: AsyncSession,
 ) -> None:
     profile_map = await _profile_map_for_rows(rows, db)
+    profile_ids = {profile.id for profile in profile_map.values()}
+    readiness_by_profile: dict[UUID, ApplicationCapitalReadinessSnapshot] = {}
+    if profile_ids:
+        latest_versions = (
+            select(
+                ApplicationCapitalReadinessSnapshot.profile_id.label("profile_id"),
+                func.max(ApplicationCapitalReadinessSnapshot.snapshot_version).label(
+                    "snapshot_version"
+                ),
+            )
+            .where(ApplicationCapitalReadinessSnapshot.profile_id.in_(profile_ids))
+            .group_by(ApplicationCapitalReadinessSnapshot.profile_id)
+            .subquery()
+        )
+        readiness_rows = list(
+            (
+                await db.execute(
+                    select(ApplicationCapitalReadinessSnapshot).join(
+                        latest_versions,
+                        (
+                            ApplicationCapitalReadinessSnapshot.profile_id
+                            == latest_versions.c.profile_id
+                        )
+                        & (
+                            ApplicationCapitalReadinessSnapshot.snapshot_version
+                            == latest_versions.c.snapshot_version
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        readiness_by_profile = {item.profile_id: item for item in readiness_rows}
     team_map = await _team_names_for_profiles(db, {p.id for p in profile_map.values()})
     loan_ids = {row.loan_id for row in rows if row.loan_id}
     loan_amounts = {
@@ -1167,6 +1203,7 @@ async def _decorate_pipeline_state(
     }
     for row in rows:
         profile = _profile_for_row(row, profile_map)
+        readiness = readiness_by_profile.get(profile.id) if profile else None
         status_value = _pipeline_status_for_row(row, profile)
         can_view_economics = user.role in INTERNAL_ROLES
         team = team_map.get(profile.id) if profile else None
@@ -1180,6 +1217,67 @@ async def _decorate_pipeline_state(
         row.pipeline_status = status_value  # type: ignore[assignment]
         row.underwriting_status = status_value  # type: ignore[assignment]
         row.profile_id = profile.id if profile and can_view_economics else None
+        if readiness is not None:
+            blockers = list(readiness.blockers or [])
+            critical_blocker_count = sum(
+                1
+                for blocker in blockers
+                if isinstance(blocker, dict)
+                and blocker.get("impact") == "critical"
+            )
+            business_today = datetime.now(ZoneInfo("America/New_York")).date()
+            overdue_milestone_count = 0
+            for phase in list(readiness.phases or []):
+                if not isinstance(phase, dict):
+                    continue
+                for action in list(phase.get("actions") or []):
+                    if not isinstance(action, dict) or action.get("status") in {
+                        "completed",
+                        "cancelled",
+                    }:
+                        continue
+                    raw_due_date = action.get("due_date")
+                    if not raw_due_date:
+                        continue
+                    try:
+                        due_date = date.fromisoformat(str(raw_due_date))
+                    except ValueError:
+                        continue
+                    if due_date < business_today:
+                        overdue_milestone_count += 1
+            top_blocker = None
+            if blockers:
+                first = blockers[0]
+                if isinstance(first, dict):
+                    top_blocker = first.get("detail") or first.get("label") or first.get(
+                        "key"
+                    )
+                elif isinstance(first, str):
+                    top_blocker = first
+            row.capital_readiness_score = (
+                float(readiness.score) if readiness.score is not None else None
+            )
+            row.capital_readiness_band = readiness.band
+            row.capital_readiness_review_status = readiness.review_status
+            row.capital_readiness_evidence_coverage_pct = float(
+                readiness.evidence_coverage_pct
+            )
+            row.capital_readiness_confidence_pct = float(readiness.confidence_pct)
+            row.capital_readiness_top_blocker = top_blocker
+            row.capital_readiness_as_of = readiness.as_of
+            row.capital_readiness = {
+                "score": row.capital_readiness_score,
+                "band": row.capital_readiness_band,
+                "review_status": row.capital_readiness_review_status,
+                "evidence_coverage_pct": row.capital_readiness_evidence_coverage_pct,
+                "confidence_pct": row.capital_readiness_confidence_pct,
+                "top_blocker": row.capital_readiness_top_blocker,
+                "critical_blocker_count": critical_blocker_count,
+                "overdue_milestone_count": overdue_milestone_count,
+                "as_of": row.capital_readiness_as_of.isoformat()
+                if row.capital_readiness_as_of
+                else None,
+            }
         requested_amount = row.amount
         if row.dealer_id in dealer_amounts:
             dealer_requested, dealer_goal, _dealer_funded = dealer_amounts[row.dealer_id]
@@ -1427,7 +1525,9 @@ def _economics_read(
     source_kind: str,
     source_id: UUID,
     profile: ApplicationProfile,
+    fee_cap_review: dict[str, object] | None = None,
 ) -> UnifiedFileEconomicsRead:
+    fee_cap_review = fee_cap_review or {}
     return UnifiedFileEconomicsRead(
         source_kind=source_kind,  # type: ignore[arg-type]
         source_id=source_id,
@@ -1445,6 +1545,10 @@ def _economics_read(
         forecast_amount_basis=row.forecast_amount_basis,
         forecast_earnings=row.forecast_earnings,
         estimated_close_date=row.estimated_close_date,
+        qc_fee_cap_percent=fee_cap_review.get("qc_fee_cap_percent"),  # type: ignore[arg-type]
+        qc_fee_review_required=bool(fee_cap_review.get("review_required")),
+        qc_fee_review_reason=fee_cap_review.get("reason"),  # type: ignore[arg-type]
+        fee_label=str(fee_cap_review.get("fee_label") or "QC origination/success fee"),
         updated_at=profile.updated_at,
     )
 
@@ -1476,6 +1580,10 @@ async def update_operator_file_economics(
         )
     if "forecast_fee_points" in changes:
         value = changes["forecast_fee_points"]
+        if value is not None:
+            await funding_programs.enforce_qc_fee_cap_for_profile(
+                db, profile, value
+            )
         profile.forecast_fee_points = Decimal(str(value)) if value is not None else None
     if "forecast_consulting_fee" in changes:
         value = changes["forecast_consulting_fee"]
@@ -1542,11 +1650,13 @@ async def update_operator_file_economics(
             status.HTTP_404_NOT_FOUND,
             "File forecast was saved, but the file is no longer visible",
         )
+    fee_cap_review = await funding_programs.qc_fee_cap_review_for_profile(db, profile)
     return _economics_read(
         row,
         source_kind=normalized_kind,
         source_id=source_id,
         profile=profile,
+        fee_cap_review=fee_cap_review,
     )
 
 
@@ -2190,6 +2300,11 @@ async def link_bucket_to_intake(
         or f"Linked {len(selected_file_ids)} selected file(s) as {payload.relationship}",
     )
     await db.flush()
+    await capital_readiness.advisory_recompute_for_intake(
+        db,
+        intake.id,
+        event_key=f"bucket-intake-linked:{link.id}:{review.id}",
+    )
     return _link_result(link, audit_ids, review.id, "bucket_intake_linked")
 
 
@@ -2260,6 +2375,11 @@ async def update_bucket_intake_link(
         detail=payload.note or f"Updated relationship with {len(selected)} selected file(s)",
     )
     await db.flush()
+    await capital_readiness.advisory_recompute_for_intake(
+        db,
+        intake.id,
+        event_key=f"bucket-intake-link-updated:{link.id}:{review.id}",
+    )
     return _link_result(link, audit_ids, review.id, "bucket_intake_link_updated")
 
 
@@ -2292,6 +2412,11 @@ async def unlink_bucket_from_intake(
         detail="Removed linked evidence access; source files were not deleted",
     )
     await db.flush()
+    await capital_readiness.advisory_recompute_for_intake(
+        db,
+        intake.id,
+        event_key=f"bucket-intake-unlinked:{link.id}:{review.id}",
+    )
     return _link_result(
         link, audit_ids, review.id, "bucket_intake_unlinked", link_status="unlinked"
     )

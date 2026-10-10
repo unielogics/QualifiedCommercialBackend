@@ -77,6 +77,10 @@ class DealerProspectEmailDraft(TimestampMixin, Base):
             name="ck_dealer_prospect_email_draft_compose_mode",
         ),
         CheckConstraint(
+            "artifact_locale IN ('en','es')",
+            name="ck_dealer_prospect_email_draft_artifact_locale",
+        ),
+        CheckConstraint(
             "char_length(outreach_profile_hash) = 64",
             name="ck_dealer_prospect_email_draft_profile_hash",
         ),
@@ -133,6 +137,9 @@ class DealerProspectEmailDraft(TimestampMixin, Base):
     ai_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
     compose_mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default="ai", server_default="ai"
+    )
+    artifact_locale: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="en", server_default="en"
     )
     purpose: Mapped[str] = mapped_column(
         String(48),

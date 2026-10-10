@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -58,6 +60,73 @@ class FundingProgramCatalog(TimestampMixin, Base):
     )
     retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     retired_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+
+class FundingProgramCommercialTerms(TimestampMixin, Base):
+    """Versioned, approved commercial terms shared by every product surface."""
+
+    __tablename__ = "funding_program_commercial_terms"
+    __table_args__ = (
+        UniqueConstraint(
+            "program_id", "version", name="uq_funding_program_commercial_terms_version"
+        ),
+        Index(
+            "uq_funding_program_commercial_terms_published",
+            "program_id",
+            unique=True,
+            postgresql_where=text("status = 'published'"),
+        ),
+        CheckConstraint(
+            "status IN ('draft','published','retired')",
+            name="ck_funding_program_commercial_terms_status",
+        ),
+        CheckConstraint(
+            "qc_fee_cap_percent IS NULL OR "
+            "(qc_fee_cap_percent >= 0 AND qc_fee_cap_percent <= 100)",
+            name="ck_funding_program_commercial_terms_fee_cap",
+        ),
+        CheckConstraint(
+            "qc_fee_default_percent IS NULL OR "
+            "(qc_fee_default_percent >= 0 AND qc_fee_default_percent <= 100)",
+            name="ck_funding_program_commercial_terms_fee_default",
+        ),
+        CheckConstraint(
+            "qc_fee_cap_percent IS NULL OR qc_fee_default_percent IS NULL OR "
+            "qc_fee_default_percent <= qc_fee_cap_percent",
+            name="ck_funding_program_commercial_terms_default_below_cap",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    program_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("funding_program_catalog.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="draft", server_default="draft"
+    )
+    minimum_amount: Mapped[float | None] = mapped_column(Numeric(16, 2))
+    maximum_amount: Mapped[float | None] = mapped_column(Numeric(16, 2))
+    minimum_term_months: Mapped[int | None] = mapped_column(Integer)
+    maximum_term_months: Mapped[int | None] = mapped_column(Integer)
+    pricing_basis: Mapped[str | None] = mapped_column(String(32))
+    minimum_pricing: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    maximum_pricing: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    qc_fee_cap_percent: Mapped[float | None] = mapped_column(Numeric(7, 4))
+    qc_fee_default_percent: Mapped[float | None] = mapped_column(Numeric(7, 4))
+    disclosures: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    source_reference: Mapped[str | None] = mapped_column(Text)
+    effective_date: Mapped[date | None] = mapped_column(Date)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
 

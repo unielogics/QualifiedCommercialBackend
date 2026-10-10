@@ -57,6 +57,10 @@ Return ONLY strict JSON (no markdown, no code fences, no commentary) with exactl
 }
 
 Hard rules — never break these:
+- If capital_readiness is present, it is the canonical, versioned advisory snapshot. Use only its typed values, policy key/version, review status, and supplied labels. Never recalculate or override its score, margins, tiers, coverage, confidence, or phase state.
+- Never self-verify an add-back, combine incompatible entities/periods/accounting bases/currencies, or invent a threshold. Missing and provisional facts must remain explicitly missing or provisional.
+- Capital Readiness is not an approval, denial, lender commitment, or permission to advance a file. Keep it separate from program readiness, evidence completion, and underwriting decisions.
+- For any client-facing wording, obey capital_readiness.communication_locale exactly: English only for "en" and Spanish only for "es". Do not mix languages.
 - Recommend ONLY legitimate treasury and deal-structuring actions: real cost reductions, verified add-back documentation, debt restructuring/refinancing, genuine deposit-consolidation of actual operating revenue, reserve building, documentation hygiene.
 - NEVER recommend statement window-dressing: no temporary transfers to inflate balances, no timing deposits around statement cut-offs, no round-tripping funds between accounts, no cosmetic activity designed to make bank statements look stronger than the business is.
 - Tax figures must reflect accurate filings — never suggest adjusting reported revenue or tax positions to "match" bank activity or dress up a package. If filed revenue and observed deposits disagree, the action is to investigate and document the real cause, not to change numbers.
@@ -80,6 +84,12 @@ def _str_list(raw: Any, limit: int = 12) -> list[str]:
     return out[:limit]
 
 
+def _optional_action_value(action: dict[str, Any], key: str, cap: int) -> str | None:
+    value = action.get(key)
+    text = str(value).strip() if value is not None else ""
+    return text[:cap] or None
+
+
 def coerce_insights(parsed: dict[str, Any]) -> dict[str, Any]:
     """Pure defensive coercion of model JSON into the response contract —
     drops malformed actions, clamps categories to the allowed set."""
@@ -96,19 +106,16 @@ def coerce_insights(parsed: dict[str, Any]) -> dict[str, Any]:
             if category not in _ALLOWED_CATEGORIES:
                 category = "liquidity"
 
-            def _opt(key: str, cap: int) -> str | None:
-                v = a.get(key)
-                s = str(v).strip() if v is not None else ""
-                return s[:cap] or None
-
             actions.append(
                 {
                     "title": title,
                     "category": category,
-                    "owner": _opt("owner", 80),
-                    "timeline": _opt("timeline", 80),
-                    "expected_effect": _opt("expected_effect", 120),
-                    "rationale": _opt("rationale", 2000),
+                    "owner": _optional_action_value(a, "owner", 80),
+                    "timeline": _optional_action_value(a, "timeline", 80),
+                    "expected_effect": _optional_action_value(
+                        a, "expected_effect", 120
+                    ),
+                    "rationale": _optional_action_value(a, "rationale", 2000),
                 }
             )
     return {

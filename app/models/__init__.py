@@ -100,6 +100,15 @@ from app.models.capital_partner_application import (  # noqa: F401
     APPLICATION_STATUSES,
     CapitalPartnerApplication,
 )
+from app.models.capital_readiness import (  # noqa: F401
+    ApplicationAddBackVerification,
+    ApplicationCapitalReadinessSnapshot,
+    ApplicationCapitalReadinessAction,
+    ApplicationFinancialPeriod,
+    CapitalReadinessPolicyVersion,
+    CapitalReadinessReview,
+    ProfitabilityAssessment,
+)
 from app.models.client import Client  # noqa: F401
 from app.models.client_ai_plan import ClientAIPlan  # noqa: F401
 from app.models.client_property import ClientProperty  # noqa: F401
@@ -131,6 +140,7 @@ from app.models.funding_program import (  # noqa: F401
     ApplicationEvidencePolicySelection,
     ApplicationRequirementEvidenceDecision,
     FundingProgramCatalog,
+    FundingProgramCommercialTerms,
     FundingProgramScope,
 )
 from app.models.google_account import GoogleAccount  # noqa: F401

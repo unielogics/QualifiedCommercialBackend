@@ -811,6 +811,7 @@ async def test_deleting_package_bucket_row_retains_immutable_artifact_bytes() ->
             return_value=SimpleNamespace(scalar_one_or_none=lambda: file)
         ),
         commit=AsyncMock(),
+        flush=AsyncMock(),
     )
     with (
         patch.object(buckets, "_load_bucket_or_404", AsyncMock()),
@@ -821,6 +822,16 @@ async def test_deleting_package_bucket_row_retains_immutable_artifact_bytes() ->
             AsyncMock(),
         ),
         patch.object(buckets, "_log", AsyncMock()),
+        patch.object(
+            buckets.profiles,
+            "affected_profiles_for_file",
+            AsyncMock(return_value=[]),
+        ),
+        patch.object(
+            buckets.capital_readiness,
+            "advisory_recompute_profiles",
+            AsyncMock(),
+        ) as readiness_recompute,
     ):
         await buckets.delete_admin_file(
             bucket_id,
@@ -833,6 +844,8 @@ async def test_deleting_package_bucket_row_retains_immutable_artifact_bytes() ->
     delete_s3.assert_not_called()
     assert file.deleted_at is not None
     assert file.delete_storage_status == "retained_package_artifact"
+    db.flush.assert_awaited_once()
+    readiness_recompute.assert_awaited_once()
     db.commit.assert_awaited_once()
 
 

@@ -393,6 +393,11 @@ async def _agreement_snapshot(
 ) -> tuple[dict[str, Any], StoredSignature, bytes]:
     from app.services import payments as pay
 
+    if include_origination_fee:
+        await pay.funding_programs.enforce_qc_fee_cap_for_profile(
+            db, profile, profile.forecast_fee_points
+        )
+
     allocation = await pay.latest_allocation(db, profile.id, for_update=True)
     if allocation is None:
         raise HTTPException(
@@ -637,6 +642,12 @@ async def prepared_agreement_is_current(
         (requested.signature_document_text or "").encode("utf-8")
     ).hexdigest():
         return False
+    if snapshot.get("include_origination_fee"):
+        cap_review = await pay.funding_programs.qc_fee_cap_review_for_profile(
+            db, profile, proposed_points=snapshot.get("origination_points")
+        )
+        if cap_review["review_required"]:
+            return False
     current = pay.economics_snapshot(profile)
     if str(current.accepted_amount or "0") != str(snapshot.get("accepted_amount") or "0"):
         return False

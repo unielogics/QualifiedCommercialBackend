@@ -38,6 +38,8 @@ SUPPORTED_FIT_FIELDS = frozenset(
         "use_of_funds_complete",
         "business_age_years",
         "revenue",
+        "gross_margin_pct",
+        "net_margin_pct",
         "annual_revenue",
         "annualized_deposits",
         "deposits",

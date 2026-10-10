@@ -21,7 +21,6 @@ from app.enums import (
 )
 from app.schemas.common import ORMModel
 
-
 # ── Living Loan Profile (output of "The Associate" summarizer) ───────────
 
 MarketWarning = Literal["Rate Pressure", "Rate Stability", "Rate Easing"]
@@ -162,6 +161,10 @@ class TodoItemRead(BaseModel):
 
 class LoanRead(ORMModel):
     id: UUID
+    # Read-only bridge to the canonical ApplicationProfile. Mobile and other
+    # clients must never call the mutating profile resolver just to render a
+    # readiness widget.
+    application_profile_id: UUID | None = None
     deal_id: str
     # Back-reference to the Deal this loan was promoted from (alembic
     # 0048). Lets mobile / desktop route from a loan row to its (A)

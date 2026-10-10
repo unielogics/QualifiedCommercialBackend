@@ -6,6 +6,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
+from app.schemas.capital_readiness import CapitalReadinessRead
 from app.schemas.requirement_review import DocumentReviewCheck
 
 ApplicationSourceKind = Literal["deal", "loan", "intake", "dealer"]
@@ -58,6 +59,9 @@ class ApplicationProfileRead(BaseModel):
     intake_id: UUID | None = None
     dealer_id: UUID | None = None
     primary_bucket_id: UUID | None = None
+    communication_locale: Literal["en", "es"] = "en"
+    communication_locale_source: str = "system_default"
+    communication_locale_updated_at: datetime | None = None
     plaid_assets_enabled: bool = True
     plaid_statements_enabled: bool = False
     plaid_policy_updated_at: datetime | None = None
@@ -416,6 +420,10 @@ class ApplicationUnderwritingRead(BaseModel):
     forecast_origination_earnings: float | None = None
     forecast_earnings: float | None = None
     estimated_close_date: date | None = None
+    qc_fee_cap_percent: float | None = None
+    qc_fee_review_required: bool = False
+    qc_fee_review_reason: str | None = None
+    fee_label: str = "QC origination/success fee"
     updated_by_user_id: UUID | None = None
     updated_at: datetime | None = None
 
@@ -1090,6 +1098,8 @@ class ApplicationRoomState(BaseModel):
     profile_id: UUID
     business_name: str
     room_url: str
+    communication_locale: Literal["en", "es"] = "en"
+    capital_readiness: CapitalReadinessRead | None = None
     capabilities: list[str] = Field(default_factory=list)
     owners: list[FileOwnerRead] = Field(default_factory=list)
     verification: FileOwnerRequirementState

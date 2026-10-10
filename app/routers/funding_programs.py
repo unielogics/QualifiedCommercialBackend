@@ -12,6 +12,7 @@ from app.enums import Role
 from app.models.user import User
 from app.schemas.funding_program import (
     FundingProgramCatalogItem,
+    FundingProgramCommercialTermsCreate,
     FundingProgramCreate,
     FundingProgramPublishRequest,
     FundingProgramRetireRequest,
@@ -102,6 +103,42 @@ async def create_funding_program_version(
 ) -> list[FundingProgramCatalogItem]:
     program = await funding_programs.catalog_item_or_404(db, program_key)
     await funding_programs.create_version(db, program, payload, user)
+    await db.commit()
+    return await funding_programs.admin_catalog(db)
+
+
+@admin_router.post(
+    "/{program_key}/commercial-terms",
+    response_model=list[FundingProgramCatalogItem],
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_funding_program_commercial_terms(
+    program_key: str,
+    payload: FundingProgramCommercialTermsCreate,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> list[FundingProgramCatalogItem]:
+    program = await funding_programs.catalog_item_or_404(db, program_key)
+    await funding_programs.create_commercial_terms(db, program, payload, user)
+    await db.commit()
+    return await funding_programs.admin_catalog(db)
+
+
+@admin_router.post(
+    "/{program_key}/commercial-terms/{terms_id}/publish",
+    response_model=list[FundingProgramCatalogItem],
+)
+async def publish_funding_program_commercial_terms(
+    program_key: str,
+    terms_id: UUID,
+    payload: FundingProgramPublishRequest,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> list[FundingProgramCatalogItem]:
+    program = await funding_programs.catalog_item_or_404(db, program_key)
+    await funding_programs.publish_commercial_terms(
+        db, program, terms_id, payload.reason, user
+    )
     await db.commit()
     return await funding_programs.admin_catalog(db)
 

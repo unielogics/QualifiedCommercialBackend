@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
+from app.models.application_profile import ApplicationProfile
 from app.models.bucket import (
     Bucket,
     BucketActivityLog,
@@ -72,7 +73,7 @@ log = logging.getLogger(__name__)
 # to hit and get the new prompt on first analysis. The only cost of leaving it
 # is that the number no longer uniquely identifies the prompt text. Bump it if
 # and when existing files genuinely need reclassifying under the new tokens.
-CURRENT_FILE_ANALYSIS_VERSION = 3
+CURRENT_FILE_ANALYSIS_VERSION = 4
 
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_REVIEW_ATTACHMENTS = 8
@@ -435,9 +436,9 @@ def build_chat_system(review_type: str | None, *, client_language: str | None = 
     if client_language == "es":
         base += (
             "\n\nThe client's preferred language is Spanish. Respond ONLY in professional, natural "
-            "Spanish, regardless of what language the supporting context/documents are in, unless the "
-            "client's own message is written in English -- in that case, reply in English for that turn "
-            "only. Never mix languages within a single reply."
+            "Spanish, regardless of what language the supporting context, documents, or latest message "
+            "use. The saved file language is authoritative for every client-facing turn. Never mix "
+            "languages within a single reply."
         )
     return base
 
@@ -508,7 +509,13 @@ P_AND_L_ANALYSIS_BLOCK = (
     "template), classify it current_p_and_l and populate key_facts with: "
     + ", ".join(PL_PROMPT_KEYS)
     + ". period_start and period_end are ISO dates. Copy the lines the document prints; when it "
-    "prints no total, leave the total null rather than computing it; never compute EBITDA or annualize."
+    "prints no total, leave the total null rather than computing it; never compute EBITDA or annualize. "
+    "Also extract currency as the printed ISO currency code (USD, CAD, etc.). If currency, entity, "
+    "accounting basis, or period is not established by the document, return null for that field; "
+    "never infer it from the business type, file name, another document, or the user's location. "
+    "A blank profit, expense, or COGS line is unknown, never zero. When multiple income statements "
+    "appear in one file, preserve each entity/period/basis/currency in an income_statements array "
+    "using the same exact keys; do not mix their figures."
 )
 BALANCE_SHEET_ANALYSIS_BLOCK = (
     "\n\nIf this document is a BALANCE SHEET (assets, liabilities and equity as of one date), "
@@ -2411,7 +2418,39 @@ async def _reconcile_analysis_consumers(
         await capture_extracted_profile_facts(db, file=file, analysis=analysis)
     from app.services.application_programs import reconcile_profiles_for_file
 
-    await reconcile_profiles_for_file(db, file)
+    profile_ids = await reconcile_profiles_for_file(db, file)
+    if analysis.status == "completed":
+        # File analysis is already durable before this point. Recompute each
+        # affected profile with a stable key so a cache replay can safely heal
+        # an interrupted readiness update without duplicating a snapshot.
+        from app.services import capital_readiness
+
+        for profile_id in profile_ids:
+            profile = await db.get(ApplicationProfile, profile_id)
+            if profile is None:
+                continue
+            try:
+                # Readiness is an advisory projection of the durable analysis,
+                # not part of making the provider result durable.  A policy or
+                # evidence error must not roll back the completed analysis (and
+                # cause a repeat model charge).  The savepoint also restores a
+                # usable outer transaction after a database-level failure.
+                async with db.begin_nested():
+                    await capital_readiness.recompute(
+                        db,
+                        profile,
+                        idempotency_key=(
+                            f"analysis:{analysis.id}:{analysis.content_hash[:16]}:"
+                            f"{analysis.analysis_version}"
+                        ),
+                        expected_snapshot_version=None,
+                    )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "capital readiness projection failed analysis=%s profile=%s",
+                    analysis.id,
+                    profile_id,
+                )
 
 
 async def analyze_bucket_file(
@@ -3847,6 +3886,41 @@ async def _chat_context(
     vendor_access: BucketVendorAccess | None,
     intake_id: UUID | None = None,
 ) -> dict[str, Any]:
+    readiness_profile = None
+    # A bucket may back more than one logical application.  When an intake is
+    # known it is the authority; never OR it with a non-unique bucket lookup.
+    # Share/vendor conversations intentionally receive no whole-file readiness
+    # data because their visibility is narrower than the application evidence.
+    if audience == "admin" or (upload_link is not None and intake_id is not None):
+        criterion = (
+            ApplicationProfile.intake_id == intake_id
+            if intake_id is not None
+            else ApplicationProfile.primary_bucket_id == bucket.id
+        )
+        readiness_profile = (
+            await db.execute(
+                select(ApplicationProfile)
+                .where(criterion)
+                .order_by(
+                    ApplicationProfile.updated_at.desc(),
+                    ApplicationProfile.created_at.desc(),
+                    ApplicationProfile.id.desc(),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    readiness_context = None
+    if readiness_profile is not None:
+        from app.services import capital_readiness
+
+        readiness_snapshot = await capital_readiness.latest_snapshot(
+            db, readiness_profile.id
+        )
+        if readiness_snapshot is not None:
+            readiness_context = capital_readiness.build_ai_context(
+                readiness_snapshot,
+                client_safe=audience != "admin",
+            )
     program_context = await _program_context_for_chat(
         db,
         bucket_id=bucket.id,
@@ -3862,6 +3936,7 @@ async def _chat_context(
             "bucket_type": bucket.bucket_type,
         },
         "audience": audience,
+        "capital_readiness": readiness_context,
     }
     if audience == "admin":
         admin_ai_context = dict(bucket.ai_context or {})

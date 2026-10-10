@@ -142,7 +142,12 @@ async def test_dealer_only_fit_context_exposes_shared_budget_and_source_purpose(
     dealer = SimpleNamespace(client_requested_amount=None, funding_goal=Decimal(1000), funding_purpose="equipment")
     db = SimpleNamespace(
         get=AsyncMock(return_value=dealer),
-        execute=AsyncMock(return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))),
+        execute=AsyncMock(
+            return_value=SimpleNamespace(
+                scalar_one_or_none=lambda: None,
+                scalars=lambda: SimpleNamespace(all=lambda: []),
+            )
+        ),
     )
     with patch.object(application_programs, "_evidence_inventory", AsyncMock(return_value=([], {}, set()))):
         context = await application_programs.profile_fit_context(db, saved)

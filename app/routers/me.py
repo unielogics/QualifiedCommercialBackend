@@ -228,6 +228,7 @@ class ProfileRead(BaseModel):
     email: str
     phone: str | None = None
     title: str | None = None
+    ui_locale: Literal["en", "es"] = "en"
 
 
 class ProfileUpdate(BaseModel):
@@ -240,11 +241,18 @@ class ProfileUpdate(BaseModel):
 
     phone: str | None = Field(default=None, max_length=40)
     title: str | None = Field(default=None, max_length=120)
+    ui_locale: Literal["en", "es"] | None = None
 
 
 @router.get("/profile", response_model=ProfileRead)
 async def read_profile(user: CurrentUser) -> ProfileRead:
-    return ProfileRead(name=user.name, email=user.email, phone=user.phone, title=user.title)
+    return ProfileRead(
+        name=user.name,
+        email=user.email,
+        phone=user.phone,
+        title=user.title,
+        ui_locale=getattr(user, "ui_locale", "en"),
+    )
 
 
 @router.patch("/profile", response_model=ProfileRead)
@@ -257,8 +265,16 @@ async def update_profile(
         user.phone = store_phone(changes["phone"])
     if "title" in changes:
         user.title = (changes["title"] or "").strip() or None
+    if changes.get("ui_locale") is not None:
+        user.ui_locale = changes["ui_locale"]
     await db.commit()
-    return ProfileRead(name=user.name, email=user.email, phone=user.phone, title=user.title)
+    return ProfileRead(
+        name=user.name,
+        email=user.email,
+        phone=user.phone,
+        title=user.title,
+        ui_locale=getattr(user, "ui_locale", "en"),
+    )
 
 
 @router.get("/booking-settings", response_model=UserBookingSettingsRead)

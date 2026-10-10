@@ -5,6 +5,7 @@ from __future__ import annotations
 # FastAPI dependency declarations intentionally use Depends in defaults.
 # ruff: noqa: B008
 from datetime import UTC, datetime
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -43,6 +44,7 @@ class MeResponse(ORMModel):
     email: str
     name: str
     role: Role
+    ui_locale: Literal["en", "es"] = "en"
     # Only ever set for Role.DEALER_PARTNER. Whether this user (and their
     # company) have the required signed contracts is a separate query — see
     # GET /contracts/{contract_type}/status — not a field on this response,
@@ -92,6 +94,7 @@ async def me(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> MeRespons
         email=user.email,
         name=user.name,
         role=user.role,
+        ui_locale=getattr(user, "ui_locale", "en") or "en",
         referral_partner_company_id=user.referral_partner_company_id,
         referral_partner_company_admin=bool(getattr(user, "referral_partner_company_admin", False)),
         account_types=effective_account_types,

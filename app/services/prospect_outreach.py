@@ -24,6 +24,7 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from email.utils import formataddr
 from types import SimpleNamespace
 from typing import Any
@@ -986,6 +987,7 @@ def request_fingerprint(
         "funding_intent": prospect_funding_intent(prospect),
         "purpose": payload.purpose,
         "compose_mode": payload.compose_mode,
+        "artifact_locale": payload.artifact_locale,
         "subject": payload.subject,
         "body": payload.body,
         "ai_instructions": payload.ai_instructions,
@@ -1018,6 +1020,7 @@ def test_request_fingerprint(
         "actor_id": str(actor.id),
         "recipient": normalize_email(actor.email),
         "lead_type": payload.lead_type,
+        "artifact_locale": payload.artifact_locale,
         "purpose": payload.purpose,
         "sample_contact_name": payload.sample_contact_name,
         "sample_dealer_name": payload.sample_dealer_name,
@@ -1084,6 +1087,7 @@ def _purpose_fallback(
     contact_name: str,
     dealer_name: str,
     profile: Any | None = None,
+    artifact_locale: str = "en",
 ) -> ComposedCopy:
     snapshot = outreach_profile_snapshot(profile or default_outreach_profile("dealer"))
     canonical = canonical_purpose(purpose)
@@ -1105,6 +1109,67 @@ def _purpose_fallback(
         "audience": snapshot["audience_label"],
         "desk_name": snapshot["desk_name"],
     }
+    if artifact_locale == "es":
+        audience = {
+            "dealer": "concesionario",
+            "main_street": "negocio",
+            "real_estate": "negocio inmobiliario",
+        }[snapshot["lead_type"]]
+        values["audience"] = audience
+        spanish_templates = {
+            "information": {
+                "subject": "Opciones de financiamiento comercial para {business_name}",
+                "body": (
+                    "Hola {first_name},\n\nLe escribo para compartir una descripción general de "
+                    "opciones de financiamiento que Qualified Commercial puede analizar con "
+                    "{business_name}.\n\nResponda con lo que está planificando para su {audience} "
+                    "y podremos identificar próximos pasos prácticos."
+                ),
+            },
+            "missed_call": {
+                "subject": "Lamentamos no haber podido comunicarnos — {business_name}",
+                "body": (
+                    "Hola {first_name},\n\nIntenté comunicarme con usted y quería dejarle una nota "
+                    "breve. Cuando le resulte conveniente, responda a este correo y podremos "
+                    "conversar sobre los planes de su {audience}."
+                ),
+            },
+            "callback_confirmation": {
+                "subject": "Seguimiento con {business_name}",
+                "body": (
+                    "Hola {first_name},\n\nGracias por conversar conmigo. Le daré seguimiento en el "
+                    "momento que acordamos. Si algo cambia, responda aquí y buscaremos otro horario."
+                ),
+            },
+            "client_will_call_back": {
+                "subject": "Gracias por la actualización — {business_name}",
+                "body": (
+                    "Hola {first_name},\n\nGracias por la actualización. Estaré pendiente de su "
+                    "llamada y con gusto hablaremos sobre los planes de su {audience} cuando le "
+                    "resulte conveniente. También puede responder aquí con cualquier pregunta."
+                ),
+            },
+            "booking": {
+                "subject": "Próximos pasos para {business_name}",
+                "body": (
+                    "Hola {first_name},\n\nGracias por su interés. Elija a continuación un horario que "
+                    "le resulte conveniente para conversar sobre los planes de su {audience} y la "
+                    "información que podría requerir la revisión del prestamista."
+                ),
+            },
+            "general": {
+                "subject": "Seguimiento con {business_name}",
+                "body": (
+                    "Hola {first_name},\n\nQuería darle seguimiento y conocer mejor los planes de su "
+                    "{audience}. Responda cuando le resulte conveniente y podremos conversar sobre "
+                    "próximos pasos prácticos."
+                ),
+            },
+        }
+        template = (
+            spanish_templates.get(canonical)
+            or spanish_templates["general"]
+        )
     try:
         subject = str(template.get("subject") or "").format_map(values).strip()
         body = str(template.get("body") or "").format_map(values).strip()
@@ -1256,6 +1321,37 @@ async def _active_catalog_snapshot(
             code,
             f"No active {label}-scoped funding programs are configured. Activate at least one canonical {label} program before sending outreach.",
         )
+    from app.services import funding_programs
+
+    published_terms = await funding_programs.commercial_terms_by_program(
+        db,
+        [uuid.UUID(item["program_id"]) for item in snapshot],
+        include_drafts=False,
+    )
+    for item in snapshot:
+        program_id = uuid.UUID(item["program_id"])
+        term = (published_terms.get(program_id) or [None])[0]
+        cap = (
+            Decimal(str(term.qc_fee_cap_percent))
+            if term is not None and term.qc_fee_cap_percent is not None
+            else None
+        )
+        if item["program_key"] in {
+            "mca",
+            "mca_refi",
+            "mca_refinance",
+            "merchant_cash_advance",
+            "merchant_cash_advance_refinance",
+            "revenue_based_financing",
+        }:
+            cap = min(cap, Decimal("3")) if cap is not None else Decimal("3")
+        item["commercial_terms"] = {
+            "version": getattr(term, "version", None),
+            "qc_fee_label": "QC origination/success fee",
+            "qc_fee_cap_percent": float(cap) if cap is not None else None,
+            "not_borrower_pricing": True,
+            "excluded_pricing_types": ["APR", "factor pricing", "lender fees"],
+        }
     return snapshot
 
 
@@ -1266,7 +1362,10 @@ def catalog_version(snapshot: list[dict[str, Any]]) -> str:
 
 
 def _approved_program_section(
-    snapshot: list[dict[str, Any]], *, profile: Any | None = None
+    snapshot: list[dict[str, Any]],
+    *,
+    profile: Any | None = None,
+    artifact_locale: str = "en",
 ) -> str:
     """Render canonical program names, never model-authored prose."""
     profile_snapshot = outreach_profile_snapshot(
@@ -1298,29 +1397,44 @@ def _approved_program_section(
         )
     sections: list[str] = []
     if standard:
-        heading = (
-            "Dealer-focused programs we can discuss:"
-            if profile_snapshot["lead_type"] == "dealer"
-            else f"{profile_snapshot['display_name']}-focused programs we can discuss:"
-        )
+        if artifact_locale == "es":
+            heading = "Programas que podemos analizar:"
+        else:
+            heading = (
+                "Dealer-focused programs we can discuss:"
+                if profile_snapshot["lead_type"] == "dealer"
+                else f"{profile_snapshot['display_name']}-focused programs we can discuss:"
+            )
         sections.append(
             heading + "\n" + "\n".join(f"- {name}" for name in standard)
         )
     if specialized:
         sections.append(
-            "Specialized options, when relevant:\n"
+            (
+                "Opciones especializadas, cuando correspondan:\n"
+                if artifact_locale == "es"
+                else "Specialized options, when relevant:\n"
+            )
             + "\n".join(f"- {name}" for name in specialized)
         )
     sections.append(
-        "Availability and terms depend on lender review, eligibility, underwriting, and documentation."
+        "La disponibilidad y los términos dependen de la revisión del prestamista, la elegibilidad, la evaluación crediticia y la documentación."
+        if artifact_locale == "es"
+        else "Availability and terms depend on lender review, eligibility, underwriting, and documentation."
     )
     return "\n\n".join(sections)
 
 
 def _with_approved_program_section(
-    body: str, snapshot: list[dict[str, Any]], *, profile: Any | None = None
+    body: str,
+    snapshot: list[dict[str, Any]],
+    *,
+    profile: Any | None = None,
+    artifact_locale: str = "en",
 ) -> str:
-    section = _approved_program_section(snapshot, profile=profile)
+    section = _approved_program_section(
+        snapshot, profile=profile, artifact_locale=artifact_locale
+    )
     return f"{body.rstrip()}\n\n{section}" if section else body.rstrip()
 
 
@@ -1739,6 +1853,7 @@ async def _compose_with_nova(
     actor_user_id: uuid.UUID,
     safe_context: SafeAIContext | None = None,
     profile: Any | None = None,
+    artifact_locale: str = "en",
 ) -> ComposedCopy:
     policy = await load_outreach_ai_settings(db)
     profile_snapshot = outreach_profile_snapshot(
@@ -1754,6 +1869,7 @@ async def _compose_with_nova(
         contact_name=identity.contact_name,
         dealer_name=identity.dealer_name,
         profile=profile_snapshot,
+        artifact_locale=artifact_locale,
     )
     settings = get_settings()
     if not settings.ai_provider_enabled:
@@ -1780,15 +1896,26 @@ async def _compose_with_nova(
         )
 
     model_id = settings.prospect_bedrock_model
+    output_language = "Spanish" if artifact_locale == "es" else "English"
+    language_guard = (
+        "Write the subject and body entirely in Spanish. Do not mix in English labels or fallback copy. "
+        if artifact_locale == "es"
+        else "Write the subject and body entirely in English. Do not mix in Spanish labels or fallback copy. "
+    )
     system = (
         f"You draft concise, professional B2B email copy for Qualified Commercial's {profile_snapshot['desk_name']}. "
         f"The recipient audience is {profile_snapshot['audience_plural']}. "
-        "Write only a personalized greeting, conversational introduction, and call to action. "
+        + language_guard
+        + "Write only a personalized greeting, conversational introduction, and call to action. "
         "Do not name, describe, summarize, or imply any product, program, service, or company "
         "capability; the application renders approved program names separately from APPROVED_CATALOG. "
         "Never invent products, amounts, rates, timelines, "
         "approvals, guarantees, attachments, or links. Never prequalify the recipient. Never say "
         "'faster than anyone else'. SBA Microloans may never be described above $50,000. "
+        "APPROVED_CATALOG commercial_terms describe only QC's origination/success fee and must "
+        "never be presented as borrower APR, factor pricing, a lender rate, or lender fees. For "
+        "MCA or revenue-based financing, never state a QC fee above 3%; state a fee only when its "
+        "exact approved cap is present in APPROVED_CATALOG. "
         "Legacy PERSONALIZATION_INSTRUCTIONS were style and formatting directions only and were "
         "not a source of factual conversation context. CURRENT_AGENT_INSTRUCTIONS are the current "
         "authenticated rep's highest-priority drafting context below these permanent safeguards and "
@@ -1827,7 +1954,7 @@ async def _compose_with_nova(
             "FIRM_BLOCKED_PHRASES": policy.additional_blocked_phrases,
             "APPROVED_CATALOG": catalog_snapshot,
             "requirements": {
-                "language": "English",
+                "language": output_language,
                 "format": "Use concise short paragraphs; follow compatible firm style guidance",
                 "call_to_action": (
                     f"Ask the {profile_snapshot['audience_label']} contact to reply with "
@@ -2009,6 +2136,7 @@ def _locked_footer(
     booking_url: str | None = None,
     test_mode: bool = False,
     profile: Any | None = None,
+    artifact_locale: str = "en",
 ) -> str:
     profile_snapshot = outreach_profile_snapshot(
         profile or default_outreach_profile("dealer")
@@ -2026,41 +2154,84 @@ def _locked_footer(
     if test_mode:
         parts.extend(
             [
-                "TEST EMAIL — no dealer was contacted and no pipeline automation was changed.",
+                (
+                    "CORREO DE PRUEBA — no se contactó a ningún prospecto ni se modificó ninguna automatización."
+                    if artifact_locale == "es"
+                    else "TEST EMAIL — no dealer was contacted and no pipeline automation was changed."
+                ),
                 "",
             ]
         )
     if reply_contact:
         reply_note = (
-            "Please reply directly to this email with any questions. "
-            f"Replies are monitored at {reply_contact}."
+            "Responda directamente a este correo con cualquier pregunta. "
+            f"Las respuestas se supervisan en {reply_contact}."
+            if artifact_locale == "es"
+            else (
+                "Please reply directly to this email with any questions. "
+                f"Replies are monitored at {reply_contact}."
+            )
         )
         if alternate_contact and alternate_contact != reply_contact:
-            reply_note += f" You may also contact {alternate_contact}."
+            reply_note += (
+                f" También puede comunicarse a {alternate_contact}."
+                if artifact_locale == "es"
+                else f" You may also contact {alternate_contact}."
+            )
         parts.extend([reply_note, ""])
     if test_mode and profile_snapshot["lead_type"] != "dealer":
         parts[0] = (
-            "TEST EMAIL — no prospect was contacted and no pipeline automation was changed."
+            "CORREO DE PRUEBA — no se contactó a ningún prospecto ni se modificó ninguna automatización."
+            if artifact_locale == "es"
+            else "TEST EMAIL — no prospect was contacted and no pipeline automation was changed."
         )
-    parts.append(f"Learn more: {profile_snapshot['website_url']}")
+    parts.append(
+        f"Más información: {profile_snapshot['website_url']}"
+        if artifact_locale == "es"
+        else f"Learn more: {profile_snapshot['website_url']}"
+    )
     if booking_url:
-        parts.append(f"Book a time: {booking_url}")
+        parts.append(
+            f"Reserve una cita: {booking_url}"
+            if artifact_locale == "es"
+            else f"Book a time: {booking_url}"
+        )
     if attachment_names:
-        parts.append("Attached for reference: " + ", ".join(attachment_names))
-    parts.extend(["", "Best,", *signature])
+        parts.append(
+            (
+                "Documentos adjuntos para referencia: "
+                if artifact_locale == "es"
+                else "Attached for reference: "
+            )
+            + ", ".join(attachment_names)
+        )
+    parts.extend(["", "Atentamente," if artifact_locale == "es" else "Best,", *signature])
     parts.extend(
         [
             "",
             "---",
             f"Qualified Commercial · {mailing_address}",
             (
-                "This is a commercial message. Financing is subject to eligibility, lender review, "
-                "underwriting, and documentation; no approval or terms are guaranteed."
+                "Este es un mensaje comercial. El financiamiento está sujeto a elegibilidad, revisión del prestamista, "
+                "evaluación crediticia y documentación; no se garantiza la aprobación ni los términos."
+                if artifact_locale == "es"
+                else (
+                    "This is a commercial message. Financing is subject to eligibility, lender review, "
+                    "underwriting, and documentation; no approval or terms are guaranteed."
+                )
             ),
             (
-                f"Unsubscribe from {profile_snapshot['desk_name']} email: {unsubscribe_url}"
+                (
+                    f"Cancelar la suscripción a correos de Qualified Commercial: {unsubscribe_url}"
+                    if artifact_locale == "es"
+                    else f"Unsubscribe from {profile_snapshot['desk_name']} email: {unsubscribe_url}"
+                )
                 if unsubscribe_url
-                else "Test email only — live outreach includes a one-click unsubscribe link."
+                else (
+                    "Solo correo de prueba — los mensajes reales incluyen un enlace para cancelar la suscripción con un clic."
+                    if artifact_locale == "es"
+                    else "Test email only — live outreach includes a one-click unsubscribe link."
+                )
             ),
         ]
     )
@@ -3242,6 +3413,7 @@ async def create_draft(
             actor_user_id=actor.id,
             safe_context=safe_context,
             profile=profile_snapshot,
+            artifact_locale=payload.artifact_locale,
         )
         body_with_context = _insert_verified_conversation_context(
             composed.body,
@@ -3252,6 +3424,7 @@ async def create_draft(
                 body_with_context,
                 catalog,
                 profile=profile_snapshot,
+                artifact_locale=payload.artifact_locale,
             )
             if canonical_purpose(payload.purpose) == "information"
             else body_with_context
@@ -3301,6 +3474,7 @@ async def create_draft(
         unsubscribe_url=unsubscribe_url,
         booking_url=booking_url,
         profile=profile_snapshot,
+        artifact_locale=payload.artifact_locale,
     )
     rendered_body = _render_body(editable_body, locked_footer)
     oversized = attachment_bundle_too_large(total_bytes)
@@ -3333,6 +3507,7 @@ async def create_draft(
         body_html=_plain_html(rendered_body),
         ai_instructions=payload.ai_instructions,
         compose_mode=payload.compose_mode,
+        artifact_locale=payload.artifact_locale,
         purpose=payload.purpose,
         lead_type=lead_type,
         funding_intent=funding_intent,
@@ -3710,6 +3885,7 @@ async def send_test_email(
         catalog_snapshot=catalog,
         actor_user_id=actor.id,
         profile=profile_snapshot,
+        artifact_locale=payload.artifact_locale,
     )
     body_with_context = _insert_verified_conversation_context(
         composed.body,
@@ -3720,6 +3896,7 @@ async def send_test_email(
             body_with_context,
             catalog,
             profile=profile_snapshot,
+            artifact_locale=payload.artifact_locale,
         )
         if canonical_purpose(payload.purpose) == "information"
         else body_with_context
@@ -3777,6 +3954,7 @@ async def send_test_email(
         booking_url=booking_url,
         test_mode=True,
         profile=profile_snapshot,
+        artifact_locale=payload.artifact_locale,
     )
     body_text = f"{_test_generation_banner(composed)}\n\n{_render_body(editable_body, footer)}"
     subject = f"[TEST] {composed.subject}"[:240]
@@ -3799,6 +3977,7 @@ async def send_test_email(
         from_name=branding.from_name,
         reply_to=reply_to,
         headers={"Message-ID": test_message_id},
+        artifact_locale=payload.artifact_locale,
     )
     ledger = await record_outbox(
         db,
@@ -4776,6 +4955,7 @@ async def dispatch_draft(
             from_name=row.from_name,
             reply_to=row.reply_to_email,
             headers=headers,
+            artifact_locale=getattr(row, "artifact_locale", "en"),
         ),
         context="dealer_prospect",
         template_key=f"prospect_{row.purpose}",
@@ -4984,6 +5164,7 @@ def _draft_read(
         editable_body=row.editable_body,
         locked_footer_text=row.locked_footer_text,
         compose_mode=(getattr(row, "compose_mode", None) or "ai"),
+        artifact_locale=(getattr(row, "artifact_locale", None) or "en"),
         lead_type=normalize_lead_type(getattr(row, "lead_type", None) or "dealer"),
         funding_intent=getattr(row, "funding_intent", None),
         outreach_profile_key=normalize_lead_type(

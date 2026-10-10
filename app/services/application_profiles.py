@@ -579,6 +579,13 @@ def profile_read(profile: ApplicationProfile) -> ApplicationProfileRead:
         intake_id=profile.intake_id,
         dealer_id=profile.dealer_id,
         primary_bucket_id=profile.primary_bucket_id,
+        communication_locale=getattr(profile, "communication_locale", "en"),
+        communication_locale_source=getattr(
+            profile, "communication_locale_source", "system_default"
+        ),
+        communication_locale_updated_at=getattr(
+            profile, "communication_locale_updated_at", None
+        ),
         plaid_assets_enabled=profile.plaid_assets_enabled,
         plaid_statements_enabled=profile.plaid_statements_enabled,
         plaid_policy_updated_at=profile.plaid_policy_updated_at,
@@ -821,10 +828,26 @@ async def provision_profile_for_intake(
     Idempotent: uq_application_profiles_intake makes the double-tap a race we
     lose politely rather than a duplicate.
     """
+    diagnostic = (intake.intake_state or {}).get("capital_readiness_diagnostic")
     profile = (
         await db.execute(select(ApplicationProfile).where(ApplicationProfile.intake_id == intake.id))
     ).scalar_one_or_none()
     if profile is not None:
+        if diagnostic and not profile.self_reported_readiness_diagnostic:
+            profile.self_reported_readiness_diagnostic = diagnostic
+        locale_source = getattr(
+            profile, "communication_locale_source", "system_default"
+        )
+        if locale_source not in {"borrower_selection", "staff_selection"}:
+            locale = (diagnostic or {}).get("locale") or getattr(
+                intake.preferred_language, "value", intake.preferred_language
+            )
+            if locale in {"en", "es"}:
+                profile.communication_locale = locale
+                profile.communication_locale_source = (
+                    "borrower_selection" if diagnostic else "contact_default"
+                )
+        await db.flush()
         return profile
 
     # A file handed over from Capital OS already has a profile under its dealer.
@@ -838,7 +861,18 @@ async def provision_profile_for_intake(
         if profile is not None:
             if profile.intake_id is None:
                 profile.intake_id = intake.id
-                await db.flush()
+            if diagnostic and not profile.self_reported_readiness_diagnostic:
+                profile.self_reported_readiness_diagnostic = diagnostic
+            if getattr(profile, "communication_locale_source", "system_default") == "system_default":
+                locale = (diagnostic or {}).get("locale") or getattr(
+                    intake.preferred_language, "value", intake.preferred_language
+                )
+                if locale in {"en", "es"}:
+                    profile.communication_locale = locale
+                    profile.communication_locale_source = (
+                        "borrower_selection" if diagnostic else "contact_default"
+                    )
+            await db.flush()
             return profile
 
     profile = ApplicationProfile(
@@ -849,6 +883,13 @@ async def provision_profile_for_intake(
         funding_category=(intake.intake_state or {}).get("funding_intent")
         or intake.loan_purpose,
         industry=((intake.intake_state or {}).get("main_street_details") or {}).get("industry"),
+        communication_locale=(diagnostic or {}).get("locale")
+        if (diagnostic or {}).get("locale") in {"en", "es"}
+        else getattr(intake.preferred_language, "value", intake.preferred_language) or "en",
+        communication_locale_source="borrower_selection"
+        if diagnostic
+        else "contact_default",
+        self_reported_readiness_diagnostic=diagnostic,
     )
     db.add(profile)
     try:

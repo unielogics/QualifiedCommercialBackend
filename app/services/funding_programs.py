@@ -6,15 +6,22 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.activity import Activity
 from app.models.ai_playbook import AICollectionRequirement, AIPlaybookTemplate
-from app.models.funding_program import FundingProgramCatalog, FundingProgramScope
+from app.models.application_profile import ApplicationProfile, ApplicationProgramSelection
+from app.models.funding_program import (
+    FundingProgramCatalog,
+    FundingProgramCommercialTerms,
+    FundingProgramScope,
+)
 from app.models.user import User
 from app.schemas.funding_program import (
     FundingProgramCatalogItem,
+    FundingProgramCommercialTermsCreate,
+    FundingProgramCommercialTermsRead,
     FundingProgramCreate,
     FundingProgramRetireRequest,
     FundingProgramScopePatch,
@@ -232,9 +239,167 @@ async def published_versions_by_program(
     return authoritative_published_versions(rows)
 
 
+async def commercial_terms_by_program(
+    db: AsyncSession,
+    program_ids: list[uuid.UUID],
+    *,
+    include_drafts: bool,
+) -> dict[uuid.UUID, list[FundingProgramCommercialTerms]]:
+    if not program_ids:
+        return {}
+    query = select(FundingProgramCommercialTerms).where(
+        FundingProgramCommercialTerms.program_id.in_(program_ids)
+    )
+    if not include_drafts:
+        query = query.where(FundingProgramCommercialTerms.status == "published")
+    rows = list(
+        (
+            await db.execute(
+                query.order_by(
+                    FundingProgramCommercialTerms.program_id,
+                    FundingProgramCommercialTerms.version.desc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    result: dict[uuid.UUID, list[FundingProgramCommercialTerms]] = defaultdict(list)
+    for row in rows:
+        result[row.program_id].append(row)
+    return result
+
+
+async def published_qc_fee_cap_for_profile(
+    db: AsyncSession, profile: ApplicationProfile
+) -> float | None:
+    """Return the strictest applicable published QC fee cap.
+
+    MCA is a funding intent, not a business type. The explicit funding category
+    and selected canonical programs therefore both participate. A 3% fallback
+    is deliberate fail-closed protection while legacy MCA files are backfilled
+    to the versioned commercial-terms ledger.
+    """
+
+    mca_keys = {"mca_refinance", "revenue_based_financing"}
+    mca_category_aliases = {
+        "mca",
+        "mca_refi",
+        "mca_refinance",
+        "merchant_cash_advance",
+        "merchant_cash_advance_refinance",
+    }
+    mca_vertical_aliases = {
+        "mca",
+        "mca_refinance",
+        "merchant_cash_advance",
+        "merchant_cash_advance_refinance",
+    }
+    funding_key = (getattr(profile, "funding_category", None) or "").strip().casefold()
+    vertical_key = (getattr(profile, "vertical", None) or "").strip().casefold()
+    is_mca = funding_key in mca_category_aliases or vertical_key in mca_vertical_aliases
+    if not hasattr(db, "execute"):
+        return 3.0 if is_mca else None
+    selected_keys = set(
+        (
+            await db.execute(
+                select(ApplicationProgramSelection.program_key).where(
+                    ApplicationProgramSelection.profile_id == profile.id,
+                    ApplicationProgramSelection.removed_at.is_(None),
+                    ApplicationProgramSelection.program_key.in_(mca_keys),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if is_mca:
+        selected_keys.add("mca_refinance")
+    if not selected_keys:
+        return None
+    caps = list(
+        (
+            await db.execute(
+                select(FundingProgramCommercialTerms.qc_fee_cap_percent)
+                .join(
+                    FundingProgramCatalog,
+                    FundingProgramCatalog.id == FundingProgramCommercialTerms.program_id,
+                )
+                .where(
+                    FundingProgramCatalog.program_key.in_(selected_keys),
+                    FundingProgramCommercialTerms.status == "published",
+                    FundingProgramCommercialTerms.qc_fee_cap_percent.is_not(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Published catalog data may contain a legacy value above the approved
+    # ceiling. It remains historical, while every new write still fails closed
+    # at 3%.
+    return min([3.0, *(float(value) for value in caps)])
+
+
+async def qc_fee_cap_review_for_profile(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    *,
+    proposed_points: object | None = None,
+) -> dict[str, object]:
+    """Canonical commercial-term review shared by every economics write path."""
+
+    cap = await published_qc_fee_cap_for_profile(db, profile)
+    points_value = profile.forecast_fee_points if proposed_points is None else proposed_points
+    points = float(points_value) if points_value is not None else None
+    review_required = bool(cap is not None and points is not None and points > cap)
+    return {
+        "applicable": cap is not None,
+        "qc_fee_cap_percent": cap,
+        "current_qc_fee_percent": points,
+        "review_required": review_required,
+        "reason": "legacy_qc_fee_above_published_cap" if review_required else None,
+        "fee_label": "QC origination/success fee",
+        "separate_from": ["borrower_apr", "factor_rate", "lender_fees", "consulting_fees"],
+    }
+
+
+async def enforce_qc_fee_cap_for_profile(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    proposed_points: object | None,
+    *,
+    field: str = "forecast_fee_points",
+) -> dict[str, object]:
+    review = await qc_fee_cap_review_for_profile(
+        db, profile, proposed_points=proposed_points
+    )
+    if review["review_required"]:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": "QC origination/success fee exceeds the published program cap",
+                "field": field,
+                "maximum": review["qc_fee_cap_percent"],
+                "current": review["current_qc_fee_percent"],
+                "program": "mca_or_mca_refinance",
+                "review_required": True,
+                "fee_label": review["fee_label"],
+            },
+        )
+    return review
+
+
+def _commercial_terms_read(
+    row: FundingProgramCommercialTerms | None,
+) -> FundingProgramCommercialTermsRead | None:
+    return FundingProgramCommercialTermsRead.model_validate(row) if row else None
+
+
 async def public_catalog(db: AsyncSession) -> list[PublicFundingProgramCatalogItem]:
     rows = await catalog_rows(db)
     scopes = await scopes_by_program(db, [row.id for row in rows])
+    terms = await commercial_terms_by_program(db, [row.id for row in rows], include_drafts=False)
     return [
         PublicFundingProgramCatalogItem(
             program_key=row.program_key,
@@ -243,6 +408,7 @@ async def public_catalog(db: AsyncSession) -> list[PublicFundingProgramCatalogIt
             short_description=row.short_description,
             display_order=row.display_order,
             verticals=list(dict.fromkeys(scope.vertical for scope in scopes.get(row.id, []))),
+            commercial_terms=_commercial_terms_read((terms.get(row.id) or [None])[0]),
         )
         for row in rows
     ]
@@ -256,6 +422,7 @@ async def admin_catalog(db: AsyncSession) -> list[FundingProgramCatalogItem]:
     # returning an inactive legacy row here would therefore reactivate it on an
     # otherwise unrelated save.
     scopes = await scopes_by_program(db, program_ids)
+    commercial_terms = await commercial_terms_by_program(db, program_ids, include_drafts=True)
     playbooks = (
         list(
             (
@@ -324,11 +491,139 @@ async def admin_catalog(db: AsyncSession) -> list[FundingProgramCatalogItem]:
                     for item in versions
                     if item.status == "draft"
                 ],
+                published_commercial_terms=_commercial_terms_read(
+                    next(
+                        (term for term in commercial_terms.get(row.id, []) if term.status == "published"),
+                        None,
+                    )
+                ),
+                draft_commercial_terms=[
+                    FundingProgramCommercialTermsRead.model_validate(term)
+                    for term in commercial_terms.get(row.id, [])
+                    if term.status == "draft"
+                ],
                 created_at=row.created_at,
                 updated_at=row.updated_at,
             )
         )
     return result
+
+
+async def create_commercial_terms(
+    db: AsyncSession,
+    program: FundingProgramCatalog,
+    payload: FundingProgramCommercialTermsCreate,
+    user: User,
+) -> FundingProgramCommercialTerms:
+    await db.execute(
+        select(FundingProgramCatalog.id)
+        .where(FundingProgramCatalog.id == program.id)
+        .with_for_update()
+    )
+    latest = (
+        await db.execute(
+            select(func.max(FundingProgramCommercialTerms.version)).where(
+                FundingProgramCommercialTerms.program_id == program.id
+            )
+        )
+    ).scalar_one_or_none()
+    row = FundingProgramCommercialTerms(
+        program_id=program.id,
+        version=int(latest or 0) + 1,
+        status="draft",
+        minimum_amount=payload.minimum_amount,
+        maximum_amount=payload.maximum_amount,
+        minimum_term_months=payload.minimum_term_months,
+        maximum_term_months=payload.maximum_term_months,
+        pricing_basis=payload.pricing_basis,
+        minimum_pricing=payload.minimum_pricing,
+        maximum_pricing=payload.maximum_pricing,
+        qc_fee_cap_percent=payload.qc_fee_cap_percent,
+        qc_fee_default_percent=payload.qc_fee_default_percent,
+        disclosures=[item.strip() for item in payload.disclosures if item.strip()],
+        source_reference=(payload.source_reference or "").strip() or None,
+        effective_date=payload.effective_date,
+    )
+    db.add(row)
+    db.add(
+        Activity(
+            actor_id=user.id,
+            actor_label="super_admin",
+            kind="funding_program.commercial_terms_created",
+            summary=f"Created commercial terms draft {row.version} for {program.name}",
+            payload={
+                "program_key": program.program_key,
+                "qc_fee_cap_percent": payload.qc_fee_cap_percent,
+                "reason": _audit_reason(payload.reason, "Commercial terms draft saved"),
+            },
+        )
+    )
+    await db.flush()
+    return row
+
+
+async def publish_commercial_terms(
+    db: AsyncSession,
+    program: FundingProgramCatalog,
+    terms_id: uuid.UUID,
+    reason: str | None,
+    user: User,
+) -> FundingProgramCommercialTerms:
+    row = (
+        await db.execute(
+            select(FundingProgramCommercialTerms).where(
+                FundingProgramCommercialTerms.id == terms_id,
+                FundingProgramCommercialTerms.program_id == program.id,
+            ).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Commercial terms version not found")
+    if row.status != "draft":
+        raise HTTPException(status.HTTP_409_CONFLICT, "Only draft commercial terms can be published")
+    if program.program_key in {"mca_refinance", "revenue_based_financing"} and (
+        row.qc_fee_cap_percent is None or float(row.qc_fee_cap_percent) > 3.0
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_field_validation_detail(
+                "qc_fee_cap_percent",
+                message="MCA and MCA Refinance QC fees cannot exceed the approved 3% cap",
+                input_value=float(row.qc_fee_cap_percent) if row.qc_fee_cap_percent is not None else None,
+            ),
+        )
+    current = list(
+        (
+            await db.execute(
+                select(FundingProgramCommercialTerms).where(
+                    FundingProgramCommercialTerms.program_id == program.id,
+                    FundingProgramCommercialTerms.status == "published",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for old in current:
+        old.status = "retired"
+    row.status = "published"
+    row.published_at = _now()
+    row.published_by_user_id = user.id
+    db.add(
+        Activity(
+            actor_id=user.id,
+            actor_label="super_admin",
+            kind="funding_program.commercial_terms_published",
+            summary=f"Published commercial terms {row.version} for {program.name}",
+            payload={
+                "program_key": program.program_key,
+                "qc_fee_cap_percent": float(row.qc_fee_cap_percent) if row.qc_fee_cap_percent is not None else None,
+                "reason": _audit_reason(reason, "Commercial terms published"),
+            },
+        )
+    )
+    await db.flush()
+    return row
 
 
 async def catalog_item_or_404(db: AsyncSession, program_key: str) -> FundingProgramCatalog:
