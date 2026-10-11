@@ -81,7 +81,7 @@ from app.services.use_of_funds import source_funding_data
 from app.services.use_of_funds import summarize as summarize_use_of_funds
 
 SATISFIED_STATES = {"verified", "waived", "not_applicable"}
-AI_EVIDENCE_DECISION_ALGORITHM = "ai-evidence-v3"
+AI_EVIDENCE_DECISION_ALGORITHM = "ai-evidence-v4-numbers-first"
 OPEN_UNDERWRITING_STATES = {
     "submitted",
     "collecting_docs",
@@ -1630,6 +1630,54 @@ def _analysis_business_entity(analysis: BucketFileAnalysis | None) -> object | N
     return key_facts.get("business_name") or key_facts.get("account_holder")
 
 
+def _entity_identity_warning(
+    analysis: BucketFileAnalysis | None,
+    expected_entity: str | None,
+    corroborated_entities: set[str] | None = None,
+) -> dict[str, Any] | None:
+    """Separate documentary usability from an unconfirmed file association.
+
+    This does not declare differently named businesses to be the same entity.
+    The exact observed name is retained for review; numerical aggregation must
+    still respect source, entity, period, basis and currency boundaries.
+    """
+    if (
+        analysis is None
+        or not _normalized_entity(expected_entity)
+        or getattr(analysis, "status", None) != "completed"
+    ):
+        return None
+    observed = _analysis_business_entity(analysis)
+    found_entity = _normalized_entity(observed)
+    if not found_entity:
+        code = "entity_unconfirmed_warning"
+        message = (
+            "Entity name was not established from this document. Usable evidence is retained; "
+            "staff should confirm its association before relying on it for a lender decision."
+        )
+    elif (
+        not _entities_match(expected_entity, observed)
+        and found_entity not in (corroborated_entities or set())
+    ):
+        code = "entity_mismatch_warning"
+        message = (
+            f"Entity-name mismatch: this document names {observed}, while the file names "
+            f"{expected_entity}. Usable evidence is retained; staff should confirm the association. "
+            "Do not combine these figures with another entity's financial results."
+        )
+    else:
+        return None
+    return {
+        "code": code,
+        "severity": "warning",
+        "expected_entity": expected_entity,
+        "observed_entity": str(observed) if observed is not None else None,
+        "association_review_required": True,
+        "blocks_document_acceptance": False,
+        "message": message,
+    }
+
+
 def _blocking_analysis_text(analysis: BucketFileAnalysis) -> str:
     detail = analysis.analysis if isinstance(analysis.analysis, dict) else {}
     values = [*(detail.get("limitations") or []), *(detail.get("red_flags") or [])]
@@ -1730,28 +1778,7 @@ def _automatic_evidence_decision(
             analysis.confidence,
         )
 
-    extracted_entity = _analysis_business_entity(analysis)
-    wanted_entity = _normalized_entity(expected_entity)
-    found_entity = _normalized_entity(extracted_entity)
-    if wanted_entity and not found_entity:
-        return (
-            "needs_more",
-            "entity_unconfirmed",
-            "AI could not confirm that this document belongs to the application entity.",
-            analysis.confidence,
-        )
-    if (
-        wanted_entity
-        and found_entity
-        and not _entities_match(expected_entity, extracted_entity)
-        and found_entity not in (corroborated_entities or set())
-    ):
-        return (
-            "rejected",
-            "wrong_entity",
-            f"The document names {extracted_entity}, which does not match the application entity.",
-            analysis.confidence,
-        )
+    identity_warning = _entity_identity_warning(analysis, expected_entity, corroborated_entities)
 
     blocking_text = _blocking_analysis_text(analysis)
     if any(
@@ -1805,9 +1832,10 @@ def _automatic_evidence_decision(
             )
         if check_assessment and check_assessment.get("status") == "pass":
             return (
-                "accepted", "document_checks_passed",
+                "accepted", identity_warning["code"] if identity_warning else "document_checks_passed",
                 "AI verified every published documentary check against source pages. "
-                "This is evidence verification, not financing approval.", analysis.confidence,
+                "This is evidence verification, not financing approval."
+                + (" " + identity_warning["message"] if identity_warning else ""), analysis.confidence,
             )
         if check_assessment and check_assessment.get("status") == "blocked":
             return (
@@ -1824,8 +1852,9 @@ def _automatic_evidence_decision(
         )
     return (
         "accepted",
-        "validated",
-        "AI validated the document type, entity, readable content, and applicable period.",
+        identity_warning["code"] if identity_warning else "validated",
+        "AI validated the document type, readable content, and applicable period."
+        + (" " + identity_warning["message"] if identity_warning else ""),
         analysis.confidence,
     )
 
@@ -1908,6 +1937,15 @@ async def _reconcile_evidence_decisions(
         seen_hashes.add(content_hash)
         current = latest.get(link.id)
         analysis_version = analysis.analysis_version if analysis else 0
+        identity_warning = (
+            _entity_identity_warning(analysis, expected_entity, corroborated_entities)
+            if analysis is not None and getattr(analysis, "content_hash", None) == file.content_hash
+            else None
+        )
+        link.provenance = {
+            **(getattr(link, "provenance", None) or {}),
+            "entity_identity_warning": identity_warning,
+        }
         retained_staff_review = (
             current is not None
             and current.actor_kind == "staff"
@@ -2232,6 +2270,11 @@ async def _materialize_requirements(
             "coverage": coverage,
             "verified_coverage": accepted_coverage,
             "accepted_file_ids": [str(row.file_id) for row in accepted_links],
+            "entity_identity_warnings": [
+                {"file_id": str(row.file_id), **warning}
+                for row in links
+                if (warning := (row.provenance or {}).get("entity_identity_warning"))
+            ],
             "review_checks_fingerprint": _review_checks_fingerprint(review_checks),
             "requires_human": requires_human,
             "ai_document_review": check_assessment,
@@ -2264,6 +2307,8 @@ async def _materialize_requirements(
                         if newest_verification.verified_by_user_id is None
                         else "Accepted by underwriting override"
                     )
+                    if state.provenance.get("entity_identity_warnings"):
+                        state.state_reason += "; entity association warnings require staff attention"
                 else:
                     state.status = "received_unverified"
                     state.verified_at = None

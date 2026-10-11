@@ -290,6 +290,77 @@ async def test_cached_analysis_replays_application_mapping_without_a_model_call(
 
 
 @pytest.mark.asyncio
+async def test_cached_statement_gets_numbers_first_diagnostics_without_provider_reanalysis():
+    file = SimpleNamespace(id=uuid4(), bucket_id=uuid4(), file_name="statement.pdf", content_hash=None)
+    cached = SimpleNamespace(
+        id=uuid4(), bucket_file_id=file.id, status="completed", classification="current_p_and_l",
+        confidence="high", analysis_version=bucket_ai.CURRENT_FILE_ANALYSIS_VERSION,
+        content_hash="a" * 64,
+        analysis={"key_facts": {"gross_revenue": "1000", "gross_profit": "130", "net_income": "30"}},
+    )
+    with (
+        patch.object(bucket_ai, "reconcile_uploaded_file", AsyncMock()),
+        patch.object(bucket_ai, "_fetch_file", return_value=(b"pdf", "application/pdf")),
+        patch.object(bucket_ai, "_cached_file_analysis", AsyncMock(return_value=cached)),
+        patch.object(bucket_ai, "_lock_analysis_scope", AsyncMock()),
+        patch.object(bucket_ai, "_reconcile_analysis_consumers", AsyncMock()),
+        patch.object(bucket_ai.merchant_processing, "is_offer_document", return_value=False),
+        patch.object(bucket_ai, "tracked_messages_create", AsyncMock()) as model_call,
+    ):
+        result = await bucket_ai.analyze_bucket_file(SimpleNamespace(), file)
+    assert result is cached
+    metrics = cached.analysis["profitability_diagnostics"][0]
+    assert metrics["gross_margin_pct"] == 13 and metrics["gross_margin_status"] == "healthy"
+    assert metrics["net_margin_pct"] == 3 and metrics["net_margin_status"] == "healthy"
+    assert metrics["period_start"] is None
+    model_call.assert_not_awaited()
+    # Do not claim the old provider extraction used a new prompt policy.
+    assert "financial_extraction_policy" not in cached.analysis
+
+
+def test_review_preserves_deterministic_diagnostics_not_model_replacements():
+    source = {
+        "policy_key": "qc_lending_margin_v1", "source_analysis_id": str(uuid4()),
+        "gross_margin_pct": 13, "gross_margin_status": "healthy", "statement_index": 0,
+    }
+    result = {"profitability_diagnostics": [{"gross_margin_pct": 99, "gross_margin_status": "very_strong"}]}
+    bucket_ai._compute_key_metrics_from_cache(result, [{
+        "file_id": str(uuid4()), "ai_classification": "current_p_and_l",
+        "key_facts": {}, "profitability_diagnostics": [source],
+    }])
+    assert result["profitability_diagnostics"] == [source]
+
+
+def test_advisory_profitability_failure_cannot_reject_a_completed_file():
+    analysis = SimpleNamespace(id=uuid4(), status="completed", analysis={"key_facts": {"gross_revenue": 1000}})
+    with patch("app.services.capital_readiness_ingestion.statement_profitability_diagnostics", side_effect=ValueError("malformed context")):
+        bucket_ai._refresh_profitability_diagnostics(analysis)
+    assert analysis.status == "completed"
+    assert analysis.analysis["key_facts"]["gross_revenue"] == 1000
+    assert analysis.analysis["profitability_diagnostics"] == []
+    assert "remain available" in analysis.analysis["profitability_diagnostics_warning"]
+
+
+def test_numbers_first_prompts_do_not_turn_identity_warnings_into_file_rejection():
+    prompt = bucket_ai.build_file_analysis_system("main_street_v1")
+    assert "numbers-first" in prompt
+    assert "entity name differs" in prompt
+    assert "Missing source labels are warnings" in prompt
+    assert "do not mix their figures" in prompt
+    assert "a blank profit" in prompt.lower()
+    assert "never zero" in prompt
+    for review_type in ("dealer_gatekeeper_v1", "main_street_v1"):
+        review_prompt = bucket_ai.build_review_system(review_type)
+        assert "Never use deposits minus withdrawals" in review_prompt
+        assert "estimated_ebitda_or_cash_flow (average monthly deposits minus withdrawals" not in review_prompt
+        assert "10% to below 13%" in review_prompt
+        assert "13% to below 18%" in review_prompt
+        assert "2% to below 3%" in review_prompt
+        assert "3% to below 5%" in review_prompt
+        assert "name mismatch alone must not invalidate" in review_prompt
+
+
+@pytest.mark.asyncio
 async def test_zip_parent_analysis_is_terminal_without_fetching_storage():
     file = SimpleNamespace(
         id=uuid4(),

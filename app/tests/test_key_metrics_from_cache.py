@@ -34,6 +34,9 @@ def _analysis(classification: str, facts: dict[str, Any], file_id: str = "f1") -
 def _typed_pl(months: int = 6, **overrides: Any) -> dict[str, Any]:
     start, end = _recent_period(months)
     facts: dict[str, Any] = {
+        "business_name": "Example LLC",
+        "basis": "accrual",
+        "currency": "USD",
         "source_form": "qc_pl.v1",
         "period_start": start,
         "period_end": end,
@@ -48,10 +51,15 @@ def _typed_pl(months: int = 6, **overrides: Any) -> dict[str, Any]:
     return _analysis("current_p_and_l", facts)
 
 
-TAX = _analysis("tax_return", {"tax_year": "2025", "gross_receipts": 900_000, "net_income": 80_000}, "t1")
+TAX = _analysis("tax_return", {
+    "business_name": "Example LLC", "basis": "tax", "currency": "USD",
+    "period_start": "2025-01-01", "period_end": "2025-12-31",
+    "tax_year": "2025", "gross_receipts": 900_000, "net_income": 80_000,
+    "interest": 0, "income_taxes": 0, "depreciation_and_amortization": 0,
+}, "t1")
 DEBTS = _analysis(
     "debt_schedule",
-    {"total_monthly_debt_service": 5_000, "total_outstanding_balance": 200_000, "debts": []},
+    {"business_name": "Example LLC", "currency": "USD", "period_start": "2025-01-01", "period_end": "2025-12-31", "total_monthly_debt_service": 5_000, "total_outstanding_balance": 200_000, "debts": []},
     "d1",
 )
 BALANCE_SHEET = _analysis(
@@ -153,7 +161,7 @@ def test_an_ai_supplied_value_is_never_overwritten_or_relabelled():
 
 
 def test_tax_revenue_and_pl_earnings_can_mix_when_the_return_lacks_net_income():
-    tax = _analysis("tax_return", {"tax_year": "2025", "gross_receipts": 900_000}, "t1")
+    tax = _analysis("tax_return", {**TAX["key_facts"], "net_income": None}, "t1")
     km = _run([tax, _typed_pl()])
     assert km["ytd_annualized_revenue"] == 900_000 and km["revenue_source"] == "tax_return"
     assert km["estimated_ebitda_or_cash_flow"] == 140_000 and km["ebitda_source"] == "profit_and_loss"
@@ -170,7 +178,9 @@ def test_dscr_uses_tax_net_income_when_a_return_exists_and_says_so():
 
 
 def test_dscr_falls_back_to_the_annualized_pl_ebitda_without_a_return():
-    km = _run([DEBTS, _typed_pl()])
+    statement = _typed_pl()
+    debts = _analysis("debt_schedule", {**DEBTS["key_facts"], "period_start": statement["key_facts"]["period_start"], "period_end": statement["key_facts"]["period_end"]}, "d1")
+    km = _run([debts, statement])
     assert km["estimated_dscr"] == round(140_000 / 60_000, 2)
     assert km["dscr_basis"] == "profit_and_loss_ebitda"
 
@@ -214,6 +224,73 @@ def test_no_statement_means_no_statement_keys_and_no_none_values():
 
 def test_an_empty_file_produces_no_keys_at_all():
     assert _run([]) == {}
+
+
+def test_missing_adjustment_lines_never_become_zero_ebitda_or_dscr():
+    statement = _typed_pl(interest=None, income_taxes=None, depreciation_and_amortization=None)
+    km = _run([DEBTS, statement])
+    assert km["pl_net_income"] == 60_000
+    for key in ("estimated_ebitda_or_cash_flow", "pl_ebitda", "pl_annualized_ebitda", "estimated_dscr"):
+        assert key not in km
+
+
+def test_unknown_context_keeps_source_figures_without_authoritative_promotion():
+    for field in ("business_name", "basis", "currency"):
+        km = _run([_typed_pl(**{field: None})])
+        assert km["pl_revenue"] == 600_000
+        assert km["pl_net_income"] == 60_000
+        assert "ytd_annualized_revenue" not in km
+        assert "estimated_ebitda_or_cash_flow" not in km
+
+
+def test_tax_net_income_is_not_ebitda_when_adjustment_lines_are_unknown():
+    tax = _analysis("tax_return", {**TAX["key_facts"], "interest": None, "income_taxes": None, "depreciation_and_amortization": None}, "t1")
+    km = _run([tax, DEBTS])
+    assert km["ytd_annualized_revenue"] == 900_000
+    assert "estimated_ebitda_or_cash_flow" not in km
+    assert "estimated_dscr" not in km
+
+
+def test_tax_profit_alias_is_not_accepted_as_book_net_income_or_ebitda():
+    tax = _analysis("tax_return", {**TAX["key_facts"], "net_income": None, "ordinary_business_income": 80_000}, "t1")
+    km = _run([tax, DEBTS])
+    assert "estimated_ebitda_or_cash_flow" not in km
+    assert "estimated_dscr" not in km
+
+
+def test_dscr_does_not_mix_debt_for_other_entity_currency_or_period():
+    for override in ({"business_name": "Other LLC"}, {"currency": "CAD"}, {"period_end": "2024-12-31"}, {"period_start": None}):
+        debt = _analysis("debt_schedule", {**DEBTS["key_facts"], **override}, "d1")
+        km = _run([TAX, debt])
+        assert "estimated_dscr" not in km
+        assert km["estimated_debt_burden"] == 60_000
+
+
+def test_tax_revenue_trend_requires_same_identity_currency_basis_and_cutoff():
+    prior_facts = {**TAX["key_facts"], "tax_year": "2024", "period_start": "2024-01-01", "period_end": "2024-12-31", "gross_receipts": 600_000}
+    prior = _analysis("tax_return", prior_facts, "t0")
+    assert "+50%" in _run([prior, TAX])["revenue_trend"]
+    for override in ({"business_name": "Different LLC"}, {"currency": "CAD"}, {"basis": "cash"}, {"period_end": "2024-11-30"}, {"period_start": None}):
+        mismatched = _analysis("tax_return", {**prior_facts, **override}, "t0")
+        assert "revenue_trend" not in _run([mismatched, TAX])
+
+
+def test_two_tax_entities_in_one_year_do_not_satisfy_two_year_evidence_baseline():
+    bank = _analysis("bank_statement", {"months": [
+        {"statement_period": f"2025-{month:02d}-01 to 2025-{month:02d}-28", "total_deposits_and_credits": 1000}
+        for month in range(1, 7)
+    ]}, "bank")
+    tax_a = _analysis("tax_return", {**TAX["key_facts"], "business_name": "A LLC"}, "a")
+    tax_b = _analysis("tax_return", {**TAX["key_facts"], "business_name": "B LLC"}, "b")
+    result: dict[str, Any] = {}
+    ai._apply_lending_readiness(result, [bank, tax_a, tax_b])
+    assert result["lending_ready"] is False
+    assert "2 years of tax returns" in result["one_next_step"]
+    # More than two files in the newest year cannot truncate a real older year.
+    older = _analysis("tax_return", {**TAX["key_facts"], "tax_year": "2024", "business_name": "A LLC"}, "old")
+    complete: dict[str, Any] = {}
+    ai._apply_lending_readiness(complete, [bank, older, tax_a, tax_b])
+    assert complete["lending_ready"] is True
 
 
 # ── the recency gate ────────────────────────────────────────────────────────

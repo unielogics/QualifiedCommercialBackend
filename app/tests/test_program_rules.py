@@ -439,7 +439,7 @@ def test_hard_scope_requires_industry_or_declared_facts() -> None:
     assert _scope_match(dealer_collateral, {"declared_collateral": None})[0] is None
 
 
-def test_ai_decisions_validate_type_entity_period_and_duplicates() -> None:
+def test_ai_decisions_validate_type_period_duplicates_and_warn_on_entity() -> None:
     requirement = SimpleNamespace(
         requirement_key="business_bank_statements_6_months",
         label="Last 6 months business bank statements",
@@ -496,9 +496,11 @@ def test_ai_decisions_validate_type_entity_period_and_duplicates() -> None:
     )
 
     assert accepted[:2] == ("accepted", "validated")
-    assert wrong_entity[:2] == ("rejected", "wrong_entity")
+    assert wrong_entity[:2] == ("accepted", "entity_mismatch_warning")
+    assert "staff should confirm" in wrong_entity[2]
+    assert "Do not combine" in wrong_entity[2]
     assert duplicate[:2] == ("rejected", "duplicate")
-    assert entity_unconfirmed[:2] == ("needs_more", "entity_unconfirmed")
+    assert entity_unconfirmed[:2] == ("accepted", "entity_unconfirmed_warning")
 
 
 def test_password_protected_skip_retains_actionable_reason_code() -> None:
@@ -601,7 +603,7 @@ def test_ai_decision_accepts_grace_legal_name_expansion() -> None:
 
     assert decision[:2] == ("accepted", "validated")
     assert aliases == {"graceautosalesservice"}
-    assert AI_EVIDENCE_DECISION_ALGORITHM == "ai-evidence-v3"
+    assert AI_EVIDENCE_DECISION_ALGORITHM == "ai-evidence-v4-numbers-first"
 
 
 @pytest.mark.asyncio

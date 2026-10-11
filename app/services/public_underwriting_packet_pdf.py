@@ -189,21 +189,28 @@ def _money(value: Any) -> str:
 
 
 def _num(value: Any) -> float | None:
-    """Best-effort parse of a currency/number to float (strips $ , and spaces)."""
-    if value is None:
+    """Parse finite printed values, preserving accounting loss parentheses."""
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        try:
+            number = float(value)
+        except (OverflowError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
     text = str(value).strip()
-    if not text:
+    if not text or len(text) > 128:
         return None
-    text = re.sub(r"[^0-9.\-]", "", text)
+    if text.startswith("(") and text.endswith(")"):
+        text = "-" + text[1:-1]
+    text = re.sub(r"[$,%\s]", "", text)
     if text in ("", "-", ".", "-."):
         return None
     try:
-        return float(text)
-    except ValueError:
+        number = float(text)
+    except (ValueError, OverflowError):
         return None
+    return number if math.isfinite(number) else None
 
 
 def _fmt_compact(number: float | None) -> str:
@@ -452,9 +459,10 @@ def _populated(record: dict[str, Any], keys: tuple[str, ...]) -> int:
 def extract_profit_and_loss(analyses: list[dict[str, Any]]) -> dict[str, Any] | None:
     """The best analyzed profit-and-loss statement (latest period_end, most
     populated on a tie) with every statement under `statements`. Totals the
-    document did not print are computed from the lines it did; EBITDA is net
-    income + interest + income taxes + depreciation and amortization (a
-    taxes-and-licenses line is an operating cost, never added back);
+    document did not print are computed only from complete known inputs.
+    Net income is a printed final profit/loss line; EBITDA is printed or net
+    income + explicitly known interest + income taxes + depreciation and
+    amortization (a taxes-and-licenses line is never added back);
     annualization happens only for a 6–11 month period. Nothing is summed
     across documents. None when no P&L was analyzed."""
     statements: list[dict[str, Any]] = []
@@ -483,14 +491,12 @@ def extract_profit_and_loss(analyses: list[dict[str, Any]]) -> dict[str, Any] | 
             total_operating_expenses = gross_profit - operating_income
         if operating_income is None and gross_profit is not None and total_operating_expenses is not None:
             operating_income = gross_profit - total_operating_expenses
-        if net_income is None and operating_income is not None:
-            net_income = operating_income + (other_income or 0.0) - (income_taxes or 0.0)
         period_start = _iso_date(facts.get("period_start"))
         period_end = _iso_date(facts.get("period_end"))
         months = _months_covered(period_start, period_end)
-        ebitda = None
-        if net_income is not None:
-            ebitda = net_income + (interest or 0.0) + (income_taxes or 0.0) + (depreciation or 0.0)
+        ebitda = _num(facts.get("ebitda"))
+        if ebitda is None and all(value is not None for value in (net_income, interest, income_taxes, depreciation)):
+            ebitda = net_income + interest + income_taxes + depreciation
         typed = bool(facts.get("source_form")) or (
             _num(facts.get("gross_revenue")) is not None
             and _num(facts.get("net_income")) is not None
@@ -501,6 +507,7 @@ def extract_profit_and_loss(analyses: list[dict[str, Any]]) -> dict[str, Any] | 
                 "file_id": item.get("file_id"),
                 "business_name": _text(facts.get("business_name"), fallback="") or None,
                 "basis": _text(facts.get("basis"), fallback="") or None,
+                "currency": _text(facts.get("currency"), fallback="") or None,
                 "period_start": period_start,
                 "period_end": period_end,
                 "months_covered": months,
@@ -635,7 +642,9 @@ def _tax_year(facts: dict[str, Any]) -> str | None:
 def extract_tax_years(analyses: list[dict[str, Any]], limit: int = 2) -> list[dict[str, Any]]:
     """Extract per-year tax-return figures from analyzed tax returns; return the
     most recent `limit` years. Empty if no tax returns were analyzed."""
-    by_year: dict[str, dict[str, Any]] = {}
+    # Two unrelated entities can file in the same year. Never let one erase
+    # the other merely because it has more populated figures.
+    by_source_period: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for item in analyses:
         cls = str(item.get("classification") or "")
         facts = item.get("key_facts") or {}
@@ -656,20 +665,29 @@ def extract_tax_years(analyses: list[dict[str, Any]], limit: int = 2) -> list[di
 
         year = _tax_year(facts) or cls
         rec = {
+            "file_id": item.get("file_id"),
             "year": year if re.fullmatch(r"(19|20)\d{2}", str(year or "")) else (_tax_year(facts) or "—"),
             "entity": _text(facts.get("entity_name") or facts.get("business_name") or facts.get("taxpayer"), fallback=""),
+            "currency": _text(facts.get("currency"), fallback=""),
+            "basis": _text(facts.get("basis") or facts.get("accounting_basis"), fallback=""),
+            "period_start": _iso_date(facts.get("period_start")),
+            "period_end": _iso_date(facts.get("period_end")),
             "gross_receipts": _first_num(_GROSS_RECEIPTS_ALIASES),
             "net_income": _first_num(_NET_INCOME_ALIASES),
             "total_income": _first_num(_TOTAL_INCOME_ALIASES),
         }
         yk = str(rec["year"])
         if yk and yk != "—":
-            prior = by_year.get(yk)
+            identity = re.sub(r"[^a-z0-9]", "", rec["entity"].casefold())
+            # Unidentified tax returns remain separate by file, not guessed
+            # to belong to the same company because the upload shares a bucket.
+            key = (yk, identity or f"unknown:{item.get('file_id')}", rec["currency"].upper(), rec["basis"].casefold())
+            prior = by_source_period.get(key)
             if prior is None or sum(1 for k in ("gross_receipts", "net_income") if rec.get(k) is not None) >= sum(
                 1 for k in ("gross_receipts", "net_income") if prior.get(k) is not None
             ):
-                by_year[yk] = rec
-    ordered = [by_year[k] for k in sorted(by_year)]
+                by_source_period[key] = rec
+    ordered = [by_source_period[k] for k in sorted(by_source_period)]
     return ordered[-limit:]
 
 
@@ -990,7 +1008,6 @@ def _executive_metric_tiles(
         _num(p_and_l.get("annualized_revenue"))
         or _num(p_and_l.get("gross_revenue"))
         or _num(key_metrics.get("ytd_annualized_revenue"))
-        or _num(key_metrics.get("annualized_adjusted_deposits"))
     )
     cash_flow = (
         _num(p_and_l.get("annualized_ebitda"))

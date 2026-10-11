@@ -79,6 +79,42 @@ def test_ebitda_is_none_without_net_income():
     assert out["typed"] is False  # net income is part of the typed shape
 
 
+def test_ebitda_requires_every_adjustment_line_unless_the_document_states_it():
+    for key in ("interest", "income_taxes", "depreciation_and_amortization"):
+        out = pdf.extract_profit_and_loss([_doc("current_p_and_l", {**TYPED_PL, key: None})])
+        assert out["net_income"] == 60_000
+        assert out["ebitda"] is None and out["annualized_ebitda"] is None
+    stated = pdf.extract_profit_and_loss([_doc("current_p_and_l", {"ebitda": 70_000, "period_start": "2026-01-01", "period_end": "2026-06-30"})])
+    assert stated["ebitda"] == 70_000 and stated["annualized_ebitda"] == 140_000
+
+
+def test_tax_returns_for_separate_entities_are_not_overwritten_by_year():
+    returns = pdf.extract_tax_years([
+        _doc("tax_return", {"tax_year": 2025, "business_name": "A LLC", "gross_receipts": 100_000}, "a"),
+        _doc("tax_return", {"tax_year": 2025, "business_name": "B LLC", "gross_receipts": 300_000}, "b"),
+    ])
+    assert {row["entity"] for row in returns} == {"A LLC", "B LLC"}
+    assert {row["file_id"] for row in returns} == {"a", "b"}
+
+
+def test_lender_brief_never_labels_bank_inflows_as_annual_revenue():
+    html = pdf._executive_metric_tiles(
+        intake=SimpleNamespace(requested_loan_amount=None),
+        result={"key_metrics": {"annualized_adjusted_deposits": 1_200_000}},
+        financials={},
+    )
+    assert "Annual revenue" in html
+    assert "1,200,000" not in html
+
+
+def test_financial_parser_preserves_losses_and_rejects_nonfinite_or_malformed_numbers():
+    assert pdf._num("($5,000.25)") == -5000.25
+    assert pdf._num(" $1,000.50 ") == 1000.5
+    assert pdf._num("1e3") == 1000
+    for invalid in (float("inf"), float("nan"), "1e999999", True, "9" * 2000, "unknown 5000"):
+        assert pdf._num(invalid) is None
+
+
 def test_totals_are_computed_from_lines_only_when_the_document_prints_none():
     facts = {
         "period_start": "2026-01-01",
@@ -92,7 +128,9 @@ def test_totals_are_computed_from_lines_only_when_the_document_prints_none():
     out = pdf.extract_profit_and_loss([_doc("current_p_and_l", facts)])
     assert out["gross_profit"] == 400_000
     assert out["total_operating_expenses"] == 340_000
-    assert out["net_income"] == 60_000
+    # Operating income is not the final profit/loss line. Do not fabricate net
+    # income (or EBITDA) even when some downstream expense labels are absent.
+    assert out["net_income"] is None
     # a printed total is kept even when the lines disagree
     printed = {**facts, "gross_profit": 399_000, "net_income": 55_000}
     out = pdf.extract_profit_and_loss([_doc("current_p_and_l", printed)])

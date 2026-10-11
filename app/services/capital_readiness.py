@@ -53,7 +53,7 @@ from app.services.operator_file_links import selected_files_for_intake
 log = logging.getLogger(__name__)
 
 POLICY_KEY = "qc_lending_margin_v1"
-FORMULA_VERSION = "score_v2"
+FORMULA_VERSION = "score_v2_numbers_first_v1"
 MONEY_TOLERANCE = Decimal("1.00")
 STATUS_SCORE = {
     "concerning": Decimal("25"),
@@ -131,6 +131,8 @@ ES_TEXT = {
     "The latest financial period contains values that require human reconciliation.": "El período financiero más reciente contiene valores que requieren conciliación humana.",
     "Financial statement entity mismatch": "Incompatibilidad de entidad en los estados financieros",
     "The available financial statements do not match the operating borrower identity and require human review.": "Los estados financieros disponibles no coinciden con la identidad del negocio prestatario y requieren revisión humana.",
+    "Financial statement identity warning": "Advertencia de identidad del estado financiero",
+    "The statement name differs from the file identity. Its numbers remain available for provisional analysis; confirm the association before relying on them for a lender decision.": "El nombre del estado financiero difiere de la identidad del expediente. Sus cifras siguen disponibles para el análisis provisional; confirme la relación antes de usarlas en una decisión del prestamista.",
     "Baseline Health Check": "Evaluación de salud inicial",
     "Reconcile starting financial and banking metrics against published QC baselines.": "Conciliar las métricas financieras y bancarias iniciales con las referencias publicadas de QC.",
     "Financial Restructuring": "Reestructuración financiera",
@@ -664,14 +666,21 @@ async def list_financial_periods(
     )
 
 
-def period_compatibility_key(period: ApplicationFinancialPeriod) -> tuple[str, str, str]:
+def period_compatibility_key(period: ApplicationFinancialPeriod) -> tuple[str, str, str, str]:
     """Values may only be combined when entity, basis, and currency match."""
 
-    return (
-        normalize_entity_name(period.entity_name),
-        (period.accounting_basis or "unknown").casefold(),
-        (period.currency or "USD").upper(),
+    entity = normalize_entity_name(period.entity_name)
+    basis = (period.accounting_basis or "unknown").casefold()
+    currency = (period.currency or "XXX").upper()
+    # Unknown context permits a source-local ratio, never a guessed merger of
+    # unrelated statements. Isolate each observation until the context is known.
+    unresolved = (
+        basis == "unknown"
+        or currency == "XXX"
+        or not entity
+        or str(period.entity_name or "").startswith("[Unidentified statement:")
     )
+    return (entity, basis, currency, str(period.id or period.idempotency_key) if unresolved else "")
 
 
 _ENTITY_SUFFIXES = {
@@ -779,12 +788,9 @@ def compatible_period_windows(
     """
 
     active = [row for row in periods if row.review_status in {"submitted", "confirmed"}]
-    if canonical_entities:
-        active = [
-            row
-            for row in active
-            if period_compatibility_key(row)[0] in canonical_entities
-        ]
+    # Retain the legacy argument for callers, but a legal/DBA header is a
+    # warning signal, not an admission gate. Use the newest coherent window
+    # and keep different entities/bases/currencies separate below.
     if not active:
         return [], []
     active.sort(
@@ -2063,11 +2069,11 @@ def _snapshot_read(
                 )
             elif signal.get("key") == "financial_entity_mismatch":
                 signal["label"] = _t(
-                    presentation_locale, "Financial statement entity mismatch"
+                    presentation_locale, "Financial statement identity warning"
                 )
                 signal["detail"] = _t(
                     presentation_locale,
-                    "The available financial statements do not match the operating borrower identity and require human review.",
+                    "The statement name differs from the file identity. Its numbers remain available for provisional analysis; confirm the association before relying on them for a lender decision.",
                 )
     for phase in phases:
         copy = PHASE_COPY.get(str(phase.get("key")))
@@ -2180,11 +2186,31 @@ def build_ai_context(
         {
             "key": item.get("key"),
             "value": item.get("value"),
+            "numerator": item.get("numerator"),
+            "denominator": item.get("denominator"),
             "unit": item.get("unit"),
             "status": item.get("status"),
             "trend_percentage_points": (item.get("source") or {}).get(
                 "trend_percentage_points"
             ),
+            "identity_warning": (item.get("source") or {}).get("identity_warning", False),
+            "provisional": (item.get("source") or {}).get("provisional", False),
+            "review_statuses": (item.get("source") or {}).get("review_statuses", []),
+            "period_start": (item.get("source") or {}).get("period_start"),
+            "period_end": (item.get("source") or {}).get("period_end"),
+            "entity_name": str((item.get("source") or {}).get("entity_name") or "")[:200],
+            "accounting_basis": (item.get("source") or {}).get("accounting_basis"),
+            "currency": (item.get("source") or {}).get("currency"),
+            "source_period_ids": list((item.get("source") or {}).get("source_period_ids") or [])[:24],
+            "context_warnings": [
+                {
+                    "code": str(warning.get("code") or "")[:80],
+                    "severity": str(warning.get("severity") or "")[:40],
+                    "detail": str(warning.get("detail") or "")[:500],
+                }
+                for warning in list((item.get("source") or {}).get("context_warnings") or [])[:8]
+                if isinstance(warning, dict)
+            ],
         }
         for item in list(snapshot.metrics or [])[:20]
     ]
@@ -2250,6 +2276,8 @@ def build_ai_context(
             "Use the supplied calculated metrics and published policy; do not recalculate or alter the score.",
             "Do not invent facts, thresholds, add-backs, approvals, rates, terms, or lender outcomes.",
             "Capital Readiness is advisory and cannot approve, deny, or advance a file.",
+            "A statement-name mismatch is a warning, not a reason to reject or ignore readable financial numbers. Explain it alongside provisional source-local metrics.",
+            "Never combine revenue and profit from different statements, periods, accounting bases or currencies; bank deposits are not revenue and cash movement is not net income.",
             (
                 "Respond only in Spanish."
                 if locale == "es"
@@ -2403,16 +2431,16 @@ async def recompute(
     active_periods = [
         row for row in periods if row.review_status in {"submitted", "confirmed"}
     ]
+    current_periods, prior_periods = compatible_period_windows(
+        periods
+    )
     entity_mismatch = bool(
         canonical_entities
-        and active_periods
-        and not any(
-            period_compatibility_key(row)[0] in canonical_entities
-            for row in active_periods
+        and current_periods
+        and any(
+            period_compatibility_key(row)[0] not in canonical_entities
+            for row in current_periods
         )
-    )
-    current_periods, prior_periods = compatible_period_windows(
-        periods, canonical_entities=canonical_entities
     )
     period = current_periods[0] if current_periods else None
     current_window = aggregate_period_window(current_periods)
@@ -2486,7 +2514,9 @@ async def recompute(
     # program rule that explicitly opted into the diagnostic margin fields.
     margins_fit_ready = bool(current_periods) and all(
         row.review_status == "confirmed" for row in current_periods
-    ) and not reconciliation_pending and not property_only
+    ) and not reconciliation_pending and not property_only and all(
+        not period_compatibility_key(row)[3] for row in current_periods
+    )
     program_candidates = await application_programs.published_candidates(
         db,
         profile,
@@ -2574,6 +2604,12 @@ async def recompute(
         if prior_periods
         else None,
         "review_statuses": review_statuses,
+        "identity_warning": entity_mismatch,
+        "provisional": any(
+            row.review_status != "confirmed" or bool(period_compatibility_key(row)[3])
+            for row in current_periods
+        ),
+        "context_warnings": current_window["warnings"],
         "verification_status": "self_reported_unverified"
         if diagnostic_financials_used
         else None,
@@ -2928,7 +2964,6 @@ async def recompute(
         normalized_score.quantize(Decimal("0.01"))
         if normalized_score is not None
         and coverage_pct >= minimum_coverage
-        and not entity_mismatch
         else None
     )
     confidence_pct = effective_confidence_pct(metrics, coverage_pct)
@@ -2982,7 +3017,6 @@ async def recompute(
                 "label": _t(locale, "Financial statement reconciliation"),
                 "detail": _t(locale, "The latest financial period contains values that require human reconciliation."),
                 "impact": "critical",
-                "metric_key": "gross_margin_pct",
             },
         )
     if entity_mismatch:
@@ -2990,13 +3024,14 @@ async def recompute(
             0,
             {
                 "key": "financial_entity_mismatch",
-                "label": _t(locale, "Financial statement entity mismatch"),
+                "label": _t(locale, "Financial statement identity warning"),
                 "detail": _t(
                     locale,
-                    "The available financial statements do not match the operating borrower identity and require human review.",
+                    "The statement name differs from the file identity. Its numbers remain available for provisional analysis; confirm the association before relying on them for a lender decision.",
                 ),
-                "impact": "critical",
-                "metric_key": "gross_margin_pct",
+                "impact": "medium",
+                "severity": "warning",
+                "blocks_file_acceptance": False,
             },
         )
 
@@ -3308,17 +3343,8 @@ async def review_snapshot(
                     "field": "financial_periods",
                 },
             )
-    if any(
-        item.get("key") == "financial_entity_mismatch"
-        for item in list(current.blockers or [])
-    ):
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "message": "Resolve the financial-statement entity mismatch before reviewing Capital Readiness",
-                "field": "financial_periods",
-            },
-        )
+    # An authorized reviewer can confirm the source association through the
+    # normal period review. A name warning alone never voids the analysis.
     now = datetime.now(UTC)
     clone = ApplicationCapitalReadinessSnapshot(
         profile_id=current.profile_id,

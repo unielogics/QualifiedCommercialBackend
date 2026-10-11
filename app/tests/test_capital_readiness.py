@@ -320,22 +320,33 @@ def test_incompatible_entities_are_never_aggregated() -> None:
     assert prior == []
 
 
-def test_canonical_entity_selects_borrower_instead_of_newest_related_entity() -> None:
+def test_canonical_name_is_not_an_analysis_admission_gate() -> None:
     borrower = _period(month=1, year=2025, entity="Operating Company, LLC")
     related = _period(month=2, year=2025, entity="Property Holding LLC")
     current, prior = compatible_period_windows(
         [related, borrower],
         canonical_entities={normalize_entity_name("Operating Company")},
     )
-    assert current == [borrower]
+    assert current == [related]
     assert prior == []
 
 
-def test_missing_canonical_entity_returns_no_scoring_window() -> None:
+def test_mismatched_name_keeps_a_coherent_scoring_window() -> None:
     related = _period(month=2, year=2025, entity="Property Holding LLC")
     assert compatible_period_windows(
         [related], canonical_entities={normalize_entity_name("Operating Company LLC")}
-    ) == ([], [])
+    ) == ([related], [])
+
+
+@pytest.mark.parametrize("context", [{"basis": "unknown"}, {"currency": "XXX"}])
+def test_unknown_context_never_combines_separate_observations(context: dict) -> None:
+    latest = _period(month=2, year=2025, **context)
+    previous = _period(month=1, year=2025, **context)
+    current, prior = compatible_period_windows([latest, previous])
+    assert current == [latest]
+    assert prior == []
+    totals = aggregate_period_window(current)
+    assert margin_value(totals["gross_profit"], totals["revenue"]) == Decimal("20")
 
 
 def test_current_evidence_filter_preserves_history_but_excludes_stale_sources() -> None:
@@ -543,7 +554,7 @@ def test_ai_context_is_bounded_and_prevents_ai_recalculation() -> None:
     assert "do not recalculate" in safeguards.lower()
     assert "cannot approve" in safeguards.lower()
     assert "Spanish" in safeguards
-    assert context["policy"]["formula_version"] == "score_v2"
+    assert context["policy"]["formula_version"] == "score_v2_numbers_first_v1"
 
 
 def test_client_safe_snapshot_removes_internal_action_and_review_identifiers() -> None:
