@@ -13,6 +13,7 @@ from uuid import uuid4
 import pytest
 from openpyxl import Workbook
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from app.routers import buckets as buckets_router
 from app.routers import dealer_ai_intake as intake_router
@@ -41,6 +42,19 @@ def _encrypted_pdf(user_password: str) -> bytes:
     writer = PdfWriter()
     writer.add_blank_page(width=72, height=72)
     writer.encrypt(user_password=user_password, owner_password="owner-secret")
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+def _searchable_financial_pdf() -> bytes:
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=300, height=300)
+    font = DictionaryObject({NameObject("/Type"): NameObject("/Font"), NameObject("/Subtype"): NameObject("/Type1"), NameObject("/BaseFont"): NameObject("/Helvetica")})
+    page[NameObject("/Resources")] = DictionaryObject({NameObject("/Font"): DictionaryObject({NameObject("/F1"): writer._add_object(font)})})
+    stream = DecodedStreamObject()
+    stream.set_data(b"BT /F1 12 Tf 20 250 Td (Gross revenue 100000) Tj 0 -20 Td (Cost of goods sold 87000) Tj 0 -20 Td (Net income 3000) Tj ET")
+    page[NameObject("/Contents")] = writer._add_object(stream)
     output = BytesIO()
     writer.write(output)
     return output.getvalue()
@@ -306,6 +320,7 @@ async def test_cached_statement_gets_numbers_first_diagnostics_without_provider_
         patch.object(bucket_ai, "_reconcile_analysis_consumers", AsyncMock()),
         patch.object(bucket_ai.merchant_processing, "is_offer_document", return_value=False),
         patch.object(bucket_ai, "tracked_messages_create", AsyncMock()) as model_call,
+        patch.object(bucket_ai, "_extract_pdf_text") as text_extraction,
     ):
         result = await bucket_ai.analyze_bucket_file(SimpleNamespace(), file)
     assert result is cached
@@ -316,6 +331,59 @@ async def test_cached_statement_gets_numbers_first_diagnostics_without_provider_
     model_call.assert_not_awaited()
     # Do not claim the old provider extraction used a new prompt policy.
     assert "financial_extraction_policy" not in cached.analysis
+    text_extraction.assert_not_called()
+    assert cached.analysis["financial_fact_citations"]["source_kind"] == "legacy"
+    assert cached.analysis["financial_fact_citations"]["statements"][0]["fact_citation_status"]["revenue"]["status"] == "unverified"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_mode", ["searchable", "timeout", "scanned", "changed_hash"])
+async def test_explicit_analysis_validates_real_pdf_quotes_and_reuses_exact_fetched_bytes(source_mode):
+    raw = _searchable_financial_pdf()
+    if source_mode == "scanned":
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=300)
+        output = BytesIO()
+        writer.write(output)
+        raw = output.getvalue()
+    file = SimpleNamespace(id=uuid4(), bucket_id=uuid4(), file_name="financials.pdf", content_type="application/pdf", content_hash=None, size_bytes=len(raw))
+    row = SimpleNamespace(id=uuid4(), bucket_file_id=file.id, status="pending", content_hash=bucket_ai._sha256_bytes(raw), analysis_version=bucket_ai.CURRENT_FILE_ANALYSIS_VERSION)
+    parsed = {"classification": "current_p_and_l", "confidence": "high", "summary": "Readable income statement", "key_facts": {"business_name": "Example LLC", "basis": "accrual", "currency": "USD", "period_start": "2025-01-01", "period_end": "2025-12-31", "gross_revenue": 100000, "cost_of_goods_sold": 87000, "net_income": 3000}, "fact_citations": {field: [{"page": 1, "line_label": label, "quote": f"{label} {value}", "value": value, "measure": field}] for field, label, value in (("revenue", "Gross revenue", 100000), ("cogs", "Cost of goods sold", 87000), ("net_income", "Net income", 3000))}}
+    response = SimpleNamespace(content=[SimpleNamespace(type="text", text=json.dumps(parsed))], stop_reason="end_turn", model="test-model", usage=None)
+    async def respond(*args, **kwargs):
+        if source_mode == "changed_hash":
+            file.content_hash = "b" * 64
+        return response
+    db = SimpleNamespace(flush=AsyncMock())
+    thread_parser = AsyncMock(side_effect=TimeoutError) if source_mode == "timeout" else bucket_ai.asyncio.to_thread
+    with (
+        patch.object(bucket_ai, "_lock_analysis_scope", AsyncMock()),
+        patch.object(bucket_ai, "reconcile_uploaded_file", AsyncMock()),
+        patch.object(bucket_ai, "_fetch_file", return_value=(raw, "application/pdf")) as fetch,
+        patch.object(bucket_ai, "_get_or_create_analysis_row", AsyncMock(return_value=row)),
+        patch.object(bucket_ai, "model_heavy", return_value="test-model"),
+        patch.object(bucket_ai, "get_client", return_value=object()),
+        patch.object(bucket_ai, "tracked_messages_create", AsyncMock(side_effect=respond)) as provider,
+        patch.object(bucket_ai.asyncio, "to_thread", thread_parser),
+        patch.object(bucket_ai, "_reconcile_analysis_consumers", AsyncMock()),
+        patch.object(bucket_ai.merchant_processing, "is_offer_document", return_value=False),
+    ):
+        result = await bucket_ai.analyze_bucket_file(db, file, force=True)
+    assert result.status == "completed"
+    citations = result.analysis["financial_fact_citations"]["statements"][0]["fact_citations"]
+    if source_mode == "searchable":
+        assert citations["revenue"][0]["quote"] == "Gross revenue 100000"
+        assert citations["revenue"][0]["content_hash"] == bucket_ai._sha256_bytes(raw)
+        assert citations["net_income"][0]["value"] == "3000"
+        provider_content = provider.await_args.kwargs["messages"][0]["content"]
+        assert any("Untrusted searchable PDF page anchors" in item.get("text", "") for item in provider_content)
+    else:
+        assert citations == {}
+        expected = "source_hash_mismatch" if source_mode == "changed_hash" else "source_not_searchable"
+        assert result.analysis["financial_fact_citations"]["statements"][0]["fact_citation_status"]["revenue"]["reason"] == expected
+        assert result.analysis["key_facts"]["gross_revenue"] == 100000
+    fetch.assert_called_once()
+    provider.assert_awaited_once()
 
 
 def test_review_preserves_deterministic_diagnostics_not_model_replacements():

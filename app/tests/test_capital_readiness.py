@@ -554,7 +554,7 @@ def test_ai_context_is_bounded_and_prevents_ai_recalculation() -> None:
     assert "do not recalculate" in safeguards.lower()
     assert "cannot approve" in safeguards.lower()
     assert "Spanish" in safeguards
-    assert context["policy"]["formula_version"] == "score_v2_numbers_first_v1"
+    assert context["policy"]["formula_version"] == "score_v2_cited_funding_v1"
 
 
 def test_client_safe_snapshot_removes_internal_action_and_review_identifiers() -> None:

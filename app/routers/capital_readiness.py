@@ -287,7 +287,7 @@ async def get_financial_periods(
 ) -> list[FinancialPeriodRead]:
     _require_role(user, _FINANCIAL_EDIT_ROLES, "You cannot view internal financial periods")
     profile = await profiles.load_profile(db, profile_id, user)
-    rows = await capital_readiness.list_financial_periods(db, profile.id)
+    rows = await capital_readiness.list_financial_periods(db, profile.id, profile=profile)
     return [capital_readiness.period_read(row) for row in rows]
 
 
@@ -332,6 +332,8 @@ async def review_financial_period(
     if row is None or row.profile_id != profile.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Financial period not found")
     if row.review_status == payload.status:
+        files, analyses = await capital_readiness._current_evidence_sources(db, profile)
+        capital_readiness.attach_financial_period_citations([row], files=files, newest_analyses=analyses)
         return capital_readiness.period_read(row)
     if row.review_status in {"rejected", "superseded"}:
         raise HTTPException(status.HTTP_409_CONFLICT, "A final financial-period decision cannot be changed")

@@ -9,7 +9,7 @@ from app.services.program_rules import evaluate_rules, validate_rules
 
 
 def _snapshot(*, review_status="confirmed", source=None):
-    return SimpleNamespace(review_status=review_status, metrics=[{"key": "gross_margin_pct", "value": 13, "status": "healthy", "source": source or {"review_statuses": ["confirmed"]}}])
+    return SimpleNamespace(review_status=review_status, metrics=[{"key": "gross_margin_pct", "value": 13, "status": "healthy", "source": source or {"review_statuses": ["confirmed"], "citation_status": "verified"}}])
 
 
 def test_program_margin_rule_requires_explicit_published_criterion():
@@ -26,8 +26,19 @@ def test_provisional_and_self_reported_results_never_satisfy_program_rules():
         _snapshot(source={"review_statuses": ["confirmed"], "verification_status": "self_reported_unverified"}),
         _snapshot(source={"review_statuses": ["confirmed"], "needs_reconciliation_review": True}),
         _snapshot(source={"review_statuses": ["confirmed"], "not_applicable": True}),
+        _snapshot(source={"review_statuses": ["confirmed"]}),
+        _snapshot(source={"review_statuses": ["confirmed"], "citation_status": "unverified", "source_kinds": ["ai_extracted"]}),
     ]:
         assert reviewed_profitability_facts(snapshot) == {"gross_margin_pct": None, "net_margin_pct": None}
+
+
+def test_only_explicit_staff_attested_non_ai_sources_can_omit_document_quotes():
+    assert reviewed_profitability_facts(_snapshot(source={
+        "review_statuses": ["confirmed"], "source_kinds": ["stated"], "citation_status": "unverified",
+    }))["gross_margin_pct"] == 13
+    assert reviewed_profitability_facts(_snapshot(source={
+        "review_statuses": ["confirmed"], "source_kinds": ["self_reported"], "citation_status": "unverified",
+    }))["gross_margin_pct"] is None
 
 
 def test_recalculation_does_not_route_using_an_old_confirmed_margin():

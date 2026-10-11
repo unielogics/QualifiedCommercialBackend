@@ -48,12 +48,17 @@ from app.schemas.capital_readiness import (
     ReadinessActionRead,
 )
 from app.services.capital_readiness_ingestion import ingest_profile_financial_periods
+from app.services.financial_fact_citations import (
+    financial_period_citation_status,
+    validated_fact_citations_for_period,
+)
+from app.services.funding_path_assessment import assess_funding_paths
 from app.services.operator_file_links import selected_files_for_intake
 
 log = logging.getLogger(__name__)
 
 POLICY_KEY = "qc_lending_margin_v1"
-FORMULA_VERSION = "score_v2_numbers_first_v1"
+FORMULA_VERSION = "score_v2_cited_funding_v1"
 MONEY_TOLERANCE = Decimal("1.00")
 STATUS_SCORE = {
     "concerning": Decimal("25"),
@@ -530,6 +535,68 @@ async def _validate_profile_evidence(
     return file_row, analysis
 
 
+def attach_financial_period_citations(
+    periods: list[ApplicationFinancialPeriod],
+    *,
+    files: dict[UUID, BucketFile],
+    newest_analyses: dict[UUID, BucketFileAnalysis],
+) -> None:
+    """Enrich authorized reads without fetching bytes or rewriting history.
+
+    A historical value remains readable when its source was retired, but must
+    never link to replacement bytes or be represented as a verified citation.
+    """
+    for period in periods:
+        file = files.get(period.source_file_id)
+        analysis = newest_analyses.get(period.source_file_id)
+        current = bool(
+            file is not None and file.content_hash
+            and file.content_hash == period.content_hash
+            and analysis is not None and analysis.id == period.source_analysis_id
+        )
+        citations = validated_fact_citations_for_period(period, analysis) if current else {}
+        statuses = financial_period_citation_status(period, analysis if current else None)
+        period.fact_citations = {
+            field: [{**citation, "file_name": str(file.file_name or "")[:255]}
+                    for citation in values]
+            for field, values in citations.items()
+        }
+        period.fact_citation_status = statuses
+
+
+def metric_citation_metadata(
+    periods: list[ApplicationFinancialPeriod], fields: tuple[str, ...]
+) -> dict[str, Any]:
+    """Every contributing numerator and denominator needs its own lineage."""
+    citations: list[dict] = []
+    verified = 0
+    reasons: list[str] = []
+    for period in periods:
+        period_citations = getattr(period, "fact_citations", {}) or {}
+        statuses = getattr(period, "fact_citation_status", {}) or {}
+        for field in fields:
+            found = period_citations.get(field) or []
+            state = statuses.get(field) or {}
+            if found and state.get("status") == "verified":
+                verified += 1
+                citations.extend(found[:4])
+            else:
+                reasons.append(str(state.get("reason") or "source_reference_needs_review"))
+    total = len(periods) * len(fields)
+    citation_status = "verified" if total and verified == total else "partial" if verified else "unverified"
+    # Preserve order while deduplicating derived inputs shared by both fields.
+    unique: dict[str, dict] = {}
+    for citation in citations:
+        key = json.dumps(citation, sort_keys=True)
+        unique.setdefault(key, citation)
+    return {
+        "fact_citations": list(unique.values())[:24],
+        "citation_status": citation_status,
+        "citation_reason": "exact_searchable_source_quotes" if citation_status == "verified"
+        else "; ".join(dict.fromkeys(reasons))[:400] or "source_reference_needs_review",
+    }
+
+
 def period_read(row: ApplicationFinancialPeriod) -> FinancialPeriodRead:
     derived = (
         Decimal(row.revenue) - Decimal(row.cogs)
@@ -563,6 +630,8 @@ def period_read(row: ApplicationFinancialPeriod) -> FinancialPeriodRead:
         extractor_version=row.extractor_version,
         content_hash=row.content_hash,
         reconciliation_warnings=list(row.reconciliation_warnings or []),
+        fact_citations=getattr(row, "fact_citations", {}) or {},
+        fact_citation_status=getattr(row, "fact_citation_status", {}) or {},
         created_at=row.created_at,
         reviewed_at=row.reviewed_at,
         reviewed_by_user_id=row.reviewed_by_user_id,
@@ -648,9 +717,9 @@ async def create_financial_period(
 
 
 async def list_financial_periods(
-    db: AsyncSession, profile_id: UUID
+    db: AsyncSession, profile_id: UUID, *, profile: ApplicationProfile | None = None
 ) -> list[ApplicationFinancialPeriod]:
-    return list(
+    rows = list(
         (
             await db.execute(
                 select(ApplicationFinancialPeriod)
@@ -664,6 +733,10 @@ async def list_financial_periods(
         .scalars()
         .all()
     )
+    if profile is not None:
+        files, analyses = await _current_evidence_sources(db, profile)
+        attach_financial_period_citations(rows, files=files, newest_analyses=analyses)
+    return rows
 
 
 def period_compatibility_key(period: ApplicationFinancialPeriod) -> tuple[str, str, str, str]:
@@ -1781,6 +1854,9 @@ async def _calculation_inputs(
         files=source_files,
         newest_analyses=newest_analyses,
     )
+    attach_financial_period_citations(
+        periods, files=source_files, newest_analyses=newest_analyses
+    )
     facts = list(
         (
             await db.execute(
@@ -1837,6 +1913,12 @@ def _fingerprint(
         "periods": sorted(
             (str(row.id), row.content_hash, row.review_status) for row in periods
         ),
+        "financial_citations": [
+            {"period_id": str(row.id),
+             "citations": getattr(row, "fact_citations", {}) or {},
+             "statuses": getattr(row, "fact_citation_status", {}) or {}}
+            for row in periods
+        ],
         "facts": sorted(
             (
                 str(row.id),
@@ -1872,6 +1954,9 @@ def _fingerprint(
                 row.playbook_version,
                 row.recommendation_status,
                 tuple(row.reasons),
+                getattr(row, "rule_state", "unavailable"),
+                getattr(row, "rule_results", []),
+                getattr(row, "fact_sources", {}),
             )
             for row in program_candidates
         ],
@@ -2001,6 +2086,131 @@ def _commercial_terms_snapshot(
     }
 
 
+def _funding_path_from_manifest(manifest: list[dict]) -> dict:
+    return next((dict(item["assessment"]) for item in manifest
+                 if item.get("kind") == "advisory_funding_path"
+                 and isinstance(item.get("assessment"), dict)), {})
+
+
+def _funding_path_presentation(path: dict, *, locale: str, client_safe: bool) -> dict:
+    result = json.loads(json.dumps(path))
+    if not result:
+        return result
+    if client_safe:
+        result.pop("program_results", None)
+        # Raw rule/source prose is an internal diagnostic, never client copy.
+        result["evidence_gaps"] = []
+    if locale == "es" or client_safe:
+        copy = {
+            "potential_program_fit": (
+                "Verified facts support a potential program fit; full underwriting and lender review are still required.",
+                "Los datos verificados indican una posible compatibilidad con un programa; aún se requieren evaluación completa y revisión del prestamista.",
+                "Review the program's document requirements with the underwriting team.",
+                "Revise los documentos requeridos del programa con el equipo de evaluación."),
+            "needs_evidence": (
+                "More evidence is needed before assessing program fit. This is not a denial.",
+                "Se necesita más evidencia antes de evaluar programas. Esto no es una denegación.",
+                "Collect the missing information and reassess.",
+                "Reúna la información faltante y vuelva a evaluar."),
+            "capital_readiness_recommended": (
+                "Documented financial gaps support a Capital Readiness improvement plan; no current program fit has been established.",
+                "Las brechas financieras documentadas justifican un plan de preparación de capital; aún no se ha establecido compatibilidad con un programa.",
+                "Review the financial blockers and prepare an action plan with the underwriting team.",
+                "Revise las brechas financieras y prepare un plan de acción con el equipo de evaluación."),
+            "criteria_unavailable": (
+                "Applicable published criteria are not configured. This is not an adverse finding about the client.",
+                "No hay criterios publicados aplicables configurados. Esto no es una conclusión negativa sobre el cliente.",
+                "Ask staff to configure the applicable program criteria before reassessment.",
+                "Solicite al equipo que configure los criterios aplicables antes de una nueva evaluación."),
+            "needs_review": (
+                "The source facts or evaluated rules require underwriting review. This is neither approval nor denial.",
+                "Los datos de origen o las reglas evaluadas requieren revisión. Esto no es aprobación ni denegación.",
+                "Review the cited facts and failed or unresolved rules with authorized staff.",
+                "Revise los datos citados y las reglas incumplidas o pendientes con personal autorizado."),
+        }.get(result.get("status"))
+        if copy:
+            result["reasons"] = [copy[1 if locale == "es" else 0]]
+            result["next_actions"] = [copy[3 if locale == "es" else 2]]
+    return result
+
+
+def _safe_financial_warnings(warnings: list, *, locale: str) -> list[dict]:
+    """Only deterministic diagnostics enter client copy or model context.
+
+    Reviewer notes, arbitrary text and internal source IDs remain staff-only.
+    """
+    copy = {
+        "gross_profit_reconciliation": ("Printed gross profit differs from revenue minus COGS; reconciliation is required.", "La utilidad bruta indicada difiere de ingresos menos costo de ventas; requiere conciliación."),
+        "nonpositive_revenue": ("Margins are unavailable when revenue is zero or negative.", "Los márgenes no están disponibles cuando los ingresos son cero o negativos."),
+        "cogs_applicability_unknown": ("Missing COGS is unknown, not zero; confirm whether it applies.", "El costo de ventas faltante es desconocido, no cero; confirme si aplica."),
+        "financial_entity_unidentified": ("Confirm the statement's association; its source-local figures remain available.", "Confirme la vinculación del estado financiero; sus cifras siguen disponibles."),
+        "financial_source_context_invalid": ("Review the statement context before relying on these provisional figures.", "Revise el contexto del estado financiero antes de utilizar estas cifras provisionales."),
+        "financial_accounting_basis_unknown": ("Accounting basis is unknown; do not combine these figures with other statements.", "La base contable es desconocida; no combine estas cifras con otros estados financieros."),
+        "financial_currency_unknown": ("Currency is unknown; do not combine these amounts with another source.", "La moneda es desconocida; no combine estos importes con otra fuente."),
+    }
+    return [{"code": warning["code"], "severity": str(warning.get("severity") or "evidence_gap")[:40],
+             "detail": copy[warning["code"]][1 if locale == "es" else 0]}
+            for warning in warnings[:24] if isinstance(warning, dict) and warning.get("code") in copy][:8]
+
+
+def _bounded_rule_context(rules: list, *, budget: int = 2500) -> list[dict]:
+    """A rule explanation carries traceable facts, not an entire file history."""
+    output: list[dict] = []
+    used = 0
+    for rule in rules[:12]:
+        if not isinstance(rule, dict):
+            continue
+        row = {key: rule.get(key) for key in ("field", "operator", "required", "observed", "status", "negated", "verification_status")}
+        for key in ("required", "observed"):
+            if len(json.dumps(row[key], default=str)) > 500:
+                row[key] = None
+                row[f"{key}_omitted"] = "context_size_limit"
+        refs = []
+        for ref in list(rule.get("source_refs") or [])[:4]:
+            if not isinstance(ref, dict):
+                continue
+            source = {key: ref.get(key) for key in ("kind", "id", "period_id", "file_id", "analysis_id", "source_file_id", "source_analysis_id", "content_hash", "review_status") if ref.get(key) is not None}
+            source["fact_citations"] = [
+                {key: citation.get(key) for key in ("file_id", "analysis_id", "content_hash", "page", "line_label", "tax_form", "tax_line", "field", "value", "verified")}
+                for citation in list(ref.get("fact_citations") or [])[:4]
+                if isinstance(citation, dict) and citation.get("verified") is True
+            ]
+            refs.append(source)
+        row["source_refs"] = refs
+        size = len(json.dumps(row, default=str))
+        if used + size > budget:
+            # Keep the exact rule/value explanation even when all source
+            # details cannot fit. Never turn omitted evidence into a new fact.
+            row["source_refs"] = []
+            row["source_details_omitted"] = "context_size_limit"
+            size = len(json.dumps(row, default=str))
+        if used + size > budget:
+            break
+        output.append(row)
+        used += size
+    return output
+
+
+def _funding_path_ai_context(path: dict, *, locale: str, client_safe: bool) -> dict:
+    result = _funding_path_presentation(path, locale=locale, client_safe=client_safe)
+    raw = result.pop("program_results", [])
+    if client_safe or not result:
+        return result
+    result["program_results"] = []
+    budget = 16000
+    for candidate in raw[:30]:
+        row = {key: candidate.get(key) for key in ("program_key", "program_name", "playbook_version", "eligible", "criteria_status", "scope_status", "rule_state", "requires_review")}
+        row["rule_results"] = _bounded_rule_context(list(candidate.get("rule_results") or []))
+        size = len(json.dumps(row, default=str))
+        if size > budget:
+            break
+        result["program_results"].append(row)
+        budget -= size
+    result["program_results_omitted"] = max(0, len(raw) - len(result["program_results"]))
+    result["evidence_gaps"] = [str(gap)[:150] for gap in list(result.get("evidence_gaps") or [])[:20]]
+    return result
+
+
 def _snapshot_read(
     row: ApplicationCapitalReadinessSnapshot,
     *,
@@ -2009,6 +2219,9 @@ def _snapshot_read(
 ) -> CapitalReadinessRead:
     metrics = json.loads(json.dumps(list(row.metrics or [])))
     source_manifest = json.loads(json.dumps(list(row.source_manifest or [])))
+    funding_path = _funding_path_from_manifest(source_manifest)
+    if funding_path:
+        funding_path["readiness_review_status"] = row.review_status
     phases = json.loads(json.dumps(list(row.phases or [])))
     material_change = (
         json.loads(json.dumps(dict(row.material_change)))
@@ -2098,6 +2311,9 @@ def _snapshot_read(
             "content_hashes",
             "addback_ids",
             "lender_accepted_addback_ids",
+            "fact_citations",
+            "fact_citation_status",
+            "citation_reason",
         }
         for metric in metrics:
             metric["source_period_id"] = None
@@ -2107,6 +2323,10 @@ def _snapshot_read(
                 for key, value in source.items()
                 if key not in sensitive_source_keys
             }
+            if "context_warnings" in metric["source"]:
+                metric["source"]["context_warnings"] = _safe_financial_warnings(
+                    list(source.get("context_warnings") or []), locale=presentation_locale
+                )
         source_manifest = []
         reviewed_by_user_id = None
         if material_change:
@@ -2138,6 +2358,8 @@ def _snapshot_read(
             # untranslated rule prose. Client reads keep stable status/keys and
             # verified gap states without mixed-language free text.
             opportunity.pop("reasons", None)
+            for key in ("rule_results", "fact_sources", "evidence_gaps"):
+                opportunity.pop(key, None)
             for gap in list(opportunity.get("verified_gaps") or []):
                 gap.pop("label", None)
     return CapitalReadinessRead(
@@ -2162,6 +2384,9 @@ def _snapshot_read(
         blockers=blockers,
         phases=phases,
         program_opportunities=program_opportunities,
+        funding_path=_funding_path_presentation(
+            funding_path, locale=presentation_locale, client_safe=client_safe
+        ),
         source_manifest=source_manifest,
         created_at=row.created_at,
         reviewed_at=row.reviewed_at,
@@ -2202,15 +2427,13 @@ def build_ai_context(
             "accounting_basis": (item.get("source") or {}).get("accounting_basis"),
             "currency": (item.get("source") or {}).get("currency"),
             "source_period_ids": list((item.get("source") or {}).get("source_period_ids") or [])[:24],
-            "context_warnings": [
-                {
-                    "code": str(warning.get("code") or "")[:80],
-                    "severity": str(warning.get("severity") or "")[:40],
-                    "detail": str(warning.get("detail") or "")[:500],
-                }
-                for warning in list((item.get("source") or {}).get("context_warnings") or [])[:8]
-                if isinstance(warning, dict)
-            ],
+            "citation_status": (item.get("source") or {}).get("citation_status", "unverified"),
+            "fact_citations": list((item.get("source") or {}).get("fact_citations") or [])[:24]
+            if not client_safe else [],
+            "context_warnings": _safe_financial_warnings(
+                list((item.get("source") or {}).get("context_warnings") or []),
+                locale=snapshot.communication_locale,
+            ),
         }
         for item in list(snapshot.metrics or [])[:20]
     ]
@@ -2224,6 +2447,9 @@ def build_ai_context(
         for item in list(snapshot.source_manifest or [])[:30]
     ] if not client_safe else []
     locale = snapshot.communication_locale if snapshot.communication_locale in {"en", "es"} else "en"
+    if client_safe:
+        for metric in metrics:
+            metric.pop("source_period_ids", None)
     return {
         "schema": "capital_readiness_ai_context_v1",
         "policy": {
@@ -2242,6 +2468,10 @@ def build_ai_context(
             "review_status": snapshot.review_status,
         },
         "metrics": metrics,
+        "funding_path": _funding_path_ai_context(
+            _funding_path_from_manifest(list(snapshot.source_manifest or [])),
+            locale=locale, client_safe=client_safe,
+        ),
         "strengths": list(snapshot.strengths or [])[:10],
         "blockers": list(snapshot.blockers or [])[:10],
         "phases": [
@@ -2258,6 +2488,9 @@ def build_ai_context(
                 "commercial_terms_version": item.get("commercial_terms_version"),
                 "qc_fee_cap_percent": item.get("qc_fee_cap_percent"),
                 "qc_fee_label": item.get("qc_fee_label"),
+                "rule_state": item.get("rule_state"),
+                "rule_results": _bounded_rule_context(list(item.get("rule_results") or []), budget=1000)
+                if not client_safe else [],
                 "verified_gaps": [
                     {
                         "requirement_key": gap.get("requirement_key"),
@@ -2278,6 +2511,8 @@ def build_ai_context(
             "Capital Readiness is advisory and cannot approve, deny, or advance a file.",
             "A statement-name mismatch is a warning, not a reason to reject or ignore readable financial numbers. Explain it alongside provisional source-local metrics.",
             "Never combine revenue and profit from different statements, periods, accounting bases or currencies; bank deposits are not revenue and cash movement is not net income.",
+            "Explain each financial conclusion using its supplied calculation and verified file/page/printed-line citation. If no validated citation exists, say the source reference needs review; never invent a line or treat that as a rejected document.",
+            "Distinguish potential program fit, missing evidence, criteria configuration gaps, source review, and financial remediation. Only published, in-scope rules can support a program match; a readiness score cannot establish eligibility.",
             (
                 "Respond only in Spanish."
                 if locale == "es"
@@ -2517,17 +2752,50 @@ async def recompute(
     ) and not reconciliation_pending and not property_only and all(
         not period_compatibility_key(row)[3] for row in current_periods
     )
+    gross_citations = metric_citation_metadata(current_periods, ("revenue", "gross_profit"))
+    net_citations = metric_citation_metadata(current_periods, ("revenue", "net_income"))
+
+    def margin_lineage_ready(fields: tuple[str, ...]) -> bool:
+        return margins_fit_ready and all(
+            source_period.source_kind != "ai_extracted"
+            or all((getattr(source_period, "fact_citation_status", {}).get(field) or {}).get("status") == "verified"
+                   for field in fields)
+            for source_period in current_periods
+        )
+
+    gross_fit_ready = margin_lineage_ready(("revenue", "gross_profit"))
+    net_fit_ready = margin_lineage_ready(("revenue", "net_income"))
+    metric_sources = {
+        key: {
+            "verification_status": "verified" if ready else "provisional",
+            "source_refs": [{
+                "period_id": str(source_period.id),
+                "file_id": str(source_period.source_file_id) if source_period.source_file_id else None,
+                "analysis_id": str(source_period.source_analysis_id) if source_period.source_analysis_id else None,
+                "content_hash": source_period.content_hash,
+                "review_status": source_period.review_status,
+                "source_kind": source_period.source_kind,
+                "fact_citations": [citation for field in fields
+                                   for citation in (getattr(source_period, "fact_citations", {}).get(field) or [])][:8],
+            } for source_period in current_periods[:24]],
+        }
+        for key, ready, fields in (
+            ("gross_margin_pct", gross_fit_ready, ("revenue", "gross_profit")),
+            ("net_margin_pct", net_fit_ready, ("revenue", "net_income")),
+        )
+    }
     program_candidates = await application_programs.published_candidates(
         db,
         profile,
         readiness_metric_overrides={
             "gross_margin_pct": _float(gross_margin_candidate)
-            if margins_fit_ready
+            if gross_fit_ready
             else None,
             "net_margin_pct": _float(net_margin_candidate)
-            if margins_fit_ready
+            if net_fit_ready
             else None,
         },
+        readiness_metric_sources=metric_sources,
     )
     program_commercial_terms = await funding_programs.commercial_terms_by_program(
         db,
@@ -2604,6 +2872,7 @@ async def recompute(
         if prior_periods
         else None,
         "review_statuses": review_statuses,
+        "source_kinds": sorted({row.source_kind for row in current_periods}),
         "identity_warning": entity_mismatch,
         "provisional": any(
             row.review_status != "confirmed" or bool(period_compatibility_key(row)[3])
@@ -2628,6 +2897,7 @@ async def recompute(
             confidence=confidence,
             source={
                 **common_source,
+                **gross_citations,
                 "trend_percentage_points": _float(gross_trend),
                 "property_policy": "noi_dscr" if property_only else None,
                 "not_applicable": property_only,
@@ -2652,6 +2922,7 @@ async def recompute(
             confidence=confidence,
             source={
                 **common_source,
+                **net_citations,
                 "trend_percentage_points": _float(net_trend),
                 "property_policy": "noi_dscr" if property_only else None,
                 "not_applicable": property_only,
@@ -2984,6 +3255,26 @@ async def recompute(
         if item["status"] in {"healthy", "very_strong"}
         and not item.get("source", {}).get("informational")
     ]
+    def advisory_metric_verified(item: dict) -> bool:
+        source = item.get("source") or {}
+        if source.get("provisional") or source.get("verification_status") == "self_reported_unverified":
+            return False
+        if item["key"] == "gross_margin_pct":
+            return gross_fit_ready
+        if item["key"] == "net_margin_pct":
+            return net_fit_ready
+        if item["key"] == "current_dscr":
+            return source.get("kind") == "underwriting" and source.get("reviewed") is True
+        if source.get("verification_status") == "verified":
+            return True
+        fact_id = source.get("fact_id")
+        return bool(fact_id and any(
+            str(fact.id) == fact_id and getattr(fact, "reviewed_by_user_id", None)
+            and (fact.source_file_id is None and fact.source_analysis_id is None)
+            and getattr(fact, "extraction_method", "document_ai") != "document_ai"
+            for fact in facts
+        ))
+
     blockers = [
         {
             "key": f"blocker_{item['key']}",
@@ -3003,6 +3294,9 @@ async def recompute(
             ),
             "impact": "high" if item["status"] == "concerning" else "medium",
             "metric_key": item["key"],
+            "severity": "financial_finding" if item["status"] == "concerning" else "evidence_gap",
+            "missing_evidence": item["status"] == "unavailable",
+            "verification_status": "verified" if advisory_metric_verified(item) else "provisional",
         }
         for item in metrics
         if item["status"] in {"concerning", "unavailable"}
@@ -3036,7 +3330,12 @@ async def recompute(
         )
 
     source_manifest: list[dict[str, Any]] = [
-        _policy_lineage(policy)
+        _policy_lineage(policy),
+        {"kind": "advisory_funding_path", "assessment": assess_funding_paths(
+            program_candidates,
+            readiness_blockers=blockers,
+            readiness_state="awaiting_review" if reconciliation_pending or entity_mismatch else "provisional",
+        )},
     ]
     source_manifest.extend(
         {
@@ -3050,12 +3349,15 @@ async def recompute(
             if source_period.source_analysis_id
             else None,
             "review_status": source_period.review_status,
+            "source_kind": source_period.source_kind,
             "entity_name": source_period.entity_name,
             "accounting_basis": source_period.accounting_basis,
             "currency": source_period.currency,
             "period_start": source_period.period_start.isoformat(),
             "period_end": source_period.period_end.isoformat(),
             "months_covered": source_period.months_covered,
+            "fact_citations": getattr(source_period, "fact_citations", {}) or {},
+            "fact_citation_status": getattr(source_period, "fact_citation_status", {}) or {},
             "window": "current" if source_period in current_periods else "comparison",
         }
         for source_period in [*current_periods, *prior_periods]
@@ -3170,6 +3472,12 @@ async def recompute(
                         program_commercial_terms.get(candidate.catalog_id) or [],
                     ),
                     "reasons": list(candidate.reasons),
+                    "scope_status": getattr(candidate, "scope_status", "unknown"),
+                    "rule_state": getattr(candidate, "rule_state", "unavailable"),
+                    "rule_results": list(getattr(candidate, "rule_results", []) or []),
+                    "fact_sources": getattr(candidate, "fact_sources", {}) or {},
+                    "evidence_gaps": list(getattr(candidate, "evidence_gaps", []) or []),
+                    "requires_review": bool(getattr(candidate, "requires_review", False)),
                     "selected": any(
                         item.program_key == candidate.program_key for item in programs
                     ),

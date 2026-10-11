@@ -205,6 +205,12 @@ def statement_profitability_diagnostics(analysis: BucketFileAnalysis) -> list[di
     indexes = list(range(min(len(statements), 60))) if isinstance(statements, list) and statements else [None]
     # Imported lazily because the readiness service also imports this bridge.
     from app.services.capital_readiness import classify_gross_margin, classify_net_margin
+    from app.services.financial_fact_citations import (
+        financial_analysis_citation_status,
+        financial_period_citation_status,
+        validated_fact_citations_for_analysis,
+        validated_fact_citations_for_period,
+    )
 
     diagnostics = []
     for index in indexes:
@@ -270,6 +276,8 @@ def statement_profitability_diagnostics(analysis: BucketFileAnalysis) -> list[di
             "net_margin_pct": float(net_margin) if net_margin is not None else None,
             "net_margin_unrounded": str(net_margin) if net_margin is not None else None,
             "net_margin_status": classify_net_margin(net_margin),
+            "fact_citations": validated_fact_citations_for_period(payload, analysis) if payload is not None else validated_fact_citations_for_analysis(analysis, statement_index=index),
+            "fact_citation_status": financial_period_citation_status(payload, analysis) if payload is not None else financial_analysis_citation_status(analysis, statement_index=index),
             "warnings": warnings,
         })
     return diagnostics

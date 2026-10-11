@@ -124,6 +124,8 @@ class FinancialPeriodRead(BaseModel):
     extractor_version: str | None = None
     content_hash: str
     reconciliation_warnings: list[dict] = Field(default_factory=list)
+    fact_citations: dict[str, list[dict]] = Field(default_factory=dict)
+    fact_citation_status: dict[str, dict] = Field(default_factory=dict)
     created_at: datetime
     reviewed_at: datetime | None = None
     reviewed_by_user_id: UUID | None = None
@@ -293,6 +295,7 @@ class CapitalReadinessRead(BaseModel):
     blockers: list[ReadinessSignal] = Field(default_factory=list)
     phases: list[ReadinessPhase] = Field(default_factory=list)
     program_opportunities: list[dict] = Field(default_factory=list)
+    funding_path: dict = Field(default_factory=dict)
     source_manifest: list[dict] = Field(default_factory=list)
     created_at: datetime
     reviewed_at: datetime | None = None

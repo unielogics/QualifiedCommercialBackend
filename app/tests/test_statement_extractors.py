@@ -97,6 +97,25 @@ def test_tax_returns_for_separate_entities_are_not_overwritten_by_year():
     assert {row["file_id"] for row in returns} == {"a", "b"}
 
 
+def test_tax_earnings_measures_are_distinct_and_cannot_become_net_margin_inputs():
+    rows = pdf.extract_tax_years([_doc("tax_return", {
+        "tax_year": 2025, "business_name": "Example LLC", "gross_income": 100000,
+        "ordinary_business_income": 12000, "taxable_income": 11000, "net_income_per_books": 8000,
+    })])
+    row = rows[0]
+    assert row["gross_receipts"] is None
+    assert row["net_income"] is None
+    assert row["net_income_per_books"] == 8000
+    assert row["ordinary_business_income"] == 12000
+    assert row["taxable_income"] == 11000
+    assert row["financial_measures"]["ordinary_business_income"]["measure"] == "ordinary_business_income"
+    assert row["financial_measures"]["ordinary_business_income"]["fact_citation_status"]["status"] == "unverified"
+    assert row["period_start"] is None and row["period_end"] is None
+    html = pdf._tax_section(rows)
+    assert "Net income per books" in html
+    assert "Earnings measure" in html
+
+
 def test_lender_brief_never_labels_bank_inflows_as_annual_revenue():
     html = pdf._executive_metric_tiles(
         intake=SimpleNamespace(requested_loan_amount=None),

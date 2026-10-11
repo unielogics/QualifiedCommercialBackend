@@ -133,6 +133,12 @@ class ProgramFitCandidate(BaseModel):
     preference_score: int = 0
     preference_reasons: list[str] = Field(default_factory=list)
     reasons: list[str] = Field(default_factory=list)
+    scope_status: Literal["matched", "unknown", "outside_scope"] = "unknown"
+    rule_state: Literal["pass", "fail", "unknown", "unavailable"] = "unavailable"
+    rule_results: list[dict] = Field(default_factory=list)
+    fact_sources: dict = Field(default_factory=dict)
+    evidence_gaps: list[str] = Field(default_factory=list)
+    requires_review: bool = False
 
 
 class ApplicationProgramSelectionRead(BaseModel):

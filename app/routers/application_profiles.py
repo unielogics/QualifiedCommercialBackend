@@ -9,10 +9,20 @@ import re
 import secrets
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Annotated
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from sqlalchemy import func, or_, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
@@ -4664,6 +4674,7 @@ async def get_application_evidence_file_url(
     file_id: UUID,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
+    expected_content_hash: Annotated[str | None, Query(pattern=r"^[a-fA-F0-9]{64}$")] = None,
 ) -> dict:
     if not _can_review_manual_bank_evidence(user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Evidence review role required")
@@ -4674,6 +4685,13 @@ async def get_application_evidence_file_url(
     file = await db.get(BucketFile, file_id)
     if file is None or file.status != "uploaded" or file.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence file not found")
+    if expected_content_hash is not None and (
+        not file.content_hash or file.content_hash.casefold() != expected_content_hash.casefold()
+    ):
+        raise HTTPException(status.HTTP_409_CONFLICT, {
+            "code": "evidence_source_changed",
+            "message": "The cited document version changed. Review the current source before relying on this reference.",
+        })
     from app.routers.buckets import _download_url
 
     await profiles.log_profile_action(db, profile, user, "evidence.preview", f"Opened {file.file_name}", target_type="file", target_id=file.id)

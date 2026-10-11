@@ -7,6 +7,7 @@ import math
 import re
 from datetime import UTC, datetime
 from html import escape
+from types import SimpleNamespace
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -611,13 +612,11 @@ _TAX_KEYS = (
 # plain 1120-S naming (2023-style) and the current/prior-year naming (2024-style).
 _GROSS_RECEIPTS_ALIASES = (
     "gross_receipts", "gross_receipts_current_year", "gross_receipts_or_sales",
-    "gross_sales", "gross_income", "total_revenue",
+    "gross_sales", "total_revenue",
 )
-_NET_INCOME_ALIASES = (
-    "net_income", "ordinary_business_income", "ordinary_business_income_loss_current",
-    "ordinary_business_income_loss", "net_income_per_books_current",
-    "net_income_per_books", "taxable_income",
-)
+_NET_INCOME_ALIASES = ("net_income", "net_profit")
+_BOOK_NET_INCOME_ALIASES = ("net_income_per_books_current", "net_income_per_books")
+_ORDINARY_BUSINESS_INCOME_ALIASES = ("ordinary_business_income", "ordinary_business_income_loss_current", "ordinary_business_income_loss")
 _TOTAL_INCOME_ALIASES = ("total_income", "total_income_current", "total_income_line6")
 
 # Classifications that carry revenue-like line items but are NOT tax returns, so the
@@ -673,9 +672,38 @@ def extract_tax_years(analyses: list[dict[str, Any]], limit: int = 2) -> list[di
             "period_start": _iso_date(facts.get("period_start")),
             "period_end": _iso_date(facts.get("period_end")),
             "gross_receipts": _first_num(_GROSS_RECEIPTS_ALIASES),
+            "gross_income": _first_num(("gross_income",)),
             "net_income": _first_num(_NET_INCOME_ALIASES),
+            "net_income_per_books": _first_num(_BOOK_NET_INCOME_ALIASES),
+            "ordinary_business_income": _first_num(_ORDINARY_BUSINESS_INCOME_ALIASES),
+            "taxable_income": _first_num(("taxable_income",)),
             "total_income": _first_num(_TOTAL_INCOME_ALIASES),
         }
+        rec["financial_measures"] = {
+            field: {"value": rec[field], "measure": field}
+            for field in ("gross_receipts", "gross_income", "net_income", "net_income_per_books", "ordinary_business_income", "taxable_income", "total_income")
+            if rec.get(field) is not None
+        }
+        # Only a server-validated manifest with independently supplied source
+        # IDs/hash can decorate these values. Raw model references are never
+        # trusted, and a legacy packet remains informative but unverified.
+        from app.services.financial_fact_citations import (
+            financial_analysis_citation_status,
+            validated_fact_citations_for_analysis,
+        )
+
+        source_analysis = SimpleNamespace(
+            id=item.get("analysis_id"), bucket_file_id=item.get("file_id"),
+            content_hash=item.get("content_hash"), status="completed",
+            analysis={"key_facts": facts, "financial_fact_citations": item.get("financial_fact_citations")},
+        )
+        citations = validated_fact_citations_for_analysis(source_analysis)
+        citation_statuses = financial_analysis_citation_status(source_analysis)
+        for field, measure in rec["financial_measures"].items():
+            canonical = "revenue" if field == "gross_receipts" else field
+            measure["canonical_measure"] = canonical
+            measure["fact_citations"] = citations.get(canonical, [])
+            measure["fact_citation_status"] = citation_statuses.get(canonical, {"status": "unverified", "reason": "citation_not_provided"})
         yk = str(rec["year"])
         if yk and yk != "—":
             identity = re.sub(r"[^a-z0-9]", "", rec["entity"].casefold())
@@ -1166,13 +1194,25 @@ def _tax_section(years: list[dict[str, Any]]) -> str:
             '<section class="card"><h2>Tax returns — 2-year summary</h2>'
             '<p class="empty">Awaiting business tax-return evidence (last 2 years).</p></section>'
         )
+    def earnings(row: dict) -> tuple[str, float | None]:
+        for key, label in (
+            ("net_income_per_books", "Net income per books"),
+            ("net_income", "Net income"),
+            ("ordinary_business_income", "Ordinary business income"),
+            ("taxable_income", "Taxable income"),
+        ):
+            if row.get(key) is not None:
+                return label, row[key]
+        return "Not established", None
+
     rows = "".join(
         "<tr>"
         f'<td>{escape(str(y["year"]))}</td>'
         f'<td>{escape(y["entity"] or "—")}</td>'
         f'<td class="num">{_fmt_full(y["gross_receipts"])}</td>'
         f'<td class="num">{_fmt_full(y["total_income"])}</td>'
-        f'<td class="num">{_fmt_full(y["net_income"])}</td>'
+        f'<td>{escape(earnings(y)[0])}</td>'
+        f'<td class="num">{_fmt_full(earnings(y)[1])}</td>'
         "</tr>"
         for y in years
     )
@@ -1180,7 +1220,11 @@ def _tax_section(years: list[dict[str, Any]]) -> str:
     narrative = ""
     if len(years) == 2:
         a, b = years[0], years[1]
-        if a.get("gross_receipts") and b.get("gross_receipts"):
+        same_identity = bool(a.get("entity") and re.sub(r"[^a-z0-9]", "", str(a["entity"]).casefold()) == re.sub(r"[^a-z0-9]", "", str(b.get("entity") or "").casefold()))
+        same_context = bool(a.get("basis") and a.get("basis") == b.get("basis") and a.get("currency") and a.get("currency") == b.get("currency")
+                            and a.get("period_start") and b.get("period_start") and a.get("period_end") and b.get("period_end")
+                            and str(a["period_start"])[5:] == str(b["period_start"])[5:] and str(a["period_end"])[5:] == str(b["period_end"])[5:])
+        if same_identity and same_context and a.get("year") != b.get("year") and a.get("gross_receipts") and b.get("gross_receipts"):
             delta = b["gross_receipts"] - a["gross_receipts"]
             pct = (delta / a["gross_receipts"] * 100) if a["gross_receipts"] else 0
             direction = "grew" if delta >= 0 else "declined"
@@ -1192,7 +1236,7 @@ def _tax_section(years: list[dict[str, Any]]) -> str:
         '<section class="card wide"><h2>Tax returns — 2-year summary</h2>'
         '<table class="grid-table"><thead><tr>'
         "<th>Tax year</th><th>Entity</th><th class='num'>Gross receipts</th>"
-        "<th class='num'>Total income</th><th class='num'>Net income</th>"
+        "<th class='num'>Total income</th><th>Earnings measure</th><th class='num'>Earnings amount</th>"
         f"</tr></thead><tbody>{rows}</tbody></table>"
         + (f'<p class="note">{escape(narrative)}</p>' if narrative else "")
         + "</section>"

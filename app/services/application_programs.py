@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import uuid
 from collections import Counter, defaultdict
@@ -121,7 +122,8 @@ def _float(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
         return None
     try:
-        return float(str(value).replace("$", "").replace(",", "").replace("x", "").strip())
+        result = float(str(value).replace("$", "").replace(",", "").replace("x", "").strip())
+        return result if math.isfinite(result) else None
     except (TypeError, ValueError):
         return None
 
@@ -140,12 +142,78 @@ def reviewed_profitability_facts(snapshot: ApplicationCapitalReadinessSnapshot |
             continue
         source = metric.get("source") or {}
         reviews = source.get("review_statuses")
-        if source.get("verification_status") == "self_reported_unverified" or source.get("needs_reconciliation_review") or source.get("not_applicable"):
+        if source.get("verification_status") == "self_reported_unverified" or source.get("needs_reconciliation_review") or source.get("not_applicable") or source.get("provisional"):
             continue
         if not reviews or any(review != "confirmed" for review in reviews):
             continue
+        source_kinds = source.get("source_kinds") or []
+        staff_attested = bool(source_kinds) and all(kind in {"stated", "derived"} for kind in source_kinds)
+        if source.get("citation_status") != "verified" and not staff_attested:
+            # A previously confirmed snapshot can predate quote-level lineage.
+            # Current bytes alone do not prove the model read the correct line.
+            continue
         result[metric["key"]] = _float(metric.get("value"))
     return result
+
+
+FINANCIAL_FIT_FIELDS = frozenset({
+    "revenue", "annual_revenue", "gross_margin_pct", "net_margin_pct", "annualized_deposits",
+    "deposits", "credit_score", "estimated_credit_score", "dscr", "cash_flow", "debt_burden",
+    "liquid_assets", "business_age_years", "nsf_or_overdraft_count",
+})
+
+
+def _fit_fact_sources(context: dict, facts: list, files: list, analyses: dict) -> dict:
+    """Require explicit staff-reviewed, current source facts for monetary fit.
+
+    Legacy AI summary cards are useful observations, never verification. A
+    bank-deposit figure cannot be silently promoted into revenue or earnings.
+    Conflicting accepted scalar facts stay unresolved rather than pooled.
+    """
+    inventory = {file.id: file for file in files}
+    output = {key: {"verification_status": "provisional" if context.get(key) is not None else "unknown",
+                    "source_refs": []} for key in FINANCIAL_FIT_FIELDS}
+    aliases = {"gross_revenue": "revenue", "annual_revenue": "annual_revenue",
+               "estimated_credit_score": "credit_score", "nsf_count": "nsf_or_overdraft_count"}
+    grouped: dict[str, list] = defaultdict(list)
+    for fact in facts:
+        key = aliases.get(fact.field_key, fact.field_key)
+        if key not in FINANCIAL_FIT_FIELDS or fact.status != "accepted" or not fact.reviewed_by_user_id:
+            continue
+        source_file_id = getattr(fact, "source_file_id", None)
+        analysis_id = getattr(fact, "source_analysis_id", None)
+        if source_file_id is not None:
+            file = inventory.get(source_file_id)
+            analysis = analyses.get(source_file_id)
+            if (file is None or analysis is None or not file.content_hash
+                    or analysis.status != "completed" or analysis.content_hash != file.content_hash
+                    or analysis_id is None or analysis.id != analysis_id):
+                continue
+            if key in {"revenue", "annual_revenue", "cash_flow", "gross_margin_pct", "net_margin_pct"} and analysis.classification not in {"current_p_and_l", "tax_return", "income_statement", "profit_and_loss"}:
+                continue
+        elif analysis_id is not None or getattr(fact, "extraction_method", "document_ai") == "document_ai":
+            continue
+        raw = fact.value.get("value") if isinstance(fact.value, dict) else fact.value
+        value = _float(raw if raw is not None else fact.normalized_value)
+        if value is not None:
+            grouped[key].append((value, fact))
+    for key, rows in grouped.items():
+        refs = [{"kind": "accepted_fact", "id": str(fact.id),
+                 "source_file_id": str(fact.source_file_id) if fact.source_file_id else None,
+                 "source_analysis_id": str(fact.source_analysis_id) if fact.source_analysis_id else None}
+                for _value, fact in rows[:10]]
+        if len({value for value, _fact in rows}) != 1:
+            output[key] = {"verification_status": "conflicting", "source_refs": refs}
+            continue
+        context[key] = rows[0][0]
+        output[key] = {"verification_status": "verified", "source_refs": refs}
+    if output["revenue"]["verification_status"] != "verified" and output["annual_revenue"]["verification_status"] == "verified":
+        context["revenue"] = context["annual_revenue"]
+        output["revenue"] = output["annual_revenue"]
+    if output["credit_score"]["verification_status"] == "verified":
+        context["estimated_credit_score"] = context["credit_score"]
+        output["estimated_credit_score"] = output["credit_score"]
+    return output
 
 
 def _deep_values(value: Any, wanted_keys: set[str]) -> list[Any]:
@@ -277,12 +345,17 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         .all()
     )
     latest_decisions = await _latest_evidence_decisions(db, evidence_links)
+    current_files = {file.id: file for file in files}
     accepted_file_ids = {
         link.file_id
         for link in evidence_links
         if (
             latest_decisions.get(link.id) is not None
             and latest_decisions[link.id].decision == "accepted"
+            and link.file_id in current_files
+            and latest_decisions[link.id].content_hash == current_files[link.file_id].content_hash
+            and link.file_id in latest_analyses
+            and latest_decisions[link.id].analysis_version == latest_analyses[link.file_id].analysis_version
         )
         or (latest_decisions.get(link.id) is None and link.verified_at is not None)
     }
@@ -408,7 +481,7 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
             .limit(1)
         )
     ).scalar_one_or_none()
-    return {
+    context = {
         **reviewed_profitability_facts(readiness_snapshot),
         "vertical": profile.vertical,
         "intake_variant": intake.variant if intake else None,
@@ -455,7 +528,43 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         "mca_obligations_present": mca_obligations,
         "floorplan_inventory_present": floorplan_inventory,
         "equipment_financing_intent": equipment_financing_intent,
+        "evidence_source_refs": {
+            classification: [{"kind": "accepted_document", "source_file_id": str(file.id),
+                              "source_analysis_id": str(latest_analyses[file.id].id),
+                              "content_hash": file.content_hash}
+                             for file in files if file.id in accepted_file_ids and file.id in latest_analyses
+                             and latest_analyses[file.id].classification == classification][:24]
+            for classification in accepted_classifications
+        },
     }
+    reviewed_facts = list((await db.execute(select(ApplicationExtractedFact).where(
+        ApplicationExtractedFact.profile_id == profile.id,
+        ApplicationExtractedFact.status == "accepted",
+    ))).scalars().all())
+    context["fact_sources"] = _fit_fact_sources(context, reviewed_facts, files, latest_analyses)
+    # Reviewed margins retain the exact snapshot lineage, not an AI estimate.
+    for field in ("gross_margin_pct", "net_margin_pct"):
+        if reviewed_profitability_facts(readiness_snapshot).get(field) is not None:
+            source_rows = [row for row in list(getattr(readiness_snapshot, "source_manifest", None) or [])
+                           if row.get("kind") == "financial_period" and row.get("window") == "current"]
+            current_sources = bool(source_rows) and all(
+                (
+                    row.get("source_kind") in {"stated", "derived"}
+                    and row.get("review_status") == "confirmed"
+                    and row.get("source_file_id") is None
+                    and row.get("source_analysis_id") is None
+                ) or (
+                    row.get("source_file_id") is not None
+                    and (file := next((f for f in files if str(f.id) == row["source_file_id"]), None)) is not None
+                    and row.get("content_hash") == file.content_hash
+                    and (analysis := latest_analyses.get(file.id)) is not None
+                    and str(analysis.id) == row.get("source_analysis_id")
+                )
+                for row in source_rows
+            )
+            if current_sources:
+                context["fact_sources"][field] = {"verification_status": "verified", "source_refs": source_rows[:24]}
+    return context
 
 
 def _expanded_naics_prefixes(values: list[str]) -> tuple[list[str], bool]:
@@ -621,6 +730,7 @@ async def published_candidates(
     profile: ApplicationProfile,
     *,
     readiness_metric_overrides: dict[str, float | None] | None = None,
+    readiness_metric_sources: dict[str, dict] | None = None,
 ) -> list[ProgramFitCandidate]:
     context = await profile_fit_context(db, profile)
     # Recalculation can evaluate the current source facts before inserting the
@@ -629,6 +739,20 @@ async def published_candidates(
     if readiness_metric_overrides is not None:
         for key in ("gross_margin_pct", "net_margin_pct"):
             context[key] = readiness_metric_overrides.get(key)
+            supplied = (readiness_metric_sources or {}).get(key)
+            context.setdefault("fact_sources", {})[key] = (
+                {"verification_status": supplied.get("verification_status", "unknown"),
+                 "source_refs": list(supplied.get("source_refs") or [])[:24]}
+                if supplied is not None else {
+                    "verification_status": "verified" if context[key] is not None else "unknown",
+                    "source_refs": [{"kind": "current_reviewed_profitability"}] if context[key] is not None else [],
+                }
+            )
+    fact_sources = context.get("fact_sources") or {}
+    evaluation_context = dict(context)
+    for field in FINANCIAL_FIT_FIELDS:
+        if (fact_sources.get(field) or {}).get("verification_status") != "verified":
+            evaluation_context[field] = None
     intent_outside_lending = context.get("intent_kind") in {"non_lending", "route_out"}
 
     catalog = await program_catalog.catalog_rows(db)
@@ -639,7 +763,7 @@ async def published_candidates(
 
     candidates: list[ProgramFitCandidate] = []
     for item in catalog:
-        scope_state, scope_reasons = _catalog_scope_match(scopes.get(item.id, []), context)
+        scope_state, scope_reasons = _catalog_scope_match(scopes.get(item.id, []), evaluation_context)
         playbook = latest.get(item.id)
         if playbook is None:
             candidates.append(
@@ -652,6 +776,7 @@ async def published_candidates(
                     recommendation_status="criteria_unavailable",
                     criteria_status="not_published",
                     reasons=["No approved published criteria version is available"],
+                    scope_status="matched" if scope_state is True else "unknown" if scope_state is None else "outside_scope",
                 )
             )
             continue
@@ -659,11 +784,12 @@ async def published_candidates(
         try:
             validate_rules(playbook.rules or {})
             has_fit_rule = bool((playbook.rules or {}).get("fit"))
-            result = evaluate_rules(playbook.rules or {}, context) if has_fit_rule else None
+            result = evaluate_rules(playbook.rules or {}, evaluation_context) if has_fit_rule else None
         except ProgramRuleError:
             rules_valid = False
             result = None
             has_fit_rule = False
+        rule_state = getattr(result, "state", "pass" if result and result.matched else "fail") if result is not None else "unavailable"
         raw_priority = (playbook.rules or {}).get("priority", 0)
         priority = (
             raw_priority
@@ -675,8 +801,15 @@ async def published_candidates(
         missing_fields = [
             field
             for field in sorted(_rule_fields((playbook.rules or {}).get("fit")))
-            if _context_field(context, field) in (None, "", [], {})
+            if _context_field(evaluation_context, field) in (None, "", [], {})
         ]
+        scope_fact_fields = {
+            str(field) for scope in scopes.get(item.id, [])
+            if scope.vertical == context.get("vertical") and getattr(scope, "is_active", True) is not False
+            for field in (scope.required_fact_keys or [])
+        }
+        missing_scope_fields = [field for field in scope_fact_fields
+                                if _context_field(evaluation_context, field) in (None, "", [], {})]
         if intent_outside_lending:
             recommendation_status = "not_eligible"
             reasons = ["Current intake intent is not routed to lending"]
@@ -699,7 +832,7 @@ async def published_candidates(
                 )
             ]
             eligible = False
-        elif scope_state is None or (not result.matched and missing_fields):
+        elif scope_state is None or rule_state == "unknown":
             recommendation_status = "needs_information"
             reasons = [
                 *scope_reasons,
@@ -715,7 +848,7 @@ async def published_candidates(
             reasons = result.reasons
             eligible = False
         preference_score, preference_reasons = (
-            evaluate_recommendation_preferences(playbook.rules, context)
+            evaluate_recommendation_preferences(playbook.rules, evaluation_context)
             if eligible else (0, [])
         )
         candidates.append(
@@ -737,6 +870,22 @@ async def published_candidates(
                 preference_score=preference_score,
                 preference_reasons=preference_reasons,
                 reasons=list(dict.fromkeys(reasons)),
+                scope_status="matched" if scope_state is True else "unknown" if scope_state is None else "outside_scope",
+                rule_state=rule_state,
+                rule_results=[{**row, "observed": (str(row["required"] if row["required"] is not None else row["field"]) in context.get("evidence_available", set())) if row["operator"] == "evidence_available" else _context_field(context, row["field"]),
+                               "source_refs": (context.get("evidence_source_refs", {}).get(str(row["required"] if row["required"] is not None else row["field"]), [])) if row["operator"] == "evidence_available" else (fact_sources.get(row["field"]) or {}).get("source_refs", []),
+                               "verification_status": (fact_sources.get(row["field"]) or {}).get("verification_status", "profile_input")}
+                              for row in (getattr(result, "results", []) if result is not None else [])],
+                fact_sources={field: fact_sources[field] for field in (_rule_fields((playbook.rules or {}).get("fit")) | scope_fact_fields) if field in fact_sources},
+                evidence_gaps=list(dict.fromkeys([
+                    *(missing_fields if rule_state == "unknown" else []),
+                    *(scope_reasons if scope_state is None else []),
+                ])),
+                requires_review=any(
+                    _context_field(context, field) is not None
+                    and (field in FINANCIAL_FIT_FIELDS and (fact_sources.get(field) or {}).get("verification_status") != "verified")
+                    for field in [*missing_fields, *(missing_scope_fields if scope_state is None else [])]
+                ),
             )
         )
     rank = {

@@ -5098,12 +5098,18 @@ async def _collect_packet_financials(
     rows = (
         await db.execute(
             select(BucketFileAnalysis)
+            .join(BucketFile, BucketFile.id == BucketFileAnalysis.bucket_file_id)
             .where(
                 BucketFileAnalysis.bucket_id == intake.bucket_id,
+                BucketFileAnalysis.bucket_id == BucketFile.bucket_id,
+                BucketFileAnalysis.bucket_file_id.in_(active_ids),
+                BucketFile.deleted_at.is_(None),
+                BucketFile.status == "uploaded",
+                BucketFileAnalysis.content_hash == BucketFile.content_hash,
                 BucketFileAnalysis.analysis_version == CURRENT_FILE_ANALYSIS_VERSION,
                 BucketFileAnalysis.status == "completed",
             )
-            .order_by(BucketFileAnalysis.created_at.desc())
+            .order_by(BucketFileAnalysis.created_at.desc(), BucketFileAnalysis.id.desc())
         )
     ).scalars().all()
 
@@ -5114,15 +5120,21 @@ async def _collect_packet_financials(
         extract_tax_years,
     )
 
-    analyses = [
-        {
+    analyses = []
+    seen_files: set[UUID] = set()
+    for row in rows:
+        if row.bucket_file_id not in active_ids or row.bucket_file_id in seen_files:
+            continue
+        seen_files.add(row.bucket_file_id)
+        data = row.analysis if isinstance(row.analysis, dict) else {}
+        analyses.append({
             "file_id": str(row.bucket_file_id),
+            "analysis_id": str(row.id),
+            "content_hash": row.content_hash,
             "classification": row.classification,
-            "key_facts": row.analysis.get("key_facts") if isinstance(row.analysis, dict) else {},
-        }
-        for row in rows
-        if row.bucket_file_id in active_ids
-    ]
+            "key_facts": data.get("key_facts") or {},
+            "financial_fact_citations": data.get("financial_fact_citations") or {},
+        })
     return {
         "bank_months": extract_bank_months(analyses),
         "tax_years": extract_tax_years(analyses),

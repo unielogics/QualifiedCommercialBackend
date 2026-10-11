@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from numbers import Real
 from typing import Any
 
@@ -73,6 +74,8 @@ class RuleEvaluation:
     passed: int
     total: int
     reasons: list[str]
+    state: str = "unknown"
+    results: list[dict[str, Any]] = dataclass_field(default_factory=list)
 
     @property
     def confidence(self) -> float:
@@ -202,7 +205,7 @@ def _validate_node(
 
 def evaluate_rules(rules: dict[str, Any] | None, context: dict[str, Any]) -> RuleEvaluation:
     if not rules or "fit" not in rules:
-        return RuleEvaluation(False, 0, 0, ["No published fit rule"])
+        return RuleEvaluation(False, 0, 0, ["No published fit rule"], "unavailable")
     validate_rules(rules)
     return _evaluate_node(rules["fit"], context)
 
@@ -244,6 +247,9 @@ def _evaluate_node(node: dict[str, Any], context: dict[str, Any]) -> RuleEvaluat
             sum(child.passed for child in children),
             sum(child.total for child in children),
             [reason for child in children for reason in child.reasons],
+            "fail" if any(child.state == "fail" for child in children) else
+            "unknown" if any(child.state == "unknown" for child in children) else "pass",
+            [result for child in children for result in child.results],
         )
     if "any" in node:
         children = [_evaluate_node(child, context) for child in node["any"]]
@@ -252,16 +258,24 @@ def _evaluate_node(node: dict[str, Any], context: dict[str, Any]) -> RuleEvaluat
             sum(child.passed for child in children),
             sum(child.total for child in children),
             [reason for child in children for reason in child.reasons],
+            "pass" if any(child.state == "pass" for child in children) else
+            "unknown" if any(child.state == "unknown" for child in children) else "fail",
+            [result for child in children for result in child.results],
         )
     if "not" in node:
         child = _evaluate_node(node["not"], context)
-        matched = not child.matched
-        return RuleEvaluation(matched, int(matched), 1, [f"not ({'; '.join(child.reasons)})"])
+        state = "unknown" if child.state == "unknown" else "fail" if child.matched else "pass"
+        matched = state == "pass"
+        return RuleEvaluation(matched, int(matched), 1, [f"not ({'; '.join(child.reasons)})"], state,
+                              [{**row, "negated": not row.get("negated", False)} for row in child.results])
 
     field = str(node["field"])
     op = str(node["op"])
     expected = node.get("value")
     actual = _resolve_field(context, field)
+    unknown = actual in (None, "", [], {})
+    if op == "evidence_available":
+        unknown = "evidence_available" not in context or context.get("evidence_available") is None
     if op == "present":
         matched = actual not in (None, "", [], {})
     elif op == "evidence_available":
@@ -276,11 +290,15 @@ def _evaluate_node(node: dict[str, Any], context: dict[str, Any]) -> RuleEvaluat
         matched = _numeric_compare(actual, expected, op)
     else:  # pragma: no cover - validation prevents this branch
         matched = False
+    state = "unknown" if unknown else "pass" if matched else "fail"
     return RuleEvaluation(
-        matched,
+        matched and not unknown,
         int(matched),
         1,
-        [f"{field} {op} {'matched' if matched else 'did not match'}"],
+        [f"{field} {op} {'needs information' if unknown else 'matched' if matched else 'did not match'}"],
+        state,
+        [{"field": field, "operator": op, "required": expected, "observed": actual,
+          "status": state}],
     )
 
 
