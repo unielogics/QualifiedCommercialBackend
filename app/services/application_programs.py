@@ -61,7 +61,7 @@ from app.schemas.application_profile import (
     ProgramReadinessItem,
 )
 from app.services import application_profiles as profiles
-from app.services import file_events, locked_file_requests, provenance
+from app.services import equipment_financing, file_events, locked_file_requests, provenance
 from app.services import funding_programs as program_catalog
 from app.services.activity_log import log_activity
 from app.services.bucket_evidence import (
@@ -126,6 +126,16 @@ def _float(value: Any) -> float | None:
         return result if math.isfinite(result) else None
     except (TypeError, ValueError):
         return None
+
+
+def _first_numeric_metric(metrics: dict[str, Any], *keys: str) -> float | None:
+    """Return the first reported numeric metric, preserving a reported zero."""
+
+    for key in keys:
+        parsed = _float(metrics.get(key))
+        if parsed is not None:
+            return parsed
+    return None
 
 
 def reviewed_profitability_facts(snapshot: ApplicationCapitalReadinessSnapshot | None) -> dict[str, float | None]:
@@ -513,8 +523,8 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         "credit_score": credit_score,
         "estimated_credit_score": credit_score,
         "dscr": _float(metrics.get("estimated_dscr") or metrics.get("dscr")),
-        "cash_flow": _float(
-            metrics.get("estimated_ebitda_or_cash_flow") or metrics.get("cash_flow")
+        "cash_flow": _first_numeric_metric(
+            metrics, "estimated_ebitda_or_cash_flow", "cash_flow"
         ),
         "debt_burden": _float(metrics.get("estimated_debt_burden") or metrics.get("debt_burden")),
         "liquid_assets": _float(
@@ -810,6 +820,11 @@ async def published_candidates(
         }
         missing_scope_fields = [field for field in scope_fact_fields
                                 if _context_field(evaluation_context, field) in (None, "", [], {})]
+        equipment_assessment = (
+            equipment_financing.assess_equipment_fit(evaluation_context)
+            if item.program_key == equipment_financing.PROGRAM_KEY
+            else None
+        )
         if intent_outside_lending:
             recommendation_status = "not_eligible"
             reasons = ["Current intake intent is not routed to lending"]
@@ -843,6 +858,17 @@ async def published_candidates(
             recommendation_status = "recommended"
             reasons = result.reasons
             eligible = True
+        elif equipment_assessment and equipment_assessment["recommendation_status"] in {
+            "needs_information",
+            "custom_review",
+        }:
+            # A request outside the published Equipment Financing amount
+            # range is a routing decision, not an adverse file decision. If
+            # any other required fact is still missing, information remains
+            # the next step rather than prematurely assigning custom review.
+            recommendation_status = equipment_assessment["recommendation_status"]
+            reasons = equipment_assessment["needs"] or result.reasons
+            eligible = False
         else:
             recommendation_status = "not_eligible"
             reasons = result.reasons
@@ -878,7 +904,12 @@ async def published_candidates(
                               for row in (getattr(result, "results", []) if result is not None else [])],
                 fact_sources={field: fact_sources[field] for field in (_rule_fields((playbook.rules or {}).get("fit")) | scope_fact_fields) if field in fact_sources},
                 evidence_gaps=list(dict.fromkeys([
-                    *(missing_fields if rule_state == "unknown" else []),
+                    *(
+                        missing_fields
+                        if rule_state == "unknown"
+                        or recommendation_status == "needs_information"
+                        else []
+                    ),
                     *(scope_reasons if scope_state is None else []),
                 ])),
                 requires_review=any(
@@ -891,8 +922,9 @@ async def published_candidates(
     rank = {
         "recommended": 0,
         "needs_information": 1,
-        "criteria_unavailable": 2,
-        "not_eligible": 3,
+        "custom_review": 2,
+        "criteria_unavailable": 3,
+        "not_eligible": 4,
     }
     return sorted(
         candidates,

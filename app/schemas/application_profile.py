@@ -34,6 +34,7 @@ RequirementStateStatus = Literal[
 ProgramRecommendationStatus = Literal[
     "recommended",
     "needs_information",
+    "custom_review",
     "not_eligible",
     "criteria_unavailable",
 ]

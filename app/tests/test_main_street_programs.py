@@ -292,7 +292,11 @@ def test_jumbo_needs_scale_and_a_large_request():
 
 def test_equipment_requires_a_stated_equipment_purchase():
     assert _fit()["equipment_financing"]["eligible"] is False
-    fit = _fit(intent="equipment", documents=[*FULL_PACKAGE, *_docs("Vendor quote for the equipment")])
+    fit = _fit(
+        intent="equipment",
+        key_metrics={**STRONG_METRICS, "requested_amount": 250_000},
+        documents=[*FULL_PACKAGE, *_docs("Vendor quote for the equipment")],
+    )
     assert fit["equipment_financing"]["eligible"] is True
     assert fit["equipment_financing"]["needs"] == []
 

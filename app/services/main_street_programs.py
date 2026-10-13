@@ -32,6 +32,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
+from app.services.equipment_financing import assess_equipment_fit
+
 __all__ = [
     "MAIN_STREET_VARIANT",
     "MAIN_STREET_INDUSTRIES",
@@ -828,17 +830,27 @@ def compute_main_street_program_fit(
 
     wants_equipment = bool(det.get("financing_equipment_or_vehicle")) or slug == "equipment"
     has_quote = _has(docs, "vendor quote") or _has(docs, "invoice")
-    equipment_financing = program(
-        wants_equipment
-        and _clears(cash_flow, _MS_EQUIPMENT_MIN_CASH_FLOW)
-        and _meets(revenue, _MS_EQUIPMENT_MIN_REVENUE),
-        blocked=(
-            _revenue_blocker(_MS_EQUIPMENT_MIN_REVENUE)
-            + ([] if wants_equipment else ["no equipment purchase stated"])
-        ),
-        needs=[] if has_quote else ["A vendor quote or invoice for the equipment"],
-        cash_flow=cash_flow,
+    equipment_financing = assess_equipment_fit(
+        {
+            "equipment_financing_intent": True if wants_equipment else False,
+            "business_age_years": tib,
+            "annual_revenue": revenue,
+            "credit_score": fico,
+            "cash_flow": cash_flow,
+            "requested_amount": requested,
+        }
     )
+    if not has_quote:
+        equipment_financing["needs"] = [
+            *equipment_financing["needs"],
+            "A vendor quote or invoice for the equipment",
+        ]
+        # A quote is evidence, not an eligibility threshold.  Keep a fully
+        # qualified file recommended while making the next document obvious.
+        equipment_financing["evidence_complete"] = False
+    else:
+        equipment_financing["evidence_complete"] = True
+    equipment_financing["cash_flow"] = cash_flow
 
     is_trucking = sector == "trucking_logistics"
     has_authority = _has(docs, "authority")

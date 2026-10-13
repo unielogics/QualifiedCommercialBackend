@@ -38,6 +38,12 @@ from app.enums import (
     Language,
     Role,
 )
+from app.lead_types import (
+    FundingIntent,
+)
+from app.lead_types import (
+    normalize_funding_intent as normalize_lead_funding_intent,
+)
 from app.models.activity import Activity
 from app.models.ai_audit_event import AIAuditEvent
 from app.models.application_profile import ApplicationProfile, ApplicationRoomDelivery
@@ -102,10 +108,13 @@ from app.schemas.bucket import (
 from app.schemas.capital_readiness import CapitalReadinessRead
 from app.schemas.common import ORMModel
 from app.schemas.phone import OptionalPhone, RequiredPhone
-from app.services import application_profiles as profiles_service
+from app.services import (
+    application_profiles as profiles_service,
+)
 from app.services import (
     booking_notify,
     booking_reminders,
+    equipment_financing,
     file_events,
     inline_images,
     locked_file_requests,
@@ -114,7 +123,9 @@ from app.services import (
     provenance,
     upload_validation,
 )
-from app.services import capital_readiness as capital_readiness_service
+from app.services import (
+    capital_readiness as capital_readiness_service,
+)
 from app.services.ai import engagement
 from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import json_safe_metadata, tracked_messages_create
@@ -170,6 +181,7 @@ log = logging.getLogger(__name__)
 
 TERMS_VERSION = "2026-05-19"
 PRIVACY_VERSION = "2026-05-19"
+EQUIPMENT_PUBLIC_PATH = "/equipment-financing-intake"
 
 # Client-facing welcome copy in English/Spanish, keyed by Language. Spanish
 # strings: AI-translated, not yet native-speaker reviewed.
@@ -192,6 +204,24 @@ _DEALER_WELCOME_BACK = {
     Language.ES: "Bienvenido de nuevo. Restauré tu sala segura de financiamiento con tus archivos y el contexto del chat anteriores.",
 }
 
+_EQUIPMENT_WELCOME = {
+    Language.EN: (
+        "I opened your secure Equipment Financing review. The equipment request is already selected. "
+        "I will review the purchase details, vendor quote, useful life, business cash flow, and the evidence needed to match the request responsibly. "
+        "Upload the vendor quote and the business documents you have now; if something is missing, I will ask for one clear item at a time."
+    ),
+    Language.ES: (
+        "Abrí tu revisión segura de Financiamiento de Equipos. La solicitud de equipos ya está seleccionada. "
+        "Revisaré los datos de la compra, la cotización, la vida útil, el flujo de caja del negocio y la evidencia necesaria para evaluar la solicitud responsablemente. "
+        "Sube la cotización y los documentos del negocio que tengas; si falta algo, te pediré un punto claro a la vez."
+    ),
+}
+
+_EQUIPMENT_WELCOME_BACK = {
+    Language.EN: "Welcome back. I restored your secure Equipment Financing review with the purchase details, uploads, and prior chat intact.",
+    Language.ES: "Bienvenido de nuevo. Restauré tu revisión segura de Financiamiento de Equipos con los datos de la compra, archivos y chat anteriores.",
+}
+
 _RE_WELCOME_BACK = {
     Language.EN: "Welcome back. I restored your secure real estate funding review with your prior uploads and chat context.",
     Language.ES: "Bienvenido de nuevo. Restauré tu revisión segura de financiamiento inmobiliario con tus archivos y el contexto del chat anteriores.",
@@ -204,6 +234,14 @@ def _dealer_welcome(lang: str, *, email_note: str = "") -> str:
 
 def _dealer_welcome_back(lang: str) -> str:
     return _DEALER_WELCOME_BACK.get(lang, _DEALER_WELCOME_BACK[Language.EN])
+
+
+def _equipment_welcome(lang: str, *, email_note: str = "") -> str:
+    return _EQUIPMENT_WELCOME.get(lang, _EQUIPMENT_WELCOME[Language.EN]) + email_note
+
+
+def _equipment_welcome_back(lang: str) -> str:
+    return _EQUIPMENT_WELCOME_BACK.get(lang, _EQUIPMENT_WELCOME_BACK[Language.EN])
 
 
 def _re_welcome_back(lang: str) -> str:
@@ -460,11 +498,54 @@ class PublicIntakeAttribution(BaseModel):
     vertical: str | None = Field(default=None, max_length=64)
     campaign: str | None = Field(default=None, max_length=120)
     cta: str | None = Field(default=None, max_length=120)
+    funding_intent: FundingIntent | None = None
 
-    @field_validator("source", "page", "program", "vertical", "campaign", "cta", mode="before")
+    @field_validator(
+        "source",
+        "page",
+        "program",
+        "vertical",
+        "campaign",
+        "cta",
+        mode="before",
+    )
     @classmethod
     def normalize_attribution(cls, value: object) -> object:
         return str(value).strip() if value is not None and str(value).strip() else None
+
+    @field_validator("funding_intent", mode="before")
+    @classmethod
+    def normalize_structured_funding_intent(cls, value: object) -> object:
+        return normalize_lead_funding_intent(value)
+
+
+class EquipmentFinancingDetails(BaseModel):
+    """Structured asset facts shared by public and staff-created applications."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    description: str | None = Field(default=None, max_length=1000)
+    age_years: float | None = Field(default=None, ge=0, le=150)
+    condition: Literal["new", "used", "refurbished", "unknown"] | None = None
+    remaining_useful_life_years: float | None = Field(default=None, gt=0, le=150)
+    seller_name: str | None = Field(default=None, max_length=240)
+    seller_contact: str | None = Field(default=None, max_length=320)
+    seller_type: Literal["dealer", "vendor", "private_party", "unknown"] | None = None
+    purchase_price: float | None = Field(default=None, gt=0, le=100_000_000)
+    delivery_timing: str | None = Field(default=None, max_length=240)
+    intended_business_use: str | None = Field(default=None, max_length=1200)
+
+    @field_validator(
+        "description",
+        "seller_name",
+        "seller_contact",
+        "delivery_timing",
+        "intended_business_use",
+        mode="before",
+    )
+    @classmethod
+    def blank_equipment_text_to_none(cls, value: object) -> object:
+        return None if value == "" else value
 
 
 class CapitalReadinessDiagnosticAnswers(BaseModel):
@@ -584,6 +665,8 @@ class DealerIntakeStart(PublicIntakeAttribution):
     privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
     preferred_language: Language = Language.EN
     capital_readiness_diagnostic: CapitalReadinessDiagnostic | None = None
+    requested_amount: float | None = Field(default=None, ge=0, le=100_000_000)
+    equipment_details: EquipmentFinancingDetails | None = None
 
     @field_validator("business_name", "phone", mode="before")
     @classmethod
@@ -621,11 +704,112 @@ def _public_intake_attribution(
     values = {
         key: value
         for key, value in payload.model_dump(
-            include={"source", "page", "program", "vertical", "campaign", "cta"}
+            include={
+                "source",
+                "page",
+                "program",
+                "vertical",
+                "campaign",
+                "cta",
+                "funding_intent",
+            }
         ).items()
         if value
     }
     return values or None
+
+
+def _equipment_details_payload(
+    details: EquipmentFinancingDetails | None,
+) -> dict[str, Any] | None:
+    if details is None:
+        return None
+    values = details.model_dump(exclude_none=True)
+    return values or None
+
+
+def _is_equipment_application(
+    *, funding_intent: object | None, details: EquipmentFinancingDetails | None = None
+) -> bool:
+    return equipment_financing.is_equipment_funding_intent(funding_intent) or details is not None
+
+
+def _is_business_equipment_application(payload: PublicIntakeAttribution) -> bool:
+    """Route the dedicated public handoff without changing dealer equipment files.
+
+    Both signals are required. A dealer can still request equipment and remain a
+    dealer intake; only the public operating-business handoff becomes Main Street.
+    """
+
+    vertical = (
+        str(payload.vertical or "")
+        .strip()
+        .casefold()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    return (
+        vertical in {"business", "main_street", "mainstreet", "operating_business"}
+        and payload.funding_intent == "equipment"
+    )
+
+
+def _is_main_street_equipment_intake(intake: PublicUnderwritingIntake) -> bool:
+    if intake.variant != MAIN_STREET_VARIANT:
+        return False
+    state = _intake_state(intake)
+    details = state.get("main_street_details")
+    return (
+        state.get("funding_intent") == "equipment"
+        or isinstance(details, dict) and details.get("intent") == "equipment"
+    )
+
+
+def _dealer_route_public_path(intake: PublicUnderwritingIntake) -> str:
+    return EQUIPMENT_PUBLIC_PATH if _is_main_street_equipment_intake(intake) else "/dealer-ai-underwriter"
+
+
+def _dealer_route_welcome_back(intake: PublicUnderwritingIntake) -> str:
+    if _is_main_street_equipment_intake(intake):
+        return _equipment_welcome_back(intake.preferred_language)
+    return _dealer_welcome_back(intake.preferred_language)
+
+
+async def _configure_equipment_bucket(
+    db: AsyncSession,
+    bucket: Bucket,
+    *,
+    details: dict[str, Any] | None = None,
+) -> None:
+    """Apply the canonical equipment context without creating another program."""
+
+    bucket.purpose = "Equipment financing AI intake"
+    bucket.ai_context = {
+        **(bucket.ai_context or {}),
+        "funding_program_key": "equipment_financing",
+        "funding_intent": "equipment",
+        "published_amount_range": {
+            "minimum": equipment_financing.MINIMUM_AMOUNT,
+            "maximum": equipment_financing.MAXIMUM_AMOUNT,
+        },
+        "published_term_range_months": {
+            "minimum": equipment_financing.MINIMUM_TERM_MONTHS,
+            "maximum": equipment_financing.MAXIMUM_TERM_MONTHS,
+        },
+        "equipment_detail_fields": list(equipment_financing.EQUIPMENT_DETAIL_FIELDS),
+        **({"equipment_financing_details": details} if details else {}),
+    }
+    await _ensure_requested_document(
+        db,
+        bucket,
+        name="Vendor quote or invoice for the equipment",
+        category="Equipment",
+        description=(
+            "Upload the current vendor quote or invoice showing the seller, "
+            "equipment description, purchase price, and expected delivery."
+        ),
+        allow_multiple_files=True,
+    )
 
 
 class AdminLeadCreate(BaseModel):
@@ -660,6 +844,7 @@ class AdminLeadCreate(BaseModel):
     force_new: bool = False  # create a second lead even if one already exists for this email
     preferred_language: Language = Language.EN
     capital_readiness_diagnostic: CapitalReadinessDiagnostic | None = None
+    equipment_details: EquipmentFinancingDetails | None = None
     # Optionally assign the file to a dealer partner at creation, so the team's
     # first message on it reaches that partner's channel. Must be a dealer_partner.
     broker_user_id: UUID | None = None
@@ -948,11 +1133,18 @@ class DealerIntakePatch(BaseModel):
     referral_source: str | None = Field(default=None, max_length=180)
     asset_rows: list[DealerAssetRow] | None = None
     entity_structure: DealerEntityStructure | None = None
+    funding_intent: FundingIntent | None = None
+    equipment_details: EquipmentFinancingDetails | None = None
 
     @field_validator("business_name", "phone", "loan_purpose", "referral_source", mode="before")
     @classmethod
     def blank_to_none(cls, value: object) -> object:
         return None if value == "" else value
+
+    @field_validator("funding_intent", mode="before")
+    @classmethod
+    def normalize_patch_funding_intent(cls, value: object) -> object:
+        return normalize_lead_funding_intent(value)
 
 
 class DealerChatRequest(BaseModel):
@@ -979,7 +1171,7 @@ class ReviewProgressResponse(BaseModel):
     error: str | None = None
 
 
-class DealerResumeLinkRequest(BaseModel):
+class DealerResumeLinkRequest(PublicIntakeAttribution):
     email: EmailStr
 
 
@@ -988,7 +1180,7 @@ class DealerResumeLinkResponse(BaseModel):
     message: str = "If a matching secure intake exists, a resume link has been sent."
 
 
-class DealerLoginStartRequest(BaseModel):
+class DealerLoginStartRequest(PublicIntakeAttribution):
     email: EmailStr
 
 
@@ -2089,10 +2281,12 @@ async def _record_super_admin_intake_notification(
     lead_url = _admin_lead_url(intake)
     bucket_url = _admin_bucket_url(intake)
     label = _dealer_label(intake)
-    subject = f"Dealer AI intake started: {label}"
+    equipment_intake = _is_main_street_equipment_intake(intake)
+    intake_label = "Equipment Financing intake" if equipment_intake else "Dealer AI intake"
+    subject = f"{intake_label} started: {label}"
     body_text = (
-        "A dealer started a Qualified Commercial AI funding review.\n\n"
-        f"Dealer/business: {_email_line(intake.business_name)}\n"
+        f"A {'business' if equipment_intake else 'dealer'} started a Qualified Commercial {'Equipment Financing' if equipment_intake else 'AI funding'} review.\n\n"
+        f"Business: {_email_line(intake.business_name)}\n"
         f"Contact: {_email_line(intake.full_name)}\n"
         f"Email: {_email_line(intake.email)}\n"
         f"Phone: {_email_line(intake.phone)}\n"
@@ -2101,15 +2295,15 @@ async def _record_super_admin_intake_notification(
         f"Open bucket: {bucket_url}\n"
     )
     body_html = (
-        "<p>A dealer started a Qualified Commercial AI funding review.</p>"
+        f"<p>A {'business' if equipment_intake else 'dealer'} started a Qualified Commercial {'Equipment Financing' if equipment_intake else 'AI funding'} review.</p>"
         "<ul>"
-        f"<li><strong>Dealer/business:</strong> {html.escape(_email_line(intake.business_name))}</li>"
+        f"<li><strong>Business:</strong> {html.escape(_email_line(intake.business_name))}</li>"
         f"<li><strong>Contact:</strong> {html.escape(_email_line(intake.full_name))}</li>"
         f"<li><strong>Email:</strong> {html.escape(_email_line(intake.email))}</li>"
         f"<li><strong>Phone:</strong> {html.escape(_email_line(intake.phone))}</li>"
         f"<li><strong>Bucket:</strong> {html.escape(_email_line(intake.bucket.name if intake.bucket else intake.bucket_id))}</li>"
         "</ul>"
-        f'<p><a href="{html.escape(lead_url)}">Review dealer AI lead</a></p>'
+        f'<p><a href="{html.escape(lead_url)}">Review {"equipment financing" if equipment_intake else "dealer AI"} lead</a></p>'
         f'<p><a href="{html.escape(bucket_url)}">Open bucket</a></p>'
     )
     try:
@@ -2131,7 +2325,7 @@ async def _record_super_admin_intake_notification(
         await db.refresh(intake, attribute_names=["intake_state"])
         state = _intake_state(intake)
         state["super_admin_intake_started_email"] = {
-            "type": "dealer_ai_intake_started",
+            "type": "equipment_financing_intake_started" if equipment_intake else "dealer_ai_intake_started",
             "sent_at": record.get("completed_at") or record.get("claimed_at"),
             "deliveries": record.get("deliveries", []),
             **_request_audit(request),
@@ -2751,11 +2945,33 @@ def _compute_loan_program_fit(intake: PublicUnderwritingIntake) -> dict[str, Any
         "revenue": revenue,
         "annualized_deposits": annualized_deposits,
     }
-    equipment_financing_intent = details.get("financing_equipment_or_vehicle") is True
-    equipment_financing = {
-        "eligible": bool(equipment_financing_intent and _clears(cash_flow, 0)),
-        "cash_flow": cash_flow,
-    }
+    equipment_financing_intent = (
+        details.get("financing_equipment_or_vehicle") is True
+        or equipment_financing.is_equipment_funding_intent(
+            _intake_state(intake).get("funding_intent")
+        )
+    )
+    equipment_fit = equipment_financing.assess_equipment_fit(
+        {
+            "equipment_financing_intent": True if equipment_financing_intent else False,
+            "business_age_years": details.get("years_in_business"),
+            "annual_revenue": revenue,
+            "credit_score": intake.estimated_credit_score,
+            "cash_flow": cash_flow,
+            "requested_amount": requested_amount,
+        }
+    )
+    if not _has_uploaded_doc_name(intake, "vendor quote") and not _has_uploaded_doc_name(
+        intake, "invoice"
+    ):
+        equipment_fit["needs"] = [
+            *equipment_fit["needs"],
+            "A vendor quote or invoice for the equipment",
+        ]
+        equipment_fit["evidence_complete"] = False
+    else:
+        equipment_fit["evidence_complete"] = True
+    equipment_fit["cash_flow"] = cash_flow
     merchant_processing = {
         "eligible": bool(_meets(annualized_deposits, _MERCHANT_PROCESSING_MIN_ANNUALIZED_DEPOSITS)),
         "annualized_deposits": annualized_deposits,
@@ -2782,7 +2998,7 @@ def _compute_loan_program_fit(intake: PublicUnderwritingIntake) -> dict[str, Any
         "term_loan_3_5_year": term_loan_3_5_year,
         "term_loan_loc_hybrid": term_loan_loc_hybrid,
         "line_of_credit": line_of_credit,
-        "equipment_financing": equipment_financing,
+        "equipment_financing": equipment_fit,
         "merchant_processing": merchant_processing,
         "transportation_factoring": transportation_factoring,
         "debt_consulting": debt_consulting,
@@ -2828,7 +3044,7 @@ def _compute_main_street_fit(intake: PublicUnderwritingIntake) -> dict[str, Any]
         intent=details.get("intent"),
         industry=details.get("industry"),
         key_metrics=km,
-        details=_dealer_details(intake),
+        details=details,
         documents=docs,
     )
 
@@ -2988,6 +3204,9 @@ async def _merge_thread_borrower_facts(db: AsyncSession, intake: PublicUnderwrit
         return
     if intake.variant == FUNDING_VARIANT:
         _merge_funding_review_details(intake, proposed)
+    elif intake.variant == MAIN_STREET_VARIANT:
+        _merge_main_street_details(intake, proposed)
+        _apply_loan_program_fit(intake)
     else:
         newly_accepted = _merge_dealer_details(intake, proposed)
         await _apply_dealer_detail_documents(db, intake, newly_accepted)
@@ -3231,6 +3450,7 @@ def _has_real_estate_schedule(intake: PublicUnderwritingIntake) -> bool:
 # the AI already knows.
 _DEALER_DETAIL_KEYS = (
     "owners",
+    "years_in_business",
     "current_year_tax_filed",
     "reinsurance_account_present",
     "reinsurance_trading_platform",
@@ -3294,6 +3514,10 @@ def _merge_dealer_details(intake: PublicUnderwritingIntake, proposed: Any) -> di
             text = str(value).strip()
             if text:
                 accepted[key] = text[:180]
+            continue
+        if key == "years_in_business":
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 250:
+                accepted[key] = float(value)
             continue
         if key in ("requested_loan_amount", "stated_monthly_debt_payments"):
             if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= 500_000_000:
@@ -3677,6 +3901,55 @@ def _main_street_details(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _merge_main_street_details(
+    intake: PublicUnderwritingIntake, proposed: Any
+) -> dict[str, Any]:
+    """Validate conversational facts without converting this file into a dealer.
+
+    The Main Street prompt emits a different fact shape from the dealer prompt.
+    Persisting it through ``_merge_dealer_details`` silently discarded industry,
+    credit, and operating-business facts and created a dealer_details object.
+    """
+
+    if not isinstance(proposed, dict):
+        return {}
+    from app.services.main_street_programs import MAIN_STREET_INDUSTRIES, MAIN_STREET_INTENTS
+
+    accepted: dict[str, Any] = {}
+    if isinstance(proposed.get("industry"), str) and proposed["industry"].strip() in MAIN_STREET_INDUSTRIES:
+        accepted["industry"] = proposed["industry"].strip()
+    if isinstance(proposed.get("intent"), str) and proposed["intent"].strip() in MAIN_STREET_INTENTS:
+        accepted["intent"] = proposed["intent"].strip()
+    for key in ("owns_operating_property", "financing_equipment_or_vehicle", "franchise"):
+        if isinstance(proposed.get(key), bool):
+            accepted[key] = proposed[key]
+    years = proposed.get("years_in_business")
+    if isinstance(years, (int, float)) and not isinstance(years, bool) and 0 <= years <= 250:
+        accepted["years_in_business"] = float(years)
+    requested = proposed.get("requested_amount")
+    if isinstance(requested, (int, float)) and not isinstance(requested, bool) and 0 < requested <= 500_000_000:
+        accepted["requested_amount"] = float(requested)
+        intake.requested_loan_amount = float(requested)
+    credit = proposed.get("estimated_credit_score")
+    if isinstance(credit, (int, float)) and not isinstance(credit, bool) and 300 <= credit <= 850:
+        accepted["estimated_credit_score"] = int(credit)
+        intake.estimated_credit_score = int(credit)
+
+    if not accepted:
+        return {}
+    state = _intake_state(intake)
+    existing = dict(state.get("main_street_details") or {})
+    # The dedicated equipment route owns its structured intent. Chat can add
+    # facts but cannot silently reclassify the application to another product.
+    if _is_main_street_equipment_intake(intake):
+        accepted["intent"] = "equipment"
+        accepted["financing_equipment_or_vehicle"] = True
+    existing.update(accepted)
+    state["main_street_details"] = existing
+    intake.intake_state = state
+    return accepted
+
+
 def _main_street_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     """AI context for an operating-business file.
 
@@ -3717,6 +3990,11 @@ def _main_street_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "referral_source": intake.referral_source,
         "entity_structure": _entity_structure(intake),
         "main_street_details": details or None,
+        "equipment_financing_details": (
+            state.get("equipment_financing_details")
+            if isinstance(state.get("equipment_financing_details"), dict)
+            else None
+        ),
         "merchant_processing_offer": _merchant_processing_offer(intake) or None,
         "chat_facts": state.get("chat_facts") if isinstance(state.get("chat_facts"), list) else [],
     }
@@ -3795,6 +4073,21 @@ def _main_street_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "booking_recommended true only for Good probability - book call. This is a "
         "preliminary screen, not a commitment to lend."
     )
+    if intent == "equipment":
+        context["underwriting_focus"] = (
+            "Equipment Financing is already selected. Review the stated asset, condition, age, "
+            "remaining useful life, seller, purchase price, delivery timing and intended business "
+            "use together with the vendor quote and operating-business cash flow. Treat a missing "
+            "fact as a clear information request, not an automatic rejection, and keep the file in "
+            "the Main Street program set rather than applying dealer framing."
+        )
+        context["custom_instructions"] = (
+            "This is a dedicated Equipment Financing intake for an operating business. The product "
+            "choice and any structured equipment_financing_details in context are authoritative and "
+            "must not be re-inferred. Confirm the vendor quote supports the seller, equipment, price "
+            "and delivery, then screen the business evidence. Never promise pricing, timing, approval, "
+            "zero down, private-party eligibility, or a credit-score exception."
+        )
     return context
 
 
@@ -3924,6 +4217,8 @@ async def _recent_dealer_chat(db: AsyncSession, intake: PublicUnderwritingIntake
 async def _find_or_create_client(db: AsyncSession, payload: DealerIntakeStart) -> Client:
     email = _normalize_email(str(payload.email))
     attribution = _public_intake_attribution(payload)
+    is_business_equipment = _is_business_equipment_application(payload)
+    source_channel = "main_street_intake" if is_business_equipment else "dealer_ai_intake"
     # Email match is inherently fragile (same email can belong to more than one
     # client record). Harden the selection: among same-email candidates, prefer
     # one already originated from a dealer AI intake so a new intake reuses the
@@ -3932,7 +4227,7 @@ async def _find_or_create_client(db: AsyncSession, payload: DealerIntakeStart) -
     candidates = (
         await db.execute(select(Client).where(Client.email == email).order_by(Client.created_at.desc()))
     ).scalars().all()
-    client = next((c for c in candidates if c.source_channel == "dealer_ai_intake"), None) or (
+    client = next((c for c in candidates if c.source_channel == source_channel), None) or (
         candidates[0] if candidates else None
     )
     owner = await primary_super_admin(db)
@@ -3941,20 +4236,21 @@ async def _find_or_create_client(db: AsyncSession, payload: DealerIntakeStart) -
             name=payload.full_name.strip(),
             email=email,
             phone=payload.phone,
-            referral_source="dealer_ai_intake",
+            referral_source=source_channel,
             originating_agent_id=owner.id if owner else None,
             current_agent_id=owner.id if owner else None,
-            source_channel="dealer_ai_intake",
+            source_channel=source_channel,
             lead_source="other",
             lead_temperature="warm",
             financing_support_needed="yes",
             relationship_context="new_lead",
             client_experience_mode="self_directed",
-            client_experience_mode_reason="dealer_ai_intake",
+            client_experience_mode_reason=source_channel,
             client_experience_mode_locked_by="firm",
             lead_intake={
-                "source": "dealer_ai_intake",
+                "source": source_channel,
                 "business_name": payload.business_name,
+                **({"lead_type": "main_street", "funding_intent": "equipment"} if is_business_equipment else {}),
                 **({"signup_attribution": attribution} if attribution else {}),
             },
         )
@@ -3971,11 +4267,13 @@ async def _find_or_create_client(db: AsyncSession, payload: DealerIntakeStart) -
     # sourced — only when empty, so an existing agent/referral attribution is
     # never overwritten.
     if not client.source_channel:
-        client.source_channel = "dealer_ai_intake"
+        client.source_channel = source_channel
     if not client.referral_source:
-        client.referral_source = "dealer_ai_intake"
+        client.referral_source = source_channel
     intake = dict(client.lead_intake or {})
-    intake.update({"source": "dealer_ai_intake", "business_name": payload.business_name or intake.get("business_name")})
+    intake.update({"source": source_channel, "business_name": payload.business_name or intake.get("business_name")})
+    if is_business_equipment:
+        intake.update({"lead_type": "main_street", "funding_intent": "equipment"})
     if attribution:
         intake["signup_attribution"] = attribution
     client.lead_intake = intake
@@ -4436,6 +4734,37 @@ def _apply_updates(intake: PublicUnderwritingIntake, updates: DealerIntakePatch 
         state["foreclosure_rescue"] = rescue_details
     if "entity_structure" in data:
         state["entity_structure"] = updates.entity_structure.model_dump() if updates.entity_structure else {}
+    equipment_details = _equipment_details_payload(updates.equipment_details)
+    if "funding_intent" in data:
+        state["funding_intent"] = updates.funding_intent
+        equipment_selected = equipment_financing.is_equipment_funding_intent(
+            updates.funding_intent
+        )
+        if intake.variant == MAIN_STREET_VARIANT:
+            main_street_details = dict(state.get("main_street_details") or {})
+            main_street_details["intent"] = "equipment" if equipment_selected else updates.funding_intent
+            state["main_street_details"] = main_street_details
+        else:
+            dealer_details = dict(state.get("dealer_details") or {})
+            dealer_details["financing_equipment_or_vehicle"] = equipment_selected
+            state["dealer_details"] = dealer_details
+        if equipment_selected and not (intake.loan_purpose or "").strip():
+            intake.loan_purpose = "Equipment financing"
+    if "equipment_details" in data:
+        state["equipment_financing_details"] = equipment_details or {}
+        if equipment_details:
+            if intake.variant == MAIN_STREET_VARIANT:
+                main_street_details = dict(state.get("main_street_details") or {})
+                main_street_details["intent"] = "equipment"
+                main_street_details.setdefault("industry", "other")
+                state["main_street_details"] = main_street_details
+            else:
+                dealer_details = dict(state.get("dealer_details") or {})
+                dealer_details["financing_equipment_or_vehicle"] = True
+                state["dealer_details"] = dealer_details
+            state["funding_intent"] = "equipment"
+            if not (intake.loan_purpose or "").strip():
+                intake.loan_purpose = "Equipment financing"
     state["last_updates"] = data
     intake.intake_state = state
     # Stamp the AI context for THIS intake's product — never force dealer context
@@ -4450,6 +4779,37 @@ def _apply_updates(intake: PublicUnderwritingIntake, updates: DealerIntakePatch 
             "above_published_program_max": rescue_details["above_published_program_max"],
             "request_classification": rescue_details["request_classification"],
         }
+
+
+async def _ensure_equipment_evidence_for_update(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    updates: DealerIntakePatch | None,
+) -> None:
+    if updates is None or intake.variant not in {DEALER_VARIANT, MAIN_STREET_VARIANT}:
+        return
+    state = dict(intake.intake_state or {})
+    dealer_details = dict(state.get("dealer_details") or {})
+    main_street_details = dict(state.get("main_street_details") or {})
+    equipment_selected = (
+        equipment_financing.is_equipment_funding_intent(state.get("funding_intent"))
+        or dealer_details.get("financing_equipment_or_vehicle") is True
+        or main_street_details.get("intent") == "equipment"
+        or bool(state.get("equipment_financing_details"))
+    )
+    if not equipment_selected:
+        return
+    await _ensure_requested_document(
+        db,
+        intake.bucket,
+        name="Vendor quote or invoice for the equipment",
+        category="Equipment",
+        description=(
+            "Upload the current vendor quote or invoice showing the seller, "
+            "equipment description, purchase price, and expected delivery."
+        ),
+        allow_multiple_files=True,
+    )
 
 
 async def _log_dealer_update_events(
@@ -6484,6 +6844,8 @@ async def _response(
     room_delivery_status: str | None = None,
     room_delivery_detail: str | None = None,
 ) -> DealerIntakeResponse:
+    if public_path == "/dealer-ai-underwriter" and _is_main_street_equipment_intake(intake):
+        public_path = EQUIPMENT_PUBLIC_PATH
     # Read-only hydration only: opening/resuming an intake must never create a
     # profile or a new financial interpretation as a side effect.
     readiness_profile = (
@@ -7794,21 +8156,88 @@ async def start_dealer_intake(
         _START_MIN_INTERVAL_SECONDS,
         "Please wait a moment before starting another review.",
     )
-    existing = await _latest_active_intake_by_email(db, str(payload.email))
+    business_equipment = _is_business_equipment_application(payload)
+    target_variant = MAIN_STREET_VARIANT if business_equipment else DEALER_VARIANT
+    existing = await _latest_active_intake_by_email(
+        db, str(payload.email), variant=target_variant
+    )
     if existing is not None:
-        await _start_login_challenge(db, email=str(payload.email), request=request, reason="existing_intake_start")
+        await _start_login_challenge(
+            db,
+            email=str(payload.email),
+            request=request,
+            reason="existing_equipment_intake_start" if business_equipment else "existing_intake_start",
+            variant=target_variant,
+            review_label="equipment financing review" if business_equipment else "dealer funding review",
+            event_prefix="equipment_financing" if business_equipment else "dealer_ai",
+            target_type="equipment_financing_intake" if business_equipment else "dealer_ai_intake",
+        )
         await db.commit()
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            "A secure dealer file already exists for this email. We sent a short access code so you can continue that file.",
+            (
+                "A secure Equipment Financing file already exists for this email. We sent a short access code so you can continue it."
+                if business_equipment
+                else "A secure dealer file already exists for this email. We sent a short access code so you can continue that file."
+            ),
         )
     client = await _find_or_create_client(db, payload)
-    bucket, link = await _create_bucket_for_intake(db, client, payload, request)
+    if business_equipment:
+        bucket, link = await _create_bucket_for_main_street(
+            db,
+            client,
+            payload,
+            request,
+            intent="equipment",
+            industry="other",
+        )
+    else:
+        bucket, link = await _create_bucket_for_intake(db, client, payload, request)
     token = _new_public_token()
     attribution = _public_intake_attribution(payload)
+    equipment_application = _is_equipment_application(
+        funding_intent=payload.funding_intent,
+        details=payload.equipment_details,
+    )
+    equipment_details = _equipment_details_payload(payload.equipment_details)
+    intake_state: dict[str, Any] = {
+        "messages": [],
+        "source": "equipment_financing_intake" if business_equipment else "dealer_ai_intake",
+        **(
+            {
+                "capital_readiness_diagnostic": payload.capital_readiness_diagnostic.model_dump(
+                    mode="json", by_alias=True
+                )
+            }
+            if payload.capital_readiness_diagnostic
+            else {}
+        ),
+        **({"signup_attribution": attribution} if attribution else {}),
+        **({"funding_intent": payload.funding_intent} if payload.funding_intent else {}),
+        **(
+            {"main_street_details": {"intent": "equipment", "industry": "other"}}
+            if business_equipment
+            else {"dealer_details": {"financing_equipment_or_vehicle": True}}
+            if equipment_application
+            else {}
+        ),
+        **(
+            {"equipment_financing_details": equipment_details}
+            if equipment_details
+            else {}
+        ),
+        "legal_acceptance": {
+            "terms_accepted": payload.terms_accepted,
+            "privacy_accepted": payload.privacy_accepted,
+            "terms_version": payload.terms_version or TERMS_VERSION,
+            "privacy_version": payload.privacy_version or PRIVACY_VERSION,
+            **_request_audit(request),
+        },
+    }
     intake = PublicUnderwritingIntake(
+        variant=target_variant,
         source_kind="public_form",
-        source_detail="Dealer intake form",
+        source_detail="Equipment Financing intake form" if business_equipment else "Dealer intake form",
         client_id=client.id,
         bucket_id=bucket.id,
         bucket_upload_link_id=link.id,
@@ -7817,34 +8246,30 @@ async def start_dealer_intake(
         email=client.email or _normalize_email(str(payload.email)),
         phone=payload.phone,
         business_name=payload.business_name,
-        referral_source=(attribution or {}).get("source") or "dealer_ai_intake",
+        requested_loan_amount=payload.requested_amount,
+        loan_purpose="Equipment financing" if equipment_application else None,
+        referral_source=(attribution or {}).get("source") or ("equipment_financing_intake" if business_equipment else "dealer_ai_intake"),
         preferred_language=payload.preferred_language,
-        intake_state={
-            "messages": [],
-            "source": "dealer_ai_intake",
-            **(
-                {
-                    "capital_readiness_diagnostic": payload.capital_readiness_diagnostic.model_dump(
-                        mode="json", by_alias=True
-                    )
-                }
-                if payload.capital_readiness_diagnostic
-                else {}
-            ),
-            **({"signup_attribution": attribution} if attribution else {}),
-            "legal_acceptance": {
-                "terms_accepted": payload.terms_accepted,
-                "privacy_accepted": payload.privacy_accepted,
-                "terms_version": payload.terms_version or TERMS_VERSION,
-                "privacy_version": payload.privacy_version or PRIVACY_VERSION,
-                **_request_audit(request),
-            },
-        },
+        intake_state=intake_state,
     )
     db.add(intake)
+    if equipment_application:
+        await _configure_equipment_bucket(
+            db,
+            bucket,
+            details=equipment_details,
+        )
     await db.commit()
     intake = await _load_public_intake(db, token)
-    email_record = await _record_resume_email(intake, token=token, request=request, reason="intake_created")
+    email_record = await _record_resume_email(
+        intake,
+        token=token,
+        request=request,
+        reason="equipment_intake_created" if business_equipment else "intake_created",
+        public_path=EQUIPMENT_PUBLIC_PATH if business_equipment else "/dealer-ai-underwriter",
+        review_label="equipment financing review" if business_equipment else "dealer funding review",
+        room_label="equipment financing file" if business_equipment else "dealer financing file",
+    )
     await _record_super_admin_intake_notification(db, intake, request=request)
     await db.commit()
     intake = await _load_public_intake(db, token)
@@ -7853,7 +8278,12 @@ async def start_dealer_intake(
         db,
         intake,
         token=token,
-        assistant_message=_dealer_welcome(intake.preferred_language, email_note=email_note),
+        assistant_message=(
+            _equipment_welcome(intake.preferred_language, email_note=email_note)
+            if business_equipment
+            else _dealer_welcome(intake.preferred_language, email_note=email_note)
+        ),
+        public_path=EQUIPMENT_PUBLIC_PATH if business_equipment else "/dealer-ai-underwriter",
     )
 
 
@@ -7863,14 +8293,32 @@ async def start_dealer_login(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> DealerLoginStartResponse:
-    login_required = await _start_login_challenge(db, email=str(payload.email), request=request, reason="dealer_login_requested")
+    business_equipment = _is_business_equipment_application(payload)
+    login_required = await _start_login_challenge(
+        db,
+        email=str(payload.email),
+        request=request,
+        reason="equipment_login_requested" if business_equipment else "dealer_login_requested",
+        variant=MAIN_STREET_VARIANT if business_equipment else DEALER_VARIANT,
+        review_label="equipment financing review" if business_equipment else "dealer funding review",
+        event_prefix="equipment_financing" if business_equipment else "dealer_ai",
+        target_type="equipment_financing_intake" if business_equipment else "dealer_ai_intake",
+    )
     await db.commit()
     return DealerLoginStartResponse(
         login_required=login_required,
         message=(
-            "We found an existing secure dealer file for this email. Enter the code we sent to continue."
+            (
+                "We found an existing secure Equipment Financing file for this email. Enter the code we sent to continue."
+                if business_equipment
+                else "We found an existing secure dealer file for this email. Enter the code we sent to continue."
+            )
             if login_required
-            else "No existing secure dealer file was found. Complete Step 1 to start a new review."
+            else (
+                "No existing Equipment Financing file was found. Complete Step 1 to start a new review."
+                if business_equipment
+                else "No existing secure dealer file was found. Complete Step 1 to start a new review."
+            )
         ),
     )
 
@@ -7917,6 +8365,7 @@ async def verify_dealer_login(
         challenge.revoked_at = _now()
         await db.commit()
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired access code")
+    _require_dealer_intake(intake)
     intake.token_hash = _hash_token(public_token)
     await _log(
         db,
@@ -7928,7 +8377,11 @@ async def verify_dealer_login(
         actor_role="public_lead",
         target_type="dealer_ai_intake",
         target_id=str(intake.id),
-        detail="Dealer AI continuation login verified",
+        detail=(
+            "Equipment Financing continuation login verified"
+            if _is_main_street_equipment_intake(intake)
+            else "Dealer AI continuation login verified"
+        ),
     )
     await db.commit()
     intake = await _load_public_intake(db, public_token)
@@ -7937,7 +8390,8 @@ async def verify_dealer_login(
         intake,
         token=public_token,
         session_token=session_token,
-        assistant_message=_dealer_welcome_back(intake.preferred_language),
+        assistant_message=_dealer_route_welcome_back(intake),
+        public_path=_dealer_route_public_path(intake),
     )
 
 
@@ -7947,6 +8401,7 @@ async def get_dealer_session(request: Request, db: AsyncSession = Depends(get_db
     if not session_token:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Dealer session is required")
     intake, _challenge = await _load_intake_by_dealer_session(db, session_token, allow_pending_signing=True)
+    _require_dealer_intake(intake)
     public_token = _new_public_token()
     intake.token_hash = _hash_token(public_token)
     await db.commit()
@@ -7956,7 +8411,8 @@ async def get_dealer_session(request: Request, db: AsyncSession = Depends(get_db
         intake,
         token=public_token,
         session_token=session_token,
-        assistant_message=_dealer_welcome_back(intake.preferred_language),
+        assistant_message=_dealer_route_welcome_back(intake),
+        public_path=_dealer_route_public_path(intake),
     )
 
 
@@ -7989,10 +8445,15 @@ async def send_dealer_resume_link(
     db: AsyncSession = Depends(get_db),
 ) -> DealerResumeLinkResponse:
     email = _normalize_email(str(payload.email))
+    business_equipment = _is_business_equipment_application(payload)
+    target_variant = MAIN_STREET_VARIANT if business_equipment else DEALER_VARIANT
     intake = (
         await db.execute(
             select(PublicUnderwritingIntake)
-            .where(PublicUnderwritingIntake.email == email)
+            .where(
+                PublicUnderwritingIntake.email == email,
+                PublicUnderwritingIntake.variant == target_variant,
+            )
             .options(selectinload(PublicUnderwritingIntake.bucket))
             .order_by(PublicUnderwritingIntake.updated_at.desc())
         )
@@ -8000,7 +8461,15 @@ async def send_dealer_resume_link(
     if intake is not None and intake.bucket is not None and intake.bucket.archived_at is None:
         token = _new_public_token()
         intake.token_hash = _hash_token(token)
-        await _record_resume_email(intake, token=token, request=request, reason="resume_link_requested")
+        await _record_resume_email(
+            intake,
+            token=token,
+            request=request,
+            reason="equipment_resume_link_requested" if business_equipment else "resume_link_requested",
+            public_path=EQUIPMENT_PUBLIC_PATH if business_equipment else "/dealer-ai-underwriter",
+            review_label="equipment financing review" if business_equipment else "dealer funding review",
+            room_label="equipment financing file" if business_equipment else "dealer financing file",
+        )
         await _log(
             db,
             intake.bucket_id,
@@ -8011,7 +8480,11 @@ async def send_dealer_resume_link(
             actor_role="public_lead",
             target_type="dealer_ai_intake",
             target_id=str(intake.id),
-            detail="Dealer AI resume link requested by email",
+            detail=(
+                "Equipment Financing resume link requested by email"
+                if business_equipment
+                else "Dealer AI resume link requested by email"
+            ),
         )
         await db.commit()
     return DealerResumeLinkResponse()
@@ -8050,7 +8523,10 @@ async def download_dealer_intelligence_pdf(
         missing_docs=missing_docs,
         result=latest_result,
     )
-    filename = _safe_filename(f"dealer-intelligence-{intake.business_name or intake.full_name or 'review'}.pdf")
+    filename = _safe_filename(
+        f"{'equipment-financing' if _is_main_street_equipment_intake(intake) else 'dealer-intelligence'}-"
+        f"{intake.business_name or intake.full_name or 'review'}.pdf"
+    )
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
@@ -8519,7 +8995,10 @@ async def download_admin_dealer_intelligence_pdf(
         credit=_credit_pull_state(intake) or None,
         internal=True,
     )
-    filename = _safe_filename(f"dealer-intelligence-{intake.business_name or intake.full_name or 'review'}.pdf")
+    filename = _safe_filename(
+        f"{'equipment-financing' if _is_main_street_equipment_intake(intake) else 'dealer-intelligence'}-"
+        f"{intake.business_name or intake.full_name or 'review'}.pdf"
+    )
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
@@ -9376,6 +9855,15 @@ async def _create_admin_ai_lead_core(
     # branch was added to fix.
     ms_intent = normalize_intent(payload.intent) if is_ms else None
     ms_industry = normalize_industry(payload.industry) if is_ms else None
+    equipment_details = _equipment_details_payload(payload.equipment_details)
+    equipment_application = (
+        not is_re
+        and not is_mca
+        and _is_equipment_application(
+            funding_intent=ms_intent if is_ms else payload.loan_purpose,
+            details=payload.equipment_details,
+        )
+    )
 
     # Duplicate policy: unless force_new, surface the existing active lead so the
     # operator opens it instead of creating a duplicate bucket for the same email.
@@ -9424,6 +9912,8 @@ async def _create_admin_ai_lead_core(
             email=payload.email,
             phone=payload.phone,
             business_name=payload.business_name,
+            funding_intent="equipment" if equipment_application else ms_intent,
+            equipment_details=payload.equipment_details,
         )
         client = client_override or await _find_or_create_client(db, adapter)
         bucket, link = await _create_bucket_for_main_street(
@@ -9456,6 +9946,8 @@ async def _create_admin_ai_lead_core(
             email=payload.email,
             phone=payload.phone,
             business_name=payload.business_name,
+            funding_intent="equipment" if equipment_application else None,
+            equipment_details=payload.equipment_details,
         )
         client = client_override or await _find_or_create_client(db, adapter)
         bucket, link = await _create_bucket_for_intake(
@@ -9487,6 +9979,14 @@ async def _create_admin_ai_lead_core(
             "intent": ms_intent,
             "industry": ms_industry,
         }
+    if equipment_application:
+        intake_state["funding_intent"] = "equipment"
+        if not is_ms:
+            intake_state["dealer_details"] = {
+                "financing_equipment_or_vehicle": True,
+            }
+        if equipment_details:
+            intake_state["equipment_financing_details"] = equipment_details
     if payload.capital_readiness_diagnostic is not None:
         intake_state["capital_readiness_diagnostic"] = (
             payload.capital_readiness_diagnostic.model_dump(mode="json", by_alias=True)
@@ -9518,6 +10018,8 @@ async def _create_admin_ai_lead_core(
         loan_purpose=(
             payload.transaction_type
             if is_re
+            else "Equipment financing"
+            if equipment_application
             else payload.loan_purpose or ("MCA refinance" if is_mca else None)
         ),
         requested_loan_amount=payload.requested_amount,
@@ -9539,6 +10041,12 @@ async def _create_admin_ai_lead_core(
         partner = await _load_dealer_partner_user(db, payload.broker_user_id)
         intake.broker_id = partner.id
     db.add(intake)
+    if equipment_application:
+        await _configure_equipment_bucket(
+            db,
+            bucket,
+            details=equipment_details,
+        )
     await _log(
         db,
         bucket.id,
@@ -12305,6 +12813,7 @@ async def update_dealer_intake(
     _require_dealer_intake(intake)
     update_data = payload.model_dump(exclude_unset=True)
     _apply_updates(intake, payload)
+    await _ensure_equipment_evidence_for_update(db, intake, payload)
     await _log_dealer_update_events(
         db,
         intake,
@@ -12330,6 +12839,7 @@ async def dealer_intake_chat(
     _require_dealer_intake(intake)
     update_data = payload.updates.model_dump(exclude_unset=True) if payload.updates else {}
     _apply_updates(intake, payload.updates)
+    await _ensure_equipment_evidence_for_update(db, intake, payload.updates)
     _record_chat_fact(intake, payload.message)
     await _log_dealer_update_events(
         db,
@@ -12351,8 +12861,11 @@ async def dealer_intake_chat(
         if chat_messages and not paused:
             raw = chat_messages[-1].metadata_json.get("raw") if isinstance(chat_messages[-1].metadata_json, dict) else None
             proposed_facts = raw.get("proposed_borrower_facts") if isinstance(raw, dict) else None
-            newly_accepted = _merge_dealer_details(intake, proposed_facts)
-            await _apply_dealer_detail_documents(db, intake, newly_accepted)
+            if intake.variant == MAIN_STREET_VARIANT:
+                _merge_main_street_details(intake, proposed_facts)
+            else:
+                newly_accepted = _merge_dealer_details(intake, proposed_facts)
+                await _apply_dealer_detail_documents(db, intake, newly_accepted)
     _apply_loan_program_fit(intake)
     await db.commit()
     intake = await _load_public_intake(db, token)
@@ -12622,9 +13135,10 @@ async def book_dealer_call(
         raise HTTPException(status.HTTP_409_CONFLICT, "That call time is no longer available. Choose another time.")
 
     who = f"{intake.full_name} <{intake.email}>"
+    equipment_intake = _is_main_street_equipment_intake(intake)
     description = (
-        "Booked from Dealer AI Underwriter.\n"
-        f"Dealer intake: {intake.id}\n"
+        f"Booked from {'Equipment Financing Review' if equipment_intake else 'Dealer AI Underwriter'}.\n"
+        f"{'Equipment financing' if equipment_intake else 'Dealer'} intake: {intake.id}\n"
         f"Bucket: {intake.bucket_id}\n"
         f"Business: {intake.business_name or '(not provided)'}\n"
         f"Name: {intake.full_name}\n"
@@ -12636,7 +13150,7 @@ async def book_dealer_call(
     ev = CalendarEvent(
         loan_id=None,
         kind=CalendarEventKind.CALL,
-        title=f"Dealer AI call: {intake.business_name or intake.full_name}",
+        title=f"{'Equipment financing' if equipment_intake else 'Dealer AI'} call: {intake.business_name or intake.full_name}",
         description=description,
         who=who[:160],
         starts_at=starts_at,
@@ -12923,6 +13437,7 @@ async def my_dealer_intake_chat(
     intake = await _load_client_intake(db, user, intake_id)
     update_data = payload.updates.model_dump(exclude_unset=True) if payload.updates else {}
     _apply_updates(intake, payload.updates)
+    await _ensure_equipment_evidence_for_update(db, intake, payload.updates)
     _record_chat_fact(intake, payload.message)
     await _log_dealer_update_events(db, intake, update_data, request=request, user=user)
     messages = []
@@ -13130,10 +13645,13 @@ def _variant_label(variant: str | None) -> str:
 
 
 def _require_dealer_intake(intake: PublicUnderwritingIntake) -> None:
-    """Reject a non-dealer intake on the dealer public routes, so a real-estate
-    token can never be driven through car-dealer logic. Mirrors
-    _require_funding_intake; 404 (not 403) to match the funding convention."""
-    if intake.variant != DEALER_VARIANT:
+    """Allow the legacy dealer room and its dedicated equipment handoff only.
+
+    The equipment page safely reuses this route family, but its intake remains
+    a Main Street file. Other Main Street, MCA, and real-estate tokens stay
+    undiscoverable here.
+    """
+    if intake.variant != DEALER_VARIANT and not _is_main_street_equipment_intake(intake):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Dealer AI intake not found")
 
 
@@ -13436,6 +13954,7 @@ async def funding_review_chat(
     intake = await _load_public_intake(db, token)
     _require_funding_intake(intake)
     _apply_updates(intake, payload.updates)
+    await _ensure_equipment_evidence_for_update(db, intake, payload.updates)
     _record_chat_fact(intake, payload.message)
     intake.last_message_at = _now()
     messages = []
@@ -14269,6 +14788,7 @@ async def mca_refinance_chat(
     intake = await _load_public_intake(db, token)
     _require_mca_intake(intake)
     _apply_updates(intake, payload.updates)
+    await _ensure_equipment_evidence_for_update(db, intake, payload.updates)
     _record_chat_fact(intake, payload.message)
     intake.last_message_at = _now()
     messages = []

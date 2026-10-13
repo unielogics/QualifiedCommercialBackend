@@ -9,12 +9,13 @@ from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import ProductAccountType, Role
+from app.lead_types import FundingIntent, normalize_funding_intent
 from app.schemas.common import ORMModel
 from app.services import user_acknowledgment as ack
 from app.services.user_access import account_types, console_keys, console_links, has_product_access
@@ -30,6 +31,44 @@ class SignupAttribution(BaseModel):
     vertical: str | None = Field(default=None, max_length=64)
     campaign: str | None = Field(default=None, max_length=120)
     cta: str | None = Field(default=None, max_length=120)
+    funding_intent: FundingIntent | None = None
+    purpose: str | None = Field(default=None, max_length=255)
+
+    @field_validator("funding_intent", mode="before")
+    @classmethod
+    def normalize_signup_funding_intent(
+        cls, value: object | None
+    ) -> FundingIntent | None:
+        return normalize_funding_intent(value)
+
+    @field_validator("purpose", mode="before")
+    @classmethod
+    def blank_signup_purpose_to_none(cls, value: object | None) -> object | None:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+
+def _persist_signup_attribution(
+    client: object,
+    body: SignupAttribution,
+    request: Request,
+) -> None:
+    """Apply attribution to a client; the route owns the database flush."""
+
+    source = (body.source.strip().lower() or "public_site")[:32]
+    payload = body.model_dump(exclude_none=True)
+    payload["source"] = source
+    payload["captured_at"] = datetime.now(UTC).isoformat()
+    payload["request_ip"] = (
+        (request.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
+        or (request.client.host if request.client else None)
+    )
+    existing = dict(getattr(client, "lead_intake", None) or {})
+    existing["signup_attribution"] = payload
+    client.lead_intake = existing
+    client.source_channel = "public_site"
+    client.lead_source = source
 
 
 class ConsoleLink(BaseModel):
@@ -124,18 +163,6 @@ async def record_signup_attribution(
 
     if user.client is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "Funding client profile is not ready")
-    source = (body.source.strip().lower() or "public_site")[:32]
-    payload = body.model_dump(exclude_none=True)
-    payload["source"] = source
-    payload["captured_at"] = datetime.now(UTC).isoformat()
-    payload["request_ip"] = (
-        (request.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
-        or (request.client.host if request.client else None)
-    )
-    existing = dict(user.client.lead_intake or {})
-    existing["signup_attribution"] = payload
-    user.client.lead_intake = existing
-    user.client.source_channel = "public_site"
-    user.client.lead_source = source
+    _persist_signup_attribution(user.client, body, request)
     await db.flush()
     return {"recorded": True}

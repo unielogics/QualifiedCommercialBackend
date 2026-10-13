@@ -15,7 +15,6 @@ from datetime import datetime
 from html import escape
 from typing import Any
 
-
 BRAND_TEAL = "#0F766E"
 INK = "#0f172a"
 INK2 = "#475569"
@@ -389,12 +388,23 @@ def render_dealer_intelligence_pdf(
 ) -> bytes:
     result = result or {}
     is_real_estate = getattr(intake, "variant", "") == "real_estate_dscr_v1"
-    variant_label = "Real Estate / DSCR Review" if is_real_estate else "Dealer Funding Review"
+    state = getattr(intake, "intake_state", None)
+    state = state if isinstance(state, dict) else {}
+    main_street = _record(state.get("main_street_details"))
+    is_equipment = (
+        getattr(intake, "variant", "") == "main_street_v1"
+        and (state.get("funding_intent") == "equipment" or main_street.get("intent") == "equipment")
+    )
+    variant_label = (
+        "Real Estate / DSCR Review"
+        if is_real_estate
+        else "Equipment Financing Review"
+        if is_equipment
+        else "Dealer Funding Review"
+    )
     key_metrics = _record(result.get("key_metrics"))
     bankability = _record(result.get("bankability_assessment"))
     evidence = _record(result.get("document_evidence_map"))
-    state = getattr(intake, "intake_state", None)
-    state = state if isinstance(state, dict) else {}
     basics = _record(state.get("funding_review_basics"))
 
     requested = _num(getattr(intake, "requested_loan_amount", None)) or _num(basics.get("requested_amount")) or _num(key_metrics.get("requested_amount"))

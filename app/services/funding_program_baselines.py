@@ -649,7 +649,67 @@ CATALOG: dict[str, dict[str, Any]] = {
         "name": "Equipment Financing",
         "slug": "equipment-financing",
         "verticals": ["main_street", "dealer"],
-        "docs": standard_docs() + [deepcopy(QUOTE)],
+        "rules": [
+            rule("equipment_financing_intent", True, "eq"),
+            rule("business_age_years", 1),
+            rule("annual_revenue", 100_000),
+            rule("credit_score", 640),
+            rule("cash_flow", 0, "gt"),
+            rule("requested_amount", 25_000),
+            rule("requested_amount", 2_000_000, "lte"),
+        ],
+        "docs": standard_docs()
+        + [
+            document(
+                "equipment_quote",
+                "Vendor quote or invoice for the equipment",
+                "Obtain the current quote or invoice. Confirm the seller, equipment description, purchase price, delivery timing, intended business use and any existing liens. Missing or unclear details require follow-up rather than an automatic rejection.",
+                checks=[
+                    check(
+                        "custom_equipment_identity",
+                        "Identify the equipment",
+                        "Record the equipment type, make/model or other identifying detail, and whether it is new, used or refurbished.",
+                        "block",
+                    ),
+                    check(
+                        "custom_equipment_seller_and_price",
+                        "Verify seller and purchase price",
+                        "Record the seller identity and contact information and reconcile the stated purchase price to the quote or invoice.",
+                        "block",
+                    ),
+                    check(
+                        "custom_equipment_delivery",
+                        "Confirm expected delivery",
+                        "Record the expected delivery timing and flag any timing or availability uncertainty for staff review.",
+                    ),
+                ],
+            ),
+            document(
+                "equipment_transaction_details",
+                "Equipment and transaction details",
+                "Collect the equipment description, age, condition, remaining useful life, seller details, purchase price, delivery timing and intended business use. Unknown details remain open questions and do not become zero or failed values.",
+                checks=[
+                    check(
+                        "custom_equipment_useful_life",
+                        "Review age, condition and useful life",
+                        "Compare the equipment's age, condition and remaining useful life with the requested financing term. Escalate an unsupported or unclear useful-life assumption.",
+                        "block",
+                    ),
+                    check(
+                        "custom_equipment_business_use",
+                        "Confirm business purpose",
+                        "Document how the equipment will be used in the business and confirm the request is for a business purpose.",
+                        "block",
+                    ),
+                ],
+                category="borrower_info",
+            ),
+        ],
+        "notes": [
+            "Website: QC's published Equipment Financing range is $25,000 to $2,000,000 with terms from 24 to 84 months.",
+            "Proposed QC policy: the preliminary screen requires an equipment need, one year in business, $100,000 annual revenue, estimated 640 credit, positive cash flow and a request within the published range. Missing facts mean more information is needed, not an automatic rejection.",
+            "Review: lender pricing, down payment, private-party eligibility and approval timing remain file-specific and must not be inferred from this baseline.",
+        ],
     },
     "jumbo_term": {
         "name": "Jumbo Term",
