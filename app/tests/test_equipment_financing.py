@@ -277,6 +277,19 @@ def test_migration_owns_versioned_scopes_without_overwriting_existing_rows():
     assert migration["MAIN_STREET_SCOPE_INTENT_KEYS"] == ["equipment"]
 
 
+def test_field_desk_catalog_insert_casts_reused_program_key_consistently():
+    migration_source = (
+        Path(__file__).parents[2]
+        / "alembic"
+        / "versions"
+        / "0236_equipment_financing_sync.py"
+    ).read_text(encoding="utf-8")
+
+    # Psycopg/PostgreSQL otherwise tries to infer one reused bind as both text
+    # and varchar when it appears in INSERT VALUES and the version subquery.
+    assert migration_source.count("CAST(:program_key AS varchar)") >= 2
+
+
 def test_signup_attribution_accepts_and_persists_equipment_intent():
     payload = DealerIntakeStart(
         full_name="Sam Owner",

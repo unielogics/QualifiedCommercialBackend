@@ -419,9 +419,9 @@ def upgrade() -> None:
                 term_max_months, effective_at, active, sort_order,
                 created_at, updated_at
             ) VALUES (
-                CAST(:id AS uuid), :program_key,
+                CAST(:id AS uuid), CAST(:program_key AS varchar),
                 COALESCE((SELECT MAX(version) + 1 FROM dos_product_catalog
-                          WHERE program_key = :program_key), 1),
+                          WHERE program_key = CAST(:program_key AS varchar)), 1),
                 'asset', CAST(:copy AS jsonb), CAST(:pricing AS jsonb),
                 CAST(:eligibility AS jsonb), CAST(:disclosures AS jsonb),
                 :minimum_amount, :maximum_amount, :minimum_term_months,
