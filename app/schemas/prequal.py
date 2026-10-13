@@ -74,6 +74,10 @@ class PrequalRequestApprove(BaseModel):
     the app) but NEVER rendered on the PDF letter."""
     approved_purchase_price: float = Field(gt=0)
     approved_loan_amount: float = Field(gt=0)
+    # Manual issuance applies the acting employee's account signature and
+    # contact information. The UI obtains this explicit, letter-specific
+    # authorization immediately before approve/reissue/revise.
+    signature_consent: bool = False
     admin_notes: str | None = Field(default=None, max_length=2000)
     approved_scenario: dict[str, Any] | None = None
     # Optional override on the letter's expiration window. None → service
@@ -134,6 +138,9 @@ class PrequalRequestRead(ORMModel):
     # Computed on read by the router (presigned GET URL, 24h TTL).
     # Always None for pending/rejected requests; populated for approved.
     pdf_url: str | None = None
+    # Same immutable PDF with an attachment content disposition so browser
+    # download controls save it instead of merely opening the S3 object.
+    pdf_download_url: str | None = None
     reviewed_by: UUID | None
     reviewed_at: datetime | None
     created_at: datetime

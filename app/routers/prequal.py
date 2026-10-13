@@ -56,6 +56,7 @@ from app.schemas.prequal import (
     PrequalSellerOutcome,
 )
 from app.services import calendar_emitter, prequal_pdf
+from app.services import stored_signatures as stored_sigs
 from app.services.activity_log import mark_loan_dirty
 
 router = APIRouter(tags=["prequal"])
@@ -113,13 +114,108 @@ def _to_read(req: PrequalRequest) -> PrequalRequestRead:
     borrower's UI between page loads."""
     settings = get_settings()
     pdf_url: str | None = None
-    if req.pdf_s3_key and req.status == "approved":
+    pdf_download_url: str | None = None
+    if req.pdf_s3_key and req.status in {"approved", "offer_accepted"}:
         pdf_url = prequal_pdf.presign_get(req.pdf_s3_key, settings=settings)
+        quote = req.quote_number or f"prequal-{str(req.id)[:8]}"
+        pdf_download_url = prequal_pdf.presign_get(
+            req.pdf_s3_key,
+            settings=settings,
+            download_filename=f"Qualified-Commercial-Prequalification-{quote}.pdf",
+        )
     base = PrequalRequestRead.model_validate(req).model_dump()
     base["pdf_url"] = pdf_url
+    base["pdf_download_url"] = pdf_download_url
     client = req.__dict__.get("client")
     base["client_name"] = client.name if client is not None else None
     return PrequalRequestRead(**base)
+
+
+async def _signer_for_actor(
+    db: AsyncSession,
+    actor_user_id: UUID | None,
+) -> prequal_pdf.PrequalSigner | None:
+    """Resolve the account identity used on a manually issued letter.
+
+    An auto-approval has no human actor and intentionally returns ``None`` so
+    the renderer uses the firm/QC letterhead. Manual approval always carries
+    the acting employee's account name, email, phone and title. Their live
+    signature-on-file is included when present and its hash is re-verified by
+    the renderer before it is embedded.
+    """
+    if actor_user_id is None:
+        return None
+    signing_user = await db.get(User, actor_user_id)
+    if signing_user is None:
+        return None
+    stored_signature = await stored_sigs.current_user_signature(db, actor_user_id)
+    return _signer_from_account(signing_user, stored_signature)
+
+
+def _signer_from_account(
+    signing_user: User,
+    stored_signature: Any | None,
+) -> prequal_pdf.PrequalSigner:
+    """Build the immutable signer snapshot used by the PDF renderer."""
+    return prequal_pdf.PrequalSigner(
+        name=(
+            stored_signature.typed_name
+            if stored_signature is not None and stored_signature.typed_name
+            else signing_user.name
+        )
+        or signing_user.email,
+        title=(
+            stored_signature.title
+            if stored_signature is not None and stored_signature.title
+            else signing_user.title
+        ),
+        email=signing_user.email,
+        phone=signing_user.phone,
+        signature_s3_key=(
+            stored_signature.signature_s3_key
+            if stored_signature is not None
+            else None
+        ),
+        signature_sha256=(
+            stored_signature.signature_sha256
+            if stored_signature is not None
+            else None
+        ),
+        signature_id=(str(stored_signature.id) if stored_signature is not None else None),
+        signature_source=(stored_signature.source if stored_signature is not None else None),
+    )
+
+
+def _letter_signer_snapshot(
+    signer: prequal_pdf.PrequalSigner | None,
+    *,
+    actor_user_id: UUID | None,
+    signed_at: datetime,
+) -> dict[str, Any]:
+    """Build durable identity evidence for the exact issued letter.
+
+    Approvals commonly happen before a Loan exists, so the Loan activity
+    stream cannot be the only audit location. This snapshot is stored on the
+    prequalification version that owns the rendered PDF.
+    """
+    if signer is None:
+        return {
+            "source": "firm_letterhead",
+            "signed_at": signed_at.isoformat(),
+        }
+    return {
+        "source": "account_signature",
+        "authorization": "explicit_per_issuance",
+        "user_id": str(actor_user_id) if actor_user_id else None,
+        "name": signer.name,
+        "title": signer.title,
+        "email": signer.email,
+        "phone": signer.phone,
+        "signature_id": signer.signature_id,
+        "signature_source": signer.signature_source,
+        "signature_sha256": signer.signature_sha256,
+        "signed_at": signed_at.isoformat(),
+    }
 
 
 def _gen_quote_number() -> str:
@@ -560,6 +656,18 @@ async def _apply_approval(
     loan type, etc.). Caller is responsible for higher-level gates
     (auth, status). Returns the updated PrequalRequest."""
 
+    if actor_user_id is not None and not payload.signature_consent:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "signature_consent_required",
+                "message": (
+                    "Confirm that your saved signature and account contact information "
+                    "may be applied to this pre-qualification letter."
+                ),
+            },
+        )
+
     # LTV cap enforcement against the matrix.
     cap = LTV_CAPS.get(req.loan_type)
     if cap is None:
@@ -683,6 +791,16 @@ async def _apply_approval(
     fallback_individual_name = (
         requester.client.name if requester and requester.client else None
     )
+    signer = await _signer_for_actor(db, actor_user_id)
+    signer_snapshot = _letter_signer_snapshot(
+        signer,
+        actor_user_id=actor_user_id,
+        signed_at=req.reviewed_at,
+    )
+    approved_scenario = dict(req.approved_scenario or {})
+    approved_scenario["_issued_letter_signer"] = signer_snapshot
+    req.approved_scenario = approved_scenario
+    await db.flush()
     # WeasyPrint + S3 upload are blocking calls (5–15s on rich
     # templates). Running them inline on the async event loop pegs the
     # worker AND, under auto-approval, can push the request past the
@@ -699,6 +817,7 @@ async def _apply_approval(
             quote_number=req.quote_number,
             settings_row=settings_row,
             fallback_individual_name=fallback_individual_name,
+            signer=signer,
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("prequal_pdf render/upload failed for request %s", req.id)
@@ -755,6 +874,7 @@ async def _apply_approval(
                     "admin_notes": req.admin_notes,
                     "approved_scenario": req.approved_scenario,
                     "auto_approved": actor_label == "ai",
+                    "letter_signer": signer_snapshot,
                 },
             )
         )

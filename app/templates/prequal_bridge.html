@@ -41,6 +41,7 @@
         .signed-on { font-size: 8pt; color: #6B7891; margin-top: 1px; margin-bottom: 4px; }
         .signature-block .name { font-weight: 700; font-size: 10pt; }
         .signature-block .title-line { font-size: 8.5pt; color: #3C4A60; margin-top: 2px; }
+        .signature-block .contact-line { font-size: 8pt; color: #3C4A60; margin-top: 2px; }
         .disclaimer { flex: 1 1 0; background-color: #fdfbf7; border: 1px solid #e0dcd3; padding: 8px 10px; font-size: 7pt; color: #555; text-align: justify; line-height: 1.3; }
         .agent-card { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; padding: 7px 9px; border: 1px solid #e8e3d6; background-color: #fdfbf7; border-radius: 4px; }
         .agent-card .agent-headshot { width: 38px; height: 38px; object-fit: cover; border-radius: 50%; border: 1px solid #d8d2c2; flex-shrink: 0; }
@@ -138,6 +139,13 @@
             <div class="signed-on">Signed: {{ signed_date }}</div>
             <div class="name">{{ officer_name }}</div>
             <div class="title-line">{{ officer_title }}</div>
+            {% if officer_email or officer_phone %}
+            <div class="contact-line">
+                {% if officer_email %}{{ officer_email }}{% endif %}
+                {% if officer_email and officer_phone %} &middot; {% endif %}
+                {% if officer_phone %}{{ officer_phone }}{% endif %}
+            </div>
+            {% endif %}
         </div>
         <div class="disclaimer">
             <strong>DISCLAIMER:</strong> This letter is a preliminary pre-qualification based on a soft-inquiry credit review and unverified, self-reported financial data provided by the borrower. This is <strong>NOT a commitment to lend</strong>, an offer of credit, or a final loan approval. All loans are strictly subject to final underwriting review, a full acceptable appraisal, environmental reports (if applicable), title clearance, verification of liquid reserves, and final approval by the designated lending institution. Qualified Commercial LLC acts as a commercial loan brokerage platform. Terms, rates, and guidelines are subject to market changes without notice and are not locked until a formal rate lock agreement is executed.

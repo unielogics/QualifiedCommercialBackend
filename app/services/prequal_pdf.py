@@ -14,8 +14,11 @@ Dockerfile installs in the runtime stage.
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
-from datetime import datetime, timedelta, timezone
+import re
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +47,25 @@ PRESIGN_TTL_SECONDS = 86400
 # Default validity window for the pre-qualification letter. The
 # underwriter can override on a per-letter basis from the review modal.
 DEFAULT_LETTER_VALIDITY_DAYS = 90
+
+
+@dataclass(frozen=True)
+class PrequalSigner:
+    """Employee identity sealed into one manually issued letter.
+
+    Contact fields come from the user's account; the signature key and hash
+    come from that user's live StoredSignature. Keeping this value detached
+    from the ORM makes it safe to hand to the blocking renderer thread.
+    """
+
+    name: str
+    title: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    signature_s3_key: str | None = None
+    signature_sha256: str | None = None
+    signature_id: str | None = None
+    signature_source: str | None = None
 
 
 def _s3_client(settings: Settings):
@@ -80,7 +102,12 @@ def _load_letterhead(settings_row: AppSettings | None) -> LetterheadSettings:
         return LetterheadSettings()
 
 
-def _signature_data_uri(settings: Settings, s3_key: str | None) -> str | None:
+def _signature_data_uri(
+    settings: Settings,
+    s3_key: str | None,
+    *,
+    expected_sha256: str | None = None,
+) -> str | None:
     """Fetch the firm's signature image from S3 and return a
     data:image/...;base64 URI suitable for inline <img src=...>.
 
@@ -88,13 +115,23 @@ def _signature_data_uri(settings: Settings, s3_key: str | None) -> str | None:
     than referencing keeps the PDF self-contained and avoids any
     network dependency at render time.
 
-    Returns None on any failure (missing key, S3 unreachable, etc.). The
-    template falls back to a plain underline + typed name when this is
-    absent, so a render is never blocked by a missing signature."""
-    return _s3_image_data_uri(settings, s3_key)
+    Returns None on any failure (missing key, S3 unreachable, etc.). Callers
+    decide whether a typed-name fallback is acceptable. A manually issued
+    letter with a configured account signature must fail closed instead of
+    claiming it was signed with a blank image."""
+    return _s3_image_data_uri(
+        settings,
+        s3_key,
+        expected_sha256=expected_sha256,
+    )
 
 
-def _s3_image_data_uri(settings: Settings, s3_key: str | None) -> str | None:
+def _s3_image_data_uri(
+    settings: Settings,
+    s3_key: str | None,
+    *,
+    expected_sha256: str | None = None,
+) -> str | None:
     """Generic S3-image-to-data-URI helper, used by the firm signature
     AND the broker headshot path. Returns None on any failure."""
     if not s3_key or not settings.s3_bucket:
@@ -103,6 +140,16 @@ def _s3_image_data_uri(settings: Settings, s3_key: str | None) -> str | None:
         s3 = _s3_client(settings)
         obj = s3.get_object(Bucket=settings.s3_bucket, Key=s3_key)
         body = obj["Body"].read()
+        if expected_sha256:
+            actual_sha256 = hashlib.sha256(body).hexdigest()
+            if actual_sha256.lower() != expected_sha256.strip().lower():
+                log.warning(
+                    "s3 signature hash mismatch key=%s expected=%s actual=%s",
+                    s3_key,
+                    expected_sha256,
+                    actual_sha256,
+                )
+                return None
         content_type = obj.get("ContentType") or "image/png"
         b64 = base64.b64encode(body).decode("ascii")
         return f"data:{content_type};base64,{b64}"
@@ -225,6 +272,7 @@ def render_letter(
     quote_number: str | None = None,
     settings_row: AppSettings | None = None,
     fallback_individual_name: str | None = None,
+    signer: PrequalSigner | None = None,
 ) -> str:
     """Render the letter to PDF and upload to S3. Returns the s3_key.
 
@@ -254,7 +302,7 @@ def render_letter(
     loan_amount = float(request.approved_loan_amount or request.requested_loan_amount)
     ltv_pct = round((loan_amount / purchase) * 100) if purchase > 0 else 0
 
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     valid_for = expiration_days if expiration_days and expiration_days > 0 else DEFAULT_LETTER_VALIDITY_DAYS
     expires = today + timedelta(days=valid_for)
 
@@ -272,7 +320,41 @@ def render_letter(
     # letterhead. When the row hasn't been edited yet this falls back to
     # the typed defaults in LetterheadSettings.
     letterhead = _load_letterhead(settings_row)
-    signature_data_uri = _signature_data_uri(settings, letterhead.signature_s3_key)
+    if signer is not None:
+        officer_name = signer.name.strip() or letterhead.officer_name
+        officer_title = (signer.title or "").strip() or "Qualified Commercial LLC"
+        officer_email = (signer.email or "").strip() or None
+        officer_phone = (signer.phone or "").strip() or None
+        signature_data_uri = _signature_data_uri(
+            settings,
+            signer.signature_s3_key,
+            expected_sha256=signer.signature_sha256,
+        )
+        if signer.signature_s3_key and not signer.signature_sha256:
+            raise RuntimeError(
+                "The saved account signature is missing verification metadata. "
+                "Save the signature again before issuing this letter."
+            )
+        if signer.signature_s3_key and not signature_data_uri:
+            raise RuntimeError(
+                "The saved account signature could not be retrieved and verified. "
+                "Retry before issuing this letter."
+            )
+    else:
+        # Automated approvals have no acting employee. They continue to use
+        # the approved firm/QC letterhead identity and company signature.
+        officer_name = letterhead.officer_name
+        officer_title = letterhead.officer_title
+        officer_email = getattr(
+            settings,
+            "prospect_reply_to_email",
+            "support@qualifiedcommercial.com",
+        )
+        officer_phone = None
+        signature_data_uri = _signature_data_uri(
+            settings,
+            letterhead.signature_s3_key,
+        )
 
     # Co-branded "from your agent" card. Pulled off the loan's broker
     # row when present; absent on direct-borrower deals.
@@ -300,8 +382,10 @@ def render_letter(
         is_refi=(request.loan_type == "dscr_refi"),
         # Configurable letterhead — see app/schemas/settings.py
         # LetterheadSettings. None means "use the template default".
-        officer_name=letterhead.officer_name,
-        officer_title=letterhead.officer_title,
+        officer_name=officer_name,
+        officer_title=officer_title,
+        officer_email=officer_email,
+        officer_phone=officer_phone,
         office_address_line_1=letterhead.office_address_line_1,
         office_address_line_2=letterhead.office_address_line_2,
         office_address_line_3=letterhead.office_address_line_3,
@@ -354,6 +438,7 @@ def presign_get(
     *,
     settings: Settings,
     ttl_seconds: int = PRESIGN_TTL_SECONDS,
+    download_filename: str | None = None,
 ) -> str | None:
     """Return a presigned GET URL for the uploaded PDF, or None if S3
     isn't reachable. Always called fresh on read so URLs in API responses
@@ -367,9 +452,22 @@ def presign_get(
         return None
     try:
         s3 = _s3_client(settings)
+        params: dict[str, str] = {
+            "Bucket": settings.s3_bucket,
+            "Key": s3_key,
+        }
+        if download_filename:
+            safe_filename = (
+                re.sub(r"[^A-Za-z0-9._-]", "_", download_filename).strip("._")
+                or "prequalification.pdf"
+            )
+            params["ResponseContentDisposition"] = (
+                f'attachment; filename="{safe_filename}"'
+            )
+            params["ResponseContentType"] = "application/pdf"
         return s3.generate_presigned_url(
             "get_object",
-            Params={"Bucket": settings.s3_bucket, "Key": s3_key},
+            Params=params,
             ExpiresIn=ttl_seconds,
         )
     except Exception as exc:  # noqa: BLE001
