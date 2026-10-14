@@ -163,13 +163,23 @@ def validate_upload_bytes(
     file_name: str | None = None,
     content_type: str | None = None,
 ) -> None:
-    """Validate a direct PDF or PDFs contained in an ordinary ZIP upload."""
+    """Retain locked evidence for replacement collection instead of rejecting it.
 
-    validate_pdf_bytes(raw, file_name=file_name, content_type=content_type)
+    Storage size/transport checks are enforced by completion. Readability and
+    passwords belong to the durable analysis pipeline. Signing workflows that
+    require an open PDF still call validate_pdf_bytes explicitly.
+    """
+    try:
+        validate_pdf_bytes(raw, file_name=file_name, content_type=content_type)
+    except PasswordProtectedPDF:
+        return
     normalized_name = (file_name or "").casefold()
     normalized_type = (content_type or "").casefold()
     if normalized_name.endswith(".zip") or "zip" in normalized_type or _looks_like_zip(raw):
-        _validate_archive_pdf_entries(raw)
+        try:
+            _validate_archive_pdf_entries(raw)
+        except PasswordProtectedPDF:
+            return
 
 
 def _s3_client():

@@ -76,7 +76,11 @@ async def _reconcile(file_name: str, rows: list[SimpleNamespace]):
     scalars = MagicMock()
     scalars.scalars.return_value.all.return_value = rows
     db.execute = AsyncMock(return_value=scalars)
-    return await reconcile_uploaded_file(db, _upload(file_name))
+    classification = filename_evidence_classification(file_name)
+    # These checklist routing tests supply content-derived analysis explicitly;
+    # separate tests below ensure names alone cannot route uploads.
+    analysis = SimpleNamespace(status="completed", classification=classification, analysis={})
+    return await reconcile_uploaded_file(db, _upload(file_name), analysis)
 
 
 @pytest.mark.asyncio

@@ -40,6 +40,7 @@ from app.models.analysis_run import AnalysisRun  # noqa: F401
 from app.models.app_settings import AppSettings  # noqa: F401
 from app.models.application_profile import (  # noqa: F401
     ApplicationBankConsent,
+    ApplicationCollectionTask,
     ApplicationExtractedFact,
     ApplicationOwner,
     ApplicationPlaidItem,
@@ -47,6 +48,7 @@ from app.models.application_profile import (  # noqa: F401
     ApplicationProgramSelection,
     ApplicationProfile,
     ApplicationRequirementEvidence,
+    ApplicationRequirementResponse,
     ApplicationRequirementState,
     ApplicationRoomDelivery,
     ApplicationTaxonomyEntry,
@@ -148,6 +150,17 @@ from app.models.hud import HudLineItem  # noqa: F401
 from app.models.hud_share_link import HudShareLink  # noqa: F401
 from app.models.legal_acceptance import LegalAcceptance  # noqa: F401
 from app.models.lender import Lender  # noqa: F401
+from app.models.arf_channel import (  # noqa: F401
+    ARFChannelConfiguration,
+    ARFReferral,
+    ApplicationAssessmentSnapshot,
+)
+from app.models.submission_batch import (  # noqa: F401
+    LenderOffering,
+    LenderSubmission,
+    LenderSubmissionEvent,
+    SubmissionBatch,
+)
 from app.models.lender_package import (  # noqa: F401
     LenderPackage,
     LenderPackageDocument,

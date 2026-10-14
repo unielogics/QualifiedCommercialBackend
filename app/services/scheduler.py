@@ -46,6 +46,15 @@ log = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler(timezone="UTC")
 
 
+async def job_lender_submission_delivery() -> None:
+    from app.services.submission_batches import drain_delivery_queue, refresh_pending_previews
+
+    try:
+        await refresh_pending_previews()
+    finally:
+        await drain_delivery_queue()
+
+
 def start_scheduler() -> None:
     """Idempotent — safe to call from FastAPI startup hooks (which fire
     on every uvicorn reload in dev). `replace_existing=True` collapses
@@ -63,6 +72,16 @@ def start_scheduler() -> None:
     from app.config import get_settings
 
     gmail_push_configured = bool(get_settings().gmail_pubsub_topic)
+
+    scheduler.add_job(
+        _wrap(job_lender_submission_delivery),
+        "interval",
+        seconds=30,
+        id="lender_submission_delivery",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
 
     # Phase 6 — debounced summarizer drain. Every 5 min picks up any
     # Loan with summary_dirty=True and refreshes its Living Loan File.

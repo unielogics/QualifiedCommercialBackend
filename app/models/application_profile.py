@@ -343,6 +343,60 @@ class ApplicationRequirementState(TimestampMixin, Base):
     )
 
 
+class ApplicationRequirementResponse(TimestampMixin, Base):
+    """Append-only structured answers; accepted values are never silently replaced."""
+
+    __tablename__ = "application_requirement_responses"
+    __table_args__ = (
+        Index("ix_application_requirement_responses_state", "requirement_state_id", "created_at"),
+        Index("ix_application_requirement_responses_profile", "profile_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    profile_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("application_profiles.id", ondelete="CASCADE"), nullable=False)
+    requirement_state_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("application_requirement_states.id", ondelete="CASCADE"), nullable=False)
+    value: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_version: Mapped[str | None] = mapped_column(String(80))
+    review_state: Mapped[str] = mapped_column(String(24), nullable=False, default="submitted", server_default="submitted")
+    provenance: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    submitted_by_user_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    reviewed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ApplicationCollectionTask(TimestampMixin, Base):
+    """One deduplicated action shared by all requirements for the same evidence."""
+
+    __tablename__ = "application_collection_tasks"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "canonical_identity", name="uq_application_collection_task_identity"),
+        Index("ix_application_collection_tasks_profile_status", "profile_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    profile_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("application_profiles.id", ondelete="CASCADE"), nullable=False)
+    canonical_identity: Mapped[str] = mapped_column(String(200), nullable=False)
+    requirement_state_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    requirement_keys: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    action_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    label: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    assignee: Mapped[str] = mapped_column(String(24), nullable=False, default="borrower", server_default="borrower")
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="open", server_default="open")
+    channel: Mapped[str] = mapped_column(String(16), nullable=False, default="portal", server_default="portal")
+    config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    automation_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    cadence_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=24, server_default="24")
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3, server_default="3")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    assigned_user_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    state_reason: Mapped[str | None] = mapped_column(Text)
+
+
 class ApplicationRequirementEvidence(TimestampMixin, Base):
     """One evidence document linked to one shared program requirement.
 

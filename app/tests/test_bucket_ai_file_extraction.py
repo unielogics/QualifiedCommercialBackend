@@ -435,6 +435,7 @@ async def test_zip_parent_analysis_is_terminal_without_fetching_storage():
         bucket_id=uuid4(),
         file_name="batch.zip",
         content_type="application/zip",
+        extraction_status="extracted",
         content_hash=None,
     )
     row = SimpleNamespace(

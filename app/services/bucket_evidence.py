@@ -159,7 +159,60 @@ def statement_months_from_analysis(analysis: dict | None) -> set[str]:
 def effective_file_classification(file_name: str, analysis: BucketFileAnalysis | None = None) -> str | None:
     if analysis is not None and analysis.status == "completed" and analysis.classification:
         return analysis.classification
-    return filename_evidence_classification(file_name)
+    # Names remain useful for suggestions, never for automatic evidence routing.
+    return None
+
+
+def analysis_classifications(analysis: BucketFileAnalysis | None) -> set[str]:
+    """Content-level types/capabilities; a single packet may prove several types."""
+    if analysis is None or analysis.status != "completed":
+        return set()
+    result = {str(analysis.classification)} if analysis.classification else set()
+    detail = getattr(analysis, "analysis", None) or {}
+    detail = detail if isinstance(detail, dict) else {}
+    for rows in (
+        getattr(analysis, "document_type_candidates", None) or detail.get("document_type_candidates") or [],
+        getattr(analysis, "evidence_claims", None) or detail.get("evidence_claims") or [],
+    ):
+        for row in rows if isinstance(rows, list) else []:
+            if isinstance(row, dict):
+                value = row.get("classification") or row.get("document_type") or row.get("capability")
+                if value:
+                    result.add(str(value))
+    return result - {"other", "unreadable", ""}
+
+
+def classification_confidence(analysis: BucketFileAnalysis, expected: set[str]) -> str:
+    detail = getattr(analysis, "analysis", None) or {}
+    detail = detail if isinstance(detail, dict) else {}
+    values = [analysis.confidence] if analysis.classification in expected else []
+    candidates = getattr(analysis, "document_type_candidates", None) or detail.get("document_type_candidates") or []
+    for row in candidates if isinstance(candidates, list) else []:
+        if isinstance(row, dict) and row.get("classification") in expected:
+            values.append(row.get("confidence"))
+    for confidence in ("high", "medium", "low"):
+        if confidence in {str(value or "").casefold() for value in values}:
+            return confidence
+    return str(analysis.confidence or "low").casefold()
+
+
+def analysis_usability(analysis: BucketFileAnalysis | None) -> str:
+    if analysis is None or analysis.status in {"pending", "running"}:
+        return "processing"
+    explicit = getattr(analysis, "usability_status", None)
+    if explicit and explicit != "processing":
+        return explicit
+    if analysis.status == "failed":
+        return "needs_review"
+    if analysis.status == "skipped":
+        return "needs_replacement" if analysis.skip_reason in {"password_protected", "pdf_text_unavailable", "legacy_spreadsheet_unsupported"} else "needs_review"
+    if getattr(analysis, "classification", None) == "unreadable":
+        return "needs_replacement"
+    detail = getattr(analysis, "analysis", None) or {}
+    detail = detail if isinstance(detail, dict) else {}
+    if str(getattr(analysis, "confidence", None) or "").casefold() != "high":
+        return "needs_review"
+    return "usable_with_warning" if detail.get("limitations") or detail.get("red_flags") else "usable"
 
 
 async def reconcile_uploaded_file(
@@ -174,10 +227,9 @@ async def reconcile_uploaded_file(
         # The processing partner's proposal is not the borrower's processing
         # statement; by filename it would satisfy that checklist slot.
         return None
-    classification = effective_file_classification(file.file_name, analysis)
-    if classification == "bank_statement" and not file.statement_period:
+    classifications = analysis_classifications(analysis)
+    if "bank_statement" in classifications and not file.statement_period:
         months = statement_months_from_analysis(analysis.analysis if analysis else None)
-        months.update(statement_months_from_filename(file.file_name))
         if months:
             file.statement_period = sorted(months)[-1]
 
@@ -186,7 +238,7 @@ async def reconcile_uploaded_file(
         if requested is not None and not requested.requires_signature:
             requested.status = "uploaded"
         return requested
-    if not classification:
+    if not classifications:
         return None
 
     documents = list(
@@ -202,7 +254,7 @@ async def reconcile_uploaded_file(
     candidates = [
         document
         for document in documents
-        if classification in classifications_for_requested_doc(document.name, document.category)
+        if classifications.intersection(classifications_for_requested_doc(document.name, document.category))
     ]
     if len(candidates) != 1:
         return None

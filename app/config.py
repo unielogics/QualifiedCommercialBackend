@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -45,6 +46,9 @@ class Settings(BaseSettings):
     bedrock_region: str = ""
     bedrock_model_heavy: str = "us.anthropic.claude-sonnet-4-6"
     bedrock_model_light: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    # Shadow records legacy/content-first outcome comparisons without another
+    # model call. Ingestion stays permissive in both modes; active omits audits.
+    evidence_decision_mode: Literal["shadow", "active"] = "shadow"
 
     # Estimated Bedrock Claude prices per 1M tokens, used for local cost
     # attribution. Alert thresholds live in AppSettings.ai_spend so

@@ -77,15 +77,14 @@ def test_malformed_encryption_text_is_not_labeled_password_protected() -> None:
     )
 
 
-def test_zip_containing_locked_pdf_is_rejected_before_children_are_stored() -> None:
+def test_zip_containing_locked_pdf_is_retained_for_replacement_collection() -> None:
     raw = _zip_with("statements/August.pdf", _pdf(password="client-secret"))
 
-    with pytest.raises(upload_validation.PasswordProtectedPDF):
-        upload_validation.validate_upload_bytes(
-            raw,
-            file_name="statements.zip",
-            content_type="application/zip",
-        )
+    upload_validation.validate_upload_bytes(
+        raw,
+        file_name="statements.zip",
+        content_type="application/zip",
+    )
 
 
 @pytest.mark.asyncio
@@ -248,6 +247,7 @@ async def test_public_bucket_completion_keeps_requirement_open_when_pdf_is_locke
 
     with (
         patch.object(buckets_router, "_load_upload_link_or_404", AsyncMock(return_value=link)),
+        patch("app.services.arf_channel.require_bucket_hosted_permission", AsyncMock()),
         patch.object(
             buckets_router.locked_file_requests,
             "require_current_unlocked_copy_upload_target",

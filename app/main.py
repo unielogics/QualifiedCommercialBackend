@@ -30,14 +30,17 @@ from app.routers import (
     ai_tasks,
     ai_voice,
     analysis,
+    application_collection,
     application_communications,
     application_offer_deliveries,
     application_profiles,
     application_terms,
+    arf,
     auth,
     billing,
     brokers,
     buckets,
+    business_capital,
     calendar,
     capital_readiness,
     capital_readiness_policies,
@@ -85,6 +88,7 @@ from app.routers import (
     regional_managers,
     reports,
     search,
+    submission_batches,
     users,
     worksheets,
 )
@@ -114,6 +118,9 @@ log = logging.getLogger("qc")
 app = FastAPI(
     title="Qualified Commercial API",
     version="0.1.0",
+    docs_url=None if settings.app_env.lower() == "production" else "/docs",
+    redoc_url=None if settings.app_env.lower() == "production" else "/redoc",
+    openapi_url=None if settings.app_env.lower() == "production" else "/openapi.json",
     description=(
         "Center of Truth backend for the AI-driven brokerage underwriting platform. "
         "See docs/ARCHITECTURE.md for locked-in constraints."
@@ -143,6 +150,12 @@ app.add_middleware(PrivateApiCacheMiddleware)
 
 @app.on_event("startup")
 async def startup() -> None:
+    from app.services.arf_channel import ensure_catalog
+
+    async with SessionLocal() as catalog_db:
+        await ensure_catalog(catalog_db)
+        await catalog_db.commit()
+
     if not settings.clerk_secret_key:
         log.warning(
             "CLERK_SECRET_KEY is unset — running in DEV auth mode (every request "
@@ -214,6 +227,12 @@ for r in [
     dealer_os_prospect_outreach_router.router,
     meta.router,
     funding_programs.public_router,
+    business_capital.public_router,
+    arf.admin_router,
+    arf.profile_router,
+    application_collection.router,
+    submission_batches.router,
+    submission_batches.public_router,
     auth.router,
     client_access.router,
     admin_router.router,

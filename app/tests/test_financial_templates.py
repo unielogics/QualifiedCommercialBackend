@@ -108,8 +108,12 @@ def test_bank_and_tax_coverage_count_distinct_periods_across_documents() -> None
     bank_requirement = _requirement(
         "business_bank_statements_6_months", "Last 6 months business bank statements"
     )
-    bank_files = [_file(f"statement-2026-{month:02d}.pdf") for month in range(1, 7)]
-    complete, coverage = _coverage_for_files(bank_requirement, bank_files, {})
+    bank_files = [_file(f"upload-{month}.pdf") for month in range(1, 7)]
+    bank_analyses = {
+        file.id: SimpleNamespace(analysis={"key_facts": {"statement_period": f"2026-{month:02d}"}})
+        for month, file in enumerate(bank_files, start=1)
+    }
+    complete, coverage = _coverage_for_files(bank_requirement, bank_files, bank_analyses)
 
     assert complete is True
     assert coverage["months"] == [f"2026-{month:02d}" for month in range(1, 7)]
@@ -118,8 +122,12 @@ def test_bank_and_tax_coverage_count_distinct_periods_across_documents() -> None
     tax_requirement = _requirement(
         "business_tax_returns_2_years", "Last 2 years business tax returns"
     )
-    tax_files = [_file("business-tax-return-2024.pdf"), _file("business-tax-return-2025.pdf")]
-    complete, coverage = _coverage_for_files(tax_requirement, tax_files, {})
+    tax_files = [_file("upload-a.pdf"), _file("upload-b.pdf")]
+    tax_analyses = {
+        file.id: SimpleNamespace(analysis={"key_facts": {"tax_year": str(year)}})
+        for file, year in zip(tax_files, (2024, 2025), strict=True)
+    }
+    complete, coverage = _coverage_for_files(tax_requirement, tax_files, tax_analyses)
 
     assert complete is True
     assert coverage["years"] == ["2024", "2025"]

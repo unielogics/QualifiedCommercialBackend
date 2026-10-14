@@ -168,6 +168,7 @@ from app.schemas.use_of_funds import (
 from app.services import application_profiles as profiles
 from app.services import (
     application_programs,
+    arf_channel,
     bucket_ai,
     business_statement_schema,
     business_statements,
@@ -1013,6 +1014,7 @@ async def apply_underwriting_changes(
 async def get_application_program_readiness(
     profile_id: UUID,
     user: CurrentUser,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationProgramReadiness:
     _require_underwriting_actor(user)
@@ -1021,6 +1023,8 @@ async def get_application_program_readiness(
     # The first read may pin an AI-selected playbook and materialize stable
     # requirement rows. Those writes are deterministic and idempotent.
     await db.commit()
+    from app.routers.application_collection import deliver_due_profile
+    background_tasks.add_task(deliver_due_profile, profile.id)
     return readiness
 
 
@@ -1120,6 +1124,7 @@ async def update_application_programs(
     profile_id: UUID,
     payload: ApplicationProgramsPatch,
     user: CurrentUser,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationProgramReadiness:
     _require_underwriting_actor(user)
@@ -1145,6 +1150,8 @@ async def update_application_programs(
         },
     )
     await db.commit()
+    from app.routers.application_collection import deliver_due_profile
+    background_tasks.add_task(deliver_due_profile, profile.id)
     return readiness
 
 
@@ -2180,6 +2187,7 @@ async def create_bank_verification_invitation(
     db: AsyncSession = Depends(get_db),
 ) -> VerificationInvitationRead:
     profile = await profiles.load_profile(db, profile_id, user)
+    await arf_channel.require_profile_hosted_permission(db, profile, requested_fields=["bank_data"])
     if user.role in {Role.CLIENT, Role.DEALER, Role.VENDOR, Role.LENDER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only scoped staff may send a bank verification request")
     intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
@@ -2351,6 +2359,7 @@ async def _mint_credit_invite(
     channel: str,
     request: Request,
 ) -> FileCreditInviteRead:
+    await arf_channel.require_profile_hosted_permission(db, profile, requested_fields=["credit_data"], capability="credit_pull")
     verification = await profiles.verification_state(db, profile)
     if not verification.ownership_complete:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Ownership must total 100.00% before credit links are sent; current total is {verification.ownership_total:.2f}%")
@@ -2447,6 +2456,9 @@ async def _public_application_owner(db: AsyncSession, token: str) -> Application
     ).scalar_one_or_none()
     if owner is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "This consent link is no longer valid")
+    profile = await db.get(ApplicationProfile, owner.profile_id)
+    if profile is not None:
+        await arf_channel.require_profile_hosted_permission(db, profile, requested_fields=["credit_data"], capability="credit_pull")
     return owner
 
 
@@ -2608,6 +2620,9 @@ async def _application_consent_granted(
     profile_id: UUID,
     required_products: list[str] | tuple[str, ...] | None = None,
 ) -> bool:
+    profile = await db.get(ApplicationProfile, profile_id)
+    if profile is not None:
+        await arf_channel.require_profile_hosted_permission(db, profile, requested_fields=["bank_data"])
     row = await _application_consent_row(db, profile_id)
     if row is None:
         return False
@@ -2633,6 +2648,7 @@ async def _public_bank_invitation(
     profile = await db.get(ApplicationProfile, invitation.profile_id)
     if profile is None or profile.dealer_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "This bank verification link is not valid")
+    await arf_channel.require_profile_hosted_permission(db, profile, requested_fields=["bank_data"])
     return invitation, profile
 
 
@@ -3194,6 +3210,7 @@ async def public_application_room_consent(
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationRoomState:
     link, profile = await _public_application_room(db, token, payload.passcode, request)
+    await arf_channel.require_profile_hosted_permission(db, profile, requested_fields=["bank_data"])
     policy = plaid_policy.from_owner(profile)
     disclosure = dealer_bank_consent.disclosure(policy.selected_products)
     db.add(
@@ -4103,6 +4120,7 @@ async def grant_application_bank_consent(
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationBankState:
     profile = await profiles.load_profile(db, profile_id, user)
+    await arf_channel.require_profile_hosted_permission(db, profile, requested_fields=["bank_data"])
     _require_profile_bank_client(profile, user)
     policy, _policy_owner = await plaid_policy.for_profile(db, profile)
     disclosure = dealer_bank_consent.disclosure(policy.selected_products)

@@ -45,6 +45,10 @@ BUSINESS_LENDING_PRODUCTS: tuple[str, ...] = (
     "jumbo_dscr",
     "reinsurance_backed",
     "mca_refinance",
+    "arf_bankroll",
+    "arf_io_bankroll",
+    "arf_elevate_bankroll",
+    "arf_io_flex_pay",
 )
 
 SERVICE_PRODUCTS: tuple[str, ...] = (
@@ -76,6 +80,10 @@ _EXTRA_LABELS: dict[str, str] = {
     "jumbo_dscr": "Jumbo DSCR",
     "reinsurance_backed": "Reinsurance-backed",
     "mca_refinance": "MCA Refinance",
+    "arf_bankroll": "ARF Bankroll",
+    "arf_io_bankroll": "ARF IO-Bankroll",
+    "arf_elevate_bankroll": "ARF Elevate Bankroll",
+    "arf_io_flex_pay": "ARF IO-Flex Pay",
     "business_systems": "Business Systems (POS)",
 }
 

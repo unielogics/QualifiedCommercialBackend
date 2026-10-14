@@ -23,6 +23,7 @@ from app.models.client import Client
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.services import application_profiles as profiles
+from app.services import collection_tasks
 from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import tracked_messages_create
 from app.services.application_programs import email_is_suppressed, get_program_readiness
@@ -43,6 +44,8 @@ def _idempotency_key(*parts: object) -> str:
 
 def _client_submission_needed(requirement: object) -> bool:
     status_value = str(getattr(requirement, "status", ""))
+    if status_value in {"verified", "waived", "not_applicable"}:
+        return False
     if status_value in {"stale", "failed"}:
         return True
     return not bool(getattr(requirement, "coverage_complete", False))
@@ -93,6 +96,9 @@ async def send_requirement_email(
     initiation_source: str,
     retry_failed: bool = False,
 ) -> ApplicationRoomDelivery:
+    if initiation_source == "automatic_missing_item":
+        return await send_requirements_email(db, profile=profile, requirement_keys=[requirement_key],
+                                             user=user, initiation_source=initiation_source, retry_failed=retry_failed)
     readiness = await get_program_readiness(db, profile)
     requirement_read = next(
         (item for item in readiness.requirements if item.requirement_key == requirement_key),
@@ -307,6 +313,8 @@ async def send_requirements_email(
         for program in readiness.programs
         for key in program.blocking_requirement_keys
     }
+    blocking_keys.update(item.requirement_key for item in readiness.requirements
+                         if getattr(item, "required_level", "required") == "required" and item.status not in {"verified", "waived", "not_applicable"})
     active_keys = [
         key
         for key in requested_keys
@@ -333,7 +341,24 @@ async def send_requirements_email(
     recipient = await _recipient(db, profile, link)
     timestamp = now()
     automatic = initiation_source == "automatic_missing_item"
+    task_labels = {}
     if automatic:
+        tasks = await collection_tasks.outreach_tasks(db, profile.id, requirement_keys=active_keys)
+        task_labels = {key: task.label for task in tasks for key in task.requirement_keys}
+        approved_keys = {key for task in tasks for key in task.requirement_keys}
+        active_keys = [key for key in active_keys if key in approved_keys]
+        requirements = [row for row in requirements if row.requirement_key in approved_keys]
+        if not active_keys:
+            raise HTTPException(status.HTTP_409_CONFLICT, "No approved borrower collection actions are due")
+        from app.services.ai.agent_settings import (
+            load_firm_communication_rules,
+            working_hours_for_client,
+        )
+        from app.services.ai.working_hours import evaluate
+        rules = await working_hours_for_client(db, profile.client_id) if profile.client_id else await load_firm_communication_rules(db)
+        decision = evaluate(rules, channel="email", is_client_initiated=False)
+        if not decision.allow:
+            raise HTTPException(status.HTTP_409_CONFLICT, decision.reason or "Outside the communication window")
         if not readiness.automation.enabled or not readiness.automation.eligible:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -394,7 +419,16 @@ async def send_requirements_email(
     room_url = f"{get_settings().frontend_app_url.rstrip('/')}/buckets/request/{link.token}?tab=todo"
     if len(requirements) == 1 and requirements[0].requested_document_id:
         room_url += f"&request={requirements[0].requested_document_id}"
-    labels = [row.label for row in requirements]
+    labels = []
+    identities = set()
+    for row in requirements:
+        metadata = getattr(row, "provenance", None) or {}
+        identity = collection_tasks.canonical_identity(metadata.get("canonical_key") or row.requirement_key,
+                                                      metadata.get("requirement_kind", "document"),
+                                                      metadata.get("collection_config") or {})
+        if identity not in identities:
+            identities.add(identity)
+            labels.append(task_labels.get(row.requirement_key, row.label))
     intro, ai_composed = await _compose_combined_intro(
         db,
         profile=profile,
@@ -461,6 +495,7 @@ async def send_requirements_email(
         profile.missing_item_email_next_send_at = timestamp + timedelta(hours=24)
         profile.missing_item_email_attempts = attempt_number
         profile.missing_item_email_requirement_key = active_keys[0]
+        await collection_tasks.record_outreach(db, profile.id, active_keys, successful=result.ok)
     await db.flush()
     await profiles.log_profile_action(
         db,
@@ -487,7 +522,6 @@ async def run_missing_item_email_pass(db: AsyncSession, *, limit: int = 100) -> 
             await db.execute(
                 select(ApplicationProfile)
                 .where(
-                    ApplicationProfile.intake_id.is_not(None),
                     ApplicationProfile.missing_item_email_enabled.is_(True),
                     ApplicationProfile.underwriting_status.in_(
                         ["submitted", "collecting_docs", "in_underwriting", "term_sheet_provided", "approved"]
@@ -501,35 +535,8 @@ async def run_missing_item_email_pass(db: AsyncSession, *, limit: int = 100) -> 
     )
     sent = failed = skipped = 0
     for profile in rows:
-        readiness = await get_program_readiness(db, profile)
-        automation = readiness.automation
-        if not automation.enabled or not automation.eligible or not automation.next_requirement_key:
-            skipped += 1
-            continue
-        if automation.next_send_at and automation.next_send_at > now():
-            skipped += 1
-            continue
-        blocking_keys = {
-            key
-            for program in readiness.programs
-            for key in program.blocking_requirement_keys
-        }
-        consolidated_keys = [
-            requirement.requirement_key
-            for requirement in readiness.requirements
-            if requirement.client_visible
-            and requirement.requirement_key in blocking_keys
-            and _client_submission_needed(requirement)
-        ]
-        try:
-            delivery = await send_requirements_email(
-                db,
-                profile=profile,
-                requirement_keys=consolidated_keys,
-                user=None,
-                initiation_source="automatic_missing_item",
-            )
-        except HTTPException:
+        delivery = await run_profile_collection_outreach(db, profile)
+        if delivery is None:
             skipped += 1
             continue
         if delivery.status == "sent":
@@ -537,3 +544,28 @@ async def run_missing_item_email_pass(db: AsyncSession, *, limit: int = 100) -> 
         else:
             failed += 1
     return {"considered": len(rows), "sent": sent, "failed": failed, "skipped": skipped}
+
+
+async def run_profile_collection_outreach(db: AsyncSession, profile: ApplicationProfile) -> ApplicationRoomDelivery | None:
+    # Several analysis/program/readiness callbacks may finish together. Lock
+    # and refresh the profile so only one sees the current cadence as due.
+    profile = (await db.execute(select(ApplicationProfile).where(
+        ApplicationProfile.id == profile.id,
+    ).with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+    if profile is None:
+        return None
+    readiness = await get_program_readiness(db, profile)
+    automation = readiness.automation
+    if not automation.enabled or not automation.eligible or not automation.next_requirement_key:
+        return None
+    if automation.next_send_at and automation.next_send_at > now():
+        return None
+    keys = [item.requirement_key for item in readiness.requirements
+            if item.client_visible and item.required_level == "required" and _client_submission_needed(item)]
+    if not keys:
+        return None
+    try:
+        return await send_requirements_email(db, profile=profile, requirement_keys=keys, user=None,
+                                             initiation_source="automatic_missing_item")
+    except HTTPException:
+        return None

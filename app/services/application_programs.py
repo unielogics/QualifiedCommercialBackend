@@ -15,6 +15,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.enums import LoanStage
 from app.models.ai_playbook import AICollectionRequirement, AIPlaybookTemplate
 from app.models.application_profile import (
@@ -65,8 +66,12 @@ from app.services import equipment_financing, file_events, locked_file_requests,
 from app.services import funding_programs as program_catalog
 from app.services.activity_log import log_activity
 from app.services.bucket_evidence import (
+    analysis_classifications,
+    analysis_usability,
+    classification_confidence,
     classifications_for_requested_doc,
     effective_file_classification,
+    filename_evidence_classification,
     statement_months_from_analysis,
     statement_months_from_filename,
 )
@@ -82,7 +87,7 @@ from app.services.use_of_funds import source_funding_data
 from app.services.use_of_funds import summarize as summarize_use_of_funds
 
 SATISFIED_STATES = {"verified", "waived", "not_applicable"}
-AI_EVIDENCE_DECISION_ALGORITHM = "ai-evidence-v4-numbers-first"
+AI_EVIDENCE_DECISION_ALGORITHM = "ai-evidence-v5-content-first-review"
 OPEN_UNDERWRITING_STATES = {
     "submitted",
     "collecting_docs",
@@ -370,11 +375,11 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         or (latest_decisions.get(link.id) is None and link.verified_at is not None)
     }
     accepted_classifications = {
-        analysis.classification
+        classification
         for file_id, analysis in latest_analyses.items()
         if file_id in accepted_file_ids
         and analysis.status == "completed"
-        and analysis.classification
+        for classification in analysis_classifications(analysis)
     }
     accepted_bank_months: set[str] = set()
     accepted_tax_years: set[str] = set()
@@ -387,7 +392,6 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         if classification == "bank_statement":
             if file.statement_period:
                 accepted_bank_months.add(file.statement_period)
-            accepted_bank_months.update(statement_months_from_filename(file.file_name))
             accepted_bank_months.update(
                 statement_months_from_analysis(analysis.analysis if analysis else None)
             )
@@ -791,6 +795,11 @@ async def published_candidates(
             )
             continue
         rules_valid = True
+        if item.program_key.startswith("arf_"):
+            from app.services.arf_channel import program_candidate
+
+            candidates.append(await program_candidate(db, profile, item, playbook))
+            continue
         try:
             validate_rules(playbook.rules or {})
             has_fit_rule = bool((playbook.rules or {}).get("fit"))
@@ -1082,6 +1091,10 @@ async def set_programs(
         return
 
     wanted = list(dict.fromkeys(key.strip() for key in payload.program_keys if key.strip()))
+    if any(key.startswith("arf_") for key in wanted):
+        from app.services.arf_channel import require_hosted_permission
+
+        await require_hosted_permission(db)
     candidates = {
         candidate.program_key: candidate for candidate in await published_candidates(db, profile)
     }
@@ -1242,8 +1255,24 @@ async def _requested_document(
     program_keys: list[str],
     policy_keys: list[str],
 ) -> BucketRequestedDocument | None:
-    if profile.primary_bucket_id is None or not _client_visible(requirement):
+    from app.services.collection_tasks import collects_file
+    if (
+        profile.primary_bucket_id is None
+        or not _client_visible(requirement)
+        or not collects_file(requirement)
+    ):
         return None
+    if any(key.startswith("arf_") for key in program_keys):
+        from app.services.arf_channel import approval_valid, get_configuration
+        arf_config = await get_configuration(db)
+        canonical_key = getattr(requirement, "canonical_key", None) or requirement.requirement_key
+        if (arf_config.intake_mode != "partner_hosted_authorized"
+                or not approval_valid(arf_config, "hosted_intake")
+                or canonical_key not in (arf_config.permitted_documents or [])):
+            return None
+    collection_config = getattr(requirement, "collection_config", None) or {}
+    form_kind = collection_config.get("form_kind") if getattr(requirement, "requirement_kind", None) == "form" else None
+    request_category = {"pfs": "Personal Financials", "debt_schedule": "Debts", "p_and_l": "Financials", "balance_sheet": "Financials"}.get(form_kind, requirement.category)
     requested = (
         await db.execute(
             select(BucketRequestedDocument)
@@ -1254,6 +1283,9 @@ async def _requested_document(
             .limit(1)
         )
     ).scalar_one_or_none()
+    if requested is None and form_kind in {"pfs", "debt_schedule", "p_and_l", "balance_sheet"}:
+        from app.routers.application_profiles import _requested_slot
+        requested = await _requested_slot(db, profile, form_kind)
     if requested is None:
         requested = (
             await db.execute(
@@ -1271,12 +1303,13 @@ async def _requested_document(
         "program_keys": program_keys,
         "policy_keys": policy_keys,
         "playbook_id": str(requirement.playbook_id),
+        "form_kind": form_kind,
     }
     if requested is None:
         requested = BucketRequestedDocument(
             bucket_id=profile.primary_bucket_id,
             name=requirement.label,
-            category=requirement.category,
+            category=request_category,
             description=requirement.objective_text or requirement.ai_request_message_template,
             required=requirement.required_level == "required",
             allow_multiple_files=True,
@@ -1289,7 +1322,7 @@ async def _requested_document(
         await db.flush()
     else:
         requested.name = requirement.label
-        requested.category = requirement.category
+        requested.category = request_category
         requested.description = (
             requirement.objective_text or requirement.ai_request_message_template
         )
@@ -1303,12 +1336,16 @@ async def _requested_document(
 
 
 def _expected_classes(requirement: AICollectionRequirement) -> set[str]:
-    classes = EXPECTED_CLASSIFICATIONS.get(requirement.requirement_key, set()).union(
+    config = getattr(requirement, "collection_config", None) or {}
+    configured = config.get("evidence_classes")
+    if isinstance(configured, list) and configured:
+        return {str(value) for value in configured if re.fullmatch(r"[a-z][a-z0-9_]{0,47}", str(value))}
+    classes = EXPECTED_CLASSIFICATIONS.get(getattr(requirement, "canonical_key", None) or requirement.requirement_key, set()).union(
         classifications_for_requested_doc(requirement.label, requirement.category)
     )
-    if _required_period_count(requirement.requirement_key, "months"):
+    if _configured_period_count(requirement, "months"):
         classes.add("bank_statement")
-    if _required_period_count(requirement.requirement_key, "years"):
+    if _configured_period_count(requirement, "years"):
         classes.add("tax_return")
     return classes
 
@@ -1318,6 +1355,29 @@ def _required_period_count(key: str, unit: str) -> int | None:
     match = re.fullmatch(rf"{stem}_(\d{{1,2}})_{unit}", key)
     count = int(match.group(1)) if match else 0
     return count if 1 <= count <= (60 if unit == "months" else 10) else None
+
+
+def _collection_count(requirement: object, key: str, maximum: int) -> int | None:
+    config = getattr(requirement, "collection_config", None) or {}
+    value = config.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= maximum else None
+
+
+def _configured_period_count(requirement: object, unit: str) -> int | None:
+    return _collection_count(requirement, f"required_{unit}", 60 if unit == "months" else 10) or _required_period_count(getattr(requirement, "canonical_key", None) or requirement.requirement_key, unit)
+
+
+def _expiration_days(requirement: object) -> int | None:
+    return _collection_count(requirement, "expiration_days", 3650) or getattr(requirement, "expiration_days", None)
+
+
+def _file_is_expired(requirement: object, file: BucketFile) -> bool:
+    days = _expiration_days(requirement)
+    created = getattr(file, "created_at", None)
+    if not days or not isinstance(created, datetime):
+        return False
+    created = created if created.tzinfo else created.replace(tzinfo=UTC)
+    return created < now() - timedelta(days=days)
 
 
 def _business_evidence_requirement(key: str) -> bool:
@@ -1353,7 +1413,7 @@ def _review_checks_fingerprint(checks: list[dict[str, Any]]) -> str:
 
 
 def _tax_years(file: BucketFile, analysis: BucketFileAnalysis | None) -> set[str]:
-    values = [file.file_name]
+    values = []
     if analysis and isinstance(analysis.analysis, dict):
         facts = analysis.analysis.get("key_facts") or {}
         values.extend(str(facts.get(key) or "") for key in ("tax_year", "year", "period"))
@@ -1378,16 +1438,24 @@ def _coverage_for_files(
     analyses: dict[uuid.UUID, BucketFileAnalysis],
 ) -> tuple[bool, dict[str, Any]]:
     expected = _expected_classes(requirement)
+    expired_ids = [str(file.id) for file in files if _file_is_expired(requirement, file)]
+    matched_count = len(files)
+    files = [file for file in files if not _file_is_expired(requirement, file)]
+    minimum_count = _collection_count(requirement, "minimum_count", 100) or 1
+    distinct_count = len({getattr(file, "content_hash", None) or str(file.id) for file in files})
     coverage: dict[str, Any] = {
-        "matched_files": len(files),
+        "matched_files": matched_count,
+        "expired_file_ids": expired_ids,
+        "usable_file_count": distinct_count,
+        "minimum_count": minimum_count,
         "expected_classifications": sorted(expected),
-        "current": len(files),
-        "required": 1,
+        "current": distinct_count,
+        "required": minimum_count,
         "unit": "documents",
     }
-    complete = bool(files)
-    required_months = _required_period_count(requirement.requirement_key, "months")
-    required_years = _required_period_count(requirement.requirement_key, "years")
+    complete = distinct_count >= minimum_count
+    required_months = _configured_period_count(requirement, "months")
+    required_years = _configured_period_count(requirement, "years")
     if required_months:
         months: set[str] = set()
         unknown_period_files = 0
@@ -1395,7 +1463,6 @@ def _coverage_for_files(
             file_months: set[str] = set()
             if file.statement_period:
                 file_months.add(file.statement_period)
-            file_months.update(statement_months_from_filename(file.file_name))
             analysis = analyses.get(file.id)
             file_months.update(
                 statement_months_from_analysis(analysis.analysis if analysis else None)
@@ -1437,12 +1504,12 @@ def _coverage_for_files(
             }
         )
         complete = current >= required_years
-    elif requirement.requirement_key == "ytd_p_and_l_balance_sheet":
+    elif (getattr(requirement, "canonical_key", None) or requirement.requirement_key) == "ytd_p_and_l_balance_sheet":
         classifications = set()
         support_categories: set[str] = set()
         for file in files:
             analysis = analyses.get(file.id)
-            classifications.add(effective_file_classification(file.file_name, analysis))
+            classifications.update(analysis_classifications(analysis))
             support_categories.update(_analysis_supports(analysis))
         has_profit_and_loss = bool(
             {"current_p_and_l", "profit_and_loss"}.intersection(classifications)
@@ -1454,23 +1521,19 @@ def _coverage_for_files(
         has_balance_sheet = (
             "balance_sheet" in classifications or "balance_sheet" in support_categories
         )
-        combined_template = any(
-            "profit-loss-balance-sheet" in file.file_name.casefold()
-            or "p&l and balance sheet" in file.file_name.casefold()
-            for file in files
-        )
-        current = 2 if combined_template else int(has_profit_and_loss) + int(has_balance_sheet)
+        current = int(has_profit_and_loss) + int(has_balance_sheet)
         coverage.update(
             {
                 "classifications": sorted(value for value in classifications if value),
-                "profit_and_loss": has_profit_and_loss or combined_template,
-                "balance_sheet": has_balance_sheet or combined_template,
+                "profit_and_loss": has_profit_and_loss,
+                "balance_sheet": has_balance_sheet,
                 "current": current,
                 "required": 2,
                 "unit": "document types",
             }
         )
         complete = current >= 2
+    complete = complete and distinct_count >= minimum_count
     coverage["complete"] = complete
     return complete, coverage
 
@@ -1490,22 +1553,15 @@ def _matching_evidence_files(
     for file in files:
         if not requested or file.requested_document_id != requested.id:
             continue
-        analysis = analyses.get(file.id)
-        # An explicit request link is strong provenance, but it must not allow
-        # a completed classifier result for a different document type to pass.
-        if not (
-            analysis
-            and analysis.status == "completed"
-            and analysis.classification
-            and analysis.classification not in expected
-        ):
-            explicit.append(file)
+        # Preserve the borrower's explicit destination. A classifier disagreement
+        # creates a review decision; it never silently removes their upload.
+        explicit.append(file)
     classified = [
         file
         for file in files
         if (analysis := analyses.get(file.id))
         and analysis.status == "completed"
-        and analysis.classification in expected
+        and analysis_classifications(analysis).intersection(expected)
     ]
     matches = list({file.id: file for file in [*explicit, *classified]}.values())
     if trust_preferred:
@@ -1557,7 +1613,7 @@ def _filename_suggestions(
         analysis = analyses.get(file.id)
         if analysis and analysis.status == "completed" and analysis.classification:
             continue
-        if effective_file_classification(file.file_name) in expected:
+        if filename_evidence_classification(file.file_name) in expected:
             suggestions.append(file)
     return suggestions
 
@@ -1588,7 +1644,7 @@ async def _sync_requirement_evidence(
     timestamp = now()
     for file_id, row in list(active.items()):
         if file_id not in inventory or (
-            row.source != "operator" and file_id not in desired_sources
+            row.source == "filename_suggestion" and file_id not in desired_sources
         ):
             row.removed_at = timestamp
             row.reason = "Evidence no longer matches this requirement"
@@ -1879,7 +1935,7 @@ def _automatic_evidence_decision(
 ) -> tuple[str, str, str, str | None]:
     if duplicate_content:
         return (
-            "rejected",
+            "needs_more",
             "duplicate",
             "An identical active copy is already linked and contributes coverage only once.",
             analysis.confidence if analysis else None,
@@ -1893,7 +1949,7 @@ def _automatic_evidence_decision(
         )
     if analysis.status == "failed":
         return (
-            "failed",
+            "needs_more",
             "analysis_failed",
             analysis.error or "AI document analysis failed and can be retried.",
             analysis.confidence,
@@ -1908,16 +1964,16 @@ def _automatic_evidence_decision(
             )
         if analysis.skip_reason == "password_protected":
             return (
-                "rejected",
+                "needs_more",
                 "password_protected",
                 analysis.skip_detail
                 or "This PDF requires a password. Ask for an unlocked copy.",
                 analysis.confidence,
             )
         return (
-            "rejected",
-            "unreadable",
-            analysis.skip_detail or "The file could not be read for evidence analysis.",
+            "needs_more",
+            "analysis_unavailable",
+            analysis.skip_detail or "Automatic analysis is unavailable. The uploaded file is retained for staff review.",
             analysis.confidence,
         )
     if file.content_hash and analysis.content_hash != file.content_hash:
@@ -1928,11 +1984,16 @@ def _automatic_evidence_decision(
             analysis.confidence,
         )
 
+    if _file_is_expired(requirement, file):
+        return (
+            "needs_more", "stale", "This document is older than the configured freshness requirement. It is retained while a current copy is collected.", analysis.confidence,
+        )
+
     expected = _expected_classes(requirement)
     classification = str(analysis.classification or "")
     if classification == "unreadable":
         return (
-            "rejected",
+            "needs_more",
             "unreadable",
             "The document is not readable enough to support this requirement.",
             analysis.confidence,
@@ -1944,14 +2005,14 @@ def _automatic_evidence_decision(
             "Published criteria do not define an automatic document classification for this requirement.",
             analysis.confidence,
         )
-    if classification not in expected:
+    if not analysis_classifications(analysis).intersection(expected):
         return (
-            "rejected",
+            "needs_more",
             "wrong_document",
-            f"AI classified this as {classification or 'an unknown document type'}, not evidence for this requirement.",
+            f"Possible different document ({classification or 'unconfirmed type'}). The file remains linked for staff to review or reassign.",
             analysis.confidence,
         )
-    if str(analysis.confidence or "").casefold() != "high":
+    if classification_confidence(analysis, expected) != "high":
         return (
             "needs_more",
             "low_confidence",
@@ -1967,9 +2028,9 @@ def _automatic_evidence_decision(
         for token in ("tamper", "altered", "fraud", "illegible", "unreadable")
     ):
         return (
-            "rejected",
+            "needs_more",
             "integrity_or_readability",
-            "AI found a document-integrity or readability issue that prevents acceptance.",
+            "AI flagged a possible integrity or readability issue. The file is retained for staff review.",
             analysis.confidence,
         )
     if any(
@@ -1983,9 +2044,8 @@ def _automatic_evidence_decision(
             analysis.confidence,
         )
 
-    if _required_period_count(requirement.requirement_key, "months"):
+    if _configured_period_count(requirement, "months"):
         months = statement_months_from_analysis(analysis.analysis)
-        months.update(statement_months_from_filename(file.file_name))
         if file.statement_period:
             months.add(file.statement_period)
         if not months:
@@ -1995,7 +2055,7 @@ def _automatic_evidence_decision(
                 "AI could not establish the statement month, so this file cannot increase coverage.",
                 analysis.confidence,
             )
-    if _required_period_count(requirement.requirement_key, "years") and not _tax_years(
+    if _configured_period_count(requirement, "years") and not _tax_years(
         file, analysis
     ):
         return (
@@ -2038,6 +2098,54 @@ def _automatic_evidence_decision(
         + (" " + identity_warning["message"] if identity_warning else ""),
         analysis.confidence,
     )
+
+
+def _evidence_shadow_comparison(
+    requirement: AICollectionRequirement,
+    file: BucketFile,
+    analysis: BucketFileAnalysis | None,
+    duplicate: bool,
+    proposed: tuple[str, str],
+) -> dict[str, Any] | None:
+    """Compare the changed legacy rules locally, without another provider call.
+
+    The comparison never changes ingestion, links, manual decisions or the
+    proposed result. Only the primary-label/filename/strict-rejection rules that
+    changed in v5 are replayed; all unchanged documentary checks reuse proposed.
+    """
+    if get_settings().evidence_decision_mode != "shadow":
+        return None
+    legacy = proposed
+    if duplicate:
+        legacy = ("rejected", "duplicate")
+    elif analysis is not None:
+        status = analysis.status
+        expected = _expected_classes(requirement)
+        if status == "failed":
+            legacy = ("failed", "analysis_failed")
+        elif status == "skipped" and analysis.skip_reason != "zip_parent_archive":
+            legacy = ("rejected", "password_protected" if analysis.skip_reason == "password_protected" else "unreadable")
+        elif status == "completed" and proposed[1] != "analysis_stale":
+            if analysis.classification == "unreadable":
+                legacy = ("rejected", "unreadable")
+            elif expected and analysis.classification not in expected:
+                legacy = ("rejected", "wrong_document")
+            elif str(analysis.confidence or "").casefold() != "high":
+                legacy = ("needs_more", "low_confidence")
+            elif proposed[1] == "integrity_or_readability":
+                legacy = ("rejected", "integrity_or_readability")
+            elif proposed[1] == "wrong_period" and (
+                (_required_period_count(requirement.requirement_key, "months") and statement_months_from_filename(file.file_name))
+                or (_required_period_count(requirement.requirement_key, "years") and re.search(r"\b20\d{2}\b", file.file_name))
+            ):
+                legacy = ("accepted", "validated")
+    return {
+        "mode": "shadow", "legacy_policy": "ai-evidence-v4-numbers-first",
+        "proposed_policy": AI_EVIDENCE_DECISION_ALGORITHM,
+        "legacy_decision": legacy[0], "legacy_reason": legacy[1],
+        "proposed_decision": proposed[0], "proposed_reason": proposed[1],
+        "changed": legacy != proposed,
+    }
 
 
 async def _latest_evidence_decisions(
@@ -2198,6 +2306,9 @@ async def _reconcile_evidence_decisions(
                         actor_kind="ai",
                         supersedes_decision_id=current.id if current else None,
                         idempotency_key=idempotency_key,
+                        audit_context=_evidence_shadow_comparison(
+                            requirement, file, analysis, duplicate, (decision, reason_code)
+                        ),
                     )
                     db.add(row)
             effective[link.id] = row
@@ -2249,6 +2360,8 @@ async def _materialize_requirements(
     policies: list[ApplicationEvidencePolicySelection],
     grouped_policies: dict[uuid.UUID, list[AICollectionRequirement]],
 ) -> tuple[list[ApplicationRequirementState], dict[uuid.UUID, list[str]]]:
+    from app.services import collection_tasks
+
     files, analyses, _classifications = await _evidence_inventory(db, profile)
     inventory = {file.id: file for file in files}
     intake = (
@@ -2274,6 +2387,7 @@ async def _materialize_requirements(
         .scalars()
         .all()
     }
+    responses = await collection_tasks.latest_responses(db, profile.id)
     merged: dict[str, dict[str, Any]] = {}
     per_selection: dict[uuid.UUID, list[str]] = defaultdict(list)
 
@@ -2314,11 +2428,36 @@ async def _materialize_requirements(
         for requirement in grouped_policies.get(policy.playbook_id, []):
             merge_requirement(requirement, policy_key=policy.policy_key)
 
+    # Lender checklist definitions use the same evidence engine as program
+    # requirements, but remain independently versioned by their offering.
+    from types import SimpleNamespace
+    for state in existing.values():
+        metadata = state.provenance or {}
+        external = metadata.get("external_definition")
+        if metadata.get("source_kind") == "lender" and external and state.requirement_key not in merged:
+            definition = {
+                "id": state.id, "playbook_id": state.id, "requirement_key": state.requirement_key,
+                "label": state.label, "category": state.category, "required_level": state.required_level,
+                "requirement_kind": metadata.get("requirement_kind", "document"),
+                "canonical_key": metadata.get("canonical_key"), "collection_config": metadata.get("collection_config") or {},
+                "visibility": external.get("visibility", ["borrower", "underwriter"]) if metadata.get("catalog_approved") else ["underwriter"],
+                "verification_required": state.verification_required,
+                "completion_mode": external.get("completion_mode", "ai_can_complete"),
+                "objective_text": external.get("objective_text", ""),
+                "completion_criteria": external.get("completion_criteria", ""),
+                "ai_request_message_template": external.get("ai_request_message_template"),
+                "expiration_days": external.get("expiration_days"),
+                "review_checks": external.get("review_checks", []),
+                "can_underwriter_waive": external.get("can_underwriter_waive", False),
+            }
+            merge_requirement(SimpleNamespace(**definition))
+
     active_keys = set(merged)
     for key, state in existing.items():
         if key not in active_keys and state.status not in {"waived", "not_applicable"}:
             state.status = "stale"
             state.state_reason = "No longer required by the selected programs"
+            state.provenance = {**(state.provenance or {}), "inactive_definition": True}
         if key not in active_keys and state.requested_document_id:
             requested = await db.get(BucketRequestedDocument, state.requested_document_id)
             if (
@@ -2369,6 +2508,20 @@ async def _materialize_requirements(
         if requested:
             state.requested_document_id = requested.id
 
+        definition_metadata = collection_tasks.definition_metadata(
+            requirement, version=criteria_versions.get(requirement.playbook_id, 1)
+        )
+        if (state.provenance or {}).get("source_kind") == "lender":
+            definition_metadata = {**definition_metadata, **{
+                name: (state.provenance or {}).get(name)
+                for name in ("source_kind", "source_key", "catalog_approved", "external_definition", "definition_version", "definition_id")
+            }}
+        state.provenance = {**(state.provenance or {}), **definition_metadata, "inactive_definition": False}
+        if not collection_tasks.collects_file(requirement):
+            await collection_tasks.materialize_response_state(db, state, responses)
+            result.append(state)
+            continue
+
         prior_links = list(
             (
                 await db.execute(
@@ -2407,12 +2560,12 @@ async def _materialize_requirements(
             analyses=analyses,
             expected_entity=(
                 expected_entity
-                if _business_evidence_requirement(requirement.requirement_key)
+                if _business_evidence_requirement(getattr(requirement, "canonical_key", None) or requirement.requirement_key)
                 else None
             ),
             corroborated_entities=(
                 corroborated_entities
-                if _business_evidence_requirement(requirement.requirement_key)
+                if _business_evidence_requirement(getattr(requirement, "canonical_key", None) or requirement.requirement_key)
                 else set()
             ),
             criteria_version=criteria_versions.get(requirement.playbook_id, 1),
@@ -2441,6 +2594,8 @@ async def _materialize_requirements(
             requested.status = "uploaded" if accepted_complete else "requested"
         state.evidence_file_id = linked_files[0].id if linked_files else None
         state.provenance = {
+            **definition_metadata,
+            "inactive_definition": False,
             **matched_provenance,
             "source": "multi_evidence",
             "linked_file_ids": [str(file.id) for file in linked_files],
@@ -2467,10 +2622,7 @@ async def _materialize_requirements(
                 state.received_at = state.received_at or min(
                     file.created_at for file in linked_files
                 )
-                if requirement.expiration_days and all(
-                    file.created_at < now() - timedelta(days=requirement.expiration_days)
-                    for file in linked_files
-                ):
+                if _expiration_days(requirement) and all(_file_is_expired(requirement, file) for file in linked_files):
                     state.status = "stale"
                     state.state_reason = "Evidence is older than the published program allows"
                 elif state.status == "failed" and prior_link_ids == {row.file_id for row in links}:
@@ -2521,6 +2673,7 @@ async def _materialize_requirements(
                     state.state_reason = "Awaiting client evidence"
         result.append(state)
     await db.flush()
+    await collection_tasks.sync_collection_tasks(db, profile, result)
     return result, per_selection
 
 
@@ -2561,6 +2714,10 @@ async def _automation_state(
             and visibility.get(item.requirement_key, False)
             and item.requirement_key not in effectively_satisfied
             and _requirement_needs_client_evidence(item)
+            and (item.provenance or {}).get("requirement_kind", "document") != "human_review"
+            and (item.provenance or {}).get("catalog_approved", True)
+            and (item.provenance or {}).get("collection_status", "open") in {"open", "requested"}
+            and (item.provenance or {}).get("collection_assignee", "borrower") == "borrower"
         ),
         None,
     )
@@ -2795,6 +2952,9 @@ async def get_program_readiness(
             can_waive[row.requirement_key] = (
                 can_waive.get(row.requirement_key, False) or row.can_underwriter_waive
             )
+    for state in states:
+        visibility.setdefault(state.requirement_key, bool((state.provenance or {}).get("client_visible")))
+        can_waive.setdefault(state.requirement_key, False)
 
     programs: list[ProgramReadinessItem] = []
     fully_loaded_program_keys: list[str] = []
@@ -2907,6 +3067,24 @@ async def get_program_readiness(
         for definition in rows:
             requirement_definitions.setdefault(definition.requirement_key, definition)
             all_requirement_definitions[definition.requirement_key].append(definition)
+    for state in states:
+        metadata = state.provenance or {}
+        external = metadata.get("external_definition")
+        if external and state.requirement_key not in requirement_definitions:
+            from types import SimpleNamespace
+            definition = SimpleNamespace(
+                **{**external, "requirement_key": state.requirement_key, "label": state.label,
+                   "category": state.category, "collection_config": metadata.get("collection_config") or {},
+                   "verification_required": state.verification_required,
+                   "completion_mode": external.get("completion_mode", "ai_can_complete"),
+                   "objective_text": external.get("objective_text", ""),
+                   "completion_criteria": external.get("completion_criteria", ""),
+                   "ai_request_message_template": external.get("ai_request_message_template"),
+                   "expiration_days": external.get("expiration_days"),
+                   "review_checks": external.get("review_checks", [])}
+            )
+            requirement_definitions[state.requirement_key] = definition
+            all_requirement_definitions[state.requirement_key].append(definition)
 
     def evidence_read(
         state: ApplicationRequirementState,
@@ -2937,6 +3115,9 @@ async def get_program_readiness(
             ),
             analysis_id=decision.analysis_id if decision else None,
             coverage_contribution=contribution,
+            usability_status=analysis_usability(available_analyses.get(file.id)),
+            document_type_candidates=getattr(available_analyses.get(file.id), "document_type_candidates", None) or [],
+            evidence_claims=getattr(available_analyses.get(file.id), "evidence_claims", None) or [],
             is_password_protected=locked_file_requests.is_password_protected_file(
                 file, available_analyses.get(file.id)
             ),
@@ -3018,6 +3199,10 @@ async def get_program_readiness(
         requirements=[
             ApplicationRequirementRead(
                 requirement_key=item.requirement_key,
+                requirement_kind=(item.provenance or {}).get("requirement_kind", "document"),
+                canonical_key=(item.provenance or {}).get("canonical_key"),
+                collection_config=(item.provenance or {}).get("collection_config") or {},
+                response=(item.provenance or {}).get("response"),
                 label=item.label,
                 category=item.category,
                 required_level=item.required_level,
@@ -3388,15 +3573,14 @@ def analysis_is_high_confidence_match(
 ) -> bool:
     """Only accept current, high-confidence, content-level classifications."""
 
-    expected = EXPECTED_CLASSIFICATIONS.get(requirement.requirement_key, set()).union(
-        classifications_for_requested_doc(requirement.label, requirement.category)
-    )
+    expected = _expected_classes(requirement)
     if not expected or analysis is None or analysis.status != "completed":
         return False
     if file.content_hash and analysis.content_hash != file.content_hash:
         return False
     return (
-        str(analysis.confidence or "").casefold() == "high" and analysis.classification in expected
+        classification_confidence(analysis, expected) == "high"
+        and bool(analysis_classifications(analysis).intersection(expected))
     )
 
 

@@ -491,6 +491,17 @@ class DealerEntityStructure(BaseModel):
         return None if value == "" else value
 
 
+async def _guard_arf_attribution(db: AsyncSession, payload: BaseModel) -> None:
+    from app.services.arf_channel import PRODUCT_BY_KEY, require_hosted_permission
+
+    values = [str(getattr(payload, key, "") or "").casefold() for key in ("program", "source", "page")]
+    slugs = {str(item["public_slug"]).casefold() for item in PRODUCT_BY_KEY.values()}
+    attributed = any(value.startswith("arf_") or value == "arf" or value.strip("/").split("/")[-1] in slugs for value in values)
+    if attributed:
+        contact_keys = {"full_name", "email", "phone", "business_name", "terms_accepted", "privacy_accepted", "source", "page", "program", "vertical", "campaign", "cta"}
+        await require_hosted_permission(db, requested_fields=sorted(payload.model_fields_set - contact_keys))
+
+
 class PublicIntakeAttribution(BaseModel):
     source: str | None = Field(default=None, max_length=64)
     page: str | None = Field(default=None, max_length=300)
@@ -8148,6 +8159,7 @@ async def start_dealer_intake(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> DealerIntakeResponse:
+    await _guard_arf_attribution(db, payload)
     if not payload.terms_accepted or not payload.privacy_accepted:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Terms and Privacy Policy acceptance is required.")
     _throttle_or_429(
@@ -13670,6 +13682,7 @@ async def start_funding_review(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> DealerIntakeResponse:
+    await _guard_arf_attribution(db, payload)
     if not payload.terms_accepted or not payload.privacy_accepted:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Terms and Privacy Policy acceptance is required.")
     existing = await _latest_active_intake_by_email(db, str(payload.email), variant=FUNDING_VARIANT)
@@ -14555,6 +14568,7 @@ async def start_mca_refinance(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> DealerIntakeResponse:
+    await _guard_arf_attribution(db, payload)
     if not payload.terms_accepted or not payload.privacy_accepted:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Terms and Privacy Policy acceptance is required.")
     _throttle_or_429(

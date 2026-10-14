@@ -27,6 +27,9 @@ class FundingProgramScopeRead(BaseModel):
 
 class FundingProgramRequirementRead(BaseModel):
     requirement_key: str
+    requirement_kind: Literal["field", "document", "form", "consent", "human_review"] = "document"
+    canonical_key: str | None = None
+    collection_config: dict = Field(default_factory=dict)
     label: str
     category: str
     required_level: str
@@ -246,6 +249,9 @@ class FundingProgramCreate(BaseModel):
 
 class FundingProgramRequirementWrite(BaseModel):
     requirement_key: str = Field(pattern=r"^[a-z0-9_]{2,120}$")
+    requirement_kind: Literal["field", "document", "form", "consent", "human_review"] = "document"
+    canonical_key: str | None = Field(default=None, pattern=r"^[a-z0-9_]{2,120}$")
+    collection_config: dict = Field(default_factory=dict)
     label: str = Field(min_length=2, max_length=200)
     category: Literal[
         "borrower_info",
@@ -306,6 +312,25 @@ class FundingProgramRequirementWrite(BaseModel):
     def _no_self_attested_document_checks(self):
         if self.review_checks and self.completion_mode == "borrower_self_attest":
             raise ValueError("Document checks require AI verification or staff verification, not borrower self-attestation")
+        value_type = self.collection_config.get("value_type", "text")
+        if value_type not in {"text", "number", "integer", "boolean", "date", "email", "enum"}:
+            raise ValueError("Unsupported field value type")
+        field_key = self.collection_config.get("field_key")
+        if field_key is not None and not re.fullmatch(r"[a-z0-9_]{2,64}", str(field_key)):
+            raise ValueError("Field keys must be 2 to 64 lowercase letters, numbers or underscores")
+        fields = self.collection_config.get("fields", [])
+        if not isinstance(fields, list) or len(fields) > 100:
+            raise ValueError("Structured forms support at most 100 fields")
+        field_keys = set()
+        for field in fields:
+            key = field.get("key") if isinstance(field, dict) else None
+            if not key or not re.fullmatch(r"[a-z0-9_]{1,64}", str(key)) or key in field_keys:
+                raise ValueError("Structured form fields need unique stable keys")
+            field_keys.add(key)
+            if field.get("value_type", "text") not in {"text", "number", "integer", "boolean", "date", "email", "enum"}:
+                raise ValueError("Unsupported structured form value type")
+        if self.requirement_kind == "human_review" and "borrower" in self.visibility:
+            self.visibility = [item for item in self.visibility if item != "borrower"] or ["underwriter"]
         return self
 
 

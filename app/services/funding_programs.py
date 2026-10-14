@@ -102,6 +102,9 @@ def _version_read(
         requirements=[
             {
                 "requirement_key": row.requirement_key,
+                "requirement_kind": getattr(row, "requirement_kind", "document"),
+                "canonical_key": getattr(row, "canonical_key", None),
+                "collection_config": dict(getattr(row, "collection_config", None) or {}),
                 "label": row.label,
                 "category": row.category,
                 "required_level": row.required_level,
@@ -397,7 +400,9 @@ def _commercial_terms_read(
 
 
 async def public_catalog(db: AsyncSession) -> list[PublicFundingProgramCatalogItem]:
-    rows = await catalog_rows(db)
+    # Counterparty-specific identities belong only in the authenticated desk.
+    # Public business-capital copy has a separate, source-free projection.
+    rows = [row for row in await catalog_rows(db) if not row.program_key.startswith("arf_")]
     scopes = await scopes_by_program(db, [row.id for row in rows])
     terms = await commercial_terms_by_program(db, [row.id for row in rows], include_drafts=False)
     return [
@@ -772,6 +777,9 @@ async def create_version(
             AICollectionRequirement(
                 playbook_id=playbook.id,
                 requirement_key=item.requirement_key,
+                requirement_kind=item.requirement_kind,
+                canonical_key=item.canonical_key,
+                collection_config=dict(item.collection_config),
                 label=item.label.strip(),
                 category=item.category,
                 required_level=item.required_level,

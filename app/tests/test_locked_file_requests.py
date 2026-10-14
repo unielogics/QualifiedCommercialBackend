@@ -1784,7 +1784,10 @@ async def test_upload_init_rejects_an_obsolete_unlocked_copy_target() -> None:
         recipient_email="client@example.com",
     )
     document = SimpleNamespace(id=uuid4(), bucket_id=bucket_id, status="requested")
-    db = SimpleNamespace(get=AsyncMock(return_value=document), commit=AsyncMock())
+    db = SimpleNamespace(
+        get=AsyncMock(return_value=document), commit=AsyncMock(),
+        execute=AsyncMock(return_value=_Result()),
+    )
     stale = locked_file_requests.StaleUnlockedCopyRequest(
         "This upload request was replaced by a newer task."
     )
@@ -1840,7 +1843,10 @@ async def test_upload_init_treats_an_inactive_normal_request_as_stale() -> None:
     document = SimpleNamespace(
         id=uuid4(), bucket_id=bucket_id, status="not_applicable"
     )
-    db = SimpleNamespace(get=AsyncMock(return_value=document), commit=AsyncMock())
+    db = SimpleNamespace(
+        get=AsyncMock(return_value=document), commit=AsyncMock(),
+        execute=AsyncMock(return_value=_Result()),
+    )
 
     with (
         patch(
@@ -1901,6 +1907,7 @@ async def test_upload_complete_rejects_an_obsolete_unlocked_copy_target() -> Non
     db = SimpleNamespace(
         get=AsyncMock(side_effect=[file, document]),
         commit=AsyncMock(),
+        execute=AsyncMock(return_value=_Result()),
     )
     stale = locked_file_requests.StaleUnlockedCopyRequest(
         "This upload request was replaced by a newer task."
@@ -2022,7 +2029,10 @@ async def test_shared_intake_upload_complete_rejects_a_hidden_duplicate_target()
 async def test_admin_bucket_upload_init_rejects_a_hidden_duplicate_target() -> None:
     bucket_id = uuid4()
     document = SimpleNamespace(id=uuid4(), bucket_id=bucket_id, status="requested")
-    db = SimpleNamespace(get=AsyncMock(return_value=document), commit=AsyncMock())
+    db = SimpleNamespace(
+        get=AsyncMock(return_value=document), commit=AsyncMock(),
+        execute=AsyncMock(return_value=_Result()),
+    )
     stale = locked_file_requests.StaleUnlockedCopyRequest(
         "This upload request was replaced by a newer task."
     )
@@ -2071,6 +2081,7 @@ async def test_admin_bucket_upload_complete_rejects_a_hidden_duplicate_target() 
     db = SimpleNamespace(
         get=AsyncMock(side_effect=[file, document]),
         commit=AsyncMock(),
+        execute=AsyncMock(return_value=_Result()),
     )
     stale = locked_file_requests.StaleUnlockedCopyRequest(
         "This upload request was replaced by a newer task."

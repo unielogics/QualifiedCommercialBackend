@@ -670,6 +670,11 @@ class BucketFileAnalysis(TimestampMixin, Base):
     skip_reason: Mapped[str | None] = mapped_column(String(48), nullable=True)
     skip_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     classification: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    # Ingestion/usability is independent from fit for a particular requirement.
+    usability_status: Mapped[str] = mapped_column(String(32), nullable=False, default="processing", server_default="processing")
+    detected_content_type: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    document_type_candidates: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    evidence_claims: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     confidence: Mapped[str | None] = mapped_column(String(8), nullable=True)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     analysis: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

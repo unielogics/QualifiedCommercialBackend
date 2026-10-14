@@ -659,8 +659,9 @@ async def test_manual_statement_rows_include_unassigned_failed_and_operator_link
     assert files[linked_id].ai_decision == "rejected"
     assert files[linked_id].ai_reason_code == "wrong_document"
     assert files[processing_id].ai_decision == "processing"
-    assert result.file_count == 2
-    assert result.pending_analysis_count == 1
+    # Unknown uploads are visible for review, but names cannot establish type.
+    assert result.file_count == 0
+    assert result.pending_analysis_count == 0
     assert result.rejected_file_count == 0
     assert result.evidence_processing_count == 1
 

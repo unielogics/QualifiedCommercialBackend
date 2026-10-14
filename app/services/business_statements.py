@@ -174,6 +174,8 @@ def _slot_matches(slot: BucketRequestedDocument, kind: str) -> tuple[bool, bool]
     row). A row named exactly as our form is dedicated even before the
     evidence vocabulary knows the word."""
     schema = bss.SCHEMA_FOR[kind]
+    if (getattr(slot, "requirement_source", None) or {}).get("form_kind") == kind:
+        return True, True
     classes = classifications_for_requested_doc(slot.name or "", slot.category)
     named = (slot.name or "").strip().casefold() == schema.label.casefold()
     if named or classes == {schema.classification}:

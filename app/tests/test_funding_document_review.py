@@ -237,13 +237,19 @@ def test_baseline_period_coverage_is_distinct_and_not_one_file(kind, count, peri
         SimpleNamespace(
             id=uuid4(),
             statement_period=None,
-            file_name=f"Statement 2026-{period:02d}.pdf"
-            if unit == "months"
-            else f"Tax return {period}.pdf",
+            file_name=f"upload-{index}.pdf",
         )
-        for period in periods
+        for index, _period in enumerate(periods)
     ]
-    result, coverage = _coverage_for_files(requirement, files, {})
+    analyses = {
+        file.id: SimpleNamespace(
+            analysis={"key_facts": {"statement_period": f"2026-{period:02d}"}}
+            if unit == "months"
+            else {"key_facts": {"tax_year": str(period)}}
+        )
+        for file, period in zip(files, periods, strict=True)
+    }
+    result, coverage = _coverage_for_files(requirement, files, analyses)
     assert result is complete
     assert coverage["required"] == count
     assert coverage["current"] == len(set(periods))
@@ -272,7 +278,10 @@ async def test_new_review_policy_invalidates_prior_staff_acceptance(monkeypatch,
         reason="Prior staff review",
     )
     file = SimpleNamespace(id=file_id, content_hash="hash")
-    analysis = SimpleNamespace(id=uuid4(), analysis_version=1, analyzed_at=None)
+    analysis = SimpleNamespace(
+        id=uuid4(), analysis_version=1, analyzed_at=None,
+        status="completed", classification="tax_return", confidence="high",
+    )
     monkeypatch.setattr(
         application_programs, "_latest_evidence_decisions", AsyncMock(return_value={link_id: staff})
     )
@@ -295,7 +304,10 @@ async def test_new_review_policy_invalidates_prior_staff_acceptance(monkeypatch,
     )
     result = await application_programs._reconcile_evidence_decisions(
         db,
-        requirement=SimpleNamespace(verification_required=False),
+        requirement=SimpleNamespace(
+            requirement_key="business_tax_returns_2_years", label="Business tax returns",
+            category="financials", verification_required=False,
+        ),
         links=[link],
         inventory={file_id: file},
         analyses={file_id: analysis},
@@ -399,7 +411,10 @@ async def test_generic_verify_writes_bound_staff_decision_and_unchanged_review_i
     db.add.reset_mock()
     await application_programs._reconcile_evidence_decisions(
         db,
-        requirement=SimpleNamespace(verification_required=True),
+        requirement=SimpleNamespace(
+            requirement_key="business_tax_returns_2_years", label="Business tax returns",
+            category="financials", verification_required=True,
+        ),
         links=[link],
         inventory={file.id: file},
         analyses={file.id: analysis},
@@ -491,7 +506,10 @@ async def test_legacy_timestamp_verification_preserves_unchanged_work_but_not_ch
     )
     await application_programs._reconcile_evidence_decisions(
         db,
-        requirement=SimpleNamespace(verification_required=True),
+        requirement=SimpleNamespace(
+            requirement_key="business_tax_returns_2_years", label="Business tax returns",
+            category="financials", verification_required=True,
+        ),
         links=[link],
         inventory={file.id: file},
         analyses={file.id: analysis},

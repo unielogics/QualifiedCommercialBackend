@@ -2107,6 +2107,9 @@ async def admin_upload_init(
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileUploadInitResponse:
     await _load_bucket_or_404(db, bucket_id)
+    from app.services.arf_channel import require_bucket_hosted_permission
+
+    await require_bucket_hosted_permission(db, bucket_id, capability="document_sharing")
     req = None
     if payload.requested_document_id:
         req = await db.get(BucketRequestedDocument, payload.requested_document_id)
@@ -2386,6 +2389,9 @@ async def admin_upload_complete(
     db: AsyncSession = Depends(get_db),
 ) -> BucketFile:
     bucket = await _load_bucket_or_404(db, bucket_id)
+    from app.services.arf_channel import require_bucket_hosted_permission
+
+    await require_bucket_hosted_permission(db, bucket_id, capability="document_sharing")
     file = await db.get(BucketFile, payload.file_id)
     if file is None or file.bucket_id != bucket_id or file.upload_link_id is not None or file.deleted_at is not None:
         await _log(db, bucket_id, "admin_file_upload_failed", request=request, user=user, target_type="file", target_id=str(payload.file_id), detail="complete failed: file not found")
@@ -3075,6 +3081,8 @@ def _public_requested_document_read(
     document: BucketRequestedDocument,
     uploaded_files: list[BucketRequestUploadedFileRead],
 ) -> BucketRequestedDocumentRead:
+    from app.services.public_identifiers import public_requirement_key
+
     metadata = locked_file_requests.public_request_metadata(document, uploaded_files)
     return BucketRequestedDocumentRead.model_validate(document).model_copy(
         update={
@@ -3082,7 +3090,11 @@ def _public_requested_document_read(
             # only for staff/audit consumers. The explicit fields below are
             # the complete public replacement-request contract.
             "requirement_source": None,
-            "requirement_key": None if metadata["request_kind"] else document.requirement_key,
+            "requirement_key": (
+                None
+                if metadata["request_kind"]
+                else public_requirement_key(document.requirement_key)
+            ),
             **metadata,
         }
     )
@@ -3268,6 +3280,9 @@ async def request_upload_init(
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileUploadInitResponse:
     link = await _load_upload_link_or_404(db, token)
+    from app.services.arf_channel import require_bucket_hosted_permission
+
+    await require_bucket_hosted_permission(db, link.bucket_id, capability="document_sharing")
     _require_upload_passcode(link)
     if not _verify_passcode(payload.passcode or "", link.passcode_hash, attempt_scope=_client_ip(request) or "unknown"):
         await _log(db, link.bucket_id, "upload_passcode_failed", request=request, actor_name=payload.uploader_name or link.recipient_name, actor_email=str(payload.uploader_email) if payload.uploader_email else link.recipient_email, actor_role="uploader", target_type="upload_link", target_id=str(link.id), detail=payload.file_name)
@@ -3367,6 +3382,9 @@ async def request_upload_complete(
     db: AsyncSession = Depends(get_db),
 ) -> BucketFile:
     link = await _load_upload_link_or_404(db, token)
+    from app.services.arf_channel import require_bucket_hosted_permission
+
+    await require_bucket_hosted_permission(db, link.bucket_id, capability="document_sharing")
     file = await db.get(BucketFile, payload.file_id)
     if file is None or file.bucket_id != link.bucket_id or file.upload_link_id != link.id or file.deleted_at is not None:
         await _log(db, link.bucket_id, "file_upload_failed", request=request, actor_name=link.recipient_name, actor_email=link.recipient_email, actor_role="uploader", target_type="file", target_id=str(payload.file_id), detail="complete failed: file not found")

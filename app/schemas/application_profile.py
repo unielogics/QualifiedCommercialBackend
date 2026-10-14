@@ -193,6 +193,9 @@ class ApplicationRequirementEvidenceRead(BaseModel):
     decision_actor: Literal["ai", "staff", "system"] | None = None
     analysis_id: UUID | None = None
     coverage_contribution: dict = Field(default_factory=dict)
+    usability_status: Literal["processing", "usable", "usable_with_warning", "needs_review", "needs_replacement", "unsafe"] = "processing"
+    document_type_candidates: list[dict] = Field(default_factory=list)
+    evidence_claims: list[dict] = Field(default_factory=list)
     is_password_protected: bool = False
     unlocked_copy_request: UnlockedCopyRequestStateRead | None = None
 
@@ -207,6 +210,10 @@ class ApplicationEvidenceOptionRead(BaseModel):
 
 class ApplicationRequirementRead(BaseModel):
     requirement_key: str
+    requirement_kind: Literal["field", "document", "form", "consent", "human_review"] = "document"
+    canonical_key: str | None = None
+    collection_config: dict = Field(default_factory=dict)
+    response: dict | None = None
     label: str
     category: str
     required_level: Literal["required", "recommended", "optional"]
@@ -690,6 +697,9 @@ class ApplicationBankEvidenceFileRead(BaseModel):
     analysis_id: UUID | None = None
     coverage_contribution: dict = Field(default_factory=dict)
     analysis_status: str | None = None
+    usability_status: str = "processing"
+    document_type_candidates: list[dict] = Field(default_factory=list)
+    evidence_claims: list[dict] = Field(default_factory=list)
     analysis_classification: str | None = None
     analysis_confidence: str | None = None
     analysis_summary: str | None = None
@@ -1216,6 +1226,9 @@ class EvidenceFileRead(BaseModel):
     included_in_review: bool = True
     preview_url: str | None = None
     analysis_status: str | None = None
+    usability_status: str = "processing"
+    document_type_candidates: list[dict] = Field(default_factory=list)
+    evidence_claims: list[dict] = Field(default_factory=list)
     analysis_classification: str | None = None
     analysis_confidence: str | None = None
     analysis_summary: str | None = None

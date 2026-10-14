@@ -72,10 +72,10 @@ from app.schemas.application_profile import (
 from app.scoping import scope_client_query, scope_loan_query
 from app.services import locked_file_requests, plaid_policy, provenance
 from app.services.bucket_evidence import (
+    analysis_usability,
     classifications_for_requested_doc,
     effective_file_classification,
     statement_months_from_analysis,
-    statement_months_from_filename,
 )
 from app.services.deal_economics import calculate_deal_earnings, optional_float
 from app.services.dealer_partner_access import (
@@ -88,6 +88,7 @@ from app.services.extracted_facts import (
     fact_review_group_key,
     pending_review_group_keys,
 )
+from app.services.public_identifiers import public_requirement_key
 from app.services.underwriting_intelligence import calculate_dscr
 from app.services.user_access import is_audit_client
 
@@ -297,7 +298,7 @@ async def client_evidence_banking_summary(
         )
         requirement_rows.append(
             ClientEvidenceRequirementRead(
-                requirement_key=item.requirement_key,
+                requirement_key=public_requirement_key(item.requirement_key),
                 label=item.label,
                 required_level=item.required_level,
                 status=item.status,
@@ -1458,6 +1459,14 @@ async def manual_statement_evidence(
         )
         classification = effective_file_classification(file.file_name, analysis)
         if classification != "bank_statement" and not requested_is_bank:
+            if analysis is None or analysis.status in {"pending", "running", "failed", "skipped"}:
+                # Keep unclassified uploads visible for manual assignment without
+                # claiming they prove a bank statement based on their names.
+                display_file_ids.add(file.id)
+                if analysis is not None and analysis.status == "failed":
+                    failed_analysis_ids.add(file.id)
+                elif analysis is None or analysis.status in {"pending", "running"}:
+                    pending_analysis_ids.add(file.id)
             continue
         statement_file_ids.add(file.id)
         display_file_ids.add(file.id)
@@ -1476,7 +1485,6 @@ async def manual_statement_evidence(
         if file.statement_period:
             months.add(str(file.statement_period))
         months.update(statement_months_from_analysis(analysis.analysis if analysis else None))
-        months.update(statement_months_from_filename(file.file_name))
     evidence_processing_count = sum(
         analysis is not None and analysis.status in {"pending", "queued", "processing", "running"}
         for _file, _requested, analysis in latest.values()
@@ -1519,7 +1527,6 @@ async def manual_statement_evidence(
         direct_months.update(
             statement_months_from_analysis(analysis.analysis if analysis else None)
         )
-        direct_months.update(statement_months_from_filename(file.file_name))
         is_linked = linked is not None or link is not None
         analysis_status = analysis.status if analysis else None
         statement_files.append(
@@ -1553,6 +1560,9 @@ async def manual_statement_evidence(
                     else {}
                 ),
                 analysis_status=analysis_status,
+                usability_status=analysis_usability(analysis),
+                document_type_candidates=getattr(analysis, "document_type_candidates", None) or [],
+                evidence_claims=getattr(analysis, "evidence_claims", None) or [],
                 analysis_classification=(effective_file_classification(file.file_name, analysis)),
                 analysis_confidence=analysis.confidence if analysis else None,
                 analysis_summary=analysis.summary if analysis else None,
@@ -2038,6 +2048,9 @@ async def evidence_state(
         analysis = latest_analyses.get(file_id)
         if analysis:
             item.analysis_status = analysis.status
+            item.usability_status = analysis_usability(analysis)
+            item.document_type_candidates = getattr(analysis, "document_type_candidates", None) or []
+            item.evidence_claims = getattr(analysis, "evidence_claims", None) or []
             item.analysis_classification = analysis.classification
             item.analysis_confidence = analysis.confidence
             item.analysis_summary = analysis.summary

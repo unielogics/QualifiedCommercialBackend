@@ -147,7 +147,10 @@ def _bucket_upload(*, source_detail=None, upload_link_id=None):
         requested_document_id=None, file_name="Bank statement.pdf", uploaded_by_name="Ana Lopez",
         uploaded_by_email="ana@example.com", source_detail=source_detail, source_kind="client_upload",
     )
-    db = SimpleNamespace(get=AsyncMock(return_value=file), add=lambda row: None, refresh=AsyncMock())
+    db = SimpleNamespace(
+        get=AsyncMock(return_value=file), add=lambda row: None, refresh=AsyncMock(),
+        execute=AsyncMock(return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))),
+    )
     emit = _ordered_emit(db)
     admin = SimpleNamespace(id=uuid.uuid4())
     return bucket, file, db, emit, admin

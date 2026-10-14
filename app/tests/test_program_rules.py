@@ -448,7 +448,7 @@ def test_ai_decisions_validate_type_period_duplicates_and_warn_on_entity() -> No
     file = SimpleNamespace(
         file_name="Bank statement 2026-08.pdf",
         content_hash="same-hash",
-        statement_period=None,
+        statement_period="2026-08",
     )
     analysis = SimpleNamespace(
         status="completed",
@@ -499,7 +499,7 @@ def test_ai_decisions_validate_type_period_duplicates_and_warn_on_entity() -> No
     assert wrong_entity[:2] == ("accepted", "entity_mismatch_warning")
     assert "staff should confirm" in wrong_entity[2]
     assert "Do not combine" in wrong_entity[2]
-    assert duplicate[:2] == ("rejected", "duplicate")
+    assert duplicate[:2] == ("needs_more", "duplicate")
     assert entity_unconfirmed[:2] == ("accepted", "entity_unconfirmed_warning")
 
 
@@ -528,7 +528,7 @@ def test_password_protected_skip_retains_actionable_reason_code() -> None:
         duplicate_content=False,
     )
 
-    assert decision[:2] == ("rejected", "password_protected")
+    assert decision[:2] == ("needs_more", "password_protected")
 
 
 @pytest.mark.parametrize(
@@ -603,7 +603,7 @@ def test_ai_decision_accepts_grace_legal_name_expansion() -> None:
 
     assert decision[:2] == ("accepted", "validated")
     assert aliases == {"graceautosalesservice"}
-    assert AI_EVIDENCE_DECISION_ALGORITHM == "ai-evidence-v4-numbers-first"
+    assert AI_EVIDENCE_DECISION_ALGORITHM == "ai-evidence-v5-content-first-review"
 
 
 @pytest.mark.asyncio
@@ -815,7 +815,11 @@ def test_coverage_counts_distinct_periods_not_file_count() -> None:
         for month in (1, 2, 2, 3, 4, 5, 6)
     ]
 
-    complete, coverage = _coverage_for_files(bank_requirement, files, {})
+    analyses = {
+        file.id: SimpleNamespace(analysis={"key_facts": {"statement_period": f"2026-{month:02d}"}})
+        for file, month in zip(files, (1, 2, 2, 3, 4, 5, 6), strict=True)
+    }
+    complete, coverage = _coverage_for_files(bank_requirement, files, analyses)
 
     assert complete is True
     assert coverage["current"] == 6

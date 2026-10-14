@@ -100,6 +100,16 @@ class AICollectionRequirement(TimestampMixin, Base):
     requirement_key: Mapped[str] = mapped_column(String(120), nullable=False)
     """Stable identifier — e.g. "purchase_contract", "buyer_agency_agreement"."""
 
+    requirement_kind: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="document", server_default="document"
+    )
+    """field | document | form | consent | human_review."""
+    canonical_key: Mapped[str | None] = mapped_column(String(120))
+    collection_config: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    """Versioned value schema, subject/period, form route, or consent disclosure."""
+
     review_checks: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
     )

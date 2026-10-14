@@ -271,3 +271,4 @@ class ApplicationRequirementEvidenceDecision(TimestampMixin, Base):
         ForeignKey("application_requirement_evidence_decisions.id", ondelete="SET NULL"),
     )
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    audit_context: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

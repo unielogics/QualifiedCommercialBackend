@@ -58,10 +58,10 @@ def test_unidentified_name_does_not_discard_usable_numbers():
 @pytest.mark.parametrize(("changes", "result"), [
     ({"content_hash": "old"}, ("processing", "analysis_stale")),
     ({"confidence": "medium"}, ("needs_more", "low_confidence")),
-    ({"classification": "insurance"}, ("rejected", "wrong_document")),
-    ({"classification": "unreadable"}, ("rejected", "unreadable")),
+    ({"classification": "insurance"}, ("needs_more", "wrong_document")),
+    ({"classification": "unreadable"}, ("needs_more", "unreadable")),
     ({"analysis": {"red_flags": ["Visible document tampering"]}},
-     ("rejected", "integrity_or_readability")),
+     ("needs_more", "integrity_or_readability")),
     ({"analysis": {"limitations": ["Missing pages"]}}, ("needs_more", "incomplete")),
 ])
 def test_name_warning_does_not_disable_integrity_or_evidence_quality(changes, result):
