@@ -12,6 +12,11 @@ resource "aws_secretsmanager_secret" "qcbackend" {
 resource "aws_secretsmanager_secret_version" "qcbackend" {
   secret_id = aws_secretsmanager_secret.qcbackend.id
   secret_string = jsonencode(merge(var.secret_payload, {
+    # Public marketing forms call the API from both directly served origins.
+    CORS_ORIGINS = join(",", distinct(concat(
+      compact(split(",", lookup(var.secret_payload, "CORS_ORIGINS", ""))),
+      ["https://qualifiedcommercial.com", "https://www.qualifiedcommercial.com"]
+    )))
     # Keep the webhook trust boundary coupled to the topic Terraform actually
     # provisions. Operators cannot accidentally paste a topic from another
     # account into the production runtime secret.
