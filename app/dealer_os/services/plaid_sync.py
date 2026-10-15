@@ -48,7 +48,7 @@ async def _bookkeep(db: AsyncSession, item_pk, *, error: str | None, retry_days:
     item = (
         await db.execute(select(DealerPlaidItem).where(DealerPlaidItem.id == item_pk))
     ).scalar_one_or_none()
-    if item is None or item.status == "removed":
+    if item is None or item.status in {"removed", "revoked"}:
         return
     item.last_pulled_at = _now()
     item.next_refresh_at = _now() + timedelta(days=retry_days)
@@ -81,7 +81,7 @@ async def sync_item(
     Bookkeeping: next_refresh_at +30 days on success, +1 day on listing
     failure so transient errors retry daily instead of stalling a month.
     """
-    if item.status == "removed" or item.environment != plaid_client.environment():
+    if item.status in {"removed", "revoked"} or item.environment != plaid_client.environment():
         return {"pulled": 0, "skipped": 0, "failed": 0}
     item_pk = item.id
     dealer_id = item.dealer_id

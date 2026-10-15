@@ -17,13 +17,14 @@ import hashlib
 import json
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from app.dealer_os.services import plaid_client, plaid_webhook
-from app.services import plaid_policy
+from app.services import plaid_lifecycle, plaid_policy
 
 # ── signing helpers ─────────────────────────────────────────────────────────
 
@@ -160,12 +161,15 @@ def _item(**over):
 
 
 @pytest.mark.asyncio
-async def test_revocation_stops_everything_and_drops_the_token():
+async def test_revocation_stops_everything_and_drops_the_token(monkeypatch):
     """Our privacy policy points users at my.plaid.com. Honouring what they do
     there is a published commitment, not an optimisation."""
     item = _item(next_refresh_at="soon")
+    cleanup = AsyncMock()
+    monkeypatch.setattr(plaid_lifecycle, "remove_reports_for_item", cleanup)
+    db = _FakeDB(item)
     out = await plaid_webhook.handle(
-        _FakeDB(item),
+        db,
         {"webhook_type": "ITEM", "webhook_code": "USER_PERMISSION_REVOKED", "item_id": "itm_1"},
     )
     assert out == "revoked"
@@ -173,6 +177,7 @@ async def test_revocation_stops_everything_and_drops_the_token():
     assert item.auto_refresh is False
     assert item.next_refresh_at is None
     assert item.encrypted_access_token is None
+    cleanup.assert_awaited_once_with(db, item, strict=False)
 
 
 @pytest.mark.asyncio
@@ -287,6 +292,7 @@ async def test_login_repaired_dismisses_update_mode_prompt():
 async def test_asset_report_ready_webhook_marks_report_downloadable():
     report = SimpleNamespace(
         status="pending",
+        removed_at=None,
         error="waiting",
         ready_at=None,
         ingested_at=None,
@@ -312,6 +318,7 @@ async def test_asset_report_ready_webhook_marks_report_downloadable():
 async def test_asset_report_ready_webhook_is_idempotent_after_ingestion():
     report = SimpleNamespace(
         status="ingested",
+        removed_at=None,
         error=None,
         ready_at="earlier",
         ingested_at="done",

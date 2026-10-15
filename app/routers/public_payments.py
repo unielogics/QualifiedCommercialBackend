@@ -690,6 +690,8 @@ async def _exchange_or_recover_payment_source(
         )
     ).scalar_one_or_none()
     if existing is not None:
+        if existing.plaid_environment != plaid_transfer.environment():
+            raise HTTPException(status.HTTP_409_CONFLICT, "Restart bank connection in the current payment environment")
         metadata = existing.metadata_json or {}
         if existing.status == "verified" and existing.revoked_at is None:
             attestation = metadata.get("business_account_attestation")
@@ -750,6 +752,7 @@ async def _exchange_or_recover_payment_source(
         owner_type=payload.owner_type,
         ach_class="CCD" if payload.owner_type == "business" else "WEB",
         plaid_item_id=item_id,
+        plaid_environment=plaid_transfer.environment(),
         plaid_account_id=payload.plaid_account_id,
         access_token_ciphertext=plaid_transfer.encrypt_access_token(access_token),
         metadata_json={
@@ -819,6 +822,9 @@ async def public_payment_exchange(
     # Serialize source replacement per file. The provider exchange happens
     # before this lock so no database lock is held while waiting on Plaid.
     await pay._lock_profile(db, profile.id)
+    await db.refresh(source, with_for_update=True)
+    if source.status != "pending" or source.plaid_environment != plaid_transfer.environment():
+        raise HTTPException(status.HTTP_409_CONFLICT, "This payment connection expired; restart bank connection")
     previous = (
         await db.execute(select(PaymentFundingSource).where(
             PaymentFundingSource.application_profile_id == profile.id,

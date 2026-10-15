@@ -1605,6 +1605,8 @@ async def create_funding_source(
     profile: ApplicationProfile,
     payload: PaymentFundingSourceCreate,
 ) -> PaymentFundingSource:
+    from app.services import plaid_transfer
+
     existing = (
         await db.execute(
             select(PaymentFundingSource).where(
@@ -1625,6 +1627,7 @@ async def create_funding_source(
         owner_type=payload.owner_type,
         ach_class=ach_class,
         plaid_item_id=payload.plaid_item_id,
+        plaid_environment=plaid_transfer.environment(),
         plaid_account_id=payload.plaid_account_id,
         access_token_ciphertext=payload.access_token_ciphertext,
         account_name=payload.account_name,
@@ -2661,6 +2664,9 @@ async def record_transfer_authorization(
     *,
     transfer_id: UUID,
     plaid_authorization_id: str,
+    risk_check_passed: bool = False,
+    rationale_code: str | None = None,
+    request_id: str | None = None,
 ) -> PaymentTransfer:
     """Persist the provider id before transfer/create crosses the network."""
 
@@ -2677,6 +2683,16 @@ async def record_transfer_authorization(
     ):
         raise RuntimeError("Transfer already linked to a different Plaid authorization")
     row.plaid_authorization_id = plaid_authorization_id
+    row.provider_metadata = {
+        **(row.provider_metadata or {}),
+        "authorization_review": {
+            "authorization_id": plaid_authorization_id,
+            "policy_version": 1,
+            "risk_check_passed": risk_check_passed,
+            "rationale_code": rationale_code,
+            "request_id": request_id,
+        },
+    }
     return row
 
 

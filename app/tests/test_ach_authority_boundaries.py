@@ -285,6 +285,7 @@ async def test_plaid_exchange_retry_recovers_without_reexchanging_public_token()
     link_id = uuid4()
     pending = SimpleNamespace(
         status="pending",
+        plaid_environment=public_payments.plaid_transfer.environment(),
         owner_type="business",
         access_token_ciphertext="encrypted-secret",
         plaid_item_id="item-1",
@@ -324,6 +325,7 @@ async def test_plaid_exchange_retry_recovers_without_reexchanging_public_token()
 def _verified_exchange_source(link_id, **overrides):
     values = {
         "status": "verified",
+        "plaid_environment": public_payments.plaid_transfer.environment(),
         "revoked_at": None,
         "plaid_account_id": "account-1",
         "owner_type": "business",

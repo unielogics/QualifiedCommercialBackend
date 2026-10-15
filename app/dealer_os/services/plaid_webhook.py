@@ -96,6 +96,10 @@ async def handle(db: AsyncSession, payload: dict[str, Any]) -> str:
         ).scalar_one_or_none()
         if report is None:
             return "ignored: unknown asset report"
+        if report.status == "removed" or report.removed_at is not None:
+            return "ignored: asset report removed"
+        if report.ingested_at is not None:
+            return "asset report already ingested"
         if code == "PRODUCT_READY":
             if report.ingested_at is not None:
                 return "asset report already ingested"
@@ -146,6 +150,7 @@ async def handle(db: AsyncSession, payload: dict[str, Any]) -> str:
 
     # ── The connection is gone, by the user's own choice ──
     if code == "USER_PERMISSION_REVOKED":
+        await plaid_lifecycle.remove_reports_for_item(db, item, strict=False)
         item.status = "revoked"
         item.error = "The bank connection was revoked by the account holder."
         item.update_mode_reason = "user_permission_revoked"

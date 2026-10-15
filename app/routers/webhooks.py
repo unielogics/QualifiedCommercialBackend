@@ -865,17 +865,22 @@ async def plaid_webhook(request: Request, background_tasks: BackgroundTasks) -> 
         untrusted_payload = json.loads(raw.decode("utf-8"))
     except Exception:  # noqa: BLE001
         return Response(status_code=status.HTTP_400_BAD_REQUEST)
+    if not isinstance(untrusted_payload, dict):
+        return Response(status_code=status.HTTP_400_BAD_REQUEST)
     is_transfer = str(untrusted_payload.get("webhook_type") or "").upper() == "TRANSFER"
 
-    try:
-        ok = (
-            await plaid_transfer.verify_webhook(raw, header)
-            if is_transfer
-            else await plaid_client.verify_webhook(raw, header)
-        )
-    except (plaid_client.PlaidUnavailable, plaid_transfer.PlaidTransferError):
-        # Keys unreachable — we cannot prove this is genuine, so we must not act
-        # on it. 503 asks Plaid to retry rather than dropping the event.
+    verifiers = [plaid_transfer.verify_webhook] if is_transfer else [plaid_client.verify_webhook]
+    if not is_transfer and plaid_transfer.enabled():
+        verifiers.append(plaid_transfer.verify_webhook)
+    ok = unavailable = False
+    for verify in verifiers:
+        try:
+            ok = await verify(raw, header)
+        except (plaid_client.PlaidUnavailable, plaid_transfer.PlaidTransferError):
+            unavailable = True
+        if ok:
+            break
+    if not ok and unavailable:
         log.warning("plaid webhook: verification key unavailable")
         return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
 
@@ -900,6 +905,10 @@ async def plaid_webhook(request: Request, background_tasks: BackgroundTasks) -> 
 
     async with SessionLocal() as db:
         outcome = await plaid_webhook.handle(db, payload)
+        if str(payload.get("webhook_type") or "").upper() == "ITEM":
+            from app.services.plaid_payment_lifecycle import handle_item_webhook
+
+            await handle_item_webhook(db, payload)
         await db.commit()
 
     if outcome == "asset report ready" and payload.get("asset_report_id"):

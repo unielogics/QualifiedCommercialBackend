@@ -295,7 +295,30 @@ async def accounts(access_token: str) -> list[dict[str, Any]]:
 async def remove_item(access_token: str) -> None:
     """Revoke a just-created Item when its access token could not be persisted."""
 
-    await _post("/item/remove", {"access_token": access_token})
+    try:
+        await _post("/item/remove", {"access_token": access_token})
+    except PlaidTransferError as exc:
+        if exc.code not in {"INVALID_ACCESS_TOKEN", "ITEM_NOT_FOUND", "ITEM_REMOVED"}:
+            raise
+
+
+def authorization_passed_risk_check(authorization: dict[str, Any]) -> bool:
+    """Approved with a rationale is not a completed risk check (Plaid default).
+
+    QC does not automatically accept incomplete-risk authorizations. Persist
+    this decision before create so crash recovery cannot bypass this policy.
+    """
+    rationale = authorization.get("decision_rationale")
+    return bool(
+        authorization.get("id")
+        and authorization.get("decision") == "approved"
+        and (
+            rationale is None
+            or isinstance(rationale, dict)
+            and rationale.get("code") is None
+            and rationale.get("failure_code") is None
+        )
+    )
 
 
 def _amount(value: Decimal | str | int | float) -> str:
@@ -348,6 +371,8 @@ async def create_authorization(
         payload["device"] = device
     if ledger_id:
         payload["ledger_id"] = ledger_id
+    if _env("PAYMENTS_PLAID_RULESET_KEY"):
+        payload["ruleset_key"] = _env("PAYMENTS_PLAID_RULESET_KEY")
     data = await _post("/transfer/authorization/create", payload)
     authorization = data.get("authorization")
     if not isinstance(authorization, dict) or not authorization.get("id"):
@@ -355,7 +380,7 @@ async def create_authorization(
             "Plaid returned no transfer authorization",
             code="PLAID_AUTHORIZATION_MISSING",
         )
-    return authorization
+    return {**authorization, "request_id": data.get("request_id")}
 
 
 async def create_transfer(
@@ -388,7 +413,7 @@ async def create_transfer(
             "Plaid returned no transfer record",
             code="PLAID_TRANSFER_MISSING",
         )
-    return transfer
+    return {**transfer, "request_id": data.get("request_id")}
 
 
 async def get_transfer(transfer_id: str) -> dict[str, Any]:

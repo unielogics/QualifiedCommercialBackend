@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dealer_os.models import DealerPlaidItem
+from app.dealer_os.models import DealerDocument, DealerPlaidItem
 from app.dealer_os.services import plaid_client
 from app.models.application_profile import ApplicationPlaidItem, PlaidAssetReport
+from app.models.bucket import BucketFile
 from app.services import plaid_policy
 
 PlaidItem = DealerPlaidItem | ApplicationPlaidItem
+log = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
@@ -134,17 +138,111 @@ async def create_asset_report(
     return report
 
 
-async def remove_asset_report(report: PlaidAssetReport, *, strict: bool = True) -> None:
+def queue_report_cleanup(report: PlaidAssetReport) -> None:
+    report.provider_removal_requested_at = report.provider_removal_requested_at or _now()
+
+
+async def _remove_provider_report(report: PlaidAssetReport) -> None:
+    if report.environment != plaid_client.environment():
+        raise plaid_client.PlaidUnavailable("Report cleanup requires its original Plaid environment")
     token = plaid_client.decrypt_token(report.encrypted_asset_report_token)
-    if token and report.environment == plaid_client.environment():
-        try:
-            await plaid_client.asset_report_remove(token)
-        except plaid_client.PlaidUnavailable:
-            if strict:
-                raise
-    report.status = "removed"
+    if not token and report.encrypted_asset_report_token:
+        raise plaid_client.PlaidUnavailable("Report cleanup token cannot be decrypted")
+    if token:
+        await plaid_client.asset_report_remove(token)
     report.encrypted_asset_report_token = None
+    report.provider_removed_at = _now()
+    report.provider_removal_error = None
+
+
+async def remove_asset_report(report: PlaidAssetReport, *, strict: bool = True) -> None:
+    queue_report_cleanup(report)
+    try:
+        await _remove_provider_report(report)
+    except plaid_client.PlaidUnavailable:
+        # Keep the ciphertext and durable request until Plaid confirms deletion.
+        report.provider_removal_error = "Provider removal failed; cleanup will retry"
+        if strict:
+            raise
+    report.status = "removed"
     report.removed_at = _now()
+
+
+async def retained_report_pdf(db: AsyncSession, report: PlaidAssetReport) -> bytes | None:
+    """Read the immutable archive, scoped to the report's already-authorized owner."""
+    from app.dealer_os.services import storage
+
+    key = None
+    if report.document_id:
+        doc = await db.get(DealerDocument, report.document_id)
+        if doc is not None and doc.dealer_id == report.dealer_id:
+            key = doc.s3_key
+    elif report.bucket_file_id and report.profile_id:
+        from app.models.application_profile import ApplicationProfile
+
+        profile = await db.get(ApplicationProfile, report.profile_id)
+        file = await db.get(BucketFile, report.bucket_file_id)
+        if (
+            profile is not None and file is not None
+            and file.bucket_id == profile.primary_bucket_id
+            and file.status == "uploaded" and file.deleted_at is None
+        ):
+            key = file.s3_key
+    if not key:
+        return None
+    raw = await asyncio.to_thread(storage.get_bytes, key)
+    return raw if raw and raw.startswith(b"%PDF-") else None
+
+
+async def report_pdf(db: AsyncSession, report: PlaidAssetReport) -> bytes:
+    if report.status not in {"ready", "ingested"}:
+        raise plaid_client.PlaidUnavailable("Asset Report is not ready")
+    archived = await retained_report_pdf(db, report)
+    if archived is not None:
+        return archived
+    if report.environment != plaid_client.environment():
+        raise plaid_client.PlaidUnavailable("Asset Report belongs to another Plaid environment")
+    token = plaid_client.decrypt_token(report.encrypted_asset_report_token)
+    if not token:
+        raise plaid_client.PlaidUnavailable("The archived Asset Report is temporarily unavailable")
+    raw = await plaid_client.asset_report_pdf(token)
+    if not raw.startswith(b"%PDF-"):
+        raise plaid_client.PlaidUnavailable("Plaid returned an invalid Asset Report PDF")
+    return raw
+
+
+async def cleanup_asset_reports(*, limit: int = 25) -> int:
+    """Retry provider removal only after the ingestion transaction committed.
+
+    Remote deletion does not expire ingested evidence or its 30-day freshness.
+    Revoked/removed reports do not require an archive because access must stop.
+    """
+    from app.db import SessionLocal
+
+    if not plaid_client.enabled():
+        return 0
+    removed = 0
+    async with SessionLocal() as db:
+        reports = list((await db.execute(
+            select(PlaidAssetReport).where(
+                PlaidAssetReport.environment == plaid_client.environment(),
+                PlaidAssetReport.provider_removal_requested_at.is_not(None),
+                PlaidAssetReport.provider_removed_at.is_(None),
+            ).order_by(PlaidAssetReport.provider_removal_requested_at).limit(limit)
+            .with_for_update(skip_locked=True)
+        )).scalars().all())
+        for report in reports:
+            try:
+                if report.status == "ingested" and await retained_report_pdf(db, report) is None:
+                    report.provider_removal_error = "Archived PDF unavailable; provider report retained"
+                    continue
+                await _remove_provider_report(report)
+                removed += 1
+            except plaid_client.PlaidUnavailable:
+                report.provider_removal_error = "Provider removal failed; cleanup will retry"
+                log.warning("Plaid report cleanup deferred for local report %s", report.id)
+        await db.commit()
+    return removed
 
 
 async def remove_reports_for_item(
@@ -179,19 +277,44 @@ async def disconnect_item(
 ) -> None:
     await remove_reports_for_item(db, item, strict=strict)
     token = plaid_client.decrypt_token(item.encrypted_access_token)
+    removed = not item.encrypted_access_token
     if token and active_environment(item):
         try:
             await plaid_client.item_remove(token)
+            removed = True
         except plaid_client.PlaidUnavailable:
             if strict:
                 raise
+    elif item.encrypted_access_token and strict:
+        raise plaid_client.PlaidUnavailable("Connection cleanup requires a usable token in its original environment")
     item.status = "removed"
-    item.encrypted_access_token = None
+    if removed:
+        item.encrypted_access_token = None
     item.auto_refresh = False
     item.is_primary_operating = False
     item.next_refresh_at = None
     item.update_mode_reason = None
     item.update_mode_account_selection = False
+
+
+async def cleanup_disconnected_items(*, limit: int = 25) -> int:
+    from app.db import SessionLocal
+
+    if not plaid_client.enabled():
+        return 0
+    removed = 0
+    async with SessionLocal() as db:
+        for model in (DealerPlaidItem, ApplicationPlaidItem):
+            rows = list((await db.execute(select(model).where(
+                model.status == "removed",
+                model.encrypted_access_token.is_not(None),
+                model.environment == plaid_client.environment(),
+            ).limit(limit).with_for_update(skip_locked=True))).scalars().all())
+            for item in rows:
+                await disconnect_item(db, item, strict=False)
+                removed += int(item.encrypted_access_token is None)
+        await db.commit()
+    return removed
 
 
 async def purge_owner_connections(

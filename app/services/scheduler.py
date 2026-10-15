@@ -247,6 +247,15 @@ def start_scheduler() -> None:
         coalesce=True,
         max_instances=1,
     )
+    scheduler.add_job(
+        _wrap(job_plaid_cleanup),
+        "interval",
+        minutes=5,
+        id="plaid_cleanup",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
     # The financial forms' PDFs, redrawn once the typing stops (0206). Saves
     # queue a deadline 120 seconds out and push it further out on every further
     # edit, so this tick is a no-op for a form somebody is still working in and
@@ -1119,3 +1128,13 @@ async def job_application_plaid_refresh() -> None:
     result = await refresh_due()
     if result["items"]:
         log.info("application_plaid_refresh: synced %s item(s)", result["items"])
+
+
+async def job_plaid_cleanup() -> None:
+    from app.services import plaid_lifecycle, plaid_payment_lifecycle
+
+    reports = await plaid_lifecycle.cleanup_asset_reports()
+    items = await plaid_lifecycle.cleanup_disconnected_items()
+    sources = await plaid_payment_lifecycle.cleanup_payment_items()
+    if reports or items or sources:
+        log.info("plaid_cleanup: reports=%s items=%s payment_sources=%s", reports, items, sources)

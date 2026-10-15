@@ -719,6 +719,7 @@ async def test_stale_submission_reuses_authorization_after_definite_empty_lookup
         authorization_id="auth-1",
         fee_obligation_id=uuid4(),
         installment_id=None,
+        authorization_risk_checked=True,
     )
     record_submission = AsyncMock()
     create_transfer = AsyncMock(return_value={"id": "transfer-1", "status": "pending"})

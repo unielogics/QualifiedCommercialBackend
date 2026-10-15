@@ -290,6 +290,8 @@ class PaymentFundingSource(TimestampMixin, Base):
     owner_type: Mapped[str] = mapped_column(String(16), nullable=False)
     ach_class: Mapped[str] = mapped_column(String(8), nullable=False)
     plaid_item_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    # Legacy sources without a known environment must reconnect, never guess.
+    plaid_environment: Mapped[str | None] = mapped_column(String(16))
     plaid_account_id: Mapped[str | None] = mapped_column(String(128))
     access_token_ciphertext: Mapped[str | None] = mapped_column(Text)
     account_name: Mapped[str | None] = mapped_column(String(180))

@@ -55,6 +55,10 @@ _SUPPORTED_PRODUCTS = {"assets", "statements"}
 class PlaidUnavailable(Exception):
     """Keys absent or the Plaid API rejected/failed the call."""
 
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 def redirect_uri() -> str:
     """The OAuth return URL, or "" when OAuth is not configured yet.
@@ -198,7 +202,7 @@ async def _post(path: str, payload: dict[str, Any], *, timeout: float = 30.0) ->
         except Exception:
             pass
         logger.warning("plaid %s -> %s %s", path, resp.status_code, code)
-        raise PlaidUnavailable(msg or f"Plaid rejected the request ({resp.status_code})")
+        raise PlaidUnavailable(msg or f"Plaid rejected the request ({resp.status_code})", code=code)
     return resp
 
 
@@ -391,7 +395,11 @@ async def item_get(access_token: str) -> dict[str, Any]:
 
 
 async def item_remove(access_token: str) -> None:
-    await _post("/item/remove", {"access_token": access_token})
+    try:
+        await _post("/item/remove", {"access_token": access_token})
+    except PlaidUnavailable as exc:
+        if exc.code not in {"INVALID_ACCESS_TOKEN", "ITEM_NOT_FOUND", "ITEM_REMOVED"}:
+            raise
 
 
 async def asset_report_create(
@@ -432,7 +440,11 @@ async def asset_report_pdf(asset_report_token: str) -> bytes:
 
 
 async def asset_report_remove(asset_report_token: str) -> None:
-    await _post("/asset_report/remove", {"asset_report_token": asset_report_token})
+    try:
+        await _post("/asset_report/remove", {"asset_report_token": asset_report_token})
+    except PlaidUnavailable as exc:
+        if exc.code not in {"INVALID_ASSET_REPORT_TOKEN", "ASSET_REPORT_REMOVED"}:
+            raise
 
 
 # --- token encryption at rest -------------------------------------------------

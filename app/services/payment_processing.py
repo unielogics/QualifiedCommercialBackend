@@ -57,6 +57,7 @@ class _ProviderContext:
     authorization_id: str | None
     fee_obligation_id: UUID | None
     installment_id: UUID | None
+    authorization_risk_checked: bool = False
 
 
 async def _provider_context(transfer_id: UUID) -> _ProviderContext | None:
@@ -76,6 +77,7 @@ async def _provider_context(transfer_id: UUID) -> _ProviderContext | None:
             return None
         if (
             source.status != "verified"
+            or source.plaid_environment != plaid_transfer.environment()
             or source.revoked_at is not None
             or mandate.status != "active"
             or mandate.revoked_at is not None
@@ -89,6 +91,7 @@ async def _provider_context(transfer_id: UUID) -> _ProviderContext | None:
         ach_class = str(source.ach_class or mandate.ach_class).strip().lower()
         if ach_class not in {"ccd", "web"}:
             return None
+        review = (transfer.provider_metadata or {}).get("authorization_review") or {}
         return _ProviderContext(
             transfer_id=transfer.id,
             amount_cents=transfer.amount_cents,
@@ -104,6 +107,11 @@ async def _provider_context(transfer_id: UUID) -> _ProviderContext | None:
             authorization_id=transfer.plaid_authorization_id,
             fee_obligation_id=transfer.fee_obligation_id,
             installment_id=transfer.installment_id,
+            authorization_risk_checked=(
+                review.get("authorization_id") == transfer.plaid_authorization_id
+                and review.get("policy_version") == 1
+                and review.get("risk_check_passed") is True
+            ),
         )
 
 
@@ -121,12 +129,18 @@ async def _submission_failed(
         await db.commit()
 
 
-async def _record_authorization(transfer_id: UUID, authorization_id: str) -> None:
+async def _record_authorization(
+    transfer_id: UUID, authorization_id: str, *, authorization: dict[str, Any]
+) -> None:
+    rationale = authorization.get("decision_rationale")
     async with SessionLocal() as db:
         await payments.record_transfer_authorization(
             db,
             transfer_id=transfer_id,
             plaid_authorization_id=authorization_id,
+            risk_check_passed=plaid_transfer.authorization_passed_risk_check(authorization),
+            rationale_code=rationale.get("code") if isinstance(rationale, dict) else None,
+            request_id=authorization.get("request_id"),
         )
         await db.commit()
 
@@ -207,6 +221,7 @@ async def dispatch_payment_transfers(*, limit: int = 25) -> int:
             continue
         amount = Decimal(context.amount_cents) / Decimal("100")
         authorization_id: str | None = context.authorization_id
+        risk_authorized = context.authorization_risk_checked
         try:
             if authorization_id:
                 # A prior worker may have reached Plaid and exited before the
@@ -232,6 +247,14 @@ async def dispatch_payment_transfers(*, limit: int = 25) -> int:
                         await db.commit()
                     submitted += 1
                     continue
+                if not context.authorization_risk_checked:
+                    await _submission_failed(
+                        context.transfer_id,
+                        code="authorization_risk_review_required",
+                        message="The saved authorization has no completed risk check. Review and authorize a new attempt.",
+                        retryable=False,
+                    )
+                    continue
             if not authorization_id:
                 authorization = await plaid_transfer.create_authorization(
                     access_token=context.access_token,
@@ -249,9 +272,13 @@ async def dispatch_payment_transfers(*, limit: int = 25) -> int:
                 decision = str(authorization.get("decision") or "").lower()
                 # Plaid returns an authorization id for user_action_required;
                 # persist it so Link update mode can repair the exact decision.
+                safe_approval = plaid_transfer.authorization_passed_risk_check(authorization)
+                risk_authorized = safe_approval
                 if authorization_id:
-                    await _record_authorization(context.transfer_id, authorization_id)
-                if decision != "approved" or not authorization_id:
+                    await _record_authorization(
+                        context.transfer_id, authorization_id, authorization=authorization
+                    )
+                if not safe_approval:
                     rationale = authorization.get("decision_rationale")
                     if isinstance(rationale, dict):
                         code = str(
@@ -266,7 +293,10 @@ async def dispatch_payment_transfers(*, limit: int = 25) -> int:
                             or ""
                         )
                     else:
-                        code = str(rationale or decision or "authorization_not_approved")
+                        code = str(rationale or (
+                            "authorization_risk_review_required" if decision == "approved"
+                            else decision or "authorization_not_approved"
+                        ))
                         provider_message = ""
                     await _submission_failed(
                         context.transfer_id,
@@ -274,6 +304,8 @@ async def dispatch_payment_transfers(*, limit: int = 25) -> int:
                         message=provider_message or (
                             "The bank requires the client to reconnect or take action."
                             if decision == "user_action_required"
+                            else "Plaid could not complete the risk check. Review is required before a new payment attempt."
+                            if decision == "approved"
                             else "Plaid did not approve this transfer authorization."
                         ),
                         retryable=decision == "user_action_required",
@@ -314,7 +346,7 @@ async def dispatch_payment_transfers(*, limit: int = 25) -> int:
             # by the durable authorization id; a retry is allowed only after a
             # definite empty lookup and reuses that same idempotent provider key.
             recovered = None
-            if authorization_id and exc.retryable:
+            if authorization_id and exc.retryable and risk_authorized:
                 recovered = await _recover_ambiguous_create(
                     context=context,
                     authorization_id=authorization_id,

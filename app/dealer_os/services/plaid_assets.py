@@ -336,6 +336,8 @@ async def ingest_asset_report(db: AsyncSession, asset_report_id: str) -> PlaidAs
         raise plaid_client.PlaidUnavailable("Asset Report token is unavailable")
     payload = await plaid_client.asset_report_get(token)
     pdf = await plaid_client.asset_report_pdf(token)
+    if not pdf.startswith(b"%PDF-"):
+        raise plaid_client.PlaidUnavailable("Plaid returned an invalid Asset Report PDF")
     normalized = normalize_asset_report(payload)
     if not normalized:
         raise plaid_client.PlaidUnavailable("Plaid returned no usable Asset Report accounts")
@@ -349,6 +351,8 @@ async def ingest_asset_report(db: AsyncSession, asset_report_id: str) -> PlaidAs
         kind="statement",
     )
     doc.status = "extracting"
+    if not doc.s3_key:
+        raise plaid_client.PlaidUnavailable("Asset Report PDF could not be archived; ingestion will retry")
     doc.detected_kind = "bank_statement"
     doc.doc_meta = {
         "source": "plaid_assets",
@@ -415,6 +419,7 @@ async def ingest_asset_report(db: AsyncSession, asset_report_id: str) -> PlaidAs
     report.error = None
     report.ingested_at = _now()
     report.document_id = doc.id
+    plaid_lifecycle.queue_report_cleanup(report)
     source_ids = [UUID(value) for value in report.source_item_ids or []]
     if source_ids:
         rows = list(

@@ -18687,11 +18687,10 @@ async def download_dealer_asset_report(
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     report = await _dealer_asset_report(db, dealer.id, report_id)
-    report_token = plaid_client.decrypt_token(report.encrypted_asset_report_token)
-    if report.status not in {"ready", "ingested"} or not report_token:
+    if report.status not in {"ready", "ingested"}:
         raise HTTPException(status.HTTP_409_CONFLICT, "Asset Report is not ready")
     try:
-        content = await plaid_client.asset_report_pdf(report_token)
+        content = await plaid_lifecycle.report_pdf(db, report)
     except plaid_client.PlaidUnavailable as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     return StreamingResponse(

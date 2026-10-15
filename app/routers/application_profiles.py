@@ -4598,12 +4598,10 @@ async def download_application_asset_report(
     profile = await profiles.load_profile(db, profile_id, user)
     _require_asset_report_staff(user)
     report = await _profile_asset_report(db, profile, report_id)
-    if report.status != "ready" or not report.encrypted_asset_report_token:
+    if report.status not in {"ready", "ingested"}:
         raise HTTPException(status.HTTP_409_CONFLICT, "Asset Report is not ready")
     try:
-        content = await plaid_client.asset_report_pdf(
-            plaid_client.decrypt_token(report.encrypted_asset_report_token) or ""
-        )
+        content = await plaid_lifecycle.report_pdf(db, report)
     except plaid_client.PlaidUnavailable as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     return Response(

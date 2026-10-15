@@ -838,6 +838,12 @@ class PlaidAssetReport(TimestampMixin, Base):
     )
     removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # Remote report cleanup is separate from local evidence removal. An
+    # ingested report stays downloadable from our archive after Plaid deletion.
+    provider_removal_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    provider_removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    provider_removal_error: Mapped[str | None] = mapped_column(Text)
+
 
 class ApplicationBankConsent(TimestampMixin, Base):
     __tablename__ = "application_bank_consents"

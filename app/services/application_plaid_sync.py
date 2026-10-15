@@ -161,6 +161,7 @@ async def ingest_asset_report(
     report.status = "ingested"
     report.ingested_at = _now()
     report.error = None
+    plaid_lifecycle.queue_report_cleanup(report)
     await log_profile_action(
         db,
         profile,
@@ -215,7 +216,7 @@ async def sync_item(
     *,
     scheduled: bool = False,
 ) -> dict[str, int]:
-    if item.status == "removed" or item.environment != plaid_client.environment():
+    if item.status in {"removed", "revoked"} or item.environment != plaid_client.environment():
         return {"pulled": 0, "skipped": 0, "failed": 0}
     profile = await db.get(ApplicationProfile, item.profile_id)
     if profile is None or profile.primary_bucket_id is None:
