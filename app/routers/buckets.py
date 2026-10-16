@@ -12,6 +12,7 @@ import re
 import secrets
 import time
 from datetime import UTC, datetime
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import boto3
@@ -514,6 +515,7 @@ def _upload_url(s3_key: str, content_type: str) -> tuple[str, dict[str, str]]:
 def _download_url(
     s3_key: str,
     *,
+    file_name: str,
     disposition: str = "inline",
     ttl: int = 900,
     content_type: str | None = None,
@@ -528,7 +530,17 @@ def _download_url(
     if disposition == "inline" and content_type is not None and _sanitize_upload_content_type(content_type) not in _INLINE_SAFE_CONTENT_TYPES:
         disposition = "attachment"
         params["ResponseContentType"] = "application/octet-stream"
-    params["ResponseContentDisposition"] = disposition
+    # Storage keys contain UUIDs and sanitized names. Tell the browser to save
+    # the client's original name instead, including spaces and Unicode. Strip
+    # paths and header controls without rewriting ordinary filename characters.
+    name = file_name.replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(char for char in name if ord(char) >= 32 and not 127 <= ord(char) <= 159)
+    name = name or "document"
+    fallback = name.encode("ascii", "ignore").decode("ascii") or "document"
+    fallback = fallback.replace("\\", "\\\\").replace('"', '\\"')
+    params["ResponseContentDisposition"] = (
+        f'{disposition}; filename="{fallback}"; filename*=UTF-8\'\'{quote(name, safe="")}'
+    )
     return _s3_client().generate_presigned_url("get_object", Params=params, ExpiresIn=ttl)
 
 
@@ -647,6 +659,7 @@ def _review_response(file: BucketFile, annotations: list[BucketFileAnnotation], 
         file=BucketFileRead.model_validate(file),
         preview_url=_download_url(
             file.s3_key,
+            file_name=file.file_name,
             disposition="inline",
             content_type=file.content_type,
             version_id=getattr(file, "s3_version_id", None),
@@ -2680,6 +2693,7 @@ async def admin_file_url(
     else:
         url = _download_url(
             file.s3_key,
+            file_name=file.file_name,
             disposition=disposition,
             content_type=file.content_type,
         )
@@ -2785,6 +2799,7 @@ async def get_vendor_bucket(
         if access.can_preview:
             item.preview_url = _download_url(
                 file.s3_key,
+                file_name=file.file_name,
                 disposition="inline",
                 content_type=file.content_type,
                 version_id=getattr(file, "s3_version_id", None),
@@ -2792,6 +2807,7 @@ async def get_vendor_bucket(
         if access.can_download:
             item.download_url = _download_url(
                 file.s3_key,
+                file_name=file.file_name,
                 disposition="attachment",
                 version_id=getattr(file, "s3_version_id", None),
             )
@@ -2950,6 +2966,7 @@ async def vendor_file_download(
     return BucketFileUrl(
         url=_download_url(
             file.s3_key,
+            file_name=file.file_name,
             disposition="attachment",
             version_id=getattr(file, "s3_version_id", None),
         ),
@@ -3715,6 +3732,7 @@ async def share_access(
         if share.can_preview:
             item.preview_url = _download_url(
                 file.s3_key,
+                file_name=file.file_name,
                 disposition="inline",
                 content_type=file.content_type,
                 version_id=getattr(file, "s3_version_id", None),
@@ -3722,6 +3740,7 @@ async def share_access(
         if share.can_download:
             item.download_url = _download_url(
                 file.s3_key,
+                file_name=file.file_name,
                 disposition="attachment",
                 version_id=getattr(file, "s3_version_id", None),
             )
@@ -3779,6 +3798,7 @@ async def public_share_access(token: str, request: Request, db: AsyncSession = D
         if share.can_preview:
             item.preview_url = _download_url(
                 file.s3_key,
+                file_name=file.file_name,
                 disposition="inline",
                 content_type=file.content_type,
                 version_id=getattr(file, "s3_version_id", None),
@@ -3786,6 +3806,7 @@ async def public_share_access(token: str, request: Request, db: AsyncSession = D
         if share.can_download:
             item.download_url = _download_url(
                 file.s3_key,
+                file_name=file.file_name,
                 disposition="attachment",
                 version_id=getattr(file, "s3_version_id", None),
             )
@@ -3822,6 +3843,7 @@ async def public_share_file_download(
     return BucketFileUrl(
         url=_download_url(
             file.s3_key,
+            file_name=file.file_name,
             disposition="attachment",
             version_id=getattr(file, "s3_version_id", None),
         ),
@@ -3950,6 +3972,7 @@ async def shared_file_download(
     return BucketFileUrl(
         url=_download_url(
             file.s3_key,
+            file_name=file.file_name,
             disposition="attachment",
             version_id=getattr(file, "s3_version_id", None),
         ),

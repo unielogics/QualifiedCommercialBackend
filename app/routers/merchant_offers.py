@@ -1,3 +1,6 @@
+# FastAPI dependency injection intentionally uses callable defaults.
+# ruff: noqa: B008
+
 """The desk's side of a merchant-processing offer.
 
 Everything here sits under a file's profile and behind the underwriting
@@ -222,7 +225,7 @@ async def _desk_read(
         lender_name=lender.name if lender else None,
         source_file_id=offer.source_file_id,
         source_file_name=file.file_name if file else None,
-        source_file_url=_download_url(file.s3_key, content_type=file.content_type) if file and file.deleted_at is None else None,
+        source_file_url=_download_url(file.s3_key, file_name=file.file_name, content_type=file.content_type) if file and file.deleted_at is None else None,
         sent_at=offer.sent_at,
         sent_by_name=(sender.name or sender.email) if sender else None,
         client_response=offer.client_response,

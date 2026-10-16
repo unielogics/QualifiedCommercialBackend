@@ -6538,6 +6538,7 @@ def _package_bucket_file_read(file: BucketFile) -> PackageReadinessBucketFileRea
         try:
             return _download_url(
                 file.s3_key,
+                file_name=file.file_name,
                 disposition=disposition,
                 content_type="application/pdf",
             )

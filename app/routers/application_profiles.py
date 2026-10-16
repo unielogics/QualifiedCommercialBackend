@@ -4712,7 +4712,7 @@ async def get_application_evidence_file_url(
 
     await profiles.log_profile_action(db, profile, user, "evidence.preview", f"Opened {file.file_name}", target_type="file", target_id=file.id)
     await db.commit()
-    return {"url": _download_url(file.s3_key, disposition="inline", content_type=file.content_type), "expires_in": 900}
+    return {"url": _download_url(file.s3_key, file_name=file.file_name, disposition="inline", content_type=file.content_type), "expires_in": 900}
 
 
 def _classification_dict(profile: ApplicationProfile) -> dict:

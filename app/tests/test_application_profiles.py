@@ -885,6 +885,7 @@ async def test_evidence_file_url_rechecks_inventory_and_signs_inline() -> None:
     assert result == {"url": "https://storage.example/signed", "expires_in": 900}
     sign.assert_called_once_with(
         file.s3_key,
+        file_name=file.file_name,
         disposition="inline",
         content_type="application/pdf",
     )
