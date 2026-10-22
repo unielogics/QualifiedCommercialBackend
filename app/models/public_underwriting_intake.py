@@ -94,11 +94,10 @@ class PublicUnderwritingIntake(TimestampMixin, Base):
     result_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # Two-step delete: a broker (or admin) flags a lead for deletion here,
-    # which only hides it from the BROKER's own list — nothing is destroyed.
-    # Only a separate super-admin "confirm delete" action (which requires
-    # this to be set) actually hard-deletes the bucket/files/intake. Never
-    # filtered out of the admin list, so admin always sees pending requests.
+    # Two-step archive: a broker (or admin) flags a lead here, which only hides
+    # it from the broker's own list. A separate operator confirmation then
+    # soft-archives the bucket while retaining the intake, files, S3 objects,
+    # and underwriting history for discovery and restore.
     delete_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     delete_requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True

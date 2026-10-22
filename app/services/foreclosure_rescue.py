@@ -96,6 +96,22 @@ UNIFIED_STATUS_MAP = {
     "withdrawn_expired": "closed_lost",
 }
 
+# Legacy AI Intake status is still exposed by a few compatibility clients.
+# Keep review/closing work distinct from actual funding, and preserve negative
+# terminal outcomes instead of collapsing every terminal state to completed.
+INTAKE_STATUS_MAP = {
+    "new_rescue": "collecting",
+    "initial_docs_pending": "reviewing",
+    "ready_for_initial_review": "reviewing",
+    "in_underwriting": "reviewed",
+    "term_sheet_issued": "reviewed",
+    "closing_docs_pending": "approved",
+    "clear_to_close": "approved",
+    "funded": "completed",
+    "declined": "denied",
+    "withdrawn_expired": "closed_lost",
+}
+
 INITIAL_REVIEW_DOCUMENTS = (
     {
         "name": "Payoff demand or default notice",

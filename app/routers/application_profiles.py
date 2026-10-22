@@ -178,6 +178,7 @@ from app.services import (
     file_events,
     financial_statements,
     funding_programs,
+    intake_lifecycle,
     locked_file_requests,
     merchant_processing,
     missing_item_automation,
@@ -913,6 +914,14 @@ async def apply_underwriting_changes(
             profile.underwriting_close_outcome = "won"
         elif status_value in {"closed_lost", "denied"}:
             profile.underwriting_close_outcome = status_value
+        # Keep the AI Intake queue in lockstep with the canonical underwriting
+        # lifecycle.  This is a status mirror only: loss/denial must not set the
+        # bucket's explicit archive flag or remove any evidence.
+        intake_id = getattr(profile, "intake_id", None)
+        if intake_id is not None:
+            intake = await db.get(PublicUnderwritingIntake, intake_id)
+            if intake is not None:
+                intake_lifecycle.sync_intake_from_underwriting(intake, status_value)
     if "approved_amount" in changes:
         profile.underwriting_approved_amount = changes["approved_amount"]
     elif (

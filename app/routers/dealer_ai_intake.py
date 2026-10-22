@@ -22,7 +22,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, with_loader_criteria
 
@@ -117,6 +117,7 @@ from app.services import (
     equipment_financing,
     file_events,
     inline_images,
+    intake_lifecycle,
     locked_file_requests,
     merchant_processing,
     notifications,
@@ -1021,10 +1022,12 @@ class RequestPfsOrDebtScheduleRequest(BaseModel):
 
 
 class RequestLeadDeletionRequest(BaseModel):
-    """Flags a lead for deletion — sets delete_requested_at/by only, destroys
-    nothing. The requesting broker's own list filters this lead out
-    immediately; the admin list never does, so admin always sees pending
-    requests and must separately confirm before anything is destroyed."""
+    """Flags a lead for archival review and destroys nothing.
+
+    The requesting broker's own list filters the lead out immediately; the
+    admin list never does, so an operator can approve the separate,
+    reversible archive action.
+    """
 
     reason: str | None = Field(default=None, max_length=500)
 
@@ -1035,11 +1038,12 @@ class RequestLeadDeletionRequest(BaseModel):
 
 
 class ConfirmLeadDeletionRequest(BaseModel):
-    """The desk's confirmation for an irreversible hard delete — a super admin
-    or an underwriter, nobody else (the owner's rule for the intake table). The
-    frontend gates this behind a themed danger confirm dialog. The exact lead
-    name remains a required server-side speed bump: a stale or scripted client
-    cannot bypass the confirmation by omitting the value."""
+    """The desk's confirmation for a reversible, evidence-retaining archive.
+
+    Only a super admin or underwriter may perform it. The exact lead name
+    remains a required server-side speed bump so a stale or scripted client
+    cannot archive the wrong file by omitting the value.
+    """
 
     confirm_name: str = Field(min_length=1, max_length=180)
 
@@ -1585,6 +1589,14 @@ class DealerAILeadRow(BaseModel):
     opened_by_role: str | None = None
     status: str
     outcome_status: str = "submitted"
+    # Canonical status from ApplicationProfile when one exists.  The legacy
+    # intake ``status`` can describe review completion, so it must not by
+    # itself be presented as proof that a deal funded.
+    underwriting_status: str | None = None
+    # ``closed`` is a lifecycle result and retains evidence access;
+    # ``archived`` is an explicit operator archive and may be restored.
+    workspace_state: Literal["active", "closed", "archived"] = "active"
+    workspace_state_reason: str | None = None
     preferred_language: str = "en"
     probability_status: str | None = None
     confidence: str | None = None
@@ -8573,8 +8585,19 @@ def _lead_result(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     return intake.result_snapshot if isinstance(intake.result_snapshot, dict) else {}
 
 
-def _lead_row(intake: PublicUnderwritingIntake) -> DealerAILeadRow:
+def _lead_row(
+    intake: PublicUnderwritingIntake,
+    *,
+    underwriting_status: str | None = None,
+) -> DealerAILeadRow:
     result = _lead_result(intake)
+    workspace_state, workspace_state_reason = intake_lifecycle.intake_workspace_state(
+        bucket_archived_at=intake.bucket.archived_at,
+        intake_status=intake.status,
+        outcome_status=intake.outcome_status,
+        foreclosure_status=intake.foreclosure_rescue_status,
+        underwriting_status=underwriting_status,
+    )
     active_files = [
         file
         for file in _active_files(intake.bucket)
@@ -8596,6 +8619,9 @@ def _lead_row(intake: PublicUnderwritingIntake) -> DealerAILeadRow:
         opened_by_role="Dealer partner" if intake.broker else "Internal",
         status=intake.status,
         outcome_status=intake.outcome_status,
+        underwriting_status=underwriting_status,
+        workspace_state=workspace_state,
+        workspace_state_reason=workspace_state_reason,
         preferred_language=intake.preferred_language,
         probability_status=str(result.get("probability_status") or "") or None,
         confidence=str(result.get("confidence") or "") or None,
@@ -8648,6 +8674,115 @@ def _intake_search_clause(query: str):
         )
         clauses.append(phone_digits.like(f"%{digits}%"))
     return or_(*clauses)
+
+
+def _closed_intake_lifecycle_clause():
+    """SQL counterpart to ``intake_workspace_state`` for queue pagination.
+
+    A lifecycle-closed file belongs in the archive/closed queue but its bucket
+    remains unarchived so reviewers can still inspect and download evidence.
+    The correlated profile check also repairs visibility for older rows whose
+    canonical underwriting status changed before intake mirroring existed.
+    """
+
+    def profile_has_status(*values: str):
+        return (
+            select(ApplicationProfile.id)
+            .where(
+                ApplicationProfile.intake_id == PublicUnderwritingIntake.id,
+                ApplicationProfile.underwriting_status.in_(values),
+            )
+            .exists()
+        )
+
+    foreclosure_status = func.coalesce(
+        PublicUnderwritingIntake.foreclosure_rescue_status, ""
+    )
+    canonical_funded = or_(
+        profile_has_status("closed_won"),
+        foreclosure_status == "funded",
+    )
+    closed_lifecycle = or_(
+        profile_has_status(*intake_lifecycle.TERMINAL_UNDERWRITING_STATUSES),
+        foreclosure_status.in_(intake_lifecycle.TERMINAL_FORECLOSURE_STATUSES),
+        PublicUnderwritingIntake.status.in_(intake_lifecycle.TERMINAL_INTAKE_STATUSES),
+        PublicUnderwritingIntake.outcome_status.in_(
+            intake_lifecycle.TERMINAL_OUTCOME_STATUSES
+        ),
+    )
+    return and_(~canonical_funded, closed_lifecycle)
+
+
+def _intake_status_filter_clause(status_filter: str):
+    """Resolve user-facing lifecycle aliases against authoritative sources."""
+
+    normalized = status_filter.strip().lower()
+
+    def profile_status(*values: str):
+        return (
+            select(ApplicationProfile.id)
+            .where(
+                ApplicationProfile.intake_id == PublicUnderwritingIntake.id,
+                ApplicationProfile.underwriting_status.in_(values),
+            )
+            .exists()
+        )
+    if normalized in {"denied", "disqualified"}:
+        return or_(
+            PublicUnderwritingIntake.status.in_(("denied", "disqualified")),
+            PublicUnderwritingIntake.outcome_status.in_(("denied", "disqualified")),
+            func.coalesce(PublicUnderwritingIntake.foreclosure_rescue_status, "")
+            == "declined",
+            profile_status("denied"),
+        )
+    if normalized in {"closed_lost", "lost", "withdrawn", "withdrawn_expired"}:
+        return or_(
+            PublicUnderwritingIntake.status.in_(("closed", "closed_lost")),
+            func.coalesce(PublicUnderwritingIntake.foreclosure_rescue_status, "")
+            == "withdrawn_expired",
+            profile_status("closed_lost"),
+        )
+    if normalized in {"closed_won", "funded"}:
+        return or_(
+            func.coalesce(PublicUnderwritingIntake.foreclosure_rescue_status, "")
+            == "funded",
+            profile_status("closed_won"),
+        )
+    if normalized == "completed":
+        # Legacy ``completed`` also carried funded rows.  The UI exposes a
+        # dedicated Funded filter now, so Review complete must exclude records
+        # whose canonical lifecycle proves funding.
+        canonical_funded = or_(
+            func.coalesce(PublicUnderwritingIntake.foreclosure_rescue_status, "")
+            == "funded",
+            profile_status("closed_won"),
+        )
+        return and_(
+            PublicUnderwritingIntake.status == "completed",
+            ~canonical_funded,
+        )
+    return PublicUnderwritingIntake.status == status_filter
+
+
+async def _underwriting_statuses_by_intake(
+    db: AsyncSession,
+    intake_ids: list[UUID],
+) -> dict[UUID, str]:
+    if not intake_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(
+                ApplicationProfile.intake_id,
+                ApplicationProfile.underwriting_status,
+            ).where(ApplicationProfile.intake_id.in_(intake_ids))
+        )
+    ).all()
+    return {
+        intake_id: underwriting_status
+        for intake_id, underwriting_status in rows
+        if intake_id is not None
+    }
 
 
 async def _load_admin_dealer_lead(db: AsyncSession, intake_id: UUID) -> PublicUnderwritingIntake:
@@ -8908,12 +9043,21 @@ async def list_dealer_ai_leads(
         )
         .order_by(PublicUnderwritingIntake.updated_at.desc())
     )
+    closed_lifecycle = _closed_intake_lifecycle_clause()
     if archived_filter == "active":
-        stmt = stmt.where(Bucket.archived_at.is_(None))
+        stmt = stmt.where(
+            Bucket.archived_at.is_(None),
+            ~closed_lifecycle,
+        )
     elif archived_filter == "archived":
-        stmt = stmt.where(Bucket.archived_at.is_not(None))
+        # "Archived" is the operator's historical-work queue.  It includes
+        # explicit bucket archives and lifecycle-closed files, but only the
+        # former receives a Restore action.
+        stmt = stmt.where(
+            or_(Bucket.archived_at.is_not(None), closed_lifecycle)
+        )
     if status_filter and status_filter != "all":
-        stmt = stmt.where(PublicUnderwritingIntake.status == status_filter)
+        stmt = stmt.where(_intake_status_filter_clause(status_filter))
     if partner_user_id is not None:
         stmt = stmt.where(PublicUnderwritingIntake.broker_id == partner_user_id)
     if variant_filter and variant_filter != "all":
@@ -8933,7 +9077,13 @@ async def list_dealer_ai_leads(
         ]
     total = len(rows)
     page = rows[offset:offset + limit]
-    items = [_lead_row(row) for row in page]
+    underwriting_by_intake = await _underwriting_statuses_by_intake(
+        db, [row.id for row in page]
+    )
+    items = [
+        _lead_row(row, underwriting_status=underwriting_by_intake.get(row.id))
+        for row in page
+    ]
     # NEW badges: unseen client/broker activity per lead for THIS admin,
     # against their per-lead seen cursors (default window: last 7 days for
     # leads never opened).
@@ -9471,11 +9621,12 @@ async def admin_request_lead_deletion(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> DealerIntakeResponse:
-    """Admin flags a lead for deletion — same flag broker-side "request
-    deletion" sets, needed here for admin-created/self-serve leads that have
-    no broker to defer to. Destroys nothing; only gates the separate
-    confirm-deletion endpoint open. Delete is the desk's — super admin and
-    underwriting — and nobody else's."""
+    """Admin flags a lead for archival review.
+
+    This is the same non-destructive request flag available to a broker and is
+    needed for admin-created/self-serve leads. It only enables the separate
+    archive confirmation endpoint; evidence is never deleted.
+    """
     _require_intake_operator(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     intake.delete_requested_at = _now()
@@ -9541,7 +9692,13 @@ async def admin_restore_lead(
     if intake is None or intake.bucket is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Dealer AI lead not found")
     if intake.bucket.archived_at is None:
-        return _lead_row(intake)
+        underwriting_by_intake = await _underwriting_statuses_by_intake(
+            db, [intake.id]
+        )
+        return _lead_row(
+            intake,
+            underwriting_status=underwriting_by_intake.get(intake.id),
+        )
 
     state = dict(intake.intake_state or {})
     archive_meta = state.pop("_archive", {})
@@ -9564,7 +9721,11 @@ async def admin_restore_lead(
         detail=intake.business_name or intake.full_name,
     )
     await db.commit()
-    return _lead_row(intake)
+    underwriting_by_intake = await _underwriting_statuses_by_intake(db, [intake.id])
+    return _lead_row(
+        intake,
+        underwriting_status=underwriting_by_intake.get(intake.id),
+    )
 
 
 @admin_router.post("/{intake_id}/confirm-deletion", status_code=status.HTTP_204_NO_CONTENT)
@@ -10190,6 +10351,7 @@ async def list_broker_dealer_leads(
     q: str | None = None,
     status_filter: str | None = None,
     probability_status: str | None = None,
+    archived_filter: Literal["active", "archived", "all"] = "active",
     limit: int = 50,
     offset: int = 0,
 ) -> DealerAILeadListResponse:
@@ -10200,7 +10362,6 @@ async def list_broker_dealer_leads(
         select(PublicUnderwritingIntake)
         .join(Bucket, PublicUnderwritingIntake.bucket_id == Bucket.id)
         .where(
-            Bucket.archived_at.is_(None),
             PublicUnderwritingIntake.broker_id == user.id,
             PublicUnderwritingIntake.variant == DEALER_VARIANT,
             # A broker's own deletion request hides the lead from their own
@@ -10220,8 +10381,13 @@ async def list_broker_dealer_leads(
         )
         .order_by(PublicUnderwritingIntake.updated_at.desc())
     )
+    closed_lifecycle = _closed_intake_lifecycle_clause()
+    if archived_filter == "active":
+        stmt = stmt.where(Bucket.archived_at.is_(None), ~closed_lifecycle)
+    elif archived_filter == "archived":
+        stmt = stmt.where(or_(Bucket.archived_at.is_not(None), closed_lifecycle))
     if status_filter and status_filter != "all":
-        stmt = stmt.where(PublicUnderwritingIntake.status == status_filter)
+        stmt = stmt.where(_intake_status_filter_clause(status_filter))
     if q and q.strip():
         stmt = stmt.where(_intake_search_clause(q))
     rows = list((await db.execute(stmt)).scalars().unique().all())
@@ -10229,7 +10395,13 @@ async def list_broker_dealer_leads(
         rows = [row for row in rows if str(_lead_result(row).get("probability_status") or "") == probability_status]
     total = len(rows)
     page = rows[offset:offset + limit]
-    items = [_lead_row(row) for row in page]
+    underwriting_by_intake = await _underwriting_statuses_by_intake(
+        db, [row.id for row in page]
+    )
+    items = [
+        _lead_row(row, underwriting_status=underwriting_by_intake.get(row.id))
+        for row in page
+    ]
     channel_unread = await _channel_unread_by_intake(db, user=user, intakes=page)
     for item in items:
         item.channel_unread_count = channel_unread.get(item.id, 0)

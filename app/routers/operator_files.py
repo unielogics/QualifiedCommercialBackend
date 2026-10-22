@@ -77,7 +77,7 @@ from app.schemas.operator_file import (
 )
 from app.scoping import regional_manager_broker_ids_subquery, scope_client_query, scope_loan_query
 from app.services import application_profiles as profiles
-from app.services import capital_readiness, file_events, funding_programs
+from app.services import capital_readiness, file_events, funding_programs, intake_lifecycle
 from app.services.activity_log import log_activity, mark_loan_dirty
 from app.services.deal_economics import calculate_deal_earnings, optional_float
 from app.services.dealer_partner_access import (
@@ -198,26 +198,8 @@ WORKING_STAGE_TO_UNDERWRITING = {
     "credit_application": "in_underwriting",
     "contracts_execution": "approved",
 }
-PIPELINE_TO_INTAKE_STATUS = {
-    "submitted": "collecting",
-    "collecting_docs": "reviewing",
-    "in_underwriting": "reviewed",
-    "term_sheet_provided": "reviewed",
-    "approved": "approved",
-    "closed_won": "completed",
-    "closed_lost": "closed_lost",
-    "denied": "denied",
-}
-PIPELINE_TO_INTAKE_OUTCOME = {
-    "submitted": "submitted",
-    "collecting_docs": "submitted",
-    "in_underwriting": "submitted",
-    "term_sheet_provided": "submitted",
-    "approved": "submitted",
-    "closed_won": "closed",
-    "closed_lost": "closed",
-    "denied": "denied",
-}
+PIPELINE_TO_INTAKE_STATUS = dict(intake_lifecycle.UNDERWRITING_TO_INTAKE_STATUS)
+PIPELINE_TO_INTAKE_OUTCOME = dict(intake_lifecycle.UNDERWRITING_TO_INTAKE_OUTCOME)
 PIPELINE_PROMOTION_REQUIRED = {
     "in_underwriting",
     "term_sheet_provided",
@@ -1794,8 +1776,11 @@ async def move_operator_file_pipeline(
 
     intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
     if intake is not None:
-        intake.status = PIPELINE_TO_INTAKE_STATUS[payload.target_status]
-        intake.outcome_status = PIPELINE_TO_INTAKE_OUTCOME[payload.target_status]
+        # A terminal loss moves the file out of the active queue through its
+        # lifecycle classification.  It must not set Bucket.archived_at: that
+        # flag is reserved for an explicit operator archive and gates evidence
+        # access throughout the application.
+        intake_lifecycle.sync_intake_from_underwriting(intake, payload.target_status)
         if profile.loan_id:
             intake.promoted_loan_id = profile.loan_id
 

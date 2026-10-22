@@ -188,6 +188,57 @@ async def test_underwriting_write_uses_same_accepted_economics_fields_as_intake(
 
 
 @pytest.mark.asyncio
+async def test_underwriting_denial_closes_intake_without_archiving_evidence() -> None:
+    intake_id = uuid4()
+    intake = SimpleNamespace(status="reviewed", outcome_status="submitted")
+    profile = SimpleNamespace(
+        id=uuid4(),
+        intake_id=intake_id,
+        loan_id=None,
+        underwriting_status="in_underwriting",
+        underwriting_notes=None,
+        underwriting_close_outcome=None,
+        underwriting_approved_amount=None,
+        underwriting_term_sheet_amount=None,
+        underwriting_updated_by_user_id=None,
+        underwriting_updated_at=None,
+    )
+    user = SimpleNamespace(
+        id=uuid4(),
+        role=Role.LOAN_EXEC,
+        name="Underwriter",
+        email="underwriter@example.com",
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=intake), flush=AsyncMock())
+
+    with (
+        patch(
+            "app.routers.application_profiles._sync_profile_loan_stage",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "app.routers.application_profiles.profiles.log_profile_action",
+            AsyncMock(),
+        ),
+        patch(
+            "app.routers.application_profiles.file_events.emit",
+            AsyncMock(),
+        ),
+    ):
+        await apply_underwriting_changes(
+            db,
+            profile,
+            user,
+            {"underwriting_status": "denied"},
+        )
+
+    assert intake.status == "denied"
+    assert intake.outcome_status == "denied"
+    assert profile.underwriting_close_outcome == "denied"
+    assert not hasattr(intake, "archived_at")
+
+
+@pytest.mark.asyncio
 async def test_underwriting_stage_sync_handles_string_stage_loaded_by_the_orm() -> None:
     loan_id = uuid4()
     loan = SimpleNamespace(id=loan_id, stage="collecting_docs")

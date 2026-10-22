@@ -39,6 +39,7 @@ from app.services.foreclosure_rescue import (
     CLOSING_DOCUMENTS,
     FORECLOSURE_RESCUE_VARIANT,
     INITIAL_REVIEW_DOCUMENTS,
+    INTAKE_STATUS_MAP,
     MAX_LTV_PCT,
     MAX_PUBLISHED_LOAN_AMOUNT,
     NOTE_RATE_PCT,
@@ -736,17 +737,16 @@ async def update_rescue_status(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Foreclosure rescue not found")
     previous = intake.foreclosure_rescue_status or "new_rescue"
     intake.foreclosure_rescue_status = payload.status
-    intake.status = {
-        "new_rescue": "collecting", "initial_docs_pending": "reviewing", "ready_for_initial_review": "reviewing",
-        "in_underwriting": "reviewed", "term_sheet_issued": "reviewed", "closing_docs_pending": "completed",
-        "clear_to_close": "completed", "funded": "completed", "declined": "completed", "withdrawn_expired": "completed",
-    }[payload.status]
+    intake.status = INTAKE_STATUS_MAP[payload.status]
     if payload.status == "funded":
         intake.outcome_status = "closed"
     elif payload.status == "declined":
         intake.outcome_status = "denied"
     elif payload.status == "withdrawn_expired":
         intake.outcome_status = "closed"
+    else:
+        # A reopened rescue must not remain hidden by a stale terminal outcome.
+        intake.outcome_status = "submitted"
     await _audit(db, intake, user, "foreclosure_rescue_status_changed", f"{STATUS_LABELS[previous]} → {STATUS_LABELS[payload.status]}" + (f" · {payload.reason.strip()}" if payload.reason else ""))
     await db.commit()
     return _read(intake)
