@@ -92,6 +92,7 @@ from app.routers.buckets import (
     _upload_url,
     _validate_completed_bucket_file,
     _vendor_user_from_payload,
+    _verify_files_before_restore,
 )
 from app.routers.public import _available_booking_slots, _to_utc_minute
 from app.schemas.bucket import (
@@ -108,20 +109,24 @@ from app.schemas.bucket import (
 from app.schemas.capital_readiness import CapitalReadinessRead
 from app.schemas.common import ORMModel
 from app.schemas.phone import OptionalPhone, RequiredPhone
+from app.schemas.retention import LegalHoldChange, RetentionStatusRead
 from app.services import (
     application_profiles as profiles_service,
 )
 from app.services import (
     booking_notify,
     booking_reminders,
+    bucket_archive,
     equipment_financing,
     file_events,
     inline_images,
     intake_lifecycle,
+    intake_retention,
     locked_file_requests,
     merchant_processing,
     notifications,
     provenance,
+    retention_holds,
     upload_validation,
 )
 from app.services import (
@@ -1469,6 +1474,11 @@ class DealerIntakeRead(ORMModel):
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+    retention_class: str = "ai_intake_record"
+    protected_until: datetime | None = None
+    retention_state: Literal[
+        "legal_hold", "protected", "expired", "unclassified"
+    ] = "unclassified"
 
 
 class SecureRoomHandoffResponse(BaseModel):
@@ -1612,6 +1622,12 @@ class DealerAILeadRow(BaseModel):
     updated_at: datetime
     last_message_at: datetime | None = None
     archived_at: datetime | None = None
+    protected_until: datetime | None = None
+    legal_hold: bool = False
+    effective_legal_hold: bool = False
+    retention_state: Literal[
+        "legal_hold", "protected", "expired", "unclassified"
+    ] = "unclassified"
     # Two-step delete state — never null-filtered out of the admin list, so
     # admin always sees pending requests and must separately confirm.
     delete_requested_at: datetime | None = None
@@ -8589,6 +8605,7 @@ def _lead_row(
     intake: PublicUnderwritingIntake,
     *,
     underwriting_status: str | None = None,
+    effective_profile_hold: bool = False,
 ) -> DealerAILeadRow:
     result = _lead_result(intake)
     workspace_state, workspace_state_reason = intake_lifecycle.intake_workspace_state(
@@ -8637,6 +8654,36 @@ def _lead_row(
         updated_at=intake.updated_at,
         last_message_at=intake.last_message_at,
         archived_at=intake.bucket.archived_at,
+        protected_until=max(
+            (
+                value
+                for value in (
+                    getattr(intake, "protected_until", None),
+                    getattr(intake.bucket, "protected_until", None),
+                )
+                if value is not None
+            ),
+            default=None,
+        ),
+        legal_hold=bool(getattr(intake, "legal_hold", False)),
+        effective_legal_hold=(
+            bool(getattr(intake, "legal_hold", False))
+            or bool(getattr(intake.bucket, "legal_hold", False))
+            or effective_profile_hold
+        ),
+        retention_state=(
+            "legal_hold"
+            if getattr(intake, "legal_hold", False)
+            or getattr(intake.bucket, "legal_hold", False)
+            or effective_profile_hold
+            else (
+                "protected"
+                if getattr(intake, "retention_state", "unclassified") == "protected"
+                or getattr(intake.bucket, "retention_state", "unclassified")
+                == "protected"
+                else getattr(intake, "retention_state", "unclassified")
+            )
+        ),
         delete_requested_at=intake.delete_requested_at,
         delete_requested_by=intake.delete_requested_by.name if intake.delete_requested_by else None,
     )
@@ -8783,6 +8830,23 @@ async def _underwriting_statuses_by_intake(
         for intake_id, underwriting_status in rows
         if intake_id is not None
     }
+
+
+async def _profile_hold_intake_ids(
+    db: AsyncSession,
+    intake_ids: list[UUID],
+) -> set[UUID]:
+    if not intake_ids:
+        return set()
+    rows = (
+        await db.execute(
+            select(ApplicationProfile.intake_id).where(
+                ApplicationProfile.intake_id.in_(intake_ids),
+                ApplicationProfile.legal_hold.is_(True),
+            )
+        )
+    ).scalars().all()
+    return {row for row in rows if row is not None}
 
 
 async def _load_admin_dealer_lead(db: AsyncSession, intake_id: UUID) -> PublicUnderwritingIntake:
@@ -9080,8 +9144,16 @@ async def list_dealer_ai_leads(
     underwriting_by_intake = await _underwriting_statuses_by_intake(
         db, [row.id for row in page]
     )
+    profile_hold_intake_ids = await _profile_hold_intake_ids(
+        db,
+        [row.id for row in page],
+    )
     items = [
-        _lead_row(row, underwriting_status=underwriting_by_intake.get(row.id))
+        _lead_row(
+            row,
+            underwriting_status=underwriting_by_intake.get(row.id),
+            effective_profile_hold=row.id in profile_hold_intake_ids,
+        )
         for row in page
     ]
     # NEW badges: unseen client/broker activity per lead for THIS admin,
@@ -9691,6 +9763,9 @@ async def admin_restore_lead(
     ).scalar_one_or_none()
     if intake is None or intake.bucket is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Dealer AI lead not found")
+    profile_hold = intake.id in (
+        await _profile_hold_intake_ids(db, [intake.id])
+    )
     if intake.bucket.archived_at is None:
         underwriting_by_intake = await _underwriting_statuses_by_intake(
             db, [intake.id]
@@ -9698,7 +9773,16 @@ async def admin_restore_lead(
         return _lead_row(
             intake,
             underwriting_status=underwriting_by_intake.get(intake.id),
+            effective_profile_hold=profile_hold,
         )
+
+    await _verify_files_before_restore(
+        [
+            file
+            for file in intake.bucket.files
+            if file.status == "uploaded" and file.deleted_at is None
+        ]
+    )
 
     state = dict(intake.intake_state or {})
     archive_meta = state.pop("_archive", {})
@@ -9725,6 +9809,117 @@ async def admin_restore_lead(
     return _lead_row(
         intake,
         underwriting_status=underwriting_by_intake.get(intake.id),
+        effective_profile_hold=profile_hold,
+    )
+
+
+@admin_router.post(
+    "/{intake_id}/legal-hold",
+    response_model=RetentionStatusRead,
+)
+async def apply_intake_legal_hold(
+    intake_id: UUID,
+    payload: LegalHoldChange,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RetentionStatusRead:
+    _require_governance_admin(user)
+    intake = await db.get(PublicUnderwritingIntake, intake_id)
+    if intake is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "AI Intake file not found")
+    already_held = intake.legal_hold
+    await retention_holds.set_legal_hold(
+        db,
+        intake,
+        PublicUnderwritingIntake,
+        enabled=True,
+    )
+    await _log(
+        db,
+        intake.bucket_id,
+        "retention_legal_hold_applied",
+        request=request,
+        user=user,
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=("Already held; " if already_held else "") + payload.reason.strip(),
+    )
+    await db.commit()
+    await db.refresh(intake)
+    return RetentionStatusRead(
+        **await retention_holds.effective_status_read(
+            db,
+            intake,
+            resource_type="ai_intake",
+        )
+    )
+
+
+@admin_router.get(
+    "/{intake_id}/retention",
+    response_model=RetentionStatusRead,
+)
+async def get_intake_retention_status(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RetentionStatusRead:
+    """Reload the intake's effective, graph-wide retention status."""
+
+    _require_governance_admin(user)
+    intake = await db.get(PublicUnderwritingIntake, intake_id)
+    if intake is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "AI Intake file not found")
+    return RetentionStatusRead(
+        **await retention_holds.effective_status_read(
+            db,
+            intake,
+            resource_type="ai_intake",
+        )
+    )
+
+
+@admin_router.post(
+    "/{intake_id}/legal-hold/release",
+    response_model=RetentionStatusRead,
+)
+async def release_intake_legal_hold(
+    intake_id: UUID,
+    payload: LegalHoldChange,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RetentionStatusRead:
+    _require_governance_admin(user)
+    intake = await db.get(PublicUnderwritingIntake, intake_id)
+    if intake is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "AI Intake file not found")
+    was_held = intake.legal_hold
+    await retention_holds.set_legal_hold(
+        db,
+        intake,
+        PublicUnderwritingIntake,
+        enabled=False,
+    )
+    await _log(
+        db,
+        intake.bucket_id,
+        "retention_legal_hold_released",
+        request=request,
+        user=user,
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=("Was not held; " if not was_held else "") + payload.reason.strip(),
+    )
+    await db.commit()
+    await db.refresh(intake)
+    return RetentionStatusRead(
+        **await retention_holds.effective_status_read(
+            db,
+            intake,
+            resource_type="ai_intake",
+        )
     )
 
 
@@ -9761,6 +9956,15 @@ async def admin_confirm_lead_deletion(
     intake.intake_state = state
     intake.bucket.archived_at = archived_at
     intake.bucket.status = "archived"
+    revoked_access_count = await bucket_archive.revoke_external_access(
+        db,
+        intake.bucket_id,
+    )
+    await intake_retention.extend_intake_retention(
+        db,
+        intake,
+        anchor=archived_at,
+    )
 
     archive_event = AIAuditEvent(
         event_type="intake_archived",
@@ -9805,7 +10009,9 @@ async def admin_confirm_lead_deletion(
         user=user,
         target_type="public_underwriting_intake",
         target_id=str(intake.id),
-        detail=confirm_target,
+        detail=(
+            f"{confirm_target} | external access revoked={revoked_access_count}"
+        ),
     )
     await db.commit()
 
@@ -9894,6 +10100,12 @@ async def update_lead_outcome_status(
     intake = await _load_admin_dealer_lead(db, intake_id)
     previous_outcome = intake.outcome_status
     intake.outcome_status = payload.outcome_status
+    if payload.outcome_status in {"closed", "denied"}:
+        await intake_retention.extend_intake_retention(
+            db,
+            intake,
+            anchor=_now(),
+        )
     await _log(
         db, intake.bucket_id, "dealer_ai_lead_outcome_status_changed", request=request, user=user,
         target_type="public_underwriting_intake", target_id=str(intake.id), detail=payload.outcome_status,
@@ -10398,8 +10610,16 @@ async def list_broker_dealer_leads(
     underwriting_by_intake = await _underwriting_statuses_by_intake(
         db, [row.id for row in page]
     )
+    profile_hold_intake_ids = await _profile_hold_intake_ids(
+        db,
+        [row.id for row in page],
+    )
     items = [
-        _lead_row(row, underwriting_status=underwriting_by_intake.get(row.id))
+        _lead_row(
+            row,
+            underwriting_status=underwriting_by_intake.get(row.id),
+            effective_profile_hold=row.id in profile_hold_intake_ids,
+        )
         for row in page
     ]
     channel_unread = await _channel_unread_by_intake(db, user=user, intakes=page)

@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Literal
 from uuid import UUID, uuid4
 
-log = logging.getLogger(__name__)
-
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import exists, func, or_, select
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -21,8 +19,8 @@ from app.models.client import Client
 from app.models.document import Document
 from app.models.document_analysis_result import DocumentAnalysisResult
 from app.models.loan import Loan
+from app.models.payments import ActualFundingConfirmation, BankDirectFeeReceipt
 from app.schemas.document import (
-    DocumentCustomCreate,
     DocumentPatch,
     DocumentRead,
     DocumentRequest,
@@ -38,6 +36,8 @@ from app.scoping import scope_loan_query
 from app.services import calendar_emitter, file_events, upload_validation
 from app.services.activity_log import mark_loan_dirty
 from app.services.ai.vector_store import log_event as vector_log
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -937,6 +937,20 @@ async def route_document(
             target.ai_notes = doc.ai_notes
         if doc.ai_scan_confidence is not None:
             target.ai_scan_confidence = doc.ai_scan_confidence
+        # Payment evidence points at the legacy Document row. Preserve the
+        # exact uploaded object while routing by moving those references to the
+        # surviving row before the old row is deleted. The transaction keeps
+        # the FK updates, target mutation, activity, and delete atomic.
+        await db.execute(
+            update(ActualFundingConfirmation)
+            .where(ActualFundingConfirmation.evidence_document_id == doc.id)
+            .values(evidence_document_id=target.id)
+        )
+        await db.execute(
+            update(BankDirectFeeReceipt)
+            .where(BankDirectFeeReceipt.evidence_document_id == doc.id)
+            .values(evidence_document_id=target.id)
+        )
         db.add(
             Activity(
                 loan_id=loan.id,
@@ -1041,7 +1055,7 @@ async def mark_document_verified(
     if doc.received_on is None:
         doc.received_on = date.today()
     if doc.verified_at is None:
-        doc.verified_at = datetime.now(timezone.utc)
+        doc.verified_at = datetime.now(UTC)
     doc.verified_by = user.id
     db.add(
         Activity(

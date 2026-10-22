@@ -77,7 +77,13 @@ from app.schemas.operator_file import (
 )
 from app.scoping import regional_manager_broker_ids_subquery, scope_client_query, scope_loan_query
 from app.services import application_profiles as profiles
-from app.services import capital_readiness, file_events, funding_programs, intake_lifecycle
+from app.services import (
+    capital_readiness,
+    file_events,
+    funding_programs,
+    intake_lifecycle,
+    intake_retention,
+)
 from app.services.activity_log import log_activity, mark_loan_dirty
 from app.services.deal_economics import calculate_deal_earnings, optional_float
 from app.services.dealer_partner_access import (
@@ -1781,6 +1787,12 @@ async def move_operator_file_pipeline(
         # flag is reserved for an explicit operator archive and gates evidence
         # access throughout the application.
         intake_lifecycle.sync_intake_from_underwriting(intake, payload.target_status)
+        if payload.target_status in {"closed_won", "closed_lost", "denied"}:
+            await intake_retention.extend_intake_retention(
+                db,
+                intake,
+                anchor=now,
+            )
         if profile.loan_id:
             intake.promoted_loan_id = profile.loan_id
 

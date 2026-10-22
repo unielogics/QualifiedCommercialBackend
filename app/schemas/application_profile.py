@@ -60,6 +60,12 @@ class ApplicationProfileRead(BaseModel):
     intake_id: UUID | None = None
     dealer_id: UUID | None = None
     primary_bucket_id: UUID | None = None
+    retention_class: str = "application_record"
+    protected_until: datetime | None = None
+    legal_hold: bool = False
+    retention_state: Literal[
+        "legal_hold", "protected", "expired", "unclassified"
+    ] = "unclassified"
     communication_locale: Literal["en", "es"] = "en"
     communication_locale_source: str = "system_default"
     communication_locale_updated_at: datetime | None = None

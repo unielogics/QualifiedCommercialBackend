@@ -2911,6 +2911,16 @@ async def apply_plaid_transfer_event(db: AsyncSession, event: dict[str, Any]) ->
                 refund.completed_at = event_time or _now()
             refund_transfer = await db.get(PaymentTransfer, refund.transfer_id)
             if refund_transfer:
+                mandate = await db.get(AchMandate, refund_transfer.mandate_id)
+                if mandate is not None:
+                    from app.services import ach_fee_workflow
+
+                    # Refunds are part of the transfer lifecycle. Nacha proof
+                    # retention therefore restarts from this later event just
+                    # as it does for debit status and return events.
+                    await ach_fee_workflow.extend_mandate_retention(
+                        db, mandate, anchor=event_time or _now()
+                    )
                 await log_event(
                     db,
                     profile_id=refund_transfer.application_profile_id,
@@ -3110,6 +3120,16 @@ async def create_refund_intent(
     )
     db.add(row)
     await db.flush()
+    mandate = await db.get(AchMandate, transfer.mandate_id)
+    if mandate is not None:
+        from app.services import ach_fee_workflow
+
+        # A refund request may precede provider events by hours or days. Move
+        # the immutable proof deadline now so a delayed webhook cannot create
+        # a retention gap.
+        await ach_fee_workflow.extend_mandate_retention(
+            db, mandate, anchor=_now()
+        )
     await log_event(
         db,
         profile_id=transfer.application_profile_id,

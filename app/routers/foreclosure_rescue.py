@@ -34,6 +34,7 @@ from app.models.user import User
 from app.routers.buckets import _generate_passcode
 from app.routers.dealer_ai_intake import _hash_token, _new_public_token, _record_resume_email
 from app.services import clerk as clerk_service
+from app.services import intake_retention
 from app.services.foreclosure_rescue import (
     AMORTIZATION_MONTHS,
     CLOSING_DOCUMENTS,
@@ -747,6 +748,12 @@ async def update_rescue_status(
     else:
         # A reopened rescue must not remain hidden by a stale terminal outcome.
         intake.outcome_status = "submitted"
+    if payload.status in {"funded", "declined", "withdrawn_expired"}:
+        await intake_retention.extend_intake_retention(
+            db,
+            intake,
+            anchor=datetime.now(UTC),
+        )
     await _audit(db, intake, user, "foreclosure_rescue_status_changed", f"{STATUS_LABELS[previous]} → {STATUS_LABELS[payload.status]}" + (f" · {payload.reason.strip()}" if payload.reason else ""))
     await db.commit()
     return _read(intake)

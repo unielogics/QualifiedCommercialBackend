@@ -4,13 +4,20 @@ import uuid
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, event
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
 from app.models._mixins import TimestampMixin
+from app.retention import (
+    AI_INTAKE_RETENTION_CLASS,
+    ProtectedRecordDeletionError,
+    default_deadline,
+    physical_deletion_prohibited,
+    retention_state,
+)
 
 if TYPE_CHECKING:
     from app.models.bucket import Bucket, BucketAIReview, BucketUploadLink
@@ -102,6 +109,40 @@ class PublicUnderwritingIntake(TimestampMixin, Base):
     delete_requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    retention_class: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=AI_INTAKE_RETENTION_CLASS,
+        server_default=AI_INTAKE_RETENTION_CLASS,
+    )
+    protected_until: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=default_deadline,
+    )
+    legal_hold: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
+    @property
+    def retention_state(self) -> str:
+        return retention_state(
+            protected_until=self.protected_until,
+            legal_hold=self.legal_hold,
+        )
+
+    def is_physical_deletion_prohibited(
+        self,
+        *,
+        at: datetime | None = None,
+        governed_purge: bool = False,
+    ) -> bool:
+        return physical_deletion_prohibited(
+            protected_until=self.protected_until,
+            legal_hold=self.legal_hold,
+            at=at,
+            governed_purge=governed_purge,
+        )
 
     client: Mapped[Client | None] = relationship()
     broker: Mapped[User | None] = relationship(foreign_keys=[broker_id])
@@ -165,3 +206,15 @@ class PublicUnderwritingIntakeEmailSend(TimestampMixin, Base):
         foreign_keys=[lender_packet_artifact_id]
     )
     sent_by_user: Mapped[User | None] = relationship()
+
+
+@event.listens_for(PublicUnderwritingIntake, "before_delete")
+def _guard_intake_physical_delete(
+    _mapper,
+    _connection,
+    target: PublicUnderwritingIntake,
+) -> None:
+    if target.is_physical_deletion_prohibited():
+        raise ProtectedRecordDeletionError(
+            "AI Intake is inside its minimum retention period; archive it instead"
+        )

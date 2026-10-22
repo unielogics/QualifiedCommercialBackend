@@ -155,15 +155,56 @@ async def _remove_provider_report(report: PlaidAssetReport) -> None:
     report.provider_removal_error = None
 
 
-async def remove_asset_report(report: PlaidAssetReport, *, strict: bool = True) -> None:
+async def _require_retained_report(
+    db: AsyncSession, report: PlaidAssetReport
+) -> None:
+    """Fail closed before deleting a provider report that contains evidence."""
+    if not _report_reached_evidence_state(report):
+        return
+    if await retained_report_pdf(db, report) is not None:
+        return
+    report.provider_removal_error = (
+        "Archived PDF unavailable; provider report retained until evidence is recoverable"
+    )
+    raise plaid_client.PlaidUnavailable(report.provider_removal_error)
+
+
+def _report_reached_evidence_state(report: PlaidAssetReport) -> bool:
+    """Include legacy rows whose status was changed before provider cleanup.
+
+    Older ``strict=False`` removal marked a report ``removed`` even when the
+    Plaid delete failed.  ``ready_at``/``ingested_at`` and archive links retain
+    the evidence history needed to keep those cleanup retries fail closed.
+    """
+    return bool(
+        report.status in {"ready", "ingested"}
+        or getattr(report, "ready_at", None) is not None
+        or getattr(report, "ingested_at", None) is not None
+        or getattr(report, "document_id", None) is not None
+        or getattr(report, "bucket_file_id", None) is not None
+    )
+
+
+async def remove_asset_report(
+    db: AsyncSession, report: PlaidAssetReport, *, strict: bool = True
+) -> None:
     queue_report_cleanup(report)
+    archive_verified = not _report_reached_evidence_state(report)
     try:
+        await _require_retained_report(db, report)
+        archive_verified = True
         await _remove_provider_report(report)
-    except plaid_client.PlaidUnavailable:
+    except plaid_client.PlaidUnavailable as exc:
         # Keep the ciphertext and durable request until Plaid confirms deletion.
-        report.provider_removal_error = "Provider removal failed; cleanup will retry"
+        if not report.provider_removal_error:
+            report.provider_removal_error = "Provider removal failed; cleanup will retry"
         if strict:
             raise
+        # A ready/ingested report remains usable locally and remotely until a
+        # durable archive exists.  Do not claim that it was removed.
+        if not archive_verified:
+            log.warning("Plaid report removal deferred for local report %s: %s", report.id, exc)
+            return
     report.status = "removed"
     report.removed_at = _now()
 
@@ -185,12 +226,16 @@ async def retained_report_pdf(db: AsyncSession, report: PlaidAssetReport) -> byt
         if (
             profile is not None and file is not None
             and file.bucket_id == profile.primary_bucket_id
-            and file.status == "uploaded" and file.deleted_at is None
+            and file.status == "uploaded"
         ):
             key = file.s3_key
     if not key:
         return None
-    raw = await asyncio.to_thread(storage.get_bytes, key)
+    try:
+        raw = await asyncio.to_thread(storage.get_bytes, key)
+    except Exception:  # noqa: BLE001 - storage SDK/network boundary; fail closed
+        log.exception("Retained Plaid report could not be read for local report %s", report.id)
+        return None
     return raw if raw and raw.startswith(b"%PDF-") else None
 
 
@@ -215,7 +260,8 @@ async def cleanup_asset_reports(*, limit: int = 25) -> int:
     """Retry provider removal only after the ingestion transaction committed.
 
     Remote deletion does not expire ingested evidence or its 30-day freshness.
-    Revoked/removed reports do not require an archive because access must stop.
+    Reports that ever reached ready/ingested remain archive-gated even when a
+    legacy path already changed their current status to removed.
     """
     from app.db import SessionLocal
 
@@ -233,14 +279,13 @@ async def cleanup_asset_reports(*, limit: int = 25) -> int:
         )).scalars().all())
         for report in reports:
             try:
-                if report.status == "ingested" and await retained_report_pdf(db, report) is None:
-                    report.provider_removal_error = "Archived PDF unavailable; provider report retained"
-                    continue
+                await _require_retained_report(db, report)
                 await _remove_provider_report(report)
                 removed += 1
-            except plaid_client.PlaidUnavailable:
-                report.provider_removal_error = "Provider removal failed; cleanup will retry"
-                log.warning("Plaid report cleanup deferred for local report %s", report.id)
+            except plaid_client.PlaidUnavailable as exc:
+                if not report.provider_removal_error:
+                    report.provider_removal_error = "Provider removal failed; cleanup will retry"
+                log.warning("Plaid report cleanup deferred for local report %s: %s", report.id, exc)
         await db.commit()
     return removed
 
@@ -269,7 +314,7 @@ async def remove_reports_for_item(
     item_key = str(item.id)
     for report in reports:
         if item_key in (report.source_item_ids or []):
-            await remove_asset_report(report, strict=strict)
+            await remove_asset_report(db, report, strict=strict)
 
 
 async def disconnect_item(
