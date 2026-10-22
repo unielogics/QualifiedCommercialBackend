@@ -145,6 +145,12 @@ class BucketRead(ORMModel):
     created_at: datetime
     updated_at: datetime
     archived_at: datetime | None
+    retention_class: str = "bucket_record"
+    protected_until: datetime | None = None
+    legal_hold: bool = False
+    retention_state: Literal[
+        "legal_hold", "protected", "expired", "unclassified"
+    ] = "unclassified"
     file_count: int = 0
     uploaded_file_count: int = 0
     file_names: list[str] = Field(default_factory=list)
@@ -329,6 +335,9 @@ class BucketFileRead(ORMModel):
     retention_class: str | None = None
     protected_until: datetime | None = None
     legal_hold: bool = False
+    retention_state: Literal[
+        "legal_hold", "protected", "expired", "unclassified"
+    ] = "unclassified"
     source_entity_type: str | None = None
     source_entity_id: UUID | None = None
     source_immutable_ref: str | None = None

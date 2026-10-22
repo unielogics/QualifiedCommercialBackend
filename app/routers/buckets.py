@@ -12,6 +12,7 @@ import re
 import secrets
 import time
 from datetime import UTC, datetime
+from typing import Literal
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
@@ -128,12 +129,17 @@ from app.schemas.bucket import (
     IntakeChatActionRead,
     IntakeChatActionResult,
 )
+from app.schemas.retention import LegalHoldChange, RetentionStatusRead
 from app.services import application_profiles as profiles
 from app.services import (
+    bucket_archive,
+    bucket_storage_integrity,
     capital_readiness,
     file_events,
+    intake_retention,
     locked_file_requests,
     provenance,
+    retention_holds,
     upload_validation,
 )
 from app.services import clerk as clerk_service
@@ -342,11 +348,19 @@ async def _log(
     )
 
 
-async def _load_bucket_or_404(db: AsyncSession, bucket_id: UUID) -> Bucket:
+async def _load_bucket_or_404(
+    db: AsyncSession,
+    bucket_id: UUID,
+    *,
+    include_archived: bool = False,
+) -> Bucket:
+    filters = [Bucket.id == bucket_id]
+    if not include_archived:
+        filters.append(Bucket.archived_at.is_(None))
     bucket = (
         await db.execute(
             select(Bucket)
-            .where(Bucket.id == bucket_id, Bucket.archived_at.is_(None))
+            .where(*filters)
             .options(
                 selectinload(Bucket.requested_documents),
                 selectinload(Bucket.files),
@@ -365,8 +379,17 @@ async def _load_bucket_or_404(db: AsyncSession, bucket_id: UUID) -> Bucket:
     return bucket
 
 
-async def _load_bucket_detail_or_404(db: AsyncSession, bucket_id: UUID) -> Bucket:
-    bucket = await _load_bucket_or_404(db, bucket_id)
+async def _load_bucket_detail_or_404(
+    db: AsyncSession,
+    bucket_id: UUID,
+    *,
+    include_archived: bool = False,
+) -> Bucket:
+    bucket = await _load_bucket_or_404(
+        db,
+        bucket_id,
+        include_archived=include_archived,
+    )
     activity = (
         await db.execute(
             select(BucketActivityLog)
@@ -391,7 +414,11 @@ async def _load_upload_link_or_404(db: AsyncSession, token: str) -> BucketUpload
             )
         )
     ).scalar_one_or_none()
-    if link is None or not _is_active(link.status, link.expires_at):
+    if (
+        link is None
+        or link.bucket.archived_at is not None
+        or not _is_active(link.status, link.expires_at)
+    ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Upload link not found or inactive")
     if link.completed_at and not link.allow_multiple_sessions:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "This upload link has already been completed")
@@ -411,7 +438,11 @@ async def _load_share_or_404(db: AsyncSession, token: str) -> BucketShare:
             )
         )
     ).scalar_one_or_none()
-    if share is None or not _is_active(share.status, share.expires_at):
+    if (
+        share is None
+        or share.bucket.archived_at is not None
+        or not _is_active(share.status, share.expires_at)
+    ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Share link not found or inactive")
     return share
 
@@ -455,9 +486,46 @@ async def _load_public_share_or_404(db: AsyncSession, token: str) -> BucketPubli
             )
         )
     ).scalar_one_or_none()
-    if share is None or not _is_active(share.status, share.expires_at):
+    if (
+        share is None
+        or share.bucket.archived_at is not None
+        or not _is_active(share.status, share.expires_at)
+    ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Share link not found or inactive")
     return share
+
+
+async def _verify_files_before_restore(files: list[BucketFile]) -> None:
+    """Map storage-integrity failures to stable, actionable API responses."""
+
+    try:
+        await bucket_storage_integrity.verify_bucket_file_objects(files)
+    except bucket_storage_integrity.RetainedObjectMissingError as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "retained_file_missing",
+                "message": (
+                    "Restore is blocked because retained file bytes are missing. "
+                    "Keep this record archived and contact support or upload a replacement."
+                ),
+                "files": [
+                    {"id": str(ref.file_id), "name": ref.file_name}
+                    for ref in exc.objects
+                ],
+            },
+        ) from exc
+    except bucket_storage_integrity.RetainedObjectVerificationError as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "code": "retained_file_storage_unavailable",
+                "message": (
+                    "Restore is paused because retained file storage could not be "
+                    "verified. No archive state changed; try again shortly."
+                ),
+            },
+        ) from exc
 
 
 # Content types the browser may safely render inline. Anything else (notably
@@ -1070,19 +1138,24 @@ async def list_templates(
 @router.get("", response_model=list[BucketRead])
 async def list_buckets(
     q: str | None = Query(default=None, max_length=200),
+    archived_filter: Literal["active", "archived", "all"] = "active",
     _: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> list[Bucket]:
-    buckets = (
-        await db.execute(
-            select(Bucket)
-            .where(Bucket.archived_at.is_(None))
-            .options(
-                selectinload(Bucket.files),
-                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
-            )
-            .order_by(Bucket.updated_at.desc())
+    stmt = select(Bucket).options(
+        selectinload(Bucket.files),
+        with_loader_criteria(
+            BucketFile,
+            BucketFile.deleted_at.is_(None),
+            include_aliases=True,
         )
+    )
+    if archived_filter == "active":
+        stmt = stmt.where(Bucket.archived_at.is_(None))
+    elif archived_filter == "archived":
+        stmt = stmt.where(Bucket.archived_at.is_not(None))
+    buckets = (
+        await db.execute(stmt.order_by(Bucket.updated_at.desc()))
     ).scalars().all()
     for bucket in buckets:
         bucket.file_count = len(bucket.files)
@@ -1188,7 +1261,11 @@ async def get_bucket(
     _: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> BucketDetail:
-    bucket = await _load_bucket_detail_or_404(db, bucket_id)
+    bucket = await _load_bucket_detail_or_404(
+        db,
+        bucket_id,
+        include_archived=True,
+    )
     if await _attach_bucket_file_links(db, [bucket]):
         await db.commit()
     return _bucket_detail_read(bucket)
@@ -1256,7 +1333,7 @@ async def list_bucket_activity(
     _: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> BucketActivityPage:
-    await _load_bucket_or_404(db, bucket_id)
+    await _load_bucket_or_404(db, bucket_id, include_archived=True)
     filters = [BucketActivityLog.bucket_id == bucket_id]
     if action:
         filters.append(BucketActivityLog.action == action)
@@ -1576,10 +1653,180 @@ async def delete_bucket(
     # payment evidence. It does not delete a BucketFile or its private object,
     # and retained artifacts remain available through the Payments,
     # Agreements, and archived-file views.
-    bucket.archived_at = _now()
+    archived_at = _now()
+    context = dict(bucket.ai_context or {})
+    context["_archive"] = {
+        "prior_status": bucket.status,
+        "archived_at": archived_at.isoformat(),
+        "archived_by_user_id": str(user.id),
+    }
+    bucket.ai_context = context
+    bucket.archived_at = archived_at
     bucket.status = "archived"
-    await _log(db, bucket_id, "bucket_deleted", request=request, user=user, detail=bucket.name)
+    revoked_access_count = await bucket_archive.revoke_external_access(
+        db,
+        bucket.id,
+    )
+    await intake_retention.extend_bucket_retention(
+        db,
+        bucket,
+        anchor=archived_at,
+    )
+    await _log(
+        db,
+        bucket_id,
+        "bucket_archived",
+        request=request,
+        user=user,
+        detail=f"{bucket.name} | external access revoked={revoked_access_count}",
+    )
     await db.commit()
+
+
+@router.post("/admin/{bucket_id}/restore", response_model=BucketRead)
+async def restore_bucket(
+    bucket_id: UUID,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> Bucket:
+    """Restore a standalone Bucket without weakening its retention deadline."""
+
+    bucket = await _load_bucket_or_404(db, bucket_id, include_archived=True)
+    if bucket.archived_at is None:
+        return bucket
+    retained_files = list(
+        (
+            await db.execute(
+                select(BucketFile).where(
+                    BucketFile.bucket_id == bucket.id,
+                    BucketFile.status == "uploaded",
+                    BucketFile.deleted_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # This must run before any ORM mutation: a missing version leaves the
+    # Bucket archived and produces a recoverable, actionable conflict.
+    await _verify_files_before_restore(retained_files)
+    context = dict(bucket.ai_context or {})
+    archive_meta = context.pop("_archive", {})
+    prior_status = (
+        archive_meta.get("prior_status") if isinstance(archive_meta, dict) else None
+    )
+    bucket.ai_context = context
+    bucket.archived_at = None
+    bucket.status = (
+        prior_status
+        if isinstance(prior_status, str)
+        and prior_status
+        and prior_status != "archived"
+        else "collecting_documents"
+    )
+    await _log(
+        db,
+        bucket.id,
+        "bucket_restored",
+        request=request,
+        user=user,
+        detail=bucket.name,
+    )
+    await db.commit()
+    await db.refresh(bucket)
+    return bucket
+
+
+@router.post(
+    "/admin/{bucket_id}/legal-hold",
+    response_model=RetentionStatusRead,
+)
+async def apply_bucket_legal_hold(
+    bucket_id: UUID,
+    payload: LegalHoldChange,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> RetentionStatusRead:
+    bucket = await _load_bucket_or_404(db, bucket_id, include_archived=True)
+    already_held = bucket.legal_hold
+    await retention_holds.set_legal_hold(db, bucket, Bucket, enabled=True)
+    await _log(
+        db,
+        bucket.id,
+        "retention_legal_hold_applied",
+        request=request,
+        user=user,
+        target_type="bucket",
+        target_id=str(bucket.id),
+        detail=("Already held; " if already_held else "") + payload.reason.strip(),
+    )
+    await db.commit()
+    await db.refresh(bucket)
+    return RetentionStatusRead(
+        **await retention_holds.effective_status_read(
+            db,
+            bucket,
+            resource_type="bucket",
+        )
+    )
+
+
+@router.get(
+    "/admin/{bucket_id}/retention",
+    response_model=RetentionStatusRead,
+)
+async def get_bucket_retention_status(
+    bucket_id: UUID,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> RetentionStatusRead:
+    """Reload the Bucket's effective, graph-wide retention status."""
+
+    bucket = await _load_bucket_or_404(db, bucket_id, include_archived=True)
+    return RetentionStatusRead(
+        **await retention_holds.effective_status_read(
+            db,
+            bucket,
+            resource_type="bucket",
+        )
+    )
+
+
+@router.post(
+    "/admin/{bucket_id}/legal-hold/release",
+    response_model=RetentionStatusRead,
+)
+async def release_bucket_legal_hold(
+    bucket_id: UUID,
+    payload: LegalHoldChange,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> RetentionStatusRead:
+    bucket = await _load_bucket_or_404(db, bucket_id, include_archived=True)
+    was_held = bucket.legal_hold
+    await retention_holds.set_legal_hold(db, bucket, Bucket, enabled=False)
+    await _log(
+        db,
+        bucket.id,
+        "retention_legal_hold_released",
+        request=request,
+        user=user,
+        target_type="bucket",
+        target_id=str(bucket.id),
+        detail=("Was not held; " if not was_held else "") + payload.reason.strip(),
+    )
+    await db.commit()
+    await db.refresh(bucket)
+    return RetentionStatusRead(
+        **await retention_holds.effective_status_read(
+            db,
+            bucket,
+            resource_type="bucket",
+        )
+    )
 
 
 @router.post("/admin/{bucket_id}/requested-documents", response_model=BucketRequestedDocumentRead)
@@ -2548,7 +2795,7 @@ async def delete_admin_file(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
     if file.deleted_at is not None:
         return
-    if getattr(file, "is_deletion_prohibited", lambda: False)():
+    if await retention_holds.is_effective_file_soft_deletion_prohibited(db, file):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "This ACH or agreement artifact is protected by retention or legal hold",
@@ -2599,7 +2846,7 @@ async def list_deleted_admin_files(
     _: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> list[BucketFile]:
-    await _load_bucket_or_404(db, bucket_id)
+    await _load_bucket_or_404(db, bucket_id, include_archived=True)
     return list(
         (
             await db.execute(
@@ -2640,6 +2887,10 @@ async def restore_admin_file(
             "This historical file predates recovery retention and its stored bytes are unavailable",
         )
 
+    # Do not claim recovery until the exact retained object/version is known to
+    # exist.  This provider call is bounded and runs outside the event loop.
+    await _verify_files_before_restore([file])
+
     prior_storage_status = file.delete_storage_status
     file.deleted_at = None
     file.deleted_by_user_id = None
@@ -2676,6 +2927,7 @@ async def admin_file_url(
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileUrl:
+    await _load_bucket_or_404(db, bucket_id, include_archived=True)
     file = await db.get(BucketFile, file_id)
     if file is None or file.bucket_id != bucket_id or file.status != "uploaded" or file.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
@@ -2708,6 +2960,7 @@ async def admin_file_review(
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileReviewRead:
+    await _load_bucket_or_404(db, bucket_id, include_archived=True)
     file = await db.get(BucketFile, file_id)
     if file is None or file.bucket_id != bucket_id or file.status != "uploaded" or file.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
@@ -2726,6 +2979,12 @@ async def create_admin_file_annotation(
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileAnnotation:
+    bucket = await _load_bucket_or_404(db, bucket_id, include_archived=True)
+    if bucket.archived_at is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Archived Buckets are read-only. Restore the Bucket before adding annotations.",
+        )
     file = await db.get(BucketFile, file_id)
     if file is None or file.bucket_id != bucket_id or file.status != "uploaded" or file.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
@@ -2888,7 +3147,8 @@ async def vendor_ai_chat(
     )
     if not access.can_propose_tasks:
         for item in proposals:
-            await db.delete(item)
+            item.status = "discarded"
+            item.completed_at = datetime.now(UTC)
         proposals = []
     await _log(
         db,
@@ -3909,7 +4169,8 @@ async def share_ai_chat(
     )
     if not share.can_propose_tasks:
         for item in proposals:
-            await db.delete(item)
+            item.status = "discarded"
+            item.completed_at = datetime.now(UTC)
         proposals = []
     await db.commit()
     return BucketAIChatResponse(

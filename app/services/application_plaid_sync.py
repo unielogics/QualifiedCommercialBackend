@@ -83,7 +83,7 @@ async def ingest_asset_report(
         raise ValueError("Asset Report is not linked to an evidence bucket")
     policy, _owner = await plaid_policy.for_profile(db, profile)
     if not policy.assets_enabled:
-        await plaid_lifecycle.remove_asset_report(report, strict=False)
+        await plaid_lifecycle.remove_asset_report(db, report, strict=False)
         await db.flush()
         return report
     token = plaid_client.decrypt_token(report.encrypted_asset_report_token)

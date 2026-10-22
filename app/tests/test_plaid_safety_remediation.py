@@ -9,6 +9,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.dealer_os.services import plaid_client, plaid_webhook
+from app.dealer_os.services import storage as dealer_storage
 from app.routers import public_payments
 from app.services import (
     application_plaid_sync,
@@ -43,6 +44,24 @@ def report_row(**overrides):
         "dealer_id": uuid4(), "profile_id": None, "ingested_at": datetime.now(UTC),
         **overrides,
     })
+
+
+def test_legacy_removed_report_keeps_evidence_archive_gate():
+    report = report_row(status="removed", removed_at=datetime.now(UTC))
+
+    assert plaid_lifecycle._report_reached_evidence_state(report) is True
+
+
+def test_never_ready_pending_report_does_not_require_evidence_archive():
+    report = report_row(
+        status="pending",
+        ready_at=None,
+        ingested_at=None,
+        document_id=None,
+        bucket_file_id=None,
+    )
+
+    assert plaid_lifecycle._report_reached_evidence_state(report) is False
 
 
 @pytest.mark.parametrize("rationale,expected", [
@@ -101,12 +120,18 @@ async def test_unsafe_authorization_never_creates_even_during_crash_recovery(mon
 @pytest.mark.asyncio
 async def test_failed_report_removal_preserves_token_and_retries(monkeypatch):
     report = report_row()
+    db_marker = object()
     monkeypatch.setenv("DEALER_OS_PLAID_ENV", "production")
     monkeypatch.setattr(plaid_client, "enabled", lambda: True)
     monkeypatch.setattr(plaid_client, "decrypt_token", lambda token: "report-token" if token else None)
+    monkeypatch.setattr(
+        plaid_lifecycle,
+        "retained_report_pdf",
+        AsyncMock(return_value=b"%PDF-archived"),
+    )
     remove = AsyncMock(side_effect=plaid_client.PlaidUnavailable("Temporary failure"))
     monkeypatch.setattr(plaid_client, "asset_report_remove", remove)
-    await plaid_lifecycle.remove_asset_report(report, strict=False)
+    await plaid_lifecycle.remove_asset_report(db_marker, report, strict=False)
     assert report.status == "removed"
     assert report.encrypted_asset_report_token == "cipher"
     assert report.provider_removal_requested_at is not None
@@ -171,11 +196,105 @@ async def test_removed_report_cannot_be_resurrected_by_late_webhook():
 async def test_cleanup_never_discards_another_environment_token(monkeypatch):
     report = report_row(environment="sandbox")
     monkeypatch.setenv("DEALER_OS_PLAID_ENV", "production")
+    monkeypatch.setattr(
+        plaid_lifecycle,
+        "retained_report_pdf",
+        AsyncMock(return_value=b"%PDF-archived"),
+    )
     remote = AsyncMock()
     monkeypatch.setattr(plaid_client, "asset_report_remove", remote)
-    await plaid_lifecycle.remove_asset_report(report, strict=False)
+    await plaid_lifecycle.remove_asset_report(object(), report, strict=False)
     assert report.encrypted_asset_report_token == "cipher"
     remote.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("report_status", ["ready", "ingested"])
+async def test_direct_report_removal_is_fail_closed_without_archive(monkeypatch, report_status):
+    report = report_row(status=report_status, document_id=None, bucket_file_id=None)
+    archive = AsyncMock(return_value=None)
+    remote = AsyncMock()
+    monkeypatch.setattr(plaid_lifecycle, "retained_report_pdf", archive)
+    monkeypatch.setattr(plaid_client, "asset_report_remove", remote)
+
+    await plaid_lifecycle.remove_asset_report(object(), report, strict=False)
+
+    remote.assert_not_awaited()
+    assert report.status == report_status
+    assert report.removed_at is None
+    assert report.encrypted_asset_report_token == "cipher"
+    assert "Archived PDF unavailable" in report.provider_removal_error
+
+    with pytest.raises(plaid_client.PlaidUnavailable, match="Archived PDF unavailable"):
+        await plaid_lifecycle.remove_asset_report(object(), report, strict=True)
+    remote.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ready_cleanup_requires_archive_before_provider_removal(monkeypatch):
+    report = report_row(status="ready", document_id=None, bucket_file_id=None)
+    plaid_lifecycle.queue_report_cleanup(report)
+    db = SimpleNamespace(execute=AsyncMock(return_value=rows_result([report])), commit=AsyncMock())
+    monkeypatch.setattr("app.db.SessionLocal", lambda: Session(db))
+    monkeypatch.setenv("DEALER_OS_PLAID_ENV", "production")
+    monkeypatch.setattr(plaid_client, "enabled", lambda: True)
+    monkeypatch.setattr(plaid_client, "decrypt_token", lambda _: "report-token")
+    archive = AsyncMock(return_value=None)
+    remote = AsyncMock()
+    monkeypatch.setattr(plaid_lifecycle, "retained_report_pdf", archive)
+    monkeypatch.setattr(plaid_client, "asset_report_remove", remote)
+
+    assert await plaid_lifecycle.cleanup_asset_reports() == 0
+    remote.assert_not_awaited()
+    assert report.status == "ready"
+    assert report.encrypted_asset_report_token == "cipher"
+
+
+@pytest.mark.asyncio
+async def test_legacy_removed_report_with_ingestion_history_still_requires_archive(monkeypatch):
+    report = report_row(
+        status="removed",
+        removed_at=datetime.now(UTC),
+        document_id=None,
+        bucket_file_id=None,
+    )
+    plaid_lifecycle.queue_report_cleanup(report)
+    db = SimpleNamespace(execute=AsyncMock(return_value=rows_result([report])), commit=AsyncMock())
+    monkeypatch.setattr("app.db.SessionLocal", lambda: Session(db))
+    monkeypatch.setenv("DEALER_OS_PLAID_ENV", "production")
+    monkeypatch.setattr(plaid_client, "enabled", lambda: True)
+    monkeypatch.setattr(plaid_lifecycle, "retained_report_pdf", AsyncMock(return_value=None))
+    remote = AsyncMock()
+    monkeypatch.setattr(plaid_client, "asset_report_remove", remote)
+
+    assert await plaid_lifecycle.cleanup_asset_reports() == 0
+    remote.assert_not_awaited()
+    assert report.encrypted_asset_report_token == "cipher"
+    assert "Archived PDF unavailable" in report.provider_removal_error
+
+
+@pytest.mark.asyncio
+async def test_storage_read_failure_is_normalized_and_provider_report_is_retained(monkeypatch):
+    report = report_row(status="ready")
+    document = SimpleNamespace(
+        dealer_id=report.dealer_id,
+        s3_key="dealer-os/archive/report.pdf",
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=document))
+    monkeypatch.setattr(
+        dealer_storage,
+        "get_bytes",
+        lambda _key: (_ for _ in ()).throw(OSError("temporary storage outage")),
+    )
+    remote = AsyncMock()
+    monkeypatch.setattr(plaid_client, "asset_report_remove", remote)
+
+    assert await plaid_lifecycle.retained_report_pdf(db, report) is None
+    await plaid_lifecycle.remove_asset_report(db, report, strict=False)
+
+    remote.assert_not_awaited()
+    assert report.status == "ready"
+    assert "Archived PDF unavailable" in report.provider_removal_error
 
 
 @pytest.mark.asyncio

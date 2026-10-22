@@ -3717,7 +3717,10 @@ async def visible_action_items(
     vendor_access_id: UUID | None = None,
     approved_only: bool = False,
 ) -> list[BucketAIActionItem]:
-    stmt = select(BucketAIActionItem).where(BucketAIActionItem.bucket_id == bucket_id)
+    stmt = select(BucketAIActionItem).where(
+        BucketAIActionItem.bucket_id == bucket_id,
+        BucketAIActionItem.status != "discarded",
+    )
     if approved_only:
         stmt = stmt.where(BucketAIActionItem.status.in_(("approved", "completed")))
     if route:

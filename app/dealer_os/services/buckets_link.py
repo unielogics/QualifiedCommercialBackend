@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.bucket import Bucket, BucketActivityLog, BucketFile, BucketRequestedDocument
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
+from app.services import bucket_storage_integrity, retention_holds
 
 from ..models import DealerBusiness, DealerDocument
 from .extract import _parse_amount
@@ -170,7 +171,9 @@ async def soft_delete_mirrored_file(
     """Remove a mirror from active bucket views while retaining its archive."""
     if bucket_file.deleted_at is not None:
         return
-    if bucket_file.is_deletion_prohibited():
+    if await retention_holds.is_effective_file_soft_deletion_prohibited(
+        db, bucket_file
+    ):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "This ACH or agreement artifact is protected by retention or legal hold",
@@ -209,6 +212,88 @@ async def soft_delete_mirrored_file(
             target_type="file",
             target_id=str(bucket_file.id),
             detail=detail,
+            created_at=now,
+        )
+    )
+    await db.flush()
+
+
+async def restore_mirrored_file(
+    db: AsyncSession,
+    bucket_file: BucketFile,
+    user: User,
+    *,
+    detail: str,
+    storage_verified: bool = False,
+) -> None:
+    """Restore only a mirror hidden by the coordinated Field Desk removal.
+
+    ``retained_for_audit`` is deliberately not accepted by the generic Bucket
+    restore endpoint.  Restoring it there would make the PDF visible again
+    while its normalized underwriting facts remained deleted.  Field Desk is
+    the sole coordinator for restoring both halves of that state.
+    """
+    if bucket_file.deleted_at is None:
+        return
+    if bucket_file.delete_storage_status != "retained_for_audit":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This file was not removed through Field Desk and must be restored from its original workspace",
+        )
+
+    if not storage_verified:
+        try:
+            await bucket_storage_integrity.verify_bucket_file_objects([bucket_file])
+        except bucket_storage_integrity.RetainedObjectMissingError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "retained_file_missing",
+                    "message": (
+                        "Restore is blocked because the retained file bytes are missing. "
+                        "The archived evidence was left unchanged."
+                    ),
+                    "files": [
+                        {"id": str(ref.file_id), "name": ref.file_name}
+                        for ref in exc.objects
+                    ],
+                },
+            ) from exc
+        except bucket_storage_integrity.RetainedObjectVerificationError as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "code": "retained_file_storage_unavailable",
+                    "message": (
+                        "Restore is paused because retained file storage could not be "
+                        "verified. No file state changed; try again shortly."
+                    ),
+                },
+            ) from exc
+
+    now = datetime.now(UTC)
+    prior_storage_status = bucket_file.delete_storage_status
+    bucket_file.deleted_at = None
+    bucket_file.deleted_by_user_id = None
+    bucket_file.delete_storage_status = None
+
+    if bucket_file.requested_document_id is not None:
+        requested = await db.get(BucketRequestedDocument, bucket_file.requested_document_id)
+        if requested is not None:
+            requested.status = "uploaded"
+
+    role = getattr(user.role, "value", str(user.role))
+    db.add(
+        BucketActivityLog(
+            bucket_id=bucket_file.bucket_id,
+            actor_user_id=user.id,
+            actor_name=user.name,
+            actor_email=user.email,
+            actor_role=role,
+            action="file_restored_from_field_desk",
+            target_type="file",
+            target_id=str(bucket_file.id),
+            detail=f"{detail} | storage={prior_storage_status}",
             created_at=now,
         )
     )

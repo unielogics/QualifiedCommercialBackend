@@ -114,7 +114,7 @@ async def handle(db: AsyncSession, payload: dict[str, Any]) -> str:
                     policy, _owner = await plaid_policy.for_profile(db, profile)
                     enabled = policy.assets_enabled
             if not enabled:
-                await plaid_lifecycle.remove_asset_report(report, strict=False)
+                await plaid_lifecycle.remove_asset_report(db, report, strict=False)
                 return "ignored: assets disabled"
             report.status = "ready"
             report.error = None

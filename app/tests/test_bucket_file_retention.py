@@ -58,11 +58,12 @@ def test_bucket_file_future_protection_blocks_deletion() -> None:
     assert row.is_deletion_prohibited(at=now)
 
 
-def test_bucket_file_expired_protection_allows_deletion() -> None:
+def test_bucket_file_expiry_still_requires_governed_purge_context() -> None:
     now = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
     row = BucketFile(legal_hold=False, protected_until=now - timedelta(seconds=1))
 
-    assert not row.is_deletion_prohibited(at=now)
+    assert row.is_deletion_prohibited(at=now)
+    assert not row.is_deletion_prohibited(at=now, governed_purge=True)
 
 
 def test_bucket_file_treats_naive_legacy_timestamp_as_utc() -> None:
@@ -98,9 +99,36 @@ def test_legacy_unclassified_file_without_expiry_remains_deletable() -> None:
         protected_until=None,
     )
 
+    assert row.is_deletion_prohibited(at=datetime(2035, 1, 1, tzinfo=UTC))
     assert not row.is_deletion_prohibited(
-        at=datetime(2035, 1, 1, tzinfo=UTC)
+        at=datetime(2035, 1, 1, tzinfo=UTC),
+        governed_purge=True,
     )
+
+
+def test_ordinary_evidence_can_be_soft_deleted_without_removing_bytes() -> None:
+    now = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
+    row = BucketFile(
+        retention_class="bucket_evidence",
+        legal_hold=False,
+        protected_until=now + timedelta(days=730),
+    )
+
+    assert not row.is_soft_deletion_prohibited(at=now)
+
+
+@pytest.mark.parametrize("retention_class", sorted(PROTECTED_RETENTION_CLASSES))
+def test_compliance_evidence_keeps_stronger_soft_delete_guard(
+    retention_class: str,
+) -> None:
+    now = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
+    row = BucketFile(
+        retention_class=retention_class,
+        legal_hold=False,
+        protected_until=now + timedelta(days=730),
+    )
+
+    assert row.is_soft_deletion_prohibited(at=now)
 
 
 def test_ach_retention_migration_recovers_legacy_certificate_rows() -> None:

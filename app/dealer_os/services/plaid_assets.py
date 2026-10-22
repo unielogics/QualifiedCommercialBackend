@@ -327,7 +327,7 @@ async def ingest_asset_report(db: AsyncSession, asset_report_id: str) -> PlaidAs
     if dealer is None:
         raise ValueError("Field Desk file not found for Asset Report")
     if not dealer.plaid_assets_enabled:
-        await plaid_lifecycle.remove_asset_report(report, strict=False)
+        await plaid_lifecycle.remove_asset_report(db, report, strict=False)
         await db.flush()
         return report
 

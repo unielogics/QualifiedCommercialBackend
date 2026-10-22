@@ -16,6 +16,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -24,6 +25,13 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
 from app.models._mixins import TimestampMixin
+from app.retention import (
+    APPLICATION_RETENTION_CLASS,
+    ProtectedRecordDeletionError,
+    default_deadline,
+    physical_deletion_prohibited,
+    retention_state,
+)
 
 
 class ApplicationProfile(TimestampMixin, Base):
@@ -92,6 +100,40 @@ class ApplicationProfile(TimestampMixin, Base):
     primary_bucket_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="SET NULL")
     )
+    retention_class: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=APPLICATION_RETENTION_CLASS,
+        server_default=APPLICATION_RETENTION_CLASS,
+    )
+    protected_until: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=default_deadline,
+    )
+    legal_hold: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
+    @property
+    def retention_state(self) -> str:
+        return retention_state(
+            protected_until=self.protected_until,
+            legal_hold=self.legal_hold,
+        )
+
+    def is_physical_deletion_prohibited(
+        self,
+        *,
+        at: datetime | None = None,
+        governed_purge: bool = False,
+    ) -> bool:
+        return physical_deletion_prohibited(
+            protected_until=self.protected_until,
+            legal_hold=self.legal_hold,
+            at=at,
+            governed_purge=governed_purge,
+        )
     # File-scoped client language. This is deliberately independent from an
     # operator's UI locale and must be snapshotted by generated artifacts.
     communication_locale: Mapped[str] = mapped_column(
@@ -667,18 +709,22 @@ class ApplicationOwner(TimestampMixin, Base):
             "uq_application_owners_primary",
             "profile_id",
             unique=True,
-            postgresql_where=text("is_primary"),
+            postgresql_where=text("is_primary AND archived_at IS NULL"),
         ),
         Index(
             "uq_application_owners_email",
             "profile_id",
             text("lower(email)"),
             unique=True,
-            postgresql_where=text("email IS NOT NULL"),
+            postgresql_where=text("email IS NOT NULL AND archived_at IS NULL"),
         ),
         CheckConstraint(
             "ownership_pct IS NULL OR (ownership_pct >= 0 AND ownership_pct <= 100)",
             name="ck_application_owners_percentage",
+        ),
+        CheckConstraint(
+            "archived_at IS NULL OR invite_token_hash IS NULL",
+            name="ck_application_owners_archived_token_revoked",
         ),
     )
 
@@ -720,6 +766,14 @@ class ApplicationOwner(TimestampMixin, Base):
     backfill_needs_review: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # Removing an owner from the active application is reversible case-state,
+    # not physical destruction. The row remains available to retention/audit
+    # controls while ordinary owner queries exclude it.
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    archive_reason: Mapped[str | None] = mapped_column(String(160))
 
     @property
     def full_name(self) -> str:
@@ -870,3 +924,15 @@ class ApplicationBankConsent(TimestampMixin, Base):
     ip_address: Mapped[str | None] = mapped_column(String(64))
     user_agent: Mapped[str | None] = mapped_column(String(400))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+@event.listens_for(ApplicationProfile, "before_delete")
+def _guard_application_profile_physical_delete(
+    _mapper,
+    _connection,
+    target: ApplicationProfile,
+) -> None:
+    if target.is_physical_deletion_prohibited():
+        raise ProtectedRecordDeletionError(
+            "Application file is inside its minimum retention period; close or archive it instead"
+        )

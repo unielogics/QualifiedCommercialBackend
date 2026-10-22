@@ -940,6 +940,7 @@ async def _enforce_private_credit_recipient(
                 select(ApplicationOwner).where(
                     ApplicationOwner.profile_id == profile.id,
                     ApplicationOwner.invite_token_hash == profile_routes._hash_token(token),
+                    ApplicationOwner.archived_at.is_(None),
                 )
             )
         ).scalar_one_or_none()

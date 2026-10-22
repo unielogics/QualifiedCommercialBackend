@@ -17,6 +17,7 @@ from sqlalchemy import (
     Table,
     Text,
     UniqueConstraint,
+    event,
     func,
     text,
 )
@@ -27,6 +28,14 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app import request_context
 from app.db import Base
 from app.models._mixins import TimestampMixin
+from app.retention import (
+    BUCKET_EVIDENCE_RETENTION_CLASS,
+    BUCKET_RETENTION_CLASS,
+    ProtectedRecordDeletionError,
+    default_deadline,
+    physical_deletion_prohibited,
+    retention_state,
+)
 
 # A protected compliance artifact without an expiry is an incomplete record,
 # not an unprotected one.  Keeping this vocabulary next to the enforcement
@@ -96,6 +105,40 @@ class Bucket(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retention_class: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=BUCKET_RETENTION_CLASS,
+        server_default=BUCKET_RETENTION_CLASS,
+    )
+    protected_until: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=default_deadline,
+    )
+    legal_hold: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
+    @property
+    def retention_state(self) -> str:
+        return retention_state(
+            protected_until=self.protected_until,
+            legal_hold=self.legal_hold,
+        )
+
+    def is_physical_deletion_prohibited(
+        self,
+        *,
+        at: datetime | None = None,
+        governed_purge: bool = False,
+    ) -> bool:
+        return physical_deletion_prohibited(
+            protected_until=self.protected_until,
+            legal_hold=self.legal_hold,
+            at=at,
+            governed_purge=governed_purge,
+        )
 
     created_by: Mapped[User | None] = relationship(foreign_keys=[created_by_id])
     requested_documents: Mapped[list[BucketRequestedDocument]] = relationship(
@@ -271,8 +314,17 @@ class BucketFile(TimestampMixin, Base):
     # policy.  ``source_entity_id`` intentionally has no foreign key: proof of
     # authorization must remain reproducible even when its workflow record is
     # later archived or removed under a different retention policy.
-    retention_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    protected_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retention_class: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=BUCKET_EVIDENCE_RETENTION_CLASS,
+        server_default=BUCKET_EVIDENCE_RETENTION_CLASS,
+    )
+    protected_until: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=default_deadline,
+    )
     legal_hold: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
@@ -292,15 +344,22 @@ class BucketFile(TimestampMixin, Base):
 
         return provenance.describe_document(self)
 
-    def is_deletion_prohibited(self, *, at: datetime | None = None) -> bool:
-        """Return whether soft or storage deletion is currently forbidden.
+    def is_deletion_prohibited(
+        self,
+        *,
+        at: datetime | None = None,
+        governed_purge: bool = False,
+    ) -> bool:
+        """Return whether physical deletion is currently forbidden.
 
         This model-level primitive keeps time comparison policy in one place;
-        API and background deletion paths must call it before mutating the row
-        or its S3 object.  A legal hold has no expiry.  Naive legacy timestamps
-        are treated as UTC.
+        storage purge and hard-delete paths must call it before removing the
+        row or its S3 object. A legal hold has no expiry. Naive legacy
+        timestamps are treated as UTC.
         """
 
+        if not governed_purge:
+            return True
         if self.legal_hold:
             return True
         if (
@@ -317,6 +376,28 @@ class BucketFile(TimestampMixin, Base):
         if checked_at.tzinfo is None:
             checked_at = checked_at.replace(tzinfo=UTC)
         return protected_until > checked_at
+
+    def is_soft_deletion_prohibited(self, *, at: datetime | None = None) -> bool:
+        """Protect immutable compliance proof while allowing recoverable trash.
+
+        Ordinary evidence remains physically protected, but an operator may
+        move it to Deleted files because that action retains both row and
+        object bytes. Existing ACH/agreement rules remain stronger.
+        """
+
+        if self.legal_hold:
+            return True
+        return (
+            self.retention_class in PROTECTED_RETENTION_CLASSES
+            and self.is_deletion_prohibited(at=at, governed_purge=True)
+        )
+
+    @property
+    def retention_state(self) -> str:
+        return retention_state(
+            protected_until=self.protected_until,
+            legal_hold=self.legal_hold,
+        )
 
     bucket_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="CASCADE"), nullable=False, index=True
@@ -829,3 +910,19 @@ class BucketAIActionItem(Base):
     requested_document: Mapped[BucketRequestedDocument | None] = relationship()
     created_by_user: Mapped[User | None] = relationship(foreign_keys=[created_by_user_id])
     approved_by_user: Mapped[User | None] = relationship(foreign_keys=[approved_by_user_id])
+
+
+@event.listens_for(Bucket, "before_delete")
+def _guard_bucket_physical_delete(_mapper, _connection, target: Bucket) -> None:
+    if target.is_physical_deletion_prohibited():
+        raise ProtectedRecordDeletionError(
+            "Bucket is inside its minimum retention period; archive it instead"
+        )
+
+
+@event.listens_for(BucketFile, "before_delete")
+def _guard_bucket_file_physical_delete(_mapper, _connection, target: BucketFile) -> None:
+    if target.is_deletion_prohibited():
+        raise ProtectedRecordDeletionError(
+            "Bucket evidence is inside its minimum retention period; soft-delete it instead"
+        )

@@ -159,6 +159,7 @@ from app.schemas.application_profile import (
     WorksheetRowOp,
 )
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
+from app.schemas.retention import LegalHoldChange, RetentionStatusRead
 from app.schemas.use_of_funds import (
     UseOfFundsPatch,
     UseOfFundsRead,
@@ -179,12 +180,14 @@ from app.services import (
     financial_statements,
     funding_programs,
     intake_lifecycle,
+    intake_retention,
     locked_file_requests,
     merchant_processing,
     missing_item_automation,
     pfs_schema,
     plaid_lifecycle,
     plaid_policy,
+    retention_holds,
     sheets,
 )
 from app.services.activity_log import log_activity, mark_loan_dirty
@@ -767,8 +770,13 @@ async def _owner_for_profile(
         if profile.dealer_id
         else ApplicationOwner.profile_id == profile.id
     )
+    active_predicate = (
+        () if profile.dealer_id else (ApplicationOwner.archived_at.is_(None),)
+    )
     owner = (
-        await db.execute(select(model).where(model.id == owner_id, predicate))
+        await db.execute(
+            select(model).where(model.id == owner_id, predicate, *active_predicate)
+        )
     ).scalar_one_or_none()
     if owner is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this file")
@@ -791,7 +799,14 @@ async def _assert_unique_email(
         if profile.dealer_id
         else ApplicationOwner.profile_id == profile.id
     )
-    stmt = select(model.id).where(predicate, func.lower(model.email) == email)
+    active_predicate = (
+        () if profile.dealer_id else (ApplicationOwner.archived_at.is_(None),)
+    )
+    stmt = select(model.id).where(
+        predicate,
+        *active_predicate,
+        func.lower(model.email) == email,
+    )
     if exclude_id:
         stmt = stmt.where(model.id != exclude_id)
     if (await db.execute(stmt.limit(1))).scalar_one_or_none() is not None:
@@ -961,6 +976,12 @@ async def apply_underwriting_changes(
         profile.estimated_close_date = changes["estimated_close_date"]
     profile.underwriting_updated_by_user_id = user.id
     profile.underwriting_updated_at = now
+    if status_value in {"closed_won", "closed_lost", "denied"}:
+        await intake_retention.extend_application_profile_retention(
+            db,
+            profile,
+            anchor=now,
+        )
 
     loan = await _sync_profile_loan_stage(
         db,
@@ -2158,6 +2179,109 @@ async def finalize_application_draft(
     return profiles.profile_read(profile)
 
 
+@router.post(
+    "/{profile_id}/legal-hold",
+    response_model=RetentionStatusRead,
+)
+async def apply_application_legal_hold(
+    profile_id: UUID,
+    payload: LegalHoldChange,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RetentionStatusRead:
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
+    profile = await profiles.load_profile(db, profile_id, user)
+    already_held = profile.legal_hold
+    await retention_holds.set_legal_hold(
+        db,
+        profile,
+        ApplicationProfile,
+        enabled=True,
+    )
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "retention.legal_hold.applied",
+        ("Already held; " if already_held else "") + payload.reason.strip(),
+        target_type="application_profile",
+        target_id=profile.id,
+    )
+    await db.commit()
+    await db.refresh(profile)
+    return RetentionStatusRead(
+        **await retention_holds.effective_status_read(
+            db,
+            profile,
+            resource_type="application_profile",
+        )
+    )
+
+
+@router.get(
+    "/{profile_id}/retention",
+    response_model=RetentionStatusRead,
+)
+async def get_application_retention_status(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RetentionStatusRead:
+    """Reload the application's effective, graph-wide retention status."""
+
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
+    profile = await profiles.load_profile(db, profile_id, user)
+    return RetentionStatusRead(
+        **await retention_holds.effective_status_read(
+            db,
+            profile,
+            resource_type="application_profile",
+        )
+    )
+
+
+@router.post(
+    "/{profile_id}/legal-hold/release",
+    response_model=RetentionStatusRead,
+)
+async def release_application_legal_hold(
+    profile_id: UUID,
+    payload: LegalHoldChange,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RetentionStatusRead:
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
+    profile = await profiles.load_profile(db, profile_id, user)
+    was_held = profile.legal_hold
+    await retention_holds.set_legal_hold(
+        db,
+        profile,
+        ApplicationProfile,
+        enabled=False,
+    )
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "retention.legal_hold.released",
+        ("Was not held; " if not was_held else "") + payload.reason.strip(),
+        target_type="application_profile",
+        target_id=profile.id,
+    )
+    await db.commit()
+    await db.refresh(profile)
+    return RetentionStatusRead(
+        **await retention_holds.effective_status_read(
+            db,
+            profile,
+            resource_type="application_profile",
+        )
+    )
+
+
 @router.get("/{profile_id}/draft-status", response_model=ApplicationDraftAnalysisStatus)
 async def get_application_draft_status(
     profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
@@ -2338,10 +2462,22 @@ async def delete_application_owner(
 ) -> None:
     profile = await profiles.load_profile(db, profile_id, user)
     owner = await _owner_for_profile(db, profile, owner_id)
-    if owner.invite_sent_at is not None or owner.credit_pulled_at is not None or owner.credit_pull_id is not None:
+    # A pending invite is not credit history for an application-owned row: the
+    # soft archive below revokes its token while retaining the invitation audit
+    # timestamps. Dealer owners keep their established hard-delete semantics.
+    removal_is_blocked = owner.credit_pulled_at is not None or owner.credit_pull_id is not None
+    if not isinstance(owner, ApplicationOwner):
+        removal_is_blocked = removal_is_blocked or owner.invite_sent_at is not None
+    if removal_is_blocked:
         raise HTTPException(status.HTTP_409_CONFLICT, "This owner has credit history and cannot be deleted")
     name = owner.full_name
-    await db.delete(owner)
+    if isinstance(owner, ApplicationOwner):
+        owner.archived_at = datetime.now(UTC)
+        owner.archived_by_user_id = user.id
+        owner.archive_reason = "removed_by_staff"
+        owner.invite_token_hash = None
+    else:
+        await db.delete(owner)
     await profiles.log_profile_action(
         db, profile, user, "owner.delete", f"Removed owner {name}", target_type="owner", target_id=owner_id,
     )
@@ -2461,7 +2597,12 @@ async def _public_application_owner(db: AsyncSession, token: str) -> Application
     if not token.startswith("app."):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "This consent link is no longer valid")
     owner = (
-        await db.execute(select(ApplicationOwner).where(ApplicationOwner.invite_token_hash == _hash_token(token)))
+        await db.execute(
+            select(ApplicationOwner).where(
+                ApplicationOwner.invite_token_hash == _hash_token(token),
+                ApplicationOwner.archived_at.is_(None),
+            )
+        )
     ).scalar_one_or_none()
     if owner is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "This consent link is no longer valid")
@@ -2507,7 +2648,10 @@ async def submit_public_application_credit_consent(
     claimed = (
         await db.execute(
             sa_update(ApplicationOwner)
-            .where(ApplicationOwner.invite_token_hash == token_hash)
+            .where(
+                ApplicationOwner.invite_token_hash == token_hash,
+                ApplicationOwner.archived_at.is_(None),
+            )
             .values(invite_token_hash=None)
             .returning(ApplicationOwner.id)
         )
@@ -3021,10 +3165,21 @@ async def public_application_room_delete_owner(
 ) -> None:
     _link, profile = await _public_application_room(db, token, payload.passcode, request)
     owner = await _owner_for_profile(db, profile, owner_id)
-    if owner.invite_sent_at is not None or owner.credit_pulled_at is not None or owner.credit_pull_id is not None:
+    # Pending application-owner invitations are revoked by the soft archive;
+    # preserve the stricter legacy rule for dealer owners.
+    removal_is_blocked = owner.credit_pulled_at is not None or owner.credit_pull_id is not None
+    if not isinstance(owner, ApplicationOwner):
+        removal_is_blocked = removal_is_blocked or owner.invite_sent_at is not None
+    if removal_is_blocked:
         raise HTTPException(status.HTTP_409_CONFLICT, "This owner has credit authorization history and cannot be deleted")
     name = owner.full_name
-    await db.delete(owner)
+    if isinstance(owner, ApplicationOwner):
+        owner.archived_at = datetime.now(UTC)
+        owner.archived_by_user_id = None
+        owner.archive_reason = "removed_by_client"
+        owner.invite_token_hash = None
+    else:
+        await db.delete(owner)
     await profiles.log_profile_action(
         db, profile, None, "owner.delete.application_room", f"Client removed owner {name}",
         target_type="owner", target_id=owner_id,
@@ -4048,7 +4203,7 @@ async def update_application_plaid_settings(
         )
         for report in reports:
             if report.ingested_at is None and report.status != "removed":
-                await plaid_lifecycle.remove_asset_report(report, strict=False)
+                await plaid_lifecycle.remove_asset_report(db, report, strict=False)
                 removed_report_ids.append(str(report.id))
 
     await profiles.log_profile_action(
@@ -4635,7 +4790,7 @@ async def delete_application_asset_report(
     profile = await profiles.load_profile(db, profile_id, user)
     report = await _profile_asset_report(db, profile, report_id)
     try:
-        await plaid_lifecycle.remove_asset_report(report)
+        await plaid_lifecycle.remove_asset_report(db, report)
     except plaid_client.PlaidUnavailable as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     await profiles.log_profile_action(
@@ -4904,6 +5059,32 @@ async def _owner_links(
     if not rows:
         return []
     by_id = {owner.id: owner for owner in await profiles.owner_rows(db, profile)}
+    # Active workflows must ignore archived owners, but a retained historical
+    # statement still needs to identify the people it covered. Load only the
+    # archived application-owner rows explicitly referenced by this statement;
+    # they remain read-only and are never offered for a new link.
+    if profile.dealer_id is None:
+        missing_application_owner_ids = {
+            row.application_owner_id
+            for row in rows
+            if row.application_owner_id is not None
+            and row.application_owner_id not in by_id
+        }
+        if missing_application_owner_ids:
+            archived_owners = (
+                (
+                    await db.execute(
+                        select(ApplicationOwner).where(
+                            ApplicationOwner.profile_id == profile.id,
+                            ApplicationOwner.id.in_(missing_application_owner_ids),
+                            ApplicationOwner.archived_at.is_not(None),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            by_id.update({owner.id: owner for owner in archived_owners})
     links: list[FinancialStatementOwnerLink] = []
     for row in rows:
         owner_id = row.application_owner_id or row.dealer_owner_id

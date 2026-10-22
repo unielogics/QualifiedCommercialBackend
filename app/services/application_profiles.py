@@ -580,6 +580,10 @@ def profile_read(profile: ApplicationProfile) -> ApplicationProfileRead:
         intake_id=profile.intake_id,
         dealer_id=profile.dealer_id,
         primary_bucket_id=profile.primary_bucket_id,
+        retention_class=getattr(profile, "retention_class", "application_record"),
+        protected_until=getattr(profile, "protected_until", None),
+        legal_hold=bool(getattr(profile, "legal_hold", False)),
+        retention_state=getattr(profile, "retention_state", "unclassified"),
         communication_locale=getattr(profile, "communication_locale", "en"),
         communication_locale_source=getattr(
             profile, "communication_locale_source", "system_default"
@@ -928,7 +932,8 @@ async def _seed_primary_owner(
         (
             await db.execute(
                 select(func.count()).select_from(ApplicationOwner).where(
-                    ApplicationOwner.profile_id == profile.id
+                    ApplicationOwner.profile_id == profile.id,
+                    ApplicationOwner.archived_at.is_(None),
                 )
             )
         ).scalar_one()
@@ -1207,10 +1212,15 @@ async def owner_rows(db: AsyncSession, profile: ApplicationProfile) -> list[Appl
         if profile.dealer_id
         else ApplicationOwner.profile_id == profile.id
     )
+    active_predicate = (
+        () if profile.dealer_id else (ApplicationOwner.archived_at.is_(None),)
+    )
     return list(
         (
             await db.execute(
-                select(model).where(predicate).order_by(model.created_at.asc(), model.id.asc())
+                select(model)
+                .where(predicate, *active_predicate)
+                .order_by(model.created_at.asc(), model.id.asc())
             )
         ).scalars().all()
     )

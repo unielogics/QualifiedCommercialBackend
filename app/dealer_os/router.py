@@ -101,6 +101,7 @@ from app.services import (
 )
 from app.services.notifications import notify_inbound_communication, notify_users
 from app.services import file_events, merchant_processing, upload_validation
+from app.services import bucket_storage_integrity
 from app.services.team_calendar import (
     effective_booking_settings,
     lock_calendar_owner,
@@ -485,6 +486,7 @@ from .services import (
     buckets_link,
     business_credit as business_credit_svc,
     credit_quality,
+    document_recovery,
     financial_snapshot as financial_snapshot_svc,
     vendors,
     handoff as handoff_service,
@@ -5326,7 +5328,19 @@ async def delete_dealer_document(
     """Soft-delete document evidence and its bucket mirror as one audited act."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
-    document = await _load_document(db, dealer.id, doc_id)
+    document = (
+        await db.execute(
+            select(DealerDocument)
+            .where(
+                DealerDocument.id == doc_id,
+                DealerDocument.dealer_id == dealer.id,
+                DealerDocument.status != "deleted",
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if document is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found for this client")
     application_submitted, package_evidence_exists = await _document_submission_state(db, dealer)
     if not _can_delete_documents(
         user.role,
@@ -5345,11 +5359,13 @@ async def delete_dealer_document(
 
     children = (
         await db.execute(
-            select(DealerDocument).where(
+            select(DealerDocument)
+            .where(
                 DealerDocument.dealer_id == dealer.id,
                 DealerDocument.parent_document_id == document.id,
                 DealerDocument.status != "deleted",
             )
+            .with_for_update()
         )
     ).scalars().all()
     targets = [document, *children]
@@ -5371,15 +5387,124 @@ async def delete_dealer_document(
     ).all()
     bank_scopes.update((account_id, period) for account_id, period in cash_scopes)
 
+    # Snapshot every normalized row that this operation removes or detaches.
+    # Re-extracting the PDF later is not an equivalent restore: extractors and
+    # classification rules evolve, so it could silently produce different
+    # underwriting facts.  The snapshot is written on the retained source
+    # document in the same transaction as the removal.
+    doc_requests = list(
+        (
+            await db.execute(
+                select(DealerDocRequest)
+                .where(DealerDocRequest.fulfilled_document_id.in_(target_ids))
+                .with_for_update()
+            )
+        ).scalars().all()
+    )
+    cash_events = list(
+        (
+            await db.execute(
+                select(DealerCashEvent)
+                .where(DealerCashEvent.document_id.in_(target_ids))
+                .with_for_update()
+            )
+        ).scalars().all()
+    )
+    tax_filings = list(
+        (
+            await db.execute(
+                select(DealerTaxFiling)
+                .where(DealerTaxFiling.document_id.in_(target_ids))
+                .with_for_update()
+            )
+        ).scalars().all()
+    )
+    debts = list(
+        (
+            await db.execute(
+                select(DealerDebt)
+                .where(DealerDebt.document_id.in_(target_ids))
+                .with_for_update()
+            )
+        ).scalars().all()
+    )
+    addbacks = list(
+        (
+            await db.execute(
+                select(DealerAddback)
+                .where(DealerAddback.document_id.in_(target_ids))
+                .with_for_update()
+            )
+        ).scalars().all()
+    )
+    impacted_period_keys = set(bank_scopes)
+    impacted_period_keys.update((None, period) for period in pl_periods)
+    impacted_periods_before: list[DealerFinancialPeriod] = []
+    if impacted_period_keys:
+        candidate_periods = list(
+            (
+                await db.execute(
+                    select(DealerFinancialPeriod)
+                    .where(
+                        DealerFinancialPeriod.dealer_id == dealer.id,
+                        DealerFinancialPeriod.period.in_(
+                            {period for _account_id, period in impacted_period_keys}
+                        ),
+                    )
+                    .with_for_update()
+                )
+            ).scalars().all()
+        )
+        impacted_periods_before = [
+            row
+            for row in candidate_periods
+            if (row.account_id, row.period) in impacted_period_keys
+        ]
+
+    deleted_at = datetime.now(timezone.utc)
+    recovery_archive: dict[str, Any] = {
+        "version": document_recovery.ARCHIVE_VERSION,
+        "state": "deleted",
+        "root_document_id": str(document.id),
+        "deleted_at": deleted_at.isoformat(),
+        "deleted_by_user_id": str(user.id),
+        "documents": [
+            {"id": str(row.id), "status": row.status, "error": row.error}
+            for row in targets
+        ],
+        "doc_requests": [document_recovery.row_snapshot(row) for row in doc_requests],
+        "cash_events": [document_recovery.row_snapshot(row) for row in cash_events],
+        "tax_filings": [document_recovery.row_snapshot(row) for row in tax_filings],
+        "debts_deleted": [
+            document_recovery.row_snapshot(row) for row in debts if row.origin != "admin"
+        ],
+        "debts_detached": [
+            document_recovery.row_snapshot(row) for row in debts if row.origin == "admin"
+        ],
+        "addbacks_deleted": [
+            document_recovery.row_snapshot(row) for row in addbacks if row.status != "verified"
+        ],
+        "addbacks_detached": [
+            document_recovery.row_snapshot(row) for row in addbacks if row.status == "verified"
+        ],
+        "financial_periods_before": [
+            document_recovery.row_snapshot(row) for row in impacted_periods_before
+        ],
+        "financial_periods_after": [],
+        "bucket_file_ids": [],
+    }
+
     bucket_file_ids = [row.bucket_file_id for row in targets if row.bucket_file_id]
     bucket_files = []
     if bucket_file_ids:
         bucket_files = (
             await db.execute(
-                select(BucketFile).where(
+                select(BucketFile)
+                .where(
                     BucketFile.id.in_(bucket_file_ids),
                     BucketFile.deleted_at.is_(None),
                 )
+                .with_for_update()
             )
         ).scalars().all()
     for bucket_file in bucket_files:
@@ -5389,6 +5514,18 @@ async def delete_dealer_document(
             user,
             detail=f"Removed with Field Desk document {document.filename}",
         )
+    recovery_archive["bucket_file_ids"] = [str(row.id) for row in bucket_files]
+
+    document_recovery.set_archive(document, recovery_archive)
+    for row in children:
+        document_recovery.set_archive(
+            row,
+            {
+                "version": document_recovery.ARCHIVE_VERSION,
+                "state": "deleted_member",
+                "root_document_id": str(document.id),
+            },
+        )
 
     await db.execute(
         sa_update(DealerDocRequest)
@@ -5397,10 +5534,12 @@ async def delete_dealer_document(
     )
     await db.execute(sa_delete(DealerCashEvent).where(DealerCashEvent.document_id.in_(target_ids)))
     await db.execute(sa_delete(DealerTaxFiling).where(DealerTaxFiling.document_id.in_(target_ids)))
+    # Debt rows are underwriting evidence. Removing their source document
+    # retires them from calculations but must not erase their retained history.
     await db.execute(
-        sa_delete(DealerDebt).where(
-            DealerDebt.document_id.in_(target_ids), DealerDebt.origin != "admin"
-        )
+        sa_update(DealerDebt)
+        .where(DealerDebt.document_id.in_(target_ids), DealerDebt.origin != "admin")
+        .values(status="dismissed", document_id=None)
     )
     await db.execute(
         sa_update(DealerDebt)
@@ -5492,6 +5631,31 @@ async def delete_dealer_document(
             financial_period.revenue = None
             financial_period.net_income = None
 
+    await db.flush()
+    impacted_periods_after: list[DealerFinancialPeriod] = []
+    if impacted_period_keys:
+        candidate_periods = list(
+            (
+                await db.execute(
+                    select(DealerFinancialPeriod).where(
+                        DealerFinancialPeriod.dealer_id == dealer.id,
+                        DealerFinancialPeriod.period.in_(
+                            {period for _account_id, period in impacted_period_keys}
+                        ),
+                    )
+                )
+            ).scalars().all()
+        )
+        impacted_periods_after = [
+            row
+            for row in candidate_periods
+            if (row.account_id, row.period) in impacted_period_keys
+        ]
+    recovery_archive["financial_periods_after"] = [
+        document_recovery.row_snapshot(row) for row in impacted_periods_after
+    ]
+    document_recovery.set_archive(document, recovery_archive)
+
     await recompute_snapshot(db, dealer.id)
     await log_action(
         db,
@@ -5514,6 +5678,404 @@ async def delete_dealer_document(
     )
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/dealers/{dealer_id}/documents/{doc_id}/restore",
+    response_model=DocumentRead,
+)
+async def restore_dealer_document(
+    dealer_id: UUID,
+    doc_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerDocument:
+    """Restore Field Desk evidence and its exact normalized underwriting facts.
+
+    A mirrored Bucket file with ``retained_for_audit`` cannot be restored on
+    its own.  This endpoint locks and restores the source document, its archive
+    children, Bucket mirrors, request fulfillment, and every normalized fact
+    as one transaction.  If later underwriting work overlaps the removed
+    periods, restoration fails instead of overwriting newer evidence.
+    """
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    selected = (
+        await db.execute(
+            select(DealerDocument)
+            .where(
+                DealerDocument.id == doc_id,
+                DealerDocument.dealer_id == dealer.id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if selected is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found for this client")
+    if selected.status != "deleted":
+        return selected
+
+    marker = document_recovery.archive_for(selected)
+    if marker is None or marker.get("version") != document_recovery.ARCHIVE_VERSION:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This historical removal does not have a complete recovery snapshot",
+        )
+    try:
+        root_document_id = UUID(str(marker.get("root_document_id") or selected.id))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This document has an invalid recovery record",
+        ) from exc
+    root = selected
+    if root_document_id != selected.id:
+        root = (
+            await db.execute(
+                select(DealerDocument)
+                .where(
+                    DealerDocument.id == root_document_id,
+                    DealerDocument.dealer_id == dealer.id,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if root is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "The parent document recovery record is unavailable",
+            )
+    archive = document_recovery.archive_for(root)
+    if (
+        archive is None
+        or archive.get("version") != document_recovery.ARCHIVE_VERSION
+        or archive.get("state") != "deleted"
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This document does not have a complete recovery snapshot",
+        )
+
+    application_submitted, package_evidence_exists = await _document_submission_state(db, dealer)
+    if not _can_delete_documents(
+        user.role,
+        application_submitted=application_submitted,
+        package_evidence_exists=package_evidence_exists,
+    ):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "This file has been submitted for underwriting. Only a super admin can restore documents now.",
+        )
+
+    try:
+        document_ids = [UUID(str(row["id"])) for row in archive.get("documents", [])]
+        bucket_file_ids = [UUID(str(value)) for value in archive.get("bucket_file_ids", [])]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This document has an invalid recovery record",
+        ) from exc
+    if not document_ids or root.id not in document_ids:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This document recovery record is incomplete",
+        )
+
+    documents = list(
+        (
+            await db.execute(
+                select(DealerDocument)
+                .where(
+                    DealerDocument.dealer_id == dealer.id,
+                    DealerDocument.id.in_(document_ids),
+                )
+                .with_for_update()
+            )
+        ).scalars().all()
+    )
+    documents_by_id = {row.id: row for row in documents}
+    if set(documents_by_id) != set(document_ids) or any(
+        row.status != "deleted" for row in documents
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "One or more archived documents changed after removal; refresh before restoring",
+        )
+
+    bucket_files: list[BucketFile] = []
+    if bucket_file_ids:
+        bucket_files = list(
+            (
+                await db.execute(
+                    select(BucketFile)
+                    .where(BucketFile.id.in_(bucket_file_ids))
+                    .with_for_update()
+                )
+            ).scalars().all()
+        )
+        if {row.id for row in bucket_files} != set(bucket_file_ids) or any(
+            row.deleted_at is None or row.delete_storage_status != "retained_for_audit"
+            for row in bucket_files
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "The retained Bucket evidence changed after removal; restore was not applied",
+            )
+        try:
+            await bucket_storage_integrity.verify_bucket_file_objects(bucket_files)
+        except bucket_storage_integrity.RetainedObjectMissingError as exc:
+            missing = ", ".join(row.file_name for row in exc.objects)
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Retained evidence is missing from storage: {missing}",
+            ) from exc
+        except bucket_storage_integrity.RetainedObjectVerificationError as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                "Retained evidence storage could not be verified; nothing was restored",
+            ) from exc
+
+    # Compare the materialized period state left by deletion with the current
+    # state.  A mismatch means later evidence or a human edit overlaps these
+    # months; silently replacing it with the old snapshot would lose work.
+    period_after = archive.get("financial_periods_after") or []
+    period_before = archive.get("financial_periods_before") or []
+    period_ids = {
+        UUID(str(row["id"])) for row in [*period_after, *period_before] if row.get("id")
+    }
+    current_periods: list[DealerFinancialPeriod] = []
+    if period_ids:
+        current_periods = list(
+            (
+                await db.execute(
+                    select(DealerFinancialPeriod)
+                    .where(
+                        DealerFinancialPeriod.dealer_id == dealer.id,
+                        DealerFinancialPeriod.id.in_(period_ids),
+                    )
+                    .with_for_update()
+                )
+            ).scalars().all()
+        )
+    current_periods_by_id = {row.id: row for row in current_periods}
+    if {UUID(str(row["id"])) for row in period_after} != set(current_periods_by_id):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Underwriting periods changed after removal; restore requires review",
+        )
+    for snapshot in period_after:
+        period_id = UUID(str(snapshot["id"]))
+        if not document_recovery.snapshots_match(current_periods_by_id[period_id], snapshot):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Underwriting periods changed after removal; restore requires review",
+            )
+
+    deleted_models: tuple[tuple[type[Any], str], ...] = (
+        (DealerCashEvent, "cash_events"),
+        (DealerTaxFiling, "tax_filings"),
+        (DealerDebt, "debts_deleted"),
+        (DealerAddback, "addbacks_deleted"),
+    )
+    for model, key in deleted_models:
+        snapshots = archive.get(key) or []
+        ids = [UUID(str(row["id"])) for row in snapshots]
+        if ids:
+            existing = list(
+                (
+                    await db.execute(select(model).where(model.id.in_(ids)).with_for_update())
+                ).scalars().all()
+            )
+            if existing:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Derived evidence was replaced after removal; restore requires review",
+                )
+
+    # Tax filings are unique by dealer/year, so detect a replacement before
+    # adding the archived row and return a clear conflict rather than a 500.
+    archived_tax_years = [int(row["year"]) for row in archive.get("tax_filings") or []]
+    if archived_tax_years:
+        replacement_tax = await db.scalar(
+            select(func.count()).select_from(DealerTaxFiling).where(
+                DealerTaxFiling.dealer_id == dealer.id,
+                DealerTaxFiling.year.in_(archived_tax_years),
+            )
+        )
+        if replacement_tax:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "A tax filing for an archived year now exists; restore requires review",
+            )
+
+    detached_rows: tuple[tuple[type[Any], str], ...] = (
+        (DealerDebt, "debts_detached"),
+        (DealerAddback, "addbacks_detached"),
+    )
+    detached_instances: list[tuple[Any, UUID]] = []
+    for model, key in detached_rows:
+        for snapshot in archive.get(key) or []:
+            row_id = UUID(str(snapshot["id"]))
+            row = await db.get(model, row_id, with_for_update=True)
+            expected_document_id = UUID(str(snapshot["document_id"]))
+            if row is None or row.document_id not in {None, expected_document_id}:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "A reviewed underwriting item changed after removal; restore requires review",
+                )
+            detached_instances.append((row, expected_document_id))
+
+    request_instances: list[tuple[DealerDocRequest, dict[str, Any]]] = []
+    for snapshot in archive.get("doc_requests") or []:
+        request_row = await db.get(
+            DealerDocRequest, UUID(str(snapshot["id"])), with_for_update=True
+        )
+        original_document_id = UUID(str(snapshot["fulfilled_document_id"]))
+        if request_row is None or not (
+            (request_row.status == "open" and request_row.fulfilled_document_id is None)
+            or (
+                request_row.status == snapshot.get("status")
+                and request_row.fulfilled_document_id == original_document_id
+            )
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "A document request changed after removal; restore requires review",
+            )
+        request_instances.append((request_row, snapshot))
+
+    for model, key in deleted_models:
+        for snapshot in archive.get(key) or []:
+            db.add(document_recovery.row_from_snapshot(model, snapshot))
+    for row, document_id_value in detached_instances:
+        row.document_id = document_id_value
+    for row, snapshot in request_instances:
+        row.status = str(snapshot.get("status") or "fulfilled")
+        row.fulfilled_document_id = UUID(str(snapshot["fulfilled_document_id"]))
+
+    before_period_ids = {UUID(str(row["id"])) for row in period_before}
+    for snapshot in period_before:
+        period_id = UUID(str(snapshot["id"]))
+        restored_values = document_recovery.row_from_snapshot(
+            DealerFinancialPeriod, snapshot
+        )
+        current = current_periods_by_id.get(period_id)
+        if current is None:
+            db.add(restored_values)
+            current_periods_by_id[period_id] = restored_values
+            continue
+        for column in DealerFinancialPeriod.__table__.columns:
+            if column.name == "id":
+                continue
+            setattr(current, column.name, getattr(restored_values, column.name))
+
+    # A period created solely by the delete rebuild has no prior snapshot.
+    # Leave it in place; the restored event ledger below becomes its source of
+    # truth and a rebuild refreshes its deposits/withdrawals.
+    restored_document_rows = {UUID(str(row["id"])): row for row in archive["documents"]}
+    restored_bank_scopes: set[tuple[UUID | None, date]] = set()
+    for document_id_value, document_row in documents_by_id.items():
+        state = restored_document_rows[document_id_value]
+        document_row.status = str(state["status"])
+        document_row.error = state.get("error")
+        document_recovery.clear_archive(document_row)
+        restored_bank_scopes.update(
+            (document_row.account_id, period)
+            for period in _document_month_keys(document_row)
+        )
+
+    for bucket_file in bucket_files:
+        await buckets_link.restore_mirrored_file(
+            db,
+            bucket_file,
+            user,
+            detail=f"Restored with Field Desk document {root.filename}",
+            storage_verified=True,
+        )
+
+    await db.flush()
+    for account_id, periods in {
+        account_id: {period for scoped_account_id, period in restored_bank_scopes if scoped_account_id == account_id}
+        for account_id, _period in restored_bank_scopes
+    }.items():
+        await rebuild_periods(db, dealer.id, periods, account_id=account_id)
+    # ``rebuild_periods`` establishes rows for any legacy gap but deliberately
+    # recomputes deposits and timestamps.  Reapply the archived pre-delete
+    # values so the restored underwriting period is byte-for-byte equivalent
+    # at the normalized-fact layer.
+    for snapshot in period_before:
+        period_id = UUID(str(snapshot["id"]))
+        restored_values = document_recovery.row_from_snapshot(
+            DealerFinancialPeriod, snapshot
+        )
+        current = current_periods_by_id[period_id]
+        for column in DealerFinancialPeriod.__table__.columns:
+            if column.name == "id":
+                continue
+            setattr(current, column.name, getattr(restored_values, column.name))
+    await db.flush()
+    await recompute_snapshot(db, dealer.id)
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "dealer_doc.restore",
+        "document",
+        entity_id=root.id,
+        before={
+            "status": "deleted",
+            "documents": len(documents),
+            "bucket_files": len(bucket_files),
+        },
+        after={
+            "status": restored_document_rows[root.id]["status"],
+            "cash_events": len(archive.get("cash_events") or []),
+            "tax_filings": len(archive.get("tax_filings") or []),
+            "debts": len(archive.get("debts_deleted") or [])
+            + len(archive.get("debts_detached") or []),
+            "addbacks": len(archive.get("addbacks_deleted") or [])
+            + len(archive.get("addbacks_detached") or []),
+            "financial_periods": len(before_period_ids),
+        },
+    )
+    await db.commit()
+    await db.refresh(root)
+    return root
+
+
+@router.get(
+    "/dealers/{dealer_id}/documents/deleted",
+    response_model=list[DocumentRead],
+)
+async def list_deleted_dealer_documents(
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[DocumentRead]:
+    """List recoverable Field Desk documents without exposing fact archives."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    rows = list(
+        (
+            await db.execute(
+                select(DealerDocument)
+                .where(
+                    DealerDocument.dealer_id == dealer.id,
+                    DealerDocument.status == "deleted",
+                )
+                .order_by(DealerDocument.updated_at.desc())
+            )
+        ).scalars().all()
+    )
+    output: list[DocumentRead] = []
+    for row in rows:
+        item = DocumentRead.model_validate(row)
+        if isinstance(item.doc_meta, dict):
+            metadata = dict(item.doc_meta)
+            metadata.pop(document_recovery.ARCHIVE_KEY, None)
+            item.doc_meta = metadata or None
+        output.append(item)
+    return output
 
 
 @router.get("/dealers/{dealer_id}/documents", response_model=list[DocumentRead])
@@ -16351,10 +16913,7 @@ async def delete_debt(
     ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Debt row not found for this client")
-    if row.vendor_key:
-        row.status = "dismissed"
-    else:
-        await db.delete(row)
+    row.status = "dismissed"
     await log_action(db, dealer.id, user, "debts.delete", "debt", entity_id=debt_id)
     await db.commit()
 
@@ -16907,7 +17466,7 @@ async def update_dealer_plaid_settings(
         reports = await plaid_lifecycle.owner_asset_reports(db, dealer_id=dealer.id)
         for report in reports:
             if report.ingested_at is None and report.status != "removed":
-                await plaid_lifecycle.remove_asset_report(report, strict=False)
+                await plaid_lifecycle.remove_asset_report(db, report, strict=False)
                 removed_report_ids.append(str(report.id))
 
     await log_action(
@@ -18714,7 +19273,7 @@ async def delete_dealer_asset_report(
     dealer = await _load_visible_dealer(db, dealer_id, user)
     report = await _dealer_asset_report(db, dealer.id, report_id)
     try:
-        await plaid_lifecycle.remove_asset_report(report)
+        await plaid_lifecycle.remove_asset_report(db, report)
     except plaid_client.PlaidUnavailable as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     await log_action(
