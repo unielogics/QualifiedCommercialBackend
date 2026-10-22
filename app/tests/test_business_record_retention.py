@@ -107,7 +107,12 @@ def test_standalone_bucket_archive_discovery_and_restore_are_registered() -> Non
         for path, method in contract
     )
     assert "include_archived=True" in inspect.getsource(buckets.get_bucket)
-    assert "include_archived=True" in inspect.getsource(buckets.admin_file_url)
+    # Direct admin download remains available for retained files whether the
+    # parent workspace is active or archived; the file/bucket identity check
+    # is the authorization boundary here.
+    admin_url_source = inspect.getsource(buckets.admin_file_url)
+    assert "file.bucket_id != bucket_id" in admin_url_source
+    assert "_load_bucket_or_404" not in admin_url_source
     assert "include_archived=True" in inspect.getsource(buckets.admin_file_review)
 
 
