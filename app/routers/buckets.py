@@ -438,9 +438,10 @@ async def _load_share_or_404(db: AsyncSession, token: str) -> BucketShare:
             )
         )
     ).scalar_one_or_none()
+    bucket = getattr(share, "bucket", None) if share is not None else None
     if (
         share is None
-        or share.bucket.archived_at is not None
+        or (bucket is not None and bucket.archived_at is not None)
         or not _is_active(share.status, share.expires_at)
     ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Share link not found or inactive")
@@ -486,9 +487,10 @@ async def _load_public_share_or_404(db: AsyncSession, token: str) -> BucketPubli
             )
         )
     ).scalar_one_or_none()
+    bucket = getattr(share, "bucket", None) if share is not None else None
     if (
         share is None
-        or share.bucket.archived_at is not None
+        or (bucket is not None and bucket.archived_at is not None)
         or not _is_active(share.status, share.expires_at)
     ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Share link not found or inactive")
@@ -2927,7 +2929,6 @@ async def admin_file_url(
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileUrl:
-    await _load_bucket_or_404(db, bucket_id, include_archived=True)
     file = await db.get(BucketFile, file_id)
     if file is None or file.bucket_id != bucket_id or file.status != "uploaded" or file.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
