@@ -96,6 +96,9 @@ OPEN_UNDERWRITING_STATES = {
     "approved",
 }
 LEVEL_RANK = {"optional": 0, "recommended": 1, "required": 2}
+# Automatic routing pins the best-ranked eligible published programs, at most
+# this many. Requirements are the union across every pinned selection.
+AUTO_SELECT_LIMIT = 3
 EXPECTED_CLASSIFICATIONS: dict[str, set[str]] = {
     "business_bank_statements_6_months": {"bank_statement"},
     "business_tax_returns_2_years": {"tax_return"},
@@ -947,12 +950,33 @@ async def published_candidates(
     )
 
 
+def _automatic_candidates(
+    profile: ApplicationProfile,
+    candidates: list[ProgramFitCandidate],
+) -> list[ProgramFitCandidate]:
+    """Return up to ``AUTO_SELECT_LIMIT`` eligible candidates in ranked order.
+
+    ``published_candidates`` already sorts best-first, so the first eligible
+    rows are the ones automatic routing pins. At most one row per program key.
+    """
+    picked: list[ProgramFitCandidate] = []
+    seen: set[str] = set()
+    for item in candidates:
+        if not item.eligible or item.program_key in seen:
+            continue
+        seen.add(item.program_key)
+        picked.append(item)
+        if len(picked) >= AUTO_SELECT_LIMIT:
+            break
+    return picked
+
+
 def _automatic_candidate(
     profile: ApplicationProfile,
     candidates: list[ProgramFitCandidate],
 ) -> ProgramFitCandidate | None:
-    eligible = next((item for item in candidates if item.eligible), None)
-    return eligible
+    picked = _automatic_candidates(profile, candidates)
+    return picked[0] if picked else None
 
 
 async def active_selections(
@@ -1035,40 +1059,45 @@ async def _auto_select(
     active = await active_selections(db, profile.id)
     if active or profile.program_selection_mode != "auto":
         return active
-    candidate = _automatic_candidate(profile, candidates)
-    if candidate is None or candidate.playbook_id is None or candidate.playbook_version is None:
+    pinned: list[tuple[ApplicationProgramSelection, ProgramFitCandidate]] = []
+    for candidate in _automatic_candidates(profile, candidates):
+        if candidate.playbook_id is None or candidate.playbook_version is None:
+            continue
+        row = ApplicationProgramSelection(
+            profile_id=profile.id,
+            playbook_id=candidate.playbook_id,
+            playbook_version=candidate.playbook_version,
+            program_key=candidate.program_key,
+            program_name=candidate.program_name,
+            source="ai_auto",
+            fit_score=candidate.fit_score,
+            fit_confidence=candidate.confidence,
+            fit_reasons=[*candidate.reasons, *candidate.preference_reasons],
+        )
+        db.add(row)
+        pinned.append((row, candidate))
+    if not pinned:
         return []
-    row = ApplicationProgramSelection(
-        profile_id=profile.id,
-        playbook_id=candidate.playbook_id,
-        playbook_version=candidate.playbook_version,
-        program_key=candidate.program_key,
-        program_name=candidate.program_name,
-        source="ai_auto",
-        fit_score=candidate.fit_score,
-        fit_confidence=candidate.confidence,
-        fit_reasons=[*candidate.reasons, *candidate.preference_reasons],
-    )
-    db.add(row)
     await db.flush()
-    await profiles.log_profile_action(
-        db,
-        profile,
-        None,
-        "programs.auto_selected",
-        f"Pinned {candidate.program_name} version {candidate.playbook_version} from published criteria",
-        target_type="application_program",
-        target_id=row.id,
-        metadata={
-            "program_key": candidate.program_key,
-            "playbook_id": str(candidate.playbook_id),
-            "playbook_version": candidate.playbook_version,
-            "fit_confidence": candidate.confidence,
-            "preference_score": candidate.preference_score,
-            "preference_reasons": candidate.preference_reasons,
-        },
-    )
-    return [row]
+    for row, candidate in pinned:
+        await profiles.log_profile_action(
+            db,
+            profile,
+            None,
+            "programs.auto_selected",
+            f"Pinned {candidate.program_name} version {candidate.playbook_version} from published criteria",
+            target_type="application_program",
+            target_id=row.id,
+            metadata={
+                "program_key": candidate.program_key,
+                "playbook_id": str(candidate.playbook_id),
+                "playbook_version": candidate.playbook_version,
+                "fit_confidence": candidate.confidence,
+                "preference_score": candidate.preference_score,
+                "preference_reasons": candidate.preference_reasons,
+            },
+        )
+    return [row for row, _ in pinned]
 
 
 async def set_programs(
