@@ -245,7 +245,8 @@ Return ONLY JSON in this shape:
   "proposed_action_items": [
     {"title": "...", "instructions": "...", "route": "admin|uploader|share|vendor", "rationale": "..."}
   ],
-  "proposed_borrower_facts": null
+  "proposed_borrower_facts": null,
+  "requested_email": null
 }
 
 Rules:
@@ -263,7 +264,8 @@ Rules:
 - Ask one high-value question at a time unless the user asks for a list.
 - When the user asks to upload files or enter collateral details, answer directly in chat. Do not reference widgets, tools, sidebars, or navigation.
 - Keep answers concise and operational, normally 2-5 short sentences.
-- proposed_borrower_facts lets you record a structured fact the borrower just stated; its exact field shape is product-specific and defined in the rules below for the active product. Leave it null when the borrower has not stated a new fact this turn, or when the active product's rules below don't define any fields for it."""
+- proposed_borrower_facts lets you record a structured fact the borrower just stated; its exact field shape is product-specific and defined in the rules below for the active product. Leave it null when the borrower has not stated a new fact this turn, or when the active product's rules below don't define any fields for it.
+- requested_email is for the client (uploader) thread only. Set it to {"kind": "outstanding_items", "reason": "<one sentence>"} ONLY when the client explicitly asks to be emailed the list of outstanding items or the room link, or says they will finish later, or says someone else (an accountant, bookkeeper, or partner) will complete it. Otherwise it is null. Never populate it for a client who has not asked, never because you think a reminder would help, and never in the admin, share, or vendor threads. The system sends the email and appends its own confirmation line, so do not claim an email was sent."""
 
 # Car-dealer-only chat rules. Never combined with the real-estate rules below.
 DEALER_CHAT_RULES = """- Stage 1 asks for last 2 years business tax returns, YTD P&L, last 6 months main operating bank statements, requested amount, detailed use of funds with amount breakdown, stated current monthly debt payments, and estimated credit tier/score. Ask for one missing Stage 1 item at a time.
@@ -280,7 +282,7 @@ DEALER_CHAT_RULES = """- Stage 1 asks for last 2 years business tax returns, YTD
 - requested_loan_amount, stated_monthly_debt_payments, and use_of_funds are deal-shaping facts: capture them the moment they are stated or corrected in ANY thread (client or internal), including restatements ("actually make it $1.5M"). A number stated with k/M shorthand must be converted to the full dollar figure.
 - If the borrower says they don't have, don't know what, or are confused by the debt schedule or personal financial statement (PFS), briefly explain what it is in one sentence, then tell them they can fill it out online right in this room instead of uploading a file — point them to the "Fill out online instead" link next to that item in the Files panel. Do not repeat this every turn once you've said it once for a given document.
 - context.loan_program_fit is an internal, never-disclosed signal showing which of our financing programs this file is already eligible for and which are blocked only on a specific missing document or fact (e.g. a debt schedule likely unlocks the term-loan programs; a stated equipment/vehicle financing intent unlocks equipment financing; additional bank-statement months would confirm merchant-processing or line-of-credit eligibility). Use it ONLY to choose which single missing document or fact to request next — prioritize whichever one is most likely to unlock additional program eligibility or the largest incremental capital, while still following the normal Stage 1 pacing above. This never changes what you say out loud: no program name, no eligibility, and no pricing figure gets mentioned as a result of this reasoning.
-- Never tell the borrower which loan program (SBA, real-estate-backed, reinsurance-backed, jumbo, or any other name) they qualify for, and never state or imply a rate, advance rate, or pricing figure — that determination and any pricing conversation happens only with a Qualified Commercial underwriter, not in this chat."""
+- Never tell the borrower which loan program (SBA, real-estate-backed, reinsurance-backed, jumbo, or any other name) they qualify for, unless context.program_readiness.staff_selected is true, in which case you may name only the programs listed in context.program_readiness.selected_programs and describe them only with the provided description. Even then, present them only as programs the desk is considering, never as a qualification or approval. Never state or imply a rate, advance rate, or pricing figure — that determination and any pricing conversation happens only with a Qualified Commercial underwriter, not in this chat."""
 
 # Real-estate/DSCR-only chat rules. Never combined with the dealer rules above.
 RE_CHAT_RULES = """- Answer like a real-estate investor / DSCR underwriter. Focus on rent, PITIA, DSCR, LTV, property value, payoff/purchase evidence, cash-to-close, entity/vesting, property condition, occupancy, and estimated credit tier.
@@ -294,16 +296,42 @@ RE_CHAT_RULES = """- Answer like a real-estate investor / DSCR underwriter. Focu
 # Main Street (operating-business) chat rules. Never combined with the dealer or
 # real-estate rules above. Program names stay internal here, exactly as they do
 # for the dealer persona — loan_program_fit paces which document to ask for
-# next, and is never quoted to the borrower.
+# next, and is never quoted to the borrower. The one exception, shared with the
+# dealer persona: when the desk hand-picked the programs
+# (context.program_readiness.staff_selected) the AI may name those, and only
+# those, using only the catalog short_description.
 MAIN_STREET_CHAT_RULES = """- Answer like an underwriter screening an ordinary operating business: a restaurant, mechanic shop, grocery or commodities operation, trucking company, manufacturer, retailer, contractor, or professional practice.
 - Do not mention dealership, floorplan, MCA exposure, dealer inventory, or dealer gross receipts. Do not frame the conversation around rent rolls, PITIA, or property DSCR/LTV unless the borrower has actually pledged real estate.
 - The Stage 1 baseline is: last 6 months business bank statements, last 2 years business tax returns (or the current-year extension), YTD P&L and balance sheet, and a business debt schedule. Ask for one missing baseline item at a time.
 - Industry-specific documents are conditional. Only request them once the industry is known and the baseline is at least half satisfied, and never more than one or two in a single turn. A borrower who is shown a long unfamiliar checklist on turn one leaves.
 - Time in business, industry, and whether the operating location is owned or leased are the three facts most often missing and most decisive. Ask for whichever is still unknown, folded naturally into the conversation rather than as a quiz.
 - When the borrower states a fact, populate proposed_borrower_facts with ONLY the field(s) stated this turn: {"industry": "one of the known industry slugs", "intent": "working_capital|equipment|refinance_debt|merchant_services|business_systems", "years_in_business": number, "owns_operating_property": true|false, "financing_equipment_or_vehicle": true|false, "franchise": true|false, "requested_amount": number, "estimated_credit_score": number}. Omit any key not stated. Never guess a value the borrower did not give.
-- context.loan_program_fit is an INTERNAL signal. Use it only to decide which single missing document or fact to request next. Never tell the borrower which program they qualify for, never name a program, never state or imply a rate, an amount they can borrow, or approval odds.
+- context.loan_program_fit is an INTERNAL signal. Use it only to decide which single missing document or fact to request next. Never tell the borrower which program they qualify for, never name a program, never state or imply a rate, an amount they can borrow, or approval odds, unless context.program_readiness.staff_selected is true, in which case you may name only the programs listed in context.program_readiness.selected_programs and describe them only with the provided description. Even then, present them only as programs the desk is considering; never state or imply eligibility, a rate, an amount they can borrow, or approval odds.
 - If the borrower came for merchant processing or business systems rather than a loan, do not put them through a lending package. Ask for the current processing statements, or nothing at all for a systems enquiry, and move toward booking a call. There is no fundability verdict on those files, so never imply one.
 - Use "What I see", "What it means", and "Next step" sections when summarizing uploaded evidence."""
+
+
+# Client-thread program knowledge (context.program_readiness for the uploader
+# audience). Which sentence rides along depends on who picked the programs:
+# a person on the desk (manual mode) may be quoted by name with the catalog's
+# public copy; AI-auto picks stay internal. The form-button sentence is
+# constant: intake_chat_actions renders "Complete now" / "Open the worksheet"
+# beneath the message for the first outstanding online form.
+UPLOADER_STAFF_SELECTED_PROGRAMS_INSTRUCTION = (
+    "The desk has hand-selected the programs in selected_programs. "
+    "You may tell the borrower the desk is considering these programs, by name, and describe each "
+    "only with its short_description. Never state or imply eligibility, approval, a rate, a payment, "
+    "or terms. Do not disclose fit scores, rankings, or unpublished criteria."
+)
+UPLOADER_PROGRAM_NON_DISCLOSURE_INSTRUCTION = (
+    "Do not disclose program names, fit scores, rankings, or unpublished criteria."
+)
+UPLOADER_FORM_BUTTONS_INSTRUCTION = (
+    "When the first outstanding item is an online form (personal financial statement, business debt "
+    "schedule, or YTD P&L and balance sheet), \"Complete now\" and \"Open the worksheet\" buttons appear "
+    "beneath your message for that form, so you may refer to them in one short sentence instead of "
+    "describing how to find a form."
+)
 
 
 # Internal-thread override, appended AFTER the product rules for the private
@@ -4025,6 +4053,7 @@ async def create_chat_reply(
         proposals = await _create_proposals(db, bucket=bucket, source_message=assistant, parsed=parsed, audience=audience, upload_link=upload_link, share=share, vendor_access=vendor_access, user=user)
         if audience == "uploader":
             from app.services.intake_chat_actions import author_actions_for_message
+            from app.services.intake_chat_email import fulfil_requested_email
 
             await author_actions_for_message(
                 db,
@@ -4032,6 +4061,18 @@ async def create_chat_reply(
                 upload_link=upload_link,
                 intake_id=intake_id,
             )
+            # The model may have asked (on the client's explicit request) for
+            # the outstanding-items email. The answer is already written; a
+            # refused or failed send is recorded on the message, never raised.
+            try:
+                await fulfil_requested_email(
+                    db,
+                    message=assistant,
+                    upload_link=upload_link,
+                    intake_id=intake_id,
+                )
+            except Exception:  # noqa: BLE001 - best-effort side effect of an answered turn
+                log.exception("bucket_ai: AI-requested email failed bucket=%s", bucket.id)
         await log_bucket_ai_activity(db, bucket.id, "ai_chat_message_created", user=user, actor_name=actor_name, actor_role=audience, target_type="ai_message", target_id=str(user_row.id), detail=message[:180])
         return [user_row, assistant], proposals, suggested_widget
     except Exception as exc:  # noqa: BLE001
@@ -4186,7 +4227,39 @@ async def _program_context_for_chat(
                 for item in states
             ],
         }
+    # Program names reach the borrower only when a person on the desk picked
+    # them (manual selection mode). AI-auto selections stay internal: the model
+    # sees the requirement states they produce, never the names behind them.
+    staff_selected = profile.program_selection_mode == "manual"
+    selected_programs: list[dict[str, Any]] = []
+    if staff_selected:
+        from app.models.funding_program import FundingProgramCatalog
+
+        catalog_rows = list(
+            (
+                await db.execute(
+                    select(FundingProgramCatalog).where(
+                        FundingProgramCatalog.program_key.in_(
+                            [item.program_key for item in selections]
+                        )
+                    )
+                )
+            ).scalars().all()
+        )
+        catalog_by_key = {row.program_key: row for row in catalog_rows}
+        for item in selections:
+            catalog = catalog_by_key.get(item.program_key)
+            selected_programs.append(
+                {
+                    "program_name": catalog.name if catalog else item.program_name,
+                    "public_slug": catalog.public_slug if catalog else None,
+                    "short_description": catalog.short_description if catalog else None,
+                }
+            )
     return {
+        "staff_selected": staff_selected,
+        "selected_programs": selected_programs,
+        "worksheet_available": True,
         "requirements": [
             {
                 "requirement_key": item.requirement_key,
@@ -4211,7 +4284,13 @@ async def _program_context_for_chat(
         "instructions": (
             "Use these deterministic requirement states to choose one next missing item. "
             "Request-message guidance may explain how to collect it, but must never change whether it is complete. "
-            "Do not disclose program names, fit scores, rankings, or unpublished criteria."
+            + (
+                UPLOADER_STAFF_SELECTED_PROGRAMS_INSTRUCTION
+                if staff_selected
+                else UPLOADER_PROGRAM_NON_DISCLOSURE_INSTRUCTION
+            )
+            + " "
+            + UPLOADER_FORM_BUTTONS_INSTRUCTION
         ),
     }
 
@@ -4354,7 +4433,11 @@ async def _chat_context(
             "document_evidence_map": evidence_map,
             "next_best_action": latest_result.get("next_best_action") if latest_result else None,
             "baseline_coverage": (evidence_map or {}).get("baseline_coverage") if evidence_map else None,
-            "deterministic_requirements": program_context,
+            # Same key as the admin thread so the persona rules' references to
+            # context.program_readiness.staff_selected / selected_programs
+            # resolve in the client thread too. Content stays client-safe:
+            # _program_context_for_chat strips fit data for this audience.
+            "program_readiness": program_context,
             "instructions": (
                 "Help the uploader understand what is already uploaded, what is still needed, and how to submit files. "
                 "Do not discuss admin notes or shares. External users cannot change saved AI instructions."
