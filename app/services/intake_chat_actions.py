@@ -21,6 +21,7 @@ from app.models.client import Client
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.schemas.bucket import IntakeChatActionRead, IntakeChatActionResult
 from app.services import application_profiles as profiles
+from app.services import chat_form_links
 from app.services.application_programs import get_program_readiness, profile_for_chat_scope
 from app.services.email.user_mailer import send_as_user
 from app.services.financial_templates import FinancialTemplate, template_for_requirement
@@ -32,9 +33,63 @@ ACTIONABLE_REQUIREMENTS = {
 }
 SATISFIED_STATES = {"verified", "waived", "not_applicable"}
 
+#: Actions that open a form the borrower fills in on our pages. "Complete now"
+#: is offered for every actionable requirement on every intake variant; the
+#: worksheet button follows it whenever anything is still outstanding. These
+#: two are re-executable: a link's token and PIN are never stored, so a second
+#: click cannot replay the first — it retires the earlier link and mints again.
+FORM_ACTIONS = {"complete_now", "open_worksheet"}
+
+#: What `room_url` says the click was for. Nothing on the public pages reads
+#: the parameter any more, but clients that predate `form_url` still land in
+#: the room from it, so it keeps the shape it always had.
+_LEGACY_FORM_PARAM = {
+    "owner_personal_financial_statement": "pfs",
+    "business_debt_schedule": "debt_schedule",
+    "ytd_p_and_l_balance_sheet": "worksheet",
+}
+
 
 def now() -> datetime:
     return datetime.now(UTC)
+
+
+def remains_blocking(item: object) -> bool:
+    """Whether a requirement row from readiness still needs the client.
+
+    Satisfied by its own state, or waived/verified under every program that
+    asked for it, means it no longer blocks; anything else does.
+    """
+    state = getattr(item, "status", None)
+    if state in SATISFIED_STATES:
+        return False
+    program_keys = list(getattr(item, "source_program_keys", []) or [])
+    overrides = dict(getattr(item, "program_overrides", {}) or {})
+    return not program_keys or not all(
+        overrides.get(program_key) in SATISFIED_STATES for program_key in program_keys
+    )
+
+
+def _is_actionable(item: object) -> bool:
+    return (
+        getattr(item, "requirement_key", None) in ACTIONABLE_REQUIREMENTS
+        and bool(getattr(item, "client_visible", False))
+        and getattr(item, "required_level", None) == "required"
+        and remains_blocking(item)
+    )
+
+
+def _result_read(action: BucketAIChatAction, result: dict, *, status: str) -> IntakeChatActionResult:
+    return IntakeChatActionResult(
+        action_id=action.id,
+        status="executed" if status == "executed" else "failed",
+        detail=str(result.get("detail") or "Action completed"),
+        download_url=result.get("download_url"),
+        room_url=result.get("room_url"),
+        delivery=result.get("delivery"),
+        form_url=result.get("form_url"),
+        access_code=result.get("access_code"),
+    )
 
 
 def _idempotency_key(*parts: object) -> str:
@@ -82,28 +137,10 @@ async def author_actions_for_message(
     if profile is None:
         return []
     readiness = await get_program_readiness(db, profile)
-    def remains_blocking(item: object) -> bool:
-        state = getattr(item, "status", None)
-        if state in SATISFIED_STATES:
-            return False
-        program_keys = list(getattr(item, "source_program_keys", []) or [])
-        overrides = dict(getattr(item, "program_overrides", {}) or {})
-        return not program_keys or not all(
-            overrides.get(program_key) in SATISFIED_STATES
-            for program_key in program_keys
-        )
-
-    requirement_read = next(
-        (
-            item
-            for item in readiness.requirements
-            if item.requirement_key in ACTIONABLE_REQUIREMENTS
-            and item.client_visible
-            and item.required_level == "required"
-            and remains_blocking(item)
-        ),
-        None,
-    )
+    # One requirement at a time: the first outstanding actionable one is the
+    # subject of this message's buttons. The worksheet button rides along on
+    # the same row because it exists only while something is outstanding.
+    requirement_read = next((item for item in readiness.requirements if _is_actionable(item)), None)
     if requirement_read is None:
         return []
     requirement = (
@@ -131,14 +168,12 @@ async def author_actions_for_message(
     intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
     spanish = bool(intake and intake.preferred_language == "es")
     specs: list[tuple[str, str]] = [
-        ("upload_own", "Subir mi documento" if spanish else "Upload my document")
+        ("upload_own", "Subir mi documento" if spanish else "Upload my document"),
+        # Every intake variant, every actionable requirement: the PFS and debt
+        # schedule open their own form pages, the P&L and balance sheet open
+        # as one worksheet link. The old dealer-only gate is gone.
+        ("complete_now", "Completar ahora" if spanish else "Complete now"),
     ]
-    supports_online_form = bool(intake and intake.variant == "dealer_gatekeeper_v1")
-    if supports_online_form and requirement.requirement_key in {
-        "owner_personal_financial_statement",
-        "business_debt_schedule",
-    }:
-        specs.append(("complete_now", "Completar ahora" if spanish else "Complete now"))
     if template:
         specs.extend(
             [
@@ -146,6 +181,9 @@ async def author_actions_for_message(
                 ("email_template", "Enviar por email" if spanish else "Email me"),
             ]
         )
+    # Offered once per message, after the four, whenever anything actionable is
+    # outstanding — which, this far down, it is. Opens all four sheets.
+    specs.append(("open_worksheet", "Abrir la hoja de trabajo" if spanish else "Open the worksheet"))
     if spanish:
         question = (
             f"Para {requirement.label}, puede subir su propio documento"
@@ -271,26 +309,49 @@ async def execute_room_action(
             for program_key in requirement_read.source_program_keys
         )
     )
-    if requirement.status in SATISFIED_STATES or overridden_for_all:
+    if action.action_type == "open_worksheet":
+        # The worksheet opens all four sheets, so it is spent only when nothing
+        # actionable is left on the file — the same rule that offered it.
+        already_complete = not any(_is_actionable(item) for item in readiness.requirements)
+    else:
+        already_complete = requirement.status in SATISFIED_STATES or overridden_for_all
+    if already_complete:
         action.status = "disabled"
         await db.flush()
         raise HTTPException(status.HTTP_409_CONFLICT, "This requested item is already complete")
     room_url = _room_url(link, requirement)
-    if action.status == "executed" and action.result:
-        return IntakeChatActionResult(
-            action_id=action.id,
-            status="executed",
-            detail=str(action.result.get("detail") or "Action already completed"),
-            download_url=action.result.get("download_url"),
-            room_url=action.result.get("room_url"),
-            delivery=action.result.get("delivery"),
+    # A form button runs again on every click (below), so its seven-day life
+    # has to be enforced here too: `load_action_for_room` only expires rows
+    # that are still "available", and an executed one would otherwise keep
+    # minting links for as long as the room exists.
+    if (
+        action.action_type in FORM_ACTIONS
+        and action.expires_at is not None
+        and action.expires_at <= now()
+    ):
+        action.status = "expired"
+        await db.flush()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "That button has expired. Ask in the chat for a new one."
         )
 
+    # A finished action answers from its stored result — except the two that
+    # open a form, whose stored result has no URL and no PIN to replay. Those
+    # run again: the earlier link is retired and a fresh one minted.
+    if action.status == "executed" and action.result and action.action_type not in FORM_ACTIONS:
+        return _result_read(
+            action,
+            {**action.result, "detail": action.result.get("detail") or "Action already completed"},
+            status="executed",
+        )
+
+    # What goes back to the borrower this once and is written nowhere: the
+    # form URL and PIN of a freshly minted link.
+    once: dict = {}
     if action.action_type == "upload_own":
         result = {"detail": "Upload area opened", "room_url": room_url.replace("tab=todo", "tab=documents")}
-    elif action.action_type == "complete_now":
-        form = "pfs" if action.requirement_key == "owner_personal_financial_statement" else "debt_schedule"
-        result = {"detail": "Secure form opened", "room_url": f"{room_url}&form={form}"}
+    elif action.action_type in FORM_ACTIONS:
+        result, once = await _open_form(db, action=action, profile=profile, room_url=room_url)
     elif action.action_type == "download_template":
         result = {
             "detail": "Template ready to download",
@@ -305,14 +366,44 @@ async def execute_room_action(
     action.executed_at = now()
     action.result = result
     await db.flush()
-    return IntakeChatActionResult(
-        action_id=action.id,
-        status="executed" if action.status == "executed" else "failed",
-        detail=str(result.get("detail") or "Action completed"),
-        download_url=result.get("download_url"),
-        room_url=result.get("room_url"),
-        delivery=result.get("delivery"),
-    )
+    return _result_read(action, {**result, **once}, status=action.status)
+
+
+async def _open_form(
+    db: AsyncSession,
+    *,
+    action: BucketAIChatAction,
+    profile: ApplicationProfile,
+    room_url: str,
+) -> tuple[dict, dict]:
+    """What a "Complete now" or "Open the worksheet" click returns, in two parts.
+
+    `chat_form_links.link_for_action` retires the chat's earlier link for the
+    same target and mints a new one. Of what it returns, the link id, expiry
+    and whether a PIN was set are kept on the action row, which the room
+    re-reads on every load; the URL (which embeds the raw token) and the PIN
+    come back separately for the response alone and are never persisted — the
+    token is stored only as a hash and the PIN is shown once, so a lost one is
+    reminted by clicking again, not looked up. `room_url` keeps its old
+    `&form=` shape for clients that predate `form_url`.
+    """
+    minted = await chat_form_links.link_for_action(db, profile=profile, action=action)
+    if action.action_type == "open_worksheet":
+        detail = "Worksheet opened"
+        legacy_room_url = f"{room_url}&form=worksheet"
+    else:
+        detail = "Secure form opened"
+        form = _LEGACY_FORM_PARAM.get(action.requirement_key, "worksheet")
+        legacy_room_url = f"{room_url}&form={form}"
+    stored = {
+        "detail": detail,
+        "room_url": legacy_room_url,
+        "link_id": minted["link_id"],
+        "pin_set": minted["access_code"] is not None,
+        "expires_at": minted["expires_at"],
+    }
+    once = {"form_url": minted["form_url"], "access_code": minted["access_code"]}
+    return stored, once
 
 
 async def _email_template(

@@ -820,7 +820,7 @@ class BucketAIChatAction(TimestampMixin, Base):
         Index("ix_bucket_ai_chat_actions_message", "source_message_id", "created_at"),
         Index("ix_bucket_ai_chat_actions_profile_status", "profile_id", "status"),
         CheckConstraint(
-            "action_type IN ('upload_own','complete_now','download_template','email_template')",
+            "action_type IN ('upload_own','complete_now','download_template','email_template','open_worksheet')",
             name="ck_bucket_ai_chat_action_type",
         ),
         CheckConstraint(

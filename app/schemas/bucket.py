@@ -771,6 +771,11 @@ class IntakeChatActionResult(BaseModel):
     download_url: str | None = None
     room_url: str | None = None
     delivery: dict | None = None
+    #: The form or worksheet page a "Complete now" / "Open the worksheet" click
+    #: opens. `room_url` stays populated beside it for clients that predate it.
+    form_url: str | None = None
+    #: The worksheet PIN, when the link carries one. Shown by the page once.
+    access_code: str | None = None
 
 
 class BucketAIChatResponse(BaseModel):
