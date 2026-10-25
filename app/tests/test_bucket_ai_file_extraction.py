@@ -948,3 +948,47 @@ async def test_zip_child_keeps_full_lineage_but_bounds_display_filename():
     assert len(child.file_name) == 255
     assert child.zip_entry_path == entry_path
     assert child.uploaded_by_user_id == parent.uploaded_by_user_id
+
+
+@pytest.mark.asyncio
+async def test_analysis_drain_consumes_the_placeholder_instead_of_deleting_it():
+    # Migration 0239 refuses a physical delete of bucket history outside a
+    # governed purge. The drain used to delete its own queue placeholder first,
+    # so it raised on every pass and never analyzed anything. It renames now.
+    file = SimpleNamespace(
+        id=uuid4(),
+        bucket_id=uuid4(),
+        file_name="statement.pdf",
+        content_type="application/pdf",
+        status="uploaded",
+        deleted_at=None,
+        extraction_status=None,
+        bucket=SimpleNamespace(ai_context={"review_type": "dealer"}),
+    )
+    placeholder = SimpleNamespace(file=file, content_hash="pending:abc123", skip_reason=None)
+    no_zips = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+    queued = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [placeholder]))
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[no_zips, queued]),
+        delete=AsyncMock(),
+        flush=AsyncMock(),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+
+    with patch.object(bucket_ai, "analyze_bucket_file", AsyncMock(return_value=object())) as analyze:
+        processed = await bucket_ai.drain_file_analyses(db, limit=1)
+
+    assert processed == 1
+    db.delete.assert_not_awaited()
+    assert placeholder.content_hash == "consumed:pending:abc123"
+    assert not placeholder.content_hash.startswith("pending")
+    analyze.assert_awaited_once()
+    assert analyze.await_args.kwargs == {"review_type": "dealer", "force": False}
+    db.commit.assert_awaited()
+
+
+def test_consumed_placeholder_hash_fits_the_column():
+    assert bucket_ai.consumed_placeholder_hash("pending") == "consumed:pending"
+    forced = bucket_ai.consumed_placeholder_hash("pending:" + "f" * 32)
+    assert forced.startswith("consumed:pending:") and len(forced) <= 64

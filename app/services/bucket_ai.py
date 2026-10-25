@@ -3441,6 +3441,19 @@ async def enqueue_file_analysis(db: AsyncSession, file: BucketFile, *, force: bo
     )
 
 
+CONSUMED_PLACEHOLDER_PREFIX = "consumed:"
+
+
+def consumed_placeholder_hash(content_hash: str) -> str:
+    """The hash a queue placeholder is renamed to once the drain has taken it.
+
+    Placeholders are `pending` or `pending:<hex>`; the drain selects on the
+    `pending%` prefix, so the rename is what dequeues them. Bounded to the
+    64-character column by construction (9 + at most 40).
+    """
+    return f"{CONSUMED_PLACEHOLDER_PREFIX}{content_hash}"[:64]
+
+
 async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
     """Analyze files queued as 'pending' (from upload-complete) outside the
     request path, so reviews compose from a warm cache. Each file is analyzed
@@ -3516,8 +3529,14 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
             # The independent retry pass above owns archive recovery. Preserve
             # this placeholder until extraction succeeds or becomes terminal.
             continue
-        # Drop the placeholder; analyze_bucket_file upserts the real hashed row.
-        await db.delete(placeholder)
+        # Consume the placeholder rather than delete it. Bucket history is
+        # retention-guarded at the database (migration 0239 refuses a physical
+        # delete outside a governed purge), and the delete that used to sit
+        # here raised on every pass, aborting the whole drain once a minute.
+        # Readers match an analysis by the file's real content hash, so a
+        # consumed placeholder is inert; the rename is what keeps it out of
+        # the next pass. analyze_bucket_file still upserts the real hashed row.
+        placeholder.content_hash = consumed_placeholder_hash(placeholder.content_hash)
         await db.flush()
         if file is None or file.deleted_at is not None or file.status != "uploaded":
             await db.commit()
