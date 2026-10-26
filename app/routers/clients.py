@@ -1352,10 +1352,21 @@ async def send_intake_link(
             "This client was saved as lead-only. Enable outreach on the client before sending an intake link.",
         )
 
+    # The MCA funding lead form grants phone/email contact only. Keep its
+    # operator-triggered intake links on email/portal; a phone number alone
+    # is not a grant to text the applicant.
+    mca_phone_email_only = client.source_channel == "mca_funding"
     # Channel resolution: explicit > phone (sms) > email > portal.
     requested_via = (payload.channel or "").lower() or None
+    if mca_phone_email_only and requested_via == "sms":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "This MCA lead authorized phone and email contact, not text messages. Choose email or share the link directly.",
+        )
     if requested_via not in {"portal", "email", "sms"}:
-        if client.phone:
+        if mca_phone_email_only:
+            requested_via = "email" if client.email else "portal"
+        elif client.phone:
             requested_via = "sms"
         elif client.email:
             requested_via = "email"
