@@ -30,6 +30,7 @@ from app.schemas.funding_program import (
     FundingProgramVersionRead,
     PublicFundingProgramCatalogItem,
 )
+from app.services.mca_refinance_policy import MAX_AMOUNT, MAX_TERM_MONTHS
 from app.services.program_rules import ProgramRuleError, validate_rules
 
 
@@ -395,8 +396,39 @@ async def enforce_qc_fee_cap_for_profile(
 
 def _commercial_terms_read(
     row: FundingProgramCommercialTerms | None,
+    *,
+    program_key: str | None = None,
 ) -> FundingProgramCommercialTermsRead | None:
-    return FundingProgramCommercialTermsRead.model_validate(row) if row else None
+    if row is None:
+        return None
+    result = FundingProgramCommercialTermsRead.model_validate(row)
+    if program_key != "mca_refinance":
+        return result
+    # Project today's intrinsic ceilings without changing the immutable
+    # historical version or pretending a legacy open range is still offered.
+    maximum_amount = min(result.maximum_amount, MAX_AMOUNT) if result.maximum_amount is not None else MAX_AMOUNT
+    maximum_term = min(result.maximum_term_months, MAX_TERM_MONTHS) if result.maximum_term_months is not None else MAX_TERM_MONTHS
+    disclosure = "Standard MCA refinance is limited to $350,000, terms up to 10 years, and no more than two active MCAs, subject to qualification. Applications with more than two active MCAs are accepted for manual review; automatic underwriting is unavailable."
+    return result.model_copy(update={
+        "maximum_amount": maximum_amount,
+        "maximum_term_months": maximum_term,
+        "minimum_amount": result.minimum_amount if result.minimum_amount is None or result.minimum_amount <= maximum_amount else None,
+        "minimum_term_months": result.minimum_term_months if result.minimum_term_months is None or result.minimum_term_months <= maximum_term else None,
+        "disclosures": list(dict.fromkeys([*result.disclosures, disclosure])),
+    })
+
+
+def _validate_mca_commercial_limits(program_key: str, values: Any) -> None:
+    if program_key != "mca_refinance":
+        return
+    for field, maximum in (("minimum_amount", MAX_AMOUNT), ("maximum_amount", MAX_AMOUNT),
+                           ("minimum_term_months", MAX_TERM_MONTHS), ("maximum_term_months", MAX_TERM_MONTHS)):
+        value = getattr(values, field, None)
+        if value is not None and value > maximum:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=_field_validation_detail(
+                field, message=f"MCA refinance {field.replace('_', ' ')} cannot exceed the program maximum of {maximum:,}",
+                input_value=float(value),
+            ))
 
 
 async def public_catalog(db: AsyncSession) -> list[PublicFundingProgramCatalogItem]:
@@ -413,7 +445,7 @@ async def public_catalog(db: AsyncSession) -> list[PublicFundingProgramCatalogIt
             short_description=row.short_description,
             display_order=row.display_order,
             verticals=list(dict.fromkeys(scope.vertical for scope in scopes.get(row.id, []))),
-            commercial_terms=_commercial_terms_read((terms.get(row.id) or [None])[0]),
+            commercial_terms=_commercial_terms_read((terms.get(row.id) or [None])[0], program_key=row.program_key),
         )
         for row in rows
     ]
@@ -520,6 +552,7 @@ async def create_commercial_terms(
     payload: FundingProgramCommercialTermsCreate,
     user: User,
 ) -> FundingProgramCommercialTerms:
+    _validate_mca_commercial_limits(program.program_key, payload)
     await db.execute(
         select(FundingProgramCatalog.id)
         .where(FundingProgramCatalog.id == program.id)
@@ -537,9 +570,9 @@ async def create_commercial_terms(
         version=int(latest or 0) + 1,
         status="draft",
         minimum_amount=payload.minimum_amount,
-        maximum_amount=payload.maximum_amount,
+        maximum_amount=payload.maximum_amount if payload.maximum_amount is not None or program.program_key != "mca_refinance" else MAX_AMOUNT,
         minimum_term_months=payload.minimum_term_months,
-        maximum_term_months=payload.maximum_term_months,
+        maximum_term_months=payload.maximum_term_months if payload.maximum_term_months is not None or program.program_key != "mca_refinance" else MAX_TERM_MONTHS,
         pricing_basis=payload.pricing_basis,
         minimum_pricing=payload.minimum_pricing,
         maximum_pricing=payload.maximum_pricing,
@@ -586,6 +619,12 @@ async def publish_commercial_terms(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Commercial terms version not found")
     if row.status != "draft":
         raise HTTPException(status.HTTP_409_CONFLICT, "Only draft commercial terms can be published")
+    _validate_mca_commercial_limits(program.program_key, row)
+    if program.program_key == "mca_refinance":
+        if row.maximum_amount is None:
+            row.maximum_amount = MAX_AMOUNT
+        if row.maximum_term_months is None:
+            row.maximum_term_months = MAX_TERM_MONTHS
     if program.program_key in {"mca_refinance", "revenue_based_financing"} and (
         row.qc_fee_cap_percent is None or float(row.qc_fee_cap_percent) > 3.0
     ):

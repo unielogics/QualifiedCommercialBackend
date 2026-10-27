@@ -41,7 +41,7 @@ from app.models.bucket import (
     BucketVendorAccess,
 )
 from app.models.user import User
-from app.services import merchant_processing, provenance
+from app.services import mca_refinance_policy, merchant_processing, provenance
 from app.services.ai.bedrock_client import get_client, model_heavy, model_light
 from app.services.ai.structured_output import is_truncated_response, require_complete_response
 from app.services.ai.usage import _usage_tokens, json_safe_metadata, tracked_messages_create
@@ -218,7 +218,7 @@ For client-facing summaries use short sections: what the files prove, whether th
 # signed credit authorization, and the current advance terms — and stops. A
 # borrower drowning in daily debits abandons long checklists; everything else
 # is gathered after the desk engages. Never combined with any other persona.
-MCA_REVIEW_RULES = """Act as a screener for a merchant-cash-advance refinance file. The applicant carries one or more MCA/revenue advances with daily or weekly debits and is asking whether a structured monthly payoff is possible. This is not a general dealer review, not a real-estate review, and not a Main Street review: never ask about floorplan lines, inventory, rent rolls, PITIA, property DSCR/LTV, P&L statements, tax returns, PFS forms, or any document outside this file's three requested items.
+MCA_REVIEW_RULES = """Act as a screener for a merchant-cash-advance refinance file. The standard program is limited to $350,000, terms up to 120 months (10 years), and no more than two active MCAs. These are program boundaries, not a promised offer or approval. Files with more than two MCAs, an amount over $350,000, or a requested term over 120 months are accepted for MANUAL DESK REVIEW ONLY: never automatically underwrite, score probability, recommend approval, estimate an offer, or trigger credit checks for those files. Unknown count or amount is not eligible for automatic underwriting. The deterministic mca_refinance_policy controls; never override it using a model inference. The applicant is asking whether a structured monthly payoff is possible. This is not a general dealer review, not a real-estate review, and not a Main Street review: never ask about floorplan lines, inventory, rent rolls, PITIA, property DSCR/LTV, P&L statements, tax returns, PFS forms, or any document outside this file's three requested items.
 The complete file is exactly three items: last 6 months business bank statements, a signed credit authorization, and the current MCA/advance terms (agreements, payoff letters, or the typed-in terms form). Ask for whichever of the three is still missing, one at a time, and for nothing else — when all three are satisfied, the file is COMPLETE and the next step is the review plus a call, never another document.
 Set screening_stage to "stage_1_mca_refinance" and choose exactly one probability_status from: "Good probability - book call", "Promising but needs one clarification", "Not enough evidence yet", or "Poor probability based on current file". Set booking_recommended true when statements and terms are on file.
 ALWAYS calculate key_metrics as NUMBERS when the documents support them. From bank statements compute annualized_adjusted_deposits (average monthly total deposits x 12), count distinct statement months, count NSF/overdraft occurrences, and estimate the monthly advance remittance total visible in the statements (recurring daily/weekly debits to advance funders). From the advance terms capture total remaining payback, the per-payment amount, payment frequency, and months remaining. Every key_metrics number MUST be a bare number, no currency symbol and no commas.
@@ -226,11 +226,12 @@ Uploaded files are often miscategorized. Classify from readable content and file
 For client-facing summaries use short sections: what the files prove, what is still missing of the three items, and one next step. Never state or imply a rate, a payment, an approval, or refinance terms — pricing is the desk's job after review."""
 
 MCA_CHAT_RULES = """- Answer like an underwriter helping a business owner out from under merchant cash advances. The tone is direct, calm and practical — this borrower is being debited daily and does not have time for a questionnaire.
+- The standard MCA refinance program supports up to $350,000, terms up to 10 years, and a maximum of two active MCAs, subject to desk review and approval. More-than-two files ARE accepted; they go to a human, not automatic underwriting. Follow mca_refinance_policy. For manual_review or information_required, collect factual information/documents and help book a call only: do not calculate qualification, recommend approval, claim an AI review is complete, propose run_review actions, or trigger a credit check. Missing eligibility is not a pass.
 - The ENTIRE file is three items: last 6 months business bank statements, a signed credit authorization (soft check, no score impact — say so when asking), and the current advance terms (upload the agreements/payoff letters OR use the terms form). Ask for exactly one missing item at a time and never request anything else: no tax returns, no P&L, no PFS, no debt schedule beyond the advance terms, no property or dealer documents.
 - Do not mention floorplan, dealer inventory, rent rolls, PITIA, or property DSCR/LTV. This is not those files.
 - When the borrower states a fact about their advance, populate proposed_borrower_facts with ONLY the field(s) stated this turn: {"funder": "name of the advance company", "remaining_payback": number, "payment_amount": number, "payment_frequency": "daily|weekly|biweekly|monthly", "months_remaining": number, "factor_rate": number, "advance_count": number, "requested_amount": number}. Omit any key not stated. Never guess or infer a value the borrower did not state. Convert k shorthand to full dollars.
 - Never state, imply, or estimate a rate, payment, term, savings figure, approval, or refinance offer, and never confirm one the borrower proposes — pricing and terms come from the desk after the review. If asked, say the desk prices each file individually after reviewing statements and credit.
-- When all three items are on file, say the file is complete, run the review, and move to booking a call. Do not invent additional requirements.
+- When all three items are on file, automatic review is possible ONLY when mca_refinance_policy.auto_underwriting_allowed is true. Otherwise explain the human-review route (or ask for the missing eligibility declaration), keep the application accepted, and offer a call. Do not invent additional document requirements.
 - Use "What I see", "What it means", and "Next step" sections when summarizing uploaded evidence."""
 
 MCA_FILE_ANALYSIS_HINT = """This document belongs to a merchant-cash-advance refinance file. Read it as bank-statement / advance-agreement / payoff-letter / debt-schedule evidence where applicable — advance agreements and payoff letters carry funder name, purchase price, purchased amount (total payback), per-payment amount, and payment frequency; capture those in key_facts as a debts array plus payment_frequency and payments_remaining when shown. Never classify it with real-estate categories and do not ask DSCR/rent questions."""
@@ -637,6 +638,7 @@ def _public_ai_context(bucket: Bucket) -> dict[str, Any]:
             "documentation_level": context.get("documentation_level")
             or "three-item MCA refinance file",
             "collateral_type": context.get("collateral_type") or "business cash flow",
+            "mca_refinance_policy": context.get("mca_refinance_policy"),
             "underwriter_persona": (
                 "Speak like an underwriter helping a business owner out from under "
                 "merchant cash advances. Direct, calm and practical — this borrower "
@@ -653,6 +655,7 @@ def _public_ai_context(bucket: Bucket) -> dict[str, Any]:
                 "the borrower.",
                 "Pricing, payments and terms come from the desk after review; the "
                 "assistant never quotes or confirms any number.",
+                "The standard program has a $350,000 maximum, terms up to 10 years, and no more than two active MCAs. Applications outside those limits remain accepted for manual desk review, with no automatic underwriting or automatic credit check. Missing count or amount must be confirmed before automatic review.",
             ],
             "baseline_document_policy": {
                 "stage": "stage_1_mca_refinance",
@@ -3060,6 +3063,21 @@ async def _persist_review_failure(
     return review
 
 
+async def _stop_mca_review(db: AsyncSession, review: BucketAIReview, policy: dict[str, Any], intake: Any = None) -> BucketAIReview:
+    """A stopped job is not a completed AI decision and must not be retried."""
+    if intake is not None:
+        mca_refinance_policy.persist(intake, request_manual=policy["review_mode"] == "manual_review", bucket=review.bucket)
+    review.status = policy["review_mode"]
+    review.result = None
+    review.error = None
+    review.completed_at = _now()
+    review.progress = {"stage": policy["review_mode"], "label": "Manual desk review required" if policy["review_mode"] == "manual_review" else "Confirm MCA eligibility information", "percent": 0,
+                       "mca_refinance_policy": policy}
+    await log_bucket_ai_activity(db, review.bucket_id, "mca_refinance_automatic_review_stopped", target_type="ai_review", target_id=str(review.id), detail=", ".join(policy["reason_codes"]))
+    await db.commit()
+    return review
+
+
 async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIReview | None:
     claimed_at = _now()
     review = (
@@ -3081,6 +3099,15 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         return await db.get(BucketAIReview, review_id)
 
     bucket = review.bucket
+    # Recheck live application facts at execution, not the queued snapshot.
+    # Admin bucket routes and old jobs cannot bypass the MCA manual-review gate.
+    from app.models.public_underwriting_intake import PublicUnderwritingIntake
+    from app.services.operator_file_links import selected_files_for_intake
+
+    intake = (await db.execute(select(PublicUnderwritingIntake).where(PublicUnderwritingIntake.bucket_id == bucket.id))).scalar_one_or_none()
+    policy = await mca_refinance_policy.for_bucket(db, bucket, intake=intake, context=review.context_snapshot)
+    if policy is not None and not policy["auto_underwriting_allowed"]:
+        return await _stop_mca_review(db, review, policy, intake)
     review.status = "running"
     review.started_at = claimed_at
     review.completed_at = None
@@ -3096,16 +3123,6 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
     # supporting buckets. These are references only; ownership and S3 objects
     # remain with their original bucket. Reviews on ordinary buckets are
     # unchanged.
-    from app.models.public_underwriting_intake import PublicUnderwritingIntake
-    from app.services.operator_file_links import selected_files_for_intake
-
-    intake = (
-        await db.execute(
-            select(PublicUnderwritingIntake).where(
-                PublicUnderwritingIntake.bucket_id == bucket.id
-            )
-        )
-    ).scalar_one_or_none()
     if intake is not None:
         linked_files = await selected_files_for_intake(db, intake.id)
         files = list({file.id: file for file in [*files, *linked_files]}.values())
@@ -3256,6 +3273,25 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
                 "financial_fact_citations": data.get("financial_fact_citations") or {},
             }
         )
+
+    if policy is not None:
+        if intake is not None:
+            # The client or desk may have changed eligibility while documents
+            # were being read. Check current durable facts before synthesis.
+            await db.refresh(intake, attribute_names=["intake_state", "requested_loan_amount", "status"])
+        # Documentary extraction may discover more advances or a larger payoff
+        # than the declaration. It can restrict eligibility, never grant it.
+        bounds = mca_refinance_policy.evidence_bounds(per_file_analyses)
+        if intake is not None and any(value is not None for value in bounds.values()):
+            state = dict(intake.intake_state or {})
+            previous = state.get("mca_details") if isinstance(state.get("mca_details"), dict) else {}
+            state["mca_details"] = {**previous,
+                **({"advance_count": max(bounds["active_mca_count"], mca_refinance_policy._count(previous.get("advance_count")) or 0)} if bounds["active_mca_count"] is not None else {}),
+                **({"remaining_payback": max(bounds["remaining_payback"], mca_refinance_policy._number(previous.get("remaining_payback")) or 0)} if bounds["remaining_payback"] is not None else {})}
+            intake.intake_state = state
+        policy = await mca_refinance_policy.for_bucket(db, bucket, intake=intake, context=review.context_snapshot)
+        if policy is not None and not policy["auto_underwriting_allowed"]:
+            return await _stop_mca_review(db, review, policy, intake)
 
     await _set_progress("checking_documents", "Checking published document requirements…", files_done)
     from app.services.document_qualification_review import review_bucket_checks

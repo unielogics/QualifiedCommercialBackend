@@ -62,7 +62,13 @@ from app.schemas.application_profile import (
     ProgramReadinessItem,
 )
 from app.services import application_profiles as profiles
-from app.services import equipment_financing, file_events, locked_file_requests, provenance
+from app.services import (
+    equipment_financing,
+    file_events,
+    locked_file_requests,
+    mca_refinance_policy,
+    provenance,
+)
 from app.services import funding_programs as program_catalog
 from app.services.activity_log import log_activity
 from app.services.bucket_evidence import (
@@ -421,6 +427,15 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         or metrics.get("fico")
     )
     intake_state = dict(intake.intake_state or {}) if intake else {}
+    mca_bucket_id = getattr(profile, "primary_bucket_id", None) or getattr(intake, "bucket_id", None)
+    mca_bucket = await db.get(Bucket, mca_bucket_id) if mca_bucket_id else None
+    mca_policy = mca_refinance_policy.evaluate(intake, bucket=mca_bucket)
+    # A model observation can tighten a cap, never establish the missing
+    # declaration needed to open automatic matching. An upload count is not an
+    # MCA count, and unknown does not mean zero or one active position.
+    mca_count = mca_policy["active_mca_count"]
+    if "active_mca_count_required" in mca_policy["reason_codes"] and mca_policy["review_mode"] != "manual_review":
+        mca_count = None
     main_street_details = intake_state.get("main_street_details")
     main_street_details = main_street_details if isinstance(main_street_details, dict) else {}
     stated_intent = normalize_intent(main_street_details.get("intent"))
@@ -513,6 +528,9 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         "naics_code_valid": naics_verified,
         "loan_purpose": loan_purpose,
         "requested_amount": _float(requested_amount),
+        "active_mca_count": mca_count,
+        "requested_term_months": mca_policy["requested_term_months"],
+        "mca_refinance_policy": mca_policy,
         "use_of_funds_total": budget.total if budget.items else None,
         "real_estate_equipment_amount": budget.real_estate_equipment_amount if budget.items else None,
         "real_estate_equipment_pct": budget.real_estate_equipment_pct,
@@ -837,6 +855,16 @@ async def published_candidates(
             if item.program_key == equipment_financing.PROGRAM_KEY
             else None
         )
+        mca_assessment = (
+            mca_refinance_policy.evaluate_fit_context(evaluation_context)
+            if item.program_key == "mca_refinance" else None
+        )
+        intake_mca_policy = context.get("mca_refinance_policy")
+        if mca_assessment is not None and isinstance(intake_mca_policy, dict) and intake_mca_policy.get("review_mode") == "manual_review":
+            # Preserve a more conservative declared/typed payoff or position
+            # count even when another funding source currently asks for less.
+            mca_assessment = intake_mca_policy
+        mca_blocked = mca_assessment is not None and not mca_assessment["auto_underwriting_allowed"]
         if intent_outside_lending:
             recommendation_status = "not_eligible"
             reasons = ["Current intake intent is not routed to lending"]
@@ -848,6 +876,11 @@ async def published_candidates(
             recommendation_status = "not_eligible"
             reasons = scope_reasons or ["Product is outside the current file scope"]
             eligible = False
+        elif mca_blocked:
+            recommendation_status = "custom_review" if mca_assessment["review_mode"] == "manual_review" else "needs_information"
+            reasons = [mca_refinance_policy.message(mca_assessment)]
+            eligible = False
+            rule_state = "fail" if recommendation_status == "custom_review" else "unknown"
         elif not has_fit_rule or result is None:
             recommendation_status = "criteria_unavailable"
             reasons = [
@@ -902,8 +935,8 @@ async def published_candidates(
                 criteria_status=(
                     "published" if has_fit_rule and rules_valid else "invalid"
                 ),
-                fit_score=round((result.confidence if result else 0) * 100, 2),
-                confidence=result.confidence if result else 0,
+                fit_score=0 if mca_blocked else round((result.confidence if result else 0) * 100, 2),
+                confidence=0 if mca_blocked else result.confidence if result else 0,
                 priority=priority,
                 preference_score=preference_score,
                 preference_reasons=preference_reasons,
@@ -916,6 +949,8 @@ async def published_candidates(
                               for row in (getattr(result, "results", []) if result is not None else [])],
                 fact_sources={field: fact_sources[field] for field in (_rule_fields((playbook.rules or {}).get("fit")) | scope_fact_fields) if field in fact_sources},
                 evidence_gaps=list(dict.fromkeys([
+                    *(["active_mca_count"] if mca_assessment and "active_mca_count_required" in mca_assessment["reason_codes"] else []),
+                    *(["requested_amount"] if mca_assessment and "requested_amount_required" in mca_assessment["reason_codes"] else []),
                     *(
                         missing_fields
                         if rule_state == "unknown"
@@ -924,7 +959,7 @@ async def published_candidates(
                     ),
                     *(scope_reasons if scope_state is None else []),
                 ])),
-                requires_review=any(
+                requires_review=bool(mca_blocked) or any(
                     _context_field(context, field) is not None
                     and (field in FINANCIAL_FIT_FIELDS and (fact_sources.get(field) or {}).get("verification_status") != "verified")
                     for field in [*missing_fields, *(missing_scope_fields if scope_state is None else [])]
@@ -3647,6 +3682,11 @@ async def accept_high_confidence_ai_evidence(
         # Serialize click/double-clicks on the bucket, not on an expensive
         # provider call. The normal scheduler drains the queued review.
         bucket = await db.get(Bucket, profile.primary_bucket_id, with_for_update=True)
+        if bucket is not None:
+            from app.services import mca_refinance_policy
+            policy = await mca_refinance_policy.for_bucket(db, bucket)
+            if policy is not None and not policy["auto_underwriting_allowed"]:
+                bucket = None  # File/evidence acceptance is retained without queueing underwriting.
         if bucket is not None:
             queued_review = (await db.execute(select(BucketAIReview).where(
                 BucketAIReview.bucket_id == bucket.id,

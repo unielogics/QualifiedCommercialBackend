@@ -4992,7 +4992,8 @@ async def confirm_application_classification(
             from app.services.operator_file_links import queue_link_change_review
 
             review = await queue_link_change_review(db, intake=intake, requested_by_user_id=user.id)
-            intake.latest_review_id = review.id
+            if review is not None:
+                intake.latest_review_id = review.id
     await profiles.log_profile_action(db, profile, user, "classification.confirm", "Changed file classification and queued requirement review", metadata={"before": before, "after": _classification_dict(profile), "revision": profile.classification_revision})
     await db.commit()
     await db.refresh(profile)

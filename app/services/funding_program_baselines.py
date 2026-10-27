@@ -10,6 +10,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from app.services.mca_refinance_policy import MAX_ACTIVE_MCAS, MAX_AMOUNT, MAX_TERM_MONTHS
+
 BASELINE_VERSION = "qcweb-2026-09-27-v1"
 SITE = "https://qualifiedcommercial.com"
 SBA_SOURCE = "https://www.sba.gov/document/sop-50-10-lender-development-company-loan-programs"
@@ -421,6 +423,12 @@ CATALOG: dict[str, dict[str, Any]] = {
         "path": "/mca-refinance",
         "additional_paths": ["/programs/mca-refinance"],
         "verticals": ["dealer", "main_street", "mca"],
+        "rules": [
+            rule("requested_amount", 0, "gt"),
+            rule("requested_amount", MAX_AMOUNT, "lte"),
+            rule("active_mca_count", 0, "gt"),
+            rule("active_mca_count", MAX_ACTIVE_MCAS, "lte"),
+        ],
         "docs": [
             banks(),
             document(
@@ -457,6 +465,8 @@ CATALOG: dict[str, dict[str, Any]] = {
             ),
         ],
         "notes": [
+            "Review: QC MCA refinance policy confirmed October 26, 2026: maximum $350,000, terms up to 120 months (10 years), and no more than two active MCAs for automatic review. These ceilings are not a financing approval or a guaranteed term.",
+            "Review: Applications with more than two active MCAs are accepted for manual desk review. Missing count or requested amount cannot pass automatic eligibility; do not assume one position from a document upload. Amounts above $350,000 or requested terms above 120 months also require manual review outside the standard program.",
             "Website: this is a restructuring / refinance workflow, not an SBA program. Review current obligations and actual proposed terms.",
             "Website: the dedicated MCA page describes the initial review as six months of statements, an authorized soft-credit pull and current advance terms. The full program page additionally requests current-year P&L, a debt schedule and a dealer license only when applicable. Do not describe the fuller package as the initial three-item review.",
         ],
@@ -898,6 +908,11 @@ def suggested_baseline(
     sources.append(CENSUS_SOURCE)
     criteria = spec.get("rules", [])
     rules: dict[str, Any] = {"fit": {"all": criteria}} if criteria else {}
+    if program_key == "mca_refinance":
+        # The term is an offer ceiling, not a fabricated requested term. The
+        # intrinsic gate applies it whenever an actual term is present.
+        rules["intrinsic_limits"] = {"maximum_amount": MAX_AMOUNT, "maximum_term_months": MAX_TERM_MONTHS,
+                                    "maximum_active_mcas": MAX_ACTIVE_MCAS, "outside_limits_route": "manual_review"}
     if spec.get("recommendation_preferences"):
         rules["recommendation_preferences"] = deepcopy(spec["recommendation_preferences"])
     if not criteria:

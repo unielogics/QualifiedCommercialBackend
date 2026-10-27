@@ -92,8 +92,12 @@ async def queue_link_change_review(
     *,
     intake: PublicUnderwritingIntake,
     requested_by_user_id: UUID,
-) -> BucketAIReview:
+) -> BucketAIReview | None:
     bucket = await db.get(Bucket, intake.bucket_id)
+    from app.services import mca_refinance_policy
+    policy = await mca_refinance_policy.for_bucket(db, bucket, intake=intake)
+    if policy is not None and not policy["auto_underwriting_allowed"]:
+        return None  # Preserve the evidence link; leave underwriting to the desk.
     files = await review_files_for_intake(db, intake)
     review = BucketAIReview(
         bucket_id=intake.bucket_id,

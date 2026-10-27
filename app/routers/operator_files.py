@@ -2300,9 +2300,9 @@ async def link_bucket_to_intake(
     await capital_readiness.advisory_recompute_for_intake(
         db,
         intake.id,
-        event_key=f"bucket-intake-linked:{link.id}:{review.id}",
+        event_key=f"bucket-intake-linked:{link.id}:{review.id if review else 'manual'}",
     )
-    return _link_result(link, audit_ids, review.id, "bucket_intake_linked")
+    return _link_result(link, audit_ids, review.id if review else None, "bucket_intake_linked")
 
 
 @router.get("/bucket-intake-links", response_model=list[BucketIntakeLinkRead])
@@ -2375,9 +2375,9 @@ async def update_bucket_intake_link(
     await capital_readiness.advisory_recompute_for_intake(
         db,
         intake.id,
-        event_key=f"bucket-intake-link-updated:{link.id}:{review.id}",
+        event_key=f"bucket-intake-link-updated:{link.id}:{review.id if review else 'manual'}",
     )
-    return _link_result(link, audit_ids, review.id, "bucket_intake_link_updated")
+    return _link_result(link, audit_ids, review.id if review else None, "bucket_intake_link_updated")
 
 
 @router.delete("/bucket-intake-links/{link_id}", response_model=BucketIntakeLinkResult)
@@ -2412,10 +2412,10 @@ async def unlink_bucket_from_intake(
     await capital_readiness.advisory_recompute_for_intake(
         db,
         intake.id,
-        event_key=f"bucket-intake-unlinked:{link.id}:{review.id}",
+        event_key=f"bucket-intake-unlinked:{link.id}:{review.id if review else 'manual'}",
     )
     return _link_result(
-        link, audit_ids, review.id, "bucket_intake_unlinked", link_status="unlinked"
+        link, audit_ids, review.id if review else None, "bucket_intake_unlinked", link_status="unlinked"
     )
 
 
@@ -2728,7 +2728,7 @@ def _write_link_audits(
 def _link_result(
     link: BucketIntakeLink,
     audit_ids: list[UUID],
-    review_id: UUID,
+    review_id: UUID | None,
     action: str,
     *,
     link_status: str = "active",

@@ -1403,9 +1403,12 @@ async def queue_ai_review(
     db: AsyncSession = Depends(get_db),
 ) -> BucketAIReview:
     bucket = await _load_bucket_or_404(db, bucket_id)
+    from app.services import mca_refinance_policy
+    await mca_refinance_policy.require_automatic(db, bucket)
     context_patch = payload.context.model_dump(exclude_none=True) if payload.context else {}
     if context_patch:
         bucket.ai_context = {**(bucket.ai_context or {}), **context_patch}
+    await mca_refinance_policy.require_automatic(db, bucket)
     active_files = [
         file
         for file in bucket.files

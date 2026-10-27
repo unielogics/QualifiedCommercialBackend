@@ -33,6 +33,8 @@ SUPPORTED_FIT_FIELDS = frozenset(
         "naics_code",
         "loan_purpose",
         "requested_amount",
+        "active_mca_count",
+        "requested_term_months",
         "use_of_funds_total",
         "real_estate_equipment_amount",
         "real_estate_equipment_pct",

@@ -123,6 +123,7 @@ from app.services import (
     intake_lifecycle,
     intake_retention,
     locked_file_requests,
+    mca_refinance_policy,
     merchant_processing,
     notifications,
     provenance,
@@ -1553,6 +1554,7 @@ async def _secure_room_handoff(
 
 class DealerIntakeResponse(BaseModel):
     intake: DealerIntakeRead
+    mca_refinance_policy: dict[str, Any] | None = None
     communication_locale: Literal["en", "es"] = "en"
     capital_readiness: CapitalReadinessRead | None = None
     # Set while the desk has taken the conversation over: the room shows the
@@ -1586,6 +1588,7 @@ class DealerIntakeResponse(BaseModel):
 
 class DealerAILeadRow(BaseModel):
     id: UUID
+    mca_refinance_policy: dict[str, Any] | None = None
     variant: str
     client_id: UUID | None = None
     bucket_id: UUID
@@ -3246,6 +3249,8 @@ async def _merge_thread_borrower_facts(db: AsyncSession, intake: PublicUnderwrit
     elif intake.variant == MAIN_STREET_VARIANT:
         _merge_main_street_details(intake, proposed)
         _apply_loan_program_fit(intake)
+    elif intake.variant == MCA_VARIANT:
+        _merge_mca_details(intake, proposed)
     else:
         newly_accepted = _merge_dealer_details(intake, proposed)
         await _apply_dealer_detail_documents(db, intake, newly_accepted)
@@ -6904,8 +6909,11 @@ async def _response(
         if readiness_profile is not None
         else None
     )
+    mca_policy = mca_refinance_policy.evaluate(intake, bucket=intake.bucket) if mca_refinance_policy.is_mca_refinance(intake, intake.bucket) else None
     review = intake.latest_review if intake.latest_review else None
-    latest_result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
+    if mca_policy is not None and not mca_policy["auto_underwriting_allowed"]:
+        review = None  # Historical AI screening is not a current eligibility decision.
+    latest_result = _lead_result(intake) if mca_policy is not None else review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
     widget = prequalification_widget
     if widget is None and latest_result and latest_result.get("booking_recommended") is True and not _call_booked(intake):
         widget = await _decorate_widget(
@@ -7024,6 +7032,7 @@ async def _response(
     )
     return DealerIntakeResponse(
         intake=intake_read,
+        mca_refinance_policy=mca_policy,
         communication_locale=(
             readiness_profile.communication_locale
             if readiness_profile is not None
@@ -7046,7 +7055,7 @@ async def _response(
         signing_gate=signing_gate,
         resume_url=_public_url(f"{public_path}?token={token}") if token and public_path else None,
         upload_url=_public_url(f"/buckets/request/{intake.bucket_upload_link.token}") if intake.bucket_upload_link else None,
-        assistant_message=assistant_message or (_format_review_update(latest_result) if latest_result else empty_message or _message_for_widget(widget, intake)),
+        assistant_message=assistant_message or (mca_refinance_policy.message(mca_policy, intake.preferred_language) if mca_policy is not None and not mca_policy["auto_underwriting_allowed"] else _format_review_update(latest_result) if latest_result else empty_message or _message_for_widget(widget, intake)),
         widget=widget,
         requested_documents=[
             _requested_document_read(doc, file_reads)
@@ -8595,6 +8604,10 @@ def _require_governance_admin(user: CurrentUser) -> None:
 
 
 def _lead_result(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    if mca_refinance_policy.is_mca_refinance(intake, getattr(intake, "bucket", None)):
+        policy = mca_refinance_policy.evaluate(intake, bucket=getattr(intake, "bucket", None))
+        if not policy["auto_underwriting_allowed"]:
+            return mca_refinance_policy.blocked_result(policy)
     review = intake.latest_review if intake.latest_review else None
     if review and isinstance(review.result, dict):
         return review.result
@@ -8623,6 +8636,7 @@ def _lead_row(
     missing_docs = _missing_required_docs(intake.bucket)
     return DealerAILeadRow(
         id=intake.id,
+        mca_refinance_policy=(mca_refinance_policy.evaluate(intake, bucket=intake.bucket) if mca_refinance_policy.is_mca_refinance(intake, intake.bucket) else None),
         variant=intake.variant,
         client_id=intake.client_id,
         bucket_id=intake.bucket_id,
@@ -8924,6 +8938,17 @@ async def _execute_intake_review(
 
     Picks the AI context by variant so a real-estate lead is never re-run with
     dealer context (and vice-versa). Returns the fresh review (or None)."""
+    if mca_refinance_policy.is_mca_refinance(intake, intake.bucket):
+        policy = mca_refinance_policy.persist(intake)
+        if not policy["auto_underwriting_allowed"]:
+            if policy["review_mode"] == "manual_review":
+                mca_refinance_policy.persist(intake, request_manual=True)
+                intake.status = "manual_review"
+                await _log(db, intake.bucket_id, "mca_refinance_manual_review_requested", request=request,
+                           actor_name=actor_name, actor_email=actor_email, actor_role=actor_role,
+                           target_type="mca_refinance_intake", target_id=str(intake.id),
+                           detail="Application accepted for human review; automatic underwriting not run: " + ", ".join(policy["reason_codes"]))
+            return None
     is_funding = intake.variant == FUNDING_VARIANT
     context_fn = _context_fn_for(intake)
     recent_key = "recent_funding_review_chat" if is_funding else "recent_dealer_chat"
@@ -8994,6 +9019,7 @@ async def _create_queued_review(
     """Create a queued review row (committed) for a lead, picking the AI context
     by variant. The heavy pass runs separately (background) so the request
     returns immediately and the UI can poll progress."""
+    await mca_refinance_policy.require_automatic(db, intake.bucket, intake=intake)
     is_funding = intake.variant == FUNDING_VARIANT
     context_fn = _context_fn_for(intake)
     recent_key = "recent_funding_review_chat" if is_funding else "recent_dealer_chat"
@@ -14680,6 +14706,10 @@ class McaRefiStart(PublicIntakeAttribution):
     email: EmailStr
     phone: RequiredPhone
     business_name: str | None = Field(default=None, max_length=180)
+    active_mca_count: int | None = Field(default=None, ge=0, le=50, strict=True)
+    requested_amount: float | None = Field(default=None, ge=0, allow_inf_nan=False, strict=True)
+    requested_term_months: int | None = Field(default=None, ge=1, le=1200, strict=True)
+    manual_review_requested: bool = Field(default=False, strict=True)
     # Optional pre-seed from the marketing calculator, so the room opens
     # already knowing what the applicant typed there.
     remaining_payback: float | None = Field(default=None, ge=0)
@@ -14710,8 +14740,21 @@ class McaTermsSubmission(BaseModel):
     item. Same trusted-structured-input rationale as the debt-schedule form."""
 
     business_name: str = Field(min_length=1, max_length=180)
-    advances: list[McaAdvanceRow] = Field(min_length=1, max_length=10)
+    advances: list[McaAdvanceRow] = Field(min_length=1, max_length=50)
     acknowledgment: bool
+
+
+class McaRefiQualification(BaseModel):
+    active_mca_count: int | None = Field(default=None, ge=0, le=50, strict=True)
+    requested_amount: float | None = Field(default=None, ge=0, allow_inf_nan=False, strict=True)
+    requested_term_months: int | None = Field(default=None, ge=1, le=1200, strict=True)
+    manual_review_requested: bool = Field(default=False, strict=True)
+
+    @model_validator(mode="after")
+    def require_facts_or_manual_request(self) -> McaRefiQualification:
+        if not self.manual_review_requested and (self.active_mca_count is None or self.requested_amount is None):
+            raise ValueError("Active MCA count and requested amount are required unless requesting manual desk review.")
+        return self
 
 
 class PublicCreditPullRequest(BaseModel):
@@ -14777,7 +14820,7 @@ def _merge_mca_details(intake: PublicUnderwritingIntake, proposed: Any) -> None:
                 accepted[key] = text
             continue
         if key == "advance_count":
-            if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 50:
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 50 and float(value).is_integer():
                 accepted[key] = int(value)
             continue
         if key == "factor_rate":
@@ -14798,6 +14841,7 @@ def _merge_mca_details(intake: PublicUnderwritingIntake, proposed: Any) -> None:
     merged.update(accepted)
     state["mca_details"] = merged
     intake.intake_state = state
+    mca_refinance_policy.persist(intake)
 
 
 def _mca_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
@@ -14813,6 +14857,9 @@ def _mca_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "business_name": intake.business_name,
         "requested_loan_amount": float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else None,
         "mca_details": _mca_details(intake) or None,
+        "mca_qualification": state.get("mca_qualification"),
+        "mca_terms_summary": state.get("mca_terms_summary"),
+        "mca_refinance_policy": mca_refinance_policy.evaluate(intake, bucket=intake.bucket),
         "credit_pull": _credit_pull_state(intake) or None,
         "checklist_status": checklist,
         "chat_facts": state.get("chat_facts") if isinstance(state.get("chat_facts"), list) else [],
@@ -15011,11 +15058,18 @@ async def start_mca_refinance(
         phone=payload.phone,
         business_name=payload.business_name,
         loan_purpose="mca_refinance",
+        requested_loan_amount=payload.requested_amount if payload.requested_amount is not None else payload.remaining_payback,
         referral_source=(attribution or {}).get("source") or "mca_refinance",
         preferred_language=payload.preferred_language,
         intake_state={
             "messages": [],
             "source": "mca_refinance",
+            **({"mca_manual_review_requested_at": _now().isoformat()} if payload.manual_review_requested else {}),
+            "mca_qualification": {
+                "active_mca_count": payload.active_mca_count,
+                "requested_amount": payload.requested_amount if payload.requested_amount is not None else payload.remaining_payback,
+                "requested_term_months": payload.requested_term_months,
+            },
             **({"signup_attribution": attribution} if attribution else {}),
             **({"mca_details": seeded} if seeded else {}),
             "legal_acceptance": {
@@ -15027,6 +15081,8 @@ async def start_mca_refinance(
             },
         },
     )
+    intake.bucket = bucket
+    mca_refinance_policy.persist(intake)
     db.add(intake)
     await db.commit()
     intake = await _load_public_intake(db, token)
@@ -15222,6 +15278,32 @@ async def mca_refinance_chat(
     )
 
 
+@mca_router.post("/{token}/qualification", response_model=DealerIntakeResponse)
+async def update_mca_refinance_qualification(
+    token: str,
+    payload: McaRefiQualification,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """Save declarations for new and legacy/upload-only files, without underwriting."""
+    intake = await _load_public_intake(db, token)
+    _require_mca_intake(intake)
+    state = _intake_state(intake)
+    declaration = dict(state.get("mca_qualification") or {})
+    declaration.update(payload.model_dump(exclude_unset=True, exclude_none=True, exclude={"manual_review_requested"}))
+    state["mca_qualification"] = declaration
+    intake.intake_state = state
+    if payload.requested_amount is not None:
+        intake.requested_loan_amount = payload.requested_amount
+    policy = mca_refinance_policy.persist(intake, request_manual=payload.manual_review_requested)
+    await _log(db, intake.bucket_id, "mca_refinance_manual_review_requested" if payload.manual_review_requested else "mca_refinance_qualification_saved", request=request,
+               actor_name=intake.full_name, actor_email=intake.email, actor_role="public_lead",
+               target_type="mca_refinance_intake", target_id=str(intake.id),
+               detail="Review route: " + policy["review_mode"])
+    await db.commit()
+    return await _response(db, intake, token=token, public_path=MCA_PUBLIC_PATH)
+
+
 @mca_router.post("/{token}/files/upload-init", response_model=BucketFileUploadInitResponse)
 async def mca_refinance_upload_init(
     token: str,
@@ -15332,6 +15414,9 @@ async def submit_mca_refinance_terms(
     )
     # Mirror the typed terms into the structured detail bundle the AI context
     # reads, so the chat knows the terms without re-deriving them from the PDF.
+    state = _intake_state(intake)
+    state["mca_terms_summary"] = {"active_mca_count": len(debts), "remaining_payback": round(total_balance, 2)}
+    intake.intake_state = state
     first = payload.advances[0]
     _merge_mca_details(
         intake,
@@ -15373,6 +15458,11 @@ async def mca_refinance_credit_pull(
     )
     intake = await _load_public_intake(db, token)
     _require_mca_intake(intake)
+    policy = mca_refinance_policy.persist(intake)
+    if not policy["auto_underwriting_allowed"]:
+        await db.commit()
+        return await _response(db, intake, token=token, public_path=MCA_PUBLIC_PATH,
+                               assistant_message=mca_refinance_policy.message(policy, intake.preferred_language))
     if intake.client_id is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "This review has no linked client")
     if _credit_pull_state(intake).get("fico") is not None or _credit_pull_state(intake).get("pull_id"):
