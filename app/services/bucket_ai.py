@@ -183,6 +183,12 @@ When per_file_analyses contains profitability_diagnostics, explain those determi
 Never invent or estimate a credit score/tier. If ai_context.authoritative_facts.credit_score is present, you MUST use that exact value and ignore any other credit number in the chat, documents, or prior review. Otherwise use ONLY the value the borrower most recently stated in the chat (a later message overrides any earlier one) or a value present in an uploaded document; if none is provided, say the credit score is not provided. Do not copy any number from these instructions.
 """
 
+# Published-criteria screen rules, appended to every review prompt after the
+# persona rules. The screen (context.published_program_screen) is the funding
+# catalog's approved criteria evaluated against this file; it is a screen,
+# never an approval, and the soft credit pull always comes last.
+REVIEW_PROGRAM_SCREEN_RULES = """context.published_program_screen lists approved programs with their published-criteria status for this file. When a program is eligible, say in executive_summary that the file fits the published criteria for that program by name and keep one_next_step on the lender's remaining items. When a program needs information, name in recommended_next_document_requests the single missing item that would unlock it. Never call a fit an approval, never quote a rate, and never treat a missing credit score as a failure: the soft credit pull is the last step."""
+
 # Compaction limits appended to every product's review prompt.
 REVIEW_LIMITS = """Keep the response compact enough to parse: executive_summary <= 1200 characters; available_documents <= 8 items; missing_or_incomplete_items <= 12 items; discrepancies <= 8 items; underwriter_questions <= 8 items; proof_of_funds_financial_collateral_gaps <= 8 items; recommended_next_document_requests <= 12 items; per_file_summaries <= 5 items; document_evidence_map.files <= 12 items; document_evidence_map.baseline_coverage <= 8 items. Keep each item detail/summary under 220 characters. Never list every file outside document_evidence_map. Per-file summaries are optional and should cover only the most important readable documents. Prioritize critical underwriting issues and one requested next action over exhaustive document recaps."""
 
@@ -333,6 +339,27 @@ UPLOADER_FORM_BUTTONS_INSTRUCTION = (
     "beneath your message for that form, so you may refer to them in one short sentence instead of "
     "describing how to find a form."
 )
+# Admin-thread program instructions. The screen wording applies whenever the
+# published-criteria screen carried any program; the no-selection wording is
+# what the operator thread said before the screen existed and still gets when
+# the screen is empty.
+ADMIN_PROGRAM_SCREEN_INSTRUCTION = (
+    "published_program_screen is the approved-criteria screen for this file. You may tell the "
+    "operator which programs the file fits now and which it would fit once the named evidence gaps "
+    "close; name the gap. It is a screen, never an approval; never quote a rate; the soft credit pull "
+    "happens last, so a missing credit score is a pending step, not a disqualifier. Do not use legacy "
+    "fit data to recommend a program."
+)
+ADMIN_NO_SELECTION_INSTRUCTION = (
+    "No approved published program is selected. Do not use legacy fit data "
+    "to recommend a program; report that published criteria are unavailable "
+    "or that more information is required."
+)
+# Published-program screen bounds: programs are best-first from
+# published_candidates, so the cap keeps the strongest fits.
+PROGRAM_SCREEN_MAX_PROGRAMS = 8
+PROGRAM_SCREEN_MAX_ITEMS = 4
+PROGRAM_DESCRIPTION_MAX_CHARS = 1200
 
 
 # Internal-thread override, appended AFTER the product rules for the private
@@ -429,14 +456,14 @@ def build_review_system(review_type: str | None) -> str:
     neutral preamble only, with no product-specific rules.
     """
     if review_type == "dealer_gatekeeper_v1":
-        return f"{REVIEW_PREAMBLE}\n{DEALER_REVIEW_RULES}\n{REVIEW_LIMITS}\n"
+        return f"{REVIEW_PREAMBLE}\n{DEALER_REVIEW_RULES}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_LIMITS}\n"
     if review_type == "real_estate_dscr_v1":
-        return f"{REVIEW_PREAMBLE}\n{RE_REVIEW_RULES}\n{REVIEW_LIMITS}\n"
+        return f"{REVIEW_PREAMBLE}\n{RE_REVIEW_RULES}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_LIMITS}\n"
     if review_type == "main_street_v1":
-        return f"{REVIEW_PREAMBLE}\n{MAIN_STREET_REVIEW_RULES}\n{REVIEW_LIMITS}\n"
+        return f"{REVIEW_PREAMBLE}\n{MAIN_STREET_REVIEW_RULES}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_LIMITS}\n"
     if review_type == "mca_refi_v1":
-        return f"{REVIEW_PREAMBLE}\n{MCA_REVIEW_RULES}\n{REVIEW_LIMITS}\n"
-    return f"{REVIEW_PREAMBLE}\n{REVIEW_LIMITS}\n"
+        return f"{REVIEW_PREAMBLE}\n{MCA_REVIEW_RULES}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_LIMITS}\n"
+    return f"{REVIEW_PREAMBLE}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_LIMITS}\n"
 
 
 def build_chat_system(review_type: str | None, *, client_language: str | None = None, audience: str | None = None) -> str:
@@ -3163,25 +3190,44 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         }
         for file in files
     ]
+    # The published-criteria screen gives the review the same approved-program
+    # intelligence the operator thread has. It is advisory: an unresolved
+    # profile simply leaves it out, and a failure never costs the review.
+    review_context: dict[str, Any] = {
+        "bucket": {
+            "name": bucket.name,
+            "client_name": bucket.client_name,
+            "purpose": bucket.purpose,
+            "bucket_type": bucket.bucket_type,
+            "description": bucket.description,
+        },
+        "ai_context": review.context_snapshot or bucket.ai_context or {},
+    }
+    try:
+        from app.services.application_programs import profile_for_chat_scope
+
+        screen_profile = await profile_for_chat_scope(
+            db,
+            bucket_id=bucket.id,
+            intake_id=intake.id if intake is not None else None,
+            upload_link_id=None,
+        )
+    except Exception:  # noqa: BLE001 - advisory context must never fail the review
+        log.exception("bucket_ai: program screen profile lookup failed review=%s", review.id)
+        screen_profile = None
+    if screen_profile is not None:
+        review_context["published_program_screen"] = await _published_program_screen(db, screen_profile)
+    review_context.update(
+        {
+            "requested_documents": requested,
+            "uploaded_files": metadata,
+            "instruction": "Review the attached/readable files and the metadata. Identify what is available, missing, discrepant, unclear, or likely to be questioned by an underwriter.",
+        }
+    )
     content: list[dict[str, Any]] = [
         {
             "type": "text",
-            "text": json.dumps(
-                {
-                    "bucket": {
-                        "name": bucket.name,
-                        "client_name": bucket.client_name,
-                        "purpose": bucket.purpose,
-                        "bucket_type": bucket.bucket_type,
-                        "description": bucket.description,
-                    },
-                    "ai_context": review.context_snapshot or bucket.ai_context or {},
-                    "requested_documents": requested,
-                    "uploaded_files": metadata,
-                    "instruction": "Review the attached/readable files and the metadata. Identify what is available, missing, discrepant, unclear, or likely to be questioned by an underwriter.",
-                },
-                default=str,
-            ),
+            "text": json.dumps(review_context, default=str),
         }
     ]
 
@@ -4149,6 +4195,51 @@ async def create_chat_reply(
         return [user_row, assistant], [], None
 
 
+def _clip_program_description(value: str | None) -> str | None:
+    text = (value or "").strip()
+    return text[:PROGRAM_DESCRIPTION_MAX_CHARS] if text else None
+
+
+async def _published_program_screen(db: AsyncSession, profile: ApplicationProfile) -> list[dict[str, Any]]:
+    """The funding catalog's approved criteria evaluated against one file.
+
+    Returns the best-first published candidates (capped), each with its
+    published-criteria status, the reasons and evidence gaps the rules
+    produced, and the published version's description. The screen is advisory
+    knowledge for the underwriting AI: any failure here is logged and yields
+    an empty screen, so it can never cost a chat turn or a review.
+    """
+    try:
+        from app.services.application_programs import published_candidates
+        from app.services.funding_programs import published_versions_by_program
+
+        candidates = list(await published_candidates(db, profile))[:PROGRAM_SCREEN_MAX_PROGRAMS]
+        versions = await published_versions_by_program(
+            db, [candidate.catalog_id for candidate in candidates]
+        )
+        return [
+            {
+                "program_key": candidate.program_key,
+                "program_name": candidate.program_name,
+                "recommendation_status": candidate.recommendation_status,
+                "eligible": bool(candidate.eligible),
+                "criteria_status": candidate.criteria_status,
+                "reasons": list(candidate.reasons or [])[:PROGRAM_SCREEN_MAX_ITEMS],
+                "evidence_gaps": list(candidate.evidence_gaps or [])[:PROGRAM_SCREEN_MAX_ITEMS],
+                "description": _clip_program_description(
+                    getattr(versions.get(candidate.catalog_id), "description", None)
+                ),
+            }
+            for candidate in candidates
+        ]
+    except Exception:  # noqa: BLE001 - advisory context must never fail the caller
+        log.exception(
+            "bucket_ai: published program screen failed profile=%s",
+            getattr(profile, "id", None),
+        )
+        return []
+
+
 async def _program_context_for_chat(
     db: AsyncSession,
     *,
@@ -4158,7 +4249,7 @@ async def _program_context_for_chat(
     audience: str,
 ) -> dict[str, Any] | None:
     """Expose selected playbook knowledge without leaking staff-only fit data."""
-    from app.models.ai_playbook import AICollectionRequirement
+    from app.models.ai_playbook import AICollectionRequirement, AIPlaybookTemplate
     from app.models.application_profile import (
         ApplicationProgramRequirementOverride,
         ApplicationRequirementState,
@@ -4176,14 +4267,14 @@ async def _program_context_for_chat(
     selections = await active_selections(db, profile.id)
     if not selections:
         if audience == "admin":
+            screen = await _published_program_screen(db, profile)
             return {
                 "selection_mode": profile.program_selection_mode,
                 "selected_programs": [],
                 "shared_requirements": [],
+                "published_program_screen": screen,
                 "instructions": (
-                    "No approved published program is selected. Do not use legacy fit data "
-                    "to recommend a program; report that published criteria are unavailable "
-                    "or that more information is required."
+                    ADMIN_PROGRAM_SCREEN_INSTRUCTION if screen else ADMIN_NO_SELECTION_INSTRUCTION
                 ),
             }
         return None
@@ -4236,6 +4327,20 @@ async def _program_context_for_chat(
         if row.selection_id in selection_by_id
     }
     if audience == "admin":
+        # The selected programs' own published text and the catalog-wide
+        # screen both reach the operator thread; the borrower thread below
+        # never receives either.
+        playbook_by_id = {
+            row.id: row
+            for row in (
+                await db.execute(
+                    select(AIPlaybookTemplate).where(
+                        AIPlaybookTemplate.id.in_([item.playbook_id for item in selections])
+                    )
+                )
+            ).scalars().all()
+        }
+        screen = await _published_program_screen(db, profile)
         return {
             "selection_mode": profile.program_selection_mode,
             "selected_programs": [
@@ -4243,9 +4348,14 @@ async def _program_context_for_chat(
                     "program_key": item.program_key,
                     "program_name": item.program_name,
                     "playbook_version": item.playbook_version,
+                    "description": _clip_program_description(
+                        getattr(playbook_by_id.get(item.playbook_id), "description", None)
+                    ),
                 }
                 for item in selections
             ],
+            "published_program_screen": screen,
+            **({"instructions": ADMIN_PROGRAM_SCREEN_INSTRUCTION} if screen else {}),
             "shared_requirements": [
                 {
                     "requirement_key": item.requirement_key,

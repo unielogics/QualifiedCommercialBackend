@@ -16,6 +16,9 @@ BASELINE_VERSION = "qcweb-2026-09-27-v1"
 SITE = "https://qualifiedcommercial.com"
 SBA_SOURCE = "https://www.sba.gov/document/sop-50-10-lender-development-company-loan-programs"
 CENSUS_SOURCE = "https://www.census.gov/naics/reference_files_tools/2022_NAICS_Manual.pdf"
+# A lender guideline kept in the repository, so the transcription can be checked
+# against its source: docs/program_sources/quidity_direct_10_year_term_loan_2026-10.pdf
+QUIDITY_SOURCE = "repo://docs/program_sources/quidity_direct_10_year_term_loan_2026-10.pdf"
 
 
 def check(key: str, label: str, instructions: str, severity: str = "review") -> dict[str, str]:
@@ -834,6 +837,247 @@ CATALOG: dict[str, dict[str, Any]] = {
             ),
         ],
     },
+    # Transcribed from docs/program_sources/quidity_direct_10_year_term_loan_2026-10.pdf
+    # (Quidity Direct program guidelines, October 2026; NEWITY LLC is the lender
+    # service provider). Every threshold below is the guide's own. Eligibility
+    # rules use only what the file already holds — tax return, bank statements,
+    # debt schedule, stated facts. The guide's credit, residency, legal and
+    # IRS tests are deliberately review items, not fit gates: the owner's
+    # process runs the soft credit pull last, and the screen must be able to
+    # say "fits" before it. Loan sizing is a staff calculation on the file,
+    # written out here so the AI can reason about it.
+    "quidity_10_year_term": {
+        "name": "10-Year Term Loan",
+        "public_slug": "ten-year-term-loan",
+        "short_description": (
+            "Working capital and payoff of high-interest business debt, including "
+            "merchant cash advances, from $50,000 to $350,000 over ten years."
+        ),
+        "sources": [QUIDITY_SOURCE],
+        "source_note": (
+            "Lender guideline: Quidity Direct 10 Year Term Loan Program Guidelines, "
+            "October 2026, consolidating the September 2026 NEWITY Growth Term Loan "
+            "criteria and the October 21, 2026 partner briefing. All terms are subject "
+            "to lender confirmation; nothing here is an approval."
+        ),
+        "description": (
+            "Quidity Direct 10 Year Term Loan (lender service provider: NEWITY LLC). "
+            "$50,000 to $350,000, 120 months, target rate 14-20% (higher by risk), "
+            "5.5% program fee deducted from proceeds, closing 2-4 weeks after an "
+            "acceptable file. All 50 states; Puerto Rico excluded. USES: working "
+            "capital, and payoff of high-interest business debt including MCAs; any "
+            "active MCA must be refinanced in the new loan (up to 2 MCAs, up to 7 "
+            "debts); not for business acquisitions or real-estate development, "
+            "investment or real-estate-sector businesses. MINIMUMS: 2 years in "
+            "business (4 for construction); at least $175,000 revenue and positive "
+            "EBITDA on the most recently filed business tax return; soft-pull Equifax "
+            "FICO 9 of 680+ for every 20%+ owner (hard minimum, checked last, "
+            "recheck after 30 days); guarantors U.S. citizens or lawful permanent "
+            "residents and at least 51% U.S. ownership; U.S. operations with "
+            "majority domestic income. SIZING: Fast Track up to $200,000 = 40% of "
+            "tax-return revenue minus current business debt, no DSCR test, blanket "
+            "business-assets UCC up to third position. Cash-flow pathway up to "
+            "$350,000 = the lesser of 40% of revenue or 60% of revenue minus current "
+            "business debt, minimum 1.10x DSCR, blanket UCC up to fourth position. "
+            "Equipment-specific UCC filings do not count as blanket positions. BANK "
+            "STATEMENTS (trailing six months): no more than 5 NSF/overdraft items; "
+            "annualized qualifying deposits not more than 25% below the tax-return "
+            "revenue; average ending balance above 3x the proposed monthly payment. "
+            "SECURITY: blanket UCC on all business assets; personal guarantee from "
+            "every 20%+ owner; no separately pledged personal collateral. RISK: no "
+            "financial-crime felony for any guarantor and no felony within 3 years; "
+            "all bankruptcies discharged and none filed within 5 years; aggregate IRS "
+            "balances at or below $100,000; no active judgments or liens within 5 "
+            "years (program review); no collection litigation active or filed within "
+            "3 years. SUBMISSION: most recently filed business tax return, trailing "
+            "six months of business bank statements, and a current business debt "
+            "schedule including MCA payoff details."
+        ),
+        "verticals": ["main_street", "mca"],
+        # Fit gates are facts, never document counts. In this engine a fact
+        # that is not known yet reads as "needs information", which is what a
+        # file that has not uploaded its return should look like; a count of
+        # zero statements reads as a failure, which is not. The filed return
+        # and the six months of statements are therefore requirement rows
+        # with review checks, and the gates below are the guide's numbers
+        # applied to what those documents yield.
+        "rules": [
+            rule("business_age_years", 2),
+            # Four years for construction. `industry_key` is the main-street
+            # slug on an intake-sourced file and the NAICS sector label on a
+            # classified one, so both spellings are matched.
+            {
+                "any": [
+                    {"not": rule("industry_key", ["construction_trades", "Construction"], "in")},
+                    rule("business_age_years", 4),
+                ]
+            },
+            rule("annual_revenue", 175000),
+            rule("cash_flow", 0, "gt"),
+            rule("nsf_or_overdraft_count", 5, "lte"),
+            rule("requested_amount", 50000),
+            rule("requested_amount", 350000, "lte"),
+        ],
+        "recommendation_preferences": [
+            {
+                "key": "mca_payoff",
+                "label": "Active MCA obligations are refinanced by this program",
+                "when": rule("mca_obligations_present", True, "eq"),
+                "score": 30,
+            },
+            {
+                "key": "refinance_intent",
+                "label": "Stated intent is refinancing business debt",
+                "when": rule("intent", "refinance_debt", "eq"),
+                "score": 15,
+            },
+            {
+                "key": "dscr_pathway",
+                "label": "DSCR at or above 1.10x opens the $350,000 cash-flow pathway",
+                "when": rule("dscr", 1.10),
+                "score": 20,
+            },
+        ],
+        # Real estate (531) and land subdivision (2372): the guide excludes
+        # real-estate development, investment and real-estate-sector businesses.
+        "excluded": ["531", "2372"],
+        "docs": [
+            taxes(
+                1,
+                patterns=False,
+                stage="underwriting",
+            )
+            | {
+                "label": "Most recently filed business tax return",
+                "completion_criteria": (
+                    "Obtain the most recently filed complete business return with schedules. "
+                    "Revenue and EBITDA for this program are read from this return, not from "
+                    "bank deposits or management accounts."
+                ),
+                "review_checks": [
+                    check(
+                        "custom_quidity_revenue_floor",
+                        "Revenue of at least $175,000 on the filed return",
+                        "Read gross receipts from the most recently filed business return. Below $175,000 the file does not meet the program minimum.",
+                        "block",
+                    ),
+                    check(
+                        "custom_quidity_positive_ebitda",
+                        "Positive EBITDA on the filed return",
+                        "Compute EBITDA from the filed return (net income plus interest, taxes, depreciation and amortization shown on the return). It must be above zero.",
+                        "block",
+                    ),
+                ],
+            },
+            banks(
+                6,
+                [
+                    check(
+                        "custom_quidity_nsf_limit",
+                        "No more than 5 NSF or overdraft items across six months",
+                        "Count every non-sufficient-funds and overdraft item on the six official statements. Six or more fails the program screen.",
+                        "block",
+                    ),
+                    check(
+                        "custom_quidity_deposit_consistency",
+                        "Annualized deposits within 25% of tax-return revenue",
+                        "Annualize qualifying deposits from the six statements and compare with gross receipts on the filed return. A decline greater than 25% fails the screen.",
+                        "block",
+                    ),
+                    check(
+                        "custom_quidity_liquidity",
+                        "Average ending balance above 3x the proposed monthly payment",
+                        "Average the six month-end balances and compare with the proposed monthly payment from the loan sizing. The average must exceed three times the payment.",
+                        "block",
+                    ),
+                ],
+            ),
+            deepcopy(DEBT)
+            | {
+                "label": "Current business debt schedule with MCA payoff details",
+                "review_checks": [
+                    check(
+                        "custom_quidity_mca_payoff",
+                        "Every active MCA is refinanced in the new loan",
+                        "List each active merchant cash advance with funder, remaining payback and payoff amount. All of them must be paid off by this loan; the schedule must carry payoff details.",
+                        "block",
+                    ),
+                    check(
+                        "custom_quidity_refinance_limits",
+                        "No more than 2 MCAs and 7 total debts refinanced",
+                        "Count the obligations being refinanced. More than two MCAs or more than seven total debts is outside the program.",
+                        "block",
+                    ),
+                    check(
+                        "custom_quidity_ucc_positions",
+                        "Blanket UCC position within the pathway limit",
+                        "From the schedule and any UCC search, count blanket all-business-assets liens. Fast Track allows up to third position, the cash-flow pathway up to fourth. Equipment-specific UCC filings do not count.",
+                        "review",
+                    ),
+                ],
+            },
+            deepcopy(USE)
+            | {
+                "completion_criteria": (
+                    "Eligible uses are general working capital and payoff of high-interest "
+                    "business debt including MCAs. Business acquisitions and real-estate "
+                    "development, investment or real-estate-sector uses are not permitted."
+                ),
+                "review_checks": [
+                    check(
+                        "custom_quidity_eligible_use",
+                        "Use of funds is working capital or eligible debt payoff",
+                        "Confirm the stated use. An acquisition or a real-estate use fails the program regardless of the financials.",
+                        "block",
+                    )
+                ],
+            },
+            document(
+                "quidity_sizing_pathways",
+                "Loan sizing: Fast Track and cash-flow pathways",
+                "Calculate both pathways from the filed return and the debt schedule. Fast Track (up to $200,000): 40% of annual tax-return revenue minus current business debt, no DSCR test. Cash-flow (up to $350,000): the lesser of 40% of revenue or 60% of revenue minus current business debt, with DSCR of at least 1.10x. Record both results and which pathway the requested amount fits. Sizing is indicative; the lender's underwriting sets the final amount.",
+                category="financials",
+            )
+            | {"requirement_kind": "human_review", "completion_mode": "requires_human_verify"},
+            document(
+                "quidity_eligibility_review",
+                "Program eligibility: geography, ownership, operations and legal standing",
+                "Confirm: business located in one of the 50 states (Puerto Rico excluded); every guarantor a U.S. citizen or lawful permanent resident and at least 51% of ownership held by such persons; U.S.-based operations and owners with a majority of income domestic; no financial-crime felony for any guarantor and no felony within 3 years; all bankruptcies discharged and none filed within 5 years; aggregate IRS balances at or below $100,000; no active judgments or liens within 5 years; no collection litigation active or filed within 3 years. Other active litigation is reviewed case by case.",
+                category="compliance",
+                waivable=False,
+                checks=[
+                    check(
+                        "custom_quidity_legal_standing",
+                        "Legal, tax and residency standing confirmed",
+                        "Each item above is confirmed from documents or a signed attestation, not inferred. Any failure is outside the program.",
+                        "block",
+                    )
+                ],
+            ),
+            document(
+                "guarantor_credit_review",
+                "Soft credit pull: 680+ Equifax FICO 9 for every 20%+ owner",
+                "Collected last. Run the soft pull for every owner at 20% or more only once the file otherwise fits; a result under 680 is a hard program minimum. A declined owner may be rechecked after 30 days. Before the pull, treat credit as pending, never as a failure.",
+                category="credit",
+                stage="closing",
+                checks=[
+                    check(
+                        "custom_quidity_credit_floor",
+                        "Every 20%+ owner at 680 or above",
+                        "Record each qualifying owner's Equifax FICO 9 from the soft pull. Any owner below 680 fails the program.",
+                        "block",
+                    )
+                ],
+            ),
+            deepcopy(P_AND_L) | {"required_level": "recommended"},
+        ],
+        "notes": [
+            "Review: the credit, residency, legal and IRS tests are review items on purpose. The fit rules use only tangible file evidence so the screen can say a file fits before the soft credit pull, which the desk runs last.",
+            "Review: the guide's revenue and EBITDA tests read the most recently filed business tax return. Revenue and EBITDA are fit gates; the return itself and the six months of statements are requirement rows, because a document the file has not received yet must read as a gap, not as a failed screen.",
+            "Review: the 25% deposit-consistency and 3x liquidity tests compare two figures on the file and are review checks on the bank statements, not fit rules; the engine compares a field with a constant only.",
+            "Review: Puerto Rico and the acquisition exclusion cannot be expressed as a NAICS prefix; both are compliance review checks.",
+        ],
+    },
 }
 
 
@@ -844,17 +1088,23 @@ def suggested_baseline(
     spec = deepcopy(CATALOG.get(program_key, {}))
     known = bool(spec)
     program_name = name or spec.get("name") or program_key.replace("_", " ").title()
-    sources = (
-        [SITE + spec.get("path", f"/programs/{spec.get('slug', program_key.replace('_', '-'))}")]
-        if known
-        else [SITE]
-    )
+    # A spec sourced from a lender's own guideline document names its sources
+    # outright (a repository path or URL) instead of deriving a site page.
+    if spec.get("sources"):
+        sources = list(spec["sources"])
+    else:
+        sources = (
+            [SITE + spec.get("path", f"/programs/{spec.get('slug', program_key.replace('_', '-'))}")]
+            if known
+            else [SITE]
+        )
     sources.extend(SITE + path for path in spec.get("additional_paths", []))
     notes = list(spec.get("notes", []))
     if known:
         notes.insert(
             0,
-            "Website: source snapshot reviewed on 2026-09-27. Published marketing ranges and closing estimates are not guaranteed terms or automatic eligibility limits.",
+            spec.get("source_note")
+            or "Website: source snapshot reviewed on 2026-09-27. Published marketing ranges and closing estimates are not guaranteed terms or automatic eligibility limits.",
         )
     else:
         notes.append(
@@ -982,4 +1232,7 @@ def suggested_baseline(
         "requirements": requirements,
         "scopes": scopes,
         "needs_review": True,
+        # The program's own words for the underwriting AI, when the spec has
+        # them; a draft made from this baseline carries it as its description.
+        "description": spec.get("description"),
     }

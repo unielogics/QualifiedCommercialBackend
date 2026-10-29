@@ -223,7 +223,7 @@ def build_review_draft_payload(
     try:
         payload = FundingProgramVersionCreate(
             name=review_draft_name(program.name),
-            description=REVIEW_DRAFT_DESCRIPTION,
+            description=baseline.get("description") or REVIEW_DRAFT_DESCRIPTION,
             rules=rules,
             requirements=deepcopy(baseline.get("requirements") or []),
             reason=REVIEW_DRAFT_REASON,

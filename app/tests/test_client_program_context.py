@@ -82,6 +82,9 @@ def _context(*, selection_mode: str, selections=SELECTIONS, catalog=CATALOG, aud
     results = [_Result(STATES), _Result(DEFINITIONS), _Result([])]
     if selection_mode == "manual" and audience == "uploader":
         results.append(_Result(catalog))
+    if audience == "admin":
+        # The admin branch also loads the selected versions' descriptions.
+        results.append(_Result([]))
     db = SimpleNamespace(execute=AsyncMock(side_effect=results))
     with patch.object(
         application_programs, "profile_for_chat_scope", AsyncMock(return_value=profile)
@@ -210,7 +213,7 @@ def test_admin_context_is_not_the_client_shape() -> None:
     assert "staff_selected" not in context
     assert "worksheet_available" not in context
     assert [item["program_key"] for item in context["selected_programs"]] == ["ez_term", "sba_7a"]
-    assert db.execute.await_count == 3
+    assert db.execute.await_count == 4
 
 
 # --- where the client thread sees it ------------------------------------------
