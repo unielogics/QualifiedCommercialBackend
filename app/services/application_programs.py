@@ -2973,6 +2973,28 @@ async def get_program_readiness(
 ) -> ApplicationProgramReadiness:
     # Readiness GETs may perform deterministic first-use materialization. Lock
     # this profile so simultaneous tabs cannot race the active unique indexes.
+    #
+    # BUCKET BEFORE PROFILE, and nowhere the other way round. Two paths hold
+    # both of these row locks inside one transaction, and until this line they
+    # took them in opposite orders:
+    #
+    #   /evidence-workspace          bucket (ensure_supporting_document_group)
+    #                                then profile (here)
+    #   /requirements/ai-review      profile (here, via
+    #                                accept_high_confidence_ai_evidence)
+    #                                then bucket (same function, later)
+    #
+    # The dashboard fires both at once for an open file, and Postgres broke the
+    # cycle the only way it can — by killing one with DeadlockDetectedError,
+    # which surfaced as an intermittent 500 on the evidence workspace.
+    #
+    # This function is on both sides of that cycle, so ordering it here fixes
+    # both paths: re-taking a row lock the transaction already holds is free,
+    # so the later acquisitions become no-ops rather than new edges in a graph.
+    if profile.primary_bucket_id is not None:
+        await db.execute(
+            select(Bucket.id).where(Bucket.id == profile.primary_bucket_id).with_for_update()
+        )
     await db.execute(
         select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update()
     )

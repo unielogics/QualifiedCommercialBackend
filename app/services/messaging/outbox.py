@@ -355,8 +355,25 @@ SES_EVENT_STATUS = {
 }
 
 
+def _is_permanent(event: str, detail: str) -> bool:
+    """Is this feedback a reason to stop writing to the address?
+
+    A complaint always is. A bounce only when SES calls it Permanent — a
+    Transient bounce is a full mailbox or a server having a bad hour, and
+    suppressing on one of those quietly loses an address that was fine.
+    """
+    if event == "Complaint":
+        return True
+    return event == "Bounce" and detail.split("/", 1)[0] == "Permanent"
+
+
 async def mark_delivery(
-    db: AsyncSession, *, provider_message_id: str, event: str, detail: str = ""
+    db: AsyncSession,
+    *,
+    provider_message_id: str,
+    event: str,
+    detail: str = "",
+    recipients: list[str] | None = None,
 ) -> bool:
     """Advance a row on an SES event.
 
@@ -364,6 +381,14 @@ async def mark_delivery(
     a late `Delivery` must not undo a `Bounce`. A bounce or complaint is
     terminal — it can only be learned after the fact and it is the truer answer.
     An open is a hint, not a state, so it dates the row without changing it.
+
+    `recipients` comes off the SES event itself, which matters because not every
+    outbound email has a ledger row: fifteen call sites reach ses_client
+    directly and only this module records a send. Six delivery events in one day
+    arrived for ids we had never stored. A delivery we cannot attribute is
+    merely untracked, but a hard bounce we cannot attribute is an address we
+    will keep writing to — so the address in the event is honoured even when the
+    id means nothing to us.
     """
     status = SES_EVENT_STATUS.get(event)
     if not provider_message_id or not status:
@@ -377,6 +402,34 @@ async def mark_delivery(
         )
     ).scalar_one_or_none()
     if row is None:
+        if _is_permanent(event, detail) and recipients:
+            from app.services.prospect_outreach import set_suppression
+
+            for address in recipients:
+                try:
+                    await set_suppression(
+                        db,
+                        email=address,
+                        reason="bounce" if event == "Bounce" else "complaint",
+                        source="ses_event",
+                        details={
+                            "provider_message_id": provider_message_id,
+                            "detail": detail,
+                            "unledgered": True,
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    # One malformed address must not drop the rest of the
+                    # feedback, and the event is not retried.
+                    log.exception("message ledger: suppression failed for %s", address)
+            log.warning(
+                "message ledger: %s for unledgered id %s — suppressed %s",
+                event, provider_message_id, ", ".join(recipients),
+            )
+            await db.flush()
+            return True
+        # A delivery or open we cannot attribute costs nothing; an unactionable
+        # bounce is still worth seeing, so neither is silent but only one is loud.
         log.info("message ledger: %s event for unknown id %s", event, provider_message_id)
         return False
 
@@ -394,9 +447,15 @@ async def mark_delivery(
         row.failed_at = now
         if detail:
             row.detail = detail[:500]
-        if row.prospect_id is not None and row.to_email:
-            # Delivery feedback is a global safety signal, not merely a status
-            # badge on one send. Future prospect drafts must be blocked.
+        # Delivery feedback is a global safety signal, not merely a status
+        # badge on one send. Future prospect drafts must be blocked.
+        #
+        # One change against the original: a Transient bounce no longer
+        # suppresses. A full mailbox is not a dead address. The prospect_id gate
+        # is deliberate and stays — a bounce on a client's own transactional
+        # mail is a problem for that file, not grounds for writing the person
+        # onto an outreach suppression list.
+        if row.prospect_id is not None and row.to_email and _is_permanent(event, detail):
             from app.services.prospect_outreach import set_suppression
 
             await set_suppression(
@@ -406,8 +465,9 @@ async def mark_delivery(
                 source="ses_event",
                 details={
                     "message_send_id": str(row.id),
-                    "prospect_id": str(row.prospect_id),
+                    "prospect_id": str(row.prospect_id) if row.prospect_id else None,
                     "provider_message_id": provider_message_id,
+                    "detail": detail,
                 },
             )
     await db.flush()

@@ -278,3 +278,126 @@ async def test_a_ledger_failure_never_stops_the_send():
         out = await outbox.deliver_email(db, _draft(), context="x")
     send.assert_called_once()
     assert out.ok is True
+
+
+# --- feedback for a send we never recorded ------------------------------------------
+#
+# Fifteen call sites reach ses_client directly and only the outbox writes a
+# ledger row, so a delivery event can arrive for an id we have never stored —
+# six did in one day on 2026-10-29. An unattributable delivery costs nothing. An
+# unattributable hard bounce is an address we would otherwise keep writing to.
+
+
+def _delivery_db(row=None):
+    db = _db()
+    result = SimpleNamespace(scalar_one_or_none=lambda: row)
+    db.execute = AsyncMock(return_value=result)
+    return db
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_bounce_for_an_unknown_id_still_suppresses_the_address():
+    db = _delivery_db(row=None)
+    with patch("app.services.prospect_outreach.set_suppression", new=AsyncMock()) as suppress:
+        handled = await outbox.mark_delivery(
+            db,
+            provider_message_id="SES-unledgered",
+            event="Bounce",
+            detail="Permanent/General",
+            recipients=["gone@example.com"],
+        )
+    assert handled is True
+    assert suppress.await_count == 1
+    assert suppress.await_args.kwargs["email"] == "gone@example.com"
+    assert suppress.await_args.kwargs["details"]["unledgered"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_transient_bounce_suppresses_nothing():
+    """A full mailbox is not a dead address, and suppressing on one quietly
+    loses a recipient who was fine an hour later."""
+    db = _delivery_db(row=None)
+    with patch("app.services.prospect_outreach.set_suppression", new=AsyncMock()) as suppress:
+        handled = await outbox.mark_delivery(
+            db,
+            provider_message_id="SES-unledgered",
+            event="Bounce",
+            detail="Transient/MailboxFull",
+            recipients=["busy@example.com"],
+        )
+    assert handled is False
+    assert suppress.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_delivery_for_an_unknown_id_is_not_treated_as_feedback():
+    db = _delivery_db(row=None)
+    with patch("app.services.prospect_outreach.set_suppression", new=AsyncMock()) as suppress:
+        handled = await outbox.mark_delivery(
+            db, provider_message_id="SES-x", event="Delivery", recipients=["a@example.com"]
+        )
+    assert handled is False
+    assert suppress.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_complaint_for_an_unknown_id_suppresses_every_recipient():
+    db = _delivery_db(row=None)
+    with patch("app.services.prospect_outreach.set_suppression", new=AsyncMock()) as suppress:
+        await outbox.mark_delivery(
+            db,
+            provider_message_id="SES-y",
+            event="Complaint",
+            detail="abuse",
+            recipients=["a@example.com", "b@example.com"],
+        )
+    assert [c.kwargs["email"] for c in suppress.await_args_list] == ["a@example.com", "b@example.com"]
+
+
+@pytest.mark.asyncio
+async def test_one_bad_address_does_not_drop_the_rest_of_the_feedback():
+    """SES does not retry these, so a raise on address one must not cost two."""
+    db = _delivery_db(row=None)
+    failing = AsyncMock(side_effect=[ValueError("bad address"), None])
+    with patch("app.services.prospect_outreach.set_suppression", new=failing):
+        handled = await outbox.mark_delivery(
+            db,
+            provider_message_id="SES-z",
+            event="Bounce",
+            detail="Permanent/General",
+            recipients=["broken", "real@example.com"],
+        )
+    assert handled is True
+    assert failing.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_ledgered_transient_bounce_fails_the_row_without_suppressing():
+    row = SimpleNamespace(
+        id=uuid4(), status="sent", to_email="busy@example.com", prospect_id=uuid4(),
+        opened_at=None, delivered_at=None, failed_at=None, detail=None,
+    )
+    db = _delivery_db(row=row)
+    with patch("app.services.prospect_outreach.set_suppression", new=AsyncMock()) as suppress:
+        await outbox.mark_delivery(
+            db, provider_message_id="SES-1", event="Bounce", detail="Transient/MailboxFull",
+        )
+    assert row.status == "bounced"
+    assert suppress.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_transactional_bounce_is_not_written_onto_the_outreach_list():
+    """The prospect_id gate is deliberate. A bounce on a client's own mail is a
+    problem for that file — it is not grounds for suppressing the person."""
+    row = SimpleNamespace(
+        id=uuid4(), status="sent", to_email="client@example.com", prospect_id=None,
+        opened_at=None, delivered_at=None, failed_at=None, detail=None,
+    )
+    db = _delivery_db(row=row)
+    with patch("app.services.prospect_outreach.set_suppression", new=AsyncMock()) as suppress:
+        await outbox.mark_delivery(
+            db, provider_message_id="SES-2", event="Bounce", detail="Permanent/General",
+        )
+    assert row.status == "bounced"
+    assert suppress.await_count == 0
