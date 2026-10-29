@@ -290,7 +290,16 @@ async def deliver_email(
             result = await send_as_user(db, sender_user_id, **send_kwargs)
             ok, message_id, detail = result.ok, result.message_id, result.detail
             provider_thread_id = getattr(result, "provider_thread_id", None)
-            provider = "gmail" if detail == "sent_gmail" else "ses"
+            # Name the transport that actually ran. A Gmail failure used to be
+            # filed under "ses" — which SES had never been asked to send — so
+            # the row showed "failed · ses" beside a googleapis.com error and
+            # sent whoever was debugging it to the wrong provider.
+            if detail == "sent_gmail":
+                provider = "gmail"
+            elif detail.startswith("gmail_send_failed"):
+                provider = "gmail"
+            else:
+                provider = "ses"
         else:
             from app.services.email import ses_client
 

@@ -25,6 +25,35 @@ from app.services.google.google_oauth_client import GMAIL_SCOPES
 log = logging.getLogger(__name__)
 
 
+def _is_permission_failure(exc: Exception) -> bool:
+    """Is this Google telling us the token may not send, rather than failing?
+
+    Matched on the HTTP status where the client exposes one and on the reason
+    string otherwise, because googleapiclient raises HttpError for everything
+    from a 403 to a gateway timeout and only the former means "reconnect".
+    """
+    status_code = getattr(getattr(exc, "resp", None), "status", None)
+    if status_code in (401, 403):
+        return True
+    text = str(exc)
+    return "insufficientPermissions" in text or "insufficient authentication scopes" in text
+
+
+async def _forget_gmail_send_scope(db: AsyncSession, sender_user_id: uuid.UUID) -> None:
+    """Drop gmail.send from the stored grant so we stop trying it.
+
+    Deliberately narrow: the account stays connected and its other scopes keep
+    working. Reconnecting Google restores this one.
+    """
+    account = await google_oauth_client.get_account(db, sender_user_id)
+    if account is None or not account.scopes:
+        return
+    remaining = [scope for scope in account.scopes if scope not in GMAIL_SCOPES]
+    if len(remaining) != len(account.scopes):
+        account.scopes = remaining
+        await db.flush()
+
+
 async def _try_gmail_send_as_user(
     db: AsyncSession,
     sender_user_id: uuid.UUID,
@@ -85,8 +114,28 @@ async def _try_gmail_send_as_user(
         log.info("send_as_user: sent via Gmail user=%s to=%s id=%s", sender_user_id, to_emails, msg_id)
         return SesSendResult(True, msg_id, "sent_gmail", thread_id)
     except Exception as exc:  # noqa: BLE001
-        # Gmail send genuinely failed (not "not connected") — surface it rather
-        # than silently falling back, so the failure is visible.
+        if _is_permission_failure(exc):
+            # Google says this token cannot send, while our own record of the
+            # granted scopes says it can. That is the GoogleScopeMissing case
+            # arriving from the other direction, and the three conditions that
+            # raise it all fall back to SES — so this does too, and the email
+            # goes out instead of dying with a 403 in a detail string.
+            #
+            # The stale scope is corrected on the way past, so the next send
+            # skips Gmail entirely and anything reading the account's scopes
+            # can prompt a reconnect rather than repeating this round trip.
+            log.warning(
+                "send_as_user: Gmail refused the send for user=%s (%s); "
+                "clearing the stale gmail.send scope and falling back to SES",
+                sender_user_id, exc,
+            )
+            try:
+                await _forget_gmail_send_scope(db, sender_user_id)
+            except Exception:  # noqa: BLE001
+                log.exception("send_as_user: could not clear stale scope user=%s", sender_user_id)
+            return None
+        # A genuine transport failure — a timeout, a 5xx. Surfaced rather than
+        # silently re-sent through SES, because a retry may well duplicate it.
         log.warning("send_as_user: Gmail send failed user=%s: %s", sender_user_id, exc)
         return SesSendResult(False, None, f"gmail_send_failed: {exc}")
 

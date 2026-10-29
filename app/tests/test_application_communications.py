@@ -512,7 +512,14 @@ async def test_thread_email_passes_exact_attachments_to_outbox(
     )
     deliver = AsyncMock(return_value=outcome)
     monkeypatch.setattr(communications.outbox, "deliver_email", deliver)
-    db = SimpleNamespace(add=Mock(), flush=AsyncMock())
+    # _send_thread_email reads the firm email footer before handing off, so the
+    # stub has to answer a SELECT. No settings row means no footer appended,
+    # which keeps this test about attachments.
+    db = SimpleNamespace(
+        add=Mock(),
+        flush=AsyncMock(),
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None)),
+    )
     profile = SimpleNamespace(
         id=uuid4(),
         client_id=uuid4(),
@@ -815,3 +822,36 @@ async def test_failed_sms_creates_operator_notification(monkeypatch: pytest.Monk
         profile_id=None,
         intake_id=intake_id,
     )
+
+
+# --- the firm sign-off --------------------------------------------------------------
+
+
+def test_the_footer_drops_a_line_whose_placeholders_are_all_empty():
+    """An operator with no phone on file must not send "Phone:" and nothing."""
+    body = "Best regards,\n{name}\n{title}\nPhone: {phone}\n{email}"
+    user = SimpleNamespace(
+        name="Jonathan Franco", title="Managing Director",
+        email="franco@qualifiedcommercial.com", phone="",
+    )
+    rendered = communications._render_footer(body, user)
+    assert "Phone:" not in rendered
+    assert "Jonathan Franco" in rendered
+    assert "franco@qualifiedcommercial.com" in rendered
+
+
+def test_a_line_mixing_a_known_and_an_unknown_placeholder_survives():
+    user = SimpleNamespace(name="Dana", title="", email="dana@example.com", phone="")
+    rendered = communications._render_footer("{name} · {title}", user)
+    assert rendered == "Dana ·"
+
+
+def test_the_footer_is_appended_once():
+    """A reply quoting an earlier message already carries the footer inside the
+    quote, which is not the same as signing this one."""
+    signed = communications._with_footer("Hello.", "Best,\nDana")
+    assert communications._with_footer(signed, "Best,\nDana") == signed
+
+
+def test_an_empty_footer_leaves_the_body_untouched():
+    assert communications._with_footer("Hello.", "") == "Hello."

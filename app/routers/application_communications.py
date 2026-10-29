@@ -957,6 +957,69 @@ async def _enforce_private_credit_recipient(
         )
 
 
+async def _email_footer(db: AsyncSession, user: User) -> str:
+    """The firm's sign-off, with this sender substituted in.
+
+    One template rather than a field per operator: the wording and any
+    disclaimer belong to the firm, and the name at the bottom belongs to
+    whoever pressed send. A placeholder we cannot fill takes its whole line
+    with it, so an operator with no phone number on file does not send
+    "Phone:" followed by nothing.
+    """
+    from app.models.app_settings import AppSettings
+
+    row = (await db.execute(select(AppSettings).limit(1))).scalar_one_or_none()
+    section = ((row.data if row else None) or {}).get("email_footer") or {}
+    if not section.get("enabled", True):
+        return ""
+    template = str(section.get("text") or "").strip()
+    if not template:
+        return ""
+
+    return _render_footer(template, user)
+
+
+def _render_footer(template: str, user: User) -> str:
+    """Substitute the sender into the template.
+
+    A line whose every placeholder is empty is dropped rather than rendered
+    hollow — an operator with no phone number on file should not send "Phone:"
+    followed by nothing. A line that mixes a known and an unknown placeholder
+    keeps what it has.
+    """
+    values = {
+        "name": (getattr(user, "name", "") or "").strip(),
+        "title": (getattr(user, "title", "") or "").strip(),
+        "email": (getattr(user, "email", "") or "").strip(),
+        "phone": (getattr(user, "phone", "") or "").strip(),
+    }
+    lines: list[str] = []
+    for line in template.splitlines():
+        used = [key for key in values if "{" + key + "}" in line]
+        if used and not any(values[key] for key in used):
+            continue
+        for key, value in values.items():
+            line = line.replace("{" + key + "}", value)
+        lines.append(line.rstrip())
+    # Collapse the blank run a dropped line can leave behind.
+    out: list[str] = []
+    for line in lines:
+        if not line and (not out or not out[-1]):
+            continue
+        out.append(line)
+    return "\n".join(out).strip()
+
+
+def _with_footer(body: str, footer: str) -> str:
+    """Append once. A reply quoting an earlier message already carries the
+    footer inside the quote, which is not the same as signing this one."""
+    if not footer:
+        return body
+    if body.rstrip().endswith(footer):
+        return body
+    return f"{body.rstrip()}\n\n{footer}"
+
+
 async def _send_thread_email(
     db: AsyncSession,
     *,
@@ -971,6 +1034,9 @@ async def _send_thread_email(
     attachments: list[tuple[str, bytes, str]] | None = None,
     headers: dict[str, str] | None = None,
 ) -> DealerRepInboxMessage:
+    # The firm sign-off goes on here rather than at each call site, so every
+    # route out of this tab — new thread, reply, retry — is signed the same.
+    body = _with_footer(body, await _email_footer(db, user))
     outcome = await outbox.deliver_email(
         db,
         outbox.Draft(
@@ -1238,6 +1304,135 @@ async def reply_application_email_thread(
     )
     await db.commit()
     return await _thread_detail(db, profile, thread, user)
+
+
+@router.post(
+    "/{profile_id}/communications/email/threads/{thread_id}/messages/{message_id}/retry",
+    response_model=ApplicationEmailThreadDetail,
+    status_code=status.HTTP_201_CREATED,
+)
+async def retry_application_email_message(
+    profile_id: UUID,
+    thread_id: UUID,
+    message_id: UUID,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationEmailThreadDetail:
+    """Send a failed email again, as it was written.
+
+    A send can fail for reasons that have nothing to do with the message — an
+    expired Gmail grant, a provider having a bad minute — and before this the
+    only way back was to retype it into a new thread, which also lost the
+    conversation. The body is taken from the stored message, so a retry sends
+    what was actually written rather than an approximation of it.
+
+    A new row, not a mutated one: the failure happened and stays on the record.
+
+    Attachments cannot be replayed — the names are kept but the bytes are not,
+    and silently sending a stripped-down version of an email someone believes
+    they attached a file to is worse than refusing. Those go back through the
+    composer.
+    """
+    profile = await _load_profile(db, profile_id, user)
+    await _enforce_direct_client_contact(db, profile)
+    thread = await _profile_thread(db, profile, thread_id)
+    if thread.owner_user_id != user.id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only the mailbox owner can retry a send in this thread.",
+        )
+
+    message = (
+        await db.execute(
+            select(DealerRepInboxMessage).where(
+                DealerRepInboxMessage.id == message_id,
+                DealerRepInboxMessage.thread_id == thread.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if message is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That message is not on this thread.")
+    if message.direction != "outbound":
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "Only an outbound message can be sent again."
+        )
+    if message.delivery_status != "failed":
+        # Guards the double-click and the stale tab. A delivered message resent
+        # is a second email to a client who already had the first.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "That message did not fail, so sending it again would deliver it twice.",
+        )
+
+    to_email = _email(str(message.recipient or "")) or ""
+    cc_emails = [value for value in (_email(str(v)) for v in (message.cc_emails or [])) if value]
+    if not to_email:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "This message no longer has a valid recipient."
+        )
+
+    names = await _attachment_names_for(db, message)
+    if names:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "This email carried "
+            + ", ".join(names)
+            + ". Attachments cannot be re-sent automatically — reply with the file attached.",
+        )
+
+    await _enforce_private_credit_recipient(
+        db, profile, body=message.body, to_email=to_email, cc_emails=cc_emails
+    )
+    await profile_routes._require_training_live_action(
+        db,
+        profile=profile,
+        user=user,
+        request=request,
+        action="Retry a failed file email",
+        provider="Gmail / SES",
+        recipient=to_email,
+        effect="Send a live email from the application file",
+    )
+
+    await _send_thread_email(
+        db,
+        profile=profile,
+        thread=thread,
+        user=user,
+        to_email=to_email,
+        cc_emails=cc_emails,
+        subject=message.subject or thread.subject,
+        # Already signed when it was first composed; _with_footer will not
+        # append a second copy.
+        body=message.body,
+    )
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "email.retried",
+        f"Retried a failed email to {to_email}",
+        target_type="email_thread",
+        target_id=thread.id,
+        metadata={
+            "retried_message_id": str(message.id),
+            "original_error": (message.provider_error or "")[:300],
+        },
+    )
+    await db.commit()
+    return await _thread_detail(db, profile, thread, user)
+
+
+async def _attachment_names_for(db: AsyncSession, message: DealerRepInboxMessage) -> list[str]:
+    """What the original send carried, by name. The ledger keeps the names and
+    not the bytes, which is exactly enough to refuse honestly."""
+    if message.message_send_id is None:
+        return []
+    from app.models.message_send import MessageSend
+
+    row = await db.get(MessageSend, message.message_send_id)
+    return [str(name) for name in ((row.attachment_names if row else None) or []) if name]
 
 
 _FORM_LABELS = {

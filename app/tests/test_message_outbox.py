@@ -401,3 +401,63 @@ async def test_a_transactional_bounce_is_not_written_onto_the_outreach_list():
         )
     assert row.status == "bounced"
     assert suppress.await_count == 0
+
+
+# --- a Gmail grant that cannot actually send ----------------------------------------
+#
+# Observed 2026-10-29: a file email failed with
+#   HttpError 403 ... "Request had insufficient authentication scopes."
+# Our stored GoogleAccount.scopes said gmail.send was granted, so
+# credentials_for_user never raised GoogleScopeMissing and nothing fell back —
+# the email simply died, and the row recorded provider "ses" for a send SES was
+# never asked to make.
+
+
+def test_a_403_from_gmail_is_a_reconnect_signal_not_a_transport_error():
+    from app.services.email import user_mailer
+
+    forbidden = Exception("insufficient scopes")
+    forbidden.resp = SimpleNamespace(status=403)
+    assert user_mailer._is_permission_failure(forbidden) is True
+
+    unauthorized = Exception("token expired")
+    unauthorized.resp = SimpleNamespace(status=401)
+    assert user_mailer._is_permission_failure(unauthorized) is True
+
+
+def test_the_message_google_actually_returns_is_recognised():
+    from app.services.email import user_mailer
+
+    assert user_mailer._is_permission_failure(
+        Exception('Request had insufficient authentication scopes.')
+    )
+    assert user_mailer._is_permission_failure(Exception("reason: 'insufficientPermissions'"))
+
+
+def test_a_timeout_is_not_a_permission_problem():
+    """It must keep surfacing as a failure. Quietly re-sending a request that
+    may already have been accepted is how one email becomes two."""
+    from app.services.email import user_mailer
+
+    assert user_mailer._is_permission_failure(TimeoutError("read timeout")) is False
+    server_error = Exception("backend error")
+    server_error.resp = SimpleNamespace(status=503)
+    assert user_mailer._is_permission_failure(server_error) is False
+
+
+@pytest.mark.asyncio
+async def test_a_failed_gmail_send_is_filed_under_gmail_not_ses():
+    """The row used to say "failed · ses" beside a googleapis.com error, which
+    sends whoever is debugging it to the wrong provider."""
+    db = _db()
+    failed = SimpleNamespace(
+        ok=False, message_id=None, detail="gmail_send_failed: HttpError 403",
+        provider_thread_id=None,
+    )
+    with patch("app.services.email.user_mailer.send_as_user", new=AsyncMock(return_value=failed)):
+        await outbox.deliver_email(
+            db, _draft(), context="ai_intake_email", sender_user_id=uuid4()
+        )
+    row = next(r for r in db.added if getattr(r, "channel", None) == "email")
+    assert row.provider == "gmail"
+    assert row.status == "failed"
