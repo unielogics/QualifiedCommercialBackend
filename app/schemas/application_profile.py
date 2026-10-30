@@ -160,6 +160,10 @@ class ApplicationProgramSelectionRead(BaseModel):
     fit_reasons: list[str] = Field(default_factory=list)
     selected_at: datetime
     needs_scope_review: bool = False
+    # A retired program keeps serving the file off its pinned playbook version.
+    # Nothing is detached under a client mid-underwriting; the desk is told so
+    # it can swap or remove the selection deliberately.
+    program_retired: bool = False
 
 
 class EvidencePolicySelectionRead(BaseModel):

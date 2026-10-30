@@ -189,15 +189,53 @@ async def test_helper_maps_candidate_fields_and_clips_the_published_description(
     assert third["description"] is None
 
 
-async def test_helper_keeps_the_first_eight_best_first_candidates() -> None:
-    candidates = [_candidate(f"program_{index}", f"Program {index}") for index in range(10)]
+async def test_helper_keeps_the_best_first_candidates_up_to_the_cap() -> None:
+    cap = bucket_ai.PROGRAM_SCREEN_MAX_PROGRAMS
+    candidates = [_candidate(f"program_{index}", f"Program {index}") for index in range(cap + 2)]
     with patch.object(
         application_programs, "published_candidates", AsyncMock(return_value=candidates)
     ), patch.object(funding_programs, "published_versions_by_program", AsyncMock(return_value={})) as loader:
         screen = await bucket_ai._published_program_screen(SimpleNamespace(), SimpleNamespace(id=uuid4()))
 
-    assert [entry["program_key"] for entry in screen] == [f"program_{index}" for index in range(8)]
-    assert loader.await_args.args[1] == [candidate.catalog_id for candidate in candidates[:8]]
+    programs = [entry for entry in screen if "program_key" in entry]
+    assert [entry["program_key"] for entry in programs] == [f"program_{index}" for index in range(cap)]
+    assert loader.await_args.args[1] == [candidate.catalog_id for candidate in candidates[:cap]]
+
+
+async def test_the_cap_holds_every_published_program_the_catalog_has_today() -> None:
+    # Thirteen programs carry published criteria in production. A cap below
+    # that hid real candidates from the underwriting AI with no signal.
+    assert bucket_ai.PROGRAM_SCREEN_MAX_PROGRAMS >= 13
+
+
+async def test_a_truncated_screen_says_how_many_programs_it_left_out(caplog) -> None:
+    caplog.set_level(logging.WARNING, logger="app.services.bucket_ai")
+    cap = bucket_ai.PROGRAM_SCREEN_MAX_PROGRAMS
+    candidates = [_candidate(f"program_{index}", f"Program {index}") for index in range(cap + 3)]
+    profile = SimpleNamespace(id=uuid4())
+    with patch.object(
+        application_programs, "published_candidates", AsyncMock(return_value=candidates)
+    ), patch.object(funding_programs, "published_versions_by_program", AsyncMock(return_value={})):
+        screen = await bucket_ai._published_program_screen(SimpleNamespace(), profile)
+
+    notices = [entry["notice"] for entry in screen if "notice" in entry]
+    assert len(notices) == 1
+    assert "3 further published program(s)" in notices[0]
+    assert "not the complete catalog" in notices[0]
+    (record,) = [r for r in caplog.records if "program screen truncated" in r.getMessage()]
+    assert record.levelno == logging.WARNING
+    assert "dropped=3" in record.getMessage()
+
+
+async def test_a_complete_screen_carries_no_truncation_notice() -> None:
+    candidates = [_candidate(f"program_{index}", f"Program {index}") for index in range(3)]
+    with patch.object(
+        application_programs, "published_candidates", AsyncMock(return_value=candidates)
+    ), patch.object(funding_programs, "published_versions_by_program", AsyncMock(return_value={})):
+        screen = await bucket_ai._published_program_screen(SimpleNamespace(), SimpleNamespace(id=uuid4()))
+
+    assert all("notice" not in entry for entry in screen)
+    assert len(screen) == 3
 
 
 async def test_helper_returns_an_empty_screen_and_logs_when_the_candidates_fail(caplog) -> None:

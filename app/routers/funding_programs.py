@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 # ruff: noqa: B008
+from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, status
@@ -22,7 +23,7 @@ from app.schemas.funding_program import (
     PublicFundingProgramCatalogItem,
 )
 from app.schemas.funding_program_baseline import FundingProgramBaselineRead
-from app.services import funding_programs
+from app.services import application_programs, capital_readiness, funding_programs
 from app.services.funding_program_baselines import suggested_baseline
 
 public_router = APIRouter(prefix="/public/funding-programs", tags=["funding-programs"])
@@ -172,5 +173,20 @@ async def retire_funding_program(
 ) -> list[FundingProgramCatalogItem]:
     program = await funding_programs.catalog_item_or_404(db, program_key)
     await funding_programs.retire_program(db, program, payload, user)
+    # Readiness keeps a stored program_opportunities copy that an AI prompt
+    # reads back, so retiring without refreshing leaves the model describing a
+    # program the desk has just withdrawn. Bounded to the files that hold it.
+    affected = await application_programs.profiles_with_active_selection(
+        db, program.program_key
+    )
+    await capital_readiness.advisory_recompute_profiles(
+        db,
+        affected,
+        event_key=(
+            f"funding-program:{program.program_key}:"
+            f"{'retired' if payload.retired else 'restored'}:"
+            f"{datetime.now(UTC).isoformat()}"
+        ),
+    )
     await db.commit()
     return await funding_programs.admin_catalog(db)

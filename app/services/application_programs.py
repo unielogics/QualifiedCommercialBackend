@@ -1035,6 +1035,39 @@ async def active_selections(
     )
 
 
+async def profiles_with_active_selection(
+    db: AsyncSession, program_key: str
+) -> list[ApplicationProfile]:
+    """Load the files still holding this program, so readiness can be refreshed.
+
+    Retiring a program changes what every one of these files should be told.
+    Bounding the refresh to the files that actually selected it keeps an admin
+    click from fanning out across the whole vertical.
+    """
+
+    if not program_key or not hasattr(db, "execute"):
+        return []
+    return list(
+        (
+            await db.execute(
+                select(ApplicationProfile)
+                .join(
+                    ApplicationProgramSelection,
+                    ApplicationProgramSelection.profile_id == ApplicationProfile.id,
+                )
+                .where(
+                    ApplicationProgramSelection.program_key == program_key,
+                    ApplicationProgramSelection.removed_at.is_(None),
+                )
+                .order_by(ApplicationProfile.id)
+            )
+        )
+        .scalars()
+        .unique()
+        .all()
+    )
+
+
 async def profile_for_chat_scope(
     db: AsyncSession,
     *,
@@ -3015,6 +3048,9 @@ async def get_program_readiness(
     )
     lending_applicable = lending_applicable or manual_lending_override
     selections = stored_selections if lending_applicable else []
+    retired_keys = await program_catalog.retired_program_keys(
+        db, [item.program_key for item in selections]
+    )
     grouped = await _selection_requirements(db, selections, context)
     policies = await ensure_evidence_policy(db, profile) if lending_applicable else []
     grouped_policies = await _policy_requirements(db, policies, context)
@@ -3266,6 +3302,7 @@ async def get_program_readiness(
                 fit_reasons=list(item.fit_reasons or []),
                 selected_at=item.selected_at,
                 needs_scope_review=item.needs_scope_review,
+                program_retired=item.program_key in retired_keys,
             )
             for item in selections
         ],

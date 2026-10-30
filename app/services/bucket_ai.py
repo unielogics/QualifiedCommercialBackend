@@ -357,7 +357,11 @@ ADMIN_NO_SELECTION_INSTRUCTION = (
 )
 # Published-program screen bounds: programs are best-first from
 # published_candidates, so the cap keeps the strongest fits.
-PROGRAM_SCREEN_MAX_PROGRAMS = 8
+# Thirteen catalog programs carry published criteria and the desk keeps adding
+# them, so a cap of 8 silently hid real candidates from the underwriting AI.
+# This holds every published program today with headroom; the screen still
+# announces a cut rather than dropping programs quietly.
+PROGRAM_SCREEN_MAX_PROGRAMS = 16
 PROGRAM_SCREEN_MAX_ITEMS = 4
 PROGRAM_DESCRIPTION_MAX_CHARS = 1200
 
@@ -4213,11 +4217,20 @@ async def _published_program_screen(db: AsyncSession, profile: ApplicationProfil
         from app.services.application_programs import published_candidates
         from app.services.funding_programs import published_versions_by_program
 
-        candidates = list(await published_candidates(db, profile))[:PROGRAM_SCREEN_MAX_PROGRAMS]
+        ranked = list(await published_candidates(db, profile))
+        candidates = ranked[:PROGRAM_SCREEN_MAX_PROGRAMS]
+        dropped = len(ranked) - len(candidates)
+        if dropped > 0:
+            log.warning(
+                "bucket_ai: program screen truncated profile=%s shown=%s dropped=%s",
+                getattr(profile, "id", None),
+                len(candidates),
+                dropped,
+            )
         versions = await published_versions_by_program(
             db, [candidate.catalog_id for candidate in candidates]
         )
-        return [
+        screen: list[dict[str, Any]] = [
             {
                 "program_key": candidate.program_key,
                 "program_name": candidate.program_name,
@@ -4232,6 +4245,18 @@ async def _published_program_screen(db: AsyncSession, profile: ApplicationProfil
             }
             for candidate in candidates
         ]
+        if dropped > 0:
+            # Say what is missing. A silently short screen reads to the model
+            # as the complete set of programs this file could reach.
+            screen.append(
+                {
+                    "notice": (
+                        f"{dropped} further published program(s) ranked below these "
+                        f"and are not shown. This screen is not the complete catalog."
+                    )
+                }
+            )
+        return screen
     except Exception:  # noqa: BLE001 - advisory context must never fail the caller
         log.exception(
             "bucket_ai: published program screen failed profile=%s",

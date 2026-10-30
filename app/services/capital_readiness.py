@@ -2478,6 +2478,19 @@ def build_ai_context(
             {"key": item.get("key"), "status": item.get("status")}
             for item in list(snapshot.phases or [])[:5]
         ],
+        # These rows were derived when the snapshot was computed, not now. The
+        # catalog can be edited or retired in between, and the live published
+        # program screen is the authority, so the age is stated rather than
+        # letting the model read a withdrawn program as current.
+        "program_opportunities_as_of": (
+            computed_at.isoformat()
+            if isinstance(computed_at := getattr(snapshot, "created_at", None), datetime)
+            else None
+        ),
+        "program_opportunities_authority": (
+            "Historical as of program_opportunities_as_of. Where a published "
+            "program screen is supplied, that screen is authoritative."
+        ),
         "program_opportunities": [
             {
                 "program_key": item.get("program_key") or item.get("key"),

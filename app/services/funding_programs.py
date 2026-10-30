@@ -179,6 +179,33 @@ async def scopes_by_program(
     return grouped
 
 
+async def retired_program_keys(db: AsyncSession, program_keys: list[str]) -> set[str]:
+    """Name which of these program keys belong to a retired catalog row.
+
+    A selection records its program as a plain string, so "absent from the
+    active catalog" cannot tell a retired program apart from a key that was
+    never catalogued at all.  Only a row that exists and reads `retired`
+    counts, which keeps the distinction honest for the file that still has it
+    selected.
+    """
+
+    keys = {key for key in program_keys if key}
+    if not keys or not hasattr(db, "execute"):
+        return set()
+    return set(
+        (
+            await db.execute(
+                select(FundingProgramCatalog.program_key).where(
+                    FundingProgramCatalog.program_key.in_(keys),
+                    FundingProgramCatalog.status == "retired",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
 def authoritative_published_versions(
     playbooks: list[AIPlaybookTemplate],
 ) -> dict[uuid.UUID, AIPlaybookTemplate]:
