@@ -27,10 +27,12 @@ from app.services import attention_queue as aq
 def test_a_room_kind_must_come_from_the_vocabulary() -> None:
     assert BucketCreate(name="Lee Motors", bucket_type="loan_file").bucket_type == "loan_file"
     assert BucketUpdate(bucket_type="general").bucket_type == "general"
+    # The labels the old form sent fold into kinds (see the transition test
+    # below); anything outside both vocabularies is still refused.
     with pytest.raises(ValidationError):
-        BucketCreate(name="Lee Motors", bucket_type="UrChoice Dealer Funding")
+        BucketCreate(name="Lee Motors", bucket_type="Something Else Entirely")
     with pytest.raises(ValidationError):
-        BucketUpdate(bucket_type="Loan File")
+        BucketUpdate(bucket_type="loan-file")
 
 
 def test_the_vocabulary_keeps_the_substrings_the_vertical_is_derived_from() -> None:
