@@ -1058,3 +1058,29 @@ async def test_evidence_file_url_carries_parsed_sheets_for_a_spreadsheet() -> No
     assert result["url"] == "https://storage.example/signed"
     preview.assert_called_once_with(file)
 
+
+@pytest.mark.asyncio
+async def test_newest_analysis_per_file_ignores_queue_placeholders() -> None:
+    """A forced re-analysis queues a placeholder newer than the completed row;
+    the newest-row readers must not let it hide the completed analysis."""
+    from app.routers.application_profiles import _bucket_analyses
+
+    statements = []
+    file = SimpleNamespace(id=uuid4())
+
+    async def execute(statement):
+        statements.append(statement)
+        if len(statements) == 1:
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [file]))
+        completed = SimpleNamespace(
+            bucket_file_id=file.id, status="completed", classification="current_p_and_l",
+            analysis={"key_facts": {"revenue": 4520000}},
+        )
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [completed]))
+
+    result = await _bucket_analyses(SimpleNamespace(execute=execute), uuid4())
+
+    sql = str(statements[1].compile(compile_kwargs={"literal_binds": True}))
+    assert "status != 'pending'" in sql
+    assert result == [{"classification": "current_p_and_l", "key_facts": {"revenue": 4520000}}]
+

@@ -5827,7 +5827,13 @@ async def _slot_analyses(
         (
             await db.execute(
                 select(BucketFileAnalysis)
-                .where(BucketFileAnalysis.bucket_file_id.in_([f.id for f in files]))
+                .where(
+                    BucketFileAnalysis.bucket_file_id.in_([f.id for f in files]),
+                    # Queue placeholders (status "pending", including the ones
+                    # the drain has consumed) are not analyses; a forced
+                    # re-analysis adds one newer than the completed row.
+                    BucketFileAnalysis.status != "pending",
+                )
                 .order_by(BucketFileAnalysis.created_at.desc())
             )
         )
@@ -6003,7 +6009,10 @@ async def _bucket_analyses(db: AsyncSession, bucket_id: UUID) -> list[dict]:
         (
             await db.execute(
                 select(BucketFileAnalysis)
-                .where(BucketFileAnalysis.bucket_file_id.in_([f.id for f in files]))
+                .where(
+                    BucketFileAnalysis.bucket_file_id.in_([f.id for f in files]),
+                    BucketFileAnalysis.status != "pending",  # not a queue placeholder
+                )
                 .order_by(BucketFileAnalysis.created_at.desc())
             )
         )
