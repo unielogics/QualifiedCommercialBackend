@@ -86,11 +86,12 @@ class ClientAccessDirectoryRow(BaseModel):
     account_status: str | None = None
     file_count: int = 0
     last_active_at: datetime | None = None
-    # The last time this person actually signed in, by any door: a Clerk
-    # session, the room PIN, or an emailed one-time code.
-    last_login_at: datetime | None = None
-    # Sign-ins that never involved a login account (room PIN, emailed code).
+    # Sign-ins that never involved a login account: this person's own room-PIN
+    # entries plus emailed one-time codes. Clerk sessions are not recorded
+    # here; last_active_at carries that presence heartbeat.
     passcode_signin_count: int = 0
+    room_pin_signin_count: int = 0
+    email_code_signin_count: int = 0
     last_passcode_signin_at: datetime | None = None
     status: str
 
@@ -244,30 +245,38 @@ async def _subject_rows(db: AsyncSession, q: str | None) -> list[ClientAccessDir
     represented_user_ids = {row.user_id for row in clients if row.user_id}
     standalone_users = [row for row in external_users if row.id not in represented_user_ids]
     standalone_user_ids = {row.id for row in standalone_users}
-    standalone_dealers = (
+    # Every dealer room an external login owns, whether or not a Client row
+    # represents that login: its sign-ins belong to whichever row shows the person.
+    external_dealers = (
         (
             await db.execute(
-                select(DealerBusiness).where(
-                    DealerBusiness.dealer_user_id.in_(standalone_user_ids)
-                )
+                select(DealerBusiness).where(DealerBusiness.dealer_user_id.in_(set(users)))
             )
         ).scalars().all()
-        if standalone_user_ids
+        if users
         else []
     )
+    dealers_by_user: dict[UUID, list[DealerBusiness]] = defaultdict(list)
+    for dealer in external_dealers:
+        if dealer.dealer_user_id:
+            dealers_by_user[dealer.dealer_user_id].append(dealer)
+    standalone_dealers = [
+        dealer for dealer in external_dealers if dealer.dealer_user_id in standalone_user_ids
+    ]
     profiles = await _profiles_for_subjects(
         db, {row.id for row in clients}, {row.id for row in all_intakes}
     )
-    standalone_dealer_ids = {row.id for row in standalone_dealers}
-    if standalone_dealer_ids:
-        standalone_profiles = (
+    external_dealer_ids = {row.id for row in external_dealers}
+    if external_dealer_ids:
+        dealer_profiles = (
             await db.execute(
                 select(ApplicationProfile).where(
-                    ApplicationProfile.dealer_id.in_(standalone_dealer_ids)
+                    ApplicationProfile.dealer_id.in_(external_dealer_ids)
                 )
             )
         ).scalars().all()
-        profiles = list({profile.id: profile for profile in [*profiles, *standalone_profiles]}.values())
+        profiles = list({profile.id: profile for profile in [*profiles, *dealer_profiles]}.values())
+    standalone_dealer_ids = {row.id for row in standalone_dealers}
     profiles_by_client: dict[UUID, list[ApplicationProfile]] = defaultdict(list)
     profiles_by_intake: dict[UUID, list[ApplicationProfile]] = defaultdict(list)
     profiles_by_dealer: dict[UUID, list[ApplicationProfile]] = defaultdict(list)
@@ -297,7 +306,7 @@ async def _subject_rows(db: AsyncSession, q: str | None) -> list[ClientAccessDir
         [
             *(profile.primary_bucket_id for profile in profiles),
             *(intake.bucket_id for intake in all_intakes),
-            *(dealer.bucket_id for dealer in standalone_dealers),
+            *(dealer.bucket_id for dealer in external_dealers),
         ],
     )
     code_signins = await client_signins.code_signins_by_intake(
@@ -368,12 +377,25 @@ async def _subject_rows(db: AsyncSession, q: str | None) -> list[ClientAccessDir
         if normalized and normalized not in searchable:
             continue
         products = sorted(assigned_product_values(user)) if user else []
+        user_dealers = dealers_by_user.get(user.id, []) if user else []
         signins = client_signins.summary_for(
             bucket_ids=[
                 *(profile.primary_bucket_id for profile in subject_profiles),
                 *(intake.bucket_id for intake in subject_intakes),
+                *(dealer.bucket_id for dealer in user_dealers),
+                *(
+                    profile.primary_bucket_id
+                    for dealer in user_dealers
+                    for profile in profiles_by_dealer.get(dealer.id, [])
+                ),
             ],
             intake_ids=[intake.id for intake in subject_intakes],
+            emails=[
+                client.email,
+                user.email if user else None,
+                *(intake.email for intake in subject_intakes),
+                *(dealer.email for dealer in user_dealers),
+            ],
             room=room_signins,
             code=code_signins,
         )
@@ -419,10 +441,9 @@ async def _subject_rows(db: AsyncSession, q: str | None) -> list[ClientAccessDir
                 account_status=user.account_status if user else None,
                 file_count=len(subject_profiles) + len(unprofiled_intakes),
                 last_active_at=max(activity_candidates),
-                last_login_at=client_signins.latest(
-                    user.last_seen_at if user else None, signins.last_at
-                ),
                 passcode_signin_count=signins.count,
+                room_pin_signin_count=signins.room_count,
+                email_code_signin_count=signins.code_count,
                 last_passcode_signin_at=signins.last_at,
                 status=(
                     user.account_status
@@ -436,6 +457,7 @@ async def _subject_rows(db: AsyncSession, q: str | None) -> list[ClientAccessDir
         signins = client_signins.summary_for(
             bucket_ids=[intake.bucket_id, *(profile.primary_bucket_id for profile in subject_profiles)],
             intake_ids=[intake.id],
+            emails=[intake.email],
             room=room_signins,
             code=code_signins,
         )
@@ -463,8 +485,9 @@ async def _subject_rows(db: AsyncSession, q: str | None) -> list[ClientAccessDir
                 last_active_at=client_signins.latest(
                     intake.last_message_at or intake.updated_at, signins.last_at
                 ),
-                last_login_at=signins.last_at,
                 passcode_signin_count=signins.count,
+                room_pin_signin_count=signins.room_count,
+                email_code_signin_count=signins.code_count,
                 last_passcode_signin_at=signins.last_at,
                 status=intake.status,
             )
@@ -508,6 +531,7 @@ async def _subject_rows(db: AsyncSession, q: str | None) -> list[ClientAccessDir
                 *(profile.primary_bucket_id for profile in subject_profiles),
             ],
             intake_ids=[],
+            emails=[external_user.email, *(dealer.email for dealer in assigned_dealers)],
             room=room_signins,
             code=code_signins,
         )
@@ -528,8 +552,9 @@ async def _subject_rows(db: AsyncSession, q: str | None) -> list[ClientAccessDir
                 last_active_at=client_signins.latest(
                     external_user.last_seen_at or external_user.updated_at, signins.last_at
                 ),
-                last_login_at=client_signins.latest(external_user.last_seen_at, signins.last_at),
                 passcode_signin_count=signins.count,
+                room_pin_signin_count=signins.room_count,
+                email_code_signin_count=signins.code_count,
                 last_passcode_signin_at=signins.last_at,
                 status=external_user.account_status,
             )
@@ -763,17 +788,28 @@ async def _detail(
     audit_scopes = await _profile_scope_options(
         db, client=client, intake=intake, user_id=user.id if user else None
     )
-    history = [AccessHistoryItem.model_validate(row, from_attributes=True) for row in events]
-    history.extend(await _signin_history(db, client=client, intake=intake, user=user, scopes=audit_scopes))
-    history.sort(key=lambda item: item.created_at, reverse=True)
+    history = combined_history(
+        [AccessHistoryItem.model_validate(row, from_attributes=True) for row in events],
+        await _signin_history(db, client=client, intake=intake, user=user, scopes=audit_scopes),
+    )
     return ClientAccessDetail(
         subject=subject,
         entitlements=entitlements,
         audit_scopes=audit_scopes,
         invitation_status=user.last_invite_status if user else None,
         invitation_error=user.last_invite_error if user else None,
-        access_history=history[:100],
+        access_history=history,
     )
+
+
+def combined_history(
+    account_events: list[AccessHistoryItem], signins: list[AccessHistoryItem]
+) -> list[AccessHistoryItem]:
+    """Newest first. Both inputs are already capped by their own queries; the
+    merge is never truncated, so a busy room cannot push the account's
+    invite/suspend/grant trail out of view."""
+
+    return sorted([*account_events, *signins], key=lambda item: item.created_at, reverse=True)
 
 
 async def _signin_history(
@@ -799,14 +835,12 @@ async def _signin_history(
         )
     if intake is not None and all(row.id != intake.id for row in subject_intakes):
         subject_intakes.append(intake)
-    dealer_bucket_ids: list[UUID | None] = []
+    dealers: list[DealerBusiness] = []
     if user is not None:
-        dealer_bucket_ids = list(
+        dealers = list(
             (
                 await db.execute(
-                    select(DealerBusiness.bucket_id).where(
-                        DealerBusiness.dealer_user_id == user.id
-                    )
+                    select(DealerBusiness).where(DealerBusiness.dealer_user_id == user.id)
                 )
             ).scalars().all()
         )
@@ -815,9 +849,15 @@ async def _signin_history(
         bucket_ids=[
             *(scope.bucket_id for scope in scopes),
             *(row.bucket_id for row in subject_intakes),
-            *dealer_bucket_ids,
+            *(dealer.bucket_id for dealer in dealers),
         ],
         intake_ids=[row.id for row in subject_intakes],
+        emails=[
+            client.email if client else None,
+            user.email if user else None,
+            *(row.email for row in subject_intakes),
+            *(dealer.email for dealer in dealers),
+        ],
     )
     return [
         AccessHistoryItem(
