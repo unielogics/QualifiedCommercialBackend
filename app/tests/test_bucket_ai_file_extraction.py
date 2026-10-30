@@ -992,3 +992,37 @@ def test_consumed_placeholder_hash_fits_the_column():
     assert bucket_ai.consumed_placeholder_hash("pending") == "consumed:pending"
     forced = bucket_ai.consumed_placeholder_hash("pending:" + "f" * 32)
     assert forced.startswith("consumed:pending:") and len(forced) <= 64
+
+
+@pytest.mark.asyncio
+async def test_a_consumed_placeholder_does_not_block_a_forced_reanalysis():
+    """The drain renames a taken placeholder to consumed:* but leaves it
+    "pending"; enqueue must not read that as in flight, or a file that was
+    ever queued can never be re-analyzed."""
+    statements = []
+
+    async def execute(statement):
+        statements.append(statement)
+        return SimpleNamespace(scalar_one_or_none=lambda: None)
+
+    added = []
+    db = SimpleNamespace(execute=execute, add=added.append)
+    file = SimpleNamespace(id=uuid4(), bucket_id=uuid4())
+
+    await bucket_ai.enqueue_file_analysis(db, file, force=True)
+
+    sql = str(statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "content_hash LIKE 'pending%'" in sql
+    assert "status = 'running'" in sql
+    assert "'completed'" not in sql
+    assert len(added) == 1 and added[0].skip_reason == "force_reanalysis"
+    assert added[0].content_hash.startswith("pending:")
+
+    statements.clear()
+    added.clear()
+    await bucket_ai.enqueue_file_analysis(db, file)
+    sql = str(statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "content_hash LIKE 'pending%'" in sql
+    assert "'completed'" in sql and "'skipped'" in sql
+    assert len(added) == 1 and added[0].content_hash == "pending"
+

@@ -17,7 +17,7 @@ from xml.etree import ElementTree
 
 import boto3
 from pypdf import PdfReader, PdfWriter
-from sqlalchemy import case, exists, or_, select
+from sqlalchemy import and_, case, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -3499,15 +3499,26 @@ async def enqueue_file_analysis(db: AsyncSession, file: BucketFile, *, force: bo
     'pending' hash; drain_file_analyses re-keys the row to the real hash when it
     runs analyze_bucket_file.
     """
+    # A placeholder the drain has taken keeps status "pending" under a
+    # "consumed:" hash (bucket history is never deleted); it is not in flight.
+    # Only a live placeholder or a running analysis blocks a new queue entry,
+    # otherwise a file that was ever queued could never be re-analyzed.
+    in_flight = or_(
+        and_(
+            BucketFileAnalysis.status == "pending",
+            BucketFileAnalysis.content_hash.like("pending%"),
+        ),
+        BucketFileAnalysis.status == "running",
+    )
     existing = (
         await db.execute(
             select(BucketFileAnalysis.id)
             .where(
                 BucketFileAnalysis.bucket_file_id == file.id,
                 BucketFileAnalysis.analysis_version == CURRENT_FILE_ANALYSIS_VERSION,
-                BucketFileAnalysis.status.in_(["pending", "running"])
+                in_flight
                 if force
-                else BucketFileAnalysis.status.in_(["pending", "running", "completed", "skipped"]),
+                else or_(in_flight, BucketFileAnalysis.status.in_(["completed", "skipped"])),
             )
             .limit(1)
         )
