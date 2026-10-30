@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import get_db
+from app.db import get_db, retry_transient_conflicts
 from app.deps import CurrentUser
 from app.models.application_profile import (
     ApplicationCollectionTask,
@@ -93,10 +93,14 @@ async def deliver_due_profile(profile_id: UUID) -> None:
     from app.db import SessionLocal
 
     async with SessionLocal() as db:
-        profile = await db.get(collection_tasks.ApplicationProfile, profile_id)
-        if profile:
-            await missing_item_automation.run_profile_collection_outreach(db, profile)
-            await db.commit()
+
+        async def work() -> None:
+            profile = await db.get(collection_tasks.ApplicationProfile, profile_id)
+            if profile:
+                await missing_item_automation.run_profile_collection_outreach(db, profile)
+                await db.commit()
+
+        await retry_transient_conflicts(db, work, label="collection outreach")
 
 
 @router.get("/application-profiles/{profile_id}/collection-tasks")

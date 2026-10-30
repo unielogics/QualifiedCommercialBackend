@@ -29,7 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.db import get_db
+from app.db import get_db, retry_transient_conflicts
 from app.dealer_os.models import DealerBusiness, DealerOwner, DealerPlaidItem
 from app.dealer_os.services import bank_consent as dealer_bank_consent
 from app.dealer_os.services import client_room, consent_delivery, plaid_client
@@ -166,7 +166,6 @@ from app.schemas.use_of_funds import (
     UseOfFundsRoomAccess,
     UseOfFundsRoomPatch,
 )
-from app.services.application_profiles import canonical_funding_category
 from app.services import application_profiles as profiles
 from app.services import (
     application_programs,
@@ -193,6 +192,7 @@ from app.services import (
 )
 from app.services.activity_log import log_activity, mark_loan_dirty
 from app.services.application_plaid_sync import sync_item_background
+from app.services.application_profiles import canonical_funding_category
 from app.services.deal_economics import calculate_deal_earnings, optional_float
 from app.services.extracted_facts import (
     accepted_review_group_keys,
@@ -823,8 +823,12 @@ async def resolve_application_profile(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationProfileRead:
-    profile = await profiles.resolve_profile(db, payload.source_kind, payload.source_id, user)
-    await db.commit()
+    async def work():
+        resolved = await profiles.resolve_profile(db, payload.source_kind, payload.source_id, user)
+        await db.commit()
+        return resolved
+
+    profile = await retry_transient_conflicts(db, work, label="application-profiles/resolve")
     await db.refresh(profile)
     return profiles.profile_read(profile)
 
@@ -1049,11 +1053,18 @@ async def get_application_program_readiness(
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationProgramReadiness:
     _require_underwriting_actor(user)
-    profile = await profiles.load_profile(db, profile_id, user)
-    readiness = await application_programs.get_program_readiness(db, profile)
-    # The first read may pin an AI-selected playbook and materialize stable
-    # requirement rows. Those writes are deterministic and idempotent.
-    await db.commit()
+
+    async def work():
+        loaded = await profiles.load_profile(db, profile_id, user)
+        computed = await application_programs.get_program_readiness(db, loaded)
+        # The first read may pin an AI-selected playbook and materialize stable
+        # requirement rows. Those writes are deterministic and idempotent, so
+        # they are also safe to run again when a concurrent transaction won
+        # the row locks first.
+        await db.commit()
+        return loaded, computed
+
+    profile, readiness = await retry_transient_conflicts(db, work, label="program-readiness")
     from app.routers.application_collection import deliver_due_profile
     background_tasks.add_task(deliver_due_profile, profile.id)
     return readiness
@@ -1067,9 +1078,14 @@ async def get_application_evidence_workspace(
 ) -> ApplicationEvidenceWorkspace:
     """One canonical snapshot for requirements, files, forms, and banking."""
     _require_underwriting_actor(user)
-    profile = await profiles.load_profile(db, profile_id, user)
-    supporting = await profiles.ensure_supporting_document_group(db, profile)
-    readiness = await application_programs.get_program_readiness(db, profile)
+
+    async def work():
+        loaded = await profiles.load_profile(db, profile_id, user)
+        group = await profiles.ensure_supporting_document_group(db, loaded)
+        computed = await application_programs.get_program_readiness(db, loaded)
+        return loaded, group, computed
+
+    profile, supporting, readiness = await retry_transient_conflicts(db, work, label="evidence-workspace")
     verification = await profiles.verification_state(db, profile)
     banking = await _application_bank_state(db, profile, include_statement_files=True)
     forms = await financial_forms_status(profile_id, user, db)

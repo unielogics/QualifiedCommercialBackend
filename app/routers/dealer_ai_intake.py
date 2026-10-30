@@ -23,6 +23,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, with_loader_criteria
 
@@ -4942,7 +4943,10 @@ async def _dealer_call_slots(
         return owner, booking, []
     if lock_host:
         await lock_calendar_owner(db, owner.id)
-    slots = await _available_booking_slots(db, owner, booking)
+    availability = await _available_booking_slots(db, owner, booking)
+    # The shared availability query answers with a BookingAvailabilityRead;
+    # iterating the model itself yields (field, value) pairs, not slots.
+    slots = list(getattr(availability, "slots", availability) or [])
     now = _now()
     next_day = now + timedelta(hours=24)
     preferred = [slot for slot in slots if slot.starts_at <= next_day]
@@ -5054,7 +5058,15 @@ async def _deliver_intake_booking(
 async def _decorate_widget(db: AsyncSession, intake: PublicUnderwritingIntake, widget: dict[str, Any] | None) -> dict[str, Any] | None:
     if widget is None or widget.get("type") != "book_call":
         return widget
-    owner, booking, slots = await _dealer_call_slots(db)
+    try:
+        owner, booking, slots = await _dealer_call_slots(db)
+    except DBAPIError:
+        raise  # the session is already unusable; let the request fail honestly
+    except Exception:
+        # Call times are a convenience on the file; a fault in the calendar
+        # path disables the widget and is logged, it does not take the file down.
+        log.exception("book_call widget for intake %s: call times unavailable", intake.id)
+        owner, booking, slots = None, None, []
     decorated = dict(widget)
     decorated["slots"] = slots
     decorated["host_name"] = owner.name or owner.email if owner is not None else "Qualified Commercial"
