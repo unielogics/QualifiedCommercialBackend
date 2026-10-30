@@ -35,6 +35,7 @@ from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.models.user_access import UserAccessEvent
 from app.services import clerk as clerk_service
+from app.services import client_signins
 from app.services.application_profiles import resolve_profile
 from app.services.user_access import (
     access_state,
@@ -78,11 +79,19 @@ class ClientAccessDirectoryRow(BaseModel):
     email: str | None = None
     phone: str | None = None
     origin: str
-    login_state: Literal["no_login", "invited", "active", "suspended", "invite_failed"]
+    login_state: Literal[
+        "no_login", "invited", "active", "suspended", "invite_failed", "passcode"
+    ]
     account_types: list[ProductAccountType] = Field(default_factory=list)
     account_status: str | None = None
     file_count: int = 0
     last_active_at: datetime | None = None
+    # The last time this person actually signed in, by any door: a Clerk
+    # session, the room PIN, or an emailed one-time code.
+    last_login_at: datetime | None = None
+    # Sign-ins that never involved a login account (room PIN, emailed code).
+    passcode_signin_count: int = 0
+    last_passcode_signin_at: datetime | None = None
     status: str
 
 
@@ -172,9 +181,13 @@ def _require_super_admin(user: User) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
 
 
-def _login_state(user: User | None) -> str:
+def _login_state(
+    user: User | None, signins: client_signins.SigninSummary = client_signins.EMPTY
+) -> str:
     if user is None:
-        return "no_login"
+        # No account, but the person has been getting in with the room PIN or
+        # an emailed code. "No login" was hiding exactly these people.
+        return "passcode" if signins.count else "no_login"
     if user.account_status == "suspended":
         return "suspended"
     if user.clerk_id:
@@ -279,6 +292,17 @@ async def _subject_rows(db: AsyncSession, q: str | None) -> list[ClientAccessDir
         ).scalars().all()
     } if dealer_ids else {}
     linked_intakes = {row.id: row for row in all_intakes}
+    room_signins = await client_signins.room_signins_by_bucket(
+        db,
+        [
+            *(profile.primary_bucket_id for profile in profiles),
+            *(intake.bucket_id for intake in all_intakes),
+            *(dealer.bucket_id for dealer in standalone_dealers),
+        ],
+    )
+    code_signins = await client_signins.code_signins_by_intake(
+        db, [intake.id for intake in all_intakes]
+    )
 
     def attribution_source(value: object) -> str | None:
         if not isinstance(value, dict):
@@ -344,12 +368,23 @@ async def _subject_rows(db: AsyncSession, q: str | None) -> list[ClientAccessDir
         if normalized and normalized not in searchable:
             continue
         products = sorted(assigned_product_values(user)) if user else []
+        signins = client_signins.summary_for(
+            bucket_ids=[
+                *(profile.primary_bucket_id for profile in subject_profiles),
+                *(intake.bucket_id for intake in subject_intakes),
+            ],
+            intake_ids=[intake.id for intake in subject_intakes],
+            room=room_signins,
+            code=code_signins,
+        )
         activity_candidates = [client.updated_at]
         activity_candidates.extend(
             (intake.last_message_at or intake.updated_at) for intake in subject_intakes
         )
         if user and user.last_seen_at:
             activity_candidates.append(user.last_seen_at)
+        if signins.last_at:
+            activity_candidates.append(signins.last_at)
         latest_intake_source = next(
             (
                 attribution_source(intake.intake_state)
@@ -379,16 +414,31 @@ async def _subject_rows(db: AsyncSession, q: str | None) -> list[ClientAccessDir
                     or client.lead_source
                     or "client_record"
                 ),
-                login_state=_login_state(user),
+                login_state=_login_state(user, signins),
                 account_types=[ProductAccountType(value) for value in products],
                 account_status=user.account_status if user else None,
                 file_count=len(subject_profiles) + len(unprofiled_intakes),
                 last_active_at=max(activity_candidates),
-                status=user.account_status if user else "no_login",
+                last_login_at=client_signins.latest(
+                    user.last_seen_at if user else None, signins.last_at
+                ),
+                passcode_signin_count=signins.count,
+                last_passcode_signin_at=signins.last_at,
+                status=(
+                    user.account_status
+                    if user
+                    else ("passcode_access" if signins.count else "no_login")
+                ),
             )
         )
     for intake in orphan_intakes:
         subject_profiles = profiles_by_intake.get(intake.id, [])
+        signins = client_signins.summary_for(
+            bucket_ids=[intake.bucket_id, *(profile.primary_bucket_id for profile in subject_profiles)],
+            intake_ids=[intake.id],
+            room=room_signins,
+            code=code_signins,
+        )
         businesses = profile_businesses(subject_profiles) or ([intake.business_name] if intake.business_name else [])
         searchable = " ".join(
             [
@@ -408,9 +458,14 @@ async def _subject_rows(db: AsyncSession, q: str | None) -> list[ClientAccessDir
                 email=intake.email,
                 phone=intake.phone,
                 origin=intake.referral_source or intake.variant or "public_intake",
-                login_state="no_login",
+                login_state=_login_state(None, signins),
                 file_count=max(1, len(subject_profiles)),
-                last_active_at=intake.last_message_at or intake.updated_at,
+                last_active_at=client_signins.latest(
+                    intake.last_message_at or intake.updated_at, signins.last_at
+                ),
+                last_login_at=signins.last_at,
+                passcode_signin_count=signins.count,
+                last_passcode_signin_at=signins.last_at,
                 status=intake.status,
             )
         )
@@ -447,6 +502,15 @@ async def _subject_rows(db: AsyncSession, q: str | None) -> list[ClientAccessDir
         if normalized and normalized not in searchable:
             continue
         products = sorted(assigned_product_values(external_user))
+        signins = client_signins.summary_for(
+            bucket_ids=[
+                *(dealer.bucket_id for dealer in assigned_dealers),
+                *(profile.primary_bucket_id for profile in subject_profiles),
+            ],
+            intake_ids=[],
+            room=room_signins,
+            code=code_signins,
+        )
         result.append(
             ClientAccessDirectoryRow(
                 subject_kind="user",
@@ -457,11 +521,16 @@ async def _subject_rows(db: AsyncSession, q: str | None) -> list[ClientAccessDir
                 email=external_user.email,
                 phone=next((dealer.phone for dealer in assigned_dealers if dealer.phone), None),
                 origin="audit_client",
-                login_state=_login_state(external_user),
+                login_state=_login_state(external_user, signins),
                 account_types=[ProductAccountType(value) for value in products],
                 account_status=external_user.account_status,
                 file_count=len(subject_profiles),
-                last_active_at=external_user.last_seen_at or external_user.updated_at,
+                last_active_at=client_signins.latest(
+                    external_user.last_seen_at or external_user.updated_at, signins.last_at
+                ),
+                last_login_at=client_signins.latest(external_user.last_seen_at, signins.last_at),
+                passcode_signin_count=signins.count,
+                last_passcode_signin_at=signins.last_at,
                 status=external_user.account_status,
             )
         )
@@ -691,16 +760,75 @@ async def _detail(
         if user
         else []
     )
+    audit_scopes = await _profile_scope_options(
+        db, client=client, intake=intake, user_id=user.id if user else None
+    )
+    history = [AccessHistoryItem.model_validate(row, from_attributes=True) for row in events]
+    history.extend(await _signin_history(db, client=client, intake=intake, user=user, scopes=audit_scopes))
+    history.sort(key=lambda item: item.created_at, reverse=True)
     return ClientAccessDetail(
         subject=subject,
         entitlements=entitlements,
-        audit_scopes=await _profile_scope_options(
-            db, client=client, intake=intake, user_id=user.id if user else None
-        ),
+        audit_scopes=audit_scopes,
         invitation_status=user.last_invite_status if user else None,
         invitation_error=user.last_invite_error if user else None,
-        access_history=[AccessHistoryItem.model_validate(row, from_attributes=True) for row in events],
+        access_history=history[:100],
     )
+
+
+async def _signin_history(
+    db: AsyncSession,
+    *,
+    client: Client | None,
+    intake: PublicUnderwritingIntake | None,
+    user: User | None,
+    scopes: list[AuditBusinessScope],
+) -> list[AccessHistoryItem]:
+    """Room-PIN and emailed-code sign-ins, shaped like the account access events."""
+
+    subject_intakes: list[PublicUnderwritingIntake] = []
+    if client is not None:
+        subject_intakes = list(
+            (
+                await db.execute(
+                    select(PublicUnderwritingIntake).where(
+                        PublicUnderwritingIntake.client_id == client.id
+                    )
+                )
+            ).scalars().all()
+        )
+    if intake is not None and all(row.id != intake.id for row in subject_intakes):
+        subject_intakes.append(intake)
+    dealer_bucket_ids: list[UUID | None] = []
+    if user is not None:
+        dealer_bucket_ids = list(
+            (
+                await db.execute(
+                    select(DealerBusiness.bucket_id).where(
+                        DealerBusiness.dealer_user_id == user.id
+                    )
+                )
+            ).scalars().all()
+        )
+    events = await client_signins.signin_events(
+        db,
+        bucket_ids=[
+            *(scope.bucket_id for scope in scopes),
+            *(row.bucket_id for row in subject_intakes),
+            *dealer_bucket_ids,
+        ],
+        intake_ids=[row.id for row in subject_intakes],
+    )
+    return [
+        AccessHistoryItem(
+            id=event.id,
+            action=event.action,
+            reason=event.reason,
+            request_metadata=event.request_metadata,
+            created_at=event.created_at,
+        )
+        for event in events
+    ]
 
 
 @router.get(
