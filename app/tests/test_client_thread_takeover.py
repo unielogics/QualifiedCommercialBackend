@@ -274,7 +274,11 @@ def test_the_signed_in_loader_gates_writes_and_lets_reads_render_the_gate():
     # trips this, which is the point — it should be a decision, not a default.
     # Three reads today: the intake detail, its gate render, and the financial
     # statement (readable while gated; saving it is a write and is not).
-    body = inspect.getsource(router)
+    # The handlers live in one module per router beside the core; the gate is
+    # applied wherever the loader is called, so every module is scanned.
+    from app.routers.dealer_ai_intake_routes import admin, broker, client, funding_review, mca_refinance, public_intake
+
+    body = "\n".join(inspect.getsource(module) for module in (router, admin, broker, client, funding_review, mca_refinance, public_intake))
     calls = [line for line in body.splitlines() if "_load_client_intake(db, user, intake_id" in line]
     allowed = [c for c in calls if "allow_pending_signing=True" in c]
     assert len(calls) >= 6
