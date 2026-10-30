@@ -113,6 +113,29 @@ class BucketRequestedDocumentRead(ORMModel):
         return source_kind(self.requirement_source)  # type: ignore[return-value]
 
 
+
+# The labels the create-room form offered before the kind became a closed set.
+# Folding them here keeps a dashboard still serving the old form working while
+# its own deploy catches up, and matches what migration 0244 did to the rows.
+LEGACY_BUCKET_TYPE_LABELS: dict[str, str] = {
+    "Loan File": "loan_file",
+    "Underwriting": "underwriting",
+    "UrChoice Dealer Funding": "general",
+    "Partner Package": "general",
+    "Borrower": "general",
+    "Funding Opportunity": "general",
+}
+
+
+def fold_legacy_bucket_type(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped:
+        return None
+    return LEGACY_BUCKET_TYPE_LABELS.get(stripped, stripped)
+
+
 class BucketCreate(BaseModel):
     name: str = Field(min_length=1, max_length=180)
     bucket_type: str | None = Field(
@@ -123,6 +146,12 @@ class BucketCreate(BaseModel):
     client_name: str | None = Field(default=None, max_length=180)
     purpose: str | None = Field(default=None, max_length=255)
     description: str | None = None
+
+    @field_validator("bucket_type", mode="before")
+    @classmethod
+    def _fold_legacy_bucket_type_labels(cls, value: object) -> object:
+        return fold_legacy_bucket_type(value)
+
 
 
 class BucketUpdate(BaseModel):
@@ -137,6 +166,12 @@ class BucketUpdate(BaseModel):
     description: str | None = None
     status: str | None = Field(default=None, max_length=40)
     name_sync_mode: Literal["linked", "custom"] | None = None
+
+    @field_validator("bucket_type", mode="before")
+    @classmethod
+    def _fold_legacy_bucket_type_labels(cls, value: object) -> object:
+        return fold_legacy_bucket_type(value)
+
 
 
 class BucketLinkedFileRead(BaseModel):

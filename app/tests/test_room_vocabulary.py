@@ -115,3 +115,13 @@ async def test_the_queue_prefers_the_column_over_the_audit_json() -> None:
     queue = await aq.load_attention_queue(_DB(), now=now)
     (item,) = queue.items
     assert "link sent 2d ago" in item.detail
+
+
+def test_the_labels_the_old_form_sent_fold_into_kinds_during_the_transition() -> None:
+    # A dashboard still serving the pre-vocabulary create form keeps working
+    # until its own deploy lands; the mapping is the one 0244 applied to rows.
+    assert BucketCreate(name="Lee Motors", bucket_type="Loan File").bucket_type == "loan_file"
+    assert BucketCreate(name="Lee Motors", bucket_type="UrChoice Dealer Funding").bucket_type == "general"
+    assert BucketUpdate(bucket_type="  ").bucket_type is None
+    with pytest.raises(ValidationError):
+        BucketCreate(name="Lee Motors", bucket_type="Something Else Entirely")
