@@ -218,6 +218,10 @@ class BucketRequestedDocument(TimestampMixin, Base):
     required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     allow_multiple_files: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="requested", server_default="requested")
+    # A closed ask is no longer owed. The reason names what closed it (today:
+    # the bucket's archive) so a restore can reopen exactly that set.
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
     is_custom: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     # Generic e-sign extension (credit-authorization forms, and any future
     # "have the client sign X" requested document) — reuses the SAME

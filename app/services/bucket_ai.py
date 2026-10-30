@@ -41,6 +41,7 @@ from app.models.bucket import (
     BucketVendorAccess,
 )
 from app.models.user import User
+from app.services.bucket_requests import is_open_request
 from app.services import mca_refinance_policy, merchant_processing, provenance
 from app.services.ai.bedrock_client import get_client, model_heavy, model_light
 from app.services.ai.structured_output import is_truncated_response, require_complete_response
@@ -1667,7 +1668,7 @@ def _reconcile_checklist_consistency(bucket: Bucket, result: dict[str, Any]) -> 
     outstanding_docs = [
         doc
         for doc in bucket.requested_documents
-        if doc.required and doc.status != "uploaded" and doc.id not in linked
+        if doc.required and is_open_request(doc) and doc.id not in linked
     ]
     result["outstanding_checklist"] = [doc.name for doc in outstanding_docs]
     if not outstanding_docs:
@@ -3816,7 +3817,7 @@ def upload_link_visible_summary(review: BucketAIReview | None, bucket: Bucket) -
                 "category": doc.category,
             }
             for doc in bucket.requested_documents
-            if doc.status != "uploaded"
+            if is_open_request(doc)
         ]
         return {
             "summary": "Qualified Commercial has prepared this file room. AI analysis uses the super-admin bucket inputs, uploaded files, and any completed underwriting review.",

@@ -95,6 +95,7 @@ from app.schemas.bucket import (
     BucketPublicShareAccessRead,
     BucketPublicShareCreate,
     BucketPublicShareFileRead,
+    BucketAIActionItemQueueRead,
     BucketPublicShareRead,
     BucketRead,
     BucketRequestAccessRead,
@@ -133,6 +134,7 @@ from app.schemas.bucket import (
     IntakeChatActionResult,
 )
 from app.schemas.retention import LegalHoldChange, RetentionStatusRead
+from app.services import bucket_requests
 from app.services import application_profiles as profiles
 from app.services import (
     bucket_archive,
@@ -1225,9 +1227,29 @@ async def list_buckets(
     buckets = (
         await db.execute(stmt.order_by(Bucket.updated_at.desc()))
     ).scalars().all()
+    # One grouped query for every listed bucket's checklist state, so the
+    # table can show "6 open" without a per-row round trip.
+    request_counts: dict[tuple[UUID, str], int] = {}
+    if buckets:
+        request_counts = {
+            (bucket_id, doc_status): int(count)
+            for bucket_id, doc_status, count in (
+                await db.execute(
+                    select(
+                        BucketRequestedDocument.bucket_id,
+                        BucketRequestedDocument.status,
+                        func.count(BucketRequestedDocument.id),
+                    )
+                    .where(BucketRequestedDocument.bucket_id.in_([bucket.id for bucket in buckets]))
+                    .group_by(BucketRequestedDocument.bucket_id, BucketRequestedDocument.status)
+                )
+            ).all()
+        }
     for bucket in buckets:
         bucket.file_count = len(bucket.files)
         bucket.uploaded_file_count = len([file for file in bucket.files if file.status == "uploaded"])
+        bucket.open_request_count = request_counts.get((bucket.id, "requested"), 0)
+        bucket.closed_request_count = request_counts.get((bucket.id, "closed"), 0)
         bucket.file_names = [
             file.file_name
             for file in bucket.files
@@ -1321,6 +1343,64 @@ async def invite_bucket_vendor(
     await db.commit()
     await db.refresh(vendor)
     return vendor
+
+
+@router.get("/admin/ai-action-items", response_model=list[BucketAIActionItemQueueRead])
+async def list_ai_action_items_across_buckets(
+    item_status: Literal["proposed", "approved", "rejected", "completed"] = Query(
+        default="proposed", alias="status"
+    ),
+    limit: int = Query(default=200, ge=1, le=500),
+    _: User = Depends(require_role(Role.SUPER_ADMIN, Role.LOAN_EXEC)),
+    db: AsyncSession = Depends(get_db),
+) -> list[BucketAIActionItemQueueRead]:
+    """Every AI suggestion across live buckets, oldest first: the desk's inbox.
+
+    Registered ahead of the ``/admin/{bucket_id}`` routes on purpose; the UUID
+    path parameter would otherwise claim this static path.
+    """
+
+    rows = (
+        await db.execute(
+            select(BucketAIActionItem, Bucket.name, Bucket.client_name)
+            .join(Bucket, Bucket.id == BucketAIActionItem.bucket_id)
+            .where(BucketAIActionItem.status == item_status, Bucket.archived_at.is_(None))
+            .order_by(BucketAIActionItem.created_at.asc())
+            .limit(limit)
+        )
+    ).all()
+    bucket_ids = {item.bucket_id for item, _name, _client in rows}
+    intake_by_bucket: dict[UUID, UUID] = {}
+    if bucket_ids:
+        intake_by_bucket = {
+            bucket_id: intake_id
+            for bucket_id, intake_id in (
+                await db.execute(
+                    select(PublicUnderwritingIntake.bucket_id, PublicUnderwritingIntake.id).where(
+                        PublicUnderwritingIntake.bucket_id.in_(bucket_ids)
+                    )
+                )
+            ).all()
+        }
+    out: list[BucketAIActionItemQueueRead] = []
+    for item, bucket_name, client_name in rows:
+        intake_id = intake_by_bucket.get(item.bucket_id)
+        href = (
+            f"/admin/ai-underwriter-leads?lead={intake_id}"
+            if intake_id is not None
+            else f"/admin/buckets?bucket={item.bucket_id}"
+        )
+        out.append(
+            BucketAIActionItemQueueRead(
+                **BucketAIActionItemRead.model_validate(item).model_dump(),
+                bucket_name=bucket_name,
+                client_name=client_name,
+                intake_id=intake_id,
+                href=href,
+                approvable_here=item.route == "admin",
+            )
+        )
+    return out
 
 
 @router.get("/admin/{bucket_id}", response_model=BucketDetail)
@@ -1725,11 +1805,22 @@ async def delete_bucket(
     # and retained artifacts remain available through the Payments,
     # Agreements, and archived-file views.
     archived_at = _now()
+    # Archiving closes what the client was still being asked for. The reason
+    # names the archive, so a restore reopens exactly this set and nothing else.
+    requested_docs = (
+        await db.execute(
+            select(BucketRequestedDocument).where(BucketRequestedDocument.bucket_id == bucket.id)
+        )
+    ).scalars().all()
+    closed_request_count = bucket_requests.close_open_requests(
+        list(requested_docs), reason=bucket_requests.ARCHIVE_REASON, at=archived_at
+    )
     context = dict(bucket.ai_context or {})
     context["_archive"] = {
         "prior_status": bucket.status,
         "archived_at": archived_at.isoformat(),
         "archived_by_user_id": str(user.id),
+        "closed_request_count": closed_request_count,
     }
     bucket.ai_context = context
     bucket.archived_at = archived_at
@@ -1795,6 +1886,16 @@ async def restore_bucket(
         and prior_status
         and prior_status != "archived"
         else "collecting_documents"
+    )
+    # Only the asks the archive closed come back; anything closed for another
+    # reason stays closed.
+    requested_docs = (
+        await db.execute(
+            select(BucketRequestedDocument).where(BucketRequestedDocument.bucket_id == bucket.id)
+        )
+    ).scalars().all()
+    bucket_requests.reopen_requests_closed_for(
+        list(requested_docs), reason=bucket_requests.ARCHIVE_REASON
     )
     await _log(
         db,

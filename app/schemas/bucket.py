@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, computed_field, field_validator
 
 from app.schemas.application_profile import (
     ClientEvidenceBankingSummary,
@@ -100,6 +100,17 @@ class BucketRequestedDocumentRead(ORMModel):
     source_file_id: UUID | None = None
     replacement_review_state: ReplacementReviewState | None = None
     template_download_url: str | None = None
+    closed_at: datetime | None = None
+    closed_reason: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def source_kind(self) -> Literal["rule", "system", "manual"]:
+        """Rule-driven, system-supporting, or typed by a person."""
+
+        from app.services.bucket_requests import source_kind
+
+        return source_kind(self.requirement_source)  # type: ignore[return-value]
 
 
 class BucketCreate(BaseModel):
@@ -153,6 +164,10 @@ class BucketRead(ORMModel):
     ] = "unclassified"
     file_count: int = 0
     uploaded_file_count: int = 0
+    # What the client still owes versus what the archive closed, so the list
+    # can show overload (one live bucket carries 17 open asks) at a glance.
+    open_request_count: int = 0
+    closed_request_count: int = 0
     file_names: list[str] = Field(default_factory=list)
     linked_files: list[BucketLinkedFileRead] = Field(default_factory=list)
 
@@ -833,6 +848,18 @@ class BucketAIActionItemRead(ORMModel):
     completed_at: datetime | None
     created_at: datetime
     updated_at: datetime
+
+
+class BucketAIActionItemQueueRead(BucketAIActionItemRead):
+    """An action item seen from the desk's queue rather than from its bucket."""
+
+    bucket_name: str
+    client_name: str | None = None
+    intake_id: UUID | None = None
+    href: str
+    # Only an admin-routed item can be approved without choosing a recipient;
+    # the others need the bucket workspace to pick the share, vendor or uploader.
+    approvable_here: bool = True
 
 
 class BucketAIActionItemCreate(BaseModel):

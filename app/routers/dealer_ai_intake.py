@@ -110,6 +110,7 @@ from app.schemas.capital_readiness import CapitalReadinessRead
 from app.schemas.common import ORMModel
 from app.schemas.phone import OptionalPhone, RequiredPhone
 from app.schemas.retention import LegalHoldChange, RetentionStatusRead
+from app.services.bucket_requests import is_open_request
 from app.services import (
     application_profiles as profiles_service,
 )
@@ -2652,7 +2653,7 @@ def _missing_required_docs(bucket: Bucket) -> list[BucketRequestedDocument]:
     return [
         doc
         for doc in bucket.requested_documents
-        if doc.required and doc.status != "uploaded" and doc.id not in uploaded
+        if doc.required and is_open_request(doc) and doc.id not in uploaded
     ]
 
 
