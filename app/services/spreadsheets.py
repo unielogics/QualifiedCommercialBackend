@@ -71,7 +71,14 @@ class Limits:
 
 
 DEFAULT_LIMITS = Limits()
-PREVIEW_LIMITS = Limits(sheets=12, rows=500, cols=60, cell_chars=400, formulas=0)
+# The preview shows exactly what the AI was given, so it reads with the same
+# bounds; it only skips the formula pass.
+PREVIEW_LIMITS = Limits(formulas=0)
+
+# Bumped when the reader's behaviour changes enough that a file it could not
+# read before deserves another try. Skipped rows are stamped with it so the
+# cache re-opens them once, not on every review.
+READER_VERSION = 1
 
 
 @dataclass
@@ -82,6 +89,8 @@ class Sheet:
     total_cols: int
     truncated_rows: bool = False
     truncated_cols: bool = False
+    # total_rows stopped counting at _COUNT_CEILING; the sheet has more.
+    count_capped: bool = False
     warnings: list[str] = field(default_factory=list)
     formulas: list[dict[str, str]] = field(default_factory=list)
 
@@ -161,9 +170,9 @@ def sniff_kind(raw: bytes, *, declared_content_type: str = "", file_name: str = 
             with zipfile.ZipFile(BytesIO(raw)) as archive:
                 if "xl/workbook.xml" in archive.namelist():
                     return KIND_XLSX
+                return None
         except zipfile.BadZipFile:
-            pass
-        return None
+            pass  # a CSV can start with the letters PK
     sample = _decode_sample(raw[:8192])
     if sample is None or not _looks_textual(sample):
         return None
@@ -172,7 +181,8 @@ def sniff_kind(raw: bytes, *, declared_content_type: str = "", file_name: str = 
         or name.endswith((".csv", ".tsv"))
         or declared in CSV_CONTENT_TYPES
         # Windows browsers declare a .csv as Excel; textual bytes settle it.
-        or declared == XLS_CONTENT_TYPE
+        # An HTML or XML "Export to Excel" saved as .xls is not a table.
+        or (declared == XLS_CONTENT_TYPE and not sample.lstrip().startswith("<"))
     ):
         return KIND_CSV
     return None
@@ -202,7 +212,7 @@ def trim_empty_tail(values: list[str]) -> list[str]:
 def _row_warnings(sheet: Sheet, limits: Limits) -> list[str]:
     warnings: list[str] = []
     if sheet.truncated_rows:
-        counted = f"{sheet.total_rows:,}" if sheet.total_rows < _COUNT_CEILING else f"more than {_COUNT_CEILING:,}"
+        counted = f"more than {sheet.total_rows:,}" if sheet.count_capped else f"{sheet.total_rows:,}"
         warnings.append(f"Only the first {limits.rows:,} of {counted} rows were included.")
     if sheet.truncated_cols:
         warnings.append(f"Only the first {limits.cols} of {sheet.total_cols} columns were included.")
@@ -212,6 +222,16 @@ def _row_warnings(sheet: Sheet, limits: Limits) -> list[str]:
 # --- .xlsx ---------------------------------------------------------------------
 
 
+def _formula_text(value: Any) -> Any:
+    """openpyxl hands back ArrayFormula / DataTableFormula objects for array
+    and data-table cells; keep the formula text, never the object's repr."""
+
+    if value is None or isinstance(value, str):
+        return value
+    text = getattr(value, "text", None)
+    return text if isinstance(text, str) else None
+
+
 def _read_openpyxl_sheet(name: str, values_ws: Any, formulas_ws: Any, limits: Limits) -> Sheet:
     rows: list[list[str]] = []
     formulas: list[dict[str, str]] = []
@@ -219,13 +239,21 @@ def _read_openpyxl_sheet(name: str, values_ws: Any, formulas_ws: Any, limits: Li
     total_cols = 0
     truncated_rows = False
     truncated_cols = False
+    count_capped = False
+    # The <dimension> record is not trusted: absent, read-only mode reports no
+    # size at all; present but stale (a placeholder "A1" from some exporters),
+    # read-only iter_rows() stops at that bound with no error. Clearing it puts
+    # every sheet on the path that walks all rows. iter_rows captures the
+    # bounds when called, so the reset comes first.
+    for worksheet in (values_ws, formulas_ws):
+        reset = getattr(worksheet, "reset_dimensions", None)
+        if callable(reset):
+            reset()
     formula_rows = formulas_ws.iter_rows() if formulas_ws is not None else None
-    # No max_row / max_col bounds on purpose: a workbook saved without a
-    # <dimension> record reports None for both, and the rows are still there.
     for row_index, value_row in enumerate(values_ws.iter_rows(), start=1):
         formula_row: tuple[Any, ...] = next(formula_rows, ()) if formula_rows is not None else ()
         values = [cell.value for cell in value_row]
-        formula_values = [cell.value for cell in formula_row]
+        formula_values = [_formula_text(cell.value) for cell in formula_row]
         width = len(trim_empty_tail([compact_cell(v, cell_chars=limits.cell_chars) for v in values]))
         formula_width = len(trim_empty_tail([compact_cell(v, cell_chars=limits.cell_chars) for v in formula_values]))
         width = max(width, formula_width)
@@ -235,7 +263,9 @@ def _read_openpyxl_sheet(name: str, values_ws: Any, formulas_ws: Any, limits: Li
         total_cols = max(total_cols, width)
         if total_rows > limits.rows:
             truncated_rows = True
-            if total_rows >= _COUNT_CEILING:
+            if total_rows > _COUNT_CEILING:
+                count_capped = True
+                total_rows = _COUNT_CEILING
                 break
             continue
         if width > limits.cols:
@@ -266,6 +296,7 @@ def _read_openpyxl_sheet(name: str, values_ws: Any, formulas_ws: Any, limits: Li
         total_cols=total_cols,
         truncated_rows=truncated_rows,
         truncated_cols=truncated_cols,
+        count_capped=count_capped,
         formulas=formulas,
     )
     sheet.warnings = _row_warnings(sheet, limits)
@@ -283,9 +314,11 @@ def _read_xlsx(raw: bytes, limits: Limits) -> Workbook:
         values_wb = load_workbook(BytesIO(raw), read_only=True, data_only=True)
         formulas_wb = load_workbook(BytesIO(raw), read_only=True, data_only=False) if limits.formulas else None
         names = list(values_wb.sheetnames)
+        # Workbook.worksheets excludes chart sheets, which have no rows to
+        # walk; sheet_names above still lists them.
         visible = [
-            name for name in names
-            if getattr(values_wb[name], "sheet_state", "visible") == "visible"
+            worksheet.title for worksheet in values_wb.worksheets
+            if getattr(worksheet, "sheet_state", "visible") == "visible"
         ]
         if not visible:
             raise SpreadsheetError(ERROR_EMPTY, "This workbook has no visible sheets.")
@@ -426,6 +459,7 @@ def _read_csv(raw: bytes, limits: Limits, *, file_name: str = "") -> Workbook:
         total_cols = 0
         truncated_rows = False
         truncated_cols = False
+        count_capped = False
         for row in csv.reader(StringIO(text), delimiter=delimiter):
             compacted = trim_empty_tail([compact_cell(v, cell_chars=limits.cell_chars) for v in row])
             if not compacted:
@@ -434,7 +468,9 @@ def _read_csv(raw: bytes, limits: Limits, *, file_name: str = "") -> Workbook:
             total_cols = max(total_cols, len(compacted))
             if total_rows > limits.rows:
                 truncated_rows = True
-                if total_rows >= _COUNT_CEILING:
+                if total_rows > _COUNT_CEILING:
+                    count_capped = True
+                    total_rows = _COUNT_CEILING
                     break
                 continue
             if len(compacted) > limits.cols:
@@ -454,6 +490,7 @@ def _read_csv(raw: bytes, limits: Limits, *, file_name: str = "") -> Workbook:
         total_cols=total_cols,
         truncated_rows=truncated_rows,
         truncated_cols=truncated_cols,
+        count_capped=count_capped,
     )
     sheet.warnings = _row_warnings(sheet, limits)
     return Workbook(
@@ -513,6 +550,7 @@ def ai_payload(workbook: Workbook, *, file_id: str, file_name: str, limits: Limi
             "delimiter": workbook.delimiter,
             "rows_sampled": len(sheet.rows),
             "rows_total": sheet.total_rows,
+            "rows_total_is_minimum": sheet.count_capped,
             "columns_sampled_limit": limits.cols,
             "warnings": list(sheet.warnings),
             "rows": sheet.rows,
@@ -527,7 +565,7 @@ def ai_payload(workbook: Workbook, *, file_id: str, file_name: str, limits: Limi
         "sheets": [
             {
                 "name": sheet.name,
-                "dimensions": {"rows": sheet.total_rows, "columns": sheet.total_cols},
+                "dimensions": {"rows": sheet.total_rows, "columns": sheet.total_cols, "rows_is_minimum": sheet.count_capped},
                 "warnings": list(sheet.warnings),
                 "rows": sheet.rows,
                 "formulas": sheet.formulas,
@@ -554,6 +592,7 @@ def preview_payload(workbook: Workbook) -> dict[str, Any]:
                 "total_cols": sheet.total_cols,
                 "truncated_rows": sheet.truncated_rows,
                 "truncated_cols": sheet.truncated_cols,
+                "count_capped": sheet.count_capped,
                 "warnings": list(sheet.warnings),
             }
             for sheet in workbook.sheets

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import codecs
 import csv
 import hashlib
 import json
@@ -95,11 +96,13 @@ PDF_VISION_DPI = 150
 # The per-file analysis is one file per call, so these bound one workbook, not
 # a shared review; a 12-month bank export or a 300-line debt schedule is read
 # whole, and whatever is still cut is reported back as a read warning.
-MAX_SPREADSHEET_SHEETS = 8
-MAX_SPREADSHEET_ROWS = 500
-MAX_SPREADSHEET_COLS = 40
+MAX_SPREADSHEET_SHEETS = spreadsheets.DEFAULT_LIMITS.sheets
+MAX_SPREADSHEET_ROWS = spreadsheets.DEFAULT_LIMITS.rows
+MAX_SPREADSHEET_COLS = spreadsheets.DEFAULT_LIMITS.cols
 MAX_SPREADSHEET_TEXT_CHARS = 120000
-MAX_CELL_CHARS = 200
+MAX_CELL_CHARS = spreadsheets.DEFAULT_LIMITS.cell_chars
+# Word text kept its own, older bound when the spreadsheet caps were raised.
+MAX_DOCX_TEXT_CHARS = 24000
 MAX_ZIP_ENTRIES = 30
 MAX_ZIP_FILE_BYTES = 50 * 1024 * 1024
 MAX_ZIP_ENTRY_BYTES = 40 * 1024 * 1024
@@ -1798,7 +1801,9 @@ def detect_document_content_type(raw: bytes, declared: str = "") -> str:
             return "text/csv" if spreadsheets.sniff_delimiter(sample) else "text/plain"
     if raw and b"\x00" not in raw[:8192]:
         try:
-            sample = raw[:8192].decode("utf-8-sig")
+            # The 8 KiB cut may land inside a multibyte character; an
+            # incremental decoder buffers that tail instead of raising.
+            sample = codecs.getincrementaldecoder("utf-8-sig")().decode(raw[:8192], final=False)
             if sum(char.isprintable() or char.isspace() for char in sample) / max(1, len(sample)) > .95:
                 try:
                     csv.Sniffer().sniff(sample, delimiters=",\t;")
@@ -1824,7 +1829,7 @@ def _extract_docx_text(raw: bytes) -> tuple[str | None, tuple[str, str] | None]:
                 paragraphs.append(value)
         text = "\n".join(paragraphs)
         if text.strip():
-            return text[:MAX_SPREADSHEET_TEXT_CHARS], None
+            return text[:MAX_DOCX_TEXT_CHARS], None
         return None, ("docx_text_unavailable", "This Word file has no extractable text. Staff can review it or request a PDF export.")
     except (zipfile.BadZipFile, KeyError, ElementTree.ParseError, RuntimeError):
         return None, ("docx_parse_failed", "Automatic Word extraction is unavailable. The original remains available for staff review.")
@@ -1971,6 +1976,9 @@ def _spreadsheet_skip_still_applies(
 
     if analysis.status != "skipped" or analysis.skip_reason not in _SPREADSHEET_SKIP_REASONS:
         return True
+    detail = getattr(analysis, "analysis", None) or {}
+    if isinstance(detail, dict) and detail.get("spreadsheet_reader") == spreadsheets.READER_VERSION:
+        return True  # already the current reader's verdict
     return not spreadsheets.is_spreadsheet_name(file_name, content_type)
 
 
@@ -2145,13 +2153,9 @@ def _decode_tabular_text(raw: bytes) -> tuple[str, str]:
     return raw.decode("utf-8", errors="replace"), "utf-8-replace"
 
 
-_SPREADSHEET_LIMITS = spreadsheets.Limits(
-    sheets=MAX_SPREADSHEET_SHEETS,
-    rows=MAX_SPREADSHEET_ROWS,
-    cols=MAX_SPREADSHEET_COLS,
-    cell_chars=MAX_CELL_CHARS,
-    formulas=20,
-)
+# The preview reads with the same bounds (minus the formula pass), so what
+# the review screen shows is what the model was given.
+_SPREADSHEET_LIMITS = spreadsheets.DEFAULT_LIMITS
 
 # What a failed read tells the reviewer, by reader and cause.
 _SPREADSHEET_SKIPS: dict[tuple[str, str], tuple[str, str]] = {
@@ -2350,12 +2354,19 @@ def _append_review_file_content(
     if _is_xlsx_file(content_type, ""):
         spreadsheet_kind = "xlsx"
     elif content_type == "application/vnd.ms-excel":
-        # Any OLE2 container sniffs as this; the reader tells a workbook from
-        # a Word/Outlook file or an encrypted one and reports accordingly.
-        spreadsheet_kind = "xls"
-    elif _is_csv_file(content_type, file_name) or (
-        content_type == "text/plain" and file_name.lower().endswith((".csv", ".tsv"))
+        # Any OLE2 container sniffs as this, and Windows browsers declare a
+        # .csv as it in any encoding: let the bytes pick the reader, and keep
+        # xlrd for OLE2 or anything opaque; it tells a workbook from a
+        # Word/Outlook file or an encrypted one and reports accordingly.
+        spreadsheet_kind = (
+            spreadsheets.sniff_kind(raw, declared_content_type=content_type, file_name=file_name) or "xls"
+        )
+    elif media is None and (
+        _is_csv_file(content_type, file_name)
+        or (content_type == "text/plain" and file_name.lower().endswith((".csv", ".tsv")))
     ):
+        # The upload name may pick the CSV reader only when the bytes did not
+        # already sniff as a PDF or image.
         spreadsheet_kind = "csv"
     if spreadsheet_kind:
         added, spreadsheet_text_chars = _append_spreadsheet_content(
@@ -2896,6 +2907,10 @@ async def analyze_bucket_file(
         row.status = "skipped"
         row.skip_reason = skip.get("reason", "unsupported")
         row.skip_detail = skip.get("explanation", "This file could not be read for AI analysis.")
+        if spreadsheets.is_spreadsheet_name(file.file_name, content_type):
+            # The current reader's verdict: _spreadsheet_skip_still_applies
+            # re-opens only rows an older reader wrote.
+            row.analysis = {"spreadsheet_reader": spreadsheets.READER_VERSION}
         row.classification = "unreadable"
         row.document_type_candidates = []
         row.evidence_claims = []

@@ -378,3 +378,190 @@ def test_is_spreadsheet_name_is_a_cheap_gate_on_metadata() -> None:
     assert spreadsheets.is_spreadsheet_name("bank.csv", None)
     assert spreadsheets.is_spreadsheet_name("export.bin", "application/vnd.ms-excel")
     assert not spreadsheets.is_spreadsheet_name("statement.pdf", "application/pdf")
+
+
+# --- review follow-ups -------------------------------------------------------------
+
+
+def _with_dimension(xlsx: bytes, ref: str) -> bytes:
+    """A workbook whose sheet XML carries a stale <dimension> record."""
+
+    source = zipfile.ZipFile(BytesIO(xlsx))
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as target:
+        for item in source.infolist():
+            data = source.read(item.filename)
+            if item.filename.startswith("xl/worksheets/sheet"):
+                data, count = re.subn(rb"<dimension ref=\"[^\"]*\"\s*/>", f'<dimension ref="{ref}"/>'.encode(), data)
+                assert count == 1
+            target.writestr(item, data)
+    return output.getvalue()
+
+
+@pytest.mark.parametrize("ref", ["A1", "A1:B2"])
+def test_a_stale_dimension_record_does_not_cut_the_sheet(ref: str) -> None:
+    raw = _with_dimension(_xlsx([["Account", "Amount", "Note"], ["Rent", 4500, "monthly"], ["Payroll", 12000, "biweekly"]]), ref)
+
+    sheet = spreadsheets.read_workbook(raw, "xlsx").sheets[0]
+
+    assert sheet.rows == [["Account", "Amount", "Note"], ["Rent", "4500", "monthly"], ["Payroll", "12000", "biweekly"]]
+    assert (sheet.total_rows, sheet.total_cols) == (3, 3)
+    assert sheet.warnings == []
+
+
+def test_a_chart_sheet_is_listed_but_not_read_and_the_data_still_is() -> None:
+    from openpyxl.chart import BarChart, Reference
+
+    workbook = Workbook()
+    data = workbook.active
+    data.title = "Data"
+    data.append(["Month", "Sales"])
+    data.append(["Jan", 100])
+    chart = BarChart()
+    chart.add_data(Reference(data, min_col=2, min_row=1, max_row=2), titles_from_data=True)
+    chart_sheet = workbook.create_chartsheet("Chart")
+    chart_sheet.add_chart(chart)
+    raw = BytesIO()
+    workbook.save(raw)
+
+    parsed = spreadsheets.read_workbook(raw.getvalue(), "xlsx")
+
+    assert parsed.sheet_names == ["Data", "Chart"]
+    assert [sheet.name for sheet in parsed.sheets] == ["Data"]
+    assert parsed.sheets[0].rows == [["Month", "Sales"], ["Jan", "100"]]
+
+
+def test_a_count_past_the_ceiling_is_reported_as_a_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(spreadsheets, "_COUNT_CEILING", 10)
+    raw = _xlsx([["n"]] + [[index] for index in range(1, 30)])
+
+    sheet = spreadsheets.read_workbook(raw, "xlsx", limits=spreadsheets.Limits(rows=5)).sheets[0]
+
+    assert sheet.count_capped is True
+    assert sheet.total_rows == 10
+    assert sheet.warnings == ["Only the first 5 of more than 10 rows were included."]
+    assert spreadsheets.preview_payload(spreadsheets.Workbook(kind="xlsx", sheet_names=["a"], sheets=[sheet]))["sheets"][0]["count_capped"] is True
+
+
+def test_a_csv_that_starts_with_the_letters_pk_is_still_a_csv() -> None:
+    raw = b"PK,Name,Amount\n1,Rent,500\n"
+
+    assert spreadsheets.sniff_kind(raw, declared_content_type="text/csv", file_name="pk.csv") == "csv"
+    assert spreadsheets.read_workbook(raw, file_name="pk.csv").sheets[0].rows[0] == ["PK", "Name", "Amount"]
+
+
+def test_an_array_formula_shows_its_text_not_an_object() -> None:
+    from openpyxl.worksheet.formula import ArrayFormula
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append([1, 2])
+    sheet["C1"] = ArrayFormula("C1:C1", "=SUM(A1:B1)")
+    raw = BytesIO()
+    workbook.save(raw)
+
+    parsed = spreadsheets.read_workbook(raw.getvalue(), "xlsx")
+
+    assert parsed.sheets[0].rows[0] == ["1", "2", "=SUM(A1:B1)"]
+    assert "ArrayFormula" not in json_dumps(parsed.sheets[0].rows)
+
+
+def json_dumps(value: object) -> str:
+    import json
+
+    return json.dumps(value, default=str)
+
+
+def test_an_html_export_declared_as_excel_is_not_a_csv() -> None:
+    raw = b"<html><body><table><tr><td>Revenue</td><td>100</td></tr></table></body></html>"
+
+    assert spreadsheets.sniff_kind(raw, declared_content_type="application/vnd.ms-excel", file_name="export.xls") is None
+    with pytest.raises(spreadsheets.SpreadsheetError) as exc:
+        spreadsheets.read_workbook(raw, declared_content_type="application/vnd.ms-excel", file_name="export.xls")
+    assert exc.value.code == "not_a_workbook"
+
+
+def test_a_utf8_sample_cut_inside_a_character_still_sniffs_as_csv() -> None:
+    line = "José,Payee,1200\n".encode()
+    raw = b"Name,Who,Amount\n" + line * (8192 // len(line) + 2)
+    # make the 8192nd byte land inside the two-byte "é"
+    cut = raw[:8192]
+    while True:
+        try:
+            cut.decode("utf-8")
+        except UnicodeDecodeError:
+            break
+        raw = b"x" + raw
+        cut = raw[:8192]
+
+    assert detect_document_content_type(raw, "application/vnd.ms-excel") == "text/csv"
+
+
+def test_a_cp1252_csv_declared_as_excel_is_read_as_csv_not_sent_to_xlrd() -> None:
+    raw = "Name,Amount\nJosé,1200\n".encode("cp1252")
+    content: list[dict] = []
+    skipped: list[dict] = []
+
+    added, _pages, _chars = _append_review_file_content(
+        content=content,
+        skipped=skipped,
+        blocked_files=[],
+        file=_file("export.csv"),
+        raw=raw,
+        content_type="application/vnd.ms-excel",
+        attached_pdf_pages=0,
+        spreadsheet_text_chars=0,
+    )
+
+    assert added is True
+    assert content[0]["text"].startswith("CSV file")
+    assert "Jos" in content[0]["text"]
+    assert skipped == []
+
+
+def test_pdf_bytes_under_a_csv_name_are_attached_as_a_pdf() -> None:
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    output = BytesIO()
+    writer.write(output)
+    content: list[dict] = []
+    skipped: list[dict] = []
+
+    added, pages, _chars = _append_review_file_content(
+        content=content,
+        skipped=skipped,
+        blocked_files=[],
+        file=_file("statement.csv"),
+        raw=output.getvalue(),
+        content_type="text/csv",
+        attached_pdf_pages=0,
+        spreadsheet_text_chars=0,
+    )
+
+    assert added is True
+    assert pages == 1
+    assert content[0]["text"].startswith("PDF file")
+    assert not any(block.get("text", "").startswith("CSV file") for block in content)
+
+
+def test_a_skip_written_by_the_current_reader_is_not_reopened() -> None:
+    old = SimpleNamespace(status="skipped", skip_reason="spreadsheet_parse_failed", analysis=None)
+    current = SimpleNamespace(
+        status="skipped", skip_reason="spreadsheet_parse_failed", analysis={"spreadsheet_reader": spreadsheets.READER_VERSION}
+    )
+
+    assert _spreadsheet_skip_still_applies(old, content_type="application/octet-stream", file_name="broken.xlsx") is False
+    assert _spreadsheet_skip_still_applies(current, content_type="application/octet-stream", file_name="broken.xlsx") is True
+
+
+def test_the_preview_reads_with_the_ai_bounds() -> None:
+    from app.services import bucket_ai
+
+    assert spreadsheets.PREVIEW_LIMITS.sheets == bucket_ai._SPREADSHEET_LIMITS.sheets == bucket_ai.MAX_SPREADSHEET_SHEETS
+    assert spreadsheets.PREVIEW_LIMITS.rows == bucket_ai._SPREADSHEET_LIMITS.rows == bucket_ai.MAX_SPREADSHEET_ROWS
+    assert spreadsheets.PREVIEW_LIMITS.cols == bucket_ai._SPREADSHEET_LIMITS.cols == bucket_ai.MAX_SPREADSHEET_COLS
+    assert spreadsheets.PREVIEW_LIMITS.cell_chars == bucket_ai.MAX_CELL_CHARS
+    assert spreadsheets.PREVIEW_LIMITS.formulas == 0
+    assert bucket_ai.MAX_DOCX_TEXT_CHARS == 24000
