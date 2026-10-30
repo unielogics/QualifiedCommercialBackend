@@ -205,7 +205,7 @@ def analysis_usability(analysis: BucketFileAnalysis | None) -> str:
     if analysis.status == "failed":
         return "needs_review"
     if analysis.status == "skipped":
-        return "needs_replacement" if analysis.skip_reason in {"password_protected", "pdf_text_unavailable", "legacy_spreadsheet_unsupported"} else "needs_review"
+        return "needs_replacement" if analysis.skip_reason in {"password_protected", "pdf_text_unavailable", "legacy_spreadsheet_unsupported", "spreadsheet_locked", "legacy_office_unsupported"} else "needs_review"
     if getattr(analysis, "classification", None) == "unreadable":
         return "needs_replacement"
     detail = getattr(analysis, "analysis", None) or {}

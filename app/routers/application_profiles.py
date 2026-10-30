@@ -4872,11 +4872,22 @@ async def get_application_evidence_file_url(
             "code": "evidence_source_changed",
             "message": "The cited document version changed. Review the current source before relying on this reference.",
         })
-    from app.routers.buckets import _download_url
+    from starlette.concurrency import run_in_threadpool
+
+    from app.routers.buckets import _download_url, _sheet_preview_payload
 
     await profiles.log_profile_action(db, profile, user, "evidence.preview", f"Opened {file.file_name}", target_type="file", target_id=file.id)
     await db.commit()
-    return {"url": _download_url(file.s3_key, file_name=file.file_name, disposition="inline", content_type=file.content_type), "expires_in": 900}
+    # Spreadsheets also come back as parsed sheets so the evidence workspace
+    # can show the rows the AI read instead of forcing a download.
+    result: dict = {
+        "url": _download_url(file.s3_key, file_name=file.file_name, disposition="inline", content_type=file.content_type),
+        "expires_in": 900,
+    }
+    sheets = await run_in_threadpool(_sheet_preview_payload, file)
+    if sheets is not None:
+        result["sheets"] = sheets
+    return result
 
 
 def _classification_dict(profile: ApplicationProfile) -> dict:

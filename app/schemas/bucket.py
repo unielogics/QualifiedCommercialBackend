@@ -382,10 +382,38 @@ class BucketFileAnnotationRead(ORMModel):
     updated_at: datetime
 
 
+class BucketSheetPreviewRead(BaseModel):
+    name: str
+    rows: list[list[str]]
+    total_rows: int
+    total_cols: int
+    truncated_rows: bool = False
+    truncated_cols: bool = False
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BucketFileSheetsRead(BaseModel):
+    """A spreadsheet's visible sheets as rows, parsed server-side by the same
+    reader the AI analysis uses, so the review screen shows what the AI saw.
+    When the file could not be read, `error_code` says why (locked,
+    not_a_workbook, empty, parse_failed) and `sheets` is empty."""
+
+    kind: str | None = None
+    sheet_names: list[str] = Field(default_factory=list)
+    sheets: list[BucketSheetPreviewRead] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    encoding: str | None = None
+    delimiter: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
 class BucketFileReviewRead(BaseModel):
     file: BucketFileRead
     preview_url: str | None
     annotations: list[BucketFileAnnotationRead]
+    # Present only for .xlsx / .xls / .csv files (by name or stored type).
+    sheets: BucketFileSheetsRead | None = None
 
 
 class BucketShareCreate(BaseModel):

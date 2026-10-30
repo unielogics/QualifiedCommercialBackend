@@ -33,7 +33,9 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, with_loader_criteria
 from sqlalchemy.orm.attributes import set_committed_value
+from starlette.concurrency import run_in_threadpool
 
+import app.services.spreadsheets as spreadsheets
 from app.config import get_settings
 from app.db import get_db
 from app.dealer_os.models import DealerBusiness
@@ -83,6 +85,7 @@ from app.schemas.bucket import (
     BucketFileAnnotationRead,
     BucketFileRead,
     BucketFileReviewRead,
+    BucketFileSheetsRead,
     BucketFileUploadInit,
     BucketFileUploadInitResponse,
     BucketFileUrl,
@@ -736,6 +739,69 @@ def _review_response(file: BucketFile, annotations: list[BucketFileAnnotation], 
         ) if preview else None,
         annotations=[BucketFileAnnotationRead.model_validate(annotation) for annotation in annotations],
     )
+
+
+# Spreadsheets larger than this are not parsed for preview; the file stays
+# downloadable and the AI path has its own bound.
+MAX_SHEET_PREVIEW_BYTES = 10 * 1024 * 1024
+
+
+def _sheet_preview_payload(file: BucketFile) -> dict | None:
+    """Rows of a spreadsheet for the review screen, or None for other files.
+
+    Synchronous on purpose (boto3 + openpyxl/xlrd); callers run it in a
+    thread. Reads the stored object, never the browser-declared type: .xlsx
+    is often stored as application/octet-stream.
+    """
+
+    if not spreadsheets.is_spreadsheet_name(file.file_name, file.content_type):
+        return None
+    if file.size_bytes and file.size_bytes > MAX_SHEET_PREVIEW_BYTES:
+        return {
+            "error_code": "too_large",
+            "error_message": "This spreadsheet is too large to preview here. Download it to open it.",
+        }
+    bucket, _, _ = _bucket_storage_config()
+    params: dict[str, str] = {"Bucket": bucket, "Key": file.s3_key}
+    version_id = getattr(file, "s3_version_id", None)
+    if version_id:
+        params["VersionId"] = version_id
+    try:
+        raw = _s3_client().get_object(**params)["Body"].read(MAX_SHEET_PREVIEW_BYTES + 1)
+    except Exception as exc:  # noqa: BLE001 - storage trouble is reported, not raised
+        logger.warning("sheet preview: could not read file=%s: %s", file.id, exc)
+        return {"error_code": "unavailable", "error_message": "The file could not be read from storage right now."}
+    if len(raw) > MAX_SHEET_PREVIEW_BYTES:
+        return {
+            "error_code": "too_large",
+            "error_message": "This spreadsheet is too large to preview here. Download it to open it.",
+        }
+    try:
+        workbook = spreadsheets.read_workbook(
+            raw,
+            limits=spreadsheets.PREVIEW_LIMITS,
+            declared_content_type=file.content_type or "",
+            file_name=file.file_name,
+        )
+    except spreadsheets.SpreadsheetError as exc:
+        return {"error_code": exc.code, "error_message": exc.message}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sheet preview: parse failed file=%s: %s", file.id, exc)
+        return {"error_code": "parse_failed", "error_message": "The spreadsheet could not be parsed."}
+    return spreadsheets.preview_payload(workbook)
+
+
+async def _review_with_sheets(
+    file: BucketFile, annotations: list[BucketFileAnnotation], *, preview: bool = True
+) -> BucketFileReviewRead:
+    """The review response, plus parsed sheets when the file is a spreadsheet."""
+
+    response = _review_response(file, annotations, preview=preview)
+    if preview:
+        payload = await run_in_threadpool(_sheet_preview_payload, file)
+        if payload is not None:
+            response.sheets = BucketFileSheetsRead.model_validate(payload)
+    return response
 
 
 def _share_read(share: BucketShare, *, passcode: str | None = None) -> BucketShareRead:
@@ -2971,7 +3037,7 @@ async def admin_file_review(
     annotations = await _file_annotations(db, bucket_id, file_id)
     await _log(db, bucket_id, "file_review_opened", request=request, user=user, target_type="file", target_id=str(file.id), detail=file.file_name)
     await db.commit()
-    return _review_response(file, annotations)
+    return await _review_with_sheets(file, annotations)
 
 
 @router.post("/admin/{bucket_id}/files/{file_id}/annotations", response_model=BucketFileAnnotationRead)
@@ -3203,7 +3269,7 @@ async def vendor_file_review(
     annotations = await _file_annotations(db, bucket_id, file_id)
     await _log(db, bucket_id, "vendor_file_previewed", request=request, user=user, actor_role="vendor", target_type="file", target_id=str(file.id), detail=file.file_name)
     await db.commit()
-    return _review_response(file, annotations, preview=True)
+    return await _review_with_sheets(file, annotations, preview=True)
 
 
 @router.post("/vendor/{bucket_id}/files/{file_id}/download", response_model=BucketFileUrl)
@@ -4206,7 +4272,7 @@ async def shared_file_review(
     annotations = await _file_annotations(db, share.bucket_id, file_id)
     await _log(db, share.bucket_id, "shared_file_review_opened", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="file", target_id=str(file.id), detail=file.file_name)
     await db.commit()
-    return _review_response(file, annotations, preview=share.can_preview)
+    return await _review_with_sheets(file, annotations, preview=share.can_preview)
 
 
 @router.post("/share/{token}/files/{file_id}/download", response_model=BucketFileUrl)

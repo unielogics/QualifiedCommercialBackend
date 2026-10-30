@@ -1023,3 +1023,38 @@ async def test_evidence_inventory_omits_preview_resolvers_for_non_staff() -> Non
         result = await get_application_evidence(profile_id, user, SimpleNamespace())
 
     assert result.files[0].preview_url is None
+
+
+@pytest.mark.asyncio
+async def test_evidence_file_url_carries_parsed_sheets_for_a_spreadsheet() -> None:
+    profile_id = uuid4()
+    file_id = uuid4()
+    file = SimpleNamespace(
+        id=file_id,
+        file_name="debt_schedule.xlsx",
+        s3_key="private/evidence/debt_schedule.xlsx",
+        content_type="application/octet-stream",
+        status="uploaded",
+        deleted_at=None,
+        content_hash=None,
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=file), commit=AsyncMock())
+    user = SimpleNamespace(id=uuid4(), role=Role.LOAN_EXEC)
+    parsed = {"kind": "xlsx", "sheet_names": ["Debts"], "sheets": [{"name": "Debts", "rows": [["Lender", "Balance"]], "total_rows": 1, "total_cols": 2}], "warnings": []}
+
+    with (
+        patch("app.routers.application_profiles.profiles.load_profile", AsyncMock(return_value=SimpleNamespace(id=profile_id))),
+        patch(
+            "app.routers.application_profiles.profiles.evidence_state",
+            AsyncMock(return_value=SimpleNamespace(files=[SimpleNamespace(id=file_id)])),
+        ),
+        patch("app.routers.application_profiles.profiles.log_profile_action", AsyncMock()),
+        patch("app.routers.buckets._download_url", return_value="https://storage.example/signed"),
+        patch("app.routers.buckets._sheet_preview_payload", return_value=parsed) as preview,
+    ):
+        result = await get_application_evidence_file_url(profile_id, file_id, user, db)
+
+    assert result["sheets"] == parsed
+    assert result["url"] == "https://storage.example/signed"
+    preview.assert_called_once_with(file)
+
