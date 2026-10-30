@@ -86,6 +86,16 @@ class Bucket(TimestampMixin, Base):
             "name_sync_mode IN ('linked','custom')",
             name="ck_buckets_name_sync_mode",
         ),
+        # One vocabulary for what kind of room this is. Free text here once held
+        # a partner's name as a "type"; operator_files derives the vertical from
+        # these values, so each keeps its substring (main_street, mca, dealer).
+        CheckConstraint(
+            "bucket_type IS NULL OR bucket_type IN ("
+            "'general','loan_file','underwriting','application_profile',"
+            "'dealer_ai_intake','main_street_intake','real_estate_ai_intake',"
+            "'mca_refinance_intake','commercial_foreclosure_rescue','business_capital_referral')",
+            name="ck_buckets_bucket_type",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

@@ -9970,7 +9970,7 @@ async def _persist_appointment_intake_classification(
     ).scalar_one_or_none()
     if profile is not None:
         profile.vertical = application_vertical_for(lead_type)
-        profile.funding_category = funding_intent
+        profile.funding_category = application_profile_service.canonical_funding_category(funding_intent)
 
 
 async def _start_rep_appointment_application(

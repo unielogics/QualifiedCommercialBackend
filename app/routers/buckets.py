@@ -1063,7 +1063,7 @@ async def _attach_bucket_file_links(db: AsyncSession, buckets: list[Bucket]) -> 
             intake.bucket_id,
             BucketLinkedFileRead(
                 id=intake.id,
-                kind="AI intake",
+                kind="File",
                 label=intake.business_name or intake.full_name,
                 reference=str(intake.id)[:8],
                 email=intake.email,

@@ -107,7 +107,8 @@ async def _intakes_without_files(db: AsyncSession, now: datetime) -> list[Attent
     items: list[AttentionItem] = []
     for intake, profile_id in rows:
         age = _age_days(intake.created_at, now)
-        sent_at = _resume_sent_at(getattr(intake, "intake_state", None))
+        # The column is authoritative once written; older intakes only have the audit JSON.
+        sent_at = getattr(intake, "last_link_sent_at", None) or _resume_sent_at(getattr(intake, "intake_state", None))
         sent_text = f"link sent {_age_days(sent_at, now)}d ago" if sent_at else "no link delivery recorded"
         items.append(
             AttentionItem(

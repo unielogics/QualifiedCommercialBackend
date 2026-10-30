@@ -814,6 +814,11 @@ def _canonical_funding_category(value: object | None) -> str | None:
         return str(value).strip() or None if value is not None else None
 
 
+# The one rule every writer of funding_category applies; exported for routers
+# outside this module so the column stays one vocabulary.
+canonical_funding_category = _canonical_funding_category
+
+
 def _split_name(name: str) -> tuple[str, str]:
     parts = name.strip().split(None, 1)
     return (parts[0] if parts else "", parts[1] if len(parts) > 1 else "")
@@ -1104,21 +1109,21 @@ async def resolve_profile(
             profile.deal_id = source.id
             profile.client_id = source.client_id
             profile.vertical = "real_estate"
-            profile.funding_category = source.deal_type
+            profile.funding_category = _canonical_funding_category(source.deal_type)
         elif isinstance(source, Loan):
             profile.loan_id = source.id
             profile.client_id = source.client_id
             profile.vertical = "mca" if "mca" in str(source.type).lower() else "real_estate"
-            profile.funding_category = str(source.type)
+            profile.funding_category = _canonical_funding_category(str(source.type))
             profile.entity_type = str(source.entity_type) if source.entity_type else None
         elif isinstance(source, PublicUnderwritingIntake):
             profile.intake_id = source.id
             profile.client_id = source.client_id
             profile.primary_bucket_id = source.bucket_id
             profile.vertical = _vertical_for_intake(source)
-            profile.funding_category = (source.intake_state or {}).get(
-                "funding_intent"
-            ) or source.loan_purpose
+            profile.funding_category = _canonical_funding_category(
+                (source.intake_state or {}).get("funding_intent") or source.loan_purpose
+            )
             detail = (source.intake_state or {}).get("main_street_details") or {}
             profile.industry = detail.get("industry")
         else:

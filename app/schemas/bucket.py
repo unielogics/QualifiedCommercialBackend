@@ -115,7 +115,11 @@ class BucketRequestedDocumentRead(ORMModel):
 
 class BucketCreate(BaseModel):
     name: str = Field(min_length=1, max_length=180)
-    bucket_type: str | None = Field(default=None, max_length=80)
+    bucket_type: str | None = Field(
+        default=None,
+        max_length=80,
+        pattern=r"^(general|loan_file|underwriting|application_profile|dealer_ai_intake|main_street_intake|real_estate_ai_intake|mca_refinance_intake|commercial_foreclosure_rescue|business_capital_referral)$",
+    )
     client_name: str | None = Field(default=None, max_length=180)
     purpose: str | None = Field(default=None, max_length=255)
     description: str | None = None
@@ -123,7 +127,11 @@ class BucketCreate(BaseModel):
 
 class BucketUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=180)
-    bucket_type: str | None = Field(default=None, max_length=80)
+    bucket_type: str | None = Field(
+        default=None,
+        max_length=80,
+        pattern=r"^(general|loan_file|underwriting|application_profile|dealer_ai_intake|main_street_intake|real_estate_ai_intake|mca_refinance_intake|commercial_foreclosure_rescue|business_capital_referral)$",
+    )
     client_name: str | None = Field(default=None, max_length=180)
     purpose: str | None = Field(default=None, max_length=255)
     description: str | None = None

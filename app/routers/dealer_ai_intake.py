@@ -1850,6 +1850,10 @@ async def _record_resume_email(
     state["resume_email"] = record
     state["resume_email_deliveries"] = deliveries[-10:]
     intake.intake_state = state
+    # The queue reads these columns; the JSON stays the full delivery audit.
+    intake.last_link_sent_at = _now()
+    intake.last_link_status = result.detail
+    intake.last_link_kind = "resume"
     return record
 
 
@@ -1894,6 +1898,10 @@ def _record_login_code_email(
     state["dealer_login_email"] = record
     state["dealer_login_email_deliveries"] = deliveries[-10:]
     intake.intake_state = state
+    # The queue reads these columns; the JSON stays the full delivery audit.
+    intake.last_link_sent_at = _now()
+    intake.last_link_status = result.detail
+    intake.last_link_kind = "login"
     return record
 
 
@@ -9818,6 +9826,8 @@ async def admin_restore_lead(
     archive_meta = state.pop("_archive", {})
     prior_status = archive_meta.get("bucket_status") if isinstance(archive_meta, dict) else None
     intake.intake_state = state
+    intake.archived_at = None
+    intake.archived_by_user_id = None
     intake.bucket.archived_at = None
     intake.bucket.status = (
         prior_status
@@ -9984,6 +9994,8 @@ async def admin_confirm_lead_deletion(
         "archived_by_user_id": str(user.id),
     }
     intake.intake_state = state
+    intake.archived_at = archived_at
+    intake.archived_by_user_id = user.id
     intake.bucket.archived_at = archived_at
     intake.bucket.status = "archived"
     revoked_access_count = await bucket_archive.revoke_external_access(

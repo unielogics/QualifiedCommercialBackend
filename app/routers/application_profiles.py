@@ -166,6 +166,7 @@ from app.schemas.use_of_funds import (
     UseOfFundsRoomAccess,
     UseOfFundsRoomPatch,
 )
+from app.services.application_profiles import canonical_funding_category
 from app.services import application_profiles as profiles
 from app.services import (
     application_programs,
@@ -4971,6 +4972,10 @@ async def confirm_application_classification(
         raise HTTPException(status.HTTP_409_CONFLICT, "Classification changed; review the latest values before confirming")
     before = _classification_dict(profile)
     values = await _validated_classification(db, profile, ClassificationPatch(**payload.model_dump(exclude={"expected_revision"})))
+    # The same rule every other writer applies, so the panel can send a label
+    # and the column still holds one vocabulary.
+    if values.get("funding_category") is not None:
+        values["funding_category"] = canonical_funding_category(values["funding_category"])
     for key, value in values.items():
         setattr(profile, key, value)
     profile.classification_revision += 1

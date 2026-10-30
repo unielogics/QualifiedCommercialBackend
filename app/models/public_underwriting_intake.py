@@ -101,6 +101,17 @@ class PublicUnderwritingIntake(TimestampMixin, Base):
     result_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Promoted out of intake_state so they can be queried: when the file was
+    # archived and by whom, and when the client was last sent a way in. The
+    # JSON audit entries remain the full record; these are the facts the desk
+    # queue and the directory need without parsing it.
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    archived_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    last_link_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_link_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_link_kind: Mapped[str | None] = mapped_column(String(24), nullable=True)
     # Two-step archive: a broker (or admin) flags a lead here, which only hides
     # it from the broker's own list. A separate operator confirmation then
     # soft-archives the bucket while retaining the intake, files, S3 objects,
