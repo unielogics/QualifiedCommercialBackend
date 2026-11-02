@@ -43,9 +43,14 @@ _EXTERNAL_PRODUCT_ROLES = {Role.CLIENT, Role.DEALER}
 # the way it does for a field rep.
 # ---------------------------------------------------------------------------
 
-CONSOLE_KEYS: frozenset[str] = frozenset({"funding", "field_desk", "audit"})
-CONSOLE_ORDER: tuple[str, ...] = ("funding", "field_desk", "audit")
-CONSOLE_LABELS: dict[str, str] = {"funding": "Funding", "field_desk": "Field Desk", "audit": "Audit"}
+CONSOLE_KEYS: frozenset[str] = frozenset({"funding", "field_desk", "audit", "capital"})
+CONSOLE_ORDER: tuple[str, ...] = ("funding", "field_desk", "audit", "capital")
+CONSOLE_LABELS: dict[str, str] = {
+    "funding": "Funding",
+    "field_desk": "Field Desk",
+    "audit": "Audit",
+    "capital": "Capital Partners",
+}
 # The roles that live in the operator consoles at all.
 OPERATOR_CONSOLE_ROLES: frozenset[Role] = frozenset(
     {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.REGIONAL_MANAGER, Role.BROKER, Role.FIELD_REP}
@@ -59,6 +64,9 @@ _INHERITED_CONSOLES: dict[Role, frozenset[str]] = {
     # A field rep already reaches audit. (assigned_product_values below); the
     # Team table used to pretend otherwise.
     Role.FIELD_REP: frozenset({"field_desk", "audit"}),
+    # A capital partner lives in the member portal and nowhere else. Operators
+    # inherit the console through _ALL_CONSOLES so they can preview it.
+    Role.CAPITAL_PARTNER: frozenset({"capital"}),
 }
 # What a super admin may toggle per role, beyond what the role inherits.
 # Audit is never a standalone grant for a broker: it arrives with Field Desk
@@ -121,6 +129,8 @@ def enterable_console_keys(user: Any) -> set[str]:
     role = getattr(user, "role", None)
     if role in OPERATOR_CONSOLE_ROLES:
         return set(console_keys(user))
+    if role == Role.CAPITAL_PARTNER:
+        return {"capital"}
     if role in _EXTERNAL_PRODUCT_ROLES:
         return set(enabled_product_values(user)) & CONSOLE_KEYS
     return {"funding"}
@@ -130,7 +140,12 @@ def console_links(user: Any) -> list[dict[str, str]]:
     """What the switcher renders: the consoles this login may enter, in fixed
     order, with the URLs from Settings. No frontend carries a host literal."""
     settings = get_settings()
-    urls = {"funding": settings.frontend_app_url, "field_desk": settings.rep_app_url, "audit": settings.audit_app_url}
+    urls = {
+        "funding": settings.frontend_app_url,
+        "field_desk": settings.rep_app_url,
+        "audit": settings.audit_app_url,
+        "capital": settings.capital_app_url,
+    }
     allowed = enterable_console_keys(user)
     return [{"key": k, "label": CONSOLE_LABELS[k], "url": urls[k].rstrip("/")} for k in CONSOLE_ORDER if k in allowed]
 

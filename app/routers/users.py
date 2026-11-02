@@ -59,6 +59,7 @@ TEAM_INVITABLE_ROLES: frozenset[Role] = frozenset(
         Role.FIELD_REP,
         Role.DEALER_PARTNER,
         Role.PROFESSIONAL_REFERRAL_PARTNER,
+        Role.CAPITAL_PARTNER,
     }
 )
 
@@ -469,6 +470,8 @@ def _invite_landing(role: Role) -> str | None:
         return f"{settings.rep_app_url.rstrip('/')}/sign-in"
     if role == Role.DEALER:
         return f"{settings.audit_app_url.rstrip('/')}/sign-in"
+    if role == Role.CAPITAL_PARTNER:
+        return f"{settings.capital_app_url.rstrip('/')}/sign-in"
     return None
 
 

@@ -12,7 +12,8 @@
       ],
       "AllowedOrigins": [
         "https://app.qualifiedcommercial.com",
-        "https://rep.qualifiedcommercial.com"
+        "https://rep.qualifiedcommercial.com",
+        "https://capital.qualifiedcommercial.com"
       ],
       "ExposeHeaders": [
         "ETag",

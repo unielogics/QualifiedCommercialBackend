@@ -29,6 +29,11 @@ class Role(StrEnum):
     # role: a rep is scoped to DealerBusiness.owner_user_id == their id and
     # never sees another rep's book.
     FIELD_REP = "field_rep"
+    # Capital partner (capital.qualifiedcommercial.com) — an accredited private
+    # investor or family office in the loan-participation program. External:
+    # the login opens the Capital Partners console only, and the API admits it
+    # to /api/v1/capital and nothing else (deps._enforce_external_product_boundary).
+    CAPITAL_PARTNER = "capital_partner"
 
 
 class ProductAccountType(StrEnum):

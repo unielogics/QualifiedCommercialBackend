@@ -192,6 +192,22 @@ def _profile_from_clerk(payload: dict, clerk_user: dict | None, clerk_id: str) -
     return email, name
 
 
+# A self-service sign-up may ask for exactly one thing: to be provisioned into
+# an external console that sees nothing until an operator approves it. Clerk's
+# unsafe_metadata is client-settable, which is why this can never choose an
+# operator role — only the capital-partner portal, where a new member is a
+# pending row behind an accreditation review and a waiting period.
+_SIGNUP_CONSOLES = frozenset({"capital"})
+
+
+def _signup_console_from_clerk(clerk_user: dict | None) -> str | None:
+    if not clerk_user:
+        return None
+    meta = clerk_user.get("unsafe_metadata") or {}
+    value = meta.get("console") if isinstance(meta, dict) else None
+    return value if value in _SIGNUP_CONSOLES else None
+
+
 def _configured_primary_super_admin_emails() -> set[str]:
     settings = get_settings()
     raw = ",".join(
@@ -404,6 +420,28 @@ async def _resolve_current_user(
             user = invited
             await db.flush()
             log.info("Bound invited row to clerk_id=%s for %s (role=%s)", clerk_id, email, user.role)
+        elif _signup_console_from_clerk(clerk_user) == "capital":
+            # Capital Partners portal sign-up (capital.qualifiedcommercial.com).
+            # The person becomes a pending member of the loan-participation
+            # program, never a borrower: no Client row, no funding book, and the
+            # API admits the login to /api/v1/capital only (see
+            # _enforce_external_product_boundary). Offerings stay hidden until a
+            # super admin approves the accreditation questionnaire and the
+            # waiting period has run.
+            from app.capital_partners.services.members import ensure_member_for_user
+
+            user = User(clerk_id=clerk_id, email=email, name=name, role=Role.CAPITAL_PARTNER)
+            db.add(user)
+            await db.flush()
+            await ensure_member_for_user(db, user, display_name=name)
+            user = (
+                await db.execute(
+                    select(User)
+                    .options(_with_client, _with_broker, _with_product_access)
+                    .where(User.id == user.id)
+                )
+            ).scalar_one()
+            log.info("Auto-provisioned capital partner clerk_id=%s email=%s", clerk_id, email)
         else:
             user = User(clerk_id=clerk_id, email=email, name=name, role=Role.CLIENT)
             db.add(user)
@@ -650,6 +688,7 @@ def _enforce_account_active(user: User, request: Request) -> None:
     )
 
 
+_CAPITAL_API_PREFIXES = ("/api/v1/capital",)
 _AUDIT_EXTERNAL_API_PREFIXES = (
     "/api/v1/dealer-os",
     "/api/v1/application-profiles",
@@ -668,6 +707,22 @@ def _enforce_external_product_boundary(user: User, request: Request) -> None:
     existing Client/DealerBusiness ownership scopes.
     """
 
+    if user.role == Role.CAPITAL_PARTNER:
+        # The member portal's API and nothing else. Default-deny, like the
+        # audit boundary below: a route that does not know this role would
+        # otherwise fall through to whatever its scoping helper returns.
+        path = request.url.path.rstrip("/") or "/"
+        if path.endswith("/auth/me") or any(
+            path == prefix or path.startswith(f"{prefix}/") for prefix in _CAPITAL_API_PREFIXES
+        ):
+            return
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "product_access_required",
+                "message": "This login opens the Capital Partners portal only.",
+            },
+        )
     if user.role not in {Role.CLIENT, Role.DEALER}:
         return
     path = request.url.path.rstrip("/") or "/"
