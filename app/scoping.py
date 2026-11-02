@@ -42,6 +42,7 @@ _NO_FUNDING_BOOK = frozenset({
     Role.PROFESSIONAL_REFERRAL_PARTNER,
     Role.DEALER,
     Role.FIELD_REP,
+    Role.CAPITAL_PARTNER,
 })
 
 

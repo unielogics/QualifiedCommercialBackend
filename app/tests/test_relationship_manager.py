@@ -196,7 +196,7 @@ async def test_auth_me_says_when_a_phone_is_still_needed():
         patch(
             "app.services.user_access.get_settings",
             return_value=SimpleNamespace(
-                frontend_app_url="https://f", rep_app_url="https://r", audit_app_url="https://a"
+                frontend_app_url="https://f", rep_app_url="https://r", audit_app_url="https://a", capital_app_url="https://c"
             ),
         ),
     ):
@@ -236,7 +236,7 @@ async def test_auth_me_lists_the_consoles_a_login_may_enter():
     from app.services import user_acknowledgment as ack
 
     settings = SimpleNamespace(
-        frontend_app_url="https://f/", rep_app_url="https://r", audit_app_url="https://a"
+        frontend_app_url="https://f/", rep_app_url="https://r", audit_app_url="https://a", capital_app_url="https://c"
     )
     with (
         patch("app.routers.auth.account_types", return_value=[]),
@@ -276,8 +276,7 @@ async def test_auth_me_lists_the_consoles_a_login_may_enter():
         assert [c.key for c in (await me(sa, SimpleNamespace())).consoles] == [
             "funding",
             "field_desk",
-            "audit",
-        ]
+            "audit", "capital"]
         sa.account_status = "suspended"
         assert (await me(sa, SimpleNamespace())).consoles == []
 
@@ -286,7 +285,7 @@ def test_the_invite_lands_on_the_console_the_role_works_in():
     from app.routers import users as users_router
 
     settings = SimpleNamespace(
-        frontend_app_url="https://f", rep_app_url="https://r/", audit_app_url="https://a"
+        frontend_app_url="https://f", rep_app_url="https://r/", audit_app_url="https://a", capital_app_url="https://c"
     )
     with patch.object(users_router, "get_settings", return_value=settings):
         assert users_router._invite_landing(Role.FIELD_REP) == "https://r/sign-in"
@@ -407,7 +406,7 @@ def test_the_migration_chain_has_one_head():
     from alembic.script import ScriptDirectory
 
     heads = ScriptDirectory.from_config(Config("alembic.ini")).get_heads()
-    assert heads == ["0245_intake_operational_columns"]
+    assert heads == ["0246_cp_core"]
     assert all(len(head) <= 32 for head in heads)
 
 

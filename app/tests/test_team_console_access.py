@@ -75,7 +75,7 @@ async def test_a_role_change_reaches_clerk_and_a_name_only_patch_does_not():
         assert sync.await_count == 0 and rec.call_count == 0
         await users_router.update_user(staffer.id, users_router.UserPatch(role=Role.LOAN_EXEC), _request(), db, current=_actor())
     assert sync.await_args.kwargs["role"] == Role.LOAN_EXEC
-    assert sync.await_args.kwargs["account_types"] == ["audit", "field_desk", "funding"]
+    assert sync.await_args.kwargs["account_types"] == ["audit", "capital", "field_desk", "funding"]
     assert rec.call_args.kwargs["before_state"]["role"] == "broker" and rec.call_args.kwargs["after_state"]["role"] == "loan_exec"
 
 

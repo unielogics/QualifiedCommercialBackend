@@ -10,6 +10,9 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
+from app.capital_partners import router_admin as capital_admin_router
+from app.capital_partners import router_member as capital_member_router
+from app.capital_partners import router_public as capital_public_router
 from app.config import get_settings
 from app.db import SessionLocal, transient_conflict_code
 from app.dealer_os import crm_router as dealer_os_crm_router
@@ -250,6 +253,9 @@ for r in [
     dealer_os_crm_router.router,
     dealer_os_prospect_router.router,
     dealer_os_prospect_outreach_router.router,
+    capital_public_router.router,
+    capital_member_router.router,
+    capital_admin_router.router,
     meta.router,
     funding_programs.public_router,
     business_capital.public_router,

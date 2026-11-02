@@ -23,11 +23,13 @@ class Settings(BaseSettings):
         "http://localhost:3000,http://localhost:8081,http://localhost:19006,"
         "https://qualifiedcommercial.com,https://www.qualifiedcommercial.com,"
         "https://app.qualifiedcommercial.com,https://agreement.qualifiedcommercial.com,"
-        "https://audit.qualifiedcommercial.com,https://rep.qualifiedcommercial.com"
+        "https://audit.qualifiedcommercial.com,https://rep.qualifiedcommercial.com,"
+        "https://capital.qualifiedcommercial.com"
     )
     frontend_app_url: str = "https://app.qualifiedcommercial.com"
     rep_app_url: str = "https://rep.qualifiedcommercial.com"
     audit_app_url: str = "https://audit.qualifiedcommercial.com"
+    capital_app_url: str = "https://capital.qualifiedcommercial.com"
     public_api_url: str = "https://api.qualifiedcommercial.com"
 
     # Clerk (auth)
