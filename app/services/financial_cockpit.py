@@ -41,6 +41,7 @@ from app.models.production_package import ProductionTermSheet
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.services import application_programs as programs
+from app.services import debt_types
 from app.services.bucket_evidence import (
     analysis_classifications,
     effective_file_classification,
@@ -1094,7 +1095,9 @@ def documented_debts(analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "is_mca": _num(row.get("factor_rate")) is not None
                 or frequency in {"daily", "weekly"}
                 or "advance" in kind
-                or "mca" in kind,
+                or "mca" in kind
+                # The schedule's own type, off a form-filed or AI-read row.
+                or debt_types.is_advance_type(row.get("debt_type") or row.get("category")),
                 "file_id": str(item.get("file_id") or ""),
                 "source": "document",
             }
@@ -2258,8 +2261,20 @@ def _debt_dicts(rows: list[DealerDebt]) -> list[dict[str, Any]]:
         "factor_rate",
         "payoff_amount",
         "vendor_key",
+        # The rest of the schedule row, so the cockpit shows what the PDF shows.
+        "payment_status",
+        "secured",
+        "collateral",
+        "originated_on",
+        "mca_modified",
+        "mca_modification_note",
     )
-    return [{field: getattr(row, field, None) for field in fields} for row in rows]
+    out = []
+    for row in rows:
+        item = {field: getattr(row, field, None) for field in fields}
+        item["category_label"] = debt_types.debt_type_label(item["category"]) or (item["category"] or "")
+        out.append(item)
+    return out
 
 
 async def current_term_sheet(db: AsyncSession, profile_id: uuid.UUID) -> ProductionTermSheet | None:

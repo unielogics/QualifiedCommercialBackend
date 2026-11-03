@@ -45,6 +45,7 @@ from typing import Any
 
 from app.services import business_statement_schema as bss
 from app.services import pfs_schema
+from app.services.debt_types import DEBT_TYPE_SLUGS, DEBT_TYPES
 from app.services.financial_statements import DEBT_COLUMN_LABELS, DEBT_COLUMNS
 
 LAYOUT_VERSION = "qc_sheets.v1"
@@ -122,8 +123,22 @@ _PFS_COUNT_COLUMNS = frozenset({"number_of_shares"})
 _DEBT_MONEY = frozenset({"original_amount", "balance", "monthly_payment"})
 _DEBT_DATES = frozenset({"originated_on", "maturity_on"})
 _DEBT_CHOICES: dict[str, tuple[str, ...]] = {
+    "debt_type": DEBT_TYPE_SLUGS,
     "secured": ("secured", "unsecured"),
     "payment_status": ("current", "delinquent"),
+    "mca_modified": ("yes", "no"),
+}
+#: What the grid and the workbook show for a choice whose stored value is a
+#: slug. The body keeps the slug; a person reads the label.
+_DEBT_OPTION_LABELS: dict[str, tuple[tuple[str, str], ...]] = {
+    "debt_type": DEBT_TYPES,
+    "mca_modified": (("yes", "Yes"), ("no", "No")),
+}
+#: Said beside the two advance cells, which the grid shows on every line but
+#: the save keeps only on a merchant cash advance or revenue-based advance.
+_DEBT_HINTS: dict[str, str] = {
+    "mca_modified": "Only for a merchant cash advance or revenue-based advance: did the funder modify it for lower sales?",
+    "mca_modification_note": "Only for an advance that was modified: what changed.",
 }
 
 _ORDINAL = re.compile(r"^r(\d+)$")
@@ -161,6 +176,9 @@ class Cell:
     #: The text of a label cell.
     label: str | None = None
     options: tuple[str, ...] | None = None
+    #: (value, label) pairs for options whose stored value is a slug; the grid
+    #: and the workbook show the label and keep the value.
+    option_labels: tuple[tuple[str, str], ...] | None = None
     #: The `totals` entry a formula cell shows.
     compute: str | None = None
     #: An input key a formula cell merely echoes (the P&L memo lines).
@@ -661,7 +679,14 @@ def _pfs(schedule_rows: Mapping[str, Sequence[str]]) -> Sheet:
 
 
 def _debt_columns() -> tuple[Column, ...]:
-    widths = {"lender": 28, "debt_type": 16, "collateral": 24, "notes": 30}
+    widths = {
+        "lender": 28,
+        "debt_type": 22,
+        "collateral": 24,
+        "mca_modified": 16,
+        "mca_modification_note": 28,
+        "notes": 30,
+    }
     return tuple(
         Column(
             index,
@@ -721,6 +746,8 @@ def _debt_schedule(row_keys: Sequence[str]) -> Sheet:
                     format=fmt,
                     editable=True,
                     options=_DEBT_CHOICES.get(key),
+                    option_labels=_DEBT_OPTION_LABELS.get(key),
+                    hint=_DEBT_HINTS.get(key),
                     path=("debts", row_key, key),
                 )
             )

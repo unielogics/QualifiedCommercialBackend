@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.application_profile import ApplicationTaxonomyEntry
 from app.models.user import User
+from app.services import debt_types
 
 from ..models import (
     DealerApplicationPreScreen,
@@ -469,7 +470,8 @@ async def build_context(
     debt_rows = [
         {
             "lender": debt.lender,
-            "category": debt.category,
+            # The label a person reads, the same one the schedule PDF prints.
+            "category": debt_types.debt_type_label(debt.category) or (debt.category or ""),
             "balance": float(debt.balance) if debt.balance is not None else None,
             "monthly_payment": float(debt.monthly_payment) if debt.monthly_payment is not None else None,
             "maturity": _date(debt.maturity_on) if debt.maturity_on else "Awaiting evidence",

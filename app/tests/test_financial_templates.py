@@ -53,7 +53,19 @@ def test_financial_templates_are_versioned_and_readable() -> None:
     debt_book = load_workbook(BytesIO(debt.content), data_only=False)
     assert debt_book.sheetnames == ["Debt Schedule"]
     assert debt_book["Debt Schedule"]["D29"].value == "=SUM(D4:D28)"
-    assert len(debt_book["Debt Schedule"].data_validations.dataValidation) == 1
+    # Four lists: debt type (the labels of `debt_types.DEBT_TYPES`), secured or
+    # unsecured, current or delinquent, and the MCA question — the same choices
+    # the online form offers, so a workbook comes back in our words.
+    validations = debt_book["Debt Schedule"].data_validations.dataValidation
+    assert len(validations) == 4
+    # The type list is longer than Excel's 255-character inline limit, so it
+    # lives down hidden column P and the validation points at that range.
+    type_list = next(dv for dv in validations if "B4:B28" in str(dv.sqref))
+    assert type_list.formula1 == "'Debt Schedule'!$P$1:$P$15"
+    assert debt_book["Debt Schedule"]["P7"].value == "Merchant cash advance (MCA)"
+    assert debt_book["Debt Schedule"].column_dimensions["P"].hidden
+    assert debt_book["Debt Schedule"]["L3"].value.startswith("MCA modified")
+    assert debt_book["Debt Schedule"]["N3"].value == "Notes"
 
     statement_book = load_workbook(BytesIO(statements.content), data_only=False)
     assert statement_book.sheetnames == ["Profit and Loss", "Balance Sheet"]

@@ -1347,9 +1347,32 @@ class DealerFinancialStatementSave(BaseModel):
 
 
 class DealerDebtScheduleRow(BaseModel):
+    """One obligation off the on-screen Debt Schedule.
+
+    The same row the borrower's link and the desk's editor send
+    (`financial_statements.DEBT_COLUMNS`): what the debt is, what it started
+    at and when, the rate, whether it is secured and by what, whether it is
+    current, and — for a merchant cash advance — whether the funder modified it
+    for lower sales. Three of these were all the modal used to collect, and the
+    PDF it filed had eight columns of nothing a lender could read.
+    """
+
     lender: str = Field(min_length=1, max_length=180)
-    balance: float = Field(ge=0)
-    monthly_payment: float = Field(ge=0)
+    # Numeric(14, 2) and Numeric(6, 3) on the row: a figure past them is a 422
+    # here rather than an overflow at flush.
+    balance: float = Field(ge=0, le=999_999_999_999)
+    monthly_payment: float = Field(ge=0, le=999_999_999_999)
+    debt_type: str | None = Field(default=None, max_length=80)
+    original_amount: float | None = Field(default=None, ge=0, le=999_999_999_999)
+    rate: float | None = Field(default=None, ge=0, le=999.999)
+    originated_on: str | None = Field(default=None, max_length=10)
+    maturity_on: str | None = Field(default=None, max_length=10)
+    secured: str | None = Field(default=None, max_length=16)
+    payment_status: str | None = Field(default=None, max_length=16)
+    collateral: str | None = Field(default=None, max_length=400)
+    notes: str | None = Field(default=None, max_length=2000)
+    mca_modified: bool | None = None
+    mca_modification_note: str | None = Field(default=None, max_length=2000)
 
 
 class DealerDebtScheduleSubmission(BaseModel):
@@ -2778,22 +2801,14 @@ def _pfs_key_facts(payload: DealerPfsSubmission) -> dict[str, Any]:
     }
 
 
-def _debt_schedule_key_facts(payload: DealerDebtScheduleSubmission) -> dict[str, Any]:
-    debts = [
-        {
-            "lender": row.lender,
-            "original_amount": None,
-            "current_balance": row.balance,
-            "monthly_payment": row.monthly_payment,
-            "maturity_date": None,
-        }
-        for row in payload.debts
-    ]
-    return {
-        "debts": debts,
-        "total_monthly_debt_service": sum(row.monthly_payment for row in payload.debts),
-        "total_outstanding_balance": sum(row.balance for row in payload.debts),
-    }
+def _debt_schedule_rows(payload: DealerDebtScheduleSubmission) -> list[dict[str, Any]]:
+    """The modal's rows read the way the link's are, so the PDF, the key facts
+    and the stored schedule are the same whichever surface filed them."""
+    from app.services import financial_statements
+
+    return financial_statements.debt_rows_from_body(
+        {"debts": [row.model_dump() for row in payload.debts]}
+    ) or []
 
 
 async def _ensure_requested_document(
@@ -8242,12 +8257,24 @@ async def _submit_debt_schedule_form(
     if req.status == "uploaded":
         raise HTTPException(status.HTTP_409_CONFLICT, "A debt schedule has already been submitted for this file")
 
+    from app.services import financial_statements
     from app.services.dealer_forms_pdf import render_debt_schedule_pdf
 
-    key_facts = _debt_schedule_key_facts(payload)
+    rows = _debt_schedule_rows(payload)
+    # Held to the same completeness as the borrower's link: the lender name,
+    # type, original amount, balance, rate, payment and whether it is current,
+    # plus the advance question on an MCA. The modal checks first; this is the
+    # stale-client path.
+    problems = financial_statements.debt_row_problems(rows)
+    if problems:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, financial_statements.describe_debt_problems(problems)
+        )
+    key_facts = financial_statements.debt_key_facts(rows)
     pdf_bytes = render_debt_schedule_pdf(
         business_name=payload.business_name,
-        debts=[(row.lender, row.balance, row.monthly_payment) for row in payload.debts],
+        # The full row, not three columns of it — the same table the link files.
+        rows=rows,
         total_balance=key_facts["total_outstanding_balance"],
         total_monthly=key_facts["total_monthly_debt_service"],
     )
@@ -8263,7 +8290,7 @@ async def _submit_debt_schedule_form(
         actor_name=actor_name,
         actor_email=actor_email,
     )
-    await _persist_client_debt_rows(db, intake, payload)
+    await _persist_client_debt_rows(db, intake, rows)
     await file_events.emit(
         db,
         intake_id=intake.id,
@@ -8281,7 +8308,7 @@ async def _submit_debt_schedule_form(
 async def _persist_client_debt_rows(
     db: AsyncSession,
     intake: PublicUnderwritingIntake,
-    payload: DealerDebtScheduleSubmission,
+    rows: list[dict[str, Any]],
 ) -> None:
     """Put what the borrower typed on the actual debt schedule.
 
@@ -8296,45 +8323,22 @@ async def _persist_client_debt_rows(
     desk. The desk's existing confirmation step is what promotes them, and
     `count_in_dscr` keeps its existing rule rather than gaining an exception.
 
+    Written through `save_debt_rows`, the one writer every form uses: the
+    modal's rows carry no ids, so each is matched to the borrower's existing
+    row at the same lender and updated in place, a borrower row the form no
+    longer lists is removed, and the desk's and the analyzer's rows are never
+    touched. The form is still the borrower's whole answer — a resubmission
+    replaces what they said last time rather than appending a second copy.
+
     Non-fatal, like the statement: the PDF already satisfies the checklist, so a
     failure here costs the structured copy and costs the borrower nothing.
     """
-    from app.dealer_os.models import DealerDebt
     from app.services import application_profiles as profile_service
+    from app.services import financial_statements
 
     try:
         profile = await profile_service.provision_profile_for_intake(db, intake)
-        existing = (
-            (
-                await db.execute(
-                    select(DealerDebt).where(
-                        DealerDebt.profile_id == profile.id,
-                        DealerDebt.origin == "client_form",
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        # The form is the borrower's whole answer, so a resubmission replaces
-        # what they said last time rather than appending a second copy of it.
-        for row in existing:
-            await db.delete(row)
-        await db.flush()
-
-        for entry in payload.debts:
-            db.add(
-                DealerDebt(
-                    profile_id=profile.id,
-                    dealer_id=profile.dealer_id,
-                    lender=entry.lender[:180],
-                    balance=entry.balance,
-                    monthly_payment=entry.monthly_payment,
-                    origin="client_form",
-                    status="active",
-                )
-            )
-        await db.flush()
+        await financial_statements.save_debt_rows(db, profile, rows, origin="client_form")
     except Exception:  # noqa: BLE001
         log.exception(
             "debt schedule: could not persist client rows for intake %s", intake.id

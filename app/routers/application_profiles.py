@@ -5837,6 +5837,16 @@ async def submit_public_financial_form(
             # The page sent no schedule at all. Filing an empty one would
             # tell the file this borrower owes nobody.
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "No debt schedule was sent")
+        # A submit is the finished answer. A row without its type, rate or
+        # whether it is current sends a lender back to ask; the page says which
+        # rows and which answers, in the message, before anything is filed.
+        # Drafts are never checked — the autosave keeps half-typed rows on purpose.
+        problems = await financial_statements.debt_submit_problems(db, profile, rows, origin="client_form")
+        if problems:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                financial_statements.describe_debt_problems(problems),
+            )
         await financial_statements.save_debt_rows(
             db, profile, rows, origin="client_form"
         )
@@ -6512,6 +6522,16 @@ async def save_debt_schedule(
         # Nothing was sent — an editor that never finished loading. Not a
         # clear, and not something to file.
         return {"row_count": 0, "submitted": False}
+    if payload.submit:
+        # The same completeness the borrower's link holds a submit to. The
+        # desk's editor checks before it sends, so this is the stale-client
+        # path; it refuses the whole save rather than file an incomplete PDF.
+        problems = await financial_statements.debt_submit_problems(db, profile, rows, origin="admin")
+        if problems:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                financial_statements.describe_debt_problems(problems),
+            )
     await financial_statements.save_debt_rows(db, profile, rows, origin="admin")
 
     if payload.submit:

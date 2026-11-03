@@ -11400,7 +11400,7 @@ async def _prepare_underwriting_review_room(
             ),
             "debt_schedule": (
                 "Current business debt schedule",
-                "Upload the current debt schedule showing lender, balance, and payment for each obligation.",
+                "Upload the current debt schedule: for each obligation the lender, type of debt, original amount, current balance, interest rate, monthly payment and whether it is current or delinquent.",
                 "debt_schedule",
             ),
             "use_of_funds_support": (
