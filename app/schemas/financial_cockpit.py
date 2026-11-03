@@ -28,6 +28,8 @@ class FinancialCockpitRead(BaseModel):
     debt: dict[str, Any] = Field(default_factory=dict)
     dscr: dict[str, Any] = Field(default_factory=dict)
     net_profit: dict[str, Any] = Field(default_factory=dict)
+    #: The plan (record, evaluation, levers); see app/services/financial_plan.py.
+    plan: dict[str, Any] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
 
 

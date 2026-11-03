@@ -372,18 +372,31 @@ def coverage_levers(
     advances = [o for o in obligations_list if o.get("is_mca") and o.get("in_debt_service") and o["id"] not in retire]
     if advances and numerator is not None:
         payoff = sum(o.get("payoff") or 0 for o in advances)
+        unknown = [o for o in advances if o.get("payoff") is None]
         amount = max(payoff, requested_amount or 0.0) or None
         payment = amortized_payment(amount, rate, term) if amount else None
         after = round(max(0.0, base_service - sum(o.get("monthly") or 0 for o in advances) + (payment or 0)), 2)
         value = _dscr_for(numerator, after)
+        sizing = (
+            f"The loan covers {payoff:,.0f} of payoffs"
+            + (f" plus the {requested_amount:,.0f} requested" if requested_amount and requested_amount > payoff else "")
+            + f"; at {rate:g}% over {term} months that is {payment:,.0f} a month."
+            if payment
+            else "Record the payoff balances to size the loan."
+        )
+        if unknown and payment:
+            sizing += (
+                f" Payoff balances are not recorded for {len(unknown)} of {len(advances)} advances, so the loan is sized at the amount requested"
+                " and this coverage is optimistic until they are."
+            )
         levers.append(
             {
                 "key": "refinance_advances",
                 "label": f"Refinance every advance into the new loan ({len(advances)} funder{'s' if len(advances) != 1 else ''})",
-                "detail": f"Payments stop: {sum(o.get('monthly') or 0 for o in advances):,.0f} a month. "
-                + (f"The loan covers {payoff:,.0f} of payoffs" + (f" plus the {requested_amount:,.0f} requested" if requested_amount and requested_amount > payoff else "") + f"; at {rate:g}% over {term} months that is {payment:,.0f} a month." if payment else "Record the payoff balances to size the loan."),
+                "detail": f"Payments stop: {sum(o.get('monthly') or 0 for o in advances):,.0f} a month. " + sizing,
                 "dscr_after": value,
                 "status_after": dscr_status(value),
+                "uncertain": bool(unknown),
                 "apply": {"retire": sorted(retire | {o["id"] for o in advances}), "new_loan_amount": amount, "new_loan_rate_pct": rate, "new_loan_term_months": term},
             }
         )
@@ -454,5 +467,6 @@ def coverage_levers(
         )
     ranked = sorted(levers, key=lambda lever: -(lever["dscr_after"] if lever["dscr_after"] is not None else -1))
     for lever in ranked:
+        lever.setdefault("uncertain", False)
         lever["improves"] = lever["dscr_after"] is not None and (base_value is None or lever["dscr_after"] > base_value)
     return ranked[:MAX_LEVERS]

@@ -105,3 +105,28 @@ def test_the_cockpit_carries_obligations_plan_and_levers() -> None:
     assert plan["evaluation"]["payoff_total"] == 50000 and plan["evaluation"]["loan_amount_needed"] == 50000.0
     assert isinstance(plan["levers"], list)
     assert build_cockpit([], [])["plan"]["evaluation"]["active"] is False
+
+
+def test_refinancing_advances_without_payoff_balances_says_the_coverage_is_optimistic() -> None:
+    obligations = fp.obligations({"rows": [], "documented": [], "service": SERVICE}, RECURRING)
+    plan = fp.normalize_plan({})
+    evaluation = fp.evaluate_plan(plan, obligations_list=obligations, recurring=RECURRING, months=MONTHS, dscr=DSCR, service=SERVICE, proposed=None, requested_amount=70000)
+    levers = fp.coverage_levers(plan, evaluation, obligations_list=obligations, recurring=RECURRING, dscr=DSCR, requested_amount=70000, terms=None)
+    refinance = next(lever for lever in levers if lever["key"] == "refinance_advances")
+    assert refinance["uncertain"] is True and "not recorded for 2 of 2 advances" in refinance["detail"] and "optimistic" in refinance["detail"]
+    assert all("uncertain" in lever for lever in levers)
+
+
+def test_the_cockpit_read_model_keeps_the_plan_and_the_obligations() -> None:
+    """A pydantic read model drops keys it does not declare; the dashboard
+    crashed on a cockpit without `plan` for exactly that reason."""
+    import uuid
+
+    from app.schemas.financial_cockpit import FinancialCockpitRead
+    from app.tests.test_financial_cockpit import LOAN_ROW, SIX_MONTHS
+
+    cockpit = build_cockpit(SIX_MONTHS, [LOAN_ROW], plan={"retire": ["row:row1"]})
+    read = FinancialCockpitRead(profile_id=uuid.uuid4(), **cockpit).model_dump()
+    assert read["plan"]["record"]["retire"] == ["row:row1"] and "evaluation" in read["plan"] and "levers" in read["plan"]
+    assert read["debt"]["obligations"][0]["id"] == "row:row1"
+    assert read["bank"]["recurring"]["payees"] == [] and "overdrafts" in read["bank"]
