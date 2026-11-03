@@ -131,11 +131,23 @@ def evaluate(intake: Any = None, *, bucket: Any = None, context: Any = None) -> 
     if not any(value is not None and value > 0 for value in confirmed_amounts):
         missing.append("requested_amount_required")
     mode = "manual_review" if manual else "information_required" if missing else "automated_review"
+    # The desk needs to see where the count came from, not only the maximum:
+    # what the borrower declared against what the documents and the chat show.
+    declared_values = [value for value in confirmed_counts if value is not None]
+    documented_values = [value for value in (_count(item.get("advance_count")) for item in details) if value is not None]
+    declared_count = max(declared_values) if declared_values else None
+    documented_count = max(documented_values) if documented_values else None
     return {
         "review_mode": mode,
         "auto_underwriting_allowed": mode == "automated_review",
         "reason_codes": manual + missing,
         "active_mca_count": active_count,
+        "declared_active_mca_count": declared_count,
+        "documented_active_mca_count": documented_count,
+        "two_or_more_active": None if active_count is None else active_count >= 2,
+        "active_mca_count_conflict": (
+            declared_count is not None and documented_count is not None and declared_count != documented_count
+        ),
         "requested_amount": amount,
         "requested_term_months": term,
         "max_amount": MAX_AMOUNT,

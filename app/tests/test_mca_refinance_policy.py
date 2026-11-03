@@ -315,3 +315,27 @@ async def test_linked_evidence_is_retained_without_queuing_manual_underwriting()
     db = Mock(get=AsyncMock(return_value=intake.bucket))
     assert await queue_link_change_review(db, intake=intake, requested_by_user_id=uuid4()) is None
     db.add.assert_not_called()
+
+
+def test_the_desk_sees_declared_and_documented_counts_apart() -> None:
+    from types import SimpleNamespace
+
+    from app.services.mca_refinance_policy import evaluate
+
+    intake = SimpleNamespace(intake_state={
+        "mca_qualification": {"active_mca_count": 2, "requested_amount": 70_000},
+        "mca_details": {"advance_count": 8, "funder": "Speedy Funding"},
+    }, requested_loan_amount=None)
+    policy = evaluate(intake)
+    assert policy["active_mca_count"] == 8
+    assert policy["declared_active_mca_count"] == 2
+    assert policy["documented_active_mca_count"] == 8
+    assert policy["active_mca_count_conflict"] is True
+    assert policy["two_or_more_active"] is True
+    assert policy["review_mode"] == "manual_review"
+
+    single = evaluate(SimpleNamespace(intake_state={"mca_qualification": {"active_mca_count": 1, "requested_amount": 50_000}}, requested_loan_amount=None))
+    assert single["two_or_more_active"] is False and single["active_mca_count_conflict"] is False
+
+    unknown = evaluate(SimpleNamespace(intake_state={}, requested_loan_amount=None))
+    assert unknown["two_or_more_active"] is None and unknown["declared_active_mca_count"] is None
