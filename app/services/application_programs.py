@@ -582,6 +582,19 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         ApplicationExtractedFact.status == "accepted",
     ))).scalars().all())
     context["fact_sources"] = _fit_fact_sources(context, reviewed_facts, files, latest_analyses)
+    # Six accepted statements say more than "needs information". Revenue and
+    # cash flow are estimated from them when no P&L or tax return is on file;
+    # the estimate is labelled as one, and a person can replace it.
+    from app.services.public_underwriting_packet_pdf import extract_bank_months
+
+    statement_rows = extract_bank_months([
+        {"file_id": str(file.id), "classification": "bank_statement",
+         "key_facts": (latest_analyses[file.id].analysis or {}).get("key_facts") or {}}
+        for file in files
+        if file.id in accepted_file_ids and file.id in latest_analyses
+        and effective_file_classification(file.file_name, latest_analyses[file.id]) == "bank_statement"
+    ], limit=120)
+    apply_statement_estimates(context, context["fact_sources"], accepted_months=len(accepted_bank_months), bank_rows=statement_rows)
     # Reviewed margins retain the exact snapshot lineage, not an AI estimate.
     for field in ("gross_margin_pct", "net_margin_pct"):
         if reviewed_profitability_facts(readiness_snapshot).get(field) is not None:
@@ -605,6 +618,59 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
             if current_sources:
                 context["fact_sources"][field] = {"verification_status": "verified", "source_refs": source_rows[:24]}
     return context
+
+
+def estimate_annualized_deposits(rows: list[dict[str, Any]]) -> float | None:
+    """Mean monthly deposits times twelve, from at least three statement months."""
+    values = [float(row["deposits"]) for row in rows if row.get("deposits") is not None]
+    if len(values) < 3:
+        return None
+    return round(sum(values) / len(values) * 12, 2)
+
+
+def estimate_cash_flow_from_statements(rows: list[dict[str, Any]]) -> float | None:
+    """Annualized net movement of the operating account: deposits less withdrawals.
+
+    Not earnings. An estimate for program fit when no P&L or tax return is on
+    file, from at least three statement months that carry both figures.
+    """
+    pairs = [(float(row["deposits"]), float(row["withdrawals"])) for row in rows
+             if row.get("deposits") is not None and row.get("withdrawals") is not None]
+    if len(pairs) < 3:
+        return None
+    return round(sum(deposits - withdrawals for deposits, withdrawals in pairs) / len(pairs) * 12, 2)
+
+
+def apply_statement_estimates(context: dict[str, Any], fact_sources: dict[str, Any], *, accepted_months: int, bank_rows: list[dict[str, Any]]) -> list[str]:
+    """Fill revenue and cash flow from accepted statements when nothing better exists.
+
+    Returns the keys that were estimated; ``context["estimated_fit_facts"]``
+    carries the same list so every reader can label them.
+    """
+    estimated: list[str] = []
+    if context.get("annualized_deposits") is None:
+        deposits = estimate_annualized_deposits(bank_rows)
+        if deposits is not None:
+            context["annualized_deposits"] = deposits
+            context["deposits"] = deposits
+            fact_sources["annualized_deposits"] = {"verification_status": "estimated_from_statements", "source_refs": []}
+            fact_sources["deposits"] = fact_sources["annualized_deposits"]
+            estimated.append("annualized_deposits")
+    deposits = context.get("annualized_deposits")
+    if context.get("annual_revenue") is None and deposits and accepted_months >= 6:
+        context["annual_revenue"] = deposits
+        context["revenue"] = deposits
+        fact_sources["annual_revenue"] = {"verification_status": "estimated_from_deposits", "source_refs": []}
+        fact_sources["revenue"] = fact_sources["annual_revenue"]
+        estimated.extend(["annual_revenue", "revenue"])
+    if context.get("cash_flow") is None:
+        cash_flow = estimate_cash_flow_from_statements(bank_rows)
+        if cash_flow is not None:
+            context["cash_flow"] = cash_flow
+            fact_sources["cash_flow"] = {"verification_status": "estimated_from_statements", "source_refs": []}
+            estimated.append("cash_flow")
+    context["estimated_fit_facts"] = estimated
+    return estimated
 
 
 def _expanded_naics_prefixes(values: list[str]) -> tuple[list[str], bool]:

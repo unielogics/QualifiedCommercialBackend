@@ -119,6 +119,19 @@ def start_scheduler() -> None:
         max_instances=1,
     )
 
+    # What the AI can fill in on its own: a NAICS suggestion for unclassified
+    # files, and the grounded document checks for requirements waiting on
+    # them. Bounded per tick; a person's classification or verification wins.
+    scheduler.add_job(
+        _wrap(job_profile_enrichment),
+        "interval",
+        minutes=2,
+        id="profile_enrichment",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
     # Phase 4 — daily doc reminder + escalation pass.
     scheduler.add_job(
         _wrap(job_doc_reminders),
@@ -522,6 +535,15 @@ async def job_admin_activity_digest() -> None:
     from app.services.admin_activity import run_admin_activity_digest  # local import to avoid circular
 
     await run_admin_activity_digest()
+
+
+async def job_profile_enrichment() -> None:
+    """Industry suggestions and pending document checks, a few files per tick."""
+    from app.db import SessionLocal
+    from app.services.profile_enrichment import enrich_profiles
+
+    async with SessionLocal() as db:
+        await enrich_profiles(db)
 
 
 async def job_evaluate_pending_prequals() -> None:

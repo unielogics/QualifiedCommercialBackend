@@ -9903,6 +9903,9 @@ class McaRefiStart(PublicIntakeAttribution):
     phone: RequiredPhone
     business_name: str | None = Field(default=None, max_length=180)
     active_mca_count: int | None = Field(default=None, ge=0, le=50, strict=True)
+    # Program fit asks how long the business has operated; the start form
+    # asks it once rather than leaving the file at "needs information".
+    years_in_business: float | None = Field(default=None, ge=0, le=150, allow_inf_nan=False)
     requested_amount: float | None = Field(default=None, ge=0, allow_inf_nan=False, strict=True)
     requested_term_months: int | None = Field(default=None, ge=1, le=1200, strict=True)
     manual_review_requested: bool = Field(default=False, strict=True)
@@ -9942,6 +9945,7 @@ class McaTermsSubmission(BaseModel):
 
 class McaRefiQualification(BaseModel):
     active_mca_count: int | None = Field(default=None, ge=0, le=50, strict=True)
+    years_in_business: float | None = Field(default=None, ge=0, le=150, allow_inf_nan=False)
     requested_amount: float | None = Field(default=None, ge=0, allow_inf_nan=False, strict=True)
     requested_term_months: int | None = Field(default=None, ge=1, le=1200, strict=True)
     manual_review_requested: bool = Field(default=False, strict=True)
@@ -9984,7 +9988,7 @@ _MCA_DETAIL_KEYS = (
     "months_remaining",
     "factor_rate",
     "advance_count",
-    "requested_amount",
+    "requested_amount", "years_in_business",
 )
 
 
@@ -10018,6 +10022,10 @@ def _merge_mca_details(intake: PublicUnderwritingIntake, proposed: Any) -> None:
         if key == "advance_count":
             if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 50 and float(value).is_integer():
                 accepted[key] = int(value)
+            continue
+        if key == "years_in_business":
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 150:
+                accepted[key] = float(value)
             continue
         if key == "factor_rate":
             if isinstance(value, (int, float)) and not isinstance(value, bool) and 1.0 <= value <= 3.0:

@@ -187,6 +187,7 @@ async def start_mca_refinance(
             **({"mca_manual_review_requested_at": core._now().isoformat()} if payload.manual_review_requested else {}),
             "mca_qualification": {
                 "active_mca_count": payload.active_mca_count,
+                "years_in_business": payload.years_in_business,
                 "requested_amount": payload.requested_amount if payload.requested_amount is not None else payload.remaining_payback,
                 "requested_term_months": payload.requested_term_months,
             },
