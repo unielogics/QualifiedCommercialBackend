@@ -30,6 +30,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dealer_os.models import DealerDebt
+from app.dealer_os.services.vendors import normalize_vendor
 from app.models.application_profile import ApplicationProfile
 from app.models.production_package import ProductionTermSheet
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
@@ -40,6 +41,13 @@ from app.services.bucket_evidence import (
     statement_period_month,
 )
 from app.services.capital_readiness import classify_dscr
+from app.services.payee_classification import (
+    CARD_KINDS,
+    DEBT_KINDS,
+    KIND_LABELS,
+    classify_payee,
+    match_names,
+)
 from app.services.public_underwriting_packet_pdf import (
     extract_balance_sheet,
     extract_debt_schedule,
@@ -55,14 +63,19 @@ ADVANCE_CLASSES = frozenset(
     {"debt_schedule", "advance_agreement", "mca_agreement", "payoff_letter"}
 )
 #: Payment cadence -> payments per month (a daily advance debits business days).
+#: The same table the client's typed advance terms use (dealer_ai_intake._MCA_REMITS_PER_MONTH),
+#: so a verbal breakdown and a typed one land on the same monthly figure.
 PAYMENTS_PER_MONTH = {
     "daily": 21.0,
-    "weekly": 52 / 12,
-    "biweekly": 26 / 12,
-    "bi-weekly": 26 / 12,
+    "weekly": 4.33,
+    "biweekly": 2.17,
+    "bi-weekly": 2.17,
     "semimonthly": 2.0,
     "monthly": 1.0,
 }
+#: A declared payment within this much of the statements' figure "matches".
+RECONCILE_TOLERANCE_PCT = 15.0
+MAX_RECURRING_PAYEES = 40
 MCA_CATEGORIES = frozenset(
     {"mca", "merchant_cash_advance", "advance", "cash_advance", "revenue_based"}
 )
@@ -706,14 +719,29 @@ def debt_service(
     rows: list[dict[str, Any]],
     document: dict[str, Any] | None,
     documented: list[dict[str, Any]],
+    recurring: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The monthly debt service and where it came from.
 
     Precedence: the debt schedule rows on the file (a person can toggle each
     one), then the total printed on an uploaded debt schedule, then the
-    payments read off advance terms. The three never add up — they describe
-    the same obligations — so one wins and the others are shown beside it.
+    payments read off advance terms, then the debits the statements show to
+    lenders and funders (cards excluded). The sources never add up — they
+    describe the same obligations — so one wins and the others are shown
+    beside it, with one exception borrowed from Capital OS: a statement debit
+    to a lender that no schedule row names is real debt service the rows
+    forgot, so it is added to them.
     """
+    recurring = recurring or {}
+    observed_monthly = recurring.get("observed_debt_service_monthly")
+    unexplained_observed = 0.0
+    if rows:
+        for payee in recurring.get("payees") or []:
+            if payee.get("is_debt") and not any(
+                match_names(row["lender"], payee["payee"]) for row in rows
+            ):
+                unexplained_observed += payee.get("monthly_average") or 0
+    unexplained_observed = round(unexplained_observed, 2)
     counted = [r for r in rows if r["count_in_dscr"] and r["monthly_payment"]]
     schedule_monthly = round(sum(r["monthly_payment"] for r in counted), 2) if counted else None
     document_monthly = _num(document.get("total_monthly_debt_service")) if document else None
@@ -722,12 +750,19 @@ def debt_service(
         if documented
         else None
     )
-    if schedule_monthly:
+    if schedule_monthly and unexplained_observed:
+        monthly, source = (
+            round(schedule_monthly + unexplained_observed, 2),
+            "debt_schedule_rows+bank_observed",
+        )
+    elif schedule_monthly:
         monthly, source = schedule_monthly, "debt_schedule_rows"
     elif document_monthly:
         monthly, source = document_monthly, "debt_schedule_document"
     elif documented_monthly:
         monthly, source = documented_monthly, "advance_terms"
+    elif observed_monthly:
+        monthly, source = observed_monthly, "bank_observed"
     else:
         monthly, source = None, "none"
     mca_rows = [r for r in rows if r["is_mca"]] if rows else []
@@ -757,6 +792,11 @@ def debt_service(
         "mca_balance": _round(sum(r["balance"] for r in mca_source_rows if r["balance"]))
         if any(r["balance"] for r in mca_source_rows)
         else None,
+        "observed_monthly": _round(observed_monthly),
+        "observed_mca_monthly": recurring.get("observed_mca_monthly"),
+        "observed_loan_monthly": recurring.get("observed_loan_monthly"),
+        "observed_card_monthly": recurring.get("observed_card_monthly"),
+        "unexplained_observed_monthly": unexplained_observed or None,
     }
 
 
@@ -792,6 +832,318 @@ def proposed_payment(terms: dict[str, Any] | None) -> dict[str, Any] | None:
         "term_months": months,
         "monthly_payment": _round(monthly),
         "annual_payment": _round(monthly * 12),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Recurring payments read off the statements
+# ---------------------------------------------------------------------------
+
+
+def _file_months(facts: dict[str, Any], period_hint: str | None) -> list[str]:
+    rows = facts.get("months")
+    months: list[str] = []
+    if isinstance(rows, list) and rows:
+        for row in rows:
+            if isinstance(row, dict):
+                month = statement_period_month(
+                    row.get("statement_period")
+                ) or statement_period_month(row.get("month"))
+                if month and month not in months:
+                    months.append(month)
+    if not months:
+        month = statement_period_month(facts.get("statement_period")) or period_hint
+        if month:
+            months.append(month)
+    return months
+
+
+def _recurring_entries(
+    item: dict[str, Any],
+) -> tuple[list[tuple[list[str], dict[str, Any]]], list[str], bool]:
+    """(entries as (months, debit), the months the file covers, whether the
+    reader produced recurring_debits at all). A per-month list beats a
+    file-level one; a file-level list on a multi-month statement is spread
+    over every month the file covers."""
+    facts = item.get("key_facts") or {}
+    if not isinstance(facts, dict):
+        return [], [], False
+    months_all = _file_months(facts, item.get("period_hint"))
+    entries: list[tuple[list[str], dict[str, Any]]] = []
+    read_any = False
+    rows = facts.get("months")
+    if isinstance(rows, list) and rows:
+        for row in rows:
+            if not isinstance(row, dict) or "recurring_debits" not in row:
+                continue
+            read_any = True
+            month = statement_period_month(row.get("statement_period")) or statement_period_month(
+                row.get("month")
+            )
+            for debit in row.get("recurring_debits") or []:
+                if isinstance(debit, dict):
+                    entries.append(([month] if month else months_all, debit))
+    if not read_any and "recurring_debits" in facts:
+        read_any = True
+        for debit in facts.get("recurring_debits") or []:
+            if isinstance(debit, dict):
+                entries.append((months_all, debit))
+    return entries, months_all, read_any
+
+
+def _mode(values: list[str]) -> str | None:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return max(counts, key=lambda k: (counts[k], k)) if counts else None
+
+
+def recurring_payments(analyses: list[dict[str, Any]]) -> dict[str, Any]:
+    """Every payee the statements debit repeatedly, rolled up across months and
+    classified (advance, loan, card, lease, payroll, ...), with the months the
+    reader covered and the statements that still need a re-read."""
+    groups: dict[str, dict[str, Any]] = {}
+    months_read: set[str] = set()
+    files_need_reread: list[str] = []
+    for item in analyses:
+        if "bank_statement" not in _classes(item):
+            continue
+        entries, months_all, read_any = _recurring_entries(item)
+        if not read_any:
+            if item.get("file_id"):
+                files_need_reread.append(str(item["file_id"]))
+            continue
+        months_read.update(months_all)
+        for months, debit in entries:
+            payee = str(debit.get("payee") or debit.get("description") or "").strip()
+            key = normalize_vendor(payee)
+            if not key:
+                continue
+            occurrences = (
+                _int(
+                    debit.get("occurrences")
+                    if debit.get("occurrences") is not None
+                    else debit.get("count")
+                )
+                or 0
+            )
+            total = _num(
+                debit.get("total_amount")
+                if debit.get("total_amount") is not None
+                else debit.get("total")
+            )
+            average = _num(
+                debit.get("average_amount")
+                if debit.get("average_amount") is not None
+                else debit.get("amount")
+            )
+            if total is None and average is not None and occurrences:
+                total = average * occurrences
+            if total is None:
+                continue
+            total = abs(total)
+            group = groups.setdefault(
+                key,
+                {
+                    "key": key,
+                    "payee": payee,
+                    "occurrences": 0,
+                    "total": 0.0,
+                    "months": set(),
+                    "cadences": [],
+                    "same_amounts": [],
+                    "reader_kinds": [],
+                    "first_date": None,
+                    "last_date": None,
+                    "file_ids": [],
+                    "accepted": False,
+                },
+            )
+            group["occurrences"] += occurrences
+            group["total"] += total
+            group["months"].update(m for m in months if m)
+            cadence = str(debit.get("cadence") or "").strip().lower()
+            if cadence:
+                group["cadences"].append(cadence)
+            if isinstance(debit.get("same_amount"), bool):
+                group["same_amounts"].append(debit["same_amount"])
+            if debit.get("kind_guess") or debit.get("kind"):
+                group["reader_kinds"].append(str(debit.get("kind_guess") or debit.get("kind")))
+            first, last = _iso_date(debit.get("first_date")), _iso_date(debit.get("last_date"))
+            if first and (group["first_date"] is None or first < group["first_date"]):
+                group["first_date"] = first
+            if last and (group["last_date"] is None or last > group["last_date"]):
+                group["last_date"] = last
+            if item.get("file_id") and str(item["file_id"]) not in group["file_ids"]:
+                group["file_ids"].append(str(item["file_id"]))
+            group["accepted"] = group["accepted"] or bool(item.get("accepted"))
+    span = len(months_read) or 1
+    payees: list[dict[str, Any]] = []
+    for group in groups.values():
+        cadence = _mode(group["cadences"])
+        same_amount: bool | None = None
+        if group["same_amounts"]:
+            same_amount = all(group["same_amounts"])
+        kind, rationale = classify_payee(
+            group["payee"],
+            cadence=cadence,
+            same_amount=same_amount,
+            reader_kind=_mode(group["reader_kinds"]),
+        )
+        occurrences = group["occurrences"]
+        payees.append(
+            {
+                "key": group["key"],
+                "payee": group["payee"],
+                "kind": kind,
+                "kind_label": KIND_LABELS.get(kind, kind),
+                "rationale": rationale,
+                "cadence": cadence,
+                "same_amount": same_amount,
+                "occurrences": occurrences,
+                "total": _round(group["total"]),
+                "average_amount": _round(group["total"] / occurrences) if occurrences else None,
+                "monthly_average": _round(group["total"] / span),
+                "months": sorted(group["months"]),
+                "months_seen": len(group["months"]),
+                "first_date": group["first_date"],
+                "last_date": group["last_date"],
+                "file_ids": group["file_ids"],
+                "accepted": group["accepted"],
+                "is_debt": kind in DEBT_KINDS,
+                "is_card": kind in CARD_KINDS,
+            }
+        )
+    payees.sort(key=lambda p: (not p["is_debt"], -(p["monthly_average"] or 0)))
+    payees = payees[:MAX_RECURRING_PAYEES]
+    debt = [p for p in payees if p["is_debt"]]
+    mca = [p for p in debt if p["kind"] == "merchant_cash_advance"]
+    loans = [p for p in debt if p["kind"] != "merchant_cash_advance"]
+    cards = [p for p in payees if p["is_card"]]
+    return {
+        "payees": payees,
+        "months_read": sorted(months_read),
+        "files_need_reread": sorted(set(files_need_reread)),
+        "observed_debt_service_monthly": _round(sum(p["monthly_average"] or 0 for p in debt))
+        if debt
+        else None,
+        "observed_mca_monthly": _round(sum(p["monthly_average"] or 0 for p in mca))
+        if mca
+        else None,
+        "observed_loan_monthly": _round(sum(p["monthly_average"] or 0 for p in loans))
+        if loans
+        else None,
+        "observed_card_monthly": _round(sum(p["monthly_average"] or 0 for p in cards))
+        if cards
+        else None,
+    }
+
+
+def _pct_delta(declared: float | None, observed: float | None) -> float | None:
+    if declared is None or observed is None or observed == 0:
+        return None
+    return round((declared - observed) / abs(observed) * 100, 1)
+
+
+def reconcile_advances(
+    rows: list[dict[str, Any]],
+    documented: list[dict[str, Any]],
+    recurring: dict[str, Any],
+) -> dict[str, Any]:
+    """Each schedule row against the contracts the AI read and the debits the
+    statements show: matches, differs, not seen. Observed debt payees that no
+    row or contract explains come back as suggestions."""
+    months_read = recurring.get("months_read") or []
+    debt_payees = [p for p in recurring.get("payees") or [] if p["is_debt"] or p["is_card"]]
+    used_documented: set[int] = set()
+    used_observed: set[str] = set()
+    out_rows: list[dict[str, Any]] = []
+    for row in rows:
+        doc_index = next(
+            (
+                i
+                for i, d in enumerate(documented)
+                if i not in used_documented and match_names(row["lender"], d["lender"])
+            ),
+            None,
+        )
+        doc = documented[doc_index] if doc_index is not None else None
+        if doc_index is not None:
+            used_documented.add(doc_index)
+        obs = next(
+            (
+                p
+                for p in debt_payees
+                if p["key"] not in used_observed and match_names(row["lender"], p["payee"])
+            ),
+            None,
+        )
+        if obs is not None:
+            used_observed.add(obs["key"])
+        observed_delta = _pct_delta(
+            row.get("monthly_payment"), obs["monthly_average"] if obs else None
+        )
+        if not months_read:
+            status = "no_statements_read"
+        elif obs is None:
+            status = "not_seen"
+        elif observed_delta is None:
+            status = "seen"
+        elif abs(observed_delta) <= RECONCILE_TOLERANCE_PCT:
+            status = "matches"
+        else:
+            status = "differs"
+        out_rows.append(
+            {
+                "row_id": row.get("id"),
+                "lender": row["lender"],
+                "is_mca": row.get("is_mca", False),
+                "declared_monthly": row.get("monthly_payment"),
+                "declared_balance": row.get("balance"),
+                "documented": {
+                    "lender": doc["lender"],
+                    "balance": doc.get("balance"),
+                    "monthly_payment": doc.get("monthly_payment"),
+                    "payment_frequency": doc.get("payment_frequency"),
+                }
+                if doc
+                else None,
+                "documented_monthly_delta_pct": _pct_delta(
+                    row.get("monthly_payment"), doc.get("monthly_payment") if doc else None
+                ),
+                "documented_balance_delta_pct": _pct_delta(
+                    row.get("balance"), doc.get("balance") if doc else None
+                ),
+                "observed": {
+                    "payee": obs["payee"],
+                    "kind": obs["kind"],
+                    "cadence": obs["cadence"],
+                    "average_amount": obs["average_amount"],
+                    "monthly_average": obs["monthly_average"],
+                    "months_seen": obs["months_seen"],
+                }
+                if obs
+                else None,
+                "observed_delta_pct": observed_delta,
+                "status": status,
+            }
+        )
+    unmatched_observed = [
+        p
+        for p in debt_payees
+        if p["key"] not in used_observed
+        and p["is_debt"]
+        and not any(match_names(p["payee"], d["lender"]) for d in documented)
+    ]
+    unmatched_documented = [d for i, d in enumerate(documented) if i not in used_documented]
+    return {
+        "rows": out_rows,
+        "unmatched_observed": unmatched_observed,
+        "unmatched_documented": unmatched_documented,
+        "months_read": len(months_read),
+        "matches": sum(1 for r in out_rows if r["status"] == "matches"),
+        "differs": sum(1 for r in out_rows if r["status"] == "differs"),
+        "not_seen": sum(1 for r in out_rows if r["status"] == "not_seen"),
     }
 
 
@@ -1124,6 +1476,18 @@ def _notes(
         notes.append(
             "Debt service is the total printed on the uploaded debt schedule; the form on the file has no rows yet."
         )
+    elif service.get("source") == "bank_observed":
+        notes.append(
+            "Debt service is what the statements show going to lenders and funders each month; record the advances or the debt schedule to confirm it."
+        )
+    elif service.get("source") == "debt_schedule_rows+bank_observed":
+        notes.append(
+            "The statements show lender debits that no schedule row names; they were added to the debt service."
+        )
+    if coverage.get("statements_need_reread"):
+        notes.append(
+            f"{coverage['statements_need_reread']} statement file(s) were read before recurring payments were extracted; re-read them to see who is being paid."
+        )
     if proposed is None:
         notes.append(
             "No loan terms recorded, so the pro-forma coverage (with the new payment) is not shown."
@@ -1155,7 +1519,9 @@ def build_cockpit(
     rows = debt_rows(debts)
     document = extract_debt_schedule(_extractor_rows(analyses))
     documented = documented_debts(analyses)
-    service = debt_service(rows, document, documented)
+    recurring = recurring_payments(analyses)
+    service = debt_service(rows, document, documented, recurring)
+    reconciliation = reconcile_advances(rows, documented, recurring)
     proposed = proposed_payment(proposed_terms)
     coverage = {
         "files_analyzed": len(analyses),
@@ -1173,12 +1539,15 @@ def build_cockpit(
         "has_debt_schedule_document": document is not None,
         "debt_rows": len(rows),
         "documented_debts": len(documented),
+        "recurring_months_read": len(recurring["months_read"]),
+        "statements_need_reread": len(recurring["files_need_reread"]),
+        "bank_files_need_reread": recurring["files_need_reread"],
     }
     return {
         "generated_at": (now or datetime.now(UTC)).isoformat(),
         "requested_amount": _num(requested_amount),
         "coverage": coverage,
-        "bank": {"months": months, "summary": bank, "accounts": accounts},
+        "bank": {"months": months, "summary": bank, "accounts": accounts, "recurring": recurring},
         "tax": {"years": years},
         "profit_and_loss": statement,
         "balance_sheet": sheet,
@@ -1194,6 +1563,7 @@ def build_cockpit(
             if document
             else None,
             "service": service,
+            "reconciliation": reconciliation,
         },
         "dscr": dscr_block(years, statement, bank, service, proposed),
         "net_profit": net_profit_block(years, statement, bank),
@@ -1345,3 +1715,23 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
     )
     cockpit["profile_id"] = str(profile.id)
     return cockpit
+
+
+async def bank_statement_files(db: AsyncSession, profile: ApplicationProfile) -> list[Any]:
+    files, latest, _classifications = await programs._evidence_inventory(db, profile)
+    return [
+        file
+        for file in files
+        if effective_file_classification(file.file_name, latest.get(file.id)) == "bank_statement"
+    ]
+
+
+async def reread_statements(db: AsyncSession, profile: ApplicationProfile) -> list[Any]:
+    """Queue a forced re-analysis of every bank statement on the file, so
+    statements read before the recurring-payments extraction existed carry it."""
+    from app.services import bucket_ai
+
+    targets = await bank_statement_files(db, profile)
+    for file in targets:
+        await bucket_ai.enqueue_file_analysis(db, file, force=True)
+    return targets

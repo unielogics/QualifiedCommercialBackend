@@ -159,7 +159,13 @@ from app.schemas.application_profile import (
     WorksheetRowOp,
 )
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
-from app.schemas.financial_cockpit import FinancialCockpitRead
+from app.schemas.financial_cockpit import (
+    AdvanceRead,
+    AdvancesRead,
+    AdvancesWrite,
+    FinancialCockpitRead,
+    StatementRereadResult,
+)
 from app.schemas.retention import LegalHoldChange, RetentionStatusRead
 from app.schemas.use_of_funds import (
     UseOfFundsPatch,
@@ -184,6 +190,7 @@ from app.services import (
     intake_lifecycle,
     intake_retention,
     locked_file_requests,
+    mca_advances,
     merchant_processing,
     missing_item_automation,
     pfs_schema,
@@ -2339,6 +2346,58 @@ async def get_financial_cockpit(
     conclusion, each naming its source."""
     profile = await profiles.load_profile(db, profile_id, user)
     return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
+
+
+@router.post("/{profile_id}/financial-cockpit/reread-statements", response_model=StatementRereadResult)
+async def reread_financial_cockpit_statements(
+    profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> StatementRereadResult:
+    """Queue every bank statement on the file for a fresh AI read, so
+    statements analyzed before recurring payments were extracted carry them."""
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    targets = await financial_cockpit.reread_statements(db, profile)
+    if targets:
+        await profiles.log_profile_action(
+            db,
+            profile,
+            user,
+            "financial_cockpit.statements_reread",
+            f"Queued {len(targets)} bank statement(s) for a fresh read",
+            metadata={"file_ids": [str(file.id) for file in targets]},
+        )
+    await db.commit()
+    return StatementRereadResult(queued=len(targets), file_ids=[file.id for file in targets])
+
+
+@router.get("/{profile_id}/advances", response_model=AdvancesRead)
+async def get_advances(profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> AdvancesRead:
+    """The merchant cash advances on the file's debt schedule, whoever wrote them."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    rows = await mca_advances.advance_rows(db, profile)
+    return AdvancesRead(profile_id=profile.id, rows=[AdvanceRead(**mca_advances.advance_read(row)) for row in rows])
+
+
+@router.put("/{profile_id}/advances", response_model=AdvancesRead)
+async def put_advances(
+    profile_id: UUID, payload: AdvancesWrite, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> AdvancesRead:
+    """Record the advances the client described (verbally or otherwise) as the
+    desk's rows on the debt schedule; the client's typed terms and the AI's
+    draft rows are shown beside them and never overwritten."""
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    rows = await mca_advances.save_advances(db, profile, [row.model_dump() for row in payload.rows])
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "advances.recorded",
+        f"Recorded {len(payload.rows)} advance(s) from the client's terms",
+        metadata={"lenders": [row.lender for row in payload.rows][:20]},
+    )
+    await db.commit()
+    return AdvancesRead(profile_id=profile.id, rows=[AdvanceRead(**mca_advances.advance_read(row)) for row in rows])
 
 
 @router.post("/{profile_id}/bank-invitations", response_model=VerificationInvitationRead, status_code=status.HTTP_201_CREATED)

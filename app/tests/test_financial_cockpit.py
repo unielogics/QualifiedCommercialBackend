@@ -259,9 +259,9 @@ def test_tax_years_rebuild_ebitda_and_year_over_year_change() -> None:
 
 
 def test_payment_cadences_convert_to_a_monthly_figure() -> None:
-    assert monthly_equivalent(1000, "weekly") == 4333.33
+    assert monthly_equivalent(1000, "weekly") == 4330.0
     assert monthly_equivalent(500, "daily") == 10500.0
-    assert monthly_equivalent(1000, "biweekly") == 2166.67
+    assert monthly_equivalent(1000, "biweekly") == 2170.0
     assert monthly_equivalent(1000, None) == 1000.0
     assert monthly_equivalent(1000, "quarterly") is None
     assert amortized_payment(100000, 12, 120) == 1434.71
@@ -547,12 +547,12 @@ def test_statements_only_file_reads_like_body_good_studio() -> None:
     service = cockpit["debt"]["service"]
     assert (service["source"], service["monthly"], service["mca_count"]) == (
         "advance_terms",
-        10633.33,
+        10630.0,
         2,
     )
     headline = cockpit["dscr"]["headline"]
     assert headline["key"] == "bank_cash_flow" and headline["value"] == round(
-        (5000 + 10633.33) * 12 / (10633.33 * 12), 2
+        (5000 + 10630.0) * 12 / (10630.0 * 12), 2
     )
     assert cockpit["net_profit"]["conclusion"]["key"] == "bank_cash_flow"
     assert any("advance terms" in note for note in cockpit["notes"])
@@ -569,3 +569,99 @@ def test_statements_only_file_reads_like_body_good_studio() -> None:
         and compact["net_profit_basis"] == "bank_cash_flow"
     )
     assert compact["net_profit"] == 60000 and compact["tax_year"] is None
+
+
+# ---------------------------------------------------------------------------
+# Recurring payments and the reconciliation of what the client said
+# ---------------------------------------------------------------------------
+
+from app.services.financial_cockpit import (  # noqa: E402
+    debt_rows,
+    reconcile_advances,
+    recurring_payments,
+)
+
+
+def _recurring_month(period: str, debits: list[dict]) -> dict:
+    return {"statement_period": period, "total_deposits_and_credits": 50000, "total_withdrawals_and_debits": 45000, "recurring_debits": debits}
+
+
+def _statement_with_recurring(file_id: str, months: list[dict]) -> dict:
+    return _file(file_id, "bank_statement", {"bank": "Chase", "account_last4": "1204", "statement_period": months[0]["statement_period"], "months": months})
+
+
+ONDECK = {"payee": "ONDECK ACH DEBIT 4471", "occurrences": 21, "total_amount": 6300, "average_amount": 300, "cadence": "daily", "same_amount": True, "kind_guess": "merchant_cash_advance"}
+CHASE_CARD = {"payee": "CHASE CARD ONLINE PAYMENT", "occurrences": 1, "total_amount": 1200, "average_amount": 1200, "cadence": "monthly", "same_amount": False, "kind_guess": "credit_card"}
+GUSTO = {"payee": "GUSTO PAYROLL", "occurrences": 2, "total_amount": 9000, "average_amount": 4500, "cadence": "biweekly", "same_amount": False, "kind_guess": "payroll"}
+MYSTERY = {"payee": "FORWARD FINANCING LLC", "occurrences": 4, "total_amount": 4000, "average_amount": 1000, "cadence": "weekly", "same_amount": True, "kind_guess": "other"}
+
+
+def test_recurring_payments_roll_up_across_months_and_classify_the_payee() -> None:
+    analyses = [
+        _statement_with_recurring("s1", [_recurring_month("2026-05-01 to 2026-05-31", [ONDECK, CHASE_CARD, GUSTO]), _recurring_month("2026-06-01 to 2026-06-30", [ONDECK, MYSTERY])]),
+        _bank("old", "2026-07-01 to 2026-07-31", 50000, 45000),  # read before the extraction existed
+    ]
+    recurring = recurring_payments(analyses)
+    assert recurring["months_read"] == ["2026-05", "2026-06"]
+    assert recurring["files_need_reread"] == ["old"]
+    by_key = {p["payee"]: p for p in recurring["payees"]}
+    ondeck = by_key["ONDECK ACH DEBIT 4471"]
+    assert (ondeck["kind"], ondeck["occurrences"], ondeck["total"], ondeck["average_amount"], ondeck["monthly_average"], ondeck["months_seen"]) == ("merchant_cash_advance", 42, 12600, 300, 6300, 2)
+    assert ondeck["cadence"] == "daily" and ondeck["same_amount"] is True and ondeck["is_debt"]
+    assert by_key["FORWARD FINANCING LLC"]["kind"] == "merchant_cash_advance"
+    assert by_key["CHASE CARD ONLINE PAYMENT"]["kind"] == "credit_card" and by_key["CHASE CARD ONLINE PAYMENT"]["is_card"]
+    assert by_key["GUSTO PAYROLL"]["kind"] == "payroll"
+    assert [p["payee"] for p in recurring["payees"][:2]] == ["ONDECK ACH DEBIT 4471", "FORWARD FINANCING LLC"]  # debt first
+    assert recurring["observed_debt_service_monthly"] == 8300.0  # 6300 + 4000/2
+    assert recurring["observed_mca_monthly"] == 8300.0 and recurring["observed_loan_monthly"] is None
+    assert recurring["observed_card_monthly"] == 600.0
+
+
+def test_statement_debits_become_the_debt_service_when_nothing_else_is_on_file() -> None:
+    cockpit = build_cockpit([_statement_with_recurring("s1", [_recurring_month("2026-05-01 to 2026-05-31", [ONDECK]), _recurring_month("2026-06-01 to 2026-06-30", [ONDECK]), _recurring_month("2026-07-01 to 2026-07-31", [ONDECK])])], [])
+    service = cockpit["debt"]["service"]
+    assert (service["source"], service["monthly"], service["observed_mca_monthly"]) == ("bank_observed", 6300.0, 6300.0)
+    assert cockpit["dscr"]["candidates"][0]["annual_debt_service"] == 75600.0
+    assert any("statements show going to lenders" in note for note in cockpit["notes"])
+    assert cockpit["coverage"]["recurring_months_read"] == 3 and cockpit["coverage"]["statements_need_reread"] == 0
+
+
+def test_a_lender_the_schedule_forgot_is_added_to_the_rows_denominator() -> None:
+    rows = debt_rows([{"id": "r1", "lender": "OnDeck Capital", "category": "mca", "payment_amount": 300, "payment_frequency": "daily", "count_in_dscr": True}])
+    recurring = recurring_payments([_statement_with_recurring("s1", [_recurring_month("2026-05-01 to 2026-05-31", [ONDECK, MYSTERY])])])
+    service = debt_service(rows, None, [], recurring)
+    assert service["source"] == "debt_schedule_rows+bank_observed"
+    assert service["monthly"] == 6300.0 + 4000.0 and service["unexplained_observed_monthly"] == 4000.0
+
+
+def test_reconciliation_marks_each_declared_advance_against_statements_and_contracts() -> None:
+    rows = debt_rows(
+        [
+            {"id": "r1", "lender": "OnDeck", "category": "mca", "payment_amount": 310, "payment_frequency": "daily", "balance": 40000, "count_in_dscr": True},
+            {"id": "r2", "lender": "Kapitus", "category": "mca", "payment_amount": 2000, "payment_frequency": "weekly", "count_in_dscr": True},
+            {"id": "r3", "lender": "Credibly", "category": "mca", "payment_amount": 500, "payment_frequency": "daily", "count_in_dscr": True},
+        ]
+    )
+    documented = [{"lender": "ON DECK CAPITAL", "balance": 41000, "monthly_payment": 6300.0, "payment_frequency": "daily", "is_mca": True}]
+    recurring = recurring_payments([_statement_with_recurring("s1", [_recurring_month("2026-05-01 to 2026-05-31", [ONDECK, MYSTERY, {"payee": "KAPITUS ACH", "occurrences": 4, "total_amount": 4000, "average_amount": 1000, "cadence": "weekly", "same_amount": True}])])])
+    result = reconcile_advances(rows, documented, recurring)
+    by_lender = {r["lender"]: r for r in result["rows"]}
+    ondeck = by_lender["OnDeck"]
+    assert ondeck["status"] == "matches" and ondeck["observed"]["payee"] == "ONDECK ACH DEBIT 4471"
+    assert ondeck["observed_delta_pct"] == 3.3  # 6510 declared vs 6300 seen
+    assert ondeck["documented"]["balance"] == 41000 and ondeck["documented_balance_delta_pct"] == -2.4
+    kapitus = by_lender["Kapitus"]
+    assert kapitus["status"] == "differs" and kapitus["observed_delta_pct"] == 116.5  # 8660 declared vs 4000 seen
+    assert by_lender["Credibly"]["status"] == "not_seen"
+    assert [p["payee"] for p in result["unmatched_observed"]] == ["FORWARD FINANCING LLC"]
+    assert result["unmatched_documented"] == []
+    assert (result["matches"], result["differs"], result["not_seen"]) == (1, 1, 1)
+
+    no_statements = reconcile_advances(rows, [], {"payees": [], "months_read": []})
+    assert {r["status"] for r in no_statements["rows"]} == {"no_statements_read"}
+
+
+def test_the_statement_prompt_asks_for_recurring_debits() -> None:
+    from app.services import bucket_ai
+
+    assert any("recurring_debits" in value and "kind_guess" in value for value in vars(bucket_ai).values() if isinstance(value, str))
