@@ -411,12 +411,18 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
     accepted_bank_months: set[str] = set()
     accepted_tax_years: set[str] = set()
     accepted_nsf_counts: list[float] = []
+    counted_accounts = _counted_bank_accounts(profile)
     for file in files:
         if file.id not in accepted_file_ids:
             continue
         analysis = latest_analyses.get(file.id)
         classification = effective_file_classification(file.file_name, analysis)
         if classification == "bank_statement":
+            if counted_accounts:
+                from app.services.financial_cockpit import bank_file_counted
+
+                if not bank_file_counted(analysis.analysis if analysis else None, counted_accounts):
+                    continue
             if file.statement_period:
                 accepted_bank_months.add(file.statement_period)
             accepted_bank_months.update(
@@ -1835,12 +1841,27 @@ def _analysis_supports(analysis: BucketFileAnalysis | None) -> set[str]:
     return {re.sub(r"[^a-z0-9]+", "_", str(value).casefold()).strip("_") for value in raw if value}
 
 
+def _counted_bank_accounts(profile: ApplicationProfile | None) -> list[str]:
+    return list(getattr(profile, "counted_bank_accounts", None) or [])
+
+
 def _coverage_for_files(
     requirement: AICollectionRequirement,
     files: list[BucketFile],
     analyses: dict[uuid.UUID, BucketFileAnalysis],
+    counted_accounts: list[str] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     expected = _expected_classes(requirement)
+    if counted_accounts and _configured_period_count(requirement, "months"):
+        # The desk chose which checking accounts count: a statement from
+        # another account neither adds a month nor blocks the requirement.
+        from app.services.financial_cockpit import bank_file_counted
+
+        files = [
+            file
+            for file in files
+            if bank_file_counted(getattr(analyses.get(file.id), "analysis", None), counted_accounts)
+        ]
     expired_ids = [str(file.id) for file in files if _file_is_expired(requirement, file)]
     matched_count = len(files)
     files = [file for file in files if not _file_is_expired(requirement, file)]
@@ -2962,7 +2983,7 @@ async def _materialize_requirements(
         desired_sources = {file.id: "automatic" for file in matched_files}
         links = await _sync_requirement_evidence(db, state, inventory, desired_sources)
         linked_files = [inventory[row.file_id] for row in links]
-        _coverage_complete, coverage = _coverage_for_files(requirement, linked_files, analyses)
+        _coverage_complete, coverage = _coverage_for_files(requirement, linked_files, analyses, counted_accounts=_counted_bank_accounts(profile))
         from app.services.document_qualification_review import current_assessment
         check_assessment = current_assessment(
             (state.provenance or {}).get("ai_document_review"), review_checks, linked_files,
@@ -3004,7 +3025,7 @@ async def _materialize_requirements(
         accepted_files = [inventory[row.file_id] for row in accepted_links]
         accepted_complete, accepted_coverage = _coverage_for_files(
             requirement, accepted_files, analyses
-        )
+        , counted_accounts=_counted_bank_accounts(profile))
         if requested and not requested.requires_signature:
             requested.status = "uploaded" if accepted_complete else "requested"
         state.evidence_file_id = linked_files[0].id if linked_files else None
@@ -3538,7 +3559,7 @@ async def get_program_readiness(
         definition = requirement_definitions.get(state.requirement_key)
         contribution: dict[str, Any] = {}
         if definition is not None:
-            _complete, contribution = _coverage_for_files(definition, [file], available_analyses)
+            _complete, contribution = _coverage_for_files(definition, [file], available_analyses, counted_accounts=_counted_bank_accounts(profile))
         inferred_decision = "accepted" if link.verified_at else "processing"
         return ApplicationRequirementEvidenceRead(
             file_id=file.id,

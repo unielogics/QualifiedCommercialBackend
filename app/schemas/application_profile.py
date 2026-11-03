@@ -758,6 +758,8 @@ class BusinessBankEvidence(BaseModel):
     processing_files: int = 0
     needs_attention_files: int = 0
     reconnect_required: bool = False
+    #: Account keys the desk chose to count (empty: every account counts).
+    counted_accounts: list[str] = Field(default_factory=list)
 
 
 class ClientEvidenceRequirementRead(BaseModel):

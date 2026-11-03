@@ -69,3 +69,22 @@ class AdvancesRead(BaseModel):
 class StatementRereadResult(BaseModel):
     queued: int
     file_ids: list[UUID] = Field(default_factory=list)
+
+
+class BankAccountRead(BaseModel):
+    key: str
+    label: str
+    months: list[str] = Field(default_factory=list)
+    accepted_months: list[str] = Field(default_factory=list)
+    counted: bool = True
+    latest_month: str | None = None
+
+
+class BankAccountsRead(BaseModel):
+    profile_id: UUID
+    accounts: list[BankAccountRead] = Field(default_factory=list)
+    counted: list[str] = Field(default_factory=list)
+
+
+class BankAccountsWrite(BaseModel):
+    counted: list[str] = Field(default_factory=list, max_length=20)

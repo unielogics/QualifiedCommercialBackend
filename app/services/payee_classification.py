@@ -52,6 +52,26 @@ KIND_LABELS = {
     "transfer": "Transfer",
     "vendor": "Vendor",
     "other": "Other",
+    # inbound
+    "customer": "Customer payments",
+    "card_settlement": "Card settlements",
+    "advance_funding": "Advance funded",
+    "loan_proceeds": "Loan proceeds",
+    "refund": "Refund",
+    "owner_contribution": "Owner contribution",
+}
+_CREDIT_READER_KINDS = {
+    "customer": "customer",
+    "customer_payment": "customer",
+    "card_settlement": "card_settlement",
+    "merchant_settlement": "card_settlement",
+    "transfer": "transfer",
+    "loan_proceeds": "loan_proceeds",
+    "advance_funding": "advance_funding",
+    "funding": "advance_funding",
+    "refund": "refund",
+    "owner_contribution": "owner_contribution",
+    "other": "other",
 }
 #: Kinds whose payments are contractual debt service (cards are reported beside them, not inside).
 DEBT_KINDS = frozenset({"merchant_cash_advance", "loan", "lease"})
@@ -278,4 +298,38 @@ def match_names(left: str, right: str) -> bool:
         return True
     # "OnDeck" against "ON DECK CAPITAL": the same name with or without a space.
     compact_a, compact_b = a.replace(" ", ""), b.replace(" ", "")
-    return (len(compact_a) >= 5 and compact_a in compact_b) or (len(compact_b) >= 5 and compact_b in compact_a)
+    return (len(compact_a) >= 5 and compact_a in compact_b) or (
+        len(compact_b) >= 5 and compact_b in compact_a
+    )
+
+
+def classify_credit(
+    payee: str, *, reader_kind: str | None = None, self_names: tuple[str, ...] = ()
+) -> tuple[str, str]:
+    """(kind, rationale) for a recurring inbound payer: an advance landing,
+    loan proceeds, card settlements, transfers, refunds, or customers."""
+    key = normalize_vendor(payee or "")
+    if not key:
+        return "other", "No payer name."
+    text = f" {key} "
+    for pattern, label in _MCA_COMPILED:
+        if pattern.search(text):
+            return (
+                "advance_funding",
+                f"Known advance funder ({label}) paying in: an advance landing.",
+            )
+    category, rationale = classify_vendor(key, 1, self_names)
+    if category == "loan":
+        return "loan_proceeds", rationale
+    if category == "merchant_services":
+        return "card_settlement", rationale
+    if category == "transfer":
+        return "transfer", rationale
+    if category == "owner_draw":
+        return "owner_contribution", rationale
+    if category == "tax":
+        return "refund", rationale
+    guess = _CREDIT_READER_KINDS.get(str(reader_kind or "").strip().lower().replace(" ", "_"))
+    if guess:
+        return guess, "The statement reader's reading of the payer."
+    return "customer", "Inbound from a counterparty with no lender or processor name."

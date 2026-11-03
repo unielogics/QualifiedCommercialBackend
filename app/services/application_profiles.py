@@ -377,6 +377,7 @@ async def client_evidence_banking_summary(
                 and uploaded_count == 0
                 and not verification.business_banking_complete
             ),
+            counted_accounts=list(getattr(profile, "counted_bank_accounts", None) or []),
         ),
     )
 

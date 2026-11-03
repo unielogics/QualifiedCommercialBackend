@@ -163,6 +163,9 @@ from app.schemas.financial_cockpit import (
     AdvanceRead,
     AdvancesRead,
     AdvancesWrite,
+    BankAccountRead,
+    BankAccountsRead,
+    BankAccountsWrite,
     FinancialCockpitRead,
     StatementRereadResult,
 )
@@ -2368,6 +2371,41 @@ async def reread_financial_cockpit_statements(
         )
     await db.commit()
     return StatementRereadResult(queued=len(targets), file_ids=[file.id for file in targets])
+
+
+@router.get("/{profile_id}/bank-accounts", response_model=BankAccountsRead)
+async def get_bank_accounts(profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> BankAccountsRead:
+    """The checking accounts the AI found on the statements and which ones count."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    accounts = await financial_cockpit.bank_accounts_for_profile(db, profile)
+    return BankAccountsRead(profile_id=profile.id, accounts=[BankAccountRead(**a) for a in accounts], counted=list(profile.counted_bank_accounts or []))
+
+
+@router.put("/{profile_id}/bank-accounts", response_model=BankAccountsRead)
+async def put_bank_accounts(
+    profile_id: UUID, payload: BankAccountsWrite, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> BankAccountsRead:
+    """Choose which checking accounts count toward the statement requirement
+    and which the cockpit reads by default. An empty list means every account."""
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    accounts = await financial_cockpit.bank_accounts_for_profile(db, profile)
+    known = {a["key"] for a in accounts}
+    unknown = [key for key in payload.counted if key not in known]
+    if unknown:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"Unknown account: {', '.join(unknown)}")
+    profile.counted_bank_accounts = list(dict.fromkeys(payload.counted))
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "bank_accounts.counted",
+        "Counting every account" if not payload.counted else f"Counting {len(payload.counted)} account(s): {', '.join(a['label'] for a in accounts if a['key'] in set(payload.counted))}",
+        metadata={"counted": profile.counted_bank_accounts},
+    )
+    await db.commit()
+    accounts = await financial_cockpit.bank_accounts_for_profile(db, profile)
+    return BankAccountsRead(profile_id=profile.id, accounts=[BankAccountRead(**a) for a in accounts], counted=list(profile.counted_bank_accounts or []))
 
 
 @router.get("/{profile_id}/advances", response_model=AdvancesRead)

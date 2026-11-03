@@ -582,8 +582,16 @@ from app.services.financial_cockpit import (  # noqa: E402
 )
 
 
-def _recurring_month(period: str, debits: list[dict]) -> dict:
-    return {"statement_period": period, "total_deposits_and_credits": 50000, "total_withdrawals_and_debits": 45000, "recurring_debits": debits}
+def _recurring_month(period: str, debits: list[dict], credits: list[dict] | None = None, overdrafts: list[dict] | None = None, **extra) -> dict:
+    return {
+        "statement_period": period,
+        "total_deposits_and_credits": 50000,
+        "total_withdrawals_and_debits": 45000,
+        "recurring_debits": debits,
+        "recurring_credits": credits or [],
+        "overdraft_items": overdrafts or [],
+        **extra,
+    }
 
 
 def _statement_with_recurring(file_id: str, months: list[dict]) -> dict:
@@ -665,3 +673,130 @@ def test_the_statement_prompt_asks_for_recurring_debits() -> None:
     from app.services import bucket_ai
 
     assert any("recurring_debits" in value and "kind_guess" in value for value in vars(bucket_ai).values() if isinstance(value, str))
+
+
+# ---------------------------------------------------------------------------
+# Accounts, per-month amounts, credits, overdrafts
+# ---------------------------------------------------------------------------
+
+
+def test_each_account_keeps_its_own_series_and_summary() -> None:
+    cockpit = build_cockpit(
+        [
+            _bank("c1", "2026-05-01 to 2026-05-31", 30000, 25000, ending_balance=5000),
+            _bank("c2", "2026-06-01 to 2026-06-30", 32000, 26000, ending_balance=6000),
+            _bank("s1", "2026-05-01 to 2026-05-31", 2000, 500, ending_balance=9000, bank="Chase", last4="7777"),
+        ],
+        [],
+    )
+    accounts = cockpit["bank"]["accounts"]
+    assert [a["label"] for a in accounts] == ["Chase ••1234", "Chase ••7777"]
+    checking = accounts[0]
+    assert [m["month"] for m in checking["series"]] == ["2026-05", "2026-06"]
+    assert checking["series"][0]["net"] == 5000 and checking["series"][0]["accounts"] == ["Chase ••1234"]
+    assert checking["summary"]["avg_deposits"] == 31000 and checking["summary"]["months"] == 2
+    savings = accounts[1]
+    assert savings["series"][0]["ending_balance"] == 9000 and savings["summary"]["avg_net"] == 1500
+    combined = cockpit["bank"]["months"]
+    assert combined[0]["deposits"] == 32000 and combined[0]["ending_balance"] == 14000  # both accounts in May
+
+
+def test_payees_carry_the_amount_seen_each_month_and_their_account() -> None:
+    recurring = recurring_payments([_statement_with_recurring("s1", [_recurring_month("2026-05-01 to 2026-05-31", [ONDECK]), _recurring_month("2026-06-01 to 2026-06-30", [ONDECK, MYSTERY])])])
+    by = {p["payee"]: p for p in recurring["payees"]}
+    assert by["ONDECK ACH DEBIT 4471"]["monthly"] == {"2026-05": 6300.0, "2026-06": 6300.0}
+    assert by["FORWARD FINANCING LLC"]["monthly"] == {"2026-06": 4000.0}
+    assert by["ONDECK ACH DEBIT 4471"]["accounts"] == ["Chase ••1204"]
+    assert recurring["files_need_reread"] == []  # every field present
+    assert recurring["total_monthly"] == 8300.0
+
+    partial = recurring_payments([_statement_with_recurring("p", [{"statement_period": "2026-05-01 to 2026-05-31", "recurring_debits": [ONDECK]}])])
+    assert partial["files_need_reread"] == ["p"]  # credits and overdraft items never read
+
+
+def test_recurring_credits_name_where_the_money_comes_from() -> None:
+    credits = recurring_payments(
+        [
+            _statement_with_recurring(
+                "s1",
+                [
+                    _recurring_month(
+                        "2026-05-01 to 2026-05-31",
+                        [],
+                        credits=[
+                            {"payee": "STRIPE TRANSFER", "occurrences": 20, "total_amount": 40000, "average_amount": 2000, "cadence": "daily", "kind_guess": "card_settlement"},
+                            {"payee": "ONDECK CAPITAL", "occurrences": 1, "total_amount": 80000, "average_amount": 80000, "cadence": "irregular", "kind_guess": "other"},
+                            {"payee": "ACME CORP", "occurrences": 2, "total_amount": 9000, "average_amount": 4500, "cadence": "biweekly", "kind_guess": "customer"},
+                        ],
+                    )
+                ],
+            )
+        ],
+        field="recurring_credits",
+        direction=1,
+    )
+    by = {p["payee"]: p for p in credits["payees"]}
+    assert by["STRIPE TRANSFER"]["kind"] == "card_settlement"
+    assert by["ONDECK CAPITAL"]["kind"] == "advance_funding" and by["ONDECK CAPITAL"]["kind_label"] == "Advance funded"
+    assert by["ACME CORP"]["kind"] == "customer"
+    assert all(not p["is_debt"] and not p["is_card"] for p in credits["payees"])
+    assert credits["observed_debt_service_monthly"] is None and credits["total_monthly"] == 129000.0
+
+
+def test_negative_days_and_overdraft_items_are_called_out() -> None:
+    cockpit = build_cockpit(
+        [
+            _statement_with_recurring(
+                "s1",
+                [
+                    _recurring_month(
+                        "2026-05-01 to 2026-05-31",
+                        [ONDECK],
+                        overdrafts=[
+                            {"date": "2026-05-12", "description": "OVERDRAFT FEE", "amount": 34, "type": "overdraft_fee"},
+                            {"date": "2026-05-12", "description": "Balance -$412.10", "amount": None, "type": "negative_balance"},
+                            {"date": "2026-05-20", "description": "RETURNED ITEM FEE", "amount": 34, "type": "returned_item"},
+                        ],
+                        negative_balance_dates=["2026-05-12", "2026-05-13"],
+                        low_daily_balance=-412.1,
+                        nsf_or_overdraft_count=2,
+                    ),
+                    _recurring_month("2026-06-01 to 2026-06-30", [ONDECK], low_daily_balance=800),
+                ],
+            )
+        ],
+        [],
+    )
+    may = cockpit["bank"]["months"][0]
+    assert may["negative_dates"] == ["2026-05-12", "2026-05-13"] and may["negative_days"] == 2 and may["fees"] == 68.0
+    overdrafts = cockpit["bank"]["overdrafts"]
+    assert (overdrafts["negative_days_total"], overdrafts["nsf_total"], overdrafts["fees_total"], overdrafts["lowest_balance"]) == (2, 2, 68.0, -412.1)
+    assert overdrafts["negative_months"] == ["2026-05"]
+    assert [i["type"] for i in overdrafts["items"]] == ["overdraft_fee", "negative_balance", "returned_item"]
+    assert overdrafts["items"][0]["month"] == "2026-05" and overdrafts["items"][0]["account"] == "Chase ••1204"
+    assert cockpit["bank"]["summary"]["negative_days_total"] == 2
+
+
+def test_counted_accounts_narrow_the_combined_months_but_keep_every_account_visible() -> None:
+    from app.services.financial_cockpit import bank_file_counted
+
+    analyses = [
+        _bank("c1", "2026-05-01 to 2026-05-31", 30000, 25000, ending_balance=5000),
+        _bank("s1", "2026-05-01 to 2026-05-31", 2000, 500, ending_balance=9000, bank="Chase", last4="7777"),
+    ]
+    cockpit = build_cockpit(analyses, [], counted_accounts=["chase ••1234"])
+    assert cockpit["bank"]["months"][0]["deposits"] == 30000  # only the counted account
+    assert cockpit["bank"]["counted_accounts"] == ["chase ••1234"]
+    assert [(a["label"], a["counted"]) for a in cockpit["bank"]["accounts"]] == [("Chase ••1234", True), ("Chase ••7777", False)]
+    assert cockpit["bank"]["all_months"][0]["deposits"] == 32000 and cockpit["bank"]["all_summary"]["avg_deposits"] == 32000
+
+    everything = build_cockpit(analyses, [], counted_accounts=[])
+    assert everything["bank"]["months"][0]["deposits"] == 32000 and everything["bank"]["all_months"] is None
+
+    stale = build_cockpit(analyses, [], counted_accounts=["gone ••0000"])  # a key no statement matches: every account counts
+    assert stale["bank"]["months"][0]["deposits"] == 32000
+
+    assert bank_file_counted({"key_facts": {"bank": "Chase", "account_last4": "7777"}}, ["chase ••7777"]) is True
+    assert bank_file_counted({"key_facts": {"bank": "Chase", "account_last4": "7777"}}, ["chase ••1234"]) is False
+    assert bank_file_counted(None, ["chase ••1234"]) is False
+    assert bank_file_counted(None, []) is True

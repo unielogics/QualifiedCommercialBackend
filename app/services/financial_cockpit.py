@@ -45,6 +45,7 @@ from app.services.payee_classification import (
     CARD_KINDS,
     DEBT_KINDS,
     KIND_LABELS,
+    classify_credit,
     classify_payee,
     match_names,
 )
@@ -73,6 +74,11 @@ PAYMENTS_PER_MONTH = {
     "semimonthly": 2.0,
     "monthly": 1.0,
 }
+OVERDRAFT_TYPES = frozenset(
+    {"nsf_fee", "overdraft_fee", "returned_item", "negative_balance", "other"}
+)
+OVERDRAFT_FEE_TYPES = frozenset({"nsf_fee", "overdraft_fee", "returned_item"})
+STATEMENT_READ_FIELDS = ("recurring_debits", "recurring_credits", "overdraft_items")
 #: A declared payment within this much of the statements' figure "matches".
 RECONCILE_TOLERANCE_PCT = 15.0
 MAX_RECURRING_PAYEES = 40
@@ -303,10 +309,25 @@ def _statement_record(
         return None
     withdrawals = _num(source.get("total_withdrawals_and_debits"))
     negatives = source.get("negative_balance_dates")
+    negative_dates: list[str] = []
     if isinstance(negatives, list):
-        negative_days: int | None = len([d for d in negatives if d])
+        negative_dates = sorted({d for d in (_iso_date(v) for v in negatives if v) if d})
+        negative_days: int | None = len(negative_dates)
     else:
         negative_days = _int(negatives)
+    items: list[dict[str, Any]] = []
+    for raw in source.get("overdraft_items") or []:
+        if not isinstance(raw, dict):
+            continue
+        kind = str(raw.get("type") or raw.get("kind") or "other").strip().lower()
+        items.append(
+            {
+                "date": _iso_date(raw.get("date")),
+                "description": str(raw.get("description") or "").strip()[:140],
+                "amount": _num(raw.get("amount")),
+                "type": kind if kind in OVERDRAFT_TYPES else "other",
+            }
+        )
     return {
         "month": month,
         "deposits": _num(source.get("total_deposits_and_credits")),
@@ -319,7 +340,30 @@ def _statement_record(
         "nsf": _int(source.get("nsf_or_overdraft_count")),
         "returned_checks": _int(source.get("returned_check_count")),
         "negative_days": negative_days,
+        "negative_dates": negative_dates,
+        "overdraft_items": items,
     }
+
+
+def _finalize_month(month: dict[str, Any]) -> dict[str, Any]:
+    deposits, withdrawals = month.get("deposits"), month.get("withdrawals")
+    month["net"] = (
+        _round(deposits - withdrawals) if deposits is not None and withdrawals is not None else None
+    )
+    month["outflow_ratio"] = _ratio(withdrawals, deposits)
+    for field in _BANK_AMOUNTS:
+        month[field] = _round(month.get(field))
+    month["negative_dates"] = sorted(set(month.get("negative_dates") or []))
+    if month["negative_dates"]:
+        month["negative_days"] = len(month["negative_dates"])
+    fees = sum(
+        item["amount"]
+        for item in month.get("overdraft_items") or []
+        if item.get("amount") and item.get("type") in OVERDRAFT_FEE_TYPES
+    )
+    month["fees"] = _round(fees) if fees else None
+    month.setdefault("label", month_label(month["month"]))
+    return month
 
 
 def _populated(record: dict[str, Any]) -> int:
@@ -335,15 +379,31 @@ def _account_identity(facts: dict[str, Any], row: dict[str, Any]) -> tuple[str, 
     return label.casefold(), label
 
 
+def account_key_of(facts: Any) -> str:
+    """The account a statement belongs to, as the cockpit names it."""
+    return _account_identity(facts if isinstance(facts, dict) else {}, {})[0]
+
+
+def bank_file_counted(analysis_payload: Any, counted: list[str] | None) -> bool:
+    """Does a statement's account count on the file? Every account counts
+    until the desk chooses; after that only the chosen keys do."""
+    if not counted:
+        return True
+    facts = analysis_payload.get("key_facts") if isinstance(analysis_payload, dict) else None
+    return account_key_of(facts) in set(counted)
+
+
 def bank_months(
     analyses: list[dict[str, Any]],
+    counted: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Month-by-month bank figures, every account on the file combined.
+    """Month-by-month bank figures, the counted accounts on the file combined.
 
     One account contributes one record per month (the most populated when a
-    statement was uploaded twice); months then sum across accounts, so a
-    business banking at two institutions reads as one position. A month is
-    accepted when any statement behind it passed the AI evidence review.
+    statement was uploaded twice); months then sum across the counted
+    accounts (every account until the desk chooses), so a business banking at
+    two institutions reads as one position. A month is accepted when any
+    statement behind it passed the AI evidence review.
     """
     per_account: dict[str, dict[str, dict[str, Any]]] = {}
     labels: dict[str, str] = {}
@@ -378,8 +438,11 @@ def bank_months(
                 )
             ):
                 slot[record["month"]] = record
+    counted_keys = {k for k in (counted or []) if k in per_account} or set(per_account)
     combined: dict[str, dict[str, Any]] = {}
     for key, months in per_account.items():
+        if key not in counted_keys:
+            continue
         for month, record in months.items():
             agg = combined.get(month)
             if agg is None:
@@ -389,6 +452,8 @@ def bank_months(
                     "accounts": [],
                     "file_ids": [],
                     "accepted": False,
+                    "negative_dates": [],
+                    "overdraft_items": [],
                 }
                 for field in _BANK_AMOUNTS + _BANK_COUNTS:
                     agg[field] = None
@@ -397,30 +462,39 @@ def bank_months(
             if record["file_id"] and record["file_id"] not in agg["file_ids"]:
                 agg["file_ids"].append(record["file_id"])
             agg["accepted"] = agg["accepted"] or record["accepted"]
+            agg["negative_dates"].extend(record.get("negative_dates") or [])
+            agg["overdraft_items"].extend(
+                {**item, "account": labels[key]} for item in record.get("overdraft_items") or []
+            )
             for field in _BANK_AMOUNTS + _BANK_COUNTS:
                 if record.get(field) is not None:
                     agg[field] = (agg[field] or 0) + record[field]
-    months_out = [combined[key] for key in sorted(combined)]
+    months_out = [_finalize_month(combined[key]) for key in sorted(combined)]
     for month in months_out:
         month["accounts"] = sorted(set(month["accounts"]))
-        deposits, withdrawals = month["deposits"], month["withdrawals"]
-        month["net"] = (
-            _round(deposits - withdrawals)
-            if deposits is not None and withdrawals is not None
-            else None
+    accounts = []
+    for key, months in sorted(per_account.items(), key=lambda kv: labels[kv[0]]):
+        series = []
+        for month_key in sorted(months):
+            record = dict(months[month_key])
+            file_id = record.pop("file_id", None)
+            record["label"] = month_label(month_key)
+            record["accounts"] = [labels[key]]
+            record["file_ids"] = [file_id] if file_id else []
+            record["overdraft_items"] = [
+                {**item, "account": labels[key]} for item in record.get("overdraft_items") or []
+            ]
+            series.append(_finalize_month(record))
+        accounts.append(
+            {
+                "key": key,
+                "label": labels[key],
+                "months": sorted(months.keys()),
+                "accepted_months": sorted(m for m, r in months.items() if r["accepted"]),
+                "series": series,
+                "counted": key in counted_keys,
+            }
         )
-        month["outflow_ratio"] = _ratio(withdrawals, deposits)
-        for field in _BANK_AMOUNTS:
-            month[field] = _round(month[field])
-    accounts = [
-        {
-            "key": key,
-            "label": labels[key],
-            "months": sorted(months.keys()),
-            "accepted_months": sorted(m for m, r in months.items() if r["accepted"]),
-        }
-        for key, months in sorted(per_account.items(), key=lambda kv: labels[kv[0]])
-    ]
     return months_out, accounts
 
 
@@ -858,13 +932,28 @@ def _file_months(facts: dict[str, Any], period_hint: str | None) -> list[str]:
     return months
 
 
+def _statement_fields_read(item: dict[str, Any]) -> set[str]:
+    """Which of the extraction fields the reader produced for this statement
+    (at file level or inside any month)."""
+    facts = item.get("key_facts") or {}
+    if not isinstance(facts, dict):
+        return set()
+    found = {field for field in STATEMENT_READ_FIELDS if field in facts}
+    rows = facts.get("months")
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, dict):
+                found.update(field for field in STATEMENT_READ_FIELDS if field in row)
+    return found
+
+
 def _recurring_entries(
-    item: dict[str, Any],
+    item: dict[str, Any], field: str = "recurring_debits"
 ) -> tuple[list[tuple[list[str], dict[str, Any]]], list[str], bool]:
-    """(entries as (months, debit), the months the file covers, whether the
-    reader produced recurring_debits at all). A per-month list beats a
-    file-level one; a file-level list on a multi-month statement is spread
-    over every month the file covers."""
+    """(entries as (months, row), the months the file covers, whether the
+    reader produced `field` at all). A per-month list beats a file-level one;
+    a file-level list on a multi-month statement is spread over every month
+    the file covers."""
     facts = item.get("key_facts") or {}
     if not isinstance(facts, dict):
         return [], [], False
@@ -874,20 +963,20 @@ def _recurring_entries(
     rows = facts.get("months")
     if isinstance(rows, list) and rows:
         for row in rows:
-            if not isinstance(row, dict) or "recurring_debits" not in row:
+            if not isinstance(row, dict) or field not in row:
                 continue
             read_any = True
             month = statement_period_month(row.get("statement_period")) or statement_period_month(
                 row.get("month")
             )
-            for debit in row.get("recurring_debits") or []:
-                if isinstance(debit, dict):
-                    entries.append(([month] if month else months_all, debit))
-    if not read_any and "recurring_debits" in facts:
+            for entry in row.get(field) or []:
+                if isinstance(entry, dict):
+                    entries.append(([month] if month else months_all, entry))
+    if not read_any and field in facts:
         read_any = True
-        for debit in facts.get("recurring_debits") or []:
-            if isinstance(debit, dict):
-                entries.append((months_all, debit))
+        for entry in facts.get(field) or []:
+            if isinstance(entry, dict):
+                entries.append((months_all, entry))
     return entries, months_all, read_any
 
 
@@ -898,44 +987,53 @@ def _mode(values: list[str]) -> str | None:
     return max(counts, key=lambda k: (counts[k], k)) if counts else None
 
 
-def recurring_payments(analyses: list[dict[str, Any]]) -> dict[str, Any]:
-    """Every payee the statements debit repeatedly, rolled up across months and
-    classified (advance, loan, card, lease, payroll, ...), with the months the
-    reader covered and the statements that still need a re-read."""
+def recurring_payments(
+    analyses: list[dict[str, Any]], *, field: str = "recurring_debits", direction: int = -1
+) -> dict[str, Any]:
+    """Every payee (or payer, for credits) the statements move money to or
+    from repeatedly, rolled up across months and classified, with the amount
+    seen each month, the account it ran through, the months the reader
+    covered and the statements that still need a re-read."""
     groups: dict[str, dict[str, Any]] = {}
     months_read: set[str] = set()
     files_need_reread: list[str] = []
     for item in analyses:
         if "bank_statement" not in _classes(item):
             continue
-        entries, months_all, read_any = _recurring_entries(item)
+        entries, months_all, read_any = _recurring_entries(item, field)
+        if not _statement_fields_read(item) >= set(STATEMENT_READ_FIELDS) and item.get("file_id"):
+            files_need_reread.append(str(item["file_id"]))
         if not read_any:
-            if item.get("file_id"):
-                files_need_reread.append(str(item["file_id"]))
             continue
         months_read.update(months_all)
-        for months, debit in entries:
-            payee = str(debit.get("payee") or debit.get("description") or "").strip()
+        facts = item.get("key_facts") or {}
+        _account_key, account_label = _account_identity(
+            facts if isinstance(facts, dict) else {}, {}
+        )
+        for months, entry in entries:
+            payee = str(
+                entry.get("payee") or entry.get("payer") or entry.get("description") or ""
+            ).strip()
             key = normalize_vendor(payee)
             if not key:
                 continue
             occurrences = (
                 _int(
-                    debit.get("occurrences")
-                    if debit.get("occurrences") is not None
-                    else debit.get("count")
+                    entry.get("occurrences")
+                    if entry.get("occurrences") is not None
+                    else entry.get("count")
                 )
                 or 0
             )
             total = _num(
-                debit.get("total_amount")
-                if debit.get("total_amount") is not None
-                else debit.get("total")
+                entry.get("total_amount")
+                if entry.get("total_amount") is not None
+                else entry.get("total")
             )
             average = _num(
-                debit.get("average_amount")
-                if debit.get("average_amount") is not None
-                else debit.get("amount")
+                entry.get("average_amount")
+                if entry.get("average_amount") is not None
+                else entry.get("amount")
             )
             if total is None and average is not None and occurrences:
                 total = average * occurrences
@@ -950,6 +1048,8 @@ def recurring_payments(analyses: list[dict[str, Any]]) -> dict[str, Any]:
                     "occurrences": 0,
                     "total": 0.0,
                     "months": set(),
+                    "monthly": {},
+                    "accounts": set(),
                     "cadences": [],
                     "same_amounts": [],
                     "reader_kinds": [],
@@ -961,15 +1061,19 @@ def recurring_payments(analyses: list[dict[str, Any]]) -> dict[str, Any]:
             )
             group["occurrences"] += occurrences
             group["total"] += total
-            group["months"].update(m for m in months if m)
-            cadence = str(debit.get("cadence") or "").strip().lower()
+            present = [m for m in months if m]
+            group["months"].update(present)
+            for m in present:
+                group["monthly"][m] = group["monthly"].get(m, 0.0) + total / len(present)
+            group["accounts"].add(account_label)
+            cadence = str(entry.get("cadence") or "").strip().lower()
             if cadence:
                 group["cadences"].append(cadence)
-            if isinstance(debit.get("same_amount"), bool):
-                group["same_amounts"].append(debit["same_amount"])
-            if debit.get("kind_guess") or debit.get("kind"):
-                group["reader_kinds"].append(str(debit.get("kind_guess") or debit.get("kind")))
-            first, last = _iso_date(debit.get("first_date")), _iso_date(debit.get("last_date"))
+            if isinstance(entry.get("same_amount"), bool):
+                group["same_amounts"].append(entry["same_amount"])
+            if entry.get("kind_guess") or entry.get("kind"):
+                group["reader_kinds"].append(str(entry.get("kind_guess") or entry.get("kind")))
+            first, last = _iso_date(entry.get("first_date")), _iso_date(entry.get("last_date"))
             if first and (group["first_date"] is None or first < group["first_date"]):
                 group["first_date"] = first
             if last and (group["last_date"] is None or last > group["last_date"]):
@@ -984,19 +1088,24 @@ def recurring_payments(analyses: list[dict[str, Any]]) -> dict[str, Any]:
         same_amount: bool | None = None
         if group["same_amounts"]:
             same_amount = all(group["same_amounts"])
-        kind, rationale = classify_payee(
-            group["payee"],
-            cadence=cadence,
-            same_amount=same_amount,
-            reader_kind=_mode(group["reader_kinds"]),
-        )
+        if direction < 0:
+            kind, rationale = classify_payee(
+                group["payee"],
+                cadence=cadence,
+                same_amount=same_amount,
+                reader_kind=_mode(group["reader_kinds"]),
+            )
+        else:
+            kind, rationale = classify_credit(
+                group["payee"], reader_kind=_mode(group["reader_kinds"])
+            )
         occurrences = group["occurrences"]
         payees.append(
             {
                 "key": group["key"],
                 "payee": group["payee"],
                 "kind": kind,
-                "kind_label": KIND_LABELS.get(kind, kind),
+                "kind_label": KIND_LABELS.get(kind, kind.replace("_", " ").capitalize()),
                 "rationale": rationale,
                 "cadence": cadence,
                 "same_amount": same_amount,
@@ -1004,14 +1113,16 @@ def recurring_payments(analyses: list[dict[str, Any]]) -> dict[str, Any]:
                 "total": _round(group["total"]),
                 "average_amount": _round(group["total"] / occurrences) if occurrences else None,
                 "monthly_average": _round(group["total"] / span),
+                "monthly": {m: _round(v) for m, v in sorted(group["monthly"].items())},
                 "months": sorted(group["months"]),
                 "months_seen": len(group["months"]),
+                "accounts": sorted(group["accounts"]),
                 "first_date": group["first_date"],
                 "last_date": group["last_date"],
                 "file_ids": group["file_ids"],
                 "accepted": group["accepted"],
-                "is_debt": kind in DEBT_KINDS,
-                "is_card": kind in CARD_KINDS,
+                "is_debt": direction < 0 and kind in DEBT_KINDS,
+                "is_card": direction < 0 and kind in CARD_KINDS,
             }
         )
     payees.sort(key=lambda p: (not p["is_debt"], -(p["monthly_average"] or 0)))
@@ -1024,6 +1135,7 @@ def recurring_payments(analyses: list[dict[str, Any]]) -> dict[str, Any]:
         "payees": payees,
         "months_read": sorted(months_read),
         "files_need_reread": sorted(set(files_need_reread)),
+        "total_monthly": _round(sum(p["monthly_average"] or 0 for p in payees)) if payees else None,
         "observed_debt_service_monthly": _round(sum(p["monthly_average"] or 0 for p in debt))
         if debt
         else None,
@@ -1036,6 +1148,48 @@ def recurring_payments(analyses: list[dict[str, Any]]) -> dict[str, Any]:
         "observed_card_monthly": _round(sum(p["monthly_average"] or 0 for p in cards))
         if cards
         else None,
+    }
+
+
+def overdrafts_block(months: list[dict[str, Any]]) -> dict[str, Any]:
+    """Negative-balance days, NSF or overdraft items and their fees, by month."""
+    by_month = []
+    items: list[dict[str, Any]] = []
+    for month in months:
+        month_items = [
+            {**item, "month": month["month"]} for item in month.get("overdraft_items") or []
+        ]
+        items.extend(month_items)
+        by_month.append(
+            {
+                "month": month["month"],
+                "label": month["label"],
+                "negative_dates": list(month.get("negative_dates") or []),
+                "negative_days": month.get("negative_days") or 0,
+                "nsf": month.get("nsf") or 0,
+                "returned_checks": month.get("returned_checks") or 0,
+                "low_balance": month.get("low_balance"),
+                "ending_balance": month.get("ending_balance"),
+                "fees": month.get("fees"),
+                "items": month_items,
+            }
+        )
+    negative_months = [
+        m["month"]
+        for m in by_month
+        if m["negative_days"] or (m["low_balance"] is not None and m["low_balance"] < 0)
+    ]
+    return {
+        "by_month": by_month,
+        "items": items,
+        "negative_days_total": sum(m["negative_days"] for m in by_month),
+        "negative_months": negative_months,
+        "nsf_total": sum(m["nsf"] for m in by_month),
+        "returned_total": sum(m["returned_checks"] for m in by_month),
+        "fees_total": _round(sum(m["fees"] or 0 for m in by_month)) or None,
+        "lowest_balance": min(
+            (m["low_balance"] for m in by_month if m["low_balance"] is not None), default=None
+        ),
     }
 
 
@@ -1501,6 +1655,7 @@ def build_cockpit(
     *,
     requested_amount: float | None = None,
     proposed_terms: dict[str, Any] | None = None,
+    counted_accounts: list[str] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """The cockpit read model from plain dicts.
@@ -1511,8 +1666,15 @@ def build_cockpit(
     `debts`: the active dos_debts rows as dicts. `proposed_terms`: the loan
     on record (amount, rate_pct, term_months, monthly_payment, source, label).
     """
-    months, accounts = bank_months(analyses)
+    months, accounts = bank_months(analyses, counted_accounts)
     bank = bank_summary(months)
+    for account in accounts:
+        account["summary"] = bank_summary(account["series"])
+    narrowed = any(not a["counted"] for a in accounts)
+    all_months, _all_accounts = bank_months(analyses) if narrowed else (months, accounts)
+    all_summary = bank_summary(all_months) if narrowed else bank
+    credits = recurring_payments(analyses, field="recurring_credits", direction=1)
+    overdrafts = overdrafts_block(months)
     years = tax_years(analyses)
     statement = profit_and_loss(analyses)
     sheet = balance_sheet(analyses)
@@ -1547,7 +1709,17 @@ def build_cockpit(
         "generated_at": (now or datetime.now(UTC)).isoformat(),
         "requested_amount": _num(requested_amount),
         "coverage": coverage,
-        "bank": {"months": months, "summary": bank, "accounts": accounts, "recurring": recurring},
+        "bank": {
+            "months": months,
+            "summary": bank,
+            "accounts": accounts,
+            "recurring": recurring,
+            "recurring_credits": credits,
+            "overdrafts": overdrafts,
+            "counted_accounts": [a["key"] for a in accounts if a["counted"]] if narrowed else [],
+            "all_months": all_months if narrowed else None,
+            "all_summary": all_summary if narrowed else None,
+        },
         "tax": {"years": years},
         "profit_and_loss": statement,
         "balance_sheet": sheet,
@@ -1712,6 +1884,7 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
         _debt_dicts(debts),
         requested_amount=float(requested_amount) if requested_amount is not None else None,
         proposed_terms=term_sheet_terms(sheet),
+        counted_accounts=list(getattr(profile, "counted_bank_accounts", None) or []),
     )
     cockpit["profile_id"] = str(profile.id)
     return cockpit
@@ -1735,3 +1908,27 @@ async def reread_statements(db: AsyncSession, profile: ApplicationProfile) -> li
     for file in targets:
         await bucket_ai.enqueue_file_analysis(db, file, force=True)
     return targets
+
+
+async def bank_accounts_for_profile(
+    db: AsyncSession, profile: ApplicationProfile
+) -> list[dict[str, Any]]:
+    """Every checking account the statements on the file belong to, with its
+    months, its accepted months and whether the desk counts it."""
+    files, latest, _classifications = await programs._evidence_inventory(db, profile)
+    accepted = await programs.accepted_evidence_file_ids(db, profile, files, latest)
+    analyses = _analysis_rows(files, latest, accepted)
+    _months, accounts = bank_months(
+        analyses, list(getattr(profile, "counted_bank_accounts", None) or [])
+    )
+    return [
+        {
+            "key": a["key"],
+            "label": a["label"],
+            "months": a["months"],
+            "accepted_months": a["accepted_months"],
+            "counted": a["counted"],
+            "latest_month": a["months"][-1] if a["months"] else None,
+        }
+        for a in accounts
+    ]
