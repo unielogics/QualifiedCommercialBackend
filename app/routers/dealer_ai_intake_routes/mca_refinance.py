@@ -626,13 +626,9 @@ async def mca_refinance_credit_pull(
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
 
     state = core._intake_state(intake)
-    state["credit_pull"] = {
-        "pull_id": str(pull.id),
-        "fico": pull.fico,
-        "pulled_at": pull.pulled_at.isoformat() if pull.pulled_at else None,
-        "expires_at": pull.expires_at.isoformat() if pull.expires_at else None,
-    }
+    state["credit_pull"] = credit_pull_core.intake_credit_state(pull)
     intake.intake_state = state
+    await credit_pull_core.stamp_primary_owner(db, intake, pull)
     await core._log(
         db,
         intake.bucket_id,

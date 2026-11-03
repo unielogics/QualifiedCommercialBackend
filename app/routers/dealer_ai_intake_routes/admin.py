@@ -58,6 +58,7 @@ __all__ = [
     "request_lead_contract",
     "get_lead_contract_status",
     "get_lead_credit_status",
+    "get_lead_credit_report",
     "get_lead_program_fit",
     "get_lead_dscr_potential",
     "run_lead_credit_pull",
@@ -1404,6 +1405,15 @@ async def get_lead_credit_status(
         return core.LeadCreditStatusResponse(authorization_requested=False, authorization_signed=False)
 
     credit_state = core._credit_pull_state(intake)
+    from app.models.credit_pull import CreditPull
+    from app.services import credit_pull_core
+
+    pull = await db.get(CreditPull, UUID(credit_state["pull_id"])) if credit_state.get("pull_id") else None
+    extras = credit_pull_core.credit_status_extras(pull)
+    if pull is None and credit_state.get("status") == "needs_ssn":
+        extras["attention"] = "The pull after signing found no bureau match on name, address and date of birth; the client is asked for the SSN, or run it here with the SSN."
+    elif pull is None and credit_state.get("status") in {"failed", "deferred"}:
+        extras["attention"] = "The pull after signing did not run; run it here."
     return core.LeadCreditStatusResponse(
         authorization_requested=True,
         authorization_signed=doc.status == "uploaded",
@@ -1412,7 +1422,31 @@ async def get_lead_credit_status(
         fico=credit_state.get("fico") if credit_state else None,
         pulled_at=datetime.fromisoformat(credit_state["pulled_at"]) if credit_state and credit_state.get("pulled_at") else None,
         expires_at=datetime.fromisoformat(credit_state["expires_at"]) if credit_state and credit_state.get("expires_at") else None,
+        **extras,
     )
+
+@core.admin_router.get("/{intake_id}/credit-report")
+async def get_lead_credit_report(
+    intake_id: UUID,
+    user: core.CurrentUser,
+    db: AsyncSession = Depends(core.get_db),
+) -> dict:
+    """A one-minute link to the archived bureau report page for this lead's
+    latest pull. The page is the record the score came from; it is kept
+    outside every client room and never attached to mail."""
+    core._require_super_admin(user)
+    intake = await core._load_admin_dealer_lead(db, intake_id)
+    credit_state = core._credit_pull_state(intake)
+    if not credit_state.get("pull_id"):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No credit pull on this file")
+    from app.models.credit_pull import CreditPull
+    from app.services import credit_report_archive
+
+    pull = await db.get(CreditPull, UUID(credit_state["pull_id"]))
+    key = (pull.bureau_response or {}).get("report_s3_key") if pull is not None and isinstance(pull.bureau_response, dict) else None
+    if not key:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No archived report for this pull")
+    return {"url": credit_report_archive.report_download_url(key), "expires_in_seconds": credit_report_archive.REPORT_LINK_SECONDS}
 
 @core.admin_router.get("/{intake_id}/program-fit", response_model=core.LeadProgramFitResponse)
 async def get_lead_program_fit(
@@ -1547,13 +1581,9 @@ async def run_lead_credit_pull(
     # ONLY place credit data touches PublicUnderwritingIntake (never added to
     # _CLIENT_SAFE_INTAKE_STATE_KEYS — bureau data stays admin/AI-only).
     state = core._intake_state(intake)
-    state["credit_pull"] = {
-        "pull_id": str(pull.id),
-        "fico": pull.fico,
-        "pulled_at": pull.pulled_at.isoformat() if pull.pulled_at else None,
-        "expires_at": pull.expires_at.isoformat() if pull.expires_at else None,
-    }
+    state["credit_pull"] = credit_pull_core.intake_credit_state(pull)
     intake.intake_state = state
+    await credit_pull_core.stamp_primary_owner(db, intake, pull)
     await db.commit()
 
     return core.LeadCreditStatusResponse(
@@ -1564,6 +1594,7 @@ async def run_lead_credit_pull(
         fico=pull.fico,
         pulled_at=pull.pulled_at,
         expires_at=pull.expires_at,
+        **credit_pull_core.credit_status_extras(pull),
     )
 
 @core.admin_router.post("/{intake_id}/prepare-banker-submission", response_model=core.PrepareBankerSubmissionResponse)

@@ -387,29 +387,35 @@ def parse_report_html(html: str) -> ScrapedReport:
 
 
 async def fetch_and_parse(report_link: str) -> ScrapedReport | None:
-    """Fetch a report URL via the cached dashboard session and parse.
+    """Fetch a report URL via the cached dashboard session and parse."""
+    parsed, _html = await fetch_report(report_link)
+    return parsed
 
-    Returns None when the parser couldn't load the page at all (session
-    failure / network / non-200). A parsed report with empty fields is
-    still a valid result and gets returned — callers should check
-    `best_score is None` to detect a parser break, not the return value.
+
+async def fetch_report(report_link: str) -> tuple[ScrapedReport | None, str | None]:
+    """Fetch a report URL via the cached dashboard session: (parsed, html).
+
+    Both are None when the page could not be loaded at all (session failure,
+    network, non-200). A parsed report with empty fields is still a valid
+    result — callers should check `best_score is None` to detect a parser
+    break, not the return value. The html is handed back so it can be kept.
     """
     if not report_link:
-        return None
+        return None, None
     try:
         session = get_session()
         resp = await session.fetch(report_link)
     except IsoftpullSessionError as exc:
         log.warning("iSoftPull session unavailable while scraping report: %s", exc)
-        return None
+        return None, None
     except Exception as exc:  # noqa: BLE001
         log.warning("Network error while scraping iSoftPull report: %s", exc)
-        return None
+        return None, None
 
     if resp.status_code != 200:
         log.warning(
             "iSoftPull report fetch returned %d for %s", resp.status_code, report_link
         )
-        return None
+        return None, None
 
-    return parse_report_html(resp.text)
+    return parse_report_html(resp.text), resp.text

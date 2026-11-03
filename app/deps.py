@@ -14,7 +14,7 @@ from typing import Annotated
 import httpx
 import jwt
 from fastapi import Depends, Header, HTTPException, Request, status
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -831,6 +831,10 @@ async def require_valid_credit_pull(
         .where(CreditPull.client_id == cid)
         .where(CreditPull.status == CreditPullStatus.COMPLETED)
         .where(CreditPull.expires_at > datetime.now(UTC))
+        # A pull the bureau answered without a score, or whose "score" is the
+        # identity-check stand-in, is not a credit check for rate purposes.
+        .where(CreditPull.fico.is_not(None))
+        .where(or_(CreditPull.notes.is_(None), ~CreditPull.notes.like("%fico_source=intelligence-proxy%")))
         .limit(1)
     )
     row = (await db.execute(stmt)).scalar_one_or_none()

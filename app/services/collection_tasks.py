@@ -39,6 +39,20 @@ COMPLETE = {"verified", "waived", "not_applicable"}
 OPEN_TASKS = {"open", "requested"}
 
 
+def _render_request_message(text: object, *, label: str | None) -> str | None:
+    """A playbook's request template with its placeholder filled in.
+
+    Templates read "Please provide {label}."; shown raw, the desk and the
+    client saw the braces. The label is the requirement's own.
+    """
+    if text is None:
+        return None
+    rendered = str(text)
+    if label:
+        rendered = rendered.replace("{label}", label).replace("{{label}}", label)
+    return rendered
+
+
 def timestamp() -> datetime:
     return datetime.now(UTC)
 
@@ -358,12 +372,13 @@ async def sync_collection_tasks(
         task.requirement_keys = [row.requirement_key for row in members]
         task.label = first.label
         message_override = (task.config or {}).get("request_message_override")
-        task.description = (
+        task.description = _render_request_message(
             message_override
             or metadata.get("request_message")
             or metadata.get("objective_text")
             or metadata.get("completion_criteria")
-            or first.state_reason
+            or first.state_reason,
+            label=first.label,
         )
         task.config = {
             **merged_config,

@@ -1145,6 +1145,12 @@ class LeadCreditStatusResponse(BaseModel):
     fico: int | None = None
     pulled_at: datetime | None = None
     expires_at: datetime | None = None
+    # Honesty beside the number: where it came from, whether it is a bureau
+    # score, whether the report page is on file, and what needs a person.
+    fico_source: str | None = None
+    score_verified: bool = False
+    report_available: bool = False
+    attention: str | None = None
 
 
 # Human-facing labels for every _compute_loan_program_fit key — the single
@@ -1629,6 +1635,9 @@ class DealerIntakeResponse(BaseModel):
     # Set when the client owes a signature on a Production Package: the room
     # shows the signing screen and nothing else until it is signed.
     signing_gate: dict[str, Any] | None = None
+    # Where the soft credit check stands, in words the client may see:
+    # not_started, completed, needs_ssn or deferred. Never the score.
+    credit_check: dict[str, Any] | None = None
 
 
 class DealerAILeadRow(BaseModel):
@@ -2805,6 +2814,20 @@ def _intake_state(intake: PublicUnderwritingIntake) -> dict[str, Any]:
 def _entity_structure(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     raw = _intake_state(intake).get("entity_structure")
     return raw if isinstance(raw, dict) else {}
+
+
+def _client_credit_check(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    """The client-safe projection of the credit pull: a status, never a score."""
+    state = _credit_pull_state(intake)
+    if state.get("pull_id") or state.get("fico") is not None:
+        status_value = "completed"
+    elif state.get("status") == "needs_ssn":
+        status_value = "needs_ssn"
+    elif state.get("status") in {"failed", "deferred"}:
+        status_value = "deferred"
+    else:
+        status_value = "not_started"
+    return {"status": status_value, "attempted_at": state.get("attempted_at") or state.get("pulled_at")}
 
 
 def _credit_pull_state(intake: PublicUnderwritingIntake) -> dict[str, Any]:
@@ -5458,7 +5481,11 @@ def _authoritative_facts_from_chat(
     credit_state = _credit_pull_state(intake)
     if credit_state.get("fico") is not None:
         facts["credit_score"] = str(credit_state["fico"])
-        facts["credit_score_source"] = "verified credit bureau soft pull"
+        facts["credit_score_source"] = (
+            "estimated: the bureau returned no score, the identity check passed (not a bureau score)"
+            if credit_state.get("fico_source") == "intelligence-proxy"
+            else "verified credit bureau soft pull"
+        )
         return facts
     stored_facts = _intake_state(intake).get("chat_facts")
     if isinstance(stored_facts, list):
@@ -5862,7 +5889,11 @@ def _prepend_credit_key_metric(summary: dict[str, Any], intake: PublicUnderwriti
     fico = credit_state.get("fico")
     if fico is None:
         return
-    row = {"label": "Credit score (verified)", "value": str(fico), "note": "Bureau soft pull"}
+    row = (
+        {"label": "Credit score (estimated)", "value": str(fico), "note": "Bureau returned no score; identity check passed"}
+        if credit_state.get("fico_source") == "intelligence-proxy"
+        else {"label": "Credit score (verified)", "value": str(fico), "note": "Bureau soft pull"}
+    )
     metrics = summary.get("key_metrics")
     if isinstance(metrics, list):
         metrics.insert(0, row)
@@ -7115,6 +7146,7 @@ async def _response(
             if readiness_snapshot is not None
             else None
         ),
+        credit_check=_client_credit_check(intake),
         ai_paused_until=_link.ai_paused_until if _link is not None and engagement.is_paused(_link) else None,
         token=token,
         session_token=session_token,
@@ -7934,6 +7966,17 @@ async def _sign_requested_document(
     )
     if not is_success_fee:
         await db.commit()
+    if is_credit_auth and applicant_data:
+        # The authorization is what the pull waits for; run it now rather
+        # than leaving a second button for the client to find.
+        from app.services import credit_pull_core
+
+        try:
+            await credit_pull_core.auto_pull_after_signature(db, intake, applicant_data=applicant_data, request=request)
+            await db.commit()
+        except Exception:  # noqa: BLE001 - the signature stands whatever the bureau did
+            log.exception("soft pull after signature failed for intake %s", intake.id)
+            await db.rollback()
     await db.refresh(result_file)
 
     if actor_email and not is_success_fee:
