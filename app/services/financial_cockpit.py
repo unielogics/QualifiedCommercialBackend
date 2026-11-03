@@ -480,7 +480,11 @@ def bank_months(
                 target[month] = record
         labels.pop(orphan, None)
         members.setdefault(owners[0], set()).update(members.pop(orphan, set()) or {orphan})
-    counted_keys = {k for k in (counted or []) if k in per_account} or set(per_account)
+    counted_keys = {
+        canonical
+        for k in (counted or [])
+        if (canonical := resolve_alias(k, aliases)) in per_account
+    } or set(per_account)
     combined: dict[str, dict[str, Any]] = {}
     for key, months in per_account.items():
         if key not in counted_keys:

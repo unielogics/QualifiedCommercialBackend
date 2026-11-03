@@ -2435,6 +2435,11 @@ async def put_bank_accounts(
         profile.bank_account_aliases = {k: v for k, v in aliases.items() if k != v}
     accounts = await financial_cockpit.bank_accounts_for_profile(db, profile)
     known = {a["key"] for a in accounts}
+    # A counted key that was just folded into another account follows it.
+    aliases = dict(profile.bank_account_aliases or {})
+    payload.counted = list(
+        dict.fromkeys(financial_cockpit.resolve_alias(key, aliases) for key in payload.counted)
+    )
     unknown = [key for key in payload.counted if key not in known]
     if unknown:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"Unknown account: {', '.join(unknown)}")

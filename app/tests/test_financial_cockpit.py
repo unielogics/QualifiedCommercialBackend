@@ -849,4 +849,7 @@ def test_the_desk_can_declare_detected_accounts_to_be_one() -> None:
     assert months[0]["deposits"] == 10000 and months[2]["deposits"] == 11000  # May: navy 9000 + atlantic 2000
     assert resolve_alias("navy ••0865", aliases) == "navy ••8547" and resolve_alias("x", {"x": "y", "y": "x"}) == "y"
     cockpit = build_cockpit(analyses, [], account_aliases=aliases, counted_accounts=["navy ••8547"])
+    # A counted key that was folded into another account still counts that account.
+    _m, merged_stale = bank_months(analyses, ["navy ••0865"], aliases)
+    assert [a["key"] for a in merged_stale if a["counted"]] == ["navy ••8547"]
     assert cockpit["bank"]["months"][0]["deposits"] == 10000 and len(cockpit["bank"]["accounts"]) == 2
