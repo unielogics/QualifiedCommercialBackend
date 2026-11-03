@@ -620,6 +620,42 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
     return context
 
 
+#: Facts the rules may evaluate. A staff-reviewed fact is verified; a value the
+#: file itself carries (snapshot metrics, the intake's declaration) is
+#: provisional; an estimate from accepted statements says so. What stays out:
+#: unknown, conflicting accepted facts, and a self-reported figure the review
+#: flagged — a rule cannot pass on those, only ask.
+EVALUABLE_FACT_STATUSES = frozenset({"verified", "provisional", "estimated_from_deposits", "estimated_from_statements"})
+
+_ESTIMATE_WORDING = {
+    "estimated_from_deposits": "estimated from bank deposits",
+    "estimated_from_statements": "estimated from bank statements",
+}
+
+
+def evaluation_values(context: dict[str, Any], fact_sources: dict[str, Any]) -> dict[str, Any]:
+    """The context the rules see: financial facts blanked unless their source
+    status is one a rule may act on. The AI's estimates count; a person
+    corrects or overrides them on the file."""
+    values = dict(context)
+    for field in FINANCIAL_FIT_FIELDS:
+        status = (fact_sources.get(field) or {}).get("verification_status")
+        if status not in EVALUABLE_FACT_STATUSES:
+            values[field] = None
+    return values
+
+
+def estimate_notes(fact_sources: dict[str, Any], rule_fields: set[str]) -> list[str]:
+    """One line per estimate a program's rules relied on, for the desk."""
+    notes: list[str] = []
+    for field in sorted(rule_fields):
+        status = (fact_sources.get(field) or {}).get("verification_status")
+        wording = _ESTIMATE_WORDING.get(str(status))
+        if wording:
+            notes.append(f"{field.replace('_', ' ').capitalize()} {wording}; a person can replace it")
+    return notes
+
+
 def estimate_annualized_deposits(rows: list[dict[str, Any]]) -> float | None:
     """Mean monthly deposits times twelve, from at least three statement months."""
     values = [float(row["deposits"]) for row in rows if row.get("deposits") is not None]
@@ -855,10 +891,7 @@ async def published_candidates(
                 }
             )
     fact_sources = context.get("fact_sources") or {}
-    evaluation_context = dict(context)
-    for field in FINANCIAL_FIT_FIELDS:
-        if (fact_sources.get(field) or {}).get("verification_status") != "verified":
-            evaluation_context[field] = None
+    evaluation_context = evaluation_values(context, fact_sources)
     intent_outside_lending = context.get("intent_kind") in {"non_lending", "route_out"}
 
     catalog = await program_catalog.catalog_rows(db)
@@ -1011,7 +1044,7 @@ async def published_candidates(
                 priority=priority,
                 preference_score=preference_score,
                 preference_reasons=preference_reasons,
-                reasons=list(dict.fromkeys(reasons)),
+                reasons=list(dict.fromkeys([*reasons, *estimate_notes(fact_sources, _rule_fields((playbook.rules or {}).get("fit")))])),
                 scope_status="matched" if scope_state is True else "unknown" if scope_state is None else "outside_scope",
                 rule_state=rule_state,
                 rule_results=[{**row, "observed": (str(row["required"] if row["required"] is not None else row["field"]) in context.get("evidence_available", set())) if row["operator"] == "evidence_available" else _context_field(context, row["field"]),
@@ -1030,10 +1063,13 @@ async def published_candidates(
                     ),
                     *(scope_reasons if scope_state is None else []),
                 ])),
+                # A person looks at any verdict that rests on a fact nobody reviewed:
+                # an estimate, a snapshot figure, the intake's own declaration.
                 requires_review=bool(mca_blocked) or any(
                     _context_field(context, field) is not None
                     and (field in FINANCIAL_FIT_FIELDS and (fact_sources.get(field) or {}).get("verification_status") != "verified")
-                    for field in [*missing_fields, *(missing_scope_fields if scope_state is None else [])]
+                    for field in [*missing_fields, *(missing_scope_fields if scope_state is None else []),
+                                  *_rule_fields((playbook.rules or {}).get("fit"))]
                 ),
             )
         )

@@ -73,3 +73,26 @@ def test_years_in_business_is_asked_at_the_start_and_accepted_from_the_chat() ->
     assert "bogus" not in intake.intake_state["mca_details"]
     _merge_mca_details(intake, {"years_in_business": 900})
     assert intake.intake_state["mca_details"]["years_in_business"] == 4.0
+
+
+def test_rules_evaluate_provisional_and_estimated_facts_and_say_so() -> None:
+    from app.services.application_programs import estimate_notes, evaluation_values
+
+    context = {"annual_revenue": 690395.0, "cash_flow": -29364.3, "nsf_or_overdraft_count": 0.0, "business_age_years": 3.0, "credit_score": 700, "dscr": 1.4, "vertical": "mca"}
+    sources = {
+        "annual_revenue": {"verification_status": "estimated_from_deposits"},
+        "cash_flow": {"verification_status": "estimated_from_statements"},
+        "nsf_or_overdraft_count": {"verification_status": "provisional"},
+        "business_age_years": {"verification_status": "provisional"},
+        "credit_score": {"verification_status": "self_reported_unverified"},
+        "dscr": {"verification_status": "conflicting"},
+    }
+    values = evaluation_values(context, sources)
+    assert values["annual_revenue"] == 690395.0 and values["cash_flow"] == -29364.3
+    assert values["nsf_or_overdraft_count"] == 0.0 and values["business_age_years"] == 3.0
+    assert values["credit_score"] is None and values["dscr"] is None
+    assert values["vertical"] == "mca"
+    assert estimate_notes(sources, {"annual_revenue", "cash_flow", "business_age_years"}) == [
+        "Annual revenue estimated from bank deposits; a person can replace it",
+        "Cash flow estimated from bank statements; a person can replace it",
+    ]

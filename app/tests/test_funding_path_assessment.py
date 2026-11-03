@@ -115,7 +115,9 @@ def test_bank_deposits_stale_bytes_or_unreviewed_facts_cannot_be_revenue(classif
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("verification,expected", [("provisional", False), ("verified", True), ("conflicting", False)])
+# The AI evaluates what the file knows: a provisional figure passes the rule
+# and the candidate asks a person to review it; a conflicting one cannot pass.
+@pytest.mark.parametrize("verification,expected", [("provisional", True), ("verified", True), ("conflicting", False)])
 async def test_candidate_requires_verified_rule_fact_not_populated_ai_summary(verification, expected):
     catalog = SimpleNamespace(id=uuid4(), program_key="term", name="Term", public_slug="term")
     version = SimpleNamespace(id=uuid4(), version=3,
@@ -131,7 +133,7 @@ async def test_candidate_requires_verified_rule_fact_not_populated_ai_summary(ve
     assert row.eligible is expected
     assert row.rule_results[0]["observed"] == 1000
     assert row.rule_results[0]["source_refs"][0]["id"] == "source"
-    assert row.requires_review is (not expected)
+    assert row.requires_review is (verification != "verified")
     assert row.rule_state == ("pass" if expected else "unknown")
 
 
@@ -153,6 +155,7 @@ async def test_current_margin_override_preserves_exact_lineage_and_review_gate(v
         row = (await programs.published_candidates(SimpleNamespace(), SimpleNamespace(),
             readiness_metric_overrides={"gross_margin_pct": 18, "net_margin_pct": None},
             readiness_metric_sources={"gross_margin_pct": source}))[0]
-    assert row.eligible is (verification == "verified")
+    assert row.eligible is True
+    assert row.requires_review is (verification != "verified")
     assert row.rule_results[0]["source_refs"] == source["source_refs"]
     assert row.rule_results[0]["observed"] == 18
