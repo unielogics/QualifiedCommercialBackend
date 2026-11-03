@@ -14,12 +14,12 @@ import uuid
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.application_profile import ApplicationProfile
 from app.models.loan import Loan
-from app.models.production_package import ProductionTermSheet
+from app.models.production_package import ProductionPackage, ProductionTermSheet
 from app.models.user import User
 from app.routers import operator_files as unified
 
@@ -115,6 +115,117 @@ async def sources(db: AsyncSession, user: User, *, q: str | None, vertical: str,
             }
         )
     return out[:300]
+
+
+async def existing_listing(db: AsyncSession, *, loan_id: uuid.UUID | None, profile_id: uuid.UUID | None) -> dict[str, Any] | None:
+    """The live (not withdrawn) listing already cut from this loan or profile, if any."""
+    conditions = []
+    if loan_id:
+        conditions.append(CpListing.loan_id == loan_id)
+    if profile_id:
+        conditions.append(CpListing.profile_id == profile_id)
+    if not conditions:
+        return None
+    row = (
+        await db.execute(
+            select(CpListing)
+            .where(or_(*conditions), CpListing.status != E.ListingStatus.WITHDRAWN)
+            .order_by(CpListing.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    return {"id": str(row.id), "ref": row.ref, "status": str(getattr(row.status, "value", row.status)), "name": row.name}
+
+
+async def resolve_intake_profile(db: AsyncSession, user: User, intake_id: uuid.UUID) -> uuid.UUID:
+    """The application profile for an AI lead, created on first use the same
+    way the file page does it (POST /application-profiles/resolve)."""
+    from app.services import application_profiles as profiles
+
+    try:
+        profile = await profiles.resolve_profile(db, "intake", intake_id, user)
+    except Exception as exc:  # noqa: BLE001 - a missing or foreign intake reads as not found
+        raise LookupError("No AI lead matches that id.") from exc
+    await db.flush()
+    return profile.id
+
+
+async def lookup(db: AsyncSession, *, loan_id: uuid.UUID | None, profile_id: uuid.UUID | None) -> dict[str, Any]:
+    """Cheap facts for the file page: the existing listing, the underwriting
+    status and whether loan terms are on record. Readiness and the package
+    the page already holds."""
+    profile: ApplicationProfile | None = await db.get(ApplicationProfile, profile_id) if profile_id else None
+    if loan_id is None and profile is not None and getattr(profile, "loan_id", None):
+        loan_id = profile.loan_id
+    sheet = await _current_term_sheet(db, profile.id) if profile is not None else None
+    return {
+        "profile_id": profile.id if profile else None,
+        "loan_id": loan_id,
+        "listing": await existing_listing(db, loan_id=loan_id, profile_id=profile.id if profile else None),
+        "underwriting_status": _str(getattr(profile, "underwriting_status", None)) if profile else None,
+        "has_term_sheet": sheet is not None,
+    }
+
+
+def file_summary_sentence(financials: dict[str, Any]) -> str | None:
+    """One factual sentence from the cockpit for the draft's summary; the desk rewrites it."""
+    months = financials.get("bank_months")
+    average = financials.get("avg_monthly_deposits")
+    if not months or average is None:
+        return None
+    return f"{months} months of bank statements reviewed; average monthly deposits ${float(average):,.0f}."
+
+
+async def readiness_snapshot(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
+    """Program readiness and the financial cockpit's headline figures, so the
+    listing carries what the desk saw on the file when it cut the draft."""
+    from app.services import application_programs as programs
+    from app.services import financial_cockpit
+
+    selections = await programs.active_selections(db, profile.id)
+    candidates = {c.program_key: c for c in await programs.published_candidates(db, profile)}
+    program_rows = []
+    for selection in selections:
+        candidate = candidates.get(selection.program_key)
+        program_rows.append(
+            {
+                "key": selection.program_key,
+                "name": selection.program_name,
+                "source": selection.source,
+                "eligible": candidate.eligible if candidate else None,
+                "recommendation_status": _str(candidate.recommendation_status) if candidate else None,
+                "rule_state": candidate.rule_state if candidate else None,
+                "requires_review": candidate.requires_review if candidate else None,
+                "reasons": list(candidate.reasons[:4]) if candidate else [],
+            }
+        )
+    cockpit = await financial_cockpit.load_cockpit(db, profile)
+    coverage = cockpit["coverage"]
+    package = (
+        await db.execute(
+            select(ProductionPackage)
+            .where(ProductionPackage.profile_id == profile.id)
+            .order_by(ProductionPackage.stage.desc(), ProductionPackage.version.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return {
+        "readiness": {
+            "programs": program_rows,
+            "bank_months": coverage["bank_months"],
+            "bank_months_accepted": coverage["bank_months_accepted"],
+            "bank_months_required": coverage["bank_months_required"],
+            "coverage_complete": coverage["bank_months_accepted"] >= coverage["bank_months_required"],
+            "tax_years": coverage["tax_years"],
+            "has_debt_schedule": coverage["debt_rows"] > 0 or coverage["has_debt_schedule_document"],
+            "files_analyzed": coverage["files_analyzed"],
+            "files_accepted": coverage["files_accepted"],
+        },
+        "financials": financial_cockpit.listing_summary(cockpit),
+        "production_package": {"stage": package.stage, "status": package.status, "version": package.version} if package else None,
+    }
 
 
 async def _current_term_sheet(db: AsyncSession, profile_id: uuid.UUID) -> ProductionTermSheet | None:
@@ -253,6 +364,10 @@ async def prefill(db: AsyncSession, user: User, *, loan_id: uuid.UUID | None, pr
         if industry and not draft.get("collateral_type"):
             draft["collateral_type"] = "Business assets"
             draft["summary"] = f"Operating business: {industry}."
+        snapshot.update(await readiness_snapshot(db, profile))
+        sentence = file_summary_sentence(snapshot.get("financials") or {})
+        if sentence:
+            draft["summary"] = " ".join(part for part in (draft.get("summary"), sentence) if part)
 
     if sheet is not None:
         snapshot["term_sheet"] = {

@@ -250,15 +250,34 @@ async def sources(admin: CpAdmin, db: Db, q: str | None = Query(None), vertical:
     return [S.SourceRow(**r) for r in rows]
 
 
+@router.get("/sources/lookup", response_model=S.SourceLookup)
+async def source_lookup(admin: CpAdmin, db: Db, profile_id: Annotated[uuid.UUID | None, Query()] = None, loan_id: Annotated[uuid.UUID | None, Query()] = None) -> S.SourceLookup:
+    """The file page asks before offering "Publish to marketplace": is there a
+    listing already, and are loan terms on record."""
+    if not profile_id and not loan_id:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Pass profile_id or loan_id.")
+    return S.SourceLookup(**await P.lookup(db, loan_id=loan_id, profile_id=profile_id))
+
+
 @router.post("/listings/prefill")
 async def prefill_listing(payload: S.PrefillIn, admin: CpAdmin, db: Db) -> dict[str, Any]:
-    if not payload.loan_id and not payload.profile_id:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Pass loan_id or profile_id.")
+    loan_id, profile_id = payload.loan_id, payload.profile_id
+    if not loan_id and not profile_id and payload.intake_id:
+        try:
+            profile_id = await P.resolve_intake_profile(db, admin, payload.intake_id)
+        except LookupError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        await db.commit()
+    if not loan_id and not profile_id:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Pass loan_id, profile_id or intake_id.")
     try:
-        draft = await P.prefill(db, admin, loan_id=payload.loan_id, profile_id=payload.profile_id)
+        draft = await P.prefill(db, admin, loan_id=loan_id, profile_id=profile_id)
     except LookupError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    return {k: (str(v) if isinstance(v, Decimal) else v) for k, v in draft.items()}
+    out = {k: (str(v) if isinstance(v, Decimal) else v) for k, v in draft.items()}
+    # The new-listing page redirects to this instead of cutting a duplicate.
+    out["existing_listing"] = await P.existing_listing(db, loan_id=loan_id, profile_id=profile_id)
+    return out
 
 
 async def _listing_admin_out(db: AsyncSession, listing: CpListing) -> S.ListingAdminOut:

@@ -159,6 +159,7 @@ from app.schemas.application_profile import (
     WorksheetRowOp,
 )
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
+from app.schemas.financial_cockpit import FinancialCockpitRead
 from app.schemas.retention import LegalHoldChange, RetentionStatusRead
 from app.schemas.use_of_funds import (
     UseOfFundsPatch,
@@ -177,6 +178,7 @@ from app.services import (
     dealer_forms_pdf,
     drafted_forms,
     file_events,
+    financial_cockpit,
     financial_statements,
     funding_programs,
     intake_lifecycle,
@@ -2326,6 +2328,17 @@ async def get_application_intelligence(
 ) -> ApplicationIntelligenceRead:
     profile = await profiles.load_profile(db, profile_id, user)
     return await profiles.intelligence_state(db, profile)
+
+
+@router.get("/{profile_id}/financial-cockpit", response_model=FinancialCockpitRead)
+async def get_financial_cockpit(
+    profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> FinancialCockpitRead:
+    """Every figure the file supports, read without a model: bank months,
+    tax years, tracked expenses, debt service, DSCR and the net-profit
+    conclusion, each naming its source."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
 
 
 @router.post("/{profile_id}/bank-invitations", response_model=VerificationInvitationRead, status_code=status.HTTP_201_CREATED)

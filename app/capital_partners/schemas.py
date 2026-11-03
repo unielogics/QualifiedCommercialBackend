@@ -440,6 +440,26 @@ class SourceRow(BaseModel):
 class PrefillIn(BaseModel):
     loan_id: UUID | None = None
     profile_id: UUID | None = None
+    #: An AI lead that was never opened has no application profile yet; the
+    #: desk may still list it, and the prefill resolves the profile first.
+    intake_id: UUID | None = None
+
+
+class ListingRef(BaseModel):
+    id: UUID
+    ref: str
+    status: str
+    name: str
+
+
+class SourceLookup(BaseModel):
+    """What the file page needs before offering "Publish to marketplace"."""
+
+    profile_id: UUID | None = None
+    loan_id: UUID | None = None
+    listing: ListingRef | None = None
+    underwriting_status: str | None = None
+    has_term_sheet: bool = False
 
 
 class ListingIn(BaseModel):

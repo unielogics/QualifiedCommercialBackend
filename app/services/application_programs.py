@@ -342,19 +342,16 @@ async def _evidence_inventory(
     return files, latest, classifications
 
 
-async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
-    intake = (
-        await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
-    )
-    requested_amount, amount_source, loan_purpose, dealer = await source_funding_data(
-        db, profile, intake=intake,
-    )
-    if seed_refinance_budget(profile, intake, requested_amount):
-        amount_source = amount_source or "intake.mca_qualification"
-        if requested_amount is None:
-            requested_amount = Decimal(str(profile.use_of_funds[0]["amount"]))
-    budget = summarize_use_of_funds(profile, requested_amount, amount_source, dealer=dealer)
-    files, latest_analyses, _classifications = await _evidence_inventory(db, profile)
+async def accepted_evidence_file_ids(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    files: list[BucketFile],
+    latest_analyses: dict[uuid.UUID, BucketFileAnalysis],
+) -> set[uuid.UUID]:
+    """Files whose latest analysis the evidence review accepted, or that a
+    person verified before decisions were recorded, keyed to the content the
+    file holds now (a re-upload or a newer analysis version starts over).
+    Shared by program fit and the financial cockpit so both read the same set."""
     evidence_links = list(
         (
             await db.execute(
@@ -375,7 +372,7 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
     )
     latest_decisions = await _latest_evidence_decisions(db, evidence_links)
     current_files = {file.id: file for file in files}
-    accepted_file_ids = {
+    return {
         link.file_id
         for link in evidence_links
         if (
@@ -388,6 +385,22 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         )
         or (latest_decisions.get(link.id) is None and link.verified_at is not None)
     }
+
+
+async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
+    intake = (
+        await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    )
+    requested_amount, amount_source, loan_purpose, dealer = await source_funding_data(
+        db, profile, intake=intake,
+    )
+    if seed_refinance_budget(profile, intake, requested_amount):
+        amount_source = amount_source or "intake.mca_qualification"
+        if requested_amount is None:
+            requested_amount = Decimal(str(profile.use_of_funds[0]["amount"]))
+    budget = summarize_use_of_funds(profile, requested_amount, amount_source, dealer=dealer)
+    files, latest_analyses, _classifications = await _evidence_inventory(db, profile)
+    accepted_file_ids = await accepted_evidence_file_ids(db, profile, files, latest_analyses)
     accepted_classifications = {
         classification
         for file_id, analysis in latest_analyses.items()

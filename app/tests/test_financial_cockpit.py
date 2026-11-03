@@ -1,0 +1,571 @@
+"""The financial cockpit reads a file's numbers without a model.
+
+Body Good Studio had six accepted statements, a signed authorization and no
+tax return, and the desk could only see the figures by generating the lender
+packet. The cockpit answers from the analyses on file: month by month, with
+every figure naming its source, and the DSCR and net-profit conclusions
+following the AI review's precedence (tax return, then P&L, then bank proxy).
+"""
+
+from __future__ import annotations
+
+from app.services.financial_cockpit import (
+    amortized_payment,
+    bank_months,
+    bank_summary,
+    build_cockpit,
+    debt_service,
+    deposit_trend_pct,
+    documented_debts,
+    listing_summary,
+    monthly_equivalent,
+    tax_years,
+)
+
+
+def _file(
+    file_id: str,
+    classification: str,
+    facts: dict,
+    *,
+    accepted: bool = True,
+    classifications: list[str] | None = None,
+) -> dict:
+    return {
+        "file_id": file_id,
+        "file_name": f"{file_id}.pdf",
+        "classification": classification,
+        "classifications": classifications or [classification],
+        "key_facts": facts,
+        "accepted": accepted,
+        "analyzed_at": None,
+        "period_hint": None,
+    }
+
+
+def _bank(
+    file_id: str,
+    period: str,
+    deposits: float,
+    withdrawals: float,
+    *,
+    accepted: bool = True,
+    bank: str = "Chase",
+    last4: str = "1234",
+    **facts,
+) -> dict:
+    return _file(
+        file_id,
+        "bank_statement",
+        {
+            "bank": bank,
+            "account_last4": last4,
+            "statement_period": period,
+            "total_deposits_and_credits": deposits,
+            "total_withdrawals_and_debits": withdrawals,
+            **facts,
+        },
+        accepted=accepted,
+    )
+
+
+def _tax(file_id: str, year: str, **facts) -> dict:
+    return _file(
+        file_id,
+        "tax_return",
+        {
+            "entity_name": "Body Good Studio LLC",
+            "tax_year": year,
+            "currency": "USD",
+            "basis": "cash",
+            **facts,
+        },
+    )
+
+
+def _pnl(file_id: str = "pl", **facts) -> dict:
+    base = {
+        "business_name": "Body Good Studio LLC",
+        "basis": "accrual",
+        "currency": "USD",
+        "period_start": "2026-01-01",
+        "period_end": "2026-06-30",
+        "gross_revenue": 300000,
+        "net_income": 30000,
+        "interest": 1000,
+        "income_taxes": 2000,
+        "depreciation_and_amortization": 3000,
+    }
+    return _file(file_id, "current_p_and_l", {**base, **facts})
+
+
+SIX_MONTHS = [
+    _bank(
+        f"bs{i}",
+        f"2026-{i + 2:02d}-28 to 2026-{i + 3:02d}-30",
+        50000,
+        45000,
+        beginning_balance=10000 + i * 1000,
+        ending_balance=15000 + i * 1000,
+        average_ledger_balance=12000 + i * 1000,
+        low_daily_balance=4000,
+        nsf_or_overdraft_count=0,
+    )
+    for i in range(1, 7)
+]
+TAX_2025 = _tax(
+    "t25",
+    "2025",
+    gross_receipts=600000,
+    ordinary_business_income=60000,
+    interest=3000,
+    depreciation=7000,
+)
+TAX_2024 = _tax(
+    "t24",
+    "2024",
+    gross_receipts=500000,
+    ordinary_business_income=40000,
+    interest=2000,
+    depreciation=8000,
+)
+LOAN_ROW = {
+    "id": "row1",
+    "lender": "Bank A",
+    "category": "loan",
+    "monthly_payment": 2000,
+    "balance": 50000,
+    "count_in_dscr": True,
+}
+TERM_SHEET = {
+    "source": "term_sheet",
+    "label": "Term sheet v1",
+    "amount": 100000,
+    "rate_pct": 10,
+    "term_months": 60,
+    "monthly_payment": 1000,
+}
+
+
+def test_a_statement_files_under_its_closing_month_and_accounts_combine() -> None:
+    months, accounts = bank_months(
+        [
+            _bank("a", "2026-05-30 to 2026-06-30", 10000, 8000, ending_balance=5000),
+            _bank(
+                "b",
+                "2026-06-01 to 2026-06-30",
+                2000,
+                1000,
+                ending_balance=1000,
+                bank="Wells Fargo",
+                last4="9876",
+                accepted=False,
+            ),
+        ]
+    )
+    assert [m["month"] for m in months] == ["2026-06"]
+    june = months[0]
+    assert june["label"] == "Jun 2026"
+    assert (june["deposits"], june["withdrawals"], june["net"], june["ending_balance"]) == (
+        12000,
+        9000,
+        3000,
+        6000,
+    )
+    assert june["accounts"] == ["Chase ••1234", "Wells Fargo ••9876"]
+    assert june["accepted"] is True and sorted(june["file_ids"]) == ["a", "b"]
+    assert [a["label"] for a in accounts] == ["Chase ••1234", "Wells Fargo ••9876"]
+    assert accounts[1]["accepted_months"] == []
+
+
+def test_a_statement_uploaded_twice_counts_once_and_keeps_the_fuller_read() -> None:
+    months, _ = bank_months(
+        [
+            _bank("first", "2026-06-01 to 2026-06-30", 10000, 8000),
+            _bank(
+                "again",
+                "2026-06-01 to 2026-06-30",
+                10000,
+                8000,
+                ending_balance=5000,
+                average_ledger_balance=4000,
+            ),
+        ]
+    )
+    assert len(months) == 1
+    assert months[0]["deposits"] == 10000
+    assert months[0]["ending_balance"] == 5000 and months[0]["average_balance"] == 4000
+
+
+def test_summary_states_averages_annualized_figures_trend_and_gaps() -> None:
+    months, _ = bank_months(
+        [
+            _bank("apr", "2026-04-01 to 2026-04-30", 40000, 30000),
+            _bank("may", "2026-05-01 to 2026-05-31", 50000, 45000, nsf_or_overdraft_count=1),
+            _bank("jul", "2026-07-01 to 2026-07-31", 60000, 50000),
+            _bank(
+                "aug",
+                "2026-08-01 to 2026-08-31",
+                70000,
+                60000,
+                negative_balance_dates=["2026-08-03"],
+            ),
+        ]
+    )
+    summary = bank_summary(months)
+    assert summary["gaps"] == ["2026-06"]
+    assert (summary["first_month"], summary["last_month"]) == ("2026-04", "2026-08")
+    assert summary["avg_deposits"] == 55000 and summary["annualized_deposits"] == 660000
+    assert summary["avg_net"] == 8750 and summary["annualized_net"] == 105000
+    assert summary["deposit_trend_pct"] == 44.4  # (60k+70k)/2 against (40k+50k)/2
+    assert summary["nsf_total"] == 1 and summary["negative_days_total"] == 1
+    assert (summary["highest_month"], summary["lowest_month"]) == ("2026-08", "2026-04")
+    assert summary["estimates_available"] is True
+
+
+def test_annualized_figures_need_three_months() -> None:
+    months, _ = bank_months(
+        [
+            _bank("a", "2026-05-01 to 2026-05-31", 10000, 5000),
+            _bank("b", "2026-06-01 to 2026-06-30", 20000, 5000),
+        ]
+    )
+    summary = bank_summary(months)
+    assert summary["avg_deposits"] == 15000
+    assert summary["annualized_deposits"] is None and summary["annualized_net"] is None
+    assert summary["estimates_available"] is False
+    assert deposit_trend_pct([10000, 20000]) == 100.0
+    assert deposit_trend_pct([None, 20000]) is None
+
+
+def test_tax_years_rebuild_ebitda_and_year_over_year_change() -> None:
+    years = tax_years(
+        [TAX_2024, TAX_2025, _tax("t23", "2023", gross_receipts=400000, net_income=10000)]
+    )
+    assert [y["year"] for y in years] == ["2023", "2024", "2025"]
+    first, prior, latest = years
+    assert (first["income"], first["income_basis"], first["ebitda"], first["ebitda_complete"]) == (
+        10000,
+        "net income",
+        10000,
+        False,
+    )
+    assert (prior["ebitda"], latest["ebitda"]) == (50000, 70000)
+    assert latest["income_basis"] == "ordinary business income"
+    assert prior["gross_receipts_change_pct"] == 25.0
+    assert latest["gross_receipts_change_pct"] == 20.0 and latest["income_change_pct"] == 50.0
+    assert latest["net_margin"] == 0.1
+    assert first["gross_receipts_change_pct"] is None
+
+
+def test_payment_cadences_convert_to_a_monthly_figure() -> None:
+    assert monthly_equivalent(1000, "weekly") == 4333.33
+    assert monthly_equivalent(500, "daily") == 10500.0
+    assert monthly_equivalent(1000, "biweekly") == 2166.67
+    assert monthly_equivalent(1000, None) == 1000.0
+    assert monthly_equivalent(1000, "quarterly") is None
+    assert amortized_payment(100000, 12, 120) == 1434.71
+    assert amortized_payment(100000, 0, 120) == 833.33
+    assert amortized_payment(100000, 12, 0) is None
+
+
+def test_debt_service_prefers_the_rows_then_the_document_then_advance_terms() -> None:
+    rows = [
+        LOAN_ROW,
+        {
+            "id": "row2",
+            "lender": "Funder B",
+            "category": "mca",
+            "payment_amount": 300,
+            "payment_frequency": "daily",
+            "balance": 40000,
+            "factor_rate": 1.3,
+            "count_in_dscr": True,
+        },
+        {
+            "id": "row3",
+            "lender": "Card",
+            "category": "card",
+            "monthly_payment": 500,
+            "count_in_dscr": False,
+        },
+    ]
+    from app.services.financial_cockpit import debt_rows
+
+    schedule = debt_rows(rows)
+    assert [r["monthly_payment"] for r in schedule] == [2000, 6300.0, 500]
+    assert [r["is_mca"] for r in schedule] == [False, True, False]
+    service = debt_service(schedule, {"total_monthly_debt_service": 2500}, [])
+    assert (service["monthly"], service["annual"], service["source"]) == (
+        8300.0,
+        99600.0,
+        "debt_schedule_rows",
+    )
+    assert service["schedule_rows_counted"] == 2 and service["schedule_balance"] == 90000
+    assert (service["mca_count"], service["mca_monthly"], service["mca_balance"]) == (
+        1,
+        6300.0,
+        40000,
+    )
+    assert service["document_monthly"] == 2500
+
+    from_document = debt_service(
+        [], {"total_monthly_debt_service": 2500, "total_outstanding_balance": 80000}, []
+    )
+    assert (
+        from_document["monthly"],
+        from_document["source"],
+        from_document["document_balance"],
+    ) == (2500, "debt_schedule_document", 80000)
+
+    documented = documented_debts(
+        [
+            _file(
+                "terms",
+                "debt_schedule",
+                {
+                    "debts": [
+                        {
+                            "lender": "Funder B",
+                            "current_balance": 40000,
+                            "payment_amount": 300,
+                            "payment_frequency": "daily",
+                        },
+                        {"lender": "funder b", "current_balance": 35000, "monthly_payment": 5000},
+                        {
+                            "lender": "Funder C",
+                            "current_balance": 20000,
+                            "monthly_payment": 1200,
+                            "factor_rate": 1.25,
+                        },
+                    ]
+                },
+            )
+        ]
+    )
+    assert [(d["lender"], d["balance"], d["monthly_payment"], d["is_mca"]) for d in documented] == [
+        ("Funder B", 40000, 6300.0, True),
+        ("Funder C", 20000, 1200.0, True),
+    ]
+    from_terms = debt_service([], None, documented)
+    assert (from_terms["monthly"], from_terms["source"], from_terms["mca_count"]) == (
+        7500.0,
+        "advance_terms",
+        2,
+    )
+
+    nothing = debt_service([], None, [])
+    assert (nothing["monthly"], nothing["source"]) == (None, "none")
+
+
+def test_dscr_candidates_follow_the_review_precedence_and_name_their_basis() -> None:
+    cockpit = build_cockpit(
+        [*SIX_MONTHS, TAX_2024, TAX_2025, _pnl()], [LOAN_ROW], proposed_terms=TERM_SHEET
+    )
+    dscr = cockpit["dscr"]
+    assert (
+        dscr["annual_debt_service"] == 24000 and dscr["debt_service_source"] == "debt_schedule_rows"
+    )
+    assert [c["key"] for c in dscr["candidates"]] == [
+        "tax_return",
+        "profit_and_loss",
+        "bank_cash_flow",
+    ]
+    tax, statement, bank = dscr["candidates"]
+    assert (tax["value"], tax["status"], tax["confidence"]) == (2.92, "very_strong", "filed")
+    assert tax["numerator"] == 70000 and "ordinary business income" in tax["numerator_label"]
+    assert (tax["pro_forma_value"], tax["pro_forma_status"]) == (1.94, "very_strong")
+    assert cockpit["profit_and_loss"]["annualized_ebitda"] == 72000
+    assert statement["value"] == 3.0 and statement["period"] == "Jan–Jun 2026"
+    assert bank["value"] == 3.5 and bank["confidence"] == "proxy" and "floor" in bank["note"]
+    assert dscr["headline"]["key"] == "tax_return"
+    assert (
+        dscr["proposed"]["monthly_payment"] == 1000 and dscr["proposed"]["annual_payment"] == 12000
+    )
+    assert dscr["thresholds"] == {"acceptable": 1.0, "healthy": 1.25, "very_strong": 1.5}
+
+
+def test_dscr_without_debt_service_explains_itself_and_still_shows_the_pro_forma() -> None:
+    cockpit = build_cockpit([TAX_2025], [], proposed_terms=TERM_SHEET)
+    dscr = cockpit["dscr"]
+    assert dscr["headline"] is None
+    assert "debt schedule" in dscr["reason"]
+    assert dscr["pro_forma_headline"]["pro_forma_value"] == 5.83
+    assert any("No debt service" in note for note in cockpit["notes"])
+
+    nothing = build_cockpit([], [])
+    assert nothing["dscr"]["headline"] is None and "income figure" in nothing["dscr"]["reason"]
+
+
+def test_proposed_payment_amortizes_when_the_sheet_has_no_monthly_figure() -> None:
+    cockpit = build_cockpit(
+        [TAX_2025],
+        [LOAN_ROW],
+        proposed_terms={
+            "source": "term_sheet",
+            "amount": 100000,
+            "rate_pct": 12,
+            "term_months": 120,
+        },
+    )
+    assert cockpit["dscr"]["proposed"]["monthly_payment"] == 1434.71
+    assert build_cockpit([], [], proposed_terms=None)["dscr"]["proposed"] is None
+
+
+def test_net_profit_concludes_from_the_tax_return_then_the_statement_then_the_bank_proxy() -> None:
+    everything = build_cockpit([*SIX_MONTHS, TAX_2025, _pnl()], [LOAN_ROW])
+    conclusion = everything["net_profit"]["conclusion"]
+    assert (conclusion["key"], conclusion["value"], conclusion["basis"], conclusion["period"]) == (
+        "tax_return",
+        60000,
+        "ordinary business income",
+        "2025",
+    )
+    assert conclusion["margin"] == 0.1 and everything["net_profit"]["note"] is None
+    assert [c["key"] for c in everything["net_profit"]["candidates"]] == [
+        "tax_return",
+        "profit_and_loss",
+        "bank_cash_flow",
+    ]
+
+    statement_only = build_cockpit([*SIX_MONTHS, _pnl()], [LOAN_ROW])
+    conclusion = statement_only["net_profit"]["conclusion"]
+    assert (conclusion["key"], conclusion["value"]) == ("profit_and_loss", 60000)
+    assert (
+        "annualized" in conclusion["basis"]
+        and "No tax return" in statement_only["net_profit"]["note"]
+    )
+
+    bank_only = build_cockpit(SIX_MONTHS, [LOAN_ROW])
+    conclusion = bank_only["net_profit"]["conclusion"]
+    assert (conclusion["key"], conclusion["value"], conclusion["revenue"]) == (
+        "bank_cash_flow",
+        60000,
+        600000,
+    )
+    assert "cash retained" in bank_only["net_profit"]["note"]
+
+
+def test_expense_lines_name_their_source_and_period() -> None:
+    cockpit = build_cockpit(
+        [
+            *SIX_MONTHS,
+            TAX_2025,
+            _pnl(cost_of_goods_sold=100000, total_operating_expenses=150000, owner_salaries=40000),
+        ],
+        [LOAN_ROW],
+    )
+    lines = {line["key"]: line for line in cockpit["expenses"]["lines"]}
+    cogs = lines["pl_cost_of_goods_sold"]
+    assert (
+        cogs["amount"],
+        cogs["annualized"],
+        cogs["period"],
+        cogs["source"],
+        cogs["ratio_to_revenue"],
+    ) == (100000, 200000, "Jan–Jun 2026", "profit_and_loss", 0.3333)
+    assert lines["pl_owner_salaries"]["annualized"] == 80000
+    assert (
+        lines["tax_depreciation"]["amount"],
+        lines["tax_depreciation"]["period"],
+        lines["tax_depreciation"]["source"],
+    ) == (7000, "2025", "tax_return")
+    assert (
+        lines["bank_outflows"]["amount"],
+        lines["bank_outflows"]["annualized"],
+        lines["bank_outflows"]["ratio_to_revenue"],
+    ) == (45000, 540000, 0.9)
+    assert (
+        lines["debt_service"]["amount"],
+        lines["debt_service"]["annualized"],
+        lines["debt_service"]["source"],
+    ) == (2000, 24000, "debt_schedule_rows")
+    assert cockpit["expenses"]["opex_ratio"] == 0.5 and cockpit["expenses"]["outflow_ratio"] == 0.9
+    assert cockpit["expenses"]["debt_service_to_deposits"] == 0.04
+    assert cockpit["profit_and_loss"]["gross_margin"] == round(200000 / 300000, 4)
+
+
+def test_an_empty_file_builds_a_cockpit_that_says_what_is_missing() -> None:
+    cockpit = build_cockpit([], [])
+    assert cockpit["coverage"]["bank_months"] == 0 and cockpit["bank"]["months"] == []
+    assert (
+        cockpit["tax"]["years"] == []
+        and cockpit["profit_and_loss"] is None
+        and cockpit["balance_sheet"] is None
+    )
+    assert cockpit["net_profit"]["conclusion"] is None
+    joined = " ".join(cockpit["notes"])
+    assert (
+        "No bank statement" in joined
+        and "No tax return" in joined
+        and "No debt service" in joined
+        and "No loan terms" in joined
+    )
+
+
+def test_statements_only_file_reads_like_body_good_studio() -> None:
+    terms = _file(
+        "advance-terms",
+        "debt_schedule",
+        {
+            "debts": [
+                {
+                    "lender": "Funder B",
+                    "current_balance": 40000,
+                    "payment_amount": 300,
+                    "payment_frequency": "daily",
+                },
+                {
+                    "lender": "Funder C",
+                    "current_balance": 20000,
+                    "payment_amount": 1000,
+                    "payment_frequency": "weekly",
+                },
+            ]
+        },
+    )
+    cockpit = build_cockpit([*SIX_MONTHS, terms], [], requested_amount=70000)
+    coverage = cockpit["coverage"]
+    assert (
+        coverage["bank_months"],
+        coverage["bank_months_accepted"],
+        coverage["bank_months_required"],
+    ) == (6, 6, 6)
+    assert (
+        coverage["tax_years"] == []
+        and coverage["has_debt_schedule_document"] is True
+        and coverage["documented_debts"] == 2
+    )
+    assert cockpit["requested_amount"] == 70000
+    summary = cockpit["bank"]["summary"]
+    assert (
+        summary["beginning_balance"],
+        summary["ending_balance"],
+        summary["average_balance"],
+    ) == (11000, 21000, 15500)
+    assert summary["lowest_balance"] == 4000 and summary["annualized_deposits"] == 600000
+    service = cockpit["debt"]["service"]
+    assert (service["source"], service["monthly"], service["mca_count"]) == (
+        "advance_terms",
+        10633.33,
+        2,
+    )
+    headline = cockpit["dscr"]["headline"]
+    assert headline["key"] == "bank_cash_flow" and headline["value"] == round(
+        (5000 + 10633.33) * 12 / (10633.33 * 12), 2
+    )
+    assert cockpit["net_profit"]["conclusion"]["key"] == "bank_cash_flow"
+    assert any("advance terms" in note for note in cockpit["notes"])
+    assert any("No tax return" in note for note in cockpit["notes"])
+
+    compact = listing_summary(cockpit)
+    assert (
+        compact["bank_months"] == 6
+        and compact["avg_monthly_deposits"] == 50000
+        and compact["annualized_deposits"] == 600000
+    )
+    assert (
+        compact["dscr_basis"] == "bank_cash_flow"
+        and compact["net_profit_basis"] == "bank_cash_flow"
+    )
+    assert compact["net_profit"] == 60000 and compact["tax_year"] is None
