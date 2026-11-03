@@ -161,6 +161,7 @@ from app.services.bucket_ai import (
     vendor_visible_summary,
     visible_action_items,
 )
+from app.services.bucket_requests import is_open_request
 from app.services.intake_chat_actions import (
     actions_for_messages,
     author_actions_for_message,
@@ -3658,7 +3659,7 @@ async def _request_access_read(
         requested_documents=[
             _public_requested_document_read(d, file_reads)
             for d in current_requested_documents
-            if d.status != "not_applicable"
+            if (is_open_request(d) or d.status == "uploaded")
             and (
                 payment_documents_visible
                 or d.signature_kind != "success_fee_agreement"

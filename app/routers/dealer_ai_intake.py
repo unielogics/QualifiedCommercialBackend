@@ -7126,7 +7126,9 @@ async def _response(
         requested_documents=[
             _requested_document_read(doc, file_reads)
             for doc in current_requested_documents
-            if doc.status != "not_applicable"
+            # A closed ask (merged duplicate, archived room) is history, not
+            # something the client or the desk still owes.
+            if is_open_request(doc) or doc.status == "uploaded"
         ],
         files=file_reads,
         ai_summary=summary,
