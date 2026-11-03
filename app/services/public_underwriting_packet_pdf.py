@@ -258,15 +258,20 @@ _MONTH_LABELS = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Se
 
 
 def _period_key(period: Any) -> tuple[str, str] | None:
-    """('2026-01-01 to 2026-01-31') -> ('2026-01', 'Jan 2026'). Returns None if unparseable."""
-    text = str(period or "").strip()
-    m = re.search(r"(\d{4})[-/](\d{1,2})", text)
-    if not m:
+    """('2026-05-30 to 2026-06-30') -> ('2026-06', 'Jun 2026'). Returns None if unparseable.
+
+    The closing month, as everywhere else a statement period is read: taking
+    the first month filed a May-30-to-June-30 cycle under May, so six
+    consecutive statements deduped to five and the review kept asking for
+    the sixth.
+    """
+    from app.services.bucket_evidence import statement_period_month
+
+    key = statement_period_month(period)
+    if key is None:
         return None
-    year, month = m.group(1), int(m.group(2))
-    if not 1 <= month <= 12:
-        return None
-    return (f"{year}-{month:02d}", f"{_MONTH_LABELS[month]} {year}")
+    year, month = key.split("-")
+    return (key, f"{_MONTH_LABELS[int(month)]} {year}")
 
 
 def _month_record(source: dict[str, Any]) -> dict[str, Any] | None:

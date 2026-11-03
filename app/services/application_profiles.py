@@ -307,7 +307,7 @@ async def client_evidence_banking_summary(
                     item.status in satisfied_states
                     or item.verified_coverage_complete
                 ),
-                coverage_complete=bool(item.coverage_complete),
+                coverage_complete=bool(getattr(item, "coverage_complete", False)),
                 evidence_count=item.evidence_count,
                 accepted_evidence_count=accepted_count,
                 processing_evidence_count=processing_count,

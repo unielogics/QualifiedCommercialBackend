@@ -311,3 +311,34 @@ async def test_a_trivial_or_unchanged_pin_is_refused_before_anything_is_stored()
         assert error.value.status_code == 422
         set_passcode.assert_not_awaited()
     db.commit.assert_not_awaited()
+
+
+# --- the AI review answers only open asks -----------------------------------
+
+
+def test_the_review_marks_open_asks_uploaded_and_leaves_closed_ones_closed() -> None:
+    from app.services.bucket_ai import _mark_satisfied_requests
+
+    open_ask = _room_row("Last 6 months bank statements", "Bank Statements")
+    merged = _room_row("Last 6 months business bank statements", "financials", status="closed")
+    unrelated = _room_row("Debt schedule", "Debts")
+
+    marked = _mark_satisfied_requests([open_ask, merged, unrelated], {"bank_statement"})
+
+    assert marked == 1
+    assert open_ask.status == "uploaded"
+    assert merged.status == "closed"
+    assert unrelated.status == "requested"
+
+
+def test_the_review_and_packet_file_a_statement_under_its_closing_month_too() -> None:
+    from app.services.public_underwriting_packet_pdf import _period_key, extract_bank_months
+
+    assert _period_key("2026-05-30 to 2026-06-30") == ("2026-06", "Jun 2026")
+    assert _period_key("2026-05-01 to 2026-05-29") == ("2026-05", "May 2026")
+    assert _period_key("no period") is None
+    months = extract_bank_months([
+        {"classification": "bank_statement", "key_facts": {"statement_period": "2026-05-01 to 2026-05-29", "ending_balance": 1}},
+        {"classification": "bank_statement", "key_facts": {"statement_period": "2026-05-30 to 2026-06-30", "ending_balance": 2}},
+    ])
+    assert [row["sort"] for row in months] == ["2026-05", "2026-06"]

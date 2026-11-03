@@ -41,7 +41,6 @@ from app.models.bucket import (
     BucketVendorAccess,
 )
 from app.models.user import User
-from app.services.bucket_requests import is_open_request
 from app.services import mca_refinance_policy, merchant_processing, provenance
 from app.services.ai.bedrock_client import get_client, model_heavy, model_light
 from app.services.ai.structured_output import is_truncated_response, require_complete_response
@@ -51,6 +50,7 @@ from app.services.bucket_evidence import (
     classifications_for_requested_doc,
     reconcile_uploaded_file,
 )
+from app.services.bucket_requests import is_open_request
 from app.services.upload_validation import pdf_requires_password as _pdf_requires_password
 
 # The user and assistant rows of one chat turn are flushed together and share
@@ -1652,6 +1652,25 @@ def _apply_lending_readiness(result: dict[str, Any], per_file_analyses: list[dic
             }
         if not one_next:
             result["one_next_step"] = question
+
+
+def _mark_satisfied_requests(documents, present_classes: set[str]) -> int:
+    """Mark an open ask uploaded when an analyzed file reads as what it asked for.
+
+    Only an ask the client still owes can be answered this way. A closed one
+    (an archived room's, or a duplicate merged into the room's own row) stays
+    closed: flipping it to uploaded resurrected a merged duplicate beside the
+    row that had adopted it.
+    """
+    marked = 0
+    for doc in documents:
+        if not is_open_request(doc):
+            continue
+        wanted = classifications_for_requested_doc(doc.name, doc.category)
+        if wanted & present_classes:
+            doc.status = "uploaded"
+            marked += 1
+    return marked
 
 
 def _reconcile_checklist_consistency(bucket: Bucket, result: dict[str, Any]) -> None:
@@ -3404,16 +3423,11 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         _merge_per_file_analyses(
             result, per_file_analyses, requested_documents=requested, slot_files=slot_files
         )
-        # Reconcile the requested-document checklist: mark a requested doc as
+        # Reconcile the requested-document checklist: mark an open ask as
         # uploaded when an analyzed file satisfies its category, so satisfied
         # baseline items stop showing as "missing" in the UI.
         present_classes = {item.get("ai_classification") for item in per_file_analyses if item.get("ai_classification")}
-        for doc in bucket.requested_documents:
-            if doc.status == "uploaded":
-                continue
-            wanted = classifications_for_requested_doc(doc.name, doc.category)
-            if wanted & present_classes:
-                doc.status = "uploaded"
+        _mark_satisfied_requests(bucket.requested_documents, present_classes)
         # Deterministically fill numeric key_metrics from the cached bank/tax facts
         # (the synthesis pass frequently leaves them null) and compute lending
         # readiness + a concrete clarifying next step from the open gaps.
