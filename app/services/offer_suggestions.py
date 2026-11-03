@@ -188,8 +188,13 @@ def income_figure(cockpit: dict[str, Any]) -> tuple[float | None, str | None, st
 async def suggest_offers(db: AsyncSession, profile: ApplicationProfile, *, program_keys: list[str] | None = None) -> dict[str, Any]:
     cockpit = await financial_cockpit.load_cockpit(db, profile)
     income, basis_key, basis_label = income_figure(cockpit)
-    existing_monthly = cockpit["debt"]["service"].get("monthly") or 0.0
-    requested = cockpit.get("requested_amount")
+    evaluation = (cockpit.get("plan") or {}).get("evaluation") or {}
+    # The plan's retirements leave the file: their payments stop, and the new
+    # loan has to cover their payoffs on top of what the client asked for.
+    existing_monthly = evaluation.get("debt_service_before_new_payment_monthly")
+    if existing_monthly is None:
+        existing_monthly = cockpit["debt"]["service"].get("monthly") or 0.0
+    requested = evaluation.get("loan_amount_needed") or cockpit.get("requested_amount")
     selections = await programs.active_selections(db, profile.id)
     candidates = {c.program_key: c for c in await programs.published_candidates(db, profile)}
     keys: list[str] = list(program_keys or [])
@@ -224,6 +229,8 @@ async def suggest_offers(db: AsyncSession, profile: ApplicationProfile, *, progr
         "income_label": basis_label,
         "existing_debt_service_monthly": existing_monthly,
         "debt_service_source": cockpit["debt"]["service"].get("source"),
+        "plan_active": bool(evaluation.get("active")),
+        "payoff_total": evaluation.get("payoff_total"),
         "target_dscr": TARGET_DSCR,
         "requested_amount": requested,
         "products": products,

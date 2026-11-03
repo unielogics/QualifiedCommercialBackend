@@ -78,6 +78,7 @@ def advance_read(row: DealerDebt) -> dict[str, Any]:
         "maturity_on": row.maturity_on,
         "notes": row.notes,
         "count_in_dscr": bool(row.count_in_dscr),
+        "payee_key": row.vendor_key or None,
         "origin": origin,
         "editable": origin == DESK_ORIGIN,
         "source": _SOURCE_BY_ORIGIN.get(origin, origin or "unknown"),
@@ -117,6 +118,11 @@ def _apply(target: DealerDebt, row: dict[str, Any]) -> None:
     )
     target.notes = str(row.get("notes") or "").strip() or None
     target.count_in_dscr = bool(row.get("count_in_dscr", True))
+    # The statement payee this advance is: the ledger identity the cockpit,
+    # the reconciliation and the plan all key on. Set once, kept thereafter.
+    payee_key = str(row.get("payee_key") or "").strip() or None
+    if payee_key:
+        target.vendor_key = payee_key[:60]
     monthly = (
         monthly_equivalent(target.payment_amount, target.payment_frequency or "monthly")
         if target.payment_amount is not None

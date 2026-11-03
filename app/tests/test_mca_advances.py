@@ -109,3 +109,13 @@ def test_only_advance_shaped_rows_count() -> None:
     assert mca_advances.is_advance_row(SimpleNamespace(category="loan", payment_frequency="daily", factor_rate=None))
     assert mca_advances.is_advance_row(SimpleNamespace(category="loan", payment_frequency=None, factor_rate=1.25))
     assert not mca_advances.is_advance_row(SimpleNamespace(category="loan", payment_frequency="monthly", factor_rate=None))
+
+
+@pytest.mark.asyncio
+async def test_an_advance_added_from_a_statement_payee_keeps_that_ledger_identity() -> None:
+    db = _DB([])
+    rows = await mca_advances.save_advances(db, PROFILE, [{"lender": "Ondeck Capital23", "payment_amount": 1350, "payment_frequency": "weekly", "payee_key": "ondeck capital"}])
+    assert rows[0].vendor_key == "ondeck capital" and rows[0].monthly_payment == 5845.5
+    assert mca_advances.advance_read(rows[0])["payee_key"] == "ondeck capital"
+    again = await mca_advances.save_advances(db, PROFILE, [{"id": str(rows[0].id), "lender": "OnDeck", "payment_amount": 1350, "payment_frequency": "weekly"}])
+    assert again[0].vendor_key == "ondeck capital"  # kept when the form omits it

@@ -46,6 +46,8 @@ class AdvanceIn(BaseModel):
     maturity_on: date | None = None
     notes: str | None = Field(default=None, max_length=1000)
     count_in_dscr: bool = True
+    #: The statement payee this advance is (cockpit payee key), when known.
+    payee_key: str | None = Field(default=None, max_length=60)
 
 
 class AdvanceRead(AdvanceIn):
@@ -88,3 +90,25 @@ class BankAccountsRead(BaseModel):
 
 class BankAccountsWrite(BaseModel):
     counted: list[str] = Field(default_factory=list, max_length=20)
+
+
+class FinancialPlanWrite(BaseModel):
+    """What the desk decided: obligations the new loan pays off, payees that
+    are not operating spend, and the new payment or the loan it comes from."""
+
+    retire: list[str] = Field(default_factory=list, max_length=60)
+    exclude: list[str] = Field(default_factory=list, max_length=60)
+    new_payment_monthly: float | None = Field(default=None, ge=0)
+    new_payment_source: Literal["manual", "term_sheet", "offer", "manual_terms"] | None = None
+    new_loan_amount: float | None = Field(default=None, ge=0)
+    new_loan_rate_pct: float | None = Field(default=None, ge=0, le=100)
+    new_loan_term_months: int | None = Field(default=None, ge=1, le=600)
+    note: str | None = Field(default=None, max_length=600)
+
+
+class FinancialPlanRead(BaseModel):
+    profile_id: UUID
+    record: dict[str, Any] = Field(default_factory=dict)
+    evaluation: dict[str, Any] = Field(default_factory=dict)
+    levers: list[dict[str, Any]] = Field(default_factory=list)
+    obligations: list[dict[str, Any]] = Field(default_factory=list)

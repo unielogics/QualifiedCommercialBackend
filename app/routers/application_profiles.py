@@ -167,6 +167,8 @@ from app.schemas.financial_cockpit import (
     BankAccountsRead,
     BankAccountsWrite,
     FinancialCockpitRead,
+    FinancialPlanRead,
+    FinancialPlanWrite,
     StatementRereadResult,
 )
 from app.schemas.retention import LegalHoldChange, RetentionStatusRead
@@ -2371,6 +2373,42 @@ async def reread_financial_cockpit_statements(
         )
     await db.commit()
     return StatementRereadResult(queued=len(targets), file_ids=[file.id for file in targets])
+
+
+@router.get("/{profile_id}/financial-plan", response_model=FinancialPlanRead)
+async def get_financial_plan(profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> FinancialPlanRead:
+    """The plan on the file with its evaluation and the levers that would raise coverage."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    cockpit = await financial_cockpit.load_cockpit(db, profile)
+    return FinancialPlanRead(profile_id=profile.id, obligations=cockpit["debt"]["obligations"], **cockpit["plan"])
+
+
+@router.put("/{profile_id}/financial-plan", response_model=FinancialPlanRead)
+async def put_financial_plan(
+    profile_id: UUID, payload: FinancialPlanWrite, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> FinancialPlanRead:
+    """Save the plan: which obligations the new loan pays off, which payees are
+    not operating spend, and the new payment. Coverage, the simulator, the
+    offer and the debt service all re-read it."""
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    record = payload.model_dump()
+    record["updated_at"] = datetime.now(UTC).isoformat()
+    record["updated_by"] = str(user.id)
+    profile.financial_plan = record
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "financial_plan.updated",
+        f"Plan: {len(payload.retire)} obligation(s) paid off by the new loan, {len(payload.exclude)} payee(s) not operating spend"
+        + (f", new payment {payload.new_payment_monthly:,.0f}/mo" if payload.new_payment_monthly else "")
+        + (f", new loan {payload.new_loan_amount:,.0f} at {payload.new_loan_rate_pct or 0:g}% over {payload.new_loan_term_months or 0} months" if payload.new_loan_amount else ""),
+        metadata={"retire": payload.retire, "exclude": payload.exclude},
+    )
+    await db.commit()
+    cockpit = await financial_cockpit.load_cockpit(db, profile)
+    return FinancialPlanRead(profile_id=profile.id, obligations=cockpit["debt"]["obligations"], **cockpit["plan"])
 
 
 @router.get("/{profile_id}/bank-accounts", response_model=BankAccountsRead)

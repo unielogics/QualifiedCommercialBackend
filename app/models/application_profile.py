@@ -187,6 +187,11 @@ class ApplicationProfile(TimestampMixin, Base):
     counted_bank_accounts: Mapped[list] = mapped_column(
         JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
     )
+    #: The financial plan (app/services/financial_plan.py): obligations the
+    #: new loan pays off, payees that are not operating spend, the new payment.
+    financial_plan: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
     use_of_funds_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     use_of_funds_updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")

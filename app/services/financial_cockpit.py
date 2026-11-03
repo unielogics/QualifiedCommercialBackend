@@ -747,6 +747,7 @@ def debt_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "payoff_amount": _num(row.get("payoff_amount")),
                 "origin": row.get("origin"),
                 "count_in_dscr": bool(row.get("count_in_dscr", True)),
+                "vendor_key": (str(row.get("vendor_key") or "").strip() or None),
                 "source": "debt_schedule_row",
             }
         )
@@ -1246,14 +1247,19 @@ def reconcile_advances(
         doc = documented[doc_index] if doc_index is not None else None
         if doc_index is not None:
             used_documented.add(doc_index)
-        obs = next(
-            (
-                p
-                for p in debt_payees
-                if p["key"] not in used_observed and match_names(row["lender"], p["payee"])
-            ),
-            None,
-        )
+        obs = None
+        vendor_key = row.get("vendor_key")
+        if vendor_key and vendor_key not in used_observed:
+            obs = next((p for p in debt_payees if p["key"] == vendor_key), None)
+        if obs is None:
+            obs = next(
+                (
+                    p
+                    for p in debt_payees
+                    if p["key"] not in used_observed and match_names(row["lender"], p["payee"])
+                ),
+                None,
+            )
         if obs is not None:
             used_observed.add(obs["key"])
         observed_delta = _pct_delta(
@@ -1678,6 +1684,7 @@ def build_cockpit(
     requested_amount: float | None = None,
     proposed_terms: dict[str, Any] | None = None,
     counted_accounts: list[str] | None = None,
+    plan: dict[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """The cockpit read model from plain dicts.
@@ -1707,6 +1714,31 @@ def build_cockpit(
     service = debt_service(rows, document, documented, recurring)
     reconciliation = reconcile_advances(rows, documented, recurring)
     proposed = proposed_payment(proposed_terms)
+    dscr = dscr_block(years, statement, bank, service, proposed)
+    from app.services import financial_plan as plans
+
+    plan_record = plans.normalize_plan(plan)
+    debt_block = {"rows": rows, "documented": documented, "service": service}
+    obligations = plans.obligations(debt_block, recurring)
+    evaluation = plans.evaluate_plan(
+        plan_record,
+        obligations_list=obligations,
+        recurring=recurring,
+        months=months,
+        dscr=dscr,
+        service=service,
+        proposed=proposed,
+        requested_amount=_num(requested_amount),
+    )
+    levers = plans.coverage_levers(
+        plan_record,
+        evaluation,
+        obligations_list=obligations,
+        recurring=recurring,
+        dscr=dscr,
+        requested_amount=_num(requested_amount),
+        terms=proposed_terms,
+    )
     coverage = {
         "files_analyzed": len(analyses),
         "files_accepted": len(_accepted_files(analyses)),
@@ -1758,8 +1790,10 @@ def build_cockpit(
             else None,
             "service": service,
             "reconciliation": reconciliation,
+            "obligations": obligations,
         },
-        "dscr": dscr_block(years, statement, bank, service, proposed),
+        "dscr": dscr,
+        "plan": {"record": plan_record, "evaluation": evaluation, "levers": levers},
         "net_profit": net_profit_block(years, statement, bank),
         "notes": _notes(coverage, bank, service, proposed, years, statement),
     }
@@ -1847,6 +1881,7 @@ def _debt_dicts(rows: list[DealerDebt]) -> list[dict[str, Any]]:
         "payment_frequency",
         "factor_rate",
         "payoff_amount",
+        "vendor_key",
     )
     return [{field: getattr(row, field, None) for field in fields} for row in rows]
 
@@ -1907,6 +1942,7 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
         requested_amount=float(requested_amount) if requested_amount is not None else None,
         proposed_terms=term_sheet_terms(sheet),
         counted_accounts=list(getattr(profile, "counted_bank_accounts", None) or []),
+        plan=getattr(profile, "financial_plan", None) or {},
     )
     cockpit["profile_id"] = str(profile.id)
     return cockpit
