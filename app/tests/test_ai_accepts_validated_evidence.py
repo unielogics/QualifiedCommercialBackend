@@ -38,10 +38,14 @@ def test_a_bare_request_is_not_an_instruction() -> None:
     assert _is_bare_request("Collect Last 6 months business bank statements", "Last 6 months business bank statements")
     assert _is_bare_request("Please provide the current advance terms or payoff letters.", "Current advance terms or payoff letters")
     assert not _is_bare_request("Confirm the statements show no more than 3 NSF events per month", "Last 6 months business bank statements")
+    # The generator's completion boilerplate restates the validation every file passes.
+    assert _is_bare_request("A readable bank_statement document is linked and verified.", "Last 6 months business bank statements")
+    assert _is_bare_request("A readable floorplan_mca_inventory document is linked and verified.", "Current advance terms or payoff letters")
 
 
 def test_only_real_instructions_become_review_checks() -> None:
     assert _merged_review_checks([_requirement()]) == []
+    assert _merged_review_checks([_requirement(completion_criteria="A readable bank_statement document is linked and verified.")]) == []
     real = _requirement(objective_text="Confirm each statement shows average daily balances above $5,000.")
     checks = _merged_review_checks([real])
     assert len(checks) == 1 and checks[0]["instructions"].startswith("Confirm each statement")

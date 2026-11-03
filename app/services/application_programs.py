@@ -1644,12 +1644,22 @@ _BARE_REQUEST_WORDS = frozenset({
 })
 
 
+_BOILERPLATE_CRITERIA = re.compile(
+    r"^\s*a readable [a-z0-9_ ]+ documents? (is|are) linked and verified\.?\s*$", re.IGNORECASE
+)
+
+
 def _is_bare_request(text: str, label: str | None) -> bool:
     """True when ``text`` only asks for the document and instructs nothing.
 
     The words left after the requirement's own label and the asking words are
-    removed are the instruction. None left, no instruction.
+    removed are the instruction. None left, no instruction. The generated
+    completion criteria ("A readable bank_statement document is linked and
+    verified.") restate the validation every file already passes, so they
+    count as bare too.
     """
+    if _BOILERPLATE_CRITERIA.match(str(text or "")):
+        return True
     value = re.sub(r"[^a-z0-9 ]+", " ", str(text or "").casefold())
     if label:
         value = value.replace(re.sub(r"[^a-z0-9 ]+", " ", str(label).casefold()), " ")
