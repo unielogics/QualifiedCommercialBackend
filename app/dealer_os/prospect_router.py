@@ -33,6 +33,7 @@ from app.models.user import User
 from app.schemas.prospect_outreach import ProspectEmailDraftCreate
 from app.services import booking_operations, booking_reminders
 from app.services import prospect_outreach as outreach_service
+from app.services.local_time import local_stamp, zone
 from app.services.notifications import notify_users
 from app.services.user_access import record_access_event, request_metadata
 
@@ -1593,7 +1594,7 @@ async def create_prospect_appointment(
         title=f"Appointment booked: {company.name}",
         body=(
             f"{contact.full_name} is scheduled for "
-            f"{starts_at.isoformat()}."
+            f"{local_stamp(starts_at, zone(getattr(booking, 'timezone', None)), fmt='%A, %B %-d at %-I:%M %p')}."
         ),
         target_type="dealer_prospect",
         target_id=str(prospect.id),

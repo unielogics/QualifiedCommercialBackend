@@ -20,6 +20,7 @@ from app.models.notification import Notification
 from app.models.user import User
 from app.services import provenance
 from app.services.email.ses_client import SesSendResult, send_email
+from app.services.local_time import local_stamp, zone
 from app.services.push import fire_and_forget_push
 
 log = logging.getLogger(__name__)
@@ -544,7 +545,7 @@ async def notify_calendar_event(
         category="calendar",
         priority="medium",
         title=("Appointment updated" if changed else "New appointment"),
-        body=f"{event.title} is scheduled for {event.starts_at.strftime('%b %d at %I:%M %p') if hasattr(event.starts_at, 'strftime') else 'the calendar'}.",
+        body=f"{event.title} is scheduled for {local_stamp(event.starts_at, zone(getattr(event, 'timezone', None)), fmt='%b %-d at %-I:%M %p') if hasattr(event.starts_at, 'strftime') else 'the calendar'}.",
         target_type="calendar_event",
         target_id=str(event.id),
         deep_link="/calendar",

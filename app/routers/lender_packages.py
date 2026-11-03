@@ -50,6 +50,7 @@ from app.schemas.lender_package import (
 from app.services.activity_log import mark_loan_dirty
 from app.services.clerk import invite_user
 from app.services.lender_connect import LenderConnectError, connect_lender
+from app.services.local_time import local_stamp
 
 router = APIRouter(tags=["lender-packages"])
 
@@ -463,7 +464,7 @@ async def create_lender_package(
                 f"For security, borrower documents are not attached and file links are not included in this email. "
                 f"Please sign in to the lender portal to review the package and, if you choose, submit proposed terms:\n"
                 f"{portal_url}\n\n"
-                f"This package expires on {expires_at:%Y-%m-%d %H:%M %Z}.\n\n"
+                f"This package expires on {local_stamp(expires_at, fmt='%B %-d, %Y at %-I:%M %p')}.\n\n"
                 f"{payload.message or ''}"
             ),
             status=EmailDraftStatus.PENDING,

@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,6 +36,7 @@ from app.models.admin_activity import AdminDigestState
 from app.models.bucket import Bucket, BucketActivityLog
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
+from app.services.local_time import firm_zone, local_stamp
 
 log = logging.getLogger(__name__)
 
@@ -188,7 +190,7 @@ def _digest_settings(raw: Any) -> dict[str, Any]:
     return parsed.model_dump()
 
 
-def _format_digest(items: list[dict[str, Any]], *, public_url: str) -> tuple[str, str, str]:
+def _format_digest(items: list[dict[str, Any]], *, public_url: str, tz: ZoneInfo | None = None) -> tuple[str, str, str]:
     """(subject, body_text, body_html) — one section per lead, newest lead first."""
     by_lead: dict[str, list[dict[str, Any]]] = {}
     order: list[str] = []
@@ -220,7 +222,7 @@ def _format_digest(items: list[dict[str, Any]], *, public_url: str) -> tuple[str
         text_lines.append(f"— {lead_name} ({len(events)} update{'s' if len(events) != 1 else ''})")
         rows_html = []
         for event in sorted(events, key=lambda item: item["created_at"]):
-            stamp = event["created_at"].astimezone(timezone.utc).strftime("%I:%M %p UTC")
+            stamp = local_stamp(event["created_at"], tz, fmt="%-I:%M %p")
             actor = event["actor_name"] or (event["actor_role"] or "client").replace("_", " ")
             detail = (event["detail"] or "").strip()
             detail_part = f" — {detail[:140]}" if detail else ""
@@ -296,7 +298,7 @@ async def run_admin_activity_digest() -> None:
             return
 
         public_url = _public_url("").rstrip("/")
-        subject, body_text, body_html = _format_digest(list(reversed(items)), public_url=public_url)
+        subject, body_text, body_html = _format_digest(list(reversed(items)), public_url=public_url, tz=await firm_zone(db))
 
         delivered = False
         for recipient in recipients:
