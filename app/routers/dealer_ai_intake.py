@@ -964,6 +964,8 @@ class AdminLeadContactUpdate(BaseModel):
     requested_loan_amount: float | None = Field(default=None, ge=0)
     estimated_credit_score: int | None = Field(default=None, ge=300, le=850)
     referral_source: str | None = Field(default=None, max_length=180)
+    # Program fit needs it and the client may not have said; the desk can.
+    years_in_business: float | None = Field(default=None, ge=0, le=150)
 
     @field_validator("phone", "business_name", "loan_purpose", "referral_source", mode="before")
     @classmethod
@@ -1497,6 +1499,41 @@ class PackageReadinessGenerationRead(BaseModel):
     artifact_history: list[PublicUnderwritingArtifactRead] = Field(default_factory=list)
 
 
+YEARS_IN_BUSINESS_KEYS = ("years_in_business", "time_in_business_years", "business_age_years")
+
+
+def _years_in_business(intake: PublicUnderwritingIntake) -> float | None:
+    """How long the business has operated, from wherever the file learned it:
+    the desk, the intake's declaration, the chat, or the review snapshot."""
+    def scan(value: Any) -> float | None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key) in YEARS_IN_BUSINESS_KEYS:
+                    try:
+                        number = float(item)
+                    except (TypeError, ValueError):
+                        number = None
+                    if number is not None and 0 <= number <= 150:
+                        return number
+            for item in value.values():
+                found = scan(item)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = scan(item)
+                if found is not None:
+                    return found
+        return None
+
+    state = intake.intake_state or {}
+    for source in (state.get("desk_facts"), state, intake.result_snapshot or {}):
+        found = scan(source)
+        if found is not None:
+            return found
+    return None
+
+
 class DealerIntakeRead(ORMModel):
     id: UUID
     client_id: UUID | None
@@ -1514,6 +1551,7 @@ class DealerIntakeRead(ORMModel):
     requested_loan_amount: float | None
     estimated_credit_score: int | None
     referral_source: str | None
+    years_in_business: float | None = None
     asset_rows: list[dict[str, Any]] | None
     intake_state: dict[str, Any] | None
     result_snapshot: dict[str, Any] | None
@@ -7098,6 +7136,7 @@ async def _response(
         else []
     )
     intake_read = DealerIntakeRead.model_validate(intake)
+    intake_read.years_in_business = _years_in_business(intake)
     intake_read.bucket_name = intake.bucket.name
     # Redact internal-only data from the public/uploader payload. The dealer
     # sees only whitelisted intake_state keys and a sanitized review result.

@@ -96,3 +96,16 @@ def test_rules_evaluate_provisional_and_estimated_facts_and_say_so() -> None:
         "Annual revenue estimated from bank deposits; a person can replace it",
         "Cash flow estimated from bank statements; a person can replace it",
     ]
+
+
+def test_the_desk_can_record_years_in_business_and_the_file_reads_it_back() -> None:
+    from app.routers.dealer_ai_intake import AdminLeadContactUpdate, _years_in_business
+
+    assert AdminLeadContactUpdate(years_in_business=3.5).years_in_business == 3.5
+    desk = SimpleNamespace(intake_state={"desk_facts": {"years_in_business": 4.0}, "mca_qualification": {"years_in_business": 2}}, result_snapshot={})
+    assert _years_in_business(desk) == 4.0  # the desk's entry wins over the declaration
+    declared = SimpleNamespace(intake_state={"mca_qualification": {"years_in_business": "2.5"}}, result_snapshot={})
+    assert _years_in_business(declared) == 2.5
+    chat = SimpleNamespace(intake_state={"mca_details": {"years_in_business": 6, "advance_count": 2}}, result_snapshot={})
+    assert _years_in_business(chat) == 6.0
+    assert _years_in_business(SimpleNamespace(intake_state={}, result_snapshot=None)) is None

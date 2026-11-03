@@ -971,6 +971,21 @@ async def update_lead_contact(
     core._require_governance_admin(user)
     intake = await core._load_admin_dealer_lead(db, intake_id)
     values = payload.model_dump(exclude_unset=True)
+    if "years_in_business" in values:
+        # Not a column: the fit engine reads it from the intake state, beside
+        # what the client declared or the chat established.
+        years = values.pop("years_in_business")
+        state = core._intake_state(intake)
+        facts = dict(state.get("desk_facts") or {})
+        if years is None:
+            facts.pop("years_in_business", None)
+        else:
+            facts["years_in_business"] = float(years)
+        state["desk_facts"] = facts
+        intake.intake_state = state
+        values_logged = ["years_in_business"]
+    else:
+        values_logged = []
     if "full_name" in values and values["full_name"] is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Principal name is required")
     if "email" in values and values["email"] is None:
@@ -983,7 +998,7 @@ async def update_lead_contact(
             linked_name = (intake.business_name or intake.full_name or "Application").strip()[:180]
             bucket.name = linked_name
             bucket.client_name = linked_name
-    changed = ", ".join(sorted(values)) or "No fields changed"
+    changed = ", ".join(sorted([*values, *values_logged])) or "No fields changed"
     await core._log(
         db,
         intake.bucket_id,
