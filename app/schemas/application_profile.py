@@ -766,6 +766,9 @@ class ClientEvidenceRequirementRead(BaseModel):
     required_level: Literal["required", "recommended", "optional"]
     status: RequirementStateStatus
     complete: bool = False
+    # Everything asked for has arrived and is only awaiting review. The room
+    # says "checking" rather than asking the client for it again.
+    coverage_complete: bool = False
     evidence_count: int = 0
     accepted_evidence_count: int = 0
     processing_evidence_count: int = 0
