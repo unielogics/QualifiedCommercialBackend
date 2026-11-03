@@ -800,3 +800,31 @@ def test_counted_accounts_narrow_the_combined_months_but_keep_every_account_visi
     assert bank_file_counted({"key_facts": {"bank": "Chase", "account_last4": "7777"}}, ["chase ••1234"]) is False
     assert bank_file_counted(None, ["chase ••1234"]) is False
     assert bank_file_counted(None, []) is True
+
+
+def test_an_account_keeps_one_identity_however_the_reader_prints_the_bank() -> None:
+    from app.services.financial_cockpit import account_key_of
+
+    assert account_key_of({"bank": "JPMorgan Chase Bank, N.A.", "account_last4": "1204"}) == "jpmorgan ••1204"
+    assert account_key_of({"bank": "Pinnacle Bank (Horizon 75)", "account_last4": "9519"}) == account_key_of({"bank": "Pinnacle Bank", "account_last4": "9519"})
+    assert account_key_of({"bank": "Citizens Bank, N.A.", "account_last4": "x4884"}) == "citizens ••4884"
+    assert account_key_of({"bank": "The Bank of Tampa", "account_last4": "0001"}) == "tampa ••0001"
+    months, accounts = bank_months(
+        [
+            _bank("a", "2026-05-01 to 2026-05-31", 10000, 5000, bank="Pinnacle Bank", last4="9519"),
+            _bank("b", "2026-06-01 to 2026-06-30", 12000, 6000, bank="Pinnacle Bank (Horizon 75)", last4="9519"),
+            _bank("c", "2026-07-01 to 2026-07-31", 9000, 4000, bank="Pinnacle Bank", last4=""),  # the reader missed the digits
+        ]
+    )
+    assert [a["key"] for a in accounts] == ["pinnacle ••9519"]
+    assert accounts[0]["months"] == ["2026-05", "2026-06", "2026-07"]
+    assert len(months) == 3
+
+    _months, two = bank_months(
+        [
+            _bank("a", "2026-05-01 to 2026-05-31", 10000, 5000, bank="KeyBank", last4="2108"),
+            _bank("b", "2026-05-01 to 2026-05-31", 7000, 1000, bank="KeyBank", last4="4835"),
+            _bank("c", "2026-06-01 to 2026-06-30", 9000, 4000, bank="KeyBank", last4=""),  # two candidates: stays apart
+        ]
+    )
+    assert [a["key"] for a in two] == ["keybank", "keybank ••2108", "keybank ••4835"]

@@ -370,13 +370,23 @@ def _populated(record: dict[str, Any]) -> int:
     return sum(1 for key in _BANK_AMOUNTS + _BANK_COUNTS if record.get(key) is not None)
 
 
+def _bank_stem(bank: str) -> str:
+    """'JPMorgan Chase Bank, N.A.' -> 'jpmorgan'; 'Pinnacle Bank (Horizon 75)' -> 'pinnacle'.
+    The reader prints a bank's name differently from statement to statement;
+    the first word plus the last four digits is what stays the same."""
+    words = [w for w in re.sub(r"[^a-z0-9 ]", " ", bank.casefold()).split() if w not in {"the", "bank", "of"}]
+    return words[0] if words else ""
+
+
 def _account_identity(facts: dict[str, Any], row: dict[str, Any]) -> tuple[str, str]:
     bank = str(row.get("bank") or facts.get("bank") or "").strip()
     last4 = re.sub(r"\D", "", str(row.get("account_last4") or facts.get("account_last4") or ""))[
         -4:
     ]
+    stem = _bank_stem(bank)
+    key = f"{stem} ••{last4}" if last4 and stem else (f"••{last4}" if last4 else (stem or "account"))
     label = " ".join(part for part in (bank, f"••{last4}" if last4 else "") if part) or "Account"
-    return label.casefold(), label
+    return key, label
 
 
 def account_key_of(facts: Any) -> str:
@@ -438,6 +448,18 @@ def bank_months(
                 )
             ):
                 slot[record["month"]] = record
+    # A statement the reader could not pin to a last-four belongs to its bank's
+    # only known account when there is exactly one; otherwise it stays apart.
+    for orphan in [k for k in per_account if "••" not in k]:
+        owners = [k for k in per_account if k.startswith(f"{orphan} ••")]
+        if len(owners) != 1:
+            continue
+        target = per_account[owners[0]]
+        for month, record in per_account.pop(orphan).items():
+            prior = target.get(month)
+            if prior is None or _populated(record) > _populated(prior):
+                target[month] = record
+        labels.pop(orphan, None)
     counted_keys = {k for k in (counted or []) if k in per_account} or set(per_account)
     combined: dict[str, dict[str, Any]] = {}
     for key, months in per_account.items():
