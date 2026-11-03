@@ -1603,6 +1603,11 @@ def _apply_lending_readiness(result: dict[str, Any], per_file_analyses: list[dic
         if key and key in satisfied_keys:
             continue
         open_items.append(m)
+    # The reconciled list is the one every consumer shows (cockpit chips, the
+    # packet PDF, the review recommendations). Leaving the model's original in
+    # place kept "six months of statements" on the desk's open-items list after
+    # the sixth statement had been counted.
+    result["missing_or_incomplete_items"] = open_items
 
     unsatisfied_rows = [c for c in baseline_rows if _status(c) not in satisfied_states]
 
@@ -1690,6 +1695,18 @@ def _reconcile_checklist_consistency(bucket: Bucket, result: dict[str, Any]) -> 
         if doc.required and is_open_request(doc) and doc.id not in linked
     ]
     result["outstanding_checklist"] = [doc.name for doc in outstanding_docs]
+    answered = {
+        doc.name.strip().lower()
+        for doc in bucket.requested_documents
+        if doc.id in linked or not is_open_request(doc)
+    }
+    existing = result.get("missing_or_incomplete_items")
+    existing = [
+        item
+        for item in (existing if isinstance(existing, list) else [])
+        if not (isinstance(item, dict) and str(item.get("title") or "").strip().lower() in answered)
+    ]
+    result["missing_or_incomplete_items"] = existing
     if not outstanding_docs:
         return
     result["lending_ready"] = False
@@ -1703,9 +1720,10 @@ def _reconcile_checklist_consistency(bucket: Bucket, result: dict[str, Any]) -> 
     if not one_next or claims_complete:
         result["one_next_step"] = f"Collect the outstanding checklist items: {names} — then advance to lender packaging."
     # Ensure the missing list carries every outstanding checklist doc so no
-    # consumer (PDF, cockpit, packets) has to re-derive the union.
-    existing = result.get("missing_or_incomplete_items")
-    existing = existing if isinstance(existing, list) else []
+    # consumer (PDF, cockpit, packets) has to re-derive the union — and drops
+    # any model-authored item that names a checklist row already answered
+    # (a file sits on it) or no longer asked (closed, merged, not applicable):
+    # for those the checklist, not the synthesis, is the source of truth.
     existing_titles = {
         str(item.get("title") or "").strip().lower() for item in existing if isinstance(item, dict)
     }
@@ -3211,7 +3229,7 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
             "required": doc.required,
             "status": doc.status,
         }
-        for doc in bucket.requested_documents
+        for doc in _live_requested_documents(bucket)
     ]
     metadata = [
         {
@@ -4618,7 +4636,7 @@ async def _chat_context(
         return {
             **base,
             "ai_context": admin_ai_context,
-            "requested_documents": [_doc_context(doc) for doc in bucket.requested_documents],
+            "requested_documents": [_doc_context(doc) for doc in _live_requested_documents(bucket)],
             "document_template_library": [_template_context(template) for template in templates],
             "files": [_file_context(file) for file in visible_files],
             "linked_evidence_files": [_file_context(file) for file in linked_files],
@@ -4651,7 +4669,7 @@ async def _chat_context(
             **base,
             "recipient_name": upload_link.recipient_name,
             "ai_context": public_ai_context or None,
-            "requested_documents": [_doc_context(doc) for doc in bucket.requested_documents],
+            "requested_documents": [_doc_context(doc) for doc in _live_requested_documents(bucket)],
             "uploaded_files": [
                 _file_context(file)
                 for file in bucket.files
@@ -4884,6 +4902,20 @@ async def _create_review_recommendation_actions(
             detail=f"{len(created)} review recommendations",
         )
     return created
+
+
+def _live_requested_documents(bucket: Bucket) -> list[BucketRequestedDocument]:
+    """The checklist as the client and the desk see it: open or answered asks.
+
+    A closed ask (an archived room's, a duplicate merged into the room's own
+    row, one marked not applicable) is history. Shown to the model it reads as
+    one more thing to collect, and the review then lists it as missing.
+    """
+    return [
+        doc
+        for doc in bucket.requested_documents
+        if is_open_request(doc) or doc.status == "uploaded"
+    ]
 
 
 def _doc_context(doc: BucketRequestedDocument) -> dict[str, Any]:

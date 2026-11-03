@@ -342,3 +342,59 @@ def test_the_review_and_packet_file_a_statement_under_its_closing_month_too() ->
         {"classification": "bank_statement", "key_facts": {"statement_period": "2026-05-30 to 2026-06-30", "ending_balance": 2}},
     ])
     assert [row["sort"] for row in months] == ["2026-05", "2026-06"]
+
+
+def test_the_review_sees_only_live_asks_and_prunes_answered_ones_from_its_missing_list() -> None:
+    from app.services.bucket_ai import _live_requested_documents, _reconcile_checklist_consistency
+
+    bank = _room_row("Last 6 months bank statements", "Bank Statements", required=True)
+    credit = _room_row("Credit Report Authorization", "Compliance", status="uploaded", requires_signature=True, signature_kind="credit_authorization")
+    merged = _room_row("Last 6 months business bank statements", "financials", status="closed")
+    terms = _room_row("Current MCA / advance terms", "Debts", required=True)
+    skipped = _room_row("Debt schedule", "Debts", status="not_applicable")
+    bucket = SimpleNamespace(
+        requested_documents=[bank, credit, merged, terms, skipped],
+        files=[SimpleNamespace(requested_document_id=bank.id, deleted_at=None)],
+    )
+
+    assert [doc.name for doc in _live_requested_documents(bucket)] == [bank.name, credit.name, terms.name]
+
+    result = {
+        "missing_or_incomplete_items": [
+            {"title": "Last 6 months business bank statements", "detail": "six months", "priority": "high"},
+            {"title": "Credit Report Authorization", "detail": "signed", "priority": "high"},
+            {"title": "OnDeck term loan documentation", "detail": "payoff", "priority": "medium"},
+        ],
+        "one_next_step": "",
+    }
+    _reconcile_checklist_consistency(bucket, result)
+
+    assert result["outstanding_checklist"] == ["Current MCA / advance terms"]
+    assert [item["title"] for item in result["missing_or_incomplete_items"]] == [
+        "OnDeck term loan documentation",
+        "Current MCA / advance terms",
+    ]
+    assert result["lending_ready"] is False
+
+
+def test_six_consecutive_cycles_satisfy_the_baseline_and_leave_the_missing_list() -> None:
+    from app.services.bucket_ai import _apply_lending_readiness
+
+    periods = [
+        "2026-05-01 to 2026-05-29", "2026-05-30 to 2026-06-30", "2026-07-01 to 2026-07-31",
+        "2026-08-01 to 2026-08-31", "2026-09-01 to 2026-09-30", "2026-10-01 to 2026-10-30",
+    ]
+    analyses = [
+        {"file_id": str(uuid4()), "ai_classification": "bank_statement", "key_facts": {"statement_period": period, "ending_balance": 1}}
+        for period in periods
+    ]
+    result = {
+        "document_evidence_map": {"baseline_coverage": [{"category": "bank statement", "status": "satisfied"}]},
+        "missing_or_incomplete_items": [
+            {"title": "Last 6 months bank statements", "detail": "", "priority": "high"},
+            {"title": "OnDeck term loan documentation", "detail": "", "priority": "medium"},
+        ],
+    }
+    _apply_lending_readiness(result, analyses)
+
+    assert [item["title"] for item in result["missing_or_incomplete_items"]] == ["OnDeck term loan documentation"]
