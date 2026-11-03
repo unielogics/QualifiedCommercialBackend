@@ -853,3 +853,50 @@ def test_the_desk_can_declare_detected_accounts_to_be_one() -> None:
     _m, merged_stale = bank_months(analyses, ["navy ••0865"], aliases)
     assert [a["key"] for a in merged_stale if a["counted"]] == ["navy ••8547"]
     assert cockpit["bank"]["months"][0]["deposits"] == 10000 and len(cockpit["bank"]["accounts"]) == 2
+
+
+def test_the_debt_schedule_is_a_standing_container_that_says_where_it_stands() -> None:
+    from app.services.financial_cockpit import schedule_block
+
+    assert schedule_block([], None, [], None)["status"] == "missing"
+    requested = {
+        "requirement_present": True,
+        "requirement_status": "requested",
+        "requested_at": "2026-10-01T00:00:00+00:00",
+    }
+    assert schedule_block([], None, [], requested)["status"] == "requested"
+    received = {"requirement_present": True, "requirement_status": "received_unverified"}
+    assert schedule_block([], None, [], received)["status"] == "received"
+    assert schedule_block([LOAN_ROW], None, [], None)["status"] == "rows"
+    voided = {"reason": "No debt on the business", "by": "Jane Desk", "at": "2026-11-03T12:00:00+00:00"}
+    block = schedule_block(
+        [], None, [], {"requirement_present": True, "requirement_status": "not_applicable", "voided": voided}
+    )
+    assert block["status"] == "voided" and block["voided"]["by"] == "Jane Desk"
+    assert block["can_void"] is False
+    assert schedule_block([], None, [], None)["can_void"] is True
+    assert schedule_block([LOAN_ROW], None, [], None)["can_void"] is False
+
+
+def test_a_voided_schedule_means_no_debt_service_unless_the_statements_disagree() -> None:
+    service = debt_service([], None, [], None, declared_none=True)
+    assert (service["monthly"], service["annual"], service["source"]) == (0.0, 0.0, "declared_none")
+    assert service["declaration_conflict"] is False
+    seen = {"observed_debt_service_monthly": 1200.0, "payees": []}
+    conflicted = debt_service([], None, [], seen, declared_none=True)
+    assert conflicted["source"] == "bank_observed" and conflicted["declaration_conflict"] is True
+
+    voided = {"reason": "No debt on the business", "by": "Jane Desk", "at": "2026-11-03T12:00:00+00:00"}
+    state = {"requirement_present": True, "requirement_status": "not_applicable", "voided": voided}
+    cockpit = build_cockpit([TAX_2025], [], proposed_terms=TERM_SHEET, schedule_state=state)
+    assert cockpit["debt"]["schedule"]["status"] == "voided"
+    assert cockpit["coverage"]["debt_schedule_status"] == "voided"
+    assert cockpit["dscr"]["no_debt"] is True and cockpit["dscr"]["headline"] is None
+    assert "voided" in cockpit["dscr"]["reason"]
+    assert cockpit["dscr"]["pro_forma_headline"]["pro_forma_value"] == 5.83
+    assert any("Jane Desk" in note for note in cockpit["notes"])
+    assert not any("No debt service on file" in note for note in cockpit["notes"])
+
+    plain = build_cockpit([TAX_2025], [], proposed_terms=TERM_SHEET)
+    assert plain["debt"]["schedule"]["status"] == "missing" and plain["dscr"]["no_debt"] is False
+    assert any("not been requested" in note for note in plain["notes"])

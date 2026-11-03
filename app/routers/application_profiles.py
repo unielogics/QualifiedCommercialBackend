@@ -166,6 +166,7 @@ from app.schemas.financial_cockpit import (
     BankAccountRead,
     BankAccountsRead,
     BankAccountsWrite,
+    DebtScheduleVoidWrite,
     FinancialCockpitRead,
     FinancialPlanRead,
     FinancialPlanWrite,
@@ -2455,6 +2456,82 @@ async def put_bank_accounts(
     await db.commit()
     accounts = await financial_cockpit.bank_accounts_for_profile(db, profile)
     return BankAccountsRead(profile_id=profile.id, accounts=[BankAccountRead(**a) for a in accounts], counted=list(profile.counted_bank_accounts or []), aliases=dict(profile.bank_account_aliases or {}))
+
+
+@router.post("/{profile_id}/debt-schedule/void", response_model=FinancialCockpitRead)
+async def void_debt_schedule(
+    profile_id: UUID,
+    payload: DebtScheduleVoidWrite,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FinancialCockpitRead:
+    """The desk declares the business carries no debt.
+
+    Every file carries the debt schedule requirement; this is the one way it
+    is set aside. It is the requirement engine's "not applicable" with the
+    declaration as its reason, so the readiness, the room and the cockpit all
+    read the same decision, and the restore route undoes it.
+    """
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    reason = (payload.reason or "").strip() or "No debt on the business"
+    try:
+        await application_programs.patch_requirement(
+            db,
+            profile,
+            financial_cockpit.DEBT_SCHEDULE_REQUIREMENT,
+            ApplicationRequirementPatch(
+                action="not_applicable", reason=reason, all_programs=True, confirmed=True
+            ),
+            user,
+        )
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_404_NOT_FOUND:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "This file has no debt schedule requirement to void yet; open its readiness first",
+            ) from exc
+        raise
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "debt_schedule.voided",
+        f"Voided the debt schedule: {reason}",
+        target_type="financial_form",
+        target_id=profile.id,
+    )
+    await db.commit()
+    return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
+
+
+@router.post("/{profile_id}/debt-schedule/restore", response_model=FinancialCockpitRead)
+async def restore_debt_schedule(
+    profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> FinancialCockpitRead:
+    """The business does carry debt after all: the schedule is required again."""
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    await application_programs.patch_requirement(
+        db,
+        profile,
+        financial_cockpit.DEBT_SCHEDULE_REQUIREMENT,
+        ApplicationRequirementPatch(
+            action="restore", reason="The debt schedule is required again", confirmed=True
+        ),
+        user,
+    )
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "debt_schedule.restored",
+        "Restored the debt schedule requirement",
+        target_type="financial_form",
+        target_id=profile.id,
+    )
+    await db.commit()
+    return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
 
 
 @router.get("/{profile_id}/advances", response_model=AdvancesRead)
@@ -6151,6 +6228,7 @@ async def financial_forms_status(
             label=_FORM_LABEL["debt_schedule"],
             requested=slot is not None,
             satisfied=bool(slot and slot.status == "uploaded"),
+            voided=(await financial_cockpit.debt_schedule_state(db, profile)).get("voided"),
             source=source,
             row_count=row_count,
             total_monthly=total_monthly,

@@ -31,9 +31,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dealer_os.models import DealerDebt
 from app.dealer_os.services.vendors import normalize_vendor
-from app.models.application_profile import ApplicationProfile
+from app.models.application_profile import (
+    ApplicationProfile,
+    ApplicationProgramRequirementOverride,
+    ApplicationProgramSelection,
+    ApplicationRequirementState,
+)
 from app.models.production_package import ProductionTermSheet
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
+from app.models.user import User
 from app.services import application_programs as programs
 from app.services.bucket_evidence import (
     analysis_classifications,
@@ -374,7 +380,11 @@ def _bank_stem(bank: str) -> str:
     """'JPMorgan Chase Bank, N.A.' -> 'jpmorgan'; 'Pinnacle Bank (Horizon 75)' -> 'pinnacle'.
     The reader prints a bank's name differently from statement to statement;
     the first word plus the last four digits is what stays the same."""
-    words = [w for w in re.sub(r"[^a-z0-9 ]", " ", bank.casefold()).split() if w not in {"the", "bank", "of"}]
+    words = [
+        w
+        for w in re.sub(r"[^a-z0-9 ]", " ", bank.casefold()).split()
+        if w not in {"the", "bank", "of"}
+    ]
     return words[0] if words else ""
 
 
@@ -384,7 +394,9 @@ def _account_identity(facts: dict[str, Any], row: dict[str, Any]) -> tuple[str, 
         -4:
     ]
     stem = _bank_stem(bank)
-    key = f"{stem} ••{last4}" if last4 and stem else (f"••{last4}" if last4 else (stem or "account"))
+    key = (
+        f"{stem} ••{last4}" if last4 and stem else (f"••{last4}" if last4 else (stem or "account"))
+    )
     label = " ".join(part for part in (bank, f"••{last4}" if last4 else "") if part) or "Account"
     return key, label
 
@@ -407,7 +419,12 @@ def resolve_alias(key: str, aliases: dict[str, str] | None) -> str:
     """Follow the desk's "same account" map to the canonical key (bounded)."""
     seen: set[str] = set()
     current = key
-    while aliases and current in aliases and aliases[current] not in seen and aliases[current] != current:
+    while (
+        aliases
+        and current in aliases
+        and aliases[current] not in seen
+        and aliases[current] != current
+    ):
         seen.add(current)
         current = aliases[current]
     return current
@@ -741,6 +758,92 @@ def monthly_equivalent(amount: Any, frequency: Any) -> float | None:
     return round(payment * per_month, 2)
 
 
+#: The readiness requirement that stands for the debt schedule on every file.
+DEBT_SCHEDULE_REQUIREMENT = "business_debt_schedule"
+
+SCHEDULE_STATUS_LABELS = {
+    "voided": "Voided: no debt on the business",
+    "rows": "Received: rows on the schedule",
+    "document": "Received: read off an uploaded schedule",
+    "advance_terms": "Not received: advance terms read off documents",
+    "received": "Received: awaiting review",
+    "requested": "Requested from the borrower, not received",
+    "missing": "Not requested yet",
+}
+
+
+def schedule_block(
+    rows: list[dict[str, Any]],
+    document: dict[str, Any] | None,
+    documented: list[dict[str, Any]],
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Where the debt schedule stands on the file.
+
+    The schedule is a standing part of every file. When nothing has arrived
+    the block still says so, and says whether the borrower was asked, so the
+    desk never mistakes an empty form for a business with no debt. Only the
+    desk's own declaration (a voided schedule) means that, and it names who
+    declared it and when.
+    """
+    state = state or {}
+    voided = state.get("voided")
+    requirement_status = state.get("requirement_status")
+    if voided:
+        status = "voided"
+    elif rows:
+        status = "rows"
+    elif document is not None:
+        status = "document"
+    elif documented:
+        status = "advance_terms"
+    elif requirement_status in {"received_unverified", "verified"}:
+        status = "received"
+    elif requirement_status in {"requested", "stale", "failed"} or state.get("requested_at"):
+        status = "requested"
+    else:
+        status = "missing"
+    return {
+        "status": status,
+        "label": SCHEDULE_STATUS_LABELS[status],
+        "rows": len(rows),
+        "documented": len(documented),
+        "has_document": document is not None,
+        "voided": voided,
+        "requested_at": state.get("requested_at"),
+        "received_at": state.get("received_at"),
+        "requirement_status": requirement_status,
+        "requirement_present": bool(state.get("requirement_present")),
+        "can_void": not voided and not rows and document is None,
+    }
+
+
+def schedule_notes(schedule: dict[str, Any], service: dict[str, Any]) -> list[str]:
+    """What the cockpit says about the schedule's standing, beside the figures."""
+    notes: list[str] = []
+    voided = schedule.get("voided")
+    if voided:
+        who = f" by {voided['by']}" if voided.get("by") else ""
+        when = f" on {voided['at'][:10]}" if voided.get("at") else ""
+        notes.append(
+            f"The debt schedule was voided{who}{when}: {voided.get('reason') or 'no debt on the business'}."
+        )
+        if service.get("declaration_conflict"):
+            observed = service.get("observed_monthly") or 0
+            notes.append(
+                f"The statements still show ${observed:,.0f} a month going to lenders or funders, so the debt service keeps the observed figure; restore the schedule if the business does carry debt."
+            )
+    elif schedule["status"] == "missing":
+        notes.append(
+            "The debt schedule has not been requested on this file; every file carries one until the desk voids it as no debt on the business."
+        )
+    elif schedule["status"] == "requested" and service.get("source") in {"none", "bank_observed"}:
+        notes.append(
+            "The debt schedule was requested from the borrower and has not arrived; until it does the debt service leans on what the statements show."
+        )
+    return notes
+
+
 def debt_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The debt schedule rows on the file (dos_debts), one dict per active row."""
     out: list[dict[str, Any]] = []
@@ -842,6 +945,7 @@ def debt_service(
     document: dict[str, Any] | None,
     documented: list[dict[str, Any]],
     recurring: dict[str, Any] | None = None,
+    declared_none: bool = False,
 ) -> dict[str, Any]:
     """The monthly debt service and where it came from.
 
@@ -885,6 +989,10 @@ def debt_service(
         monthly, source = documented_monthly, "advance_terms"
     elif observed_monthly:
         monthly, source = observed_monthly, "bank_observed"
+    elif declared_none:
+        # The desk voided the schedule: the business carries no debt, and
+        # nothing on file says otherwise.
+        monthly, source = 0.0, "declared_none"
     else:
         monthly, source = None, "none"
     mca_rows = [r for r in rows if r["is_mca"]] if rows else []
@@ -892,8 +1000,12 @@ def debt_service(
     mca_source_rows = mca_rows or mca_documented
     return {
         "monthly": _round(monthly),
-        "annual": _round(monthly * 12) if monthly else None,
+        "annual": _round(monthly * 12) if monthly is not None else None,
         "source": source,
+        "declared_none": declared_none,
+        # The desk declared no debt while the statements show lender debits:
+        # the observed figure wins and the declaration is questioned.
+        "declaration_conflict": bool(declared_none and observed_monthly),
         "schedule_monthly": schedule_monthly,
         "schedule_balance": _round(sum(r["balance"] for r in rows if r["balance"]))
         if any(r["balance"] for r in rows)
@@ -1465,8 +1577,13 @@ def dscr_block(
         if not candidates:
             reason = "No income figure yet: a tax return, a profit-and-loss statement or three months of bank statements gives one."
         elif not annual:
-            reason = "No debt service on file: add the debt schedule or upload one to compute the coverage."
+            reason = (
+                "No debt to cover: the desk voided the debt schedule as no debt on the business, so the coverage is the proposed payment alone."
+                if service.get("source") == "declared_none"
+                else "No debt service on file: add the debt schedule or upload one to compute the coverage."
+            )
     return {
+        "no_debt": service.get("source") == "declared_none",
         "candidates": candidates,
         "headline": headline,
         "pro_forma_headline": pro_forma_headline,
@@ -1711,6 +1828,7 @@ def build_cockpit(
     counted_accounts: list[str] | None = None,
     plan: dict[str, Any] | None = None,
     account_aliases: dict[str, str] | None = None,
+    schedule_state: dict[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """The cockpit read model from plain dicts.
@@ -1739,7 +1857,10 @@ def build_cockpit(
     document = extract_debt_schedule(_extractor_rows(analyses))
     documented = documented_debts(analyses)
     recurring = recurring_payments(analyses)
-    service = debt_service(rows, document, documented, recurring)
+    schedule = schedule_block(rows, document, documented, schedule_state)
+    service = debt_service(
+        rows, document, documented, recurring, declared_none=schedule["status"] == "voided"
+    )
     reconciliation = reconcile_advances(rows, documented, recurring)
     proposed = proposed_payment(proposed_terms)
     dscr = dscr_block(years, statement, bank, service, proposed)
@@ -1782,6 +1903,7 @@ def build_cockpit(
         "has_balance_sheet": sheet is not None,
         "has_debt_schedule_document": document is not None,
         "debt_rows": len(rows),
+        "debt_schedule_status": schedule["status"],
         "documented_debts": len(documented),
         "recurring_months_read": len(recurring["months_read"]),
         "statements_need_reread": len(recurring["files_need_reread"]),
@@ -1819,11 +1941,13 @@ def build_cockpit(
             "service": service,
             "reconciliation": reconciliation,
             "obligations": obligations,
+            "schedule": schedule,
         },
         "dscr": dscr,
         "plan": {"record": plan_record, "evaluation": evaluation, "levers": levers},
         "net_profit": net_profit_block(years, statement, bank),
-        "notes": _notes(coverage, bank, service, proposed, years, statement),
+        "notes": _notes(coverage, bank, service, proposed, years, statement)
+        + schedule_notes(schedule, service),
     }
 
 
@@ -1964,6 +2088,7 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
         db, profile, intake=intake
     )
     sheet = await current_term_sheet(db, profile.id)
+    schedule_state = await debt_schedule_state(db, profile)
     cockpit = build_cockpit(
         analyses,
         _debt_dicts(debts),
@@ -1972,9 +2097,113 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
         counted_accounts=list(getattr(profile, "counted_bank_accounts", None) or []),
         plan=getattr(profile, "financial_plan", None) or {},
         account_aliases=dict(getattr(profile, "bank_account_aliases", None) or {}),
+        schedule_state=schedule_state,
     )
     cockpit["profile_id"] = str(profile.id)
     return cockpit
+
+
+def _iso(value: Any) -> str | None:
+    return value.isoformat() if isinstance(value, datetime) else None
+
+
+async def _declaration(
+    db: AsyncSession, *, reason: str | None, user_id: uuid.UUID | None, at: datetime | None
+) -> dict[str, Any]:
+    by = None
+    if user_id is not None:
+        user = await db.get(User, user_id)
+        if user is not None:
+            by = user.name or user.email
+    return {
+        "reason": (reason or "").strip() or "No debt on the business",
+        "by": by,
+        "by_user_id": str(user_id) if user_id else None,
+        "at": _iso(at),
+    }
+
+
+async def debt_schedule_state(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
+    """The debt schedule requirement on the file and whether the desk voided it.
+
+    A void is the requirement engine's "not applicable": set on the state
+    itself when the baseline policy asks for the schedule, or as an override
+    on every selected program that asks for it. Either way the cockpit reports
+    one thing: who declared the business debt-free, when, and why.
+    """
+    state = (
+        await db.execute(
+            select(ApplicationRequirementState).where(
+                ApplicationRequirementState.profile_id == profile.id,
+                ApplicationRequirementState.requirement_key == DEBT_SCHEDULE_REQUIREMENT,
+            )
+        )
+    ).scalar_one_or_none()
+    if state is None:
+        return {"requirement_present": False}
+    out: dict[str, Any] = {
+        "requirement_present": True,
+        "requirement_status": state.status,
+        "requested_at": _iso(state.first_requested_at or state.last_requested_at),
+        "received_at": _iso(state.received_at),
+        "voided": None,
+    }
+    if state.status in {"waived", "not_applicable"}:
+        out["voided"] = await _declaration(
+            db,
+            reason=state.state_reason,
+            user_id=state.verified_by_user_id,
+            at=state.verified_at or state.updated_at,
+        )
+        return out
+    program_keys = [str(k) for k in (state.source_program_keys or [])]
+    if not program_keys:
+        return out
+    selections = list(
+        (
+            await db.execute(
+                select(ApplicationProgramSelection).where(
+                    ApplicationProgramSelection.profile_id == profile.id,
+                    ApplicationProgramSelection.removed_at.is_(None),
+                    ApplicationProgramSelection.program_key.in_(program_keys),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not selections:
+        return out
+    overrides = list(
+        (
+            await db.execute(
+                select(ApplicationProgramRequirementOverride).where(
+                    ApplicationProgramRequirementOverride.selection_id.in_(
+                        [s.id for s in selections]
+                    ),
+                    ApplicationProgramRequirementOverride.requirement_key
+                    == DEBT_SCHEDULE_REQUIREMENT,
+                    ApplicationProgramRequirementOverride.restored_at.is_(None),
+                    ApplicationProgramRequirementOverride.disposition.in_(
+                        ["waived", "not_applicable"]
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    covered = {o.selection_id for o in overrides}
+    if overrides and all(s.id in covered for s in selections):
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        latest = max(overrides, key=lambda o: o.updated_at or o.created_at or epoch)
+        out["voided"] = await _declaration(
+            db,
+            reason=latest.reason,
+            user_id=latest.created_by_user_id,
+            at=latest.updated_at or latest.created_at,
+        )
+    return out
 
 
 async def bank_statement_files(db: AsyncSession, profile: ApplicationProfile) -> list[Any]:

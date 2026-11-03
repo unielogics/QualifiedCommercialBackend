@@ -33,6 +33,13 @@ class FinancialCockpitRead(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
+class DebtScheduleVoidWrite(BaseModel):
+    """The desk's declaration that the business carries no debt, so the
+    standing debt schedule requirement is set aside on this file."""
+
+    reason: str | None = Field(default=None, max_length=2000)
+
+
 class AdvanceIn(BaseModel):
     """One merchant cash advance as the client describes it: who funded it, what
     was approved, what is left, how often it debits and how much."""

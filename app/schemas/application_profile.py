@@ -1425,6 +1425,9 @@ class FinancialFormStatus(BaseModel):
     total_liabilities: float | None = None
     total_equity: float | None = None
     balances: bool | None = None
+    #: The debt schedule only: the desk's declaration that the business carries
+    #: no debt ({reason, by, by_user_id, at}), which sets the request aside.
+    voided: dict | None = None
 
 
 class FinancialFormPacket(BaseModel):
