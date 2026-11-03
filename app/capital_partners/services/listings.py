@@ -129,6 +129,7 @@ def card(listing: CpListing, committed: Decimal, *, now: datetime | None = None)
         "personal_guarantee": listing.personal_guarantee,
         "status": listing.status,
         "outcome": listing.outcome,
+        "products": list(listing.products or []),
         "opens_at": listing.opens_at,
         "closes_at": listing.closes_at,
         "days_left": days_left(listing, now),

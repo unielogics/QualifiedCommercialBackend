@@ -178,6 +178,32 @@ def file_summary_sentence(financials: dict[str, Any]) -> str | None:
     return f"{months} months of bank statements reviewed; average monthly deposits ${float(average):,.0f}."
 
 
+async def suggested_products(db: AsyncSession, profile: ApplicationProfile) -> list[dict[str, Any]]:
+    """The listing's starting products: the file's selected and eligible
+    programs with the terms the cockpit's income supports (offer_suggestions)."""
+    from app.services import offer_suggestions
+
+    suggestions = await offer_suggestions.suggest_offers(db, profile)
+    products: list[dict[str, Any]] = []
+    for index, item in enumerate(suggestions.get("products") or []):
+        products.append(
+            {
+                "program_key": item.get("program_key"),
+                "label": item.get("label") or item.get("program_key") or "Loan",
+                "amount": item.get("amount"),
+                "rate_pct": item.get("rate_pct"),
+                "factor_rate": item.get("factor_rate"),
+                "term_months": item.get("term_months"),
+                "payment_frequency": "monthly",
+                "monthly_payment": item.get("monthly_payment"),
+                "dscr": item.get("dscr"),
+                "notes": item.get("reading"),
+                "primary": index == 0,
+            }
+        )
+    return products
+
+
 async def readiness_snapshot(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
     """Program readiness and the financial cockpit's headline figures, so the
     listing carries what the desk saw on the file when it cut the draft."""
@@ -368,6 +394,20 @@ async def prefill(db: AsyncSession, user: User, *, loan_id: uuid.UUID | None, pr
         sentence = file_summary_sentence(snapshot.get("financials") or {})
         if sentence:
             draft["summary"] = " ".join(part for part in (draft.get("summary"), sentence) if part)
+        draft["products"] = await suggested_products(db, profile)
+
+    # An unfunded file lists with suggested terms: the primary product supplies
+    # the headline rate, term and amount unless a loan or term sheet already did.
+    primary = next((item for item in draft.get("products") or [] if item.get("primary")), None)
+    if primary is not None:
+        draft.setdefault("program_label", primary.get("label"))
+        if draft.get("note_rate_pct") is None and primary.get("rate_pct") is not None:
+            draft["note_rate_pct"] = _num(primary["rate_pct"])
+        if draft.get("term_months") is None and primary.get("term_months"):
+            draft["term_months"] = int(primary["term_months"])
+        if draft.get("loan_amount") is None and primary.get("amount") is not None:
+            draft["loan_amount"] = _num(primary["amount"])
+            draft["offered_amount"] = _num(primary["amount"])
 
     if sheet is not None:
         snapshot["term_sheet"] = {

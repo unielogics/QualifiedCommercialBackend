@@ -94,3 +94,39 @@ async def test_an_unknown_intake_reads_as_not_found(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(profiles, "resolve_profile", failing)
     with pytest.raises(LookupError):
         await prefill.resolve_intake_profile(SimpleNamespace(), SimpleNamespace(), uuid.uuid4())
+
+
+def test_products_apply_as_plain_json_with_one_primary() -> None:
+    from decimal import Decimal
+
+    from app.capital_partners import schemas as S
+    from app.capital_partners.models import CpListing
+    from app.capital_partners.router_admin import _apply
+
+    listing = CpListing()
+    _apply(
+        listing,
+        S.ListingIn(
+            products=[
+                S.ListingProductIn(program_key="mca_refinance", label="MCA Refinance", amount=Decimal("70000"), rate_pct=Decimal("16"), term_months=120, monthly_payment=Decimal("1172.26"), dscr=Decimal("1.31")),
+                S.ListingProductIn(program_key="rbf", label="Revenue-based", amount=Decimal("50000"), factor_rate=Decimal("1.3"), term_months=12),
+            ]
+        ),
+    )
+    assert listing.products[0]["primary"] is True and listing.products[1]["primary"] is False
+    assert listing.products[0]["amount"] == 70000.0 and listing.products[0]["rate_pct"] == 16.0
+    assert listing.products[1]["factor_rate"] == 1.3 and listing.products[1]["payment_frequency"] == "monthly"
+    assert all(not isinstance(v, Decimal) for p in listing.products for v in p.values())
+
+
+@pytest.mark.asyncio
+async def test_suggested_products_mark_the_first_as_primary(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import offer_suggestions
+
+    async def fake(_db, _profile, *, program_keys=None):
+        return {"products": [{"program_key": "a", "label": "A", "amount": 70000.0, "rate_pct": 16.0, "term_months": 120, "monthly_payment": 1172.26, "dscr": 1.31, "reading": "A: fine."}, {"program_key": "b", "label": "B", "amount": None, "reason": "no room"}]}
+
+    monkeypatch.setattr(offer_suggestions, "suggest_offers", fake)
+    products = await prefill.suggested_products(SimpleNamespace(), SimpleNamespace(id=uuid.uuid4()))
+    assert [p["primary"] for p in products] == [True, False]
+    assert products[0]["notes"] == "A: fine." and products[1]["amount"] is None

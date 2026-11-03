@@ -259,6 +259,20 @@ async def source_lookup(admin: CpAdmin, db: Db, profile_id: Annotated[uuid.UUID 
     return S.SourceLookup(**await P.lookup(db, loan_id=loan_id, profile_id=profile_id))
 
 
+@router.get("/sources/suggest-terms", response_model=S.OfferSuggestions)
+async def suggest_terms(admin: CpAdmin, db: Db, profile_id: Annotated[uuid.UUID, Query()], program_keys: Annotated[str | None, Query()] = None) -> S.OfferSuggestions:
+    """Suggested products and terms for an unfunded file, from the cockpit's
+    income figure, today's debt service and each program's published terms."""
+    from app.models.application_profile import ApplicationProfile
+    from app.services import offer_suggestions
+
+    profile = await db.get(ApplicationProfile, profile_id)
+    if profile is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Application profile not found.")
+    keys = [key.strip() for key in (program_keys or "").split(",") if key.strip()] or None
+    return S.OfferSuggestions(**await offer_suggestions.suggest_offers(db, profile, program_keys=keys))
+
+
 @router.post("/listings/prefill")
 async def prefill_listing(payload: S.PrefillIn, admin: CpAdmin, db: Db) -> dict[str, Any]:
     loan_id, profile_id = payload.loan_id, payload.profile_id
@@ -363,7 +377,7 @@ _LISTING_FIELDS = [
     "source_kind", "loan_id", "profile_id", "vertical", "program_label", "name", "summary", "city", "state", "collateral_type",
     "lien_position", "note_rate_pct", "term_months", "ltv_pct", "ltv_kind", "loan_amount", "offered_amount", "minimum_investment",
     "payment_frequency", "personal_guarantee", "guarantee_text", "borrower_track_record", "exit_plan", "valuation_amount",
-    "valuation_source", "title_status", "servicer_label", "maturity_date", "closes_at", "source_snapshot",
+    "valuation_source", "title_status", "servicer_label", "maturity_date", "closes_at", "source_snapshot", "products",
 ]
 
 
@@ -374,6 +388,15 @@ def _apply(listing: CpListing, payload: S.ListingIn) -> None:
             value = data[key]
             if key == "state" and value:
                 value = value.upper()
+            if key == "products":
+                # JSONB: decimals become plain numbers, and exactly one product is primary.
+                products = [
+                    {k: (float(v) if isinstance(v, Decimal) else v) for k, v in item.model_dump().items()}
+                    for item in payload.products or []
+                ]
+                if products and not any(item.get("primary") for item in products):
+                    products[0]["primary"] = True
+                value = products
             setattr(listing, key, value)
 
 

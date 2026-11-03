@@ -249,6 +249,8 @@ class CpListing(TimestampMixin, Base):
     withdrawn_reason: Mapped[str | None] = mapped_column(Text)
     #: What the loan, profile and term sheet said when the listing was cut.
     source_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    #: Products offered on the listing (see schemas.ListingProductIn); the primary one supplies the headline terms.
+    products: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default="[]")
     created_by_id: Mapped[uuid.UUID | None] = _user_fk()
 
     documents: Mapped[list[CpListingDocument]] = relationship(

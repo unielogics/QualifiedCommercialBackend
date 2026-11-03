@@ -193,6 +193,7 @@ class ListingCard(BaseModel):
     repaid_at: datetime | None
     maturity_date: date | None
     published_at: datetime | None
+    products: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SubscriptionOut(_Out):
@@ -462,6 +463,34 @@ class SourceLookup(BaseModel):
     has_term_sheet: bool = False
 
 
+class ListingProductIn(BaseModel):
+    """One product offered on a listing: a program with suggested amount, rate and term."""
+
+    program_key: str | None = Field(default=None, max_length=80)
+    label: str = Field(min_length=1, max_length=120)
+    amount: Decimal | None = Field(default=None, ge=0)
+    rate_pct: Decimal | None = Field(default=None, ge=0, le=100)
+    factor_rate: Decimal | None = Field(default=None, ge=1, le=3)
+    term_months: int | None = Field(default=None, ge=1, le=600)
+    payment_frequency: Literal["monthly", "weekly", "daily"] | None = "monthly"
+    monthly_payment: Decimal | None = Field(default=None, ge=0)
+    dscr: Decimal | None = None
+    notes: str | None = Field(default=None, max_length=600)
+    primary: bool = False
+
+
+class OfferSuggestions(BaseModel):
+    profile_id: UUID
+    income_annual: float | None = None
+    income_basis: str | None = None
+    income_label: str | None = None
+    existing_debt_service_monthly: float | None = None
+    debt_service_source: str | None = None
+    target_dscr: float
+    requested_amount: float | None = None
+    products: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class ListingIn(BaseModel):
     """Create or patch. Every field optional on patch; create needs name + vertical."""
 
@@ -495,6 +524,7 @@ class ListingIn(BaseModel):
     maturity_date: date | None = None
     closes_at: datetime | None = None
     source_snapshot: dict[str, Any] | None = None
+    products: list[ListingProductIn] | None = Field(default=None, max_length=8)
 
 
 class ListingEventOut(_Out):
