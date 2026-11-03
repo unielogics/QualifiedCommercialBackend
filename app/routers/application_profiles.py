@@ -2416,7 +2416,7 @@ async def get_bank_accounts(profile_id: UUID, user: CurrentUser, db: AsyncSessio
     """The checking accounts the AI found on the statements and which ones count."""
     profile = await profiles.load_profile(db, profile_id, user)
     accounts = await financial_cockpit.bank_accounts_for_profile(db, profile)
-    return BankAccountsRead(profile_id=profile.id, accounts=[BankAccountRead(**a) for a in accounts], counted=list(profile.counted_bank_accounts or []))
+    return BankAccountsRead(profile_id=profile.id, accounts=[BankAccountRead(**a) for a in accounts], counted=list(profile.counted_bank_accounts or []), aliases=dict(profile.bank_account_aliases or {}))
 
 
 @router.put("/{profile_id}/bank-accounts", response_model=BankAccountsRead)
@@ -2427,6 +2427,12 @@ async def put_bank_accounts(
     and which the cockpit reads by default. An empty list means every account."""
     _require_underwriting_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
+    if payload.aliases is not None:
+        # Keys fold into the account they belong to; a canonical key never points elsewhere.
+        aliases = {str(k): str(v) for k, v in payload.aliases.items() if k and v and k != v}
+        for key in list(aliases):
+            aliases[key] = financial_cockpit.resolve_alias(aliases[key], aliases)
+        profile.bank_account_aliases = {k: v for k, v in aliases.items() if k != v}
     accounts = await financial_cockpit.bank_accounts_for_profile(db, profile)
     known = {a["key"] for a in accounts}
     unknown = [key for key in payload.counted if key not in known]
@@ -2443,7 +2449,7 @@ async def put_bank_accounts(
     )
     await db.commit()
     accounts = await financial_cockpit.bank_accounts_for_profile(db, profile)
-    return BankAccountsRead(profile_id=profile.id, accounts=[BankAccountRead(**a) for a in accounts], counted=list(profile.counted_bank_accounts or []))
+    return BankAccountsRead(profile_id=profile.id, accounts=[BankAccountRead(**a) for a in accounts], counted=list(profile.counted_bank_accounts or []), aliases=dict(profile.bank_account_aliases or {}))
 
 
 @router.get("/{profile_id}/advances", response_model=AdvancesRead)

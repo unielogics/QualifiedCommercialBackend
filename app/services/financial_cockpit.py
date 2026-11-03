@@ -403,9 +403,20 @@ def bank_file_counted(analysis_payload: Any, counted: list[str] | None) -> bool:
     return account_key_of(facts) in set(counted)
 
 
+def resolve_alias(key: str, aliases: dict[str, str] | None) -> str:
+    """Follow the desk's "same account" map to the canonical key (bounded)."""
+    seen: set[str] = set()
+    current = key
+    while aliases and current in aliases and aliases[current] not in seen and aliases[current] != current:
+        seen.add(current)
+        current = aliases[current]
+    return current
+
+
 def bank_months(
     analyses: list[dict[str, Any]],
     counted: list[str] | None = None,
+    aliases: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Month-by-month bank figures, the counted accounts on the file combined.
 
@@ -417,6 +428,7 @@ def bank_months(
     """
     per_account: dict[str, dict[str, dict[str, Any]]] = {}
     labels: dict[str, str] = {}
+    members: dict[str, set[str]] = {}
     for item in analyses:
         if "bank_statement" not in _classes(item):
             continue
@@ -433,7 +445,14 @@ def bank_months(
             if record is None:
                 continue
             key, label = _account_identity(facts, row)
-            labels[key] = label
+            canonical = resolve_alias(key, aliases)
+            if canonical != key:
+                labels.setdefault(canonical, label)
+                members.setdefault(canonical, set()).add(key)
+                key = canonical
+            else:
+                labels[key] = label
+            members.setdefault(key, set()).add(key)
             record["file_id"] = str(item.get("file_id") or "")
             record["accepted"] = bool(item.get("accepted"))
             slot = per_account.setdefault(key, {})
@@ -460,6 +479,7 @@ def bank_months(
             if prior is None or _populated(record) > _populated(prior):
                 target[month] = record
         labels.pop(orphan, None)
+        members.setdefault(owners[0], set()).update(members.pop(orphan, set()) or {orphan})
     counted_keys = {k for k in (counted or []) if k in per_account} or set(per_account)
     combined: dict[str, dict[str, Any]] = {}
     for key, months in per_account.items():
@@ -515,6 +535,7 @@ def bank_months(
                 "accepted_months": sorted(m for m, r in months.items() if r["accepted"]),
                 "series": series,
                 "counted": key in counted_keys,
+                "members": sorted(members.get(key) or {key}),
             }
         )
     return months_out, accounts
@@ -1685,6 +1706,7 @@ def build_cockpit(
     proposed_terms: dict[str, Any] | None = None,
     counted_accounts: list[str] | None = None,
     plan: dict[str, Any] | None = None,
+    account_aliases: dict[str, str] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """The cockpit read model from plain dicts.
@@ -1695,12 +1717,14 @@ def build_cockpit(
     `debts`: the active dos_debts rows as dicts. `proposed_terms`: the loan
     on record (amount, rate_pct, term_months, monthly_payment, source, label).
     """
-    months, accounts = bank_months(analyses, counted_accounts)
+    months, accounts = bank_months(analyses, counted_accounts, account_aliases)
     bank = bank_summary(months)
     for account in accounts:
         account["summary"] = bank_summary(account["series"])
     narrowed = any(not a["counted"] for a in accounts)
-    all_months, _all_accounts = bank_months(analyses) if narrowed else (months, accounts)
+    all_months, _all_accounts = (
+        bank_months(analyses, None, account_aliases) if narrowed else (months, accounts)
+    )
     all_summary = bank_summary(all_months) if narrowed else bank
     credits = recurring_payments(analyses, field="recurring_credits", direction=1)
     overdrafts = overdrafts_block(months)
@@ -1943,6 +1967,7 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
         proposed_terms=term_sheet_terms(sheet),
         counted_accounts=list(getattr(profile, "counted_bank_accounts", None) or []),
         plan=getattr(profile, "financial_plan", None) or {},
+        account_aliases=dict(getattr(profile, "bank_account_aliases", None) or {}),
     )
     cockpit["profile_id"] = str(profile.id)
     return cockpit
@@ -1977,7 +2002,9 @@ async def bank_accounts_for_profile(
     accepted = await programs.accepted_evidence_file_ids(db, profile, files, latest)
     analyses = _analysis_rows(files, latest, accepted)
     _months, accounts = bank_months(
-        analyses, list(getattr(profile, "counted_bank_accounts", None) or [])
+        analyses,
+        list(getattr(profile, "counted_bank_accounts", None) or []),
+        dict(getattr(profile, "bank_account_aliases", None) or {}),
     )
     return [
         {
@@ -1987,6 +2014,7 @@ async def bank_accounts_for_profile(
             "accepted_months": a["accepted_months"],
             "counted": a["counted"],
             "latest_month": a["months"][-1] if a["months"] else None,
+            "members": a.get("members") or [a["key"]],
         }
         for a in accounts
     ]

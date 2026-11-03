@@ -192,6 +192,10 @@ class ApplicationProfile(TimestampMixin, Base):
     financial_plan: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
+    #: Account keys the desk declared to be the same account: {key: canonical key}.
+    bank_account_aliases: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
     use_of_funds_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     use_of_funds_updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")

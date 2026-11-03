@@ -82,16 +82,21 @@ class BankAccountRead(BaseModel):
     accepted_months: list[str] = Field(default_factory=list)
     counted: bool = True
     latest_month: str | None = None
+    #: The detected keys folded into this account (itself included).
+    members: list[str] = Field(default_factory=list)
 
 
 class BankAccountsRead(BaseModel):
     profile_id: UUID
     accounts: list[BankAccountRead] = Field(default_factory=list)
     counted: list[str] = Field(default_factory=list)
+    aliases: dict[str, str] = Field(default_factory=dict)
 
 
 class BankAccountsWrite(BaseModel):
     counted: list[str] = Field(default_factory=list, max_length=20)
+    #: Detected keys the desk declares to be the same account: {key: the account it belongs to}.
+    aliases: dict[str, str] | None = Field(default=None)
 
 
 class FinancialPlanWrite(BaseModel):
