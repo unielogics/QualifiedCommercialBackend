@@ -1,9 +1,10 @@
 name: ci
 
+# Runs on its own for pull requests, and as the first job of deploy.yml
+# (workflow_call) for every push to main, so nothing ships until this passes.
 on:
   pull_request:
-  push:
-    branches: [main]
+  workflow_call:
 
 jobs:
   test:
@@ -24,6 +25,8 @@ jobs:
             BASE_SHA="${{ github.event.before }}"
           fi
           if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
+            # No "before" (workflow_dispatch, first push): lint against the parent.
+            git fetch --no-tags --deepen=1 origin
             BASE_SHA="$(git rev-parse HEAD^)"
           fi
           git fetch --no-tags --depth=1 origin "$BASE_SHA"

@@ -11,7 +11,13 @@ permissions:
   packages: write       # push to GHCR
 
 jobs:
+  # The gate: the whole test suite (ci.yml) must pass for this exact commit
+  # before anything is built or rolled out. A red suite stops here.
+  test:
+    uses: ./.github/workflows/ci.yml
+
   deploy:
+    needs: test
     runs-on: ubuntu-latest
     environment: production
     env:
