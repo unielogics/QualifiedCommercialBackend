@@ -9,6 +9,7 @@ import re
 import uuid
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -89,7 +90,7 @@ from app.services.program_rules import (
     evaluate_rules,
     validate_rules,
 )
-from app.services.use_of_funds import source_funding_data
+from app.services.use_of_funds import seed_refinance_budget, source_funding_data
 from app.services.use_of_funds import summarize as summarize_use_of_funds
 
 SATISFIED_STATES = {"verified", "waived", "not_applicable"}
@@ -348,6 +349,10 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
     requested_amount, amount_source, loan_purpose, dealer = await source_funding_data(
         db, profile, intake=intake,
     )
+    if seed_refinance_budget(profile, intake, requested_amount):
+        amount_source = amount_source or "intake.mca_qualification"
+        if requested_amount is None:
+            requested_amount = Decimal(str(profile.use_of_funds[0]["amount"]))
     budget = summarize_use_of_funds(profile, requested_amount, amount_source, dealer=dealer)
     files, latest_analyses, _classifications = await _evidence_inventory(db, profile)
     evidence_links = list(
@@ -1618,13 +1623,67 @@ def _merged_review_checks(requirements: list[AICollectionRequirement]) -> list[d
             for field, label in (("objective_text", "Document review objective"),
                                  ("completion_criteria", "Document completion requirements")):
                 instructions = str(getattr(requirement, field, "") or "").strip()
-                if instructions:
+                # "Collect Last 6 months business bank statements" names the
+                # document; it instructs nothing. Treating it as a check sent
+                # every baseline requirement through the grounded page review,
+                # which cannot run over six statements, and the file sat at
+                # "received" with everything in hand.
+                if instructions and not _is_bare_request(instructions, getattr(requirement, "label", None)):
                     for start in range(0, len(instructions), 2000):
                         part = instructions[start:start + 2000]
                         check = {"key": "custom_" + hashlib.sha256(part.encode()).hexdigest()[:20],
                                  "label": label, "instructions": part, "severity": "review"}
                         unique.setdefault(json.dumps(check, sort_keys=True), check)
     return [unique[key] for key in sorted(unique)]
+
+
+_BARE_REQUEST_WORDS = frozenset({
+    "collect", "please", "provide", "upload", "send", "share", "submit", "attach", "the", "your", "a", "an",
+    "of", "for", "this", "these", "those", "file", "files", "document", "documents", "latest", "current",
+    "copy", "copies", "all", "and", "or", "to", "us", "me", "from", "client", "borrower",
+})
+
+
+def _is_bare_request(text: str, label: str | None) -> bool:
+    """True when ``text`` only asks for the document and instructs nothing.
+
+    The words left after the requirement's own label and the asking words are
+    removed are the instruction. None left, no instruction.
+    """
+    value = re.sub(r"[^a-z0-9 ]+", " ", str(text or "").casefold())
+    if label:
+        value = value.replace(re.sub(r"[^a-z0-9 ]+", " ", str(label).casefold()), " ")
+    words = [word for word in value.split() if word not in _BARE_REQUEST_WORDS and not word.isdigit()]
+    return not words
+
+
+_CHECKS_NOT_RUN_MARKERS = (
+    "exceeds the ai review", "bounded ai document review", "unavailable", "searchable pdf",
+    "cannot be quoted reliably", "password protected", "did not return", "could not be retrieved",
+)
+
+
+def _checks_could_not_run(check_assessment: dict[str, Any] | None) -> str | None:
+    """The reason the grounded document checks did not run, or None if they did."""
+    if not isinstance(check_assessment, dict) or check_assessment.get("status") != "unknown":
+        return None
+    if check_assessment.get("checks"):
+        return None
+    reason = str(check_assessment.get("reason") or "")
+    lowered = reason.casefold()
+    return reason if any(marker in lowered for marker in _CHECKS_NOT_RUN_MARKERS) else None
+
+
+def _verifiable_without_a_person(requirement: AICollectionRequirement, file: BucketFile, requires_human: bool) -> bool:
+    """Whether an accepted file may be verified by the AI alone.
+
+    A certificate the system generated from the client's own signature in the
+    room is verified by construction; asking a person to confirm it again is
+    a queue, not a control.
+    """
+    if getattr(file, "source_kind", None) == "generated" and getattr(file, "source_detail", None) == "signed_document":
+        return True
+    return not _requires_human_verification(requirement) and not requires_human
 
 
 def _review_checks_fingerprint(checks: list[dict[str, Any]]) -> str:
@@ -2303,6 +2362,18 @@ def _automatic_evidence_decision(
                 "A published do-not-accept check failed; review the grounded findings and source pages.",
                 analysis.confidence,
             )
+        not_run = _checks_could_not_run(check_assessment)
+        if not_run:
+            # The file itself passed: right type, right business, right period,
+            # read with high confidence. The grounded checks could not run on
+            # this evidence; that is a note for a person, not a reason to keep
+            # asking the client. A person can still override.
+            return (
+                "accepted", identity_warning["code"] if identity_warning else "checks_not_run",
+                "Accepted on file validation (document type, business and period). The published document "
+                f"checks could not run on this evidence: {not_run.rstrip('.')}. A person can override."
+                + (" " + identity_warning["message"] if identity_warning else ""), analysis.confidence,
+            )
         return (
             "needs_more", "document_review_pending",
             str((check_assessment or {}).get("reason") or
@@ -2533,7 +2604,7 @@ async def _reconcile_evidence_decisions(
             effective[link.id] = row
 
         accepted = effective[link.id].decision == "accepted"
-        can_auto_verify = accepted and not _requires_human_verification(requirement) and not requires_human
+        can_auto_verify = accepted and _verifiable_without_a_person(requirement, file, requires_human)
         newer_evidence = any(
             isinstance(value, datetime) and isinstance(link.verified_at, datetime)
             and (value.replace(tzinfo=UTC) if value.tzinfo is None else value)
@@ -2833,8 +2904,11 @@ async def _materialize_requirements(
             "review_checks_fingerprint": _review_checks_fingerprint(review_checks),
             "requires_human": requires_human,
             "ai_document_review": check_assessment,
-            "review_checks_status": "verified" if review_checks and accepted_complete
-            else "pending" if review_checks else "not_required",
+            "review_checks_status": (
+                "not_run" if review_checks and accepted_complete and _checks_could_not_run(check_assessment)
+                else "verified" if review_checks and accepted_complete
+                else "pending" if review_checks else "not_required"
+            ),
         }
         if state.status not in {"waived", "not_applicable"}:
             if linked_files:
