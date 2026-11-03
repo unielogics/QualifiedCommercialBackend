@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -1377,6 +1377,12 @@ async def _requested_document(
                 BucketRequestedDocument.bucket_id == profile.primary_bucket_id,
                 BucketRequestedDocument.requirement_key == requirement.requirement_key,
             )
+            # A closed ask (an archived room, a merged duplicate) must not
+            # shadow the open one carrying the same key.
+            .order_by(
+                case((BucketRequestedDocument.status == "closed", 1), else_=0),
+                BucketRequestedDocument.created_at,
+            )
             .limit(1)
         )
     ).scalar_one_or_none()
@@ -1395,6 +1401,8 @@ async def _requested_document(
                 .limit(1)
             )
         ).scalar_one_or_none()
+    if requested is None and form_kind is None:
+        requested = await _adopt_room_request(db, profile.primary_bucket_id, requirement)
     source = {
         "kind": "program_readiness",
         "program_keys": program_keys,
@@ -1417,7 +1425,7 @@ async def _requested_document(
         )
         db.add(requested)
         await db.flush()
-    else:
+    elif _created_by_program_readiness(requested):
         requested.name = requirement.label
         requested.category = request_category
         requested.description = (
@@ -1429,7 +1437,121 @@ async def _requested_document(
         requested.requirement_source = source
         if requested.status == "not_applicable":
             requested.status = "requested"
+    else:
+        # The room's own ask: seeded by an intake template, typed by the desk,
+        # or adopted on an earlier pass. The client has already read its name
+        # and the signature flows look it up by that name, so the wording
+        # stays; only the link to the requirement is recorded.
+        requested.requirement_key = requirement.requirement_key
+        requested.requirement_source = {**source, "adopted": True}
+        if requested.status == "not_applicable":
+            requested.status = "requested"
     return requested
+
+
+#: Requirements satisfied by signing in the room rather than uploading, keyed
+#: to the signature kind the room's own ask carries.
+SIGNATURE_REQUIREMENTS: dict[str, str] = {"signed_credit_authorization": "credit_authorization"}
+
+
+def _created_by_program_readiness(requested: BucketRequestedDocument) -> bool:
+    """True for an ask the readiness engine minted itself and may reword freely."""
+    source = requested.requirement_source if isinstance(requested.requirement_source, dict) else {}
+    return source.get("kind") == "program_readiness" and not source.get("adopted")
+
+
+def _adoption_classes(requirement: AICollectionRequirement) -> set[str]:
+    """What an uploaded document must read as to satisfy ``requirement``.
+
+    The curated map, not the label-derived one: a label such as "Current
+    advance terms" also reads as rent (the keyword sits inside "current"), and
+    adoption must not pair rows on an accident like that.
+    """
+    key = getattr(requirement, "canonical_key", None) or requirement.requirement_key
+    curated = EXPECTED_CLASSIFICATIONS.get(key)
+    return set(curated) if curated else set(_expected_classes(requirement))
+
+
+def adoptable_room_request(
+    candidates: list[BucketRequestedDocument],
+    *,
+    requirement_key: str,
+    expected: set[str],
+    file_counts: dict[uuid.UUID, int] | None = None,
+) -> BucketRequestedDocument | None:
+    """The room's own ask for the same document as ``requirement_key``, if any.
+
+    A signature requirement adopts the row the client signs; a document
+    requirement adopts a non-signature row whose name reads as one of the
+    expected document types. With several, the row already holding files wins,
+    then the oldest.
+    """
+    signature_kind = SIGNATURE_REQUIREMENTS.get(requirement_key)
+    matches: list[BucketRequestedDocument] = []
+    for row in candidates:
+        if signature_kind:
+            if row.requires_signature and row.signature_kind == signature_kind:
+                matches.append(row)
+            continue
+        if row.requires_signature:
+            continue
+        if classifications_for_requested_doc(row.name, row.category) & expected:
+            matches.append(row)
+    if not matches:
+        return None
+    counts = file_counts or {}
+    matches.sort(key=lambda row: (-counts.get(row.id, 0), row.created_at or datetime.max.replace(tzinfo=UTC)))
+    return matches[0]
+
+
+async def _adopt_room_request(
+    db: AsyncSession, bucket_id: uuid.UUID, requirement: AICollectionRequirement
+) -> BucketRequestedDocument | None:
+    """Adopt the room's existing ask instead of minting a second one.
+
+    Intake templates seed a checklist the moment a room is born ("Last 6
+    months bank statements", "Credit Report Authorization"), and the readiness
+    playbook names the same documents differently. Minting a second ask left
+    a room with two rows for one document: the client's uploads on the first,
+    the application waiting on the second, and the client told to send again
+    what they had already sent.
+    """
+    candidates = list(
+        (
+            await db.execute(
+                select(BucketRequestedDocument)
+                .where(
+                    BucketRequestedDocument.bucket_id == bucket_id,
+                    BucketRequestedDocument.requirement_key.is_(None),
+                    BucketRequestedDocument.status.notin_(["closed", "not_applicable"]),
+                )
+                .order_by(BucketRequestedDocument.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not candidates:
+        return None
+    file_counts: dict[uuid.UUID, int] = {}
+    if len(candidates) > 1:
+        rows = (
+            await db.execute(
+                select(BucketFile.requested_document_id, func.count())
+                .where(
+                    BucketFile.bucket_id == bucket_id,
+                    BucketFile.deleted_at.is_(None),
+                    BucketFile.status == "uploaded",
+                    BucketFile.requested_document_id.in_([row.id for row in candidates]),
+                )
+                .group_by(BucketFile.requested_document_id)
+            )
+        ).all()
+        file_counts = {row[0]: int(row[1]) for row in rows}
+    key = getattr(requirement, "canonical_key", None) or requirement.requirement_key
+    return adoptable_room_request(
+        candidates, requirement_key=key, expected=_adoption_classes(requirement), file_counts=file_counts
+    )
 
 
 def _expected_classes(requirement: AICollectionRequirement) -> set[str]:

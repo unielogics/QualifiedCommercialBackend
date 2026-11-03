@@ -284,6 +284,17 @@ class BucketRequestAccessRequest(BaseModel):
     passcode: str = Field(min_length=1, max_length=80)
 
 
+class BucketRequestPasscodeChange(BucketRequestAccessRequest):
+    """The client replaces the PIN we generated with six digits of their own."""
+
+    new_passcode: str = Field(min_length=1, max_length=12)
+
+
+class BucketRequestPasscodeChanged(BaseModel):
+    ok: bool = True
+    passcode_needs_setup: bool = False
+
+
 class BucketRequestUploadedFileRead(ORMModel):
     id: UUID
     bucket_id: UUID
@@ -338,6 +349,8 @@ class BucketRequestAccessRead(BaseModel):
     allow_notes: bool
     can_use_ai_chat: bool = True
     can_view_ai_tasks: bool = True
+    # True until the client replaces the generated PIN with one they chose.
+    passcode_needs_setup: bool = False
     requested_documents: list[BucketRequestedDocumentRead]
     files: list[BucketRequestUploadedFileRead] = []
     ai_summary: dict | None = None

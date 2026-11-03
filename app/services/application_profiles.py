@@ -76,6 +76,7 @@ from app.services.bucket_evidence import (
     classifications_for_requested_doc,
     effective_file_classification,
     statement_months_from_analysis,
+    statement_period_month,
 )
 from app.services.deal_economics import calculate_deal_earnings, optional_float
 from app.services.dealer_partner_access import (
@@ -520,10 +521,9 @@ async def capture_extracted_profile_facts(
                         "source_analysis_id": str(analysis.id), "status": "suggested",
                     }
     key_facts = payload.get("key_facts") if isinstance(payload.get("key_facts"), dict) else {}
-    period = str(key_facts.get("statement_period") or "")
-    month_match = re.search(r"(20\d{2})[-/](0[1-9]|1[0-2])", period)
-    if analysis.classification == "bank_statement" and month_match and not file.statement_period:
-        file.statement_period = f"{month_match.group(1)}-{month_match.group(2)}"
+    month = statement_period_month(key_facts.get("statement_period"))
+    if analysis.classification == "bank_statement" and month and not file.statement_period:
+        file.statement_period = month
     await db.flush()
     return [profile.id for profile in profiles]
 

@@ -71,6 +71,7 @@ from app.schemas.bucket import (
     BucketActivityRead,
     BucketAIActionItemCreate,
     BucketAIActionItemPatch,
+    BucketAIActionItemQueueRead,
     BucketAIActionItemRead,
     BucketAIChatMessageCreate,
     BucketAIChatResponse,
@@ -95,7 +96,6 @@ from app.schemas.bucket import (
     BucketPublicShareAccessRead,
     BucketPublicShareCreate,
     BucketPublicShareFileRead,
-    BucketAIActionItemQueueRead,
     BucketPublicShareRead,
     BucketRead,
     BucketRequestAccessRead,
@@ -104,6 +104,8 @@ from app.schemas.bucket import (
     BucketRequestedDocumentCreate,
     BucketRequestedDocumentRead,
     BucketRequestInfoRead,
+    BucketRequestPasscodeChange,
+    BucketRequestPasscodeChanged,
     BucketRequestUploadedFileRead,
     BucketShareAccessRead,
     BucketShareAccessRequest,
@@ -134,10 +136,10 @@ from app.schemas.bucket import (
     IntakeChatActionResult,
 )
 from app.schemas.retention import LegalHoldChange, RetentionStatusRead
-from app.services import bucket_requests
 from app.services import application_profiles as profiles
 from app.services import (
     bucket_archive,
+    bucket_requests,
     bucket_storage_integrity,
     capital_readiness,
     file_events,
@@ -3652,6 +3654,7 @@ async def _request_access_read(
         allow_notes=link.allow_notes,
         can_use_ai_chat=link.can_use_ai_chat,
         can_view_ai_tasks=link.can_view_ai_tasks,
+        passcode_needs_setup=getattr(link, "passcode_set_by_client_at", None) is None,
         requested_documents=[
             _public_requested_document_read(d, file_reads)
             for d in current_requested_documents
@@ -3718,6 +3721,32 @@ async def request_link_status(
     link = await _load_upload_link_or_404(db, token)
     await _require_request_access_passcode(db, link, payload, request)
     return await _request_access_read(db, link)
+
+
+@router.post("/request/{token}/passcode", response_model=BucketRequestPasscodeChanged)
+async def request_link_choose_passcode(
+    token: str,
+    payload: BucketRequestPasscodeChange,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketRequestPasscodeChanged:
+    """The client replaces the generated room PIN with six digits of their own.
+
+    The current PIN proves they are in the room. The new one is held to the
+    rules a dealer room already applies (six digits, nothing trivial, not the
+    one we sent) and stored the same way, so staff recovery keeps working.
+    Until this is done the room keeps offering it: a PIN the client chose is
+    one they can come back with.
+    """
+    link = await _load_upload_link_or_404(db, token)
+    await _require_request_access_passcode(db, link, payload, request)
+    problem = client_room.passcode_problem(payload.new_passcode, payload.passcode)
+    if problem:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
+    await client_room.set_passcode(db, link, payload.new_passcode)
+    await _log(db, link.bucket_id, "room_passcode_chosen", request=request, actor_name=link.recipient_name, actor_email=link.recipient_email, actor_role="uploader", target_type="upload_link", target_id=str(link.id))
+    await db.commit()
+    return BucketRequestPasscodeChanged(ok=True, passcode_needs_setup=False)
 
 
 @router.post("/request/{token}/upload-init", response_model=BucketFileUploadInitResponse)

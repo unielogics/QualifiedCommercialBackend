@@ -399,30 +399,35 @@ REQUIRED_DOCUMENTS = [
     {
         "name": "Last 2 years business tax returns",
         "category": "Financials",
+        "requirement_key": "business_tax_returns_2_years",
         "description": "Upload the dealership/business tax returns for the last two years.",
         "allow_multiple_files": True,
     },
     {
         "name": "Current year P&L",
         "category": "Financials",
-        "description": "Upload the current year profit and loss statement for the dealership/business.",
+        "requirement_key": "ytd_p_and_l_balance_sheet",
+        "description": "Upload the year-to-date profit and loss statement and a current balance sheet for the dealership/business.",
         "allow_multiple_files": True,
     },
     {
         "name": "Last 6 months bank statements",
         "category": "Bank Statements",
         "description": "Upload the last six months of the main operating business bank statements.",
+        "requirement_key": "business_bank_statements_6_months",
         "allow_multiple_files": True,
     },
     {
         "name": "Debt schedule",
         "category": "Debts",
+        "requirement_key": "business_debt_schedule",
         "description": "Upload a schedule of all outstanding business debt: lender, balance, and monthly payment for each.",
         "allow_multiple_files": False,
     },
     {
         "name": "Personal financial statement",
         "category": "Personal Financials",
+        "requirement_key": "owner_personal_financial_statement",
         "description": "Upload a completed personal financial statement (PFS) for each owner. Use the blank form below if you need one.",
         "allow_multiple_files": True,
     },
@@ -438,6 +443,7 @@ REAL_ESTATE_REQUIRED_DOCUMENTS = [
     {
         "name": "Purchase contract, payoff, or mortgage statement",
         "category": "Transaction and debt",
+        "requirement_key": "property_debt_evidence",
         "description": "Upload the purchase contract for acquisitions or payoff/mortgage statements for refinance and cash-out.",
         "allow_multiple_files": True,
     },
@@ -450,6 +456,7 @@ REAL_ESTATE_REQUIRED_DOCUMENTS = [
     {
         "name": "Entity or vesting documents",
         "category": "Ownership",
+        "requirement_key": "entity_or_vesting",
         "description": "Upload entity, vesting, or ownership documents when available.",
         "allow_multiple_files": True,
     },
@@ -463,7 +470,9 @@ REAL_ESTATE_REQUIRED_DOCUMENTS = [
 # Naming is load-bearing twice over: "bank"+"statement" in the first row keys
 # _baseline_key in bucket_ai so the >=6-months readiness engine works
 # unchanged; "mca" in the third row maps uploads to floorplan_mca_inventory in
-# _CATEGORY_CLASSIFICATIONS. The credit authorization is seeded at CREATION
+# _CATEGORY_CLASSIFICATIONS. Each row also carries the readiness playbook's
+# requirement_key, so the application adopts the room's row instead of
+# minting a second ask for the same document. The credit authorization is seeded at CREATION
 # with its signature_kind — no other public flow does this today (the admin
 # endpoint mints it on demand for other variants); seeding it is what lets the
 # borrower sign in-room without an admin touching the file first.
@@ -472,11 +481,13 @@ MCA_REQUIRED_DOCUMENTS = [
         "name": "Last 6 months bank statements",
         "category": "Bank Statements",
         "description": "Upload the last six months of the main operating business bank statements — the account your advances debit from.",
+        "requirement_key": "business_bank_statements_6_months",
         "allow_multiple_files": True,
     },
     {
         "name": "Credit Report Authorization",
         "category": "Compliance",
+        "requirement_key": "signed_credit_authorization",
         "description": "Authorize one soft credit check. It does not affect your score and is required to price a structured payoff.",
         "allow_multiple_files": False,
         "requires_signature": True,
@@ -485,6 +496,7 @@ MCA_REQUIRED_DOCUMENTS = [
     {
         "name": "Current MCA / advance terms",
         "category": "Debts",
+        "requirement_key": "current_advance_terms",
         "description": "Your current advance agreements or payoff letters — or type the terms in with the form and skip the paperwork.",
         "allow_multiple_files": True,
     },
@@ -1251,6 +1263,17 @@ class DealerFileUploadInit(BaseModel):
     file_name: str = Field(min_length=1, max_length=255)
     content_type: str = "application/octet-stream"
     size_bytes: int = Field(default=0, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_size_alias(cls, data: object) -> object:
+        # The intake page sent the byte count as ``size``; every statement the
+        # client uploaded was recorded, and shown back to them, at 0 B.
+        if isinstance(data, dict) and not data.get("size_bytes"):
+            size = data.get("size")
+            if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
+                data = {**data, "size_bytes": size}
+        return data
 
 
 class DealerUploadComplete(BaseModel):
@@ -4456,6 +4479,7 @@ async def _create_bucket_for_intake(
                 allow_multiple_files=bool(doc["allow_multiple_files"]),
                 status="requested",
                 is_custom=False,
+                requirement_key=doc.get("requirement_key"),
             )
         )
     passcode = room_pin or _generate_passcode()
@@ -4669,6 +4693,7 @@ async def _create_bucket_for_funding_review(
                 allow_multiple_files=bool(doc["allow_multiple_files"]),
                 status="requested",
                 is_custom=False,
+                requirement_key=doc.get("requirement_key"),
             )
         )
     passcode = room_pin or _generate_passcode()
@@ -10093,6 +10118,7 @@ async def _create_bucket_for_mca_refi(
                 allow_multiple_files=bool(doc["allow_multiple_files"]),
                 status="requested",
                 is_custom=False,
+                requirement_key=doc.get("requirement_key"),
                 requires_signature=bool(doc.get("requires_signature", False)),
                 signature_kind=doc.get("signature_kind"),
             )

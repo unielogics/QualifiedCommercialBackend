@@ -126,6 +126,10 @@ def statement_months_from_filename(file_name: str) -> set[str]:
     result: set[str] = set()
     for match in re.finditer(r"(?<!\d)(20\d{2})[-_. /](0?[1-9]|1[0-2])(?:[-_. /](?:0?[1-9]|[12]\d|3[01]))?(?!\d)", value):
         result.add(f"{match.group(1)}-{int(match.group(2)):02d}")
+    # Bank exports carry the closing date with no separators at all:
+    # "20260630-statements-1204-.pdf" is the June statement.
+    for match in re.finditer(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)", value):
+        result.add(f"{match.group(1)}-{match.group(2)}")
     for match in re.finditer(r"(?<!\d)(0?[1-9]|1[0-2])[-_. /](?:0?[1-9]|[12]\d|3[01])[-_. /](20\d{2})(?!\d)", value):
         result.add(f"{match.group(2)}-{int(match.group(1)):02d}")
     month_names = "|".join(sorted(_MONTHS, key=len, reverse=True))
@@ -134,6 +138,38 @@ def statement_months_from_filename(file_name: str) -> set[str]:
     for match in re.finditer(rf"\b(20\d{{2}})\b[^a-z0-9]{{0,12}}({month_names})\b", value):
         result.add(f"{match.group(1)}-{_MONTHS[match.group(2)]:02d}")
     return result
+
+
+_ISO_MONTH = re.compile(r"(?<!\d)(20\d{2})[-/.](0?[1-9]|1[0-2])(?:[-/.](?:0?[1-9]|[12]\d|3[01]))?(?!\d)")
+_US_MONTH = re.compile(r"(?<!\d)(0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])[-/.](20\d{2})(?!\d)")
+
+
+def _month_mentions(value: str) -> list[str]:
+    """Every month a period string names, in the order it names them."""
+    text = value.casefold()
+    found: list[tuple[int, str]] = []
+    for match in _ISO_MONTH.finditer(text):
+        found.append((match.start(), f"{match.group(1)}-{int(match.group(2)):02d}"))
+    for match in _US_MONTH.finditer(text):
+        found.append((match.start(), f"{match.group(2)}-{int(match.group(1)):02d}"))
+    month_names = "|".join(sorted(_MONTHS, key=len, reverse=True))
+    for match in re.finditer(rf"\b({month_names})\b[^a-z]{{0,16}}?(20\d{{2}})\b", text):
+        found.append((match.start(), f"{match.group(2)}-{_MONTHS[match.group(1)]:02d}"))
+    found.sort()
+    return [month for _, month in found]
+
+
+def statement_period_month(value: object) -> str | None:
+    """The month a statement is filed under.
+
+    A cycle that opens on May 30 and closes on June 30 is the June statement:
+    the bank names it by its closing date, and so does the file the client
+    downloads. A period therefore answers with the month it ends in. Taking the
+    first month it mentioned filed that statement under May, and a six-month
+    checklist with all six statements uploaded stood at five.
+    """
+    mentions = _month_mentions(str(value or ""))
+    return mentions[-1] if mentions else None
 
 
 def statement_months_from_analysis(analysis: dict | None) -> set[str]:
@@ -145,14 +181,17 @@ def statement_months_from_analysis(analysis: dict | None) -> set[str]:
     values: list[object] = [key_facts.get("statement_period")]
     for row in key_facts.get("months") or []:
         if isinstance(row, dict):
-            values.extend(row.get(key) for key in ("month", "statement_period", "period", "start_date"))
+            # One row is one statement: its period names the month. A bare
+            # start date is the fallback when the model offered nothing better.
+            period = next((row.get(key) for key in ("statement_period", "period", "month") if row.get(key)), None)
+            values.append(period or row.get("end_date") or row.get("start_date"))
         else:
             values.append(row)
     result: set[str] = set()
     for value in values:
-        match = re.search(r"(20\d{2})[-/](0[1-9]|1[0-2])", str(value or ""))
-        if match:
-            result.add(f"{match.group(1)}-{match.group(2)}")
+        month = statement_period_month(value)
+        if month:
+            result.add(month)
     return result
 
 
