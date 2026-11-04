@@ -929,7 +929,7 @@ def _schedule_chart_svg(
     (principal in navy, interest in teal) on the left axis, and the principal
     still out as a share of the loan (the investor's exposure) as a red line
     on the right axis, 100% down to zero. Returns (svg, logical_width)."""
-    pad_l, pad_r, pad_t, pad_b = 64, 52, 56, 34
+    pad_l, pad_r, pad_t, pad_b = 64, 52, 64, 34
     plot_w = width - pad_l - pad_r
     plot_h = height - pad_t - pad_b
     x0, x1, y0, y1 = pad_l, width - pad_r, pad_t, height - pad_b
@@ -990,11 +990,12 @@ def _schedule_chart_svg(
     if exposure:
         exposure.insert(0, f"{x0:.1f},{py_pct(100.0):.1f}")
         parts.append(f'<polyline points="{" ".join(exposure)}" fill="none" stroke="{RED}" stroke-width="2.2"/>')
-    legend = [("Principal", NAVY), ("Interest", TEAL), ("Principal still out", RED)]
-    lx = width - 16 - sum(22 + len(lbl) * 5.6 + 16 for lbl, _ in legend)
+    # The legend on its own row under the title, so a long title never runs into it.
+    legend = [("Principal", NAVY), ("Interest", TEAL), ("Principal still out, % of the loan", RED)]
+    lx = 16.0
     for label, color in legend:
-        parts.append(f'<rect x="{lx:.1f}" y="16" width="16" height="10" rx="2" fill="{color}"/>')
-        parts.append(f'<text x="{lx + 21:.1f}" y="25" font-family="Arial" font-size="9.5" fill="{SLATE}">{escape(label)}</text>')
+        parts.append(f'<rect x="{lx:.1f}" y="34" width="16" height="10" rx="2" fill="{color}"/>')
+        parts.append(f'<text x="{lx + 21:.1f}" y="43" font-family="Arial" font-size="9.5" fill="{SLATE}">{escape(label)}</text>')
         lx += 22 + len(label) * 5.6 + 16
     parts.append("</svg>")
     return "".join(parts), width
