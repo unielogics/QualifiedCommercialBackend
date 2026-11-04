@@ -224,6 +224,10 @@ class ListingDetail(ListingCard):
     documents: list[DocumentOut]
     my_subscriptions: list[SubscriptionOut]
     can_subscribe: bool
+    #: The underwriting figures the file showed when the desk cut or last
+    #: refreshed the listing, with the desk's plan: what changes, coverage
+    #: before and after. None for a listing not cut from a file.
+    financials: dict[str, Any] | None = None
 
 
 class FacetCount(BaseModel):
@@ -472,6 +476,8 @@ class ListingProductIn(BaseModel):
     rate_pct: Decimal | None = Field(default=None, ge=0, le=100)
     factor_rate: Decimal | None = Field(default=None, ge=1, le=3)
     term_months: int | None = Field(default=None, ge=1, le=600)
+    #: Interest alone each month, principal at maturity.
+    interest_only: bool = False
     payment_frequency: Literal["monthly", "weekly", "daily"] | None = "monthly"
     monthly_payment: Decimal | None = Field(default=None, ge=0)
     dscr: Decimal | None = None
@@ -488,6 +494,11 @@ class OfferSuggestions(BaseModel):
     debt_service_source: str | None = None
     target_dscr: float
     requested_amount: float | None = None
+    plan_active: bool = False
+    payoff_total: float | None = None
+    #: The loan the desk's plan carries (amount, rate, term, interest-only, payment).
+    plan_loan: dict[str, Any] | None = None
+    interest_only: bool = False
     products: list[dict[str, Any]] = Field(default_factory=list)
 
 

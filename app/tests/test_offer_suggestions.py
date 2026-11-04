@@ -67,3 +67,12 @@ def test_income_figure_follows_the_cockpit_headline() -> None:
     proxy = {"dscr": {"headline": None, "pro_forma_headline": None, "candidates": [{"numerator": -29364, "key": "bank_cash_flow", "numerator_label": "Cash retained"}]}}
     assert income_figure(proxy) == (-29364, "bank_cash_flow", "Cash retained")
     assert income_figure({"dscr": {"headline": None, "pro_forma_headline": None, "candidates": []}}) == (None, None, None)
+
+
+def test_an_interest_only_suggestion_prices_interest_alone() -> None:
+    shape = program_shape(SimpleNamespace(pricing_basis="interest_rate", minimum_pricing=12, maximum_pricing=12, minimum_term_months=12, maximum_term_months=60, minimum_amount=None, maximum_amount=None))
+    product = suggest_product(program_key="bridge", label="Bridge", income_annual=120000, existing_monthly_debt_service=2000, requested_amount=400000, shape=shape, interest_only=True)
+    # room 6000/mo at 12% interest-only supports 600k of principal; the client asked for 400k
+    assert product["interest_only"] is True and product["affordable_amount"] == 600000.0 and product["amount"] == 400000.0
+    assert product["monthly_payment"] == 4000.0 and product["dscr"] == round(120000 / ((2000 + 4000) * 12), 2)
+    assert "interest-only" in product["reading"]

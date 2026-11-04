@@ -109,9 +109,30 @@ class BankAccountsWrite(BaseModel):
     aliases: dict[str, str] | None = Field(default=None)
 
 
+class AddBackIn(BaseModel):
+    """One amount the desk adds back to the income available for debt service."""
+
+    id: str | None = Field(default=None, max_length=60)
+    kind: Literal["owner_salary", "interest_refinanced", "depreciation", "one_time_expense", "rent_to_owner", "other"] = "other"
+    label: str | None = Field(default=None, max_length=120)
+    amount_monthly: float = Field(gt=0)
+    note: str | None = Field(default=None, max_length=300)
+    source: str | None = Field(default=None, max_length=40)
+
+
+class PlanOverridesIn(BaseModel):
+    """Figures the desk sets outright, each with the reason."""
+
+    income_annual: float | None = Field(default=None, ge=0)
+    income_note: str | None = Field(default=None, max_length=300)
+    debt_service_monthly: float | None = Field(default=None, ge=0)
+    debt_service_note: str | None = Field(default=None, max_length=300)
+
+
 class FinancialPlanWrite(BaseModel):
     """What the desk decided: obligations the new loan pays off, payees that
-    are not operating spend, and the new payment or the loan it comes from."""
+    are not operating spend, add-backs and overrides to the coverage inputs,
+    and the new payment or the loan it comes from (level or interest-only)."""
 
     retire: list[str] = Field(default_factory=list, max_length=60)
     exclude: list[str] = Field(default_factory=list, max_length=60)
@@ -120,6 +141,9 @@ class FinancialPlanWrite(BaseModel):
     new_loan_amount: float | None = Field(default=None, ge=0)
     new_loan_rate_pct: float | None = Field(default=None, ge=0, le=100)
     new_loan_term_months: int | None = Field(default=None, ge=1, le=600)
+    new_loan_interest_only: bool = False
+    add_backs: list[AddBackIn] = Field(default_factory=list, max_length=20)
+    overrides: PlanOverridesIn | None = None
     note: str | None = Field(default=None, max_length=600)
 
 

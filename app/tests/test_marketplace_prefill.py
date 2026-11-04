@@ -130,3 +130,26 @@ async def test_suggested_products_mark_the_first_as_primary(monkeypatch: pytest.
     products = await prefill.suggested_products(SimpleNamespace(), SimpleNamespace(id=uuid.uuid4()))
     assert [p["primary"] for p in products] == [True, False]
     assert products[0]["notes"] == "A: fine." and products[1]["amount"] is None
+
+
+def test_members_see_the_file_figures_and_the_plan_but_not_the_raw_snapshot() -> None:
+    from types import SimpleNamespace
+
+    from app.capital_partners.services.listings import partner_financials
+
+    snapshot = {
+        "readiness": {"programs": []},
+        "financials": {
+            "bank_months": 6, "avg_monthly_deposits": 57533.0, "dscr": 0.8, "dscr_basis": "bank_cash_flow", "dscr_status": "concerning",
+            "dscr_after_plan": 1.62, "net_profit": -29362.0, "secret_internal": "never",
+            "plan": {"active": True, "modifications": [{"kind": "retire", "label": "Pay off OnDeck with the new loan", "detail": "Its 5,850 a month stops.", "monthly_effect": -5850}], "impact": {"dscr": {"before": 0.8, "after": 1.62}}},
+        },
+        "refreshed_at": "2026-11-04T01:00:00+00:00",
+    }
+    out = partner_financials(SimpleNamespace(source_snapshot=snapshot))
+    assert out["dscr"] == 0.8 and out["dscr_after_plan"] == 1.62 and "secret_internal" not in out
+    assert out["plan"]["modifications"] == [{"kind": "retire", "label": "Pay off OnDeck with the new loan", "detail": "Its 5,850 a month stops."}]
+    assert out["plan"]["impact"]["dscr"]["after"] == 1.62 and out["refreshed_at"] == "2026-11-04T01:00:00+00:00"
+    assert partner_financials(SimpleNamespace(source_snapshot={})) is None
+    inactive = partner_financials(SimpleNamespace(source_snapshot={"financials": {"dscr": 1.1, "plan": {"active": False, "modifications": []}}}))
+    assert "plan" not in inactive and inactive["dscr"] == 1.1

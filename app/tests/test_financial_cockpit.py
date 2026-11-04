@@ -948,3 +948,22 @@ def test_a_multi_month_file_whose_rows_agree_on_the_digits_is_that_account() -> 
     _months, accounts = bank_months([six])
     assert [a["key"] for a in accounts] == ["chase ••1204"] and accounts[0]["months"] == [f"2026-{i:02d}" for i in range(1, 7)]
     assert accounts[0]["sub_accounts"] == []
+
+
+def test_the_cockpit_carries_the_plan_in_words_and_the_listing_summary_repeats_it() -> None:
+    from app.services.financial_cockpit import plan_brief
+
+    plan = {"retire": [], "add_backs": [{"kind": "owner_salary", "amount_monthly": 5000, "note": "Discretionary owner pay"}], "new_loan_amount": 100000, "new_loan_rate_pct": 10, "new_loan_interest_only": True}
+    cockpit = build_cockpit([TAX_2025, *SIX_MONTHS], [LOAN_ROW], plan=plan, counted_accounts=None)
+    block = cockpit["plan"]
+    assert [m["kind"] for m in block["modifications"]] == ["add_back", "loan"]
+    assert block["impact"]["active"] and block["impact"]["dscr"]["basis"] == "tax_return"
+    assert block["impact"]["loan"]["interest_only"] is True and block["impact"]["loan"]["payment_monthly"] == 833.33
+    summary = listing_summary(cockpit)
+    assert summary["plan"]["active"] and summary["dscr_after_plan"] == block["evaluation"]["headline_after"]
+    assert summary["debt_service_after_monthly"] == block["evaluation"]["debt_service_after_monthly"]
+    brief = plan_brief(cockpit)
+    assert brief["active"] and brief["dscr_before"] == cockpit["dscr"]["headline"]["value"] and brief["dscr_after"] == summary["dscr_after_plan"]
+    assert any(line.startswith("Add back") for line in brief["modifications"])
+    quiet = build_cockpit([TAX_2025], [LOAN_ROW])
+    assert quiet["plan"]["impact"]["active"] is False and listing_summary(quiet)["plan"]["active"] is False

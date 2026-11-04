@@ -2058,7 +2058,10 @@ def build_cockpit(
         dscr=dscr,
         requested_amount=_num(requested_amount),
         terms=proposed_terms,
+        tax_years=years,
     )
+    modifications = plans.describe_modifications(plan_record, evaluation, obligations, recurring, accounts)
+    impact = plans.plan_impact(evaluation, dscr, accounts)
     coverage = {
         "files_analyzed": len(analyses),
         "files_accepted": len(_accepted_files(analyses)),
@@ -2115,10 +2118,55 @@ def build_cockpit(
             "schedule": schedule,
         },
         "dscr": dscr,
-        "plan": {"record": plan_record, "evaluation": evaluation, "levers": levers},
+        "plan": {
+            "record": plan_record,
+            "evaluation": evaluation,
+            "levers": levers,
+            "modifications": modifications,
+            "impact": impact,
+        },
         "net_profit": net_profit_block(years, statement, bank),
         "notes": _notes(coverage, bank, service, proposed, years, statement)
         + schedule_notes(schedule, service),
+    }
+
+
+def plan_summary(cockpit: dict[str, Any]) -> dict[str, Any]:
+    """The desk's plan as a package or a listing carries it: whether it is in
+    force, what changed in plain words, and the figures before and after."""
+    plan = cockpit.get("plan") or {}
+    evaluation = plan.get("evaluation") or {}
+    record = plan.get("record") or {}
+    return {
+        "active": bool(evaluation.get("active")),
+        "modifications": plan.get("modifications") or [],
+        "impact": plan.get("impact") or {},
+        "note": record.get("note"),
+        "updated_at": record.get("updated_at"),
+        "updated_by": record.get("updated_by"),
+    }
+
+
+def plan_brief(cockpit: dict[str, Any]) -> dict[str, Any]:
+    """The plan as facts for a model: what the desk changed and the coverage
+    before and after, nothing that reads as an instruction."""
+    summary = plan_summary(cockpit)
+    impact = summary["impact"]
+    dscr = impact.get("dscr") or {}
+    service = impact.get("debt_service_monthly") or {}
+    return {
+        "active": summary["active"],
+        "modifications": [
+            f"{m['label']}: {m['detail']}" if m.get("detail") else str(m.get("label"))
+            for m in summary["modifications"]
+        ],
+        "dscr_before": dscr.get("before"),
+        "dscr_after": dscr.get("after"),
+        "dscr_basis": dscr.get("basis"),
+        "debt_service_before_monthly": service.get("before"),
+        "debt_service_after_monthly": service.get("after"),
+        "loan": impact.get("loan"),
+        "note": summary["note"],
     }
 
 
@@ -2142,6 +2190,11 @@ def listing_summary(cockpit: dict[str, Any]) -> dict[str, Any]:
         "dscr_basis": headline.get("key"),
         "dscr_status": headline.get("status"),
         "pro_forma_dscr": (cockpit["dscr"].get("pro_forma_headline") or {}).get("pro_forma_value"),
+        "dscr_after_plan": ((cockpit.get("plan") or {}).get("evaluation") or {}).get("headline_after"),
+        "debt_service_after_monthly": ((cockpit.get("plan") or {}).get("evaluation") or {}).get(
+            "debt_service_after_monthly"
+        ),
+        "plan": plan_summary(cockpit),
         "annual_debt_service": cockpit["dscr"].get("annual_debt_service"),
         "net_profit": conclusion.get("value"),
         "net_profit_basis": conclusion.get("key"),

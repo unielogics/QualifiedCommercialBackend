@@ -130,3 +130,74 @@ def test_the_cockpit_read_model_keeps_the_plan_and_the_obligations() -> None:
     assert read["plan"]["record"]["retire"] == ["row:row1"] and "evaluation" in read["plan"] and "levers" in read["plan"]
     assert read["debt"]["obligations"][0]["id"] == "row:row1"
     assert read["bank"]["recurring"]["payees"] == [] and "overdrafts" in read["bank"]
+
+
+TAX_YEARS = [{"year": "2025", "officer_compensation": 96000.0, "ebitda": 70000.0}]
+
+
+def test_add_backs_overrides_and_an_interest_only_loan_change_every_figure_together() -> None:
+    obligations = fp.obligations({"rows": [], "documented": [], "service": SERVICE}, RECURRING)
+    plan = fp.normalize_plan(
+        {
+            "retire": ["payee:ondeck"],
+            "add_backs": [{"kind": "owner_salary", "amount_monthly": 8000, "note": "Owner draws a salary; discretionary"}, {"kind": "bogus", "amount_annual": 12000}, {"kind": "other", "amount_monthly": 0}],
+            "new_loan_amount": 150000,
+            "new_loan_rate_pct": 12,
+            "new_loan_interest_only": True,
+        }
+    )
+    assert [a["kind"] for a in plan["add_backs"]] == ["owner_salary", "other"]  # the unknown kind folds to other; zero drops
+    assert plan["add_backs"][1]["amount_monthly"] == 1000.0 and plan["new_loan_interest_only"] is True
+    result = fp.evaluate_plan(plan, obligations_list=obligations, recurring=RECURRING, months=MONTHS, dscr=DSCR, service=SERVICE, proposed=None, requested_amount=70000)
+    assert result["add_backs_monthly"] == 9000.0 and result["add_backs_annual"] == 108000.0
+    assert result["new_payment_monthly"] == 1500.0 and result["new_payment_source"] == "manual_terms"  # 150k × 12% / 12
+    assert result["loan_terms"] == {"amount": 150000.0, "rate_pct": 12.0, "term_months": None, "interest_only": True}
+    assert result["debt_service_after_monthly"] == round(11897.0 - 6750.0 + 1500.0, 2)
+    bank, tax = result["candidates"]
+    assert bank["numerator_after"] == 131063.0 + 108000.0 and tax["numerator_after"] == 70000.0 + 108000.0
+    assert result["income_before_annual"] == 131063.0 and result["income_after_annual"] == bank["numerator_after"]
+    assert result["headline_after"] == round(bank["numerator_after"] / (result["debt_service_after_monthly"] * 12), 2)
+
+    overridden = fp.normalize_plan({"overrides": {"income_annual": 200000, "income_note": "Per the CPA letter", "debt_service_monthly": 3000}})
+    out = fp.evaluate_plan(overridden, obligations_list=obligations, recurring=RECURRING, months=MONTHS, dscr=DSCR, service=SERVICE, proposed=None, requested_amount=None)
+    assert out["active"] and out["debt_service_before_monthly"] == 3000.0 and out["debt_service_after_monthly"] == 3000.0
+    assert all(c["numerator_after"] == 200000.0 and c["overridden"] for c in out["candidates"])
+    assert out["headline_after"] == round(200000 / 36000, 2)
+    alone = fp.evaluate_plan(fp.normalize_plan({"overrides": {"income_annual": 90000}, "new_payment_monthly": 2000}), obligations_list=[], recurring={"payees": [], "months_read": []}, months=[], dscr={"candidates": [], "headline": None}, service={"monthly": None}, proposed=None, requested_amount=None)
+    assert alone["candidates"][0]["key"] == "desk_override" and alone["headline_after"] == round(90000 / 24000, 2)
+
+
+def test_modifications_and_impact_read_as_original_change_and_result() -> None:
+    obligations = fp.obligations({"rows": [], "documented": [], "service": SERVICE}, RECURRING)
+    plan = fp.normalize_plan({"retire": ["payee:ondeck"], "exclude": ["payee:wise inc"], "add_backs": [{"kind": "owner_salary", "amount_monthly": 8000}], "overrides": {"debt_service_monthly": 12000, "debt_service_note": "Includes the truck lease"}, "new_loan_amount": 150000, "new_loan_rate_pct": 12, "new_loan_term_months": 60})
+    evaluation = fp.evaluate_plan(plan, obligations_list=obligations, recurring=RECURRING, months=MONTHS, dscr=DSCR, service=SERVICE, proposed=None, requested_amount=70000)
+    accounts = [{"label": "Chase ••1204", "counted": True}, {"label": "Chase ••7777", "counted": False}]
+    lines = fp.describe_modifications(plan, evaluation, obligations, RECURRING, accounts)
+    assert [m["kind"] for m in lines] == ["retire", "exclude", "add_back", "override_debt_service", "loan", "accounts"]
+    assert lines[0]["label"] == "Pay off ONDECK ACH 4471 with the new loan" and lines[0]["monthly_effect"] == -6750.0
+    assert "150,000 at 12% over 60 months" in lines[4]["label"] and lines[4]["monthly_effect"] == -evaluation["new_payment_monthly"]
+    assert lines[5]["detail"] == "Not counted: Chase ••7777."
+    impact = fp.plan_impact(evaluation, DSCR, accounts)
+    assert impact["active"] and impact["dscr"]["before"] == 0.92 and impact["dscr"]["after"] == evaluation["headline_after"]
+    assert impact["debt_service_monthly"]["before"] == 12000.0 and impact["debt_service_monthly"]["change"] == round(evaluation["debt_service_after_monthly"] - 12000.0, 2)
+    assert impact["loan"]["interest_only"] is False and impact["loan"]["payment_monthly"] == evaluation["new_payment_monthly"]
+    assert impact["accounts"] == {"counted": ["Chase ••1204"], "not_counted": ["Chase ••7777"]}
+
+
+def test_levers_offer_the_officer_add_back_and_interest_only_when_they_raise_coverage() -> None:
+    obligations = fp.obligations({"rows": [], "documented": [], "service": SERVICE}, RECURRING)
+    plan = fp.normalize_plan({"retire": ["payee:ondeck", "payee:wayflyer"], "new_loan_amount": 150000, "new_loan_rate_pct": 12, "new_loan_term_months": 60})
+    evaluation = fp.evaluate_plan(plan, obligations_list=obligations, recurring=RECURRING, months=MONTHS, dscr=DSCR, service=SERVICE, proposed=None, requested_amount=70000)
+    levers = {lever["key"]: lever for lever in fp.coverage_levers(plan, evaluation, obligations_list=obligations, recurring=RECURRING, dscr=DSCR, requested_amount=70000, terms=None, tax_years=TAX_YEARS)}
+    comp = levers["addback:officer_compensation"]
+    assert comp["apply"]["add_backs"][0]["amount_monthly"] == 8000.0 and comp["apply"]["add_backs"][0]["source"] == "tax_return"
+    assert comp["dscr_after"] == round((131063.0 + 96000.0) / (evaluation["debt_service_after_monthly"] * 12), 2)
+    io = levers["interest_only"]
+    assert io["apply"] == {"new_loan_interest_only": True, "new_payment_monthly": None}
+    assert io["dscr_after"] == round(131063.0 / ((evaluation["debt_service_before_new_payment_monthly"] + 1500.0) * 12), 2)
+    assert io["dscr_after"] > evaluation["headline_after"]
+    # Once applied, neither lever is offered again.
+    applied = fp.normalize_plan({**plan, **comp["apply"], **io["apply"]})
+    again = fp.evaluate_plan(applied, obligations_list=obligations, recurring=RECURRING, months=MONTHS, dscr=DSCR, service=SERVICE, proposed=None, requested_amount=70000)
+    keys = {lever["key"] for lever in fp.coverage_levers(applied, again, obligations_list=obligations, recurring=RECURRING, dscr=DSCR, requested_amount=70000, terms=None, tax_years=TAX_YEARS)}
+    assert "addback:officer_compensation" not in keys and "interest_only" not in keys

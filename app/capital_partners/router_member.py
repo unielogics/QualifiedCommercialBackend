@@ -228,6 +228,7 @@ async def listing_detail(ref: str, ctx: ClearedMember, db: Db) -> S.ListingDetai
         documents=[S.DocumentOut(**L.document_out(d)) for d in L.ready_documents(listing)],
         my_subscriptions=[S.SubscriptionOut(**s) for s in mine],
         can_subscribe=(not ctx.preview) and listing.status in E.SUBSCRIBABLE_STATUSES and L.remaining_amount(listing, committed) > 0,
+        financials=L.partner_financials(listing),
     )
 
 

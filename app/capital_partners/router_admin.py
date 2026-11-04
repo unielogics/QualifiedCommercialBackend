@@ -445,6 +445,39 @@ async def publish_listing(listing_id: uuid.UUID, payload: S.PublishIn, admin: Cp
     return await _listing_admin_out(db, listing)
 
 
+@router.post("/listings/{listing_id}/refresh-snapshot", response_model=S.ListingAdminOut)
+async def refresh_listing_snapshot(listing_id: uuid.UUID, admin: CpAdmin, db: Db) -> S.ListingAdminOut:
+    """Re-read the file behind a listing: program readiness, the cockpit's
+    figures and the desk's plan (what changes, the coverage before and after),
+    so what members see follows what the desk decided on the file."""
+    listing = await _load_admin_listing(db, listing_id)
+    if listing.profile_id is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "This listing was not cut from a file, so there is nothing to re-read.")
+    from app.models.application_profile import ApplicationProfile
+
+    profile = await db.get(ApplicationProfile, listing.profile_id)
+    if profile is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "The file behind this listing was not found.")
+    fresh = await P.readiness_snapshot(db, profile)
+    refreshed_at = datetime.now(UTC).isoformat()
+    listing.source_snapshot = {**(listing.source_snapshot or {}), **fresh, "refreshed_at": refreshed_at}
+    financials = fresh.get("financials") or {}
+    await L.log_event(
+        db,
+        listing.id,
+        "snapshot_refreshed",
+        actor_user_id=admin.id,
+        detail={
+            "dscr": financials.get("dscr"),
+            "dscr_after_plan": financials.get("dscr_after_plan"),
+            "plan_active": bool((financials.get("plan") or {}).get("active")),
+            "refreshed_at": refreshed_at,
+        },
+    )
+    await db.commit()
+    return await _listing_admin_out(db, listing)
+
+
 @router.post("/listings/{listing_id}/status", response_model=S.ListingAdminOut)
 async def set_listing_status(listing_id: uuid.UUID, payload: S.StatusIn, admin: CpAdmin, db: Db) -> S.ListingAdminOut:
     listing = await _load_admin_listing(db, listing_id)

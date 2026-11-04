@@ -140,6 +140,58 @@ def card(listing: CpListing, committed: Decimal, *, now: datetime | None = None)
     }
 
 
+#: The cockpit figures a member may see on an offering.
+PARTNER_FINANCIAL_KEYS = (
+    "generated_at",
+    "bank_months",
+    "bank_months_accepted",
+    "avg_monthly_deposits",
+    "annualized_deposits",
+    "avg_monthly_net",
+    "average_balance",
+    "nsf_total",
+    "deposit_trend_pct",
+    "dscr",
+    "dscr_basis",
+    "dscr_status",
+    "pro_forma_dscr",
+    "dscr_after_plan",
+    "debt_service_after_monthly",
+    "annual_debt_service",
+    "net_profit",
+    "net_profit_basis",
+    "net_profit_period",
+    "tax_year",
+    "tax_gross_receipts",
+    "tax_income",
+)
+
+
+def partner_financials(listing: CpListing) -> dict[str, Any] | None:
+    """The underwriting figures a member sees on an offering: what the file
+    showed when the desk cut or last refreshed the listing, and the desk's
+    plan beside it (what changes, the coverage before and after). None for a
+    listing that was not cut from a file."""
+    snapshot = listing.source_snapshot if isinstance(listing.source_snapshot, dict) else {}
+    financials = snapshot.get("financials")
+    if not isinstance(financials, dict):
+        return None
+    out: dict[str, Any] = {k: financials.get(k) for k in PARTNER_FINANCIAL_KEYS if financials.get(k) is not None}
+    plan = financials.get("plan") if isinstance(financials.get("plan"), dict) else {}
+    if plan.get("active"):
+        out["plan"] = {
+            "modifications": [
+                {"kind": m.get("kind"), "label": m.get("label"), "detail": m.get("detail")}
+                for m in plan.get("modifications") or []
+                if isinstance(m, dict)
+            ],
+            "impact": plan.get("impact") or {},
+        }
+    if snapshot.get("refreshed_at"):
+        out["refreshed_at"] = snapshot["refreshed_at"]
+    return out or None
+
+
 def document_out(doc: CpListingDocument) -> dict[str, Any]:
     return {
         "id": doc.id,

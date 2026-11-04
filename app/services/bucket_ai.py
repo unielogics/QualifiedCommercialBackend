@@ -194,6 +194,7 @@ Never invent or estimate a credit score/tier. If ai_context.authoritative_facts.
 # persona rules. The screen (context.published_program_screen) is the funding
 # catalog's approved criteria evaluated against this file; it is a screen,
 # never an approval, and the soft credit pull always comes last.
+REVIEW_PLAN_RULES = """context.desk_financial_plan, when present, is the underwriter's own coverage plan for this file: the obligations the new loan pays off, statement payees treated as not operating spend, add-backs and overrides to the coverage inputs, and the new loan's terms, with the coverage before and after. Treat it as the underwriter's stated assumptions: cite it when you discuss coverage, name the before and after figures as the plan's, and never present the after figure as the file's current state or as a decision."""
 REVIEW_PROGRAM_SCREEN_RULES = """context.published_program_screen lists approved programs with their published-criteria status for this file. When a program is eligible, say in executive_summary that the file fits the published criteria for that program by name and keep one_next_step on the lender's remaining items. When a program needs information, name in recommended_next_document_requests the single missing item that would unlock it. Never call a fit an approval, never quote a rate, and never treat a missing credit score as a failure: the soft credit pull is the last step."""
 
 # Compaction limits appended to every product's review prompt.
@@ -467,14 +468,14 @@ def build_review_system(review_type: str | None) -> str:
     neutral preamble only, with no product-specific rules.
     """
     if review_type == "dealer_gatekeeper_v1":
-        return f"{REVIEW_PREAMBLE}\n{DEALER_REVIEW_RULES}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_LIMITS}\n"
+        return f"{REVIEW_PREAMBLE}\n{DEALER_REVIEW_RULES}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_PLAN_RULES}\n{REVIEW_LIMITS}\n"
     if review_type == "real_estate_dscr_v1":
-        return f"{REVIEW_PREAMBLE}\n{RE_REVIEW_RULES}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_LIMITS}\n"
+        return f"{REVIEW_PREAMBLE}\n{RE_REVIEW_RULES}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_PLAN_RULES}\n{REVIEW_LIMITS}\n"
     if review_type == "main_street_v1":
-        return f"{REVIEW_PREAMBLE}\n{MAIN_STREET_REVIEW_RULES}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_LIMITS}\n"
+        return f"{REVIEW_PREAMBLE}\n{MAIN_STREET_REVIEW_RULES}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_PLAN_RULES}\n{REVIEW_LIMITS}\n"
     if review_type == "mca_refi_v1":
-        return f"{REVIEW_PREAMBLE}\n{MCA_REVIEW_RULES}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_LIMITS}\n"
-    return f"{REVIEW_PREAMBLE}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_LIMITS}\n"
+        return f"{REVIEW_PREAMBLE}\n{MCA_REVIEW_RULES}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_PLAN_RULES}\n{REVIEW_LIMITS}\n"
+    return f"{REVIEW_PREAMBLE}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_PLAN_RULES}\n{REVIEW_LIMITS}\n"
 
 
 def build_chat_system(review_type: str | None, *, client_language: str | None = None, audience: str | None = None) -> str:
@@ -3273,6 +3274,14 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         screen_profile = None
     if screen_profile is not None:
         review_context["published_program_screen"] = await _published_program_screen(db, screen_profile)
+        try:
+            from app.services import financial_cockpit as cockpit_svc
+
+            brief = cockpit_svc.plan_brief(await cockpit_svc.load_cockpit(db, screen_profile))
+            if brief.get("active"):
+                review_context["desk_financial_plan"] = brief
+        except Exception:  # noqa: BLE001 - the plan is advisory context, never a reason to fail the review
+            log.exception("bucket_ai: financial plan brief failed review=%s", review.id)
     review_context.update(
         {
             "requested_documents": requested,
