@@ -11,11 +11,15 @@ from app.routers import buckets
 
 
 def test_bucket_file_delete_retains_storage_for_recovery() -> None:
-    source = inspect.getsource(buckets.delete_admin_file)
-    assert 'file.delete_storage_status = "retained_soft_delete"' in source
-    assert "_delete_s3_object" not in source
-    assert "selectinload(BucketFile.public_shares)" in source
-    assert "file.public_shares.clear()" in source
+    helper = inspect.getsource(buckets._soft_delete_file)
+    assert 'file.delete_storage_status = "retained_soft_delete"' in helper
+    assert "_delete_s3_object" not in helper
+    assert "file.public_shares.clear()" in helper
+    loader = inspect.getsource(buckets._files_for_removal)
+    assert "selectinload(BucketFile.public_shares)" in loader
+    route = inspect.getsource(buckets.delete_admin_file)
+    assert "_files_for_removal(" in route and "_soft_delete_file(" in route
+    assert "_delete_s3_object" not in route
 
 
 def test_bucket_archive_does_not_delete_or_reject_protected_files() -> None:

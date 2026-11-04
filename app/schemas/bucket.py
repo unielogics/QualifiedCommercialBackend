@@ -425,6 +425,24 @@ class BucketFileUrl(BaseModel):
     expires_in: int
 
 
+class BucketFileSelection(BaseModel):
+    """Ids of files in one room, as the operator checked them."""
+
+    file_ids: list[UUID] = Field(min_length=1, max_length=200)
+
+
+class BucketFileRemovalBlocked(BaseModel):
+    file_id: UUID
+    file_name: str
+    reason: str
+
+
+class BucketFilesRemoveResult(BaseModel):
+    removed: list[UUID]
+    blocked: list[BucketFileRemovalBlocked]
+    missing: list[UUID]
+
+
 class BucketFileAnnotationCreate(BaseModel):
     page_number: int = Field(default=1, ge=1)
     x: float = Field(ge=0, le=1)

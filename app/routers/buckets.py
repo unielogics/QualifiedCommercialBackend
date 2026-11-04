@@ -85,8 +85,11 @@ from app.schemas.bucket import (
     BucketFileAnnotationCreate,
     BucketFileAnnotationRead,
     BucketFileRead,
+    BucketFileRemovalBlocked,
     BucketFileReviewRead,
+    BucketFileSelection,
     BucketFileSheetsRead,
+    BucketFilesRemoveResult,
     BucketFileUploadInit,
     BucketFileUploadInitResponse,
     BucketFileUrl,
@@ -139,6 +142,7 @@ from app.schemas.retention import LegalHoldChange, RetentionStatusRead
 from app.services import application_profiles as profiles
 from app.services import (
     bucket_archive,
+    bucket_file_archive,
     bucket_requests,
     bucket_storage_integrity,
     capital_readiness,
@@ -2943,40 +2947,39 @@ async def admin_upload_complete(
     return file
 
 
-@router.delete("/admin/{bucket_id}/files/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_admin_file(
-    bucket_id: UUID,
-    file_id: UUID,
-    request: Request,
-    user: User = Depends(require_role(Role.SUPER_ADMIN)),
-    db: AsyncSession = Depends(get_db),
-) -> None:
-    await _load_bucket_or_404(db, bucket_id)
-    file = (
-        await db.execute(
-            select(BucketFile)
-            .where(
-                BucketFile.id == file_id,
-                BucketFile.bucket_id == bucket_id,
-            )
-            .options(
-                selectinload(BucketFile.shares),
-                selectinload(BucketFile.public_shares),
-                selectinload(BucketFile.vendor_access),
-            )
-        )
-    ).scalar_one_or_none()
-    if file is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
-    if file.deleted_at is not None:
-        return
-    if await retention_holds.is_effective_file_soft_deletion_prohibited(db, file):
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            "This ACH or agreement artifact is protected by retention or legal hold",
-        )
+async def _files_for_removal(db: AsyncSession, bucket_id: UUID, file_ids: list[UUID]) -> list[BucketFile]:
+    """Load the room's rows for these ids with every share relation a removal clears."""
 
-    file.deleted_at = _now()
+    if not file_ids:
+        return []
+    rows = await db.execute(
+        select(BucketFile)
+        .where(BucketFile.bucket_id == bucket_id, BucketFile.id.in_(file_ids))
+        .options(
+            selectinload(BucketFile.shares),
+            selectinload(BucketFile.public_shares),
+            selectinload(BucketFile.vendor_access),
+        )
+    )
+    return list(rows.scalars().all())
+
+
+async def _soft_delete_file(
+    db: AsyncSession,
+    bucket_id: UUID,
+    file: BucketFile,
+    *,
+    request: Request,
+    user: User,
+    at: datetime | None = None,
+) -> list[ApplicationProfile]:
+    """Move one file to Removed files and return the applications it touched.
+
+    The caller checks retention first and runs the readiness recompute itself,
+    so a multi-file removal recomputes each application once.
+    """
+
+    file.deleted_at = at or _now()
     file.deleted_by_user_id = user.id
     if provenance.is_internal_package_output(file):
         # Package BucketFiles and immutable underwriting artifacts intentionally
@@ -3006,13 +3009,178 @@ async def delete_admin_file(
         detail=f"{file.file_name} | storage={file.delete_storage_status}",
     )
     await db.flush()
-    affected_profiles = await profiles.affected_profiles_for_file(db, file)
+    return await profiles.affected_profiles_for_file(db, file)
+
+
+@router.delete("/admin/{bucket_id}/files/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_admin_file(
+    bucket_id: UUID,
+    file_id: UUID,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    await _load_bucket_or_404(db, bucket_id)
+    rows = await _files_for_removal(db, bucket_id, [file_id])
+    file = rows[0] if rows else None
+    if file is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
+    if file.deleted_at is not None:
+        return
+    if await retention_holds.is_effective_file_soft_deletion_prohibited(db, file):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This ACH or agreement artifact is protected by retention or legal hold",
+        )
+    affected_profiles = await _soft_delete_file(db, bucket_id, file, request=request, user=user)
     await capital_readiness.advisory_recompute_profiles(
         db,
         affected_profiles,
         event_key=f"file-deleted:{file.id}:{file.deleted_at.isoformat()}",
     )
     await db.commit()
+
+
+@router.post("/admin/{bucket_id}/selected-files/remove", response_model=BucketFilesRemoveResult)
+async def remove_admin_files(
+    bucket_id: UUID,
+    payload: BucketFileSelection,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketFilesRemoveResult:
+    """Move the checked files to Removed files in one request.
+
+    Files under retention or legal hold stay and are reported, as are ids that
+    are no longer in the room; everything else moves together, so one refusal
+    never leaves the operator guessing which half was applied.
+    """
+
+    await _load_bucket_or_404(db, bucket_id)
+    wanted = list(dict.fromkeys(payload.file_ids))
+    by_id = {row.id: row for row in await _files_for_removal(db, bucket_id, wanted)}
+    now = _now()
+    removed: list[UUID] = []
+    blocked: list[BucketFileRemovalBlocked] = []
+    missing: list[UUID] = []
+    affected: dict[UUID, ApplicationProfile] = {}
+    for file_id in wanted:
+        file = by_id.get(file_id)
+        if file is None or file.deleted_at is not None:
+            missing.append(file_id)
+            continue
+        if await retention_holds.is_effective_file_soft_deletion_prohibited(db, file):
+            blocked.append(
+                BucketFileRemovalBlocked(
+                    file_id=file.id,
+                    file_name=file.file_name,
+                    reason="Protected by retention or legal hold",
+                )
+            )
+            continue
+        touched = await _soft_delete_file(db, bucket_id, file, request=request, user=user, at=now)
+        for profile in touched:
+            affected[profile.id] = profile
+        removed.append(file.id)
+    if removed:
+        await capital_readiness.advisory_recompute_profiles(
+            db,
+            list(affected.values()),
+            event_key=f"files-removed:{bucket_id}:{now.isoformat()}",
+        )
+    await db.commit()
+    return BucketFilesRemoveResult(removed=removed, blocked=blocked, missing=missing)
+
+
+def _attachment_disposition(name: str) -> str:
+    fallback = name.encode("ascii", "ignore").decode("ascii")
+    fallback = fallback.replace("\\", "\\\\").replace('"', '\\"') or "download.zip"
+    return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{quote(name, safe="")}'
+
+
+@router.post("/admin/{bucket_id}/selected-files/archive")
+async def archive_admin_files(
+    bucket_id: UUID,
+    payload: BucketFileSelection,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Download the checked files as one zip. Archived rooms stay readable."""
+
+    from app.services import ach_fee_workflow
+
+    bucket = await _load_bucket_or_404(db, bucket_id, include_archived=True)
+    wanted = list(dict.fromkeys(payload.file_ids))
+    rows = await db.execute(
+        select(BucketFile).where(BucketFile.bucket_id == bucket_id, BucketFile.id.in_(wanted))
+    )
+    by_id = {
+        row.id: row
+        for row in rows.scalars().all()
+        if row.status == "uploaded" and row.deleted_at is None
+    }
+    gone = [file_id for file_id in wanted if file_id not in by_id]
+    if gone:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"{len(gone)} of the selected files are no longer in this room. "
+            "Refresh the room and check them again.",
+        )
+    files = [by_id[file_id] for file_id in wanted]
+    protected_bytes: dict[UUID, bytes] = {}
+    for file in files:
+        if file.retention_class not in PROTECTED_RETENTION_CLASSES:
+            continue
+        verified = await ach_fee_workflow.verified_protected_bytes(file)
+        if verified is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{file.file_name} failed its integrity check and was not packaged.",
+            )
+        protected_bytes[file.id] = verified
+    storage_bucket, _, _ = _bucket_storage_config()
+
+    def read_bytes(file: BucketFile) -> bytes:
+        if file.id in protected_bytes:
+            return protected_bytes[file.id]
+        params: dict[str, str] = {"Bucket": storage_bucket, "Key": file.s3_key}
+        if file.s3_version_id:
+            params["VersionId"] = file.s3_version_id
+        return _s3_client().get_object(**params)["Body"].read()
+
+    try:
+        result = await run_in_threadpool(bucket_file_archive.build_archive, files, read_bytes)
+    except bucket_file_archive.ArchiveTooLargeError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - storage trouble is reported, not raised
+        logger.warning("files archive: bucket=%s could not be read: %s", bucket_id, exc)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "A selected file could not be read from storage right now. Try again in a moment.",
+        ) from exc
+    archive_name = bucket_file_archive.archive_file_name(bucket.name)
+    for file in files:
+        await _log(
+            db,
+            bucket_id,
+            "file_archive_downloaded",
+            request=request,
+            user=user,
+            target_type="file",
+            target_id=str(file.id),
+            detail=f"{file.file_name} | {archive_name}",
+        )
+    await db.commit()
+    return Response(
+        content=result.data,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": _attachment_disposition(archive_name),
+            "Cache-Control": "no-store",
+            "X-Files-Packaged": str(result.files_packaged),
+        },
+    )
 
 
 @router.get("/admin/{bucket_id}/deleted-files", response_model=list[BucketFileRead])
