@@ -167,7 +167,9 @@ def build_schedule(
             breakeven_month = float(math.ceil(r["month"] - 1e-9))
     term_month = rows[-1]["month"] if rows else 0.0
     if breakeven_month is None and balloon and rows and cum_paid + balloon >= principal - 0.005:
-        breakeven_month = float(math.ceil(term_month - 1e-9))  # the balloon brings it back at maturity
+        breakeven_month = float(
+            math.ceil(term_month - 1e-9)
+        )  # the balloon brings it back at maturity
     weighted_life = (
         sum(r["principal"] * r["month"] for r in rows) + balloon * term_month
     ) / principal

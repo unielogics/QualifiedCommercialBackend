@@ -267,7 +267,9 @@ def test_a_sheet_recorded_before_structures_existed_reads_the_structure_off_its_
 
 def test_counting_the_interest_received_the_capital_is_back_before_the_principal() -> None:
     s = build_schedule(200000, 12, 24, interest_only_months=6)
-    assert s["rows"][5]["cash_at_risk_pct"] == 94.0  # six interest payments of 2,000 already in hand
+    assert (
+        s["rows"][5]["cash_at_risk_pct"] == 94.0
+    )  # six interest payments of 2,000 already in hand
     assert s["breakeven_month"] == 21.0  # 12,000 + 15 × 13,111 ≥ 200,000 at month 21
     assert s["rows"][20]["cash_at_risk_pct"] == 0.0 and s["rows"][19]["cash_at_risk_pct"] > 0
     assert "capital is back by month 21" in risk_profile(s)["words"]
