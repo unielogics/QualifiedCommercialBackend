@@ -533,6 +533,50 @@ def _document_secured(line: dict[str, Any]) -> str | None:
     if str(_first_present(line, "secured_by", "collateral") or "").strip():
         return "secured"
     return None
+ROW_PATCH_FIELDS = (
+    "lender",
+    "category",
+    "monthly_payment",
+    "balance",
+    "payoff_amount",
+    "payment_amount",
+    "payment_frequency",
+    "count_in_dscr",
+    "vendor_key",
+    "status",
+)
+
+
+def apply_debt_row_patch(row: Any, changes: dict[str, Any]) -> list[str]:
+    """Write the sent fields onto a schedule row; returns the names changed.
+
+    A category is normalised to the closed debt-type vocabulary (an unknown
+    word is kept as typed, lower-cased). A monthly figure typed by the desk
+    replaces a per-payment cadence; an empty vendor key unlinks the payee.
+    """
+    changed: list[str] = []
+    for key in ROW_PATCH_FIELDS:
+        if key not in changes:
+            continue
+        value = changes[key]
+        if key == "category" and value is not None:
+            value = debt_types.normalize_debt_type(value) or str(value).strip().lower()[:24]
+        if key == "lender" and value is not None:
+            value = str(value).strip()[:180] or getattr(row, "lender", None)
+        if key == "vendor_key":
+            value = (str(value).strip()[:60] or None) if value is not None else None
+        if key in {"monthly_payment", "balance", "payoff_amount", "payment_amount"} and value is not None:
+            value = round(float(value), 2)
+        if getattr(row, key, None) != value:
+            setattr(row, key, value)
+            changed.append(key)
+    if "monthly_payment" in changes and changes["monthly_payment"] is not None and "payment_amount" not in changes:
+        # The desk typed the month; a per-payment cadence read earlier no longer describes it.
+        if getattr(row, "payment_amount", None) is not None:
+            row.payment_amount = None
+            row.payment_frequency = None
+            changed.append("payment_amount")
+    return changed
 
 
 def document_debts_as_body(document: dict[str, Any] | None) -> dict[str, Any]:

@@ -159,6 +159,24 @@ class FinancialPlanWrite(BaseModel):
     note: str | None = Field(default=None, max_length=600)
 
 
+class DebtRowPatch(BaseModel):
+    """One schedule row edited in place on the coverage card: the figures the
+    desk overrides, the statement payee it is linked to, whether it counts,
+    and whether it stays. Only the fields sent change."""
+
+    lender: str | None = Field(default=None, min_length=1, max_length=180)
+    category: str | None = Field(default=None, max_length=40)
+    monthly_payment: float | None = Field(default=None, ge=0, le=1_000_000_000)
+    balance: float | None = Field(default=None, ge=0, le=1_000_000_000)
+    payoff_amount: float | None = Field(default=None, ge=0, le=1_000_000_000)
+    payment_amount: float | None = Field(default=None, ge=0, le=1_000_000_000)
+    payment_frequency: Literal["daily", "weekly", "biweekly", "monthly"] | None = None
+    count_in_dscr: bool | None = None
+    #: The recurring payee (its key) this row is seen as in the statements; "" unlinks.
+    vendor_key: str | None = Field(default=None, max_length=60)
+    status: Literal["active", "dismissed"] | None = None
+
+
 class ClosingStipulationItem(BaseModel):
     id: str | None = None
     text: str = Field(min_length=1, max_length=600)

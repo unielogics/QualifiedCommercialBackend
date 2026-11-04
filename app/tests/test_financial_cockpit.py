@@ -994,3 +994,21 @@ def test_the_uploaded_schedule_lines_become_the_desk_form_and_the_plan_obligatio
     assert listed[0]["lender"] == "Ally" and listed[0]["monthly"] == 1090.38 and listed[0]["payoff"] == 49139.2 and listed[0]["in_debt_service"] is True
     assert listed[0]["kind"] == "schedule_document" and listed[0]["origin"] == "uploaded_schedule"
     assert obligations({"rows": [], "service": {"source": "none"}, "document": document, "documented": []}, {"payees": []}) == []
+
+
+def test_a_schedule_row_edited_in_place_takes_the_figures_and_the_payee_link() -> None:
+    from types import SimpleNamespace
+
+    from app.services.financial_statements import apply_debt_row_patch
+
+    row = SimpleNamespace(lender="Arya", category="loan", monthly_payment=None, balance=17688.2, payoff_amount=None, payment_amount=450.0, payment_frequency="daily", count_in_dscr=True, vendor_key=None, status="active")
+    changed = apply_debt_row_patch(row, {"monthly_payment": 9000, "category": "Merchant cash advance", "vendor_key": "arya capital", "payoff_amount": 17000})
+    assert row.monthly_payment == 9000.0 and row.payoff_amount == 17000.0 and row.vendor_key == "arya capital"
+    assert row.category == "mca"  # the closed vocabulary's key for an advance
+    assert row.payment_amount is None and row.payment_frequency is None  # the typed month replaces the daily cadence
+    assert set(changed) == {"monthly_payment", "category", "vendor_key", "payoff_amount", "payment_amount"}
+    assert apply_debt_row_patch(row, {"monthly_payment": 9000}) == []  # nothing new
+    apply_debt_row_patch(row, {"vendor_key": "", "status": "dismissed", "count_in_dscr": False})
+    assert row.vendor_key is None and row.status == "dismissed" and row.count_in_dscr is False
+    apply_debt_row_patch(row, {"lender": "  "})
+    assert row.lender == "Arya"  # a blank name keeps the old one

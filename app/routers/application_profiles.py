@@ -168,6 +168,7 @@ from app.schemas.financial_cockpit import (
     BankAccountsWrite,
     ClosingStipulationsRead,
     ClosingStipulationsWrite,
+    DebtRowPatch,
     DebtScheduleVoidWrite,
     FinancialCockpitRead,
     FinancialPlanRead,
@@ -2539,6 +2540,11 @@ async def adopt_uploaded_debt_schedule(
     them like a schedule the desk entered; the desk edits them from there."""
     _require_underwriting_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
+    # One adoption at a time per file: a second click waits here and then
+    # meets the "already has rows" check instead of writing the rows twice.
+    await db.execute(
+        select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update()
+    )
     cockpit = await financial_cockpit.load_cockpit(db, profile)
     document = (cockpit.get("debt") or {}).get("document")
     rows = financial_statements.debt_rows_from_body(financial_statements.document_debts_as_body(document))
@@ -2553,6 +2559,43 @@ async def adopt_uploaded_debt_schedule(
         f"Adopted {len(rows)} obligation(s) from the uploaded debt schedule onto the file's schedule",
     )
     await db.commit()
+    return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
+
+
+@router.patch("/{profile_id}/debt-schedule/rows/{row_id}", response_model=FinancialCockpitRead)
+async def patch_debt_schedule_row(
+    profile_id: UUID,
+    row_id: UUID,
+    payload: DebtRowPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FinancialCockpitRead:
+    """Edit one schedule row in place: the per-month figure, balance and
+    payoff, type, whether it counts in the DSCR, the statement payee it is
+    linked to, or dismiss it. The coverage, the plan and the package read the
+    row as edited; the row keeps its origin."""
+    from app.dealer_os.models import DealerDebt
+
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    row = (
+        await db.execute(
+            select(DealerDebt).where(DealerDebt.id == row_id, DealerDebt.profile_id == profile.id)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That schedule row is not on this file.")
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
+    changed = financial_statements.apply_debt_row_patch(row, changes)
+    if changed:
+        await db.flush()
+        await profiles.log_profile_action(
+            db, profile, user, "financial_form.debt_schedule_row_edited",
+            f"Edited {row.lender} on the business debt schedule ({', '.join(changed)})",
+        )
+        await db.commit()
     return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
 
 
