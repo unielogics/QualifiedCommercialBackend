@@ -2004,6 +2004,7 @@ def build_cockpit(
     account_aliases: dict[str, str] | None = None,
     schedule_state: dict[str, Any] | None = None,
     recorded_terms: dict[str, Any] | None = None,
+    economics: dict[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """The cockpit read model from plain dicts.
@@ -2090,7 +2091,7 @@ def build_cockpit(
         "statements_need_reread": len(recurring["files_need_reread"]),
         "bank_files_need_reread": recurring["files_need_reread"],
     }
-    return {
+    cockpit: dict[str, Any] = {
         "generated_at": (now or datetime.now(UTC)).isoformat(),
         "requested_amount": _num(requested_amount),
         "coverage": coverage,
@@ -2134,11 +2135,22 @@ def build_cockpit(
             "terms_link": terms_link,
             "schedule": evaluation.get("schedule"),
             "schedule_rows": evaluation.get("schedule_rows") or [],
+            "risk": evaluation.get("risk"),
         },
         "net_profit": net_profit_block(years, statement, bank),
         "notes": _notes(coverage, bank, service, proposed, years, statement)
         + schedule_notes(schedule, service),
     }
+
+    # The terms the package and the listing speak of, with the schedule and
+    # the principal at risk; and, for the desk only, what the deal costs the
+    # client with QC's fees in (never copied into a summary, a package or a
+    # listing: those build their own dicts key by key).
+    cockpit["proposed_terms"] = proposed_terms_block(cockpit)
+    cockpit["plan"]["economics"] = (
+        internal_economics(economics, cockpit["proposed_terms"]) if economics is not None else None
+    )
+    return cockpit
 
 
 def plan_summary(cockpit: dict[str, Any]) -> dict[str, Any]:
@@ -2180,6 +2192,141 @@ def plan_brief(cockpit: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
+    """The terms the package and the listing speak of: the recorded term
+    sheet first, else the loan in the desk's plan, with the payment schedule
+    on a monthly basis and the principal at risk (the coverage on every
+    payment uses the income after the plan and the existing service beside
+    the new loan). Never a fee: the package and the offering print this."""
+    from app.services.loan_schedule import STRUCTURE_LABELS, build_schedule, describe, risk_profile
+
+    plan = cockpit.get("plan") or {}
+    evaluation = plan.get("evaluation") or {}
+    dscr = cockpit.get("dscr") or {}
+    proposed = dscr.get("proposed")
+    base: dict[str, Any] | None = None
+    if proposed and proposed.get("amount"):
+        base = {
+            "source": "term_sheet",
+            "label": proposed.get("label"),
+            "amount": proposed.get("amount"),
+            "rate_pct": proposed.get("rate_pct"),
+            "term_months": proposed.get("term_months"),
+            "monthly_payment": proposed.get("monthly_payment"),
+            "structure": proposed.get("structure")
+            or ("interest_only" if proposed.get("interest_only") else None),
+            "interest_only_months": int(proposed.get("interest_only_months") or 0),
+            "treatment": proposed.get("treatment"),
+            "retained_annual_debt_service": proposed.get("retained_annual_debt_service"),
+            "payment_stated": bool(proposed.get("payment_stated")),
+        }
+    else:
+        loan = (plan.get("impact") or {}).get("loan")
+        if loan and loan.get("amount"):
+            base = {
+                "source": "plan",
+                "label": "The desk's plan",
+                "amount": loan.get("amount"),
+                "rate_pct": loan.get("rate_pct"),
+                "term_months": loan.get("term_months"),
+                "monthly_payment": loan.get("payment_monthly"),
+                "structure": loan.get("structure")
+                or ("interest_only" if loan.get("interest_only") else None),
+                "interest_only_months": int(loan.get("interest_only_months") or 0),
+                "treatment": None,
+                "retained_annual_debt_service": None,
+                "payment_stated": False,
+            }
+    if base is None:
+        return None
+    schedule = (
+        build_schedule(
+            base["amount"],
+            base["rate_pct"],
+            base["term_months"],
+            structure=base["structure"],
+            interest_only_months=base["interest_only_months"],
+        )
+        if base["amount"]
+        and base["rate_pct"] is not None
+        and (base["term_months"] or base["structure"] == "interest_only")
+        else None
+    )
+    base["interest_only"] = (
+        bool(schedule and schedule["structure"] == "interest_only")
+        or (not schedule and base["structure"] == "interest_only")
+    )
+    if schedule:
+        base["structure"] = schedule["structure"]
+        base["structure_label"] = STRUCTURE_LABELS[schedule["structure"]]
+        base["interest_only_months"] = schedule["interest_only_months"]
+        base["payment_io_monthly"] = schedule["payment_io_monthly"]
+        base["payment_after_monthly"] = schedule["payment_after_monthly"]
+        base["describe"] = describe(schedule)
+        base["schedule"] = {k: v for k, v in schedule.items() if k != "rows"}
+        keys = (
+            "period",
+            "month",
+            "phase",
+            "payment",
+            "interest",
+            "principal",
+            "balance",
+            "balloon",
+            "exposure_pct",
+            "recovered_pct",
+        )
+        base["schedule_rows"] = [{k: r.get(k) for k in keys} for r in schedule["rows"]]
+        stated = _num(base.get("monthly_payment"))
+        formula = schedule["coverage_payment_monthly"]
+        if base["payment_stated"] and stated and formula and abs(stated - formula) / formula > 0.02:
+            base["payment_note"] = (
+                f"The recorded payment, {stated:,.0f} a month, is the lender's own figure; "
+                f"the schedule is the formula at the stated rate ({formula:,.0f} a month)."
+            )
+        else:
+            base["payment_note"] = None
+        if base["monthly_payment"] is None:
+            base["monthly_payment"] = formula
+        # Coverage on every payment: the income after the plan when there is
+        # one, else today's; beside the existing service after what the plan
+        # retires (or what the sheet retains when it refinances).
+        if evaluation.get("active") and evaluation.get("income_after_annual"):
+            income_annual = evaluation["income_after_annual"]
+        else:
+            income_annual = (dscr.get("headline") or {}).get("numerator")
+        if base["treatment"] == "refinance" and base["retained_annual_debt_service"] is not None:
+            existing = float(base["retained_annual_debt_service"]) / 12.0
+        elif (
+            evaluation.get("active")
+            and evaluation.get("debt_service_before_new_payment_monthly") is not None
+        ):
+            existing = float(evaluation["debt_service_before_new_payment_monthly"])
+        else:
+            existing = float(dscr.get("annual_debt_service") or 0.0) / 12.0
+        base["risk"] = risk_profile(
+            schedule,
+            income_monthly=(float(income_annual) / 12.0) if income_annual else None,
+            existing_service_monthly=existing,
+        )
+    else:
+        base["structure_label"] = None
+        base["schedule"] = None
+        base["schedule_rows"] = []
+        base["risk"] = None
+        base["payment_note"] = None
+    return base
+
+
+def internal_economics(
+    inputs: dict[str, Any] | None, proposed: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """What the deal costs the client once QC's fees are in, for the desk only."""
+    from app.services.deal_cost import internal_economics as _economics
+
+    return _economics(inputs or {}, proposed)
+
+
 def listing_summary(cockpit: dict[str, Any]) -> dict[str, Any]:
     """The handful of figures a marketplace listing draft carries from the file."""
     bank = cockpit["bank"]["summary"]
@@ -2205,6 +2352,9 @@ def listing_summary(cockpit: dict[str, Any]) -> dict[str, Any]:
             "debt_service_after_monthly"
         ),
         "plan": plan_summary(cockpit),
+        "proposed_terms": cockpit["proposed_terms"]
+        if "proposed_terms" in cockpit
+        else proposed_terms_block(cockpit),
         "annual_debt_service": cockpit["dscr"].get("annual_debt_service"),
         "net_profit": conclusion.get("value"),
         "net_profit_basis": conclusion.get("key"),
@@ -2327,6 +2477,9 @@ async def recorded_terms_for_profile(
         "monthly_payment": recorded["payment_monthly"],
         "treatment": recorded["treatment"],
         "retained_annual_debt_service": recorded["retained_annual_debt_service"],
+        "structure": recorded.get("structure"),
+        "interest_only_months": int(recorded.get("interest_only_months") or 0),
+        "payment_stated": False,
     }
     return recorded, proposed
 
@@ -2346,7 +2499,25 @@ def term_sheet_terms(sheet: ProductionTermSheet | None) -> dict[str, Any] | None
         # (additive) or in place of it (refinance, keeping what is retained).
         "treatment": str(extra.get("debt_service_treatment") or "additive"),
         "retained_annual_debt_service": _num(extra.get("retained_annual_debt_service")),
+        # The sheet's repayment structure in the schedule's vocabulary; None
+        # leaves the house default for the term (a balloon or a lender-stated
+        # payment has no structure the schedule can draw exactly).
+        "structure": _sheet_structure(extra),
+        "interest_only_months": int(_num(extra.get("interest_only_months")) or 0)
+        if str(extra.get("repayment_structure") or "") == "interest_only_then_amortizing"
+        else 0,
+        "payment_stated": bool(extra.get("lender_payment_override"))
+        or str(extra.get("repayment_structure") or "") in {"fixed_payment", "custom"},
     }
+
+
+def _sheet_structure(extra: dict[str, Any]) -> str | None:
+    repayment = str(extra.get("repayment_structure") or "")
+    if repayment in {"fully_amortizing", "interest_only_then_amortizing"}:
+        return "amortizing"
+    if repayment in {"interest_only", "revolving_interest_only"}:
+        return "interest_only"
+    return None
 
 
 async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
@@ -2384,6 +2555,11 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
         account_aliases=dict(getattr(profile, "bank_account_aliases", None) or {}),
         schedule_state=schedule_state,
         recorded_terms=recorded_terms,
+        economics={
+            "accepted_amount": getattr(profile, "underwriting_accepted_amount", None),
+            "origination_points": getattr(profile, "forecast_fee_points", None),
+            "consulting_fee": getattr(profile, "forecast_consulting_fee", None),
+        },
     )
     cockpit["profile_id"] = str(profile.id)
     return cockpit

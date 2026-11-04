@@ -30,6 +30,10 @@ class FinancialCockpitRead(BaseModel):
     net_profit: dict[str, Any] = Field(default_factory=dict)
     #: The plan (record, evaluation, levers); see app/services/financial_plan.py.
     plan: dict[str, Any] = Field(default_factory=dict)
+    #: The terms the package and the listing speak of (recorded term sheet,
+    #: else the plan's loan) with the schedule and the principal at risk;
+    #: see financial_cockpit.proposed_terms_block.
+    proposed_terms: dict[str, Any] | None = None
     notes: list[str] = Field(default_factory=list)
 
 

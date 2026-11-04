@@ -458,6 +458,7 @@ def evaluate_plan(
             "total_interest": schedule["total_interest"] if schedule else None,
             "total_paid": schedule["total_paid"] if schedule else None,
             "balloon": schedule["balloon"] if schedule else None,
+            "weighted_average_life_months": schedule["weighted_average_life_months"] if schedule else None,
             "describe": describe(schedule),
         }
     if new_payment is None and loan_terms and schedule:
@@ -559,8 +560,19 @@ def evaluate_plan(
         or plan.get("new_loan_amount")
         or (plan.get("new_payment_source") == "term_sheet" and new_payment is not None)
     )
+    risk = None
+    if schedule:
+        from app.services.loan_schedule import risk_profile
+
+        income_after = headline_after["numerator_after"] if headline_after else None
+        risk = risk_profile(
+            schedule,
+            income_monthly=(float(income_after) / 12.0) if income_after else None,
+            existing_service_monthly=before_new or 0.0,
+        )
     return {
         "active": active,
+        "risk": risk,
         "retired_ids": sorted(retire),
         "excluded_ids": sorted(exclude),
         "retired_monthly": retired_monthly,

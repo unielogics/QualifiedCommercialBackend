@@ -48,6 +48,10 @@ def _r2(value: float) -> float:
     return round(value + 0.0, 2)
 
 
+def _r1(value: float) -> float:
+    return round(value + 0.0, 1)
+
+
 def _half_up(value: float) -> int:
     """Period counts round half up (floor(x + .5)): identical in Python and in
     the browser preview, where Python's ties-to-even round() would not be."""
@@ -139,6 +143,33 @@ def build_schedule(
     balloon = _r2(balance) if balance > 0.005 else 0.0
     if balloon and rows:
         rows[-1]["balloon"] = balloon
+    # Principal at risk, period by period: the balance still out after each
+    # payment as a share of the loan, and how much of the principal is back.
+    cum_principal = 0.0
+    cum_interest = 0.0
+    for r in rows:
+        cum_principal = _r2(cum_principal + r["principal"])
+        cum_interest = _r2(cum_interest + r["interest"])
+        r["month"] = round(r["period"] * 12.0 / ppy, 2)
+        r["cumulative_principal"] = cum_principal
+        r["cumulative_interest"] = cum_interest
+        r["exposure_pct"] = _r1(r["balance"] / principal * 100.0)
+        r["recovered_pct"] = _r1(cum_principal / principal * 100.0)
+    term_month = rows[-1]["month"] if rows else 0.0
+    weighted_life = (
+        sum(r["principal"] * r["month"] for r in rows) + balloon * term_month
+    ) / principal
+    milestones: dict[str, float | None] = {}
+    for threshold in (25, 50, 75, 100):
+        hit = next((r for r in rows if r["recovered_pct"] >= threshold - 1e-9), None)
+        if hit is not None:
+            milestones[str(threshold)] = float(math.ceil(hit["month"] - 1e-9))
+        elif balloon and rows:
+            milestones[str(threshold)] = float(
+                math.ceil(term_month - 1e-9)
+            )  # the balloon brings it back at maturity
+        else:
+            milestones[str(threshold)] = None
     first_year = rows[: _half_up(ppy)] if ppy >= 1 else rows
     annual_debt_service = _r2(sum(r["payment"] for r in first_year))
     payment_io = _r2(rows[0]["payment"]) if io_periods else None
@@ -171,8 +202,141 @@ def build_schedule(
         "total_interest": _r2(sum(r["interest"] for r in rows)),
         "total_paid": _r2(sum(r["payment"] for r in rows) + balloon),
         "balloon": balloon,
+        "balloon_pct": _r1(balloon / principal * 100.0) if balloon else 0.0,
+        #: Months until the average dollar of principal is back (the balloon
+        #: counts at maturity): the investor's measure of how long the
+        #: principal is at risk.
+        "weighted_average_life_months": _r1(weighted_life),
+        #: The month by which a quarter, half, three quarters and all of the
+        #: principal is back; None when the schedule never gets there.
+        "recovery_milestones": milestones,
+        #: Months the balance stays at 100%: the interest-only months, or the
+        #: whole term when principal is due at maturity.
+        "full_exposure_months": _half_up(io_periods * 12.0 / ppy),
         "rows": rows,
     }
+
+
+def risk_profile(
+    summary: dict[str, Any] | None,
+    *,
+    income_monthly: float | None = None,
+    existing_service_monthly: float | None = None,
+) -> dict[str, Any] | None:
+    """Principal at risk and the coverage on every payment.
+
+    The exposure curve is in the rows; this says what it means in words and
+    numbers: the weighted average life, when a quarter, half, three quarters
+    and all of the principal is back, how long the balance sits at 100%, the
+    balloon. With the income available for debt service after the plan and
+    the existing service beside the new loan, every payment gets its own
+    coverage (income over existing service plus that payment, monthly), so
+    the interest-only months and the step-up are both visible; the lowest is
+    the one underwriting stands on.
+    """
+    if not summary or not summary.get("rows"):
+        return None
+    rows = summary["rows"]
+    ppy = float(summary.get("periods_per_year") or 12.0)
+    to_monthly = ppy / 12.0
+    income = float(income_monthly) if income_monthly else None
+    existing = max(0.0, float(existing_service_monthly or 0.0))
+    coverage_rows: list[dict[str, Any]] = []
+    if income is not None and income > 0:
+        for r in rows:
+            payment_monthly = _r2(r["payment"] * to_monthly)
+            denominator = existing + payment_monthly
+            coverage_rows.append(
+                {
+                    "period": r["period"],
+                    "month": r["month"],
+                    "phase": r["phase"],
+                    "payment_monthly": payment_monthly,
+                    "coverage": round(income / denominator, 2) if denominator > 0 else None,
+                }
+            )
+    with_cov = [c for c in coverage_rows if c["coverage"] is not None]
+    lowest = min(with_cov, key=lambda c: c["coverage"]) if with_cov else None
+    io_cov = next((c["coverage"] for c in with_cov if c["phase"] == "interest_only"), None)
+    after_cov = next((c["coverage"] for c in with_cov if c["phase"] != "interest_only"), None)
+    milestones = summary.get("recovery_milestones") or {}
+    return {
+        "weighted_average_life_months": summary.get("weighted_average_life_months"),
+        "recovery_milestones": milestones,
+        "full_exposure_months": summary.get("full_exposure_months"),
+        "balloon": summary.get("balloon") or 0.0,
+        "balloon_pct": summary.get("balloon_pct") or 0.0,
+        "income_monthly": _r2(income) if income is not None else None,
+        "existing_service_monthly": _r2(existing),
+        "coverage_by_period": coverage_rows,
+        "coverage_during_interest_only": io_cov,
+        "coverage_after_interest_only": after_cov,
+        "lowest_coverage": lowest["coverage"] if lowest else None,
+        "lowest_coverage_month": lowest["month"] if lowest else None,
+        "words": risk_words(summary, lowest=lowest, io_cov=io_cov, after_cov=after_cov),
+    }
+
+
+def risk_words(
+    summary: dict[str, Any],
+    *,
+    lowest: dict[str, Any] | None = None,
+    io_cov: float | None = None,
+    after_cov: float | None = None,
+) -> str:
+    """The principal-risk reading in plain words, for the package and the offering."""
+    kind = summary.get("structure")
+    term = summary.get("term_months")
+    io_months = int(summary.get("full_exposure_months") or 0)
+    milestones = summary.get("recovery_milestones") or {}
+    wal = summary.get("weighted_average_life_months")
+    parts: list[str] = []
+
+    def month(key: str) -> str:
+        value = milestones.get(key)
+        return f"month {int(value)}" if value else "never"
+
+    if kind == "interest_only":
+        parts.append(
+            f"The whole principal stays out for the full {term} months and comes back at maturity: the exposure never falls before then."
+            if term
+            else "The whole principal stays out until maturity: the exposure never falls before then."
+        )
+    else:
+        if io_months:
+            parts.append(
+                f"Principal is fully exposed for the first {io_months} month{'s' if io_months != 1 else ''}, then comes back "
+                + (
+                    "evenly"
+                    if kind == "simple_interest"
+                    else "with each level payment, slowly at first"
+                )
+                + f": a quarter by {month('25')}, half by {month('50')}, all of it by {month('100')}."
+            )
+        else:
+            parts.append(
+                "Principal comes back from the first payment"
+                + (
+                    " evenly"
+                    if kind == "simple_interest"
+                    else ", slowly at first (level payments pay mostly interest early)"
+                )
+                + f": a quarter by {month('25')}, half by {month('50')}, all of it by {month('100')}."
+            )
+        if summary.get("balloon"):
+            parts.append(
+                f"{summary['balloon']:,.0f} ({summary.get('balloon_pct', 0):g}% of the loan) is due at maturity."
+            )
+    if wal is not None:
+        parts.append(f"Weighted average life {wal:g} months.")
+    if lowest and lowest.get("coverage") is not None:
+        if io_cov is not None and after_cov is not None and io_cov != after_cov:
+            parts.append(
+                f"Coverage on each payment: {io_cov:.2f}x during the interest-only months, {after_cov:.2f}x once principal starts; the lowest, {lowest['coverage']:.2f}x, is what underwriting stands on."
+            )
+        else:
+            parts.append(f"Coverage on each payment {lowest['coverage']:.2f}x.")
+    return " ".join(parts)
 
 
 def describe(summary: dict[str, Any] | None) -> str:

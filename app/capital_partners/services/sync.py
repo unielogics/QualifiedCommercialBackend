@@ -37,30 +37,13 @@ def _fingerprint(value: Any) -> str:
 
 def proposed_terms(cockpit: dict[str, Any]) -> dict[str, Any] | None:
     """The terms the package and the listing speak of: the recorded term
-    sheet first, else the loan in the desk's plan."""
-    proposed = (cockpit.get("dscr") or {}).get("proposed")
-    if proposed:
-        return {
-            "source": "term_sheet",
-            "label": proposed.get("label"),
-            "amount": proposed.get("amount"),
-            "rate_pct": proposed.get("rate_pct"),
-            "term_months": proposed.get("term_months"),
-            "monthly_payment": proposed.get("monthly_payment"),
-            "interest_only": False,
-        }
-    loan = ((cockpit.get("plan") or {}).get("impact") or {}).get("loan")
-    if loan and loan.get("amount"):
-        return {
-            "source": "plan",
-            "label": "The desk's plan",
-            "amount": loan.get("amount"),
-            "rate_pct": loan.get("rate_pct"),
-            "term_months": loan.get("term_months"),
-            "monthly_payment": loan.get("payment_monthly"),
-            "interest_only": bool(loan.get("interest_only")),
-        }
-    return None
+    sheet first, else the loan in the desk's plan, with the schedule and the
+    principal at risk (financial_cockpit.proposed_terms_block)."""
+    from app.services import financial_cockpit
+
+    if "proposed_terms" in cockpit:
+        return cockpit.get("proposed_terms")
+    return financial_cockpit.proposed_terms_block(cockpit)
 
 
 def file_sections(

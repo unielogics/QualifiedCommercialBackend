@@ -187,9 +187,39 @@ def partner_financials(listing: CpListing) -> dict[str, Any] | None:
             ],
             "impact": plan.get("impact") or {},
         }
+    terms = financials.get("proposed_terms")
+    if isinstance(terms, dict) and terms.get("amount"):
+        out["proposed_terms"] = partner_terms(terms)
     if snapshot.get("refreshed_at"):
         out["refreshed_at"] = snapshot["refreshed_at"]
     return out or None
+
+
+PARTNER_TERMS_KEYS = (
+    "source",
+    "label",
+    "amount",
+    "rate_pct",
+    "term_months",
+    "structure",
+    "structure_label",
+    "interest_only",
+    "interest_only_months",
+    "monthly_payment",
+    "payment_io_monthly",
+    "payment_after_monthly",
+    "describe",
+    "payment_note",
+    "schedule",
+    "schedule_rows",
+    "risk",
+)
+
+
+def partner_terms(terms: dict[str, Any]) -> dict[str, Any]:
+    """The proposed terms a member sees: the structure, the schedule and the
+    principal at risk, key by key. No fee lives here, and none is added."""
+    return {k: terms.get(k) for k in PARTNER_TERMS_KEYS if terms.get(k) is not None}
 
 
 def document_out(doc: CpListingDocument) -> dict[str, Any]:

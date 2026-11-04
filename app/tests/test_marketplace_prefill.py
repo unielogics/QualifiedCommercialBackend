@@ -188,7 +188,9 @@ def test_the_listing_knows_what_changed_on_the_file_since_the_last_push() -> Non
     after = sync.fingerprints(sync.file_sections(moved, program_keys=["mca_refinance"], package=None))
     changed = {c["key"]: c["label"] for c in sync.sync_state(listing, after)["changed"]}
     assert set(changed) == {"plan", "terms", "figures"} and changed["terms"] == "Proposed terms"  # figures carry dscr_after_plan
-    assert sync.proposed_terms(moved) == {"source": "plan", "label": "The desk's plan", "amount": 150000.0, "rate_pct": 12.0, "term_months": None, "monthly_payment": 1500.0, "interest_only": True}
+    proposed = sync.proposed_terms(moved)
+    assert {k: proposed[k] for k in ("source", "label", "amount", "rate_pct", "term_months", "monthly_payment", "interest_only")} == {"source": "plan", "label": "The desk's plan", "amount": 150000.0, "rate_pct": 12.0, "term_months": None, "monthly_payment": 1500.0, "interest_only": True}
+    assert proposed["structure"] == "interest_only" and proposed["schedule"]["balloon"] == 150000.0 and proposed["risk"]["full_exposure_months"] == 12  # a year of interest-only, principal at maturity
 
     # A refresh stamps the snapshot sections but not the package; a package push stamps everything.
     sync.mark_published(listing, after, by=None, keys=["figures", "plan", "terms", "programs"])
