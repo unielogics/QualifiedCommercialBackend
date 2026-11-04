@@ -486,6 +486,37 @@ def _money_or_none(value: Any) -> Decimal | None:
     return -amount if negative else amount
 
 
+def document_debts_as_body(document: dict[str, Any] | None) -> dict[str, Any]:
+    """The lines the AI read off an uploaded debt schedule, as the desk's form
+    body, so they can be adopted as the file's own rows with one click."""
+    debts: list[dict[str, Any]] = []
+    for line in (document or {}).get("debts") or []:
+        if not isinstance(line, dict):
+            continue
+        lender = str(line.get("lender") or line.get("creditor") or line.get("name") or "").strip()
+        if not lender:
+            continue
+        current = line.get("current")
+        status = "current" if current is True else ("past_due" if current is False else None)
+        debts.append(
+            {
+                "lender": lender,
+                "debt_type": line.get("debt_type") or line.get("type"),
+                "original_amount": line.get("original_amount"),
+                "balance": line.get("current_balance") if line.get("current_balance") is not None else line.get("balance"),
+                "rate": line.get("rate_pct") if line.get("rate_pct") is not None else line.get("rate"),
+                "monthly_payment": line.get("monthly_payment"),
+                "originated_on": line.get("origination_date") or line.get("originated_on"),
+                "maturity_on": line.get("maturity_date") or line.get("maturity_on"),
+                "collateral": line.get("secured_by") or line.get("collateral"),
+                "secured": "yes" if line.get("secured_by") else None,
+                "payment_status": status,
+                "notes": "Adopted from the uploaded debt schedule.",
+            }
+        )
+    return {"debts": debts}
+
+
 def debt_rows_from_body(body: dict[str, Any]) -> list[dict[str, Any]] | None:
     """The rows out of a submitted debt-schedule form, cleaned.
 

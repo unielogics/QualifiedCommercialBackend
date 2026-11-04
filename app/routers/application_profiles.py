@@ -2528,6 +2528,34 @@ async def put_bank_accounts(
     return BankAccountsRead(profile_id=profile.id, accounts=[BankAccountRead(**a) for a in accounts], counted=list(profile.counted_bank_accounts or []), aliases=dict(profile.bank_account_aliases or {}))
 
 
+@router.post("/{profile_id}/debt-schedule/adopt-document", response_model=FinancialCockpitRead)
+async def adopt_uploaded_debt_schedule(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FinancialCockpitRead:
+    """The lines the AI read off the uploaded debt schedule become the file's
+    own rows (origin admin), so the schedule, the coverage and the plan read
+    them like a schedule the desk entered; the desk edits them from there."""
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    cockpit = await financial_cockpit.load_cockpit(db, profile)
+    document = (cockpit.get("debt") or {}).get("document")
+    rows = financial_statements.debt_rows_from_body(financial_statements.document_debts_as_body(document))
+    if not rows:
+        raise HTTPException(status.HTTP_409_CONFLICT, "The uploaded schedule has no lines the system could read.")
+    existing = (cockpit.get("debt") or {}).get("rows") or []
+    if existing:
+        raise HTTPException(status.HTTP_409_CONFLICT, "The file already has schedule rows; edit those instead of adopting the upload again.")
+    await financial_statements.save_debt_rows(db, profile, rows, origin="admin")
+    await profiles.log_profile_action(
+        db, profile, user, "financial_form.debt_schedule_adopted",
+        f"Adopted {len(rows)} obligation(s) from the uploaded debt schedule onto the file's schedule",
+    )
+    await db.commit()
+    return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
+
+
 @router.post("/{profile_id}/debt-schedule/void", response_model=FinancialCockpitRead)
 async def void_debt_schedule(
     profile_id: UUID,

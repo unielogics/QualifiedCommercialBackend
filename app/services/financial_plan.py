@@ -186,6 +186,16 @@ def normalize_plan(raw: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _number(value: Any) -> float | None:
+    """A float from what the reader printed, or None."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(str(value).replace(",", "").replace("$", "").strip())
+    except ValueError:
+        return None
+
+
 def obligations(debt: dict[str, Any], recurring: dict[str, Any]) -> list[dict[str, Any]]:
     """One list of what the business pays lenders, whichever source the debt
     service came from, each entry carrying the monthly amount it puts in the
@@ -239,6 +249,49 @@ def obligations(debt: dict[str, Any], recurring: dict[str, Any]) -> list[dict[st
                 "origin": row.get("origin"),
             }
         )
+    if source == "debt_schedule_document":
+        # The schedule the client uploaded, read by the AI: its lines are the
+        # obligations until the desk adopts them as rows or enters its own.
+        document = debt.get("document") or {}
+        for index, line in enumerate(document.get("debts") or []):
+            if not isinstance(line, dict):
+                continue
+            lender = str(line.get("lender") or line.get("creditor") or line.get("name") or "").strip()
+            if not lender:
+                continue
+            monthly = _number(line.get("monthly_payment"))
+            balance = _number(line.get("current_balance") or line.get("balance"))
+            linked = next(
+                (p for p in payees if p["key"] not in used and match_names(lender, p["payee"])),
+                None,
+            )
+            if linked is not None:
+                used.add(linked["key"])
+            kind_text = str(line.get("debt_type") or line.get("type") or "").lower()
+            is_mca = "advance" in kind_text or "mca" in kind_text
+            out.append(
+                {
+                    "id": f"sched:{index}",
+                    "kind": "schedule_document",
+                    "lender": lender,
+                    "category": "merchant_cash_advance" if is_mca else (kind_text.replace(" ", "_") or "loan"),
+                    "is_mca": is_mca,
+                    "monthly": monthly,
+                    "balance": balance,
+                    "payoff": _number(line.get("payoff_amount")) if line.get("payoff_amount") is not None else balance,
+                    "in_debt_service": True,
+                    "count_in_dscr": True,
+                    "linked_payee_key": linked["key"] if linked else None,
+                    "linked_payee": linked["payee"] if linked else None,
+                    "observed_monthly": linked["monthly_average"] if linked else None,
+                    "cadence": line.get("payment_frequency") or (linked["cadence"] if linked else None),
+                    "source": "debt_schedule_document",
+                    "origin": "uploaded_schedule",
+                    "rate_pct": _number(line.get("rate_pct") or line.get("rate")),
+                    "maturity_on": line.get("maturity_date") or line.get("maturity_on"),
+                    "secured_by": line.get("secured_by"),
+                }
+            )
     if source == "advance_terms":
         for index, doc in enumerate(debt.get("documented") or []):
             linked = next(

@@ -967,3 +967,30 @@ def test_the_cockpit_carries_the_plan_in_words_and_the_listing_summary_repeats_i
     assert any(line.startswith("Add back") for line in brief["modifications"])
     quiet = build_cockpit([TAX_2025], [LOAN_ROW])
     assert quiet["plan"]["impact"]["active"] is False and listing_summary(quiet)["plan"]["active"] is False
+
+
+def test_the_uploaded_schedule_lines_become_the_desk_form_and_the_plan_obligations() -> None:
+    from app.services.financial_plan import obligations
+    from app.services.financial_statements import debt_rows_from_body, document_debts_as_body
+
+    document = {
+        "total_monthly_debt_service": 19607.18,
+        "debts": [
+            {"lender": "Ally", "current": None, "rate_pct": 11.89, "debt_type": "Vehicle loan", "secured_by": "2025 RAM 1500 VIN 68897", "maturity_date": "2030-09-03", "current_balance": 49139.2, "monthly_payment": 1090.38, "original_amount": 55937.3},
+            {"lender": "", "monthly_payment": 1},
+            {"lender": "Stellantis Financial Services", "current": True, "rate_pct": 10.11, "debt_type": "Vehicle loan", "current_balance": 54771.35, "monthly_payment": 1166.74},
+        ],
+    }
+    body = document_debts_as_body(document)
+    assert [d["lender"] for d in body["debts"]] == ["Ally", "Stellantis Financial Services"]
+    rows = debt_rows_from_body(body)
+    assert rows is not None and len(rows) == 2
+    assert float(rows[0]["balance"]) == 49139.2 and float(rows[0]["monthly_payment"]) == 1090.38
+    assert rows[0]["collateral"] == "2025 RAM 1500 VIN 68897"
+    assert rows[0]["maturity_on"] is not None and rows[0]["rate"] is not None
+    assert rows[1]["payment_status"] == "current"
+    listed = obligations({"rows": [], "service": {"source": "debt_schedule_document"}, "document": document, "documented": []}, {"payees": []})
+    assert [o["id"] for o in listed] == ["sched:0", "sched:2"]
+    assert listed[0]["lender"] == "Ally" and listed[0]["monthly"] == 1090.38 and listed[0]["payoff"] == 49139.2 and listed[0]["in_debt_service"] is True
+    assert listed[0]["kind"] == "schedule_document" and listed[0]["origin"] == "uploaded_schedule"
+    assert obligations({"rows": [], "service": {"source": "none"}, "document": document, "documented": []}, {"payees": []}) == []
