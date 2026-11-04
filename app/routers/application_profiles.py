@@ -166,6 +166,8 @@ from app.schemas.financial_cockpit import (
     BankAccountRead,
     BankAccountsRead,
     BankAccountsWrite,
+    ClosingStipulationsRead,
+    ClosingStipulationsWrite,
     DebtScheduleVoidWrite,
     FinancialCockpitRead,
     FinancialPlanRead,
@@ -187,6 +189,7 @@ from app.services import (
     business_statement_schema,
     business_statements,
     capital_readiness,
+    closing_stipulations,
     dealer_forms_pdf,
     drafted_forms,
     file_events,
@@ -2388,6 +2391,46 @@ async def reread_financial_cockpit_statements(
         )
     await db.commit()
     return StatementRereadResult(queued=len(targets), file_ids=[file.id for file in targets])
+
+
+@router.get("/{profile_id}/closing-stipulations", response_model=ClosingStipulationsRead)
+async def get_closing_stipulations(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClosingStipulationsRead:
+    """Stipulations to close and the estimated close date, once the client has accepted."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    return ClosingStipulationsRead(**await closing_stipulations.read(db, profile))
+
+
+@router.put("/{profile_id}/closing-stipulations", response_model=ClosingStipulationsRead)
+async def put_closing_stipulations(
+    profile_id: UUID,
+    payload: ClosingStipulationsWrite,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClosingStipulationsRead:
+    """The list as the desk keeps it; an item left out is kept as waived."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    block = await closing_stipulations.write(
+        db, profile, [item.model_dump() for item in payload.items], by=str(getattr(user, "id", "") or "") or None
+    )
+    await db.commit()
+    return ClosingStipulationsRead(**block)
+
+
+@router.post("/{profile_id}/closing-stipulations/seed", response_model=ClosingStipulationsRead)
+async def seed_closing_stipulations(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClosingStipulationsRead:
+    """Add the conditions on the accepted terms as open stipulations, once each."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    block = await closing_stipulations.seed(db, profile, by=str(getattr(user, "id", "") or "") or None)
+    await db.commit()
+    return ClosingStipulationsRead(**block)
 
 
 @router.get("/{profile_id}/financial-plan", response_model=FinancialPlanRead)

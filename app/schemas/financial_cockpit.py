@@ -159,6 +159,36 @@ class FinancialPlanWrite(BaseModel):
     note: str | None = Field(default=None, max_length=600)
 
 
+class ClosingStipulationItem(BaseModel):
+    id: str | None = None
+    text: str = Field(min_length=1, max_length=600)
+    source: Literal["term_sheet", "desk"] | None = None
+    status: Literal["open", "received", "waived"] = "open"
+    note: str | None = Field(default=None, max_length=600)
+    updated_at: str | None = None
+    updated_by: str | None = None
+    created_at: str | None = None
+
+
+class ClosingStipulationsWrite(BaseModel):
+    items: list[ClosingStipulationItem] = Field(default_factory=list, max_length=200)
+
+
+class ClosingStipulationsRead(BaseModel):
+    """What must be in hand before funding, once the client has accepted."""
+
+    profile_id: str
+    accepted: bool
+    accepted_amount: float | None = None
+    estimated_close_date: str | None = None
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    open_count: int = 0
+    received_count: int = 0
+    waived_count: int = 0
+    terms_conditions: list[str] = Field(default_factory=list)
+    ready_to_close: bool = False
+
+
 class FinancialPlanRead(BaseModel):
     profile_id: UUID
     record: dict[str, Any] = Field(default_factory=dict)

@@ -17,6 +17,7 @@ NAVY = "#0B1D3A"
 TEAL = "#0f766e"
 TEAL_LT = "#21d3c7"
 RED = "#b91c1c"
+GOLD = "#b45309"
 INK = "#111827"
 SLATE = "#334155"
 MUTE = "#64748b"
@@ -990,8 +991,14 @@ def _schedule_chart_svg(
     if exposure:
         exposure.insert(0, f"{x0:.1f},{py_pct(100.0):.1f}")
         parts.append(f'<polyline points="{" ".join(exposure)}" fill="none" stroke="{RED}" stroke-width="2.2"/>')
+    # Counting the interest received as well: the capital still at risk,
+    # which reaches zero at the break-even payment, earlier than the principal.
+    at_risk = [f"{px(i):.1f},{py_pct(float(r.get('cash_at_risk_pct') or 0.0)):.1f}" for i, r in enumerate(rows) if r.get("cash_at_risk_pct") is not None]
+    if at_risk:
+        at_risk.insert(0, f"{x0:.1f},{py_pct(100.0):.1f}")
+        parts.append(f'<polyline points="{" ".join(at_risk)}" fill="none" stroke="{GOLD}" stroke-width="2" stroke-dasharray="5 3"/>')
     # The legend on its own row under the title, so a long title never runs into it.
-    legend = [("Principal", NAVY), ("Interest", TEAL), ("Principal still out, % of the loan", RED)]
+    legend = [("Principal", NAVY), ("Interest", TEAL), ("Principal still out, % of the loan", RED), ("Capital at risk, counting interest received", GOLD)]
     lx = 16.0
     for label, color in legend:
         parts.append(f'<rect x="{lx:.1f}" y="34" width="16" height="10" rx="2" fill="{color}"/>')
@@ -1032,6 +1039,9 @@ def _schedule_block(terms: dict[str, Any], *, compact: bool) -> str:
     exposed = _num(risk.get("full_exposure_months") or summary.get("full_exposure_months"))
     if exposed:
         facts.append(f"<li><strong>Fully exposed</strong> {int(exposed)} months before principal starts</li>")
+    breakeven = _num(risk.get("breakeven_month") or summary.get("breakeven_month"))
+    if breakeven:
+        facts.append(f"<li><strong>Capital back, counting interest</strong> month {int(breakeven)}: nothing at risk after that</li>")
     balloon = _num(summary.get("balloon"))
     if balloon:
         facts.append(f"<li><strong>Due at maturity</strong> {_fmt_full(balloon)} ({_num(summary.get('balloon_pct')) or 0:g}% of the loan)</li>")

@@ -147,15 +147,27 @@ def build_schedule(
     # payment as a share of the loan, and how much of the principal is back.
     cum_principal = 0.0
     cum_interest = 0.0
+    cum_paid = 0.0
+    breakeven_month: float | None = None
     for r in rows:
         cum_principal = _r2(cum_principal + r["principal"])
         cum_interest = _r2(cum_interest + r["interest"])
+        cum_paid = _r2(cum_paid + r["payment"])
         r["month"] = round(r["period"] * 12.0 / ppy, 2)
         r["cumulative_principal"] = cum_principal
         r["cumulative_interest"] = cum_interest
+        r["cumulative_paid"] = cum_paid
         r["exposure_pct"] = _r1(r["balance"] / principal * 100.0)
         r["recovered_pct"] = _r1(cum_principal / principal * 100.0)
+        # Counting every dollar received, interest included: what the
+        # investor still has out until the payments have returned the
+        # investment; zero from the break-even payment on.
+        r["cash_at_risk_pct"] = _r1(max(0.0, principal - cum_paid) / principal * 100.0)
+        if breakeven_month is None and cum_paid >= principal - 0.005:
+            breakeven_month = float(math.ceil(r["month"] - 1e-9))
     term_month = rows[-1]["month"] if rows else 0.0
+    if breakeven_month is None and balloon and rows and cum_paid + balloon >= principal - 0.005:
+        breakeven_month = float(math.ceil(term_month - 1e-9))  # the balloon brings it back at maturity
     weighted_life = (
         sum(r["principal"] * r["month"] for r in rows) + balloon * term_month
     ) / principal
@@ -213,6 +225,9 @@ def build_schedule(
         #: Months the balance stays at 100%: the interest-only months, or the
         #: whole term when principal is due at maturity.
         "full_exposure_months": _half_up(io_periods * 12.0 / ppy),
+        #: The month by which the payments received, interest included, add
+        #: up to the investment: from here on no capital is at risk.
+        "breakeven_month": breakeven_month,
         "rows": rows,
     }
 
@@ -264,6 +279,7 @@ def risk_profile(
         "weighted_average_life_months": summary.get("weighted_average_life_months"),
         "recovery_milestones": milestones,
         "full_exposure_months": summary.get("full_exposure_months"),
+        "breakeven_month": summary.get("breakeven_month"),
         "balloon": summary.get("balloon") or 0.0,
         "balloon_pct": summary.get("balloon_pct") or 0.0,
         "income_monthly": _r2(income) if income is not None else None,
@@ -329,6 +345,11 @@ def risk_words(
             )
     if wal is not None:
         parts.append(f"Weighted average life {wal:g} months.")
+    breakeven = summary.get("breakeven_month")
+    if breakeven:
+        parts.append(
+            f"Counting the interest received, the capital is back by month {int(breakeven)}; nothing is at risk after that."
+        )
     if lowest and lowest.get("coverage") is not None:
         if io_cov is not None and after_cov is not None and io_cov != after_cov:
             parts.append(

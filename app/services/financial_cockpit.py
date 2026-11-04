@@ -2284,6 +2284,8 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
             "balloon",
             "exposure_pct",
             "recovered_pct",
+            "cumulative_paid",
+            "cash_at_risk_pct",
         )
         base["schedule_rows"] = [{k: r.get(k) for k in keys} for r in schedule["rows"]]
         stated = _num(base.get("monthly_payment"))

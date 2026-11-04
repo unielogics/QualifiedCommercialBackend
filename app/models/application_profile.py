@@ -265,6 +265,12 @@ class ApplicationProfile(TimestampMixin, Base):
     forecast_fee_points: Mapped[Decimal | None] = mapped_column(Numeric(7, 4))
     forecast_consulting_fee: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     estimated_close_date: Mapped[date | None] = mapped_column(Date)
+    #: Stipulations to close: [{id, text, source, status, note, updated_at,
+    #: updated_by}], listed once the client accepts; see
+    #: app/services/closing_stipulations.py.
+    closing_stipulations: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
     program_selection_mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default="auto", server_default="auto"
     )
