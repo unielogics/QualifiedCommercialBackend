@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -115,6 +116,43 @@ class DscrContext:
     source: str
 
 
+async def _cockpit_context(db: AsyncSession, profile: ApplicationProfile) -> DscrContext | None:
+    """The business DSCR context from the financial cockpit, or None when the
+    cockpit has no income figure (then the AI review's inputs stand in)."""
+    try:
+        from app.services import financial_cockpit
+
+        cockpit = await financial_cockpit.load_cockpit(db, profile)
+    except Exception:  # noqa: BLE001 - never block terms on the cockpit
+        return None
+    headline = (cockpit.get("dscr") or {}).get("headline") or {}
+    candidates = (cockpit.get("dscr") or {}).get("candidates") or []
+    basis = headline or (candidates[0] if candidates else {})
+    plan = cockpit.get("plan") or {}
+    evaluation = plan.get("evaluation") or {}
+    active = bool(evaluation.get("active"))
+    income = evaluation.get("income_after_annual") if active and evaluation.get("income_after_annual") is not None else basis.get("numerator")
+    if income is None:
+        return None
+    existing_monthly = evaluation.get("debt_service_before_new_payment_monthly")
+    if existing_monthly is None:
+        existing_monthly = (cockpit.get("debt") or {}).get("service", {}).get("monthly") or 0.0
+    label = str(basis.get("label") or "Income available for debt service")
+    changes = [m.get("label") for m in plan.get("modifications") or [] if m.get("kind") != "loan" and m.get("label")]
+    source = f"Financial cockpit: {label}"
+    if active and changes:
+        source += " with the desk's plan (" + "; ".join(str(c) for c in changes[:4]) + ")"
+    return DscrContext(
+        method="business",
+        before=_number(basis.get("value")),
+        cash_flow=float(income),
+        cash_flow_label=f"{label} income available for debt service" + (" with the desk's plan" if active and changes else ""),
+        current_annual_debt_service=round(float(existing_monthly) * 12, 2),
+        real_estate_carrying_costs=None,
+        source=source,
+    )
+
+
 async def _dscr_context(db: AsyncSession, profile: ApplicationProfile) -> DscrContext:
     intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
     snapshot = dict(intake.result_snapshot or {}) if intake else {}
@@ -126,6 +164,13 @@ async def _dscr_context(db: AsyncSession, profile: ApplicationProfile) -> DscrCo
 
     is_real_estate = profile.vertical == "real_estate" or bool(intake and intake.asset_rows)
     if not is_real_estate:
+        # The Financials tab's figures and the desk's plan are the basis: the
+        # same income (add-backs and overrides included) and the same existing
+        # debt service (after what the plan pays off) that the cockpit shows,
+        # so the Underwriting tab and Financials read the same coverage.
+        mirrored = await _cockpit_context(db, profile)
+        if mirrored is not None:
+            return mirrored
         inputs = intelligence.dscr_inputs or {}
         cash_flow = _number(inputs.get("bankable_ebitda"))
         current_annual = _number(inputs.get("annual_debt_service"))
@@ -327,6 +372,7 @@ async def read_terms(
         )
     client_email, suppressed = await _recipient_state(db, profile)
     context = await _dscr_context(db, profile)
+    plan_block = await _plan_block(db, profile)
     if row is None:
         intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
         initial_amount = profile.underwriting_term_sheet_amount or profile.underwriting_approved_amount
@@ -350,6 +396,7 @@ async def read_terms(
             direct_client_contact_suppressed=suppressed,
             loan_type_options=options,
             calculation=calc,
+            plan=plan_block,
         )
 
     total = float(row.periodic_payment) * int(row.payment_count)
@@ -407,7 +454,32 @@ async def read_terms(
         direct_client_contact_suppressed=suppressed,
         loan_type_options=options,
         calculation=calc,
+        plan=plan_block,
     )
+
+
+async def _plan_block(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any] | None:
+    """What the Financials tab says, for the Underwriting tab to show beside
+    the terms: the plan in words, coverage today and with the plan, and
+    whether the plan's loan mirrors the recorded terms."""
+    try:
+        from app.services import financial_cockpit
+
+        cockpit = await financial_cockpit.load_cockpit(db, profile)
+    except Exception:  # noqa: BLE001 - advisory
+        return None
+    plan = cockpit.get("plan") or {}
+    impact = plan.get("impact") or {}
+    evaluation = plan.get("evaluation") or {}
+    return {
+        "active": bool(evaluation.get("active")),
+        "modifications": [m.get("label") for m in plan.get("modifications") or [] if m.get("label")],
+        "dscr": impact.get("dscr"),
+        "debt_service_monthly": impact.get("debt_service_monthly"),
+        "income_annual": impact.get("income_annual"),
+        "loan": impact.get("loan"),
+        "terms_link": plan.get("terms_link"),
+    }
 
 
 async def save_terms(
@@ -511,6 +583,10 @@ async def save_terms(
     profile.underwriting_updated_by_user_id = user.id
     profile.underwriting_updated_at = now
     await db.flush()
+    # The Financials plan mirrors what was just recorded.
+    from app.services import plan_terms_link
+
+    await plan_terms_link.adopt_for_profile(db, profile, plan_terms_link.recorded_from_client_terms(row), user=user)
     await profiles.log_profile_action(
         db,
         profile,

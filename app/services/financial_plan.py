@@ -133,6 +133,8 @@ def normalize_plan(raw: Any) -> dict[str, Any]:
         "add_backs": normalize_add_backs(raw.get("add_backs")),
         "overrides": normalize_overrides(raw.get("overrides")),
         "note": str(raw.get("note") or "")[:600] or None,
+        # Which recorded terms the loan fields were adopted from, if any.
+        "terms_ref": dict(raw["terms_ref"]) if isinstance(raw.get("terms_ref"), dict) and raw["terms_ref"].get("id") else None,
         "updated_at": raw.get("updated_at"),
         "updated_by": raw.get("updated_by"),
     }
@@ -629,7 +631,24 @@ def describe_modifications(
     payment = evaluation.get("new_payment_monthly")
     loan = evaluation.get("loan_terms")
     if payment:
-        if loan and loan.get("source") == "term_sheet":
+        ref = plan.get("terms_ref") if isinstance(plan.get("terms_ref"), dict) else None
+        if ref and plan.get("new_payment_source") == "recorded_terms":
+            lines.append(
+                {
+                    "kind": "loan",
+                    "label": f"New payment {payment:,.0f} a month from {ref.get('label') or 'the recorded terms'}",
+                    "detail": (
+                        f"{loan['amount']:,.0f} at {loan['rate_pct']:g}%"
+                        + (" interest-only" if loan.get("interest_only") else (f" over {loan['term_months']} months" if loan.get("term_months") else ""))
+                        + ", as recorded on the Underwriting tab."
+                        if loan and loan.get("amount")
+                        else "As recorded on the Underwriting tab."
+                    ),
+                    "monthly_effect": _round(-float(payment)),
+                    "annual_effect": _round(-float(payment) * 12),
+                }
+            )
+        elif loan and loan.get("source") == "term_sheet":
             lines.append(
                 {
                     "kind": "loan",

@@ -137,13 +137,16 @@ class FinancialPlanWrite(BaseModel):
     retire: list[str] = Field(default_factory=list, max_length=60)
     exclude: list[str] = Field(default_factory=list, max_length=60)
     new_payment_monthly: float | None = Field(default=None, ge=0)
-    new_payment_source: Literal["manual", "term_sheet", "offer", "manual_terms"] | None = None
+    new_payment_source: Literal["manual", "term_sheet", "offer", "manual_terms", "recorded_terms"] | None = None
     new_loan_amount: float | None = Field(default=None, ge=0)
     new_loan_rate_pct: float | None = Field(default=None, ge=0, le=100)
     new_loan_term_months: int | None = Field(default=None, ge=1, le=600)
     new_loan_interest_only: bool = False
     add_backs: list[AddBackIn] = Field(default_factory=list, max_length=20)
     overrides: PlanOverridesIn | None = None
+    #: Which recorded terms the loan fields were adopted from; kept across saves
+    #: so the cockpit can say whether the plan still mirrors them.
+    terms_ref: dict[str, Any] | None = None
     note: str | None = Field(default=None, max_length=600)
 
 

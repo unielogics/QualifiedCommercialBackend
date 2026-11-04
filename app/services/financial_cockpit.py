@@ -2003,6 +2003,7 @@ def build_cockpit(
     plan: dict[str, Any] | None = None,
     account_aliases: dict[str, str] | None = None,
     schedule_state: dict[str, Any] | None = None,
+    recorded_terms: dict[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """The cockpit read model from plain dicts.
@@ -2065,6 +2066,9 @@ def build_cockpit(
     )
     modifications = plans.describe_modifications(plan_record, evaluation, obligations, recurring, accounts)
     impact = plans.plan_impact(evaluation, dscr, accounts)
+    from app.services import plan_terms_link as terms_link_svc
+
+    terms_link = terms_link_svc.terms_link(plan_record, evaluation, recorded_terms)
     coverage = {
         "files_analyzed": len(analyses),
         "files_accepted": len(_accepted_files(analyses)),
@@ -2127,6 +2131,7 @@ def build_cockpit(
             "levers": levers,
             "modifications": modifications,
             "impact": impact,
+            "terms_link": terms_link,
         },
         "net_profit": net_profit_block(years, statement, bank),
         "notes": _notes(coverage, bank, service, proposed, years, statement)
@@ -2291,6 +2296,39 @@ async def current_term_sheet(db: AsyncSession, profile_id: uuid.UUID) -> Product
     ).scalar_one_or_none()
 
 
+async def recorded_terms_for_profile(
+    db: AsyncSession, profile: ApplicationProfile, sheet: ProductionTermSheet | None
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """(the recorded terms as the plan reads them, the proposed-terms dict the
+    DSCR block uses): the dealer's production term sheet when there is one,
+    else the current client terms. Both instruments live on the Underwriting
+    tab; the cockpit mirrors whichever is in force."""
+    from app.services import plan_terms_link as link
+
+    if sheet is not None:
+        return link.recorded_from_production_sheet(sheet), term_sheet_terms(sheet)
+    try:
+        from app.services.application_terms import current_term_sheet as current_client_terms
+
+        row = await current_client_terms(db, profile.id)
+    except Exception:  # noqa: BLE001 - the client terms are one source among several
+        row = None
+    recorded = link.recorded_from_client_terms(row)
+    if recorded is None:
+        return None, None
+    proposed = {
+        "source": "term_sheet",
+        "label": recorded["label"],
+        "amount": recorded["amount"],
+        "rate_pct": recorded["rate_pct"],
+        "term_months": recorded["term_months"],
+        "monthly_payment": recorded["payment_monthly"],
+        "treatment": recorded["treatment"],
+        "retained_annual_debt_service": recorded["retained_annual_debt_service"],
+    }
+    return recorded, proposed
+
+
 def term_sheet_terms(sheet: ProductionTermSheet | None) -> dict[str, Any] | None:
     if sheet is None:
         return None
@@ -2333,15 +2371,17 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
     )
     sheet = await current_term_sheet(db, profile.id)
     schedule_state = await debt_schedule_state(db, profile)
+    recorded_terms, proposed_terms = await recorded_terms_for_profile(db, profile, sheet)
     cockpit = build_cockpit(
         analyses,
         _debt_dicts(debts),
         requested_amount=float(requested_amount) if requested_amount is not None else None,
-        proposed_terms=term_sheet_terms(sheet),
+        proposed_terms=proposed_terms,
         counted_accounts=list(getattr(profile, "counted_bank_accounts", None) or []),
         plan=getattr(profile, "financial_plan", None) or {},
         account_aliases=dict(getattr(profile, "bank_account_aliases", None) or {}),
         schedule_state=schedule_state,
+        recorded_terms=recorded_terms,
     )
     cockpit["profile_id"] = str(profile.id)
     return cockpit

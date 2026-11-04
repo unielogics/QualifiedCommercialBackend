@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
@@ -137,6 +137,9 @@ class ClientTermsRead(BaseModel):
     direct_client_contact_suppressed: bool = False
     loan_type_options: list[LoanTypeOption] = Field(default_factory=list)
     calculation: ClientTermsCalculation
+    #: What the Financials tab says: the plan in words, coverage today and
+    #: with the plan, and whether the plan's loan mirrors these terms.
+    plan: dict[str, Any] | None = None
 
 
 class ClientTermsEmailRequest(BaseModel):
