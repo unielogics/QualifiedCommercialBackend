@@ -67,8 +67,14 @@ def test_the_new_payment_falls_back_to_loan_terms_then_the_term_sheet() -> None:
     obligations = fp.obligations({"rows": [], "documented": [], "service": SERVICE}, RECURRING)
     terms = fp.evaluate_plan(fp.normalize_plan({"new_loan_amount": 100000, "new_loan_rate_pct": 12, "new_loan_term_months": 120}), obligations_list=obligations, recurring=RECURRING, months=MONTHS, dscr=DSCR, service=SERVICE, proposed=None, requested_amount=None)
     assert (terms["new_payment_monthly"], terms["new_payment_source"]) == (1434.71, "manual_terms")
-    sheet = fp.evaluate_plan(fp.normalize_plan({}), obligations_list=obligations, recurring=RECURRING, months=MONTHS, dscr=DSCR, service=SERVICE, proposed={"monthly_payment": 999.0}, requested_amount=None)
-    assert (sheet["new_payment_monthly"], sheet["new_payment_source"], sheet["active"]) == (999.0, "term_sheet", False)
+    # A term sheet on file is not a decision: nothing is added until the desk adopts it.
+    on_file = fp.evaluate_plan(fp.normalize_plan({}), obligations_list=obligations, recurring=RECURRING, months=MONTHS, dscr=DSCR, service=SERVICE, proposed={"monthly_payment": 999.0}, requested_amount=None)
+    assert on_file["new_payment_monthly"] is None and on_file["active"] is False and on_file["debt_service_after_monthly"] == 11897.0
+    sheet = fp.evaluate_plan(fp.normalize_plan({"new_payment_source": "term_sheet"}), obligations_list=obligations, recurring=RECURRING, months=MONTHS, dscr=DSCR, service=SERVICE, proposed={"monthly_payment": 999.0, "amount": 100000, "rate_pct": 12, "term_months": 120, "label": "Term sheet v1: Bank"}, requested_amount=None)
+    assert (sheet["new_payment_monthly"], sheet["new_payment_source"], sheet["active"]) == (999.0, "term_sheet", True)
+    assert sheet["loan_terms"]["source"] == "term_sheet" and sheet["loan_terms"]["amount"] == 100000.0
+    lines = fp.describe_modifications(fp.normalize_plan({"new_payment_source": "term_sheet"}), sheet, obligations, RECURRING)
+    assert lines[0]["label"] == "New payment 999 a month from the recorded loan terms" and "Term sheet v1: Bank: 100,000 at 12% over 120 months" in lines[0]["detail"]
     nothing = fp.evaluate_plan(fp.normalize_plan({}), obligations_list=obligations, recurring=RECURRING, months=MONTHS, dscr=DSCR, service=SERVICE, proposed=None, requested_amount=None)
     assert nothing["new_payment_monthly"] is None and nothing["debt_service_after_monthly"] == 11897.0 and nothing["headline_after"] == 0.92
 
@@ -201,3 +207,28 @@ def test_levers_offer_the_officer_add_back_and_interest_only_when_they_raise_cov
     again = fp.evaluate_plan(applied, obligations_list=obligations, recurring=RECURRING, months=MONTHS, dscr=DSCR, service=SERVICE, proposed=None, requested_amount=70000)
     keys = {lever["key"] for lever in fp.coverage_levers(applied, again, obligations_list=obligations, recurring=RECURRING, dscr=DSCR, requested_amount=70000, terms=None, tax_years=TAX_YEARS)}
     assert "addback:officer_compensation" not in keys and "interest_only" not in keys
+
+
+def test_the_recorded_loan_terms_are_offered_as_levers_not_assumed() -> None:
+    quiet = {"payees": [], "months_read": []}
+    service = {"source": "debt_schedule_rows", "monthly": 20932.0, "annual": 251184.0}
+    obligations = fp.obligations({"rows": [_row("r1", "David Bender", 18417.0, 1200000.0, is_mca=False), _row("r2", "SBA", 2515.0, 477480.0, is_mca=False)], "documented": [], "service": service}, quiet)
+    dscr = {"headline": {"key": "tax_return", "numerator": 258000.0, "value": 1.03}, "candidates": [{"key": "tax_return", "label": "Tax return 2025", "numerator": 258000.0, "value": 1.03}]}
+    plan = fp.normalize_plan({})
+    proposed = {"monthly_payment": 36662.07, "amount": 400000, "rate_pct": 32, "term_months": 13, "label": "Term sheet v1: Dealer capital advance"}
+    evaluation = fp.evaluate_plan(plan, obligations_list=obligations, recurring=quiet, months=[], dscr=dscr, service=service, proposed=proposed, requested_amount=400000)
+    assert evaluation["active"] is False and evaluation["debt_service_after_monthly"] == 20932.0  # nothing assumed
+    additive = {**proposed, "source": "term_sheet", "treatment": "additive", "retained_annual_debt_service": None}
+    levers = {lever["key"]: lever for lever in fp.coverage_levers(plan, evaluation, obligations_list=obligations, recurring=quiet, dscr=dscr, requested_amount=400000, terms=additive)}
+    add = levers["term_sheet:add"]
+    assert add["apply"]["new_payment_source"] == "term_sheet" and add["dscr_after"] == round(258000.0 / ((20932.0 + 36662.07) * 12), 2)
+    assert "additional debt" in add["detail"] and "term_sheet:refinance" not in levers
+    refinance = {**additive, "treatment": "refinance", "retained_annual_debt_service": 30180.0}
+    levers = {lever["key"]: lever for lever in fp.coverage_levers(plan, evaluation, obligations_list=obligations, recurring=quiet, dscr=dscr, requested_amount=400000, terms=refinance)}
+    refi = levers["term_sheet:refinance"]
+    assert refi["apply"]["retire"] == ["row:r1", "row:r2"] and refi["apply"]["new_payment_source"] == "term_sheet"
+    assert refi["dscr_after"] == round(258000.0 / ((30180.0 / 12 + 36662.07) * 12), 2) and "retained per the sheet" in refi["detail"]
+    adopted = fp.evaluate_plan(fp.normalize_plan(refi["apply"]), obligations_list=obligations, recurring=quiet, months=[], dscr=dscr, service=service, proposed=proposed, requested_amount=400000)
+    assert adopted["active"] and adopted["retired_monthly"] == 20932.0 and adopted["new_payment_monthly"] == 36662.07
+    again = {lever["key"] for lever in fp.coverage_levers(fp.normalize_plan(refi["apply"]), adopted, obligations_list=obligations, recurring=quiet, dscr=dscr, requested_amount=400000, terms=refinance)}
+    assert "term_sheet:add" not in again and "term_sheet:refinance" not in again

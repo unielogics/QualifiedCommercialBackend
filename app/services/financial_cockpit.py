@@ -2294,6 +2294,7 @@ async def current_term_sheet(db: AsyncSession, profile_id: uuid.UUID) -> Product
 def term_sheet_terms(sheet: ProductionTermSheet | None) -> dict[str, Any] | None:
     if sheet is None:
         return None
+    extra = sheet.extra if isinstance(sheet.extra, dict) else {}
     return {
         "source": "term_sheet",
         "label": f"Term sheet v{sheet.version}: {sheet.funding_party_name}",
@@ -2301,6 +2302,10 @@ def term_sheet_terms(sheet: ProductionTermSheet | None) -> dict[str, Any] | None
         "rate_pct": sheet.rate_pct,
         "term_months": sheet.term_months,
         "monthly_payment": sheet.monthly_debt_service,
+        # How the sheet itself treats the existing debt: on top of it
+        # (additive) or in place of it (refinance, keeping what is retained).
+        "treatment": str(extra.get("debt_service_treatment") or "additive"),
+        "retained_annual_debt_service": _num(extra.get("retained_annual_debt_service")),
     }
 
 

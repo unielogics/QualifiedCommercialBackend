@@ -396,8 +396,26 @@ def evaluate_plan(
             loan_terms["amount"], loan_terms["rate_pct"], loan_terms["term_months"], interest_only
         )
         source = source or "manual_terms"
-    if new_payment is None and proposed:
-        new_payment, source = proposed.get("monthly_payment"), "term_sheet"
+    # The recorded loan terms join the plan only when the desk adopts them:
+    # a term sheet on file is not a decision, and adding its payment on its
+    # own made "with the plan" worse than today with nothing planned.
+    if (
+        new_payment is None
+        and source == "term_sheet"
+        and proposed
+        and proposed.get("monthly_payment") is not None
+    ):
+        new_payment = proposed.get("monthly_payment")
+        loan_terms = {
+            "amount": _num(proposed.get("amount")),
+            "rate_pct": _num(proposed.get("rate_pct")) or 0.0,
+            "term_months": int(proposed["term_months"])
+            if _num(proposed.get("term_months"))
+            else None,
+            "interest_only": False,
+            "source": "term_sheet",
+            "label": proposed.get("label"),
+        }
     # The existing debt service: what the file shows, unless the desk set it.
     service_monthly = (
         float(service_override)
@@ -472,6 +490,7 @@ def evaluate_plan(
         or service_override is not None
         or plan.get("new_payment_monthly") is not None
         or plan.get("new_loan_amount")
+        or (plan.get("new_payment_source") == "term_sheet" and new_payment is not None)
     )
     return {
         "active": active,
@@ -610,7 +629,24 @@ def describe_modifications(
     payment = evaluation.get("new_payment_monthly")
     loan = evaluation.get("loan_terms")
     if payment:
-        if loan:
+        if loan and loan.get("source") == "term_sheet":
+            lines.append(
+                {
+                    "kind": "loan",
+                    "label": f"New payment {payment:,.0f} a month from the recorded loan terms",
+                    "detail": (loan.get("label") or "Term sheet")
+                    + (
+                        f": {loan['amount']:,.0f} at {loan['rate_pct']:g}%"
+                        if loan.get("amount")
+                        else ""
+                    )
+                    + (f" over {loan['term_months']} months" if loan.get("term_months") else "")
+                    + ".",
+                    "monthly_effect": _round(-float(payment)),
+                    "annual_effect": _round(-float(payment) * 12),
+                }
+            )
+        elif loan:
             structure = (
                 "interest-only"
                 if loan.get("interest_only")
@@ -840,6 +876,82 @@ def coverage_levers(
                     "dscr_after": value_one,
                     "status_after": dscr_status(value_one),
                     "apply": {"retire": sorted(retire | {o["id"]})},
+                }
+            )
+    # The recorded loan terms, offered rather than assumed: the desk sees what
+    # adding them does and, when the sheet refinances the schedule, what
+    # stopping the existing payments does with them.
+    sheet_payment = _num((terms or {}).get("monthly_payment")) if terms else None
+    if (
+        sheet_payment is None
+        and terms
+        and _num(terms.get("amount"))
+        and _num(terms.get("term_months"))
+    ):
+        sheet_payment = amortized_payment(
+            float(terms["amount"]), float(terms.get("rate_pct") or 0.0), int(terms["term_months"])
+        )
+    adopted = (
+        plan.get("new_payment_source") == "term_sheet"
+        or plan.get("new_payment_monthly") is not None
+        or plan.get("new_loan_amount")
+    )
+    if sheet_payment and numerator is not None and not adopted:
+        sheet_label = (terms or {}).get("label") or "the recorded loan terms"
+        sheet_terms = (
+            f"{float(terms['amount']):,.0f} at {float(terms.get('rate_pct') or 0):g}% over {int(terms['term_months'])} months"
+            if terms and _num(terms.get("amount")) and _num(terms.get("term_months"))
+            else f"{sheet_payment:,.0f} a month"
+        )
+        adopt = {
+            "new_payment_source": "term_sheet",
+            "new_payment_monthly": None,
+            "new_loan_amount": None,
+            "new_loan_rate_pct": None,
+            "new_loan_term_months": None,
+            "new_loan_interest_only": False,
+        }
+        after_add = round(
+            max(0.0, evaluation["debt_service_before_new_payment_monthly"] + sheet_payment), 2
+        )
+        value_add = _dscr_for(numerator, after_add)
+        treatment = str((terms or {}).get("treatment") or "additive")
+        levers.append(
+            {
+                "key": "term_sheet:add",
+                "label": "Add the recorded loan terms as the new payment",
+                "detail": f"{sheet_label}: {sheet_terms} is {sheet_payment:,.0f} a month"
+                + (
+                    f", on top of today's {evaluation['debt_service_before_new_payment_monthly']:,.0f}: the sheet treats it as additional debt. Tick what it pays off if it refinances the schedule."
+                    if treatment != "refinance"
+                    else "."
+                ),
+                "dscr_after": value_add,
+                "status_after": dscr_status(value_add),
+                "apply": adopt,
+            }
+        )
+        in_service = [
+            o for o in obligations_list if o.get("in_debt_service") and o["id"] not in retire
+        ]
+        if treatment == "refinance" and in_service:
+            retained = _num((terms or {}).get("retained_annual_debt_service")) or 0.0
+            after_refi = round(max(0.0, retained / 12 + sheet_payment), 2)
+            value_refi = _dscr_for(numerator, after_refi)
+            levers.append(
+                {
+                    "key": "term_sheet:refinance",
+                    "label": "Refinance the schedule into the recorded loan terms",
+                    "detail": f"{sheet_label} replaces the existing payments: {sum(o.get('monthly') or 0 for o in in_service):,.0f} a month stops"
+                    + (
+                        f", {retained / 12:,.0f} a month is retained per the sheet"
+                        if retained
+                        else ""
+                    )
+                    + f", and {sheet_payment:,.0f} a month begins.",
+                    "dscr_after": value_refi,
+                    "status_after": dscr_status(value_refi),
+                    "apply": {**adopt, "retire": sorted(retire | {o["id"] for o in in_service})},
                 }
             )
     existing_kinds = {a.get("kind") for a in plan.get("add_backs") or []}
