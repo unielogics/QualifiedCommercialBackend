@@ -248,6 +248,10 @@ class ApplicationProfile(TimestampMixin, Base):
     )
     underwriting_approved_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
     underwriting_accepted_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    #: When the acceptance was recorded, and which terms it answered:
+    #: {kind, id, version, amount, rate_pct, term_months, label}.
+    underwriting_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    accepted_terms_ref: Mapped[dict | None] = mapped_column(JSONB)
     underwriting_funded_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
     underwriting_term_sheet_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
     underwriting_current_dscr: Mapped[float | None] = mapped_column(Numeric(8, 4))

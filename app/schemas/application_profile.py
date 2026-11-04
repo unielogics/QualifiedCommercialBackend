@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
@@ -444,6 +444,9 @@ class ApplicationUnderwritingRead(BaseModel):
     forecast_origination_earnings: float | None = None
     forecast_earnings: float | None = None
     estimated_close_date: date | None = None
+    #: When the acceptance was recorded and which terms it answered.
+    accepted_at: datetime | None = None
+    accepted_terms_ref: dict[str, Any] | None = None
     qc_fee_cap_percent: float | None = None
     qc_fee_review_required: bool = False
     qc_fee_review_reason: str | None = None
@@ -473,6 +476,9 @@ class ApplicationUnderwritingPatch(BaseModel):
         default=None, ge=0, allow_inf_nan=False
     )
     estimated_close_date: date | None = None
+    #: The terms the acceptance answers (kind, id, version, amount, rate_pct,
+    #: term_months, label); None clears it with the amount.
+    accepted_terms_ref: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def matching_origination_point_aliases(self) -> ApplicationUnderwritingPatch:

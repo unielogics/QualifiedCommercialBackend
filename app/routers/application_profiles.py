@@ -732,6 +732,8 @@ def _underwriting_read(
         forecast_origination_earnings=optional_float(earnings.origination_earnings),
         forecast_earnings=optional_float(earnings.total),
         estimated_close_date=profile.estimated_close_date,
+        accepted_at=getattr(profile, "underwriting_accepted_at", None),
+        accepted_terms_ref=getattr(profile, "accepted_terms_ref", None),
         qc_fee_cap_percent=fee_cap_review.get("qc_fee_cap_percent"),  # type: ignore[arg-type]
         qc_fee_review_required=bool(fee_cap_review.get("review_required")),
         qc_fee_review_reason=fee_cap_review.get("reason"),  # type: ignore[arg-type]
@@ -976,7 +978,18 @@ async def apply_underwriting_changes(
             "approved_amount": float(profile.underwriting_term_sheet_amount),
         }
     if "accepted_amount" in changes:
+        was_accepted = profile.underwriting_accepted_amount is not None
         profile.underwriting_accepted_amount = changes["accepted_amount"]
+        if changes["accepted_amount"] is None:
+            profile.underwriting_accepted_at = None
+            profile.accepted_terms_ref = None
+        elif not was_accepted or "accepted_terms_ref" in changes:
+            profile.underwriting_accepted_at = now
+    if (
+        "accepted_terms_ref" in changes
+        and changes.get("accepted_amount", profile.underwriting_accepted_amount) is not None
+    ):
+        profile.accepted_terms_ref = changes["accepted_terms_ref"]
     if "funded_amount" in changes:
         profile.underwriting_funded_amount = changes["funded_amount"]
     if "term_sheet_amount" in changes:
