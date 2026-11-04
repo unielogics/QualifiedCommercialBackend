@@ -62,7 +62,11 @@ def recorded_from_production_sheet(sheet: Any) -> dict[str, Any] | None:
     if sheet is None:
         return None
     extra = sheet.extra if isinstance(getattr(sheet, "extra", None), dict) else {}
-    structure = str(extra.get("repayment_structure") or "")
+    structure = str(extra.get("repayment_structure") or "") or (
+        "fully_amortizing"
+        if getattr(sheet, "debt_service_is_level_payment", True)
+        else "fixed_payment"
+    )
     io_months = int(_num(extra.get("interest_only_months")) or 0)
     term = int(sheet.term_months) if sheet.term_months else None
     fully_io = structure in {"interest_only", "revolving_interest_only"}

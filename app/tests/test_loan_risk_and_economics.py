@@ -199,3 +199,46 @@ def test_the_package_draws_the_schedule_and_the_principal_at_risk_without_a_fee(
     assert "2,000 a month for 6 months, then" in html and "fee" not in text
     brief = _plan_section({"plan": {"active": False}, "proposed_terms": terms}, compact=True)
     assert "Principal at risk" in brief and "Schedule by year" not in brief
+
+
+def test_a_sheet_recorded_before_structures_existed_reads_the_structure_off_its_payment() -> None:
+    from types import SimpleNamespace
+
+    from app.services.financial_cockpit import term_sheet_terms
+
+    level = build_schedule(400000, 32, 13, structure="amortizing")["coverage_payment_monthly"]
+    sheet = SimpleNamespace(
+        version=1,
+        funding_party_name="Quidity",
+        approved_amount=400000,
+        rate_pct=32,
+        term_months=13,
+        monthly_debt_service=round(level, 2),
+        debt_service_is_level_payment=False,
+        extra={},
+    )
+    terms = term_sheet_terms(sheet)
+    assert (
+        terms["structure"] == "amortizing" and terms["payment_stated"] is True
+    )  # the lender's figure is the level payment
+    cockpit = _cockpit_with_terms()
+    cockpit["dscr"]["proposed"] = {**terms, "source": "term_sheet"}
+    proposed = proposed_terms_block(cockpit)
+    assert proposed["structure"] == "amortizing" and proposed["payment_note"] is None
+    sheet.monthly_debt_service = (
+        50000  # a figure no structure produces: the house default and a note
+    )
+    terms = term_sheet_terms(sheet)
+    assert terms["structure"] is None
+    cockpit["dscr"]["proposed"] = {**terms, "source": "term_sheet"}
+    proposed = proposed_terms_block(cockpit)
+    assert proposed["structure"] == "simple_interest" and proposed["payment_note"].startswith(
+        "The recorded payment, 50,000 a month"
+    )
+    legacy_level = SimpleNamespace(
+        **{**sheet.__dict__, "debt_service_is_level_payment": True, "monthly_debt_service": 1}
+    )
+    assert (
+        term_sheet_terms(legacy_level)["structure"] == "amortizing"
+        and term_sheet_terms(legacy_level)["payment_stated"] is False
+    )

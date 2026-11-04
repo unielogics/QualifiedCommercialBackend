@@ -2502,22 +2502,59 @@ def term_sheet_terms(sheet: ProductionTermSheet | None) -> dict[str, Any] | None
         # The sheet's repayment structure in the schedule's vocabulary; None
         # leaves the house default for the term (a balloon or a lender-stated
         # payment has no structure the schedule can draw exactly).
-        "structure": _sheet_structure(extra),
+        "structure": _sheet_structure(sheet, extra),
         "interest_only_months": int(_num(extra.get("interest_only_months")) or 0)
-        if str(extra.get("repayment_structure") or "") == "interest_only_then_amortizing"
+        if _sheet_repayment(sheet, extra) == "interest_only_then_amortizing"
         else 0,
         "payment_stated": bool(extra.get("lender_payment_override"))
-        or str(extra.get("repayment_structure") or "") in {"fixed_payment", "custom"},
+        or _sheet_repayment(sheet, extra) in {"fixed_payment", "custom"},
     }
 
 
-def _sheet_structure(extra: dict[str, Any]) -> str | None:
+def _sheet_repayment(sheet: Any, extra: dict[str, Any]) -> str:
+    """The sheet's repayment structure; sheets recorded before the structure
+    existed carry only whether the payment was the level payment."""
     repayment = str(extra.get("repayment_structure") or "")
+    if repayment:
+        return repayment
+    return "fully_amortizing" if getattr(sheet, "debt_service_is_level_payment", True) else "fixed_payment"
+
+
+def _sheet_structure(sheet: Any, extra: dict[str, Any]) -> str | None:
+    repayment = _sheet_repayment(sheet, extra)
     if repayment in {"fully_amortizing", "interest_only_then_amortizing"}:
         return "amortizing"
     if repayment in {"interest_only", "revolving_interest_only"}:
         return "interest_only"
+    if repayment in {"fixed_payment", "custom"}:
+        # A lender-stated payment: the structure whose own payment it matches
+        # (within five percent) is the one the lender priced; otherwise the
+        # house default for the term, and the note names the difference.
+        return _structure_matching_payment(
+            _num(getattr(sheet, "approved_amount", None)),
+            _num(getattr(sheet, "rate_pct", None)),
+            int(getattr(sheet, "term_months", 0) or 0),
+            _num(getattr(sheet, "monthly_debt_service", None)),
+        )
     return None
+
+
+def _structure_matching_payment(
+    amount: float | None, rate_pct: float | None, term_months: int, stated_monthly: float | None
+) -> str | None:
+    from app.services.loan_schedule import build_schedule
+
+    if not amount or rate_pct is None or term_months <= 0 or not stated_monthly:
+        return None
+    best: tuple[float, str] | None = None
+    for kind in ("amortizing", "simple_interest"):
+        summary = build_schedule(amount, rate_pct, term_months, structure=kind)
+        if not summary or not summary.get("coverage_payment_monthly"):
+            continue
+        gap = abs(stated_monthly - summary["coverage_payment_monthly"]) / summary["coverage_payment_monthly"]
+        if best is None or gap < best[0]:
+            best = (gap, kind)
+    return best[1] if best and best[0] <= 0.05 else None
 
 
 async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
