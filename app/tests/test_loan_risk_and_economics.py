@@ -3,6 +3,8 @@ the desk-only economics that never reach the package or the offering."""
 
 from __future__ import annotations
 
+import re
+
 from app.capital_partners.services.listings import partner_terms
 from app.services.deal_cost import effective_rate_pct, internal_economics
 from app.services.financial_cockpit import plan_summary, proposed_terms_block
@@ -193,6 +195,7 @@ def test_the_package_draws_the_schedule_and_the_principal_at_risk_without_a_fee(
         in html
     )
     assert "Schedule by year" in html and "Year 2" in html
-    assert "2,000 a month for 6 months, then" in html and "fee" not in html.lower()
+    text = re.sub(r'src="data:[^"]*"', "", html).lower()  # the chart's PNG bytes are not words
+    assert "2,000 a month for 6 months, then" in html and "fee" not in text
     brief = _plan_section({"plan": {"active": False}, "proposed_terms": terms}, compact=True)
     assert "Principal at risk" in brief and "Schedule by year" not in brief
