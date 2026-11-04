@@ -6576,12 +6576,27 @@ async def _package_generation_inputs(
         intake,
         active_file_ids={file.id for file in source_files},
     )
+    # The desk's plan and the proposed terms print in both PDFs and are part of
+    # the fingerprint: a changed plan or new terms make the package stale.
+    plan_block: dict[str, Any] = {}
+    proposed_terms: dict[str, Any] | None = None
+    try:
+        from app.capital_partners.services import sync as marketplace_sync
+        from app.services import financial_cockpit as cockpit_svc
+
+        cockpit = await cockpit_svc.load_cockpit(db, profile)
+        plan_block = cockpit_svc.plan_summary(cockpit)
+        proposed_terms = marketplace_sync.proposed_terms(cockpit)
+    except Exception:  # noqa: BLE001 - the package still prints without the plan
+        log.exception("package: plan block unavailable intake=%s", intake.id)
     financials = {
         **financials,
         "program_selection_mode": readiness.selection_mode,
         "selected_programs": readiness_snapshot["selected_programs"],
         "package_readiness": readiness_snapshot,
         "use_of_funds": budget_snapshot,
+        "plan": {k: v for k, v in plan_block.items() if k not in {"updated_at", "updated_by"}},
+        "proposed_terms": proposed_terms,
     }
     input_fingerprint = _package_input_fingerprint(
         source_metadata=source_metadata,

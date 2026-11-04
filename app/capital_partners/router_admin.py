@@ -45,6 +45,7 @@ from .services import listings as L
 from .services import members as M
 from .services import prefill as P
 from .services import refs as R
+from .services import sync as SYNC
 
 router = APIRouter(prefix="/capital/admin", tags=["capital-admin"])
 Db = Annotated[AsyncSession, Depends(get_db)]
@@ -341,8 +342,10 @@ async def _listing_admin_out(db: AsyncSession, listing: CpListing) -> S.ListingA
     for ev in events:
         await db.refresh(ev, attribute_names=["occurred_at"])
     investor_count = (await F.investor_counts(db)).get(listing.id, 0)
+    sync = await SYNC.sync_for_listing(db, listing)
     return S.ListingAdminOut(
         **L.card(listing, committed),
+        sync=sync,
         summary=listing.summary, guarantee_text=listing.guarantee_text, borrower_track_record=listing.borrower_track_record,
         exit_plan=listing.exit_plan, valuation_amount=listing.valuation_amount, valuation_source=listing.valuation_source,
         title_status=listing.title_status, servicer_label=listing.servicer_label,
@@ -461,6 +464,10 @@ async def refresh_listing_snapshot(listing_id: uuid.UUID, admin: CpAdmin, db: Db
     fresh = await P.readiness_snapshot(db, profile)
     refreshed_at = datetime.now(UTC).isoformat()
     listing.source_snapshot = {**(listing.source_snapshot or {}), **fresh, "refreshed_at": refreshed_at}
+    # The figures, the plan, the terms and the programs just went onto the
+    # listing: stamp them so the file page knows they are current.
+    current, _sections, _cockpit = await SYNC.current_fingerprints(db, profile)
+    SYNC.mark_published(listing, current, by=admin.id, keys=["figures", "plan", "terms", "programs"])
     financials = fresh.get("financials") or {}
     await L.log_event(
         db,
@@ -475,6 +482,68 @@ async def refresh_listing_snapshot(listing_id: uuid.UUID, admin: CpAdmin, db: Db
         },
     )
     await db.commit()
+    return await _listing_admin_out(db, listing)
+
+
+@router.post("/listings/{listing_id}/publish-package", response_model=S.ListingAdminOut)
+async def publish_listing_package(listing_id: uuid.UUID, admin: CpAdmin, db: Db) -> S.ListingAdminOut:
+    """Push the file's package onto the listing: the current, in-sync
+    executive credit brief and lender packet become listing documents (the
+    prior ones superseded), the snapshot is re-read, and the listing is
+    stamped with what was pushed so unpublished changes can be named later.
+    Members see the documents once the listing itself is published."""
+    listing = await _load_admin_listing(db, listing_id)
+    if listing.profile_id is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "This listing was not cut from a file, so there is no package to push.")
+    if listing.status in {E.ListingStatus.REPAID, E.ListingStatus.WITHDRAWN}:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This listing is closed.")
+    from app.models.application_profile import ApplicationProfile
+    from app.models.public_underwriting_intake import PublicUnderwritingIntake
+    from app.routers.dealer_ai_intake import _fresh_package_artifact_pair
+
+    profile = await db.get(ApplicationProfile, listing.profile_id)
+    if profile is None or profile.intake_id is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "The file behind this listing was not found.")
+    intake = await db.get(PublicUnderwritingIntake, profile.intake_id)
+    if intake is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "The file behind this listing was not found.")
+    # 409 with the desk's own words when the pair is missing, split or stale.
+    summary, packet = await _fresh_package_artifact_pair(db, intake)
+    if not storage.configured():
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Document storage is not available right now.")
+    now = datetime.now(UTC)
+    pushed: list[dict[str, Any]] = []
+    for artifact, kind, name in (
+        (summary, E.DocumentKind.EXECUTIVE_SUMMARY, "Executive credit brief"),
+        (packet, E.DocumentKind.UNDERWRITING_PACKAGE, "Underwriting package"),
+    ):
+        if not artifact.s3_key:
+            raise HTTPException(status.HTTP_409_CONFLICT, f"The {name.lower()} has no stored PDF; refresh Package Readiness first.")
+        previous = [d for d in listing.documents if d.kind == kind and d.status != E.DocumentStatus.SUPERSEDED]
+        version = max((d.version for d in listing.documents if d.kind == kind), default=0) + 1
+        key = storage.build_key(listing.id, f"{kind}-v{version}.pdf")
+        if not storage.copy_object(artifact.s3_key, key, content_type="application/pdf"):
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "The package PDF could not be copied onto the listing.")
+        head = storage.head_object(key) or {}
+        for doc in previous:
+            doc.status = E.DocumentStatus.SUPERSEDED
+            doc.superseded_at = now
+        document = CpListingDocument(
+            listing_id=listing.id, kind=kind, name=f"{name} v{version}.pdf", s3_key=key, content_type="application/pdf",
+            size_bytes=int(head.get("ContentLength") or 0) or None, version=version, status=E.DocumentStatus.READY,
+            uploaded_by_id=admin.id, uploaded_at=now,
+        )
+        db.add(document)
+        await db.flush()
+        pushed.append({"kind": str(kind), "document_id": str(document.id), "artifact_id": str(artifact.id), "version": version})
+    fresh = await P.readiness_snapshot(db, profile)
+    listing.source_snapshot = {**(listing.source_snapshot or {}), **fresh, "refreshed_at": now.isoformat()}
+    current, _sections, _cockpit = await SYNC.current_fingerprints(db, profile)
+    package = await SYNC.current_package(db, profile)
+    SYNC.mark_published(listing, current, by=admin.id, package={**(package or {}), "documents": pushed, "at": now.isoformat()})
+    await L.log_event(db, listing.id, "package_published", actor_user_id=admin.id, detail={"documents": pushed, "generation_id": (package or {}).get("generation_id")})
+    await db.commit()
+    await db.refresh(listing, attribute_names=["documents"])
     return await _listing_admin_out(db, listing)
 
 

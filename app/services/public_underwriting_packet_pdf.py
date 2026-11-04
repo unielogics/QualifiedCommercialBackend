@@ -1425,6 +1425,88 @@ def _program_fit_section(program_fit: dict[str, Any] | None) -> str:
     )
 
 
+def _plan_section(financials: dict[str, Any], *, compact: bool = False) -> str:
+    """Proposed terms and the desk's plan: what changes at funding and what
+    it does to coverage, as original, with the plan, and the difference.
+    Nothing when the file carries neither terms nor a plan."""
+    plan = _record(financials.get("plan"))
+    terms = _record(financials.get("proposed_terms"))
+    active = bool(plan.get("active"))
+    if not active and not terms:
+        return ""
+    impact = _record(plan.get("impact"))
+
+    def pair(name: str) -> dict[str, Any]:
+        return _record(impact.get(name))
+
+    def x(value: Any) -> str:
+        number = _num(value)
+        return f"{number:.2f}x" if number is not None else "—"
+
+    def delta(p: dict[str, Any], render) -> str:
+        change = _num(p.get("change"))
+        if change is None:
+            return "—"
+        sign = "+" if change > 0 else ("−" if change < 0 else "")
+        return f"{sign}{render(abs(change))}"
+
+    terms_line = ""
+    if terms:
+        amount = _num(terms.get("amount"))
+        rate = _num(terms.get("rate_pct"))
+        payment = _num(terms.get("monthly_payment"))
+        structure = "interest-only" if terms.get("interest_only") else (f"over {int(terms['term_months'])} months" if _num(terms.get("term_months")) else "")
+        source = "recorded term sheet" if terms.get("source") == "term_sheet" else "the desk's plan"
+        terms_line = (
+            f"<p><strong>Proposed terms ({escape(source)}).</strong> "
+            + escape(
+                " ".join(
+                    part
+                    for part in (
+                        _fmt_full(amount) if amount is not None else "",
+                        f"at {rate:g}%" if rate is not None else "",
+                        structure,
+                        f"— {_fmt_full(payment)} a month" if payment is not None else "",
+                        "of interest, principal at maturity" if terms.get("interest_only") and payment is not None else "",
+                    )
+                    if part
+                )
+            )
+            + "</p>"
+        )
+    rows: list[tuple[str, dict[str, Any], Any]] = [
+        ("Debt service coverage" + (f" · {escape(str(pair('dscr').get('basis') or '').replace('_', ' '))}" if pair("dscr").get("basis") else ""), pair("dscr"), x),
+        ("Income available for debt service, a year", pair("income_annual"), lambda v: _fmt_full(_num(v))),
+        ("Debt service, a month", pair("debt_service_monthly"), lambda v: _fmt_full(_num(v))),
+        ("Net cash flow, a month", pair("net_cash_flow_monthly"), lambda v: _fmt_full(_num(v))),
+        ("Ending balance, last month", pair("ending_balance"), lambda v: _fmt_full(_num(v))),
+    ]
+    if compact:
+        rows = rows[:3]
+    table = ""
+    body = [
+        f'<tr><td class="rowhead">{label}</td><td class="num">{render(p.get("before")) if p.get("before") is not None else "—"}</td>'
+        f'<td class="num">{render(p.get("after")) if p.get("after") is not None else "—"}</td><td class="num">{delta(p, lambda n, r=render: r(n))}</td></tr>'
+        for label, p, render in rows
+        if p.get("before") is not None or p.get("after") is not None
+    ]
+    if active and body:
+        table = (
+            '<table class="grid-table"><thead><tr><th>Figure</th><th class="num">Original</th><th class="num">With the plan</th><th class="num">Change</th></tr></thead>'
+            "<tbody>" + "".join(body) + "</tbody></table>"
+        )
+    mods = [m for m in plan.get("modifications") or [] if isinstance(m, dict) and m.get("label")]
+    mods_html = ""
+    if active and mods and not compact:
+        mods_html = "<ul>" + "".join(
+            f"<li>{escape(str(m.get('label')))}{(' — ' + escape(str(m.get('detail')))) if m.get('detail') else ''}</li>" for m in mods[:10]
+        ) + "</ul>"
+    note = f'<p class="note">{escape(str(plan.get("note")))}</p>' if active and plan.get("note") and not compact else ""
+    caveat = '<p class="note">The plan is underwriting\'s assumption until funding; the original column is the file as read.</p>' if active else ""
+    title = "Proposed terms and the desk's plan" if active else "Proposed terms"
+    return f'<section class="card"><h2>{title}</h2>{terms_line}{mods_html}{table}{note}{caveat}</section>'
+
+
 def _metric_table(metric_rows: list[dict[str, Any]]) -> str:
     body = "".join(
         "<tr>"
@@ -1723,6 +1805,7 @@ def render_executive_summary_pdf(
     <td><section class="card summary-card"><h2>Recommended structure</h2><p>{escape(approach)}</p></section></td>
   </tr></table>
   {metric_tiles}
+  {_plan_section(financials, compact=True)}
   <div class="next"><strong>Next desk action</strong>&nbsp;{escape(next_action)}</div>
   <table class="cols"><tr><td>{strengths_html}</td><td>{risks_html}</td></tr></table>
   {mitigants_html}
@@ -2002,6 +2085,7 @@ def render_underwriting_packet_pdf(
     <td>{_credit_section(credit)}</td>
   </tr></table>
   {_program_readiness_section(financials) if selected_programs else _program_fit_section(loan_program_fit)}
+  {_plan_section(financials)}
 
   <table class="cols"><tr>
     <td>{_bullet_card("Strengths", strengths, "green")}</td>

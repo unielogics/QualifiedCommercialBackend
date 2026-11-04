@@ -113,6 +113,33 @@ def presign_put(key: str, *, content_type: str, ttl: int = UPLOAD_URL_TTL_SECOND
         return None
 
 
+def copy_object(source_key: str, key: str, *, content_type: str = "application/pdf") -> bool:
+    """Copy a private object inside the bucket (the file's own PDF onto a
+    listing), keeping the bucket's encryption posture. False when storage is
+    unconfigured or the copy fails."""
+    cfg = get_settings()
+    if not cfg.s3_bucket:
+        return False
+    params: dict[str, object] = {
+        "Bucket": cfg.s3_bucket,
+        "CopySource": {"Bucket": cfg.s3_bucket, "Key": source_key},
+        "Key": key,
+        "ContentType": content_type,
+        "MetadataDirective": "REPLACE",
+    }
+    if cfg.buckets_kms_key_id:
+        params["ServerSideEncryption"] = "aws:kms"
+        params["SSEKMSKeyId"] = cfg.buckets_kms_key_id
+    else:
+        params["ServerSideEncryption"] = "AES256"
+    try:
+        _s3_client().copy_object(**params)
+        return True
+    except Exception:
+        logger.exception("capital: copy failed %s -> %s", source_key, key)
+        return False
+
+
 def head_object(key: str) -> dict | None:
     """Size and content type of an uploaded object, or None if it is not there."""
     cfg = get_settings()

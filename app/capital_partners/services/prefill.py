@@ -160,12 +160,22 @@ async def lookup(db: AsyncSession, *, loan_id: uuid.UUID | None, profile_id: uui
     if loan_id is None and profile is not None and getattr(profile, "loan_id", None):
         loan_id = profile.loan_id
     sheet = await _current_term_sheet(db, profile.id) if profile is not None else None
+    listing_ref = await existing_listing(db, loan_id=loan_id, profile_id=profile.id if profile else None)
+    sync = None
+    if listing_ref is not None and profile is not None:
+        from . import listings as L
+        from . import sync as SYNC
+
+        listing = await L.load_listing(db, listing_id=listing_ref["id"] if isinstance(listing_ref, dict) else listing_ref.id)
+        if listing is not None:
+            sync = await SYNC.sync_for_listing(db, listing)
     return {
         "profile_id": profile.id if profile else None,
         "loan_id": loan_id,
-        "listing": await existing_listing(db, loan_id=loan_id, profile_id=profile.id if profile else None),
+        "listing": listing_ref,
         "underwriting_status": _str(getattr(profile, "underwriting_status", None)) if profile else None,
         "has_term_sheet": sheet is not None,
+        "sync": sync,
     }
 
 

@@ -131,6 +131,10 @@ class DocumentKind(StrEnum):
     VALUATION = "valuation"
     TITLE = "title"
     SERVICING_SUMMARY = "servicing_summary"
+    #: The file's own package, pushed from the desk: the executive credit
+    #: brief and the lender packet, as members may read them once cleared.
+    EXECUTIVE_SUMMARY = "executive_summary"
+    UNDERWRITING_PACKAGE = "underwriting_package"
     OTHER = "other"
 
 
@@ -141,6 +145,8 @@ DOCUMENT_KIND_LABELS: dict[str, str] = {
     DocumentKind.VALUATION: "Valuation report",
     DocumentKind.TITLE: "Title and lien search",
     DocumentKind.SERVICING_SUMMARY: "Servicing agreement summary",
+    DocumentKind.EXECUTIVE_SUMMARY: "Executive credit brief",
+    DocumentKind.UNDERWRITING_PACKAGE: "Underwriting package",
     DocumentKind.OTHER: "Other document",
 }
 

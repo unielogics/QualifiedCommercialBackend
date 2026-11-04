@@ -465,6 +465,9 @@ class SourceLookup(BaseModel):
     listing: ListingRef | None = None
     underwriting_status: str | None = None
     has_term_sheet: bool = False
+    #: What the listing carries against the file now: published, up to date,
+    #: and which sections changed since the last push. None without a listing.
+    sync: dict[str, Any] | None = None
 
 
 class ListingProductIn(BaseModel):
@@ -577,6 +580,7 @@ class ListingAdminOut(ListingDetail):
     withdrawn_at: datetime | None
     withdrawn_reason: str | None
     source_snapshot: dict[str, Any]
+    sync: dict[str, Any] | None = None
     created_by_id: UUID | None
     created_at: datetime
     updated_at: datetime

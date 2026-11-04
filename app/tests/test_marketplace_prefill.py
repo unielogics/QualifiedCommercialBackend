@@ -153,3 +153,64 @@ def test_members_see_the_file_figures_and_the_plan_but_not_the_raw_snapshot() ->
     assert partner_financials(SimpleNamespace(source_snapshot={})) is None
     inactive = partner_financials(SimpleNamespace(source_snapshot={"financials": {"dscr": 1.1, "plan": {"active": False, "modifications": []}}}))
     assert "plan" not in inactive and inactive["dscr"] == 1.1
+
+
+def test_the_listing_knows_what_changed_on_the_file_since_the_last_push() -> None:
+    from types import SimpleNamespace
+
+    from app.capital_partners.services import sync
+
+    cockpit = {
+        "requested_amount": 70000.0,
+        "coverage": {"bank_months": 6, "bank_months_accepted": 6},
+        "bank": {"summary": {"avg_deposits": 57533.0, "annualized_deposits": 690000.0, "avg_net": -2447.0, "average_balance": 6477.0, "nsf_total": 12, "deposit_trend_pct": -12.6}},
+        "dscr": {"headline": {"key": "bank_cash_flow", "value": 0.8, "status": "concerning"}, "pro_forma_headline": None, "annual_debt_service": 143990.0, "proposed": None},
+        "net_profit": {"conclusion": {"key": "bank_cash_flow", "value": -29362.0, "period": "May–Oct 2026"}},
+        "tax": {"years": []},
+        "plan": {"record": {"note": None, "updated_at": "2026-11-04T01:00:00+00:00"}, "evaluation": {"active": False, "headline_after": 0.8, "debt_service_after_monthly": 11999.0}, "modifications": [], "impact": {"active": False, "loan": None}},
+    }
+    sections = sync.file_sections(cockpit, program_keys=["mca_refinance"], package=None)
+    assert sections["terms"]["proposed"] is None and sections["programs"] == ["mca_refinance"]
+    assert "generated_at" not in sections["figures"] and "plan" not in sections["figures"]
+    current = sync.fingerprints(sections)
+
+    listing = SimpleNamespace(source_snapshot={}, status="draft")
+    state = sync.sync_state(listing, current)
+    assert state["published"] is False and state["up_to_date"] is False
+    assert {c["key"] for c in state["changed"]} == {"figures", "plan", "terms", "programs"}  # no package yet, so it is not "changed"
+
+    sync.mark_published(listing, current, by=None)
+    assert sync.sync_state(listing, current)["up_to_date"] is True
+
+    # The desk saves a plan with a loan: the plan and the terms move, the figures do not.
+    moved = dict(cockpit)
+    moved["plan"] = {**cockpit["plan"], "evaluation": {"active": True, "headline_after": 1.6, "debt_service_after_monthly": 6000.0}, "modifications": [{"kind": "loan", "label": "New loan", "detail": None}], "impact": {"active": True, "loan": {"amount": 150000.0, "rate_pct": 12.0, "term_months": None, "interest_only": True, "payment_monthly": 1500.0}}}
+    after = sync.fingerprints(sync.file_sections(moved, program_keys=["mca_refinance"], package=None))
+    changed = {c["key"]: c["label"] for c in sync.sync_state(listing, after)["changed"]}
+    assert set(changed) == {"plan", "terms", "figures"} and changed["terms"] == "Proposed terms"  # figures carry dscr_after_plan
+    assert sync.proposed_terms(moved) == {"source": "plan", "label": "The desk's plan", "amount": 150000.0, "rate_pct": 12.0, "term_months": None, "monthly_payment": 1500.0, "interest_only": True}
+
+    # A refresh stamps the snapshot sections but not the package; a package push stamps everything.
+    sync.mark_published(listing, after, by=None, keys=["figures", "plan", "terms", "programs"])
+    with_package = sync.fingerprints(sync.file_sections(moved, program_keys=["mca_refinance"], package={"generation_id": "g1"}))
+    assert [c["key"] for c in sync.sync_state(listing, with_package)["changed"]] == ["package"]
+    sync.mark_published(listing, with_package, by=None, package={"generation_id": "g1", "documents": []})
+    state = sync.sync_state(listing, with_package)
+    assert state["up_to_date"] and state["package"]["generation_id"] == "g1"
+
+
+def test_the_package_prints_proposed_terms_and_the_plan_for_every_client() -> None:
+    from app.services.public_underwriting_packet_pdf import _plan_section
+
+    assert _plan_section({}) == ""
+    terms_only = _plan_section({"proposed_terms": {"source": "term_sheet", "amount": 100000, "rate_pct": 10, "term_months": 60, "monthly_payment": 2124.7, "interest_only": False}})
+    assert "Proposed terms (recorded term sheet)" in terms_only and "$100,000" in terms_only and "over 60 months" in terms_only
+    html = _plan_section({
+        "proposed_terms": {"source": "plan", "amount": 150000, "rate_pct": 12, "term_months": None, "monthly_payment": 1500, "interest_only": True},
+        "plan": {"active": True, "modifications": [{"label": "Pay off OnDeck with the new loan", "detail": "Its 5,850 a month stops."}], "impact": {"dscr": {"before": 0.8, "after": 1.62, "change": 0.82, "basis": "bank_cash_flow"}, "debt_service_monthly": {"before": 11897, "after": 6647, "change": -5250}}, "note": "Refinance at closing"},
+    })
+    assert "the desk's plan" in html and "interest-only" in html and "principal at maturity" in html
+    assert "0.80x" in html and "1.62x" in html and "+0.82x" in html and "−$5,250" in html
+    assert "Pay off OnDeck with the new loan" in html and "Refinance at closing" in html
+    compact = _plan_section({"plan": {"active": True, "modifications": [{"label": "x"}], "impact": {"dscr": {"before": 0.8, "after": 1.1, "change": 0.3}}}}, compact=True)
+    assert "<ul>" not in compact and "0.80x" in compact
