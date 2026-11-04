@@ -388,31 +388,202 @@ def _bank_stem(bank: str) -> str:
     return words[0] if words else ""
 
 
-def _account_identity(facts: dict[str, Any], row: dict[str, Any]) -> tuple[str, str]:
-    bank = str(row.get("bank") or facts.get("bank") or "").strip()
-    last4 = re.sub(r"\D", "", str(row.get("account_last4") or facts.get("account_last4") or ""))[
-        -4:
-    ]
+#: Where a reader puts the other accounts a consolidated statement lists.
+_SUB_ACCOUNT_LISTS = ("sub_accounts", "accounts", "accounts_summary")
+_STATEMENT_AMOUNT_KEYS = (
+    "beginning_balance",
+    "ending_balance",
+    "total_deposits_and_credits",
+    "total_withdrawals_and_debits",
+    "average_ledger_balance",
+    "low_daily_balance",
+)
+
+
+def _last4(value: Any) -> str:
+    """The last four digits of whatever the reader printed: "x4884",
+    "Bus Plus Checking – …0865"."""
+    return re.sub(r"\D", "", str(value or ""))[-4:]
+
+
+def _entry_last4(entry: dict[str, Any]) -> str:
+    return _last4(entry.get("account_last4") or entry.get("account_number"))
+
+
+def _entry_label(entry: dict[str, Any]) -> str:
+    return str(
+        entry.get("account_label") or entry.get("account_name") or entry.get("account_type") or ""
+    ).strip()
+
+
+def _activity(entry: dict[str, Any]) -> float:
+    return abs(_num(entry.get("total_deposits_and_credits")) or 0) + abs(
+        _num(entry.get("total_withdrawals_and_debits")) or 0
+    )
+
+
+def _figures_present(entry: dict[str, Any]) -> int:
+    return sum(1 for key in _STATEMENT_AMOUNT_KEYS if _num(entry.get(key)) is not None)
+
+
+def _sub_accounts_of(row: dict[str, Any]) -> list[dict[str, Any]]:
+    """The accounts a consolidated statement lists inside one row, if the
+    reader put them there (sub_accounts, or its ad-hoc accounts lists)."""
+    for field in _SUB_ACCOUNT_LISTS:
+        entries = row.get(field)
+        if isinstance(entries, list) and any(isinstance(e, dict) for e in entries):
+            return [e for e in entries if isinstance(e, dict)]
+    return []
+
+
+def _primary_entry(entries: list[dict[str, Any]], preferred_last4: str) -> dict[str, Any] | None:
+    """Of the accounts one statement lists, the statement's own: the one
+    carrying the statement's digits, else the one with the activity."""
+    if not entries:
+        return None
+    if preferred_last4:
+        for entry in entries:
+            if _entry_last4(entry) == preferred_last4:
+                return entry
+    return max(entries, key=lambda e: (_activity(e), _figures_present(e)))
+
+
+def file_account_identity(facts: dict[str, Any]) -> tuple[str, str, str]:
+    """The account a statement is FOR: key, label and last four digits.
+
+    One statement file is one account. The digits are the statement's own
+    (account_last4, or the primary account the reader named in words), never
+    the other accounts a consolidated statement lists or the counterparties on
+    its transfer lines. When the file's month rows all carry the same digits
+    those are the account's; when the statement lists several accounts, the
+    one with the activity is the statement's account, and an account the
+    reader listed with no activity is not trusted to name the statement at
+    all (it folds into the bank's known account instead).
+    """
+    bank = str(facts.get("bank") or "").strip()
+    rows_raw = facts.get("months")
+    rows = [m for m in rows_raw if isinstance(m, dict)] if isinstance(rows_raw, list) else []
+    if not bank:
+        bank = next((str(r.get("bank")).strip() for r in rows if r.get("bank")), "")
+    last4 = (
+        _last4(facts.get("account_last4"))
+        or _last4(facts.get("primary_account_last4"))
+        or _last4(facts.get("primary_account"))
+    )
+    if not last4:
+        row_digits = {d for d in (_last4(r.get("account_last4")) for r in rows) if d}
+        if len(row_digits) == 1:
+            last4 = row_digits.pop()
+        else:
+            listed = [entry for source in (rows or [facts]) for entry in _sub_accounts_of(source)]
+            if not listed and len(row_digits) > 1:
+                listed = rows  # one "month" row per account of the same statement
+            primary = _primary_entry(listed, "")
+            if primary is not None and _activity(primary) > 0:
+                last4 = _entry_last4(primary)
     stem = _bank_stem(bank)
     key = (
         f"{stem} ••{last4}" if last4 and stem else (f"••{last4}" if last4 else (stem or "account"))
     )
     label = " ".join(part for part in (bank, f"••{last4}" if last4 else "") if part) or "Account"
-    return key, label
+    return key, label, last4
 
 
 def account_key_of(facts: Any) -> str:
     """The account a statement belongs to, as the cockpit names it."""
-    return _account_identity(facts if isinstance(facts, dict) else {}, {})[0]
+    return file_account_identity(facts if isinstance(facts, dict) else {})[0]
 
 
 def bank_file_counted(analysis_payload: Any, counted: list[str] | None) -> bool:
     """Does a statement's account count on the file? Every account counts
-    until the desk chooses; after that only the chosen keys do."""
+    until the desk chooses; after that only the chosen keys do. A statement
+    the reader could not pin to a last-four counts with its bank's only
+    counted account, as the cockpit folds it."""
     if not counted:
         return True
     facts = analysis_payload.get("key_facts") if isinstance(analysis_payload, dict) else None
-    return account_key_of(facts) in set(counted)
+    key = account_key_of(facts)
+    chosen = set(counted)
+    if key in chosen:
+        return True
+    if "••" not in key:
+        return len([k for k in chosen if k.startswith(f"{key} ••")]) == 1
+    return False
+
+
+def _file_month_records(item: dict[str, Any]) -> tuple[tuple[str, str, str], list[dict[str, Any]]]:
+    """One statement file: its account identity and one record per month.
+
+    A consolidated statement lists several accounts for the same month (the
+    checking with the activity, a savings, empty share accounts); those never
+    become accounts of their own. The statement's account gets the month,
+    the other accounts ride along as `other_accounts`, and when the reader
+    gave no figures for the statement's own account the combined totals it
+    printed stand in.
+    """
+    facts = item.get("key_facts") or {}
+    if not isinstance(facts, dict):
+        return ("account", "Account", ""), []
+    identity = file_account_identity(facts)
+    _key, _label, last4 = identity
+    rows_raw = facts.get("months")
+    rows = (
+        [m for m in rows_raw if isinstance(m, dict)]
+        if isinstance(rows_raw, list) and rows_raw
+        else [facts]
+    )
+    hint = item.get("period_hint") if len(rows) == 1 else None
+    by_month: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for row in rows:
+        month = (
+            statement_period_month(row.get("statement_period"))
+            or (statement_period_month(facts.get("statement_period")) if row is not facts else None)
+            or hint
+        )
+        if not month:
+            continue
+        listed = _sub_accounts_of(row)
+        for entry in listed or [row]:
+            by_month.setdefault(month, []).append((entry, row))
+    records: list[dict[str, Any]] = []
+    for month, candidates in by_month.items():
+        entries = [entry for entry, _row in candidates]
+        primary = _primary_entry(entries, last4) if len(entries) > 1 else entries[0]
+        row = next(r for entry, r in candidates if entry is primary)
+        if primary is row:
+            source = dict(row)
+        else:
+            source = {**row, **{k: v for k, v in primary.items() if v is not None}}
+        totals = row.get("combined_totals")
+        if (
+            primary is not row
+            and isinstance(totals, dict)
+            and _activity(primary) == 0
+            and _activity(totals) > 0
+        ):
+            source.update(
+                {k: v for k, v in totals.items() if v is not None and k in _STATEMENT_AMOUNT_KEYS}
+            )
+            if (
+                totals.get("previous_balance") is not None
+                and totals.get("beginning_balance") is None
+            ):
+                source["beginning_balance"] = totals["previous_balance"]
+        source["statement_period"] = row.get("statement_period") or facts.get("statement_period")
+        record = _statement_record(source, period_hint=month)
+        if record is None:
+            continue
+        record["other_accounts"] = [
+            {
+                "last4": _entry_last4(entry),
+                "label": _entry_label(entry),
+                "ending_balance": _num(entry.get("ending_balance")),
+            }
+            for entry in entries
+            if entry is not primary and _entry_last4(entry)
+        ]
+        records.append(record)
+    return identity, records
 
 
 def resolve_alias(key: str, aliases: dict[str, str] | None) -> str:
@@ -449,27 +620,18 @@ def bank_months(
     for item in analyses:
         if "bank_statement" not in _classes(item):
             continue
-        facts = item.get("key_facts") or {}
-        if not isinstance(facts, dict):
+        (key, label, _digits), records = _file_month_records(item)
+        if not records:
             continue
-        rows = facts.get("months")
-        candidates = (
-            [m for m in rows if isinstance(m, dict)] if isinstance(rows, list) and rows else [facts]
-        )
-        for row in candidates:
-            hint = item.get("period_hint") if len(candidates) == 1 else None
-            record = _statement_record(row, period_hint=hint)
-            if record is None:
-                continue
-            key, label = _account_identity(facts, row)
-            canonical = resolve_alias(key, aliases)
-            if canonical != key:
-                labels.setdefault(canonical, label)
-                members.setdefault(canonical, set()).add(key)
-                key = canonical
-            else:
-                labels[key] = label
-            members.setdefault(key, set()).add(key)
+        canonical = resolve_alias(key, aliases)
+        if canonical != key:
+            labels.setdefault(canonical, label)
+            members.setdefault(canonical, set()).add(key)
+            key = canonical
+        else:
+            labels[key] = label
+        members.setdefault(key, set()).add(key)
+        for record in records:
             record["file_id"] = str(item.get("file_id") or "")
             record["accepted"] = bool(item.get("accepted"))
             slot = per_account.setdefault(key, {})
@@ -538,9 +700,15 @@ def bank_months(
     accounts = []
     for key, months in sorted(per_account.items(), key=lambda kv: labels[kv[0]]):
         series = []
+        subs: dict[str, dict[str, Any]] = {}
         for month_key in sorted(months):
             record = dict(months[month_key])
             file_id = record.pop("file_id", None)
+            for other in record.pop("other_accounts", None) or []:
+                subs[other["last4"]] = {
+                    **subs.get(other["last4"], {}),
+                    **{k: v for k, v in other.items() if v not in (None, "")},
+                }
             record["label"] = month_label(month_key)
             record["accounts"] = [labels[key]]
             record["file_ids"] = [file_id] if file_id else []
@@ -557,6 +725,9 @@ def bank_months(
                 "series": series,
                 "counted": key in counted_keys,
                 "members": sorted(members.get(key) or {key}),
+                # Accounts the statements list beside this one (a savings, empty
+                # share accounts): seen, named, never accounts of their own.
+                "sub_accounts": [subs[k] for k in sorted(subs)],
             }
         )
     return months_out, accounts
@@ -1167,8 +1338,8 @@ def recurring_payments(
             continue
         months_read.update(months_all)
         facts = item.get("key_facts") or {}
-        _account_key, account_label = _account_identity(
-            facts if isinstance(facts, dict) else {}, {}
+        _account_key, account_label, _digits = file_account_identity(
+            facts if isinstance(facts, dict) else {}
         )
         for months, entry in entries:
             payee = str(
@@ -2248,6 +2419,7 @@ async def bank_accounts_for_profile(
             "counted": a["counted"],
             "latest_month": a["months"][-1] if a["months"] else None,
             "members": a.get("members") or [a["key"]],
+            "sub_accounts": a.get("sub_accounts") or [],
         }
         for a in accounts
     ]

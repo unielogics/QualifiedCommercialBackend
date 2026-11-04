@@ -91,6 +91,9 @@ class BankAccountRead(BaseModel):
     latest_month: str | None = None
     #: The detected keys folded into this account (itself included).
     members: list[str] = Field(default_factory=list)
+    #: Accounts the statements list beside this one (savings, empty shares):
+    #: {last4, label, ending_balance}. Seen and named, never accounts of their own.
+    sub_accounts: list[dict] = Field(default_factory=list)
 
 
 class BankAccountsRead(BaseModel):

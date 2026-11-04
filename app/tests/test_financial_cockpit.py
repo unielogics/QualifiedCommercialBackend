@@ -900,3 +900,51 @@ def test_a_voided_schedule_means_no_debt_service_unless_the_statements_disagree(
     plain = build_cockpit([TAX_2025], [], proposed_terms=TERM_SHEET)
     assert plain["debt"]["schedule"]["status"] == "missing" and plain["dscr"]["no_debt"] is False
     assert any("not been requested" in note for note in plain["notes"])
+
+
+def test_a_consolidated_statement_is_one_account_whatever_it_lists() -> None:
+    """The Navy Federal shape: one member statement lists six share accounts.
+    Only the statement's own account becomes an account; the rest are named."""
+    from app.services.financial_cockpit import account_key_of, bank_file_counted
+
+    july_period = "2026-07-01 to 2026-07-31"
+    zero = {"beginning_balance": 0.0, "ending_balance": 0.0, "total_deposits_and_credits": 0.0, "total_withdrawals_and_debits": 0.0}
+    july = _file("jul", "bank_statement", {"bank": "Navy Federal Credit Union", "statement_period": july_period, "months": [
+        {"account_label": "Bus Plus Checking", "account_last4": "0865", "statement_period": july_period, "beginning_balance": 43583.17, "ending_balance": 25959.07, "total_deposits_and_credits": 495315.14, "total_withdrawals_and_debits": 512939.24},
+        *[{"account_label": f"Business Checking {d}", "account_last4": d, "statement_period": july_period, **zero} for d in ("8513", "8539", "8547", "8554")],
+        {"account_label": "Mbr Business Savings", "account_last4": "5087", "statement_period": july_period, "beginning_balance": 5.06, "ending_balance": 5.06, "total_deposits_and_credits": 0.0, "total_withdrawals_and_debits": 0.0},
+    ]})
+    march = _file("mar", "bank_statement", {"bank": "Navy Federal Credit Union", "months": [{"statement_period": "2026-03-01 to 2026-03-31", "accounts": [
+        {"account_name": "Bus Plus Checking", "account_last4": "0865", "beginning_balance": 133084.58, "ending_balance": 124421.34, "total_deposits_and_credits": 700070.86, "total_withdrawals_and_debits": 708734.1},
+        {"account_name": "Business Checking 8513", "account_last4": "8513", **zero},
+    ], "combined_totals": {"ending_balance": 124426.4, "previous_balance": 133089.64, "total_deposits_and_credits": 700070.86, "total_withdrawals_and_debits": 708734.1}}]})
+    april = _file("apr", "bank_statement", {"bank": "Navy Federal Credit Union", "primary_account": "Bus Plus Checking – 7000000865", "statement_period": "2026-04-01 to 2026-04-30", "beginning_balance": 124421.34, "ending_balance": 23942.24, "total_deposits_and_credits": 738065.75, "total_withdrawals_and_debits": 838544.85})
+    august = _file("aug", "bank_statement", {"bank": "Navy Federal Credit Union", "months": [{"statement_period": "2026-08-01 to 2026-08-31", "accounts_summary": [
+        {"account_type": "Business Checking", "account_last4": "8513", **zero}],
+        "combined_totals": {"ending_balance": 60533.07, "beginning_balance": 25964.13, "total_deposits_and_credits": 548596.23, "total_withdrawals_and_debits": 514027.29}}]})
+    atlantic = [_bank(f"au{i}", f"2026-{i:02d}-01 to 2026-{i:02d}-28", 2000000 + i, 1900000, bank="Atlantic Union Bank", last4="5045") for i in range(3, 9)]
+
+    months, accounts = bank_months([july, march, april, august, *atlantic])
+    assert [a["key"] for a in accounts] == ["atlantic ••5045", "navy ••0865"]
+    navy = accounts[1]
+    assert navy["months"] == ["2026-03", "2026-04", "2026-07", "2026-08"]
+    by_month = {m["month"]: m for m in navy["series"]}
+    assert by_month["2026-07"]["deposits"] == 495315.14 and by_month["2026-07"]["ending_balance"] == 25959.07
+    assert by_month["2026-03"]["deposits"] == 700070.86
+    assert by_month["2026-08"]["deposits"] == 548596.23  # the combined figure stands in for the missing own line
+    assert {s["last4"] for s in navy["sub_accounts"]} == {"8513", "8539", "8547", "8554", "5087"}
+    assert months[0]["month"] == "2026-03" and months[0]["deposits"] == 2000003 + 700070.86
+    assert account_key_of({"bank": "Navy Federal Credit Union", "primary_account": "Bus Plus Checking – 7000000865"}) == "navy ••0865"
+    assert account_key_of(august["key_facts"]) == "navy"  # an empty listed account never names the statement
+    assert bank_file_counted({"key_facts": august["key_facts"]}, ["navy ••0865"]) is True
+    assert bank_file_counted({"key_facts": august["key_facts"]}, ["atlantic ••5045"]) is False
+
+
+def test_a_multi_month_file_whose_rows_agree_on_the_digits_is_that_account() -> None:
+    six = _file("six", "bank_statement", {"bank": "Chase", "months": [
+        {"account_last4": "1204", "statement_period": f"2026-{i:02d}-01 to 2026-{i:02d}-28", "total_deposits_and_credits": 1000 * i, "total_withdrawals_and_debits": 500}
+        for i in range(1, 7)
+    ]})
+    _months, accounts = bank_months([six])
+    assert [a["key"] for a in accounts] == ["chase ••1204"] and accounts[0]["months"] == [f"2026-{i:02d}" for i in range(1, 7)]
+    assert accounts[0]["sub_accounts"] == []
