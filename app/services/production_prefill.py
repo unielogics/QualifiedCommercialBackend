@@ -46,6 +46,7 @@ SOURCE_LABELS: dict[str, str] = {
     # stored label names the person ("Linked profile of Jane Doe").
     "sponsor_default": "Linked profile",
     "document_extraction": "Read from an uploaded document",
+    "financial_plan": "Financial plan on the file",
 }
 
 _ENTITY_ALIASES: dict[str, str] = {
@@ -276,6 +277,19 @@ async def build_prefill(db: AsyncSession, profile: ApplicationProfile, actor: Us
     out.put("dealer_entity", normalize_entity_type(profile.entity_type), "profile")
     out.put("dealer_dba", _text(ident.get("dba")), "dealer")
 
+    # ---- the desk's financial plan on the file: original, modification, impact ----
+    # What the cockpit computed from the file plus the desk's decisions (payoffs,
+    # add-backs, overrides, the new loan). Advisory: a file the cockpit cannot
+    # read leaves these blank rather than failing the prefill.
+    try:
+        from app.services import financial_cockpit as cockpit_svc
+
+        cockpit = await cockpit_svc.load_cockpit(db, profile)
+    except Exception:  # noqa: BLE001 - the plan is one source among several
+        cockpit = None
+    if cockpit is not None:
+        plan_fields(out, cockpit_svc.plan_summary(cockpit), cockpit)
+
     # ---- what the documents already say ----
     # Below the typed columns: a human-entered value always wins over a reading.
     facts = await extracted_facts(db, profile)
@@ -341,6 +355,54 @@ async def build_prefill(db: AsyncSession, profile: ApplicationProfile, actor: Us
     return out
 
 
+_BASIS_LABELS = {
+    "tax_return": "Tax return EBITDA",
+    "profit_and_loss": "Profit and loss EBITDA",
+    "bank_cash_flow": "Bank cash flow",
+    "desk_override": "Desk figure",
+}
+
+
+def plan_fields(out: PrefillResult, summary: dict[str, Any], cockpit: dict[str, Any]) -> None:
+    """The plan onto the arrangement: before and after figures, the changes in
+    words, the new loan, when it was read. Nothing when there is no plan, so
+    the keys stay blank (and a prefill clears a plan that was later undone)."""
+    if not summary.get("active"):
+        return
+    impact = summary.get("impact") or {}
+
+    def pair(key: str, name: str) -> None:
+        values = impact.get(name) or {}
+        out.put(f"{key}_before", _number(values.get("before")), "financial_plan")
+        out.put(f"{key}_after", _number(values.get("after")), "financial_plan")
+
+    pair("plan_dscr", "dscr")
+    pair("plan_income", "income_annual")
+    pair("plan_debt_service", "debt_service_monthly")
+    pair("plan_net_cash", "net_cash_flow_monthly")
+    pair("plan_ending", "ending_balance")
+    basis = (impact.get("dscr") or {}).get("basis")
+    out.put("plan_dscr_basis", _BASIS_LABELS.get(str(basis or ""), str(basis or "")), "financial_plan")
+    lines = [
+        f"{m.get('label')}" + (f" — {m.get('detail')}" if m.get("detail") else "")
+        for m in summary.get("modifications") or []
+        if m.get("label")
+    ]
+    out.put("plan_modifications", "\n".join(lines), "financial_plan")
+    loan = impact.get("loan") or {}
+    if loan.get("amount"):
+        structure = "interest-only" if loan.get("interest_only") else f"over {loan.get('term_months')} months"
+        payment = loan.get("payment_monthly")
+        out.put(
+            "plan_loan",
+            f"{float(loan['amount']):,.0f} at {float(loan.get('rate_pct') or 0):g}% {structure}"
+            + (f": {float(payment):,.0f} a month" if payment else ""),
+            "financial_plan",
+        )
+    out.put("plan_note", _text(summary.get("note")), "financial_plan")
+    out.put("plan_as_of", _text(str(cockpit.get("generated_at") or "")[:10]), "financial_plan")
+
+
 def apply_prefill(
     arrangement: dict[str, Any],
     provenance: dict[str, Any],
@@ -356,13 +418,24 @@ def apply_prefill(
     wanted = set(fields) if fields else set(result.values)
     applied: list[str] = []
     skipped: list[str] = []
+    # The plan's figures are the file's, never the desk's typing: a prefill
+    # refreshes them every time, and clears the ones the plan no longer carries.
+    for key in (pa.PLAN_KEYS if not fields else pa.PLAN_KEYS & set(fields)):
+        if key not in result.values and base.get(key) not in ("", None):
+            base[key] = ""
+            prov.pop(key, None)
+            applied.append(key)
     for key in sorted(wanted):
         if key not in result.values or key not in pa.FIELD_RULES_BY_KEY:
             continue
         rule = pa.FIELD_RULES_BY_KEY[key]
         current = base.get(key)
         default = pa.DEFAULTS.get(key)
-        untouched = pa.is_blank(rule, current) or (default is not None and current == default and key not in prov)
+        untouched = (
+            pa.is_blank(rule, current)
+            or (default is not None and current == default and key not in prov)
+            or key in pa.PLAN_KEYS
+        )
         if not force and not untouched:
             skipped.append(key)
             continue

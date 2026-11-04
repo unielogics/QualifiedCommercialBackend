@@ -814,3 +814,65 @@ def test_the_proposal_prints_where_the_loan_goes_only_once_an_amount_is_entered(
     assert "Where the loan goes" in html and "floorplan relief" in html and "$700,000" in html
     assert "$500,000 of the request unallocated" in html
     assert "Previous contract repayment" not in html.split("Where the loan goes", 1)[1].split("</table>", 1)[0]
+
+
+def test_the_plan_fields_are_desk_only_and_a_prefill_refreshes_or_clears_them():
+    from app.services import production_arrangement as pa
+    from app.services import production_prefill as prefill
+
+    assert {"plan_dscr_before", "plan_dscr_after", "plan_modifications", "plan_loan"} <= pa.PLAN_KEYS <= pa.DESK_ONLY_KEYS
+    assert all(pa.FIELD_RULES_BY_KEY[k].required_for == "never" for k in pa.PLAN_KEYS)
+
+    cockpit = {"generated_at": "2026-11-04T01:00:00+00:00"}
+    summary = {
+        "active": True,
+        "modifications": [{"label": "Pay off OnDeck with the new loan", "detail": "Its 5,850 a month stops."}, {"label": "Add back officer compensation", "detail": None}],
+        "impact": {
+            "dscr": {"before": 0.8, "after": 1.62, "basis": "bank_cash_flow"},
+            "income_annual": {"before": 131063.0, "after": 227063.0},
+            "debt_service_monthly": {"before": 11897.0, "after": 6647.0},
+            "net_cash_flow_monthly": {"before": -2447.0, "after": 3400.0},
+            "ending_balance": {"before": 1600.0, "after": 18000.0},
+            "loan": {"amount": 150000.0, "rate_pct": 12.0, "term_months": None, "interest_only": True, "payment_monthly": 1500.0},
+        },
+        "note": "Refinance at closing",
+    }
+    result = prefill.PrefillResult()
+    prefill.plan_fields(result, summary, cockpit)
+    v = result.values
+    assert v["plan_dscr_before"] == 0.8 and v["plan_dscr_after"] == 1.62 and v["plan_dscr_basis"] == "Bank cash flow"
+    assert v["plan_modifications"] == "Pay off OnDeck with the new loan — Its 5,850 a month stops.\nAdd back officer compensation"
+    assert v["plan_loan"] == "150,000 at 12% interest-only: 1,500 a month" and v["plan_as_of"] == "2026-11-04"
+    assert all(result.provenance[k]["source"] == "financial_plan" for k in v if k.startswith("plan_"))
+
+    # Already-filled plan figures are refreshed without force; a typed field is not.
+    arrangement = {**pa.empty_arrangement(), "plan_dscr_after": 1.1, "requested": 90000}
+    typed = prefill.PrefillResult()
+    typed.put("requested", 120000, "intake")
+    typed.put("plan_dscr_after", 1.62, "financial_plan")
+    base, prov, applied, skipped = prefill.apply_prefill(arrangement, {}, typed)
+    assert base["plan_dscr_after"] == 1.62 and "plan_dscr_after" in applied and prov["plan_dscr_after"]["source"] == "financial_plan"
+    assert base["requested"] == 90000 and "requested" in skipped
+
+    # A plan that was undone clears what it had printed.
+    gone = prefill.PrefillResult()
+    cleared, prov2, applied2, _s = prefill.apply_prefill({**pa.empty_arrangement(), "plan_dscr_after": 1.62, "plan_loan": "x"}, {"plan_loan": {"source": "financial_plan"}}, gone)
+    assert cleared["plan_dscr_after"] == "" and cleared["plan_loan"] == "" and "plan_loan" not in prov2 and set(applied2) == {"plan_dscr_after", "plan_loan"}
+
+    quiet = prefill.PrefillResult()
+    prefill.plan_fields(quiet, {"active": False, "modifications": [], "impact": {}}, cockpit)
+    assert quiet.values == {}
+
+
+def test_the_presentation_prints_the_plan_as_original_modification_impact():
+    from app.services import production_arrangement as pa
+    from app.services import production_presentation as pres
+
+    arr = {**pa.empty_arrangement(), "plan_dscr_before": 0.8, "plan_dscr_after": 1.62, "plan_dscr_basis": "Bank cash flow",
+           "plan_debt_service_before": 11897, "plan_debt_service_after": 6647, "plan_modifications": "Pay off OnDeck with the new loan\nAdd back officer compensation",
+           "plan_loan": "150,000 at 12% interest-only: 1,500 a month"}
+    html = pres.build_presentation_html(arr, pa.compute(arr, stage=1), meta={"snapshot_short": "abc", "generated_label": "now"})
+    assert "5a. The business after the plan" in html and "0.80x" in html and "1.62x" in html and "+0.82x" in html
+    assert "Pay off OnDeck with the new loan" in html and "150,000 at 12% interest-only" in html
+    plain = pres.build_presentation_html(pa.empty_arrangement(), pa.compute(pa.empty_arrangement(), stage=1), meta={"snapshot_short": "abc", "generated_label": "now"})
+    assert "5a. The business after the plan" not in plain

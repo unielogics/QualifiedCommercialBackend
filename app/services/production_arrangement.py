@@ -299,6 +299,25 @@ FIELD_RULES: tuple[FieldRule, ...] = (
     FieldRule("mgmt_fee", "advance", "Programme management (monthly)", kind="number"),
     FieldRule("loss_prov", "advance", "Loss provision (%)", kind="number"),
     FieldRule("fund_target", "buildout", "Share of payment policies should fund (%)", kind="number"),
+    # ---- the desk's financial plan on the file: original, modification, impact ----
+    # Prefilled from the financial cockpit, never typed: what the desk changed
+    # (payoffs, add-backs, overrides, the new loan) and what it does to the
+    # figures. Desk-only by step; refreshed on every prefill.
+    FieldRule("plan_dscr_before", "advance", "Debt service coverage, original", kind="number"),
+    FieldRule("plan_dscr_after", "advance", "Debt service coverage, with the plan", kind="number"),
+    FieldRule("plan_dscr_basis", "advance", "Coverage basis"),
+    FieldRule("plan_income_before", "advance", "Income available for debt service, original (a year)", kind="number"),
+    FieldRule("plan_income_after", "advance", "Income available for debt service, with the plan (a year)", kind="number"),
+    FieldRule("plan_debt_service_before", "advance", "Debt service, original (a month)", kind="number"),
+    FieldRule("plan_debt_service_after", "advance", "Debt service, with the plan (a month)", kind="number"),
+    FieldRule("plan_net_cash_before", "advance", "Net cash flow, original (a month)", kind="number"),
+    FieldRule("plan_net_cash_after", "advance", "Net cash flow, with the plan (a month)", kind="number"),
+    FieldRule("plan_ending_before", "advance", "Ending balance, original (last month)", kind="number"),
+    FieldRule("plan_ending_after", "advance", "Ending balance, with the plan (last month)", kind="number"),
+    FieldRule("plan_loan", "advance", "New loan in the plan"),
+    FieldRule("plan_modifications", "advance", "What the plan changes", kind="textarea"),
+    FieldRule("plan_note", "advance", "Plan note"),
+    FieldRule("plan_as_of", "advance", "Plan figures as of"),
     FieldRule("debt_service", "advance", "Monthly program coverage amount", kind="number", required_for="presentation",
               non_zero=True, title="Monthly program coverage is not set",
               detail="The minimum remittance covenant is 125% of the program coverage amount — it cannot be derived until this is filled.",
@@ -403,6 +422,8 @@ FIELD_RULES: tuple[FieldRule, ...] = (
       for i in (1, 2, 3, 4) for f, lbl in (("name", "legal name"), ("rel", "existing relationship"), ("info", "supporting information"))],
 )
 FIELD_RULES_BY_KEY: dict[str, FieldRule] = {r.key: r for r in FIELD_RULES}
+#: The financial plan's keys: system-derived, refreshed on every prefill, never typed.
+PLAN_KEYS: frozenset[str] = frozenset(r.key for r in FIELD_RULES if r.key.startswith("plan_"))
 FIELD_KEYS: frozenset[str] = frozenset(FIELD_RULES_BY_KEY)
 NUMBER_KEYS: frozenset[str] = frozenset(r.key for r in FIELD_RULES if r.kind == "number")
 # Keys the term sheet owns on the final; the desk changes them on the sheet, not the form.
