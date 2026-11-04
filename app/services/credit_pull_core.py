@@ -110,7 +110,11 @@ def credit_status_extras(pull: CreditPull | None) -> dict:
     response = pull.bureau_response if isinstance(pull.bureau_response, dict) else {}
     verified = pull.fico is not None and source != PROXY_FICO_SOURCE
     if pull.fico is None:
-        attention = "The bureau returned no score; a person needs to review the report or re-run with the SSN."
+        attention = (
+            "The linked report has not been imported. Import the existing report to retrieve its score; do not run a new pull."
+            if not response.get("parsed_report") and not response.get("full_feed")
+            else "No score was extracted from the imported report. Review the report and score model before requesting another pull."
+        )
     elif source == PROXY_FICO_SOURCE:
         attention = "The bureau returned no score; the 720 shown is a stand-in from the identity check, not a bureau score."
     else:
@@ -118,7 +122,7 @@ def credit_status_extras(pull: CreditPull | None) -> dict:
     return {
         "fico_source": source,
         "score_verified": verified,
-        "report_available": bool(response.get("report_s3_key")),
+        "report_available": bool(response.get("report_s3_key") or response.get("parsed_report") or response.get("full_feed")),
         "attention": attention,
     }
 
@@ -398,15 +402,19 @@ async def run_soft_pull(
         effective_fico = result.fico
         fico_source = "full_feed" if result.fico is not None else None
 
-        scraped = None
+        scraped = isoftpull_report_parser.parse_full_feed(result.raw or {})
         report_html = None
-        if result.report_link:
+        if result.report_link and scraped is None:
             # The page is fetched whether or not a score is still needed: it
             # is the report, and the desk wants it on file either way.
             scraped, report_html = await isoftpull_report_parser.fetch_report(result.report_link)
             if effective_fico is None and scraped and scraped.best_score is not None:
                 effective_fico = scraped.best_score
                 fico_source = f"scraped:{scraped.best_score_model}"
+
+        if effective_fico is None and scraped and scraped.best_score is not None:
+            effective_fico = scraped.best_score
+            fico_source = f"full_feed:{scraped.best_score_model}" if (result.raw or {}).get("full_feed") else f"scraped:{scraped.best_score_model}"
 
         if effective_fico is None and result.intelligence_passed:
             effective_fico = INTELLIGENCE_PASSED_PROXY_FICO

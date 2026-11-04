@@ -116,7 +116,7 @@ def _date_words(value: Any) -> str:
         except ValueError:
             return value
     if isinstance(value, datetime):
-        return value.strftime("%b %-d, %Y")
+        return f"{value:%b} {value.day}, {value:%Y}"
     return "an unknown date"
 
 

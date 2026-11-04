@@ -157,7 +157,7 @@ async def test_candidates_put_the_linked_and_the_exact_first() -> None:
     assert [c.level for c in candidates] == ["exact", "exact", "likely", "weak"]
     first = candidates[0].read()
     assert first["linked_to_this_owner"] and first["confidence"] == "exact" and first["why"] == "Name matches on this client"
-    assert first["score"] is None and first["attention"].startswith("The bureau returned no score")
+    assert first["score"] is None and first["attention"].startswith("The linked report has not been imported")
 
 
 async def test_candidates_need_a_client_or_a_name() -> None:
@@ -179,7 +179,7 @@ async def test_linking_points_both_ways_and_fills_the_owner_identity(quiet) -> N
     assert owner.credit_pull_id == pull.id and owner.credit_pulled_at == PULLED
     assert owner.credit_score is None and owner.credit_tier is None
     assert owner.credit_summary["linked_how"] == "manual"
-    assert owner.credit_summary["attention"].startswith("The bureau returned no score")
+    assert owner.credit_summary["attention"].startswith("The linked report has not been imported")
     assert (owner.dob, owner.street, owner.city, owner.state, owner.zip) == (date(1979, 4, 2), "1 Main St", "Miami", "FL", "33101")
     assert result["words"] == "Linked by hand: pull from Nov 3, 2026, no score returned, to Linda Louis"
     assert result["intake_id"] == str(profile.intake_id)

@@ -39,6 +39,10 @@ class IsoftpullSessionError(Exception):
     """Login or session-renewal failed."""
 
 
+class IsoftpullTermsRequired(IsoftpullSessionError):
+    """The provider account holder must accept updated terms themselves."""
+
+
 @dataclass
 class _CachedSession:
     client: httpx.AsyncClient
@@ -134,6 +138,12 @@ class IsoftpullSession:
 
         `url` may be a full https URL or a path relative to the dashboard.
         """
+        from urllib.parse import urljoin, urlsplit
+
+        base = get_settings().isoftpull_dashboard_url
+        target = urlsplit(urljoin(base, url))
+        if target.scheme != "https" or target.netloc != urlsplit(base).netloc:
+            raise IsoftpullSessionError("Refusing a report URL outside the configured provider domain")
         client = await self.get()
         # follow_redirects=False so we can detect session expiration cleanly.
         resp = await client.get(url, follow_redirects=False)
@@ -148,6 +158,17 @@ class IsoftpullSession:
         # decide. If we got a 2xx, return as-is.
         if 300 <= resp.status_code < 400 and "/users/sign_in" in (resp.headers.get("location") or ""):
             raise IsoftpullSessionError("session refresh failed: still bouncing to /sign_in")
+        if resp.status_code == 403:
+            try:
+                code = resp.json().get("error")
+            except (ValueError, AttributeError):
+                code = None
+            if code == "terms_not_accepted":
+                raise IsoftpullTermsRequired(
+                    "The iSoftPull service account must accept its updated terms before reports can be imported. "
+                    "Sign in to iSoftPull with that account and complete Terms Acceptance, then retry. "
+                    "No new credit pull was made."
+                )
         return resp
 
 

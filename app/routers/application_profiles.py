@@ -3046,6 +3046,14 @@ async def link_owner_credit(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "This pull was run for another client. Confirm it is the same person to link it.",
         )
+    from app.services.credit_report_import import ReportImportUnavailable, import_existing_report
+
+    try:
+        await import_existing_report(db, pull)
+    except ReportImportUnavailable:
+        # Keep the association even if provider access needs attention. The
+        # owner still gets an explicit import-pending status, never a fake score.
+        pass
     try:
         await credit_links.link_pull(db, profile, owner, pull, actor=user, how=credit_links.HOW_MANUAL)
     except credit_links.LinkConflict as conflict:
@@ -3069,6 +3077,48 @@ async def unlink_owner_credit(
     await db.commit()
     await db.refresh(owner)
     return profiles.owner_read(owner)
+
+
+@router.get("/{profile_id}/owners/{owner_id}/credit-report")
+async def owner_credit_report(
+    profile_id: UUID, owner_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> dict:
+    from app.services.credit_report_import import stored_report
+
+    if _role_value(user) not in ("super_admin", "loan_exec", "broker"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator-only")
+    profile = await profiles.load_profile(db, profile_id, user)
+    owner = await _owner_for_profile(db, profile, owner_id)
+    pull = await db.get(CreditPull, owner.credit_pull_id) if owner.credit_pull_id else None
+    if pull is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No linked credit pull")
+    return {"owner": profiles.owner_read(owner), "report": stored_report(pull.bureau_response or {})}
+
+
+@router.post("/{profile_id}/owners/{owner_id}/credit-report/import")
+async def import_owner_credit_report(
+    profile_id: UUID, owner_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> dict:
+    from app.services.credit_report_import import ReportImportUnavailable, import_existing_report
+
+    if _role_value(user) not in ("super_admin", "loan_exec", "broker"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator-only")
+    profile = await profiles.load_profile(db, profile_id, user)
+    owner = await _owner_for_profile(db, profile, owner_id)
+    pull = await db.get(CreditPull, owner.credit_pull_id) if owner.credit_pull_id else None
+    if pull is None or not credit_links.is_completed(pull):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No completed linked credit pull")
+    try:
+        report = await import_existing_report(db, pull)
+    except ReportImportUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    await profiles.log_profile_action(
+        db, profile, user, "owner.credit_report_imported", "Imported the existing credit report; no new inquiry",
+        target_type="owner", target_id=owner.id, metadata={"pull_id": str(pull.id), "score": pull.fico},
+    )
+    await db.commit()
+    await db.refresh(owner)
+    return {"owner": profiles.owner_read(owner), "report": report}
 
 
 @router.post("/{profile_id}/credit-links/auto", response_model=ProfileCreditLinkReport)

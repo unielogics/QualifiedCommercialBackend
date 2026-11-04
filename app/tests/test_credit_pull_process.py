@@ -45,7 +45,7 @@ def test_status_extras_say_when_the_number_is_not_a_bureau_score() -> None:
     proxy = credit_pull_core.credit_status_extras(_pull(fico=720, notes="fico_source=intelligence-proxy"))
     assert proxy["score_verified"] is False and "stand-in" in proxy["attention"]
     none = credit_pull_core.credit_status_extras(_pull(fico=None, notes="isoftpull_id=x"))
-    assert none["score_verified"] is False and "no score" in none["attention"]
+    assert none["score_verified"] is False and "not been imported" in none["attention"]
     assert credit_pull_core.credit_status_extras(None)["report_available"] is False
 
 

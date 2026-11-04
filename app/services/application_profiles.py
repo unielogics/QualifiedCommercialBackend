@@ -1185,6 +1185,9 @@ async def resolve_profile(
 def owner_read(owner: ApplicationOwner | DealerOwner) -> FileOwnerRead:
     summary = getattr(owner, "credit_summary", None)
     summary = summary if isinstance(summary, dict) else {}
+    attention = summary.get("attention")
+    if owner.credit_score is None and str(attention or "").startswith("The bureau returned no score;"):
+        attention = "The report is linked, but its score has not been imported. Import the existing report; do not request a new pull."
     return FileOwnerRead(
         id=owner.id,
         full_name=owner.full_name,
@@ -1214,7 +1217,7 @@ def owner_read(owner: ApplicationOwner | DealerOwner) -> FileOwnerRead:
         credit_score_verified=bool(summary.get("score_verified")),
         credit_report_available=bool(summary.get("report_available")),
         credit_link_how=summary.get("linked_how"),
-        credit_attention=summary.get("attention"),
+        credit_attention=attention,
         credit_expires_at=summary.get("expires_at"),
         backfill_needs_review=getattr(owner, "backfill_needs_review", False),
         source="dealer" if isinstance(owner, DealerOwner) else "application",
