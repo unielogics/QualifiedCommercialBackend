@@ -4,6 +4,7 @@ import asyncio
 import base64
 import codecs
 import csv
+import dataclasses
 import hashlib
 import json
 import logging
@@ -42,7 +43,12 @@ from app.models.bucket import (
     BucketVendorAccess,
 )
 from app.models.user import User
-from app.services import mca_refinance_policy, merchant_processing, provenance
+from app.services import (
+    bank_transactions_export,
+    mca_refinance_policy,
+    merchant_processing,
+    provenance,
+)
 from app.services.ai.bedrock_client import get_client, model_heavy, model_light
 from app.services.ai.structured_output import is_truncated_response, require_complete_response
 from app.services.ai.usage import _usage_tokens, json_safe_metadata, tracked_messages_create
@@ -2213,6 +2219,44 @@ _SPREADSHEET_SKIPS: dict[tuple[str, str], tuple[str, str]] = {
 }
 
 
+# A transactions export is read whole (the model's row cap does not apply):
+# the months are computed from every row, not from the first few hundred.
+_EXPORT_LIMITS = dataclasses.replace(spreadsheets.DEFAULT_LIMITS, rows=bank_transactions_export.MAX_ROWS, cols=60, formulas=0)
+
+
+def _transactions_export_facts(file: BucketFile, raw: bytes, content_type: str) -> dict[str, Any] | None:
+    """The statement months a bank transactions export yields, computed from
+    its rows; None when the file is not a spreadsheet or holds no such table."""
+    kind = spreadsheets.sniff_kind(raw, declared_content_type=content_type or "", file_name=file.file_name or "")
+    if kind not in {"csv", "xlsx", "xls"}:
+        return None
+    try:
+        workbook = spreadsheets.read_workbook(raw, kind, limits=_EXPORT_LIMITS, file_name=file.file_name or "")
+        return bank_transactions_export.read_export(workbook, file_name=file.file_name or "")
+    except Exception:  # noqa: BLE001 - the model's read still stands
+        log.exception("transactions export read failed file=%s", getattr(file, "id", None))
+        return None
+
+
+_EXPORT_RECLASSIFY = {"", "other", "unknown", "spreadsheet", "financial_spreadsheet", "bank_statement", "bank_transactions", "transaction_history", "transactions"}
+
+
+def _apply_transactions_export(row: BucketFileAnalysis, facts: dict[str, Any]) -> None:
+    """The computed months replace the model's arithmetic for an export; the
+    model's other facts stay. The file reads as a bank statement."""
+    analysis = row.analysis if isinstance(row.analysis, dict) else {}
+    model_facts = analysis.get("key_facts") if isinstance(analysis.get("key_facts"), dict) else {}
+    analysis["key_facts"] = {**model_facts, **facts}
+    note = bank_transactions_export.describe(facts)
+    analysis["limitations"] = [*(analysis.get("limitations") or []), note]
+    analysis["read_warnings"] = [*(analysis.get("read_warnings") or []), note]
+    analysis["transactions_export"] = {"source": facts.get("source"), "months": len(facts.get("months") or []), "transactions_read": facts.get("transactions_read")}
+    row.analysis = analysis
+    current = str(row.classification or "").strip().lower()
+    if current in _EXPORT_RECLASSIFY or "transaction" in current or "statement" in current:
+        row.classification = "bank_statement"
+
+
 def _read_spreadsheet(
     file: BucketFile, raw: bytes, kind: str, *, display_name: str | None = None
 ) -> tuple[spreadsheets.Workbook | None, tuple[str, str] | None]:
@@ -3067,6 +3111,9 @@ async def analyze_bucket_file(
             if isinstance(parsed.get("profile_facts"), dict)
             else {},
         }
+        export_facts = _transactions_export_facts(file, raw, content_type)
+        if export_facts and not offer_document:
+            _apply_transactions_export(row, export_facts)
         if offer_document:
             row.classification = merchant_processing.OFFER_CLASSIFICATION
             row.analysis["desk_only"] = (
