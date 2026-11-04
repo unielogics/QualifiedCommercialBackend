@@ -55,6 +55,14 @@ async def job_lender_submission_delivery() -> None:
         await drain_delivery_queue()
 
 
+async def job_credit_link_sweep() -> None:
+    """Automatic mode only: attach unowned credit pulls to the owners carrying
+    their names and tell the desk what connected (services/credit_links.py)."""
+    from app.services.credit_links import run_scheduled_sweep
+
+    await run_scheduled_sweep()
+
+
 def start_scheduler() -> None:
     """Idempotent — safe to call from FastAPI startup hooks (which fire
     on every uvicorn reload in dev). `replace_existing=True` collapses
@@ -78,6 +86,18 @@ def start_scheduler() -> None:
         "interval",
         seconds=30,
         id="lender_submission_delivery",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # Credit pulls nobody linked yet: every half hour in automatic mode the
+    # sweep attaches them to the owners carrying their names.
+    scheduler.add_job(
+        _wrap(job_credit_link_sweep),
+        "interval",
+        minutes=30,
+        id="credit_link_sweep",
         replace_existing=True,
         coalesce=True,
         max_instances=1,

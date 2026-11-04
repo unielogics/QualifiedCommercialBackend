@@ -55,6 +55,7 @@ from app.models.bucket import (
     BucketUploadLink,
 )
 from app.models.client import Client
+from app.models.credit_pull import CreditPull
 from app.models.financial_form_link import FinancialFormLink
 from app.models.financial_statement import FinancialStatement, FinancialStatementOwner
 from app.models.financial_worksheet import FinancialFormLinkSheet, FinancialWorksheet
@@ -129,8 +130,11 @@ from app.schemas.application_profile import (
     FundingCategoryRead,
     ManualBankOverrideRequest,
     MissingItemAutomationPatch,
+    OwnerCreditCandidateRead,
+    OwnerCreditLinkRequest,
     PlaidAssetReportCreate,
     PlaidAssetReportRead,
+    ProfileCreditLinkReport,
     PublicBankVerificationRead,
     PublicFileOwnerConsentRead,
     PublicFileOwnerConsentResult,
@@ -191,6 +195,7 @@ from app.services import (
     business_statements,
     capital_readiness,
     closing_stipulations,
+    credit_links,
     dealer_forms_pdf,
     drafted_forms,
     file_events,
@@ -656,13 +661,7 @@ def _hash_token(token: str) -> str:
 
 
 def _credit_tier(score: int | None) -> str | None:
-    if score is None:
-        return None
-    if score >= 720:
-        return "Tier 1"
-    if score >= 660:
-        return "Tier 2"
-    return "Tier 3"
+    return credit_links.tier_for(score)
 
 
 def _require_profile_bank_client(profile: ApplicationProfile, user: User) -> None:
@@ -3004,6 +3003,86 @@ async def _public_application_owner(db: AsyncSession, token: str) -> Application
     if profile is not None:
         await arf_channel.require_profile_hosted_permission(db, profile, requested_fields=["credit_data"], capability="credit_pull")
     return owner
+
+
+def _application_owner_only(owner: ApplicationOwner | DealerOwner) -> ApplicationOwner:
+    if isinstance(owner, DealerOwner):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Dealer OS owners carry their own credit flow; link pulls from the dealer room",
+        )
+    return owner
+
+
+@router.get("/{profile_id}/owners/{owner_id}/credit-candidates", response_model=list[OwnerCreditCandidateRead])
+async def list_owner_credit_candidates(
+    profile_id: UUID, owner_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[OwnerCreditCandidateRead]:
+    """Completed pulls that could be this owner's, most trustworthy first."""
+
+    profile = await profiles.load_profile(db, profile_id, user)
+    owner = _application_owner_only(await _owner_for_profile(db, profile, owner_id))
+    candidates = await credit_links.candidate_pulls(db, profile, owner)
+    return [OwnerCreditCandidateRead(**candidate.read()) for candidate in candidates]
+
+
+@router.post("/{profile_id}/owners/{owner_id}/credit-link", response_model=FileOwnerRead)
+async def link_owner_credit(
+    profile_id: UUID,
+    owner_id: UUID,
+    payload: OwnerCreditLinkRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FileOwnerRead:
+    """Attach one completed pull to this owner by hand."""
+
+    profile = await profiles.load_profile(db, profile_id, user)
+    owner = _application_owner_only(await _owner_for_profile(db, profile, owner_id))
+    pull = await db.get(CreditPull, payload.pull_id)
+    if pull is None or not credit_links.is_completed(pull):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That credit pull is not on record as completed")
+    if profile.client_id and pull.client_id != profile.client_id and not payload.confirm_other_client:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "This pull was run for another client. Confirm it is the same person to link it.",
+        )
+    try:
+        await credit_links.link_pull(db, profile, owner, pull, actor=user, how=credit_links.HOW_MANUAL)
+    except credit_links.LinkConflict as conflict:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(conflict)) from conflict
+    await db.commit()
+    await db.refresh(owner)
+    return profiles.owner_read(owner)
+
+
+@router.delete("/{profile_id}/owners/{owner_id}/credit-link", response_model=FileOwnerRead)
+async def unlink_owner_credit(
+    profile_id: UUID, owner_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> FileOwnerRead:
+    """The owner's credit step goes back to pending; the pull itself stays."""
+
+    profile = await profiles.load_profile(db, profile_id, user)
+    owner = _application_owner_only(await _owner_for_profile(db, profile, owner_id))
+    if owner.credit_pull_id is None:
+        return profiles.owner_read(owner)
+    await credit_links.unlink_pull(db, profile, owner, actor=user)
+    await db.commit()
+    await db.refresh(owner)
+    return profiles.owner_read(owner)
+
+
+@router.post("/{profile_id}/credit-links/auto", response_model=ProfileCreditLinkReport)
+async def auto_link_profile_credit(
+    profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> ProfileCreditLinkReport:
+    """Link every owner on this file whose pull matches exactly; say who waits."""
+
+    profile = await profiles.load_profile(db, profile_id, user)
+    if profile.dealer_id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Dealer OS files link credit from the dealer room")
+    report = await credit_links.auto_link_profile(db, profile, actor=user, how=credit_links.HOW_SWEEP)
+    await db.commit()
+    return ProfileCreditLinkReport(**report)
 
 
 @router.get("/public/credit-consent/{token}", response_model=PublicFileOwnerConsentRead)

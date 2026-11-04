@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
@@ -391,6 +391,17 @@ class ProspectOutreachAISettings(BaseModel):
         return cleaned
 
 
+class CreditLinkingSettings(BaseModel):
+    """Whether credit pulls attach to file owners on their own or only by hand.
+
+    `last_run` is the most recent sweep report (app/services/credit_links.py);
+    the dedicated /credit-links routes own this section.
+    """
+
+    mode: Literal["manual", "automatic"] = "manual"
+    last_run: dict[str, Any] | None = None
+
+
 class AppSettingsData(BaseModel):
     """Full settings blob. Each section has sensible defaults so a bare table
     row still produces usable values for the UI."""
@@ -425,6 +436,7 @@ class AppSettingsData(BaseModel):
         default_factory=MerchantProcessingSettings
     )
     file_updates: FileUpdatesSettings = Field(default_factory=FileUpdatesSettings)
+    credit_linking: CreditLinkingSettings = Field(default_factory=CreditLinkingSettings)
 
 
 class AppSettingsRead(BaseModel):
@@ -451,6 +463,7 @@ class AppSettingsUpdate(BaseModel):
     email_footer: EmailFooterSettings | None = None
     merchant_processing: MerchantProcessingSettings | None = None
     file_updates: FileUpdatesSettings | None = None
+    credit_linking: CreditLinkingSettings | None = None
 
 
 # --- Signature image upload ---------------------------------------------

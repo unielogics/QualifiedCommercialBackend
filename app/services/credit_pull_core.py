@@ -160,9 +160,9 @@ async def stamp_primary_owner(db: AsyncSession, intake, pull: CreditPull) -> boo
     ).scalar_one_or_none()
     if owner is None or owner.credit_pull_id is not None:
         return False
-    owner.credit_pull_id = pull.id
-    owner.credit_pulled_at = pull.pulled_at or datetime.now(UTC)
-    await db.flush()
+    from app.services import credit_links
+
+    await credit_links.link_pull(db, profile, owner, pull, how=credit_links.HOW_SIGNATURE)
     return True
 
 
@@ -472,6 +472,14 @@ async def run_soft_pull(
             },
         )
         await calendar_emitter.emit_for_credit_pull(db, pull)
+        try:
+            # Automatic mode attaches the pull to its owner right away; manual
+            # mode leaves it for the desk to link from the file.
+            from app.services import credit_links
+
+            await credit_links.after_pull(db, pull)
+        except Exception:  # noqa: BLE001 - linking never fails the pull itself
+            log.exception("credit_links.after_pull failed pull=%s", pull.id)
     except Exception as exc:  # noqa: BLE001
         log.exception("Failed to persist credit pull result")
         pull.status = CreditPullStatus.REVOKED

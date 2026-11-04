@@ -609,6 +609,13 @@ class FileOwnerRead(BaseModel):
     credit_required: bool = False
     credit_complete: bool = False
     credit_contact_complete: bool = False
+    credit_pull_id: UUID | None = None
+    credit_fico_source: str | None = None
+    credit_score_verified: bool = False
+    credit_report_available: bool = False
+    credit_link_how: str | None = None
+    credit_attention: str | None = None
+    credit_expires_at: str | None = None
     backfill_needs_review: bool = False
     source: Literal["application", "dealer"] = "application"
 
@@ -1569,3 +1576,39 @@ class WorksheetLinkCreate(BaseModel):
     ttl_days: int | None = None
     label: str | None = None
     invitee_email: str | None = None
+
+
+class OwnerCreditCandidateRead(BaseModel):
+    """A completed pull that could be an owner's, with the evidence for it."""
+
+    pull_id: str
+    status: str
+    score: int | None = None
+    fico_source: str | None = None
+    score_verified: bool = False
+    report_available: bool = False
+    attention: str | None = None
+    pulled_at: str | None = None
+    expires_at: str | None = None
+    expired: bool = False
+    first_name: str | None = None
+    last_name: str | None = None
+    email: str | None = None
+    dob_on_file: bool = False
+    client_id: str | None = None
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    confidence: str
+    why: str
+    linked_to_this_owner: bool = False
+    linked_elsewhere: bool = False
+
+
+class OwnerCreditLinkRequest(BaseModel):
+    pull_id: UUID
+    confirm_other_client: bool = False
+
+
+class ProfileCreditLinkReport(BaseModel):
+    profile_id: str
+    linked: list[dict[str, Any]] = Field(default_factory=list)
+    waiting: list[dict[str, Any]] = Field(default_factory=list)

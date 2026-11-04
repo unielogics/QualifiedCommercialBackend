@@ -1183,6 +1183,8 @@ async def resolve_profile(
 
 
 def owner_read(owner: ApplicationOwner | DealerOwner) -> FileOwnerRead:
+    summary = getattr(owner, "credit_summary", None)
+    summary = summary if isinstance(summary, dict) else {}
     return FileOwnerRead(
         id=owner.id,
         full_name=owner.full_name,
@@ -1207,6 +1209,13 @@ def owner_read(owner: ApplicationOwner | DealerOwner) -> FileOwnerRead:
         credit_required=owner.credit_required,
         credit_complete=owner.credit_complete,
         credit_contact_complete=owner.credit_contact_complete,
+        credit_pull_id=getattr(owner, "credit_pull_id", None),
+        credit_fico_source=summary.get("fico_source"),
+        credit_score_verified=bool(summary.get("score_verified")),
+        credit_report_available=bool(summary.get("report_available")),
+        credit_link_how=summary.get("linked_how"),
+        credit_attention=summary.get("attention"),
+        credit_expires_at=summary.get("expires_at"),
         backfill_needs_review=getattr(owner, "backfill_needs_review", False),
         source="dealer" if isinstance(owner, DealerOwner) else "application",
     )
