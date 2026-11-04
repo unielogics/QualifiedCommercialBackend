@@ -142,6 +142,11 @@ class FinancialPlanWrite(BaseModel):
     new_loan_rate_pct: float | None = Field(default=None, ge=0, le=100)
     new_loan_term_months: int | None = Field(default=None, ge=1, le=600)
     new_loan_interest_only: bool = False
+    #: amortizing | simple_interest | interest_only; defaults by term (simple
+    #: interest under three years, amortizing from three years).
+    new_loan_structure: Literal["amortizing", "simple_interest", "interest_only"] | None = None
+    #: Months of the term that are interest-only before principal starts.
+    new_loan_interest_only_months: int | None = Field(default=None, ge=0, le=600)
     add_backs: list[AddBackIn] = Field(default_factory=list, max_length=20)
     overrides: PlanOverridesIn | None = None
     #: Which recorded terms the loan fields were adopted from; kept across saves

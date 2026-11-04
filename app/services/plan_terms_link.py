@@ -48,7 +48,9 @@ def recorded_from_client_terms(row: Any) -> dict[str, Any] | None:
         "amount": _num(row.amount),
         "rate_pct": _num(row.apr_pct),
         "term_months": int(row.term_months) if row.term_months else None,
-        "interest_only": False,
+        "interest_only": (getattr(row, "loan_structure", None) or "amortizing") == "interest_only",
+        "structure": getattr(row, "loan_structure", None) or "amortizing",
+        "interest_only_months": int(getattr(row, "interest_only_months", None) or 0),
         "payment_monthly": round(payment * periods / 12.0, 2) if payment is not None else None,
         "treatment": str(getattr(row, "debt_service_treatment", None) or "additive"),
         "retained_annual_debt_service": _num(getattr(row, "retained_annual_debt_service", None)),
@@ -61,6 +63,9 @@ def recorded_from_production_sheet(sheet: Any) -> dict[str, Any] | None:
         return None
     extra = sheet.extra if isinstance(getattr(sheet, "extra", None), dict) else {}
     structure = str(extra.get("repayment_structure") or "")
+    io_months = int(_num(extra.get("interest_only_months")) or 0)
+    term = int(sheet.term_months) if sheet.term_months else None
+    fully_io = structure in {"interest_only", "revolving_interest_only"}
     return {
         "kind": "production_term_sheet",
         "id": str(sheet.id),
@@ -68,8 +73,12 @@ def recorded_from_production_sheet(sheet: Any) -> dict[str, Any] | None:
         "label": f"Term sheet v{sheet.version}: {sheet.funding_party_name}",
         "amount": _num(sheet.approved_amount),
         "rate_pct": _num(sheet.rate_pct),
-        "term_months": int(sheet.term_months) if sheet.term_months else None,
-        "interest_only": structure in {"interest_only", "revolving_interest_only"},
+        "term_months": term,
+        "interest_only": fully_io,
+        "structure": "interest_only" if fully_io else "amortizing",
+        "interest_only_months": (term or 0)
+        if fully_io
+        else (io_months if structure == "interest_only_then_amortizing" else 0),
         "payment_monthly": _num(sheet.monthly_debt_service),
         "treatment": str(extra.get("debt_service_treatment") or "additive"),
         "retained_annual_debt_service": _num(extra.get("retained_annual_debt_service")),
@@ -91,6 +100,9 @@ def adopt(
             "new_loan_rate_pct": recorded.get("rate_pct"),
             "new_loan_term_months": recorded.get("term_months"),
             "new_loan_interest_only": bool(recorded.get("interest_only")),
+            "new_loan_structure": recorded.get("structure")
+            or ("interest_only" if recorded.get("interest_only") else "amortizing"),
+            "new_loan_interest_only_months": int(recorded.get("interest_only_months") or 0),
             "terms_ref": {
                 "kind": recorded.get("kind"),
                 "id": recorded.get("id"),
@@ -177,7 +189,9 @@ def terms_link(
         for key in ("amount", "rate_pct", "term_months", "interest_only", "payment_monthly"):
             a, b = plan_loan.get(key), recorded.get(key)
             if key == "interest_only":
-                same = bool(a) == bool(b)
+                same = bool(a) == bool(b) and int(loan.get("interest_only_months") or 0) == int(
+                    recorded.get("interest_only_months") or 0
+                )
             elif a is None or b is None:
                 same = a is None and b is None
             else:

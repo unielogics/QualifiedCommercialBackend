@@ -6,6 +6,7 @@ import unicodedata
 from datetime import date, datetime
 from html import escape
 from pathlib import Path
+from typing import Any
 
 from app.models.application_terms import ApplicationTermSheet
 
@@ -177,6 +178,7 @@ def render_terms_html(
       <div class="term"><span class="label">Loan type</span><strong style="font-size:11px">{escape(row.program_name)}</strong></div>
       <div class="term"><span class="label">Funder type</span><strong style="font-size:11px">{escape(funder)}</strong></div>
       <div class="term"><span class="label">Repayment</span><strong style="font-size:11px">{escape(cadence)}</strong><small>{row.payment_count} estimated payments</small></div>
+      <div class="term"><span class="label">Structure</span><strong style="font-size:11px">{escape(_structure_line(row))}</strong><small>{escape(_structure_note(row))}</small></div>
     </div>
     <div class="payment">
       <div class="primary"><span class="label">Estimated {escape(cadence.lower())} payment</span><strong>{_money(payment)}</strong></div>
@@ -200,6 +202,31 @@ def render_terms_html(
 </body></html>
 """
     return html
+
+
+def _structure_line(row: Any) -> str:
+    from app.services.loan_schedule import STRUCTURE_LABELS
+
+    kind = getattr(row, "loan_structure", None) or "amortizing"
+    io = int(getattr(row, "interest_only_months", None) or 0)
+    label = STRUCTURE_LABELS.get(kind, kind.replace("_", " ").title())
+    if kind == "interest_only":
+        return "Interest-only, principal at maturity"
+    return f"{io} months interest-only, then {label.lower()}" if io else label
+
+
+def _structure_note(row: Any) -> str:
+    from app.services.loan_schedule import build_schedule
+
+    kind = getattr(row, "loan_structure", None) or "amortizing"
+    io = int(getattr(row, "interest_only_months", None) or 0)
+    if not io or kind == "interest_only":
+        return ""
+    periods = float(row.payments_per_year or 12)
+    summary = build_schedule(float(row.amount), float(row.apr_pct), int(row.term_months), structure=kind, interest_only_months=io, periods_per_year=periods)
+    if not summary or summary.get("payment_io") is None:
+        return ""
+    return f"{_money(summary['payment_io'])} per payment during the interest-only months"
 
 
 def render_terms_pdf(

@@ -2132,6 +2132,8 @@ def build_cockpit(
             "modifications": modifications,
             "impact": impact,
             "terms_link": terms_link,
+            "schedule": evaluation.get("schedule"),
+            "schedule_rows": evaluation.get("schedule_rows") or [],
         },
         "net_profit": net_profit_block(years, statement, bank),
         "notes": _notes(coverage, bank, service, proposed, years, statement)

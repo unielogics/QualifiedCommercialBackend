@@ -481,6 +481,10 @@ class ListingProductIn(BaseModel):
     term_months: int | None = Field(default=None, ge=1, le=600)
     #: Interest alone each month, principal at maturity.
     interest_only: bool = False
+    #: amortizing | simple_interest | interest_only (defaults by term), and the
+    #: months of the term that are interest-only before principal starts.
+    structure: Literal["amortizing", "simple_interest", "interest_only"] | None = None
+    interest_only_months: int | None = Field(default=None, ge=0, le=600)
     payment_frequency: Literal["monthly", "weekly", "daily"] | None = "monthly"
     monthly_payment: Decimal | None = Field(default=None, ge=0)
     dscr: Decimal | None = None

@@ -110,8 +110,24 @@ async def defaults(db: AsyncSession, profile: ApplicationProfile, parent: Produc
         put("approved_amount", pa._num(plan.get("new_loan_amount")), "financial_plan")
         put("rate_pct", pa._num(plan.get("new_loan_rate_pct")), "financial_plan")
         put("term_months", int(pa._num(plan.get("new_loan_term_months")) or 0) or None, "financial_plan")
-        if plan.get("new_loan_interest_only"):
+        structure = str(plan.get("new_loan_structure") or "")
+        io_months = int(pa._num(plan.get("new_loan_interest_only_months")) or 0)
+        term = int(pa._num(plan.get("new_loan_term_months")) or 0)
+        if plan.get("new_loan_interest_only") or structure == "interest_only" or (term and io_months >= term):
             put("repayment_structure", "interest_only", "financial_plan")
+        elif io_months:
+            put("repayment_structure", "interest_only_then_amortizing", "financial_plan")
+            put("interest_only_months", io_months, "financial_plan")
+        elif structure == "simple_interest" and term:
+            # The dealer sheet has no simple-interest structure: a fixed payment
+            # equal to the schedule's carries the same money.
+            from app.services.loan_schedule import build_schedule
+
+            summary = build_schedule(pa._num(plan.get("new_loan_amount")), pa._num(plan.get("new_loan_rate_pct")), term, structure="simple_interest")
+            if summary:
+                put("repayment_structure", "fixed_payment", "financial_plan")
+                put("periodic_payment", summary["payment_after"], "financial_plan")
+                put("lender_payment_override", True, "financial_plan")
     if "approved_amount" not in out:
         put("approved_amount", pa._num(arrangement.get("requested")), "stage_one")
     put("min_activation_amount", pa._num(arrangement.get("min_activation")), "stage_one")

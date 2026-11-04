@@ -102,16 +102,50 @@ def loan_payment(
     rate_pct: float | None,
     term_months: int | None,
     interest_only: bool = False,
+    *,
+    structure: str | None = None,
+    interest_only_months: int | None = None,
 ) -> float | None:
-    """The new loan's monthly payment: interest alone when the loan is
-    interest-only (principal due at maturity), else the level payment."""
+    """The payment coverage stands on: interest alone for an interest-only
+    loan, else the payment after any interest-only months, from the one loan
+    schedule (simple interest under three years by default, amortizing from
+    three years)."""
+    from app.services.loan_schedule import build_schedule
+
     if not amount or amount <= 0:
         return None
-    if interest_only:
-        return round(float(amount) * float(rate_pct or 0.0) / 100 / 12, 2)
-    if not term_months:
+    kind = "interest_only" if interest_only else structure
+    if kind != "interest_only" and not term_months:
         return None
-    return amortized_payment(float(amount), float(rate_pct or 0.0), int(term_months))
+    summary = build_schedule(
+        float(amount),
+        float(rate_pct or 0.0),
+        int(term_months or 0),
+        structure=kind,
+        interest_only_months=interest_only_months or 0,
+    )
+    return summary["coverage_payment_monthly"] if summary else None
+
+
+def _structure_of(raw: dict[str, Any]) -> str | None:
+    from app.services.loan_schedule import STRUCTURES, default_structure
+
+    term = int(raw["new_loan_term_months"]) if _num(raw.get("new_loan_term_months")) else None
+    if raw.get("new_loan_interest_only"):
+        return "interest_only"
+    text = str(raw.get("new_loan_structure") or "").strip().lower()
+    if text in STRUCTURES:
+        return text
+    return default_structure(term) if raw.get("new_loan_amount") else None
+
+
+def _io_months_of(raw: dict[str, Any]) -> int:
+    months = _num(raw.get("new_loan_interest_only_months"))
+    term = _num(raw.get("new_loan_term_months"))
+    if months is None or months < 0:
+        return 0
+    value = int(months)
+    return min(value, int(term)) if term else value
 
 
 def normalize_plan(raw: Any) -> dict[str, Any]:
@@ -130,11 +164,18 @@ def normalize_plan(raw: Any) -> dict[str, Any]:
         if _num(raw.get("new_loan_term_months"))
         else None,
         "new_loan_interest_only": bool(raw.get("new_loan_interest_only")),
+        # Structure: simple interest under three years, amortizing from three
+        # years, or interest-only; and how many of the term's months are
+        # interest-only before principal starts.
+        "new_loan_structure": _structure_of(raw),
+        "new_loan_interest_only_months": _io_months_of(raw),
         "add_backs": normalize_add_backs(raw.get("add_backs")),
         "overrides": normalize_overrides(raw.get("overrides")),
         "note": str(raw.get("note") or "")[:600] or None,
         # Which recorded terms the loan fields were adopted from, if any.
-        "terms_ref": dict(raw["terms_ref"]) if isinstance(raw.get("terms_ref"), dict) and raw["terms_ref"].get("id") else None,
+        "terms_ref": dict(raw["terms_ref"])
+        if isinstance(raw.get("terms_ref"), dict) and raw["terms_ref"].get("id")
+        else None,
         "updated_at": raw.get("updated_at"),
         "updated_by": raw.get("updated_by"),
     }
@@ -379,12 +420,25 @@ def evaluate_plan(
     add_backs_annual = round(add_backs_monthly * 12, 2)
     income_override = overrides.get("income_annual")
     service_override = overrides.get("debt_service_monthly")
-    interest_only = bool(plan.get("new_loan_interest_only"))
+    interest_only = (
+        bool(plan.get("new_loan_interest_only"))
+        or plan.get("new_loan_structure") == "interest_only"
+    )
 
     new_payment = plan.get("new_payment_monthly")
     source = plan.get("new_payment_source")
     loan_terms: dict[str, Any] | None = None
+    schedule: dict[str, Any] | None = None
     if plan.get("new_loan_amount") and (plan.get("new_loan_term_months") or interest_only):
+        from app.services.loan_schedule import build_schedule, describe
+
+        schedule = build_schedule(
+            float(plan["new_loan_amount"]),
+            float(plan.get("new_loan_rate_pct") or 0.0),
+            int(plan["new_loan_term_months"]) if plan.get("new_loan_term_months") else 0,
+            structure="interest_only" if interest_only else plan.get("new_loan_structure"),
+            interest_only_months=int(plan.get("new_loan_interest_only_months") or 0),
+        )
         loan_terms = {
             "amount": float(plan["new_loan_amount"]),
             "rate_pct": float(plan.get("new_loan_rate_pct") or 0.0),
@@ -392,11 +446,22 @@ def evaluate_plan(
             if plan.get("new_loan_term_months")
             else None,
             "interest_only": interest_only,
+            "structure": schedule["structure"]
+            if schedule
+            else ("interest_only" if interest_only else plan.get("new_loan_structure")),
+            "interest_only_months": schedule["interest_only_months"]
+            if schedule
+            else int(plan.get("new_loan_interest_only_months") or 0),
+            "payment_io": schedule["payment_io_monthly"] if schedule else None,
+            "payment_after": schedule["payment_after_monthly"] if schedule else None,
+            "annual_debt_service": schedule["annual_debt_service"] if schedule else None,
+            "total_interest": schedule["total_interest"] if schedule else None,
+            "total_paid": schedule["total_paid"] if schedule else None,
+            "balloon": schedule["balloon"] if schedule else None,
+            "describe": describe(schedule),
         }
-    if new_payment is None and loan_terms:
-        new_payment = loan_payment(
-            loan_terms["amount"], loan_terms["rate_pct"], loan_terms["term_months"], interest_only
-        )
+    if new_payment is None and loan_terms and schedule:
+        new_payment = schedule["coverage_payment_monthly"]
         source = source or "manual_terms"
     # The recorded loan terms join the plan only when the desk adopts them:
     # a term sheet on file is not a decision, and adding its payment on its
@@ -509,6 +574,8 @@ def evaluate_plan(
         "debt_service_override_monthly": service_override,
         "interest_only": interest_only,
         "loan_terms": loan_terms,
+        "schedule": {k: v for k, v in schedule.items() if k != "rows"} if schedule else None,
+        "schedule_rows": schedule["rows"] if schedule else [],
         "new_payment_monthly": _round(float(new_payment)) if new_payment is not None else None,
         "new_payment_source": source if new_payment is not None else None,
         "loan_amount_needed": _round(max(payoff_total or 0.0, requested_amount or 0.0)) or None,
@@ -639,7 +706,15 @@ def describe_modifications(
                     "label": f"New payment {payment:,.0f} a month from {ref.get('label') or 'the recorded terms'}",
                     "detail": (
                         f"{loan['amount']:,.0f} at {loan['rate_pct']:g}%"
-                        + (" interest-only" if loan.get("interest_only") else (f" over {loan['term_months']} months" if loan.get("term_months") else ""))
+                        + (
+                            " interest-only"
+                            if loan.get("interest_only")
+                            else (
+                                f" over {loan['term_months']} months"
+                                if loan.get("term_months")
+                                else ""
+                            )
+                        )
                         + ", as recorded on the Underwriting tab."
                         if loan and loan.get("amount")
                         else "As recorded on the Underwriting tab."
@@ -666,21 +741,22 @@ def describe_modifications(
                 }
             )
         elif loan:
-            structure = (
+            structure = loan.get("describe") or (
                 "interest-only"
                 if loan.get("interest_only")
                 else f"over {loan.get('term_months')} months"
             )
+            if loan.get("payment_io") is not None and loan.get("payment_after") is not None:
+                detail = f"{loan['payment_io']:,.0f} a month for {loan.get('interest_only_months')} months, then {loan['payment_after']:,.0f} a month."
+            elif loan.get("interest_only"):
+                detail = f"{payment:,.0f} a month of interest; the principal is due at maturity."
+            else:
+                detail = f"{payment:,.0f} a month."
             lines.append(
                 {
                     "kind": "loan",
                     "label": f"New loan {loan['amount']:,.0f} at {loan['rate_pct']:g}% {structure}",
-                    "detail": f"{payment:,.0f} a month"
-                    + (
-                        " of interest; the principal is due at maturity."
-                        if loan.get("interest_only")
-                        else "."
-                    ),
+                    "detail": detail,
                     "monthly_effect": _round(-float(payment)),
                     "annual_effect": _round(-float(payment) * 12),
                 }
@@ -1025,7 +1101,12 @@ def coverage_levers(
                 "detail": f"{loan['amount']:,.0f} at {loan['rate_pct']:g}% costs {io_payment:,.0f} a month of interest instead of {evaluation['new_payment_monthly']:,.0f}; the principal is due at maturity, so the coverage holds only through the interest-only period.",
                 "dscr_after": value_io,
                 "status_after": dscr_status(value_io),
-                "apply": {"new_loan_interest_only": True, "new_payment_monthly": None},
+                "apply": {
+                    "new_loan_interest_only": True,
+                    "new_loan_structure": "interest_only",
+                    "new_loan_interest_only_months": None,
+                    "new_payment_monthly": None,
+                },
             }
         )
     if key == "bank_cash_flow" and numerator is not None and not overridden:

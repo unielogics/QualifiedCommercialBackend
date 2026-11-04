@@ -24,7 +24,7 @@ from app.models.funding_program import FundingProgramCatalog
 from app.services import application_programs as programs
 from app.services import financial_cockpit
 from app.services import funding_programs as program_catalog
-from app.services.financial_cockpit import amortized_payment, dscr_status
+from app.services.financial_cockpit import dscr_status
 
 TARGET_DSCR = 1.25
 #: The 10-year MCA refinance program's shape when a program publishes no range.
@@ -112,13 +112,30 @@ def program_shape(terms: Any | None) -> dict[str, Any]:
     }
 
 
-def payment_for(amount: float, shape: dict[str, Any], interest_only: bool = False) -> float | None:
+def payment_for(
+    amount: float,
+    shape: dict[str, Any],
+    interest_only: bool = False,
+    *,
+    structure: str | None = None,
+    interest_only_months: int = 0,
+) -> float | None:
+    """The payment coverage stands on, from the one loan schedule: simple
+    interest under three years, amortizing from three years, interest-only
+    to maturity; the payment after any interest-only months."""
+    from app.services.loan_schedule import build_schedule
+
     term = int(shape.get("term_months") or DEFAULT_TERM_MONTHS)
     if shape.get("factor_rate"):
         return round(amount * float(shape["factor_rate"]) / term, 2)
-    if interest_only:
-        return round(amount * float(shape.get("rate_pct") or 0.0) / 100 / 12, 2)
-    return amortized_payment(amount, float(shape.get("rate_pct") or 0.0), term)
+    summary = build_schedule(
+        amount,
+        float(shape.get("rate_pct") or 0.0),
+        term,
+        structure="interest_only" if interest_only else structure,
+        interest_only_months=interest_only_months,
+    )
+    return summary["coverage_payment_monthly"] if summary else None
 
 
 def suggest_product(
@@ -132,11 +149,17 @@ def suggest_product(
     target: float = TARGET_DSCR,
     eligible: bool | None = None,
     interest_only: bool = False,
+    structure: str | None = None,
+    interest_only_months: int = 0,
 ) -> dict[str, Any]:
+    from app.services.loan_schedule import default_structure
+
     room = capacity_monthly(income_annual, existing_monthly_debt_service, target)
     term = int(shape.get("term_months") or DEFAULT_TERM_MONTHS)
     rate = shape.get("rate_pct")
     interest_only = bool(interest_only and not shape.get("factor_rate"))
+    structure = "interest_only" if interest_only else (structure or default_structure(term))
+    interest_only_months = 0 if interest_only else max(0, min(int(interest_only_months or 0), term))
     affordable: float | None = None
     if room is not None:
         if shape.get("factor_rate"):
@@ -161,7 +184,17 @@ def suggest_product(
     elif amount is not None and shape.get("min_amount") and amount < float(shape["min_amount"]):
         reason = f"The amount the income supports ({amount:,.0f}) is below the program minimum ({float(shape['min_amount']):,.0f})."
         amount = None
-    payment = payment_for(amount, shape, interest_only) if amount else None
+    payment = (
+        payment_for(
+            amount,
+            shape,
+            interest_only,
+            structure=structure,
+            interest_only_months=interest_only_months,
+        )
+        if amount
+        else None
+    )
     existing_annual = (existing_monthly_debt_service or 0.0) * 12
     dscr_at = (
         round(income_annual / (existing_annual + payment * 12), 2)
@@ -169,7 +202,15 @@ def suggest_product(
         else None
     )
     requested_payment = (
-        payment_for(requested_amount, shape, interest_only) if requested_amount else None
+        payment_for(
+            requested_amount,
+            shape,
+            interest_only,
+            structure=structure,
+            interest_only_months=interest_only_months,
+        )
+        if requested_amount
+        else None
     )
     dscr_requested = (
         round(income_annual / (existing_annual + requested_payment * 12), 2)
@@ -185,6 +226,8 @@ def suggest_product(
         "factor_rate": shape.get("factor_rate"),
         "term_months": term,
         "interest_only": interest_only,
+        "structure": structure,
+        "interest_only_months": interest_only_months,
         "payment_frequency": "monthly",
         "monthly_payment": payment,
         "dscr": dscr_at,

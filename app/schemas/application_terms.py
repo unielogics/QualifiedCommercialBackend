@@ -40,6 +40,11 @@ class ClientTermsWrite(BaseModel):
     custom_repayment_label: str | None = Field(default=None, max_length=80)
     debt_service_treatment: DebtServiceTreatment = "additive"
     retained_annual_debt_service: float | None = Field(default=None, ge=0, le=1_000_000_000)
+    #: amortizing | simple_interest | interest_only; None means the house
+    #: default for the term (simple interest under three years, amortizing from
+    #: three years). interest_only_months: interest-only months before principal.
+    loan_structure: Literal["amortizing", "simple_interest", "interest_only"] | None = None
+    interest_only_months: int | None = Field(default=None, ge=0, le=480)
     expiration_days: int = Field(ge=1, le=180)
     closing_estimate_days: int = Field(ge=0, le=180)
     co_brand_enabled: bool = True
@@ -104,6 +109,12 @@ class ClientTermsCalculation(BaseModel):
     dscr_status: Literal["ready", "needs_evidence"]
     dscr_explanation: str
     source: str
+    #: The structure the payment stands on, the interest-only months first and
+    #: the payment during them (the periodic payment above is the one after).
+    loan_structure: str | None = None
+    interest_only_months: int = 0
+    interest_only_payment: float | None = None
+    structure_label: str | None = None
 
 
 class ClientTermsRead(BaseModel):
@@ -123,6 +134,8 @@ class ClientTermsRead(BaseModel):
     custom_repayment_label: str | None = None
     debt_service_treatment: DebtServiceTreatment = "additive"
     retained_annual_debt_service: float | None = None
+    loan_structure: Literal["amortizing", "simple_interest", "interest_only"] | None = None
+    interest_only_months: int | None = None
     expiration_days: int | None = None
     closing_estimate_days: int | None = None
     co_brand_enabled: bool = True

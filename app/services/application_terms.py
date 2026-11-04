@@ -72,8 +72,21 @@ def repayment_math(
     term_months: int,
     frequency: str,
     custom_payments_per_year: int | None = None,
+    loan_structure: str | None = None,
+    interest_only_months: int | None = None,
 ) -> tuple[float, int, float, float, float, float]:
-    """Return periodic payment, count, periods/year, annual service, total, cost."""
+    """Return periodic payment, count, periods/year, annual service, total, cost.
+
+    The payment and the annual service are the ones coverage stands on: the
+    payment after any interest-only periods (the larger of the two) over the
+    periods actually due in a year, so a six-month offer is not annualized
+    into twelve months of payments that do not exist, and an interest-only
+    start does not flatter the ratio (the Financials tab prices the same way,
+    so the two screens mirror). The structure defaults by term: simple
+    interest under three years, amortizing from three years.
+    """
+    from app.services.loan_schedule import build_schedule
+
     periods = (
         float(custom_payments_per_year or 0)
         if frequency == "custom"
@@ -81,28 +94,70 @@ def repayment_math(
     )
     if periods <= 0:
         raise ValueError("A valid repayment frequency is required")
-    # Terms are positive, so floor(x + .5) gives a clear half-up rule that is
-    # identical in Python and the browser preview. Python's built-in round()
-    # uses ties-to-even and can otherwise disagree with JavaScript.
-    payment_count = max(1, math.floor(term_months * periods / 12.0 + 0.5))
-    periodic_rate = (apr_pct / 100.0) / periods
-    if periodic_rate == 0:
-        payment = amount / payment_count
-    else:
-        payment = amount * periodic_rate / (1 - (1 + periodic_rate) ** (-payment_count))
-    # DSCR uses debt service actually due over the next 12 months. A six-month
-    # offer must not be annualized into twelve months of payments that do not
-    # exist.
-    annual_debt_service = payment * min(float(payment_count), periods)
-    total = payment * payment_count
-    return (
-        round(payment, 2),
-        payment_count,
-        round(periods, 3),
-        round(annual_debt_service, 2),
-        round(total, 2),
-        round(max(0.0, total - amount), 2),
+    summary = build_schedule(
+        amount,
+        apr_pct,
+        term_months,
+        structure=loan_structure,
+        interest_only_months=interest_only_months or 0,
+        periods_per_year=periods,
     )
+    if summary is None:
+        raise ValueError("A positive amount and term are required")
+    payment = (
+        summary["payment_after"] if summary["payment_after"] is not None else summary["payment_io"]
+    )
+    total = summary["total_paid"]
+    return (
+        round(float(payment or 0.0), 2),
+        int(summary["periods"]),
+        round(periods, 3),
+        round(float(summary["coverage_annual_debt_service"]), 2),
+        round(float(total), 2),
+        round(max(0.0, float(total) - amount), 2),
+    )
+
+
+def structure_block(
+    *,
+    amount: float | None,
+    apr_pct: float | None,
+    term_months: int | None,
+    frequency: str | None,
+    custom_payments_per_year: int | None,
+    loan_structure: str | None,
+    interest_only_months: int | None,
+) -> dict[str, Any]:
+    """What the read model says about the structure: which, the interest-only
+    months, and the payment during them."""
+    from app.services.loan_schedule import STRUCTURE_LABELS, build_schedule, normalize_structure
+
+    periods = (
+        float(custom_payments_per_year or 0)
+        if frequency == "custom"
+        else CADENCE_PERIODS_PER_YEAR.get(frequency or "monthly", 12.0)
+    )
+    kind = normalize_structure(loan_structure, term_months)
+    summary = (
+        build_schedule(
+            amount,
+            apr_pct,
+            term_months,
+            structure=kind,
+            interest_only_months=interest_only_months or 0,
+            periods_per_year=periods or 12.0,
+        )
+        if amount and (term_months or kind == "interest_only")
+        else None
+    )
+    return {
+        "loan_structure": summary["structure"] if summary else kind,
+        "interest_only_months": int(summary["interest_only_months"])
+        if summary
+        else int(interest_only_months or 0),
+        "interest_only_payment": summary["payment_io"] if summary else None,
+        "structure_label": STRUCTURE_LABELS.get(summary["structure"] if summary else kind),
+    }
 
 
 @dataclass(frozen=True)
@@ -131,14 +186,22 @@ async def _cockpit_context(db: AsyncSession, profile: ApplicationProfile) -> Dsc
     plan = cockpit.get("plan") or {}
     evaluation = plan.get("evaluation") or {}
     active = bool(evaluation.get("active"))
-    income = evaluation.get("income_after_annual") if active and evaluation.get("income_after_annual") is not None else basis.get("numerator")
+    income = (
+        evaluation.get("income_after_annual")
+        if active and evaluation.get("income_after_annual") is not None
+        else basis.get("numerator")
+    )
     if income is None:
         return None
     existing_monthly = evaluation.get("debt_service_before_new_payment_monthly")
     if existing_monthly is None:
         existing_monthly = (cockpit.get("debt") or {}).get("service", {}).get("monthly") or 0.0
     label = str(basis.get("label") or "Income available for debt service")
-    changes = [m.get("label") for m in plan.get("modifications") or [] if m.get("kind") != "loan" and m.get("label")]
+    changes = [
+        m.get("label")
+        for m in plan.get("modifications") or []
+        if m.get("kind") != "loan" and m.get("label")
+    ]
     source = f"Financial cockpit: {label}"
     if active and changes:
         source += " with the desk's plan (" + "; ".join(str(c) for c in changes[:4]) + ")"
@@ -146,7 +209,8 @@ async def _cockpit_context(db: AsyncSession, profile: ApplicationProfile) -> Dsc
         method="business",
         before=_number(basis.get("value")),
         cash_flow=float(income),
-        cash_flow_label=f"{label} income available for debt service" + (" with the desk's plan" if active and changes else ""),
+        cash_flow_label=f"{label} income available for debt service"
+        + (" with the desk's plan" if active and changes else ""),
         current_annual_debt_service=round(float(existing_monthly) * 12, 2),
         real_estate_carrying_costs=None,
         source=source,
@@ -154,7 +218,9 @@ async def _cockpit_context(db: AsyncSession, profile: ApplicationProfile) -> Dsc
 
 
 async def _dscr_context(db: AsyncSession, profile: ApplicationProfile) -> DscrContext:
-    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    intake = (
+        await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    )
     snapshot = dict(intake.result_snapshot or {}) if intake else {}
     state = dict(intake.intake_state or {}) if intake else {}
     mappings = _nested_mappings(snapshot) + _nested_mappings(state)
@@ -188,12 +254,16 @@ async def _dscr_context(db: AsyncSession, profile: ApplicationProfile) -> DscrCo
         )
 
     loan = await db.get(Loan, profile.loan_id) if profile.loan_id else None
-    rent = float(loan.monthly_rent) if loan and loan.monthly_rent is not None else _first_number(
-        mappings,
-        "monthly_rent",
-        "in_place_monthly_rent",
-        "market_monthly_rent",
-        "gross_monthly_rent",
+    rent = (
+        float(loan.monthly_rent)
+        if loan and loan.monthly_rent is not None
+        else _first_number(
+            mappings,
+            "monthly_rent",
+            "in_place_monthly_rent",
+            "market_monthly_rent",
+            "gross_monthly_rent",
+        )
     )
     taxes = _first_number(mappings, "annual_taxes", "annual_property_taxes")
     insurance = _first_number(mappings, "annual_insurance", "insurance_annual_premium")
@@ -205,8 +275,14 @@ async def _dscr_context(db: AsyncSession, profile: ApplicationProfile) -> DscrCo
         # Loan defaults are zero, so only positive taxes/insurance prove that
         # these required carrying costs were actually entered. HOA may truly
         # be zero and is optional once taxes and insurance are known.
-        taxes = taxes if taxes is not None else (loan_taxes if loan_taxes and loan_taxes > 0 else None)
-        insurance = insurance if insurance is not None else (loan_insurance if loan_insurance and loan_insurance > 0 else None)
+        taxes = (
+            taxes if taxes is not None else (loan_taxes if loan_taxes and loan_taxes > 0 else None)
+        )
+        insurance = (
+            insurance
+            if insurance is not None
+            else (loan_insurance if loan_insurance and loan_insurance > 0 else None)
+        )
         hoa = hoa if hoa is not None else (loan_hoa or 0)
     carrying = None
     if taxes is not None and insurance is not None:
@@ -271,7 +347,11 @@ def _calculation(
         missing.append("current DSCR evidence")
     if context.cash_flow is None:
         missing.append(context.cash_flow_label.lower())
-    if context.method == "business" and treatment == "additive" and context.current_annual_debt_service is None:
+    if (
+        context.method == "business"
+        and treatment == "additive"
+        and context.current_annual_debt_service is None
+    ):
         missing.append("current annual debt service")
     if context.method == "real_estate":
         if treatment == "refinance" and context.real_estate_carrying_costs is None:
@@ -280,11 +360,13 @@ def _calculation(
             missing.append("current annual PITIA")
     status_value = "ready" if context.before is not None and after is not None else "needs_evidence"
     if status_value == "ready":
-        explanation = (
-            "Current and projected DSCR are calculated from the file evidence and the proposed payment schedule."
-        )
+        explanation = "Current and projected DSCR are calculated from the file evidence and the proposed payment schedule."
     else:
-        explanation = "More evidence is needed for a complete before-and-after DSCR: " + ", ".join(dict.fromkeys(missing or ["offer terms"])) + "."
+        explanation = (
+            "More evidence is needed for a complete before-and-after DSCR: "
+            + ", ".join(dict.fromkeys(missing or ["offer terms"]))
+            + "."
+        )
     financing_cost = (
         round(total_repayment - amount, 2)
         if total_repayment is not None and amount is not None
@@ -334,13 +416,13 @@ async def current_term_sheet(db: AsyncSession, profile_id: UUID) -> ApplicationT
 async def lock_profile_terms(db: AsyncSession, profile_id: UUID) -> None:
     """Serialize every mutation of a profile's current terms version."""
     await db.execute(
-        select(ApplicationProfile.id)
-        .where(ApplicationProfile.id == profile_id)
-        .with_for_update()
+        select(ApplicationProfile.id).where(ApplicationProfile.id == profile_id).with_for_update()
     )
 
 
-async def _recipient_state(db: AsyncSession, profile: ApplicationProfile) -> tuple[str | None, bool]:
+async def _recipient_state(
+    db: AsyncSession, profile: ApplicationProfile
+) -> tuple[str | None, bool]:
     sources = await file_contacts.load_sources(db, profile)
     recipient = await file_contacts.client_recipient(db, profile, sources)
     if profile.primary_bucket_id is not None:
@@ -374,8 +456,12 @@ async def read_terms(
     context = await _dscr_context(db, profile)
     plan_block = await _plan_block(db, profile)
     if row is None:
-        intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
-        initial_amount = profile.underwriting_term_sheet_amount or profile.underwriting_approved_amount
+        intake = (
+            await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+        )
+        initial_amount = (
+            profile.underwriting_term_sheet_amount or profile.underwriting_approved_amount
+        )
         if initial_amount is None and intake is not None:
             initial_amount = intake.requested_loan_amount
         calc = _calculation(
@@ -411,17 +497,33 @@ async def read_terms(
         dscr_after=float(row.dscr_after) if row.dscr_after is not None else None,
         cash_flow_value=float(row.cash_flow_value) if row.cash_flow_value is not None else None,
         cash_flow_label=row.cash_flow_label,
-        current_annual_debt_service=float(row.current_annual_debt_service) if row.current_annual_debt_service is not None else None,
+        current_annual_debt_service=float(row.current_annual_debt_service)
+        if row.current_annual_debt_service is not None
+        else None,
         annual_property_carrying_costs=(
             float(row.annual_property_carrying_costs)
             if row.annual_property_carrying_costs is not None
             else None
         ),
-        projected_annual_debt_service=float(row.projected_annual_debt_service) if row.projected_annual_debt_service is not None else None,
+        projected_annual_debt_service=float(row.projected_annual_debt_service)
+        if row.projected_annual_debt_service is not None
+        else None,
         dscr_method=row.dscr_method,  # type: ignore[arg-type]
         dscr_status=row.dscr_status,  # type: ignore[arg-type]
         dscr_explanation=row.dscr_explanation,
         source=row.dscr_source,
+        **structure_block(
+            amount=float(row.amount),
+            apr_pct=float(row.apr_pct),
+            term_months=row.term_months,
+            frequency=row.repayment_frequency,
+            custom_payments_per_year=round(float(row.payments_per_year))
+            if row.repayment_frequency == "custom"
+            else None,
+            # Rows saved before the structure existed were amortizing.
+            loan_structure=getattr(row, "loan_structure", None) or "amortizing",
+            interest_only_months=getattr(row, "interest_only_months", None),
+        ),
     )
     return ClientTermsRead(
         profile_id=profile.id,
@@ -436,10 +538,16 @@ async def read_terms(
         funder_type=row.funder_type,  # type: ignore[arg-type]
         funder_name=row.funder_name,
         repayment_frequency=row.repayment_frequency,  # type: ignore[arg-type]
-        custom_payments_per_year=round(float(row.payments_per_year)) if row.repayment_frequency == "custom" else None,
+        custom_payments_per_year=round(float(row.payments_per_year))
+        if row.repayment_frequency == "custom"
+        else None,
         custom_repayment_label=row.custom_repayment_label,
         debt_service_treatment=row.debt_service_treatment,  # type: ignore[arg-type]
-        retained_annual_debt_service=float(row.retained_annual_debt_service) if row.retained_annual_debt_service is not None else None,
+        retained_annual_debt_service=float(row.retained_annual_debt_service)
+        if row.retained_annual_debt_service is not None
+        else None,
+        loan_structure=(getattr(row, "loan_structure", None) or "amortizing"),  # type: ignore[arg-type]
+        interest_only_months=getattr(row, "interest_only_months", None) or 0,
         expiration_days=row.expiration_days,
         closing_estimate_days=row.closing_estimate_days,
         co_brand_enabled=row.co_brand_enabled,
@@ -473,7 +581,9 @@ async def _plan_block(db: AsyncSession, profile: ApplicationProfile) -> dict[str
     evaluation = plan.get("evaluation") or {}
     return {
         "active": bool(evaluation.get("active")),
-        "modifications": [m.get("label") for m in plan.get("modifications") or [] if m.get("label")],
+        "modifications": [
+            m.get("label") for m in plan.get("modifications") or [] if m.get("label")
+        ],
         "dscr": impact.get("dscr"),
         "debt_service_monthly": impact.get("debt_service_monthly"),
         "income_annual": impact.get("income_annual"),
@@ -510,13 +620,27 @@ async def save_terms(
         )
     chosen = next((item for item in options if item.value == payload.loan_type), None)
     if chosen is None:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Choose a loan type from the active funding catalog")
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Choose a loan type from the active funding catalog",
+        )
     payment, count, periods, annual, _, _ = repayment_math(
         amount=payload.amount,
         apr_pct=payload.apr_pct,
         term_months=payload.term_months,
         frequency=payload.repayment_frequency,
         custom_payments_per_year=payload.custom_payments_per_year,
+        loan_structure=payload.loan_structure,
+        interest_only_months=payload.interest_only_months,
+    )
+    structure = structure_block(
+        amount=payload.amount,
+        apr_pct=payload.apr_pct,
+        term_months=payload.term_months,
+        frequency=payload.repayment_frequency,
+        custom_payments_per_year=payload.custom_payments_per_year,
+        loan_structure=payload.loan_structure,
+        interest_only_months=payload.interest_only_months,
     )
     context = await _dscr_context(db, profile)
     calc = _calculation(
@@ -551,6 +675,8 @@ async def save_terms(
         custom_repayment_label=payload.custom_repayment_label,
         debt_service_treatment=payload.debt_service_treatment,
         retained_annual_debt_service=payload.retained_annual_debt_service,
+        loan_structure=structure["loan_structure"],
+        interest_only_months=structure["interest_only_months"],
         periodic_payment=payment,
         payment_count=count,
         annual_new_debt_service=annual,
@@ -586,7 +712,9 @@ async def save_terms(
     # The Financials plan mirrors what was just recorded.
     from app.services import plan_terms_link
 
-    await plan_terms_link.adopt_for_profile(db, profile, plan_terms_link.recorded_from_client_terms(row), user=user)
+    await plan_terms_link.adopt_for_profile(
+        db, profile, plan_terms_link.recorded_from_client_terms(row), user=user
+    )
     await profiles.log_profile_action(
         db,
         profile,

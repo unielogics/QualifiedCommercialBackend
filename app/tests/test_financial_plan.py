@@ -157,7 +157,7 @@ def test_add_backs_overrides_and_an_interest_only_loan_change_every_figure_toget
     result = fp.evaluate_plan(plan, obligations_list=obligations, recurring=RECURRING, months=MONTHS, dscr=DSCR, service=SERVICE, proposed=None, requested_amount=70000)
     assert result["add_backs_monthly"] == 9000.0 and result["add_backs_annual"] == 108000.0
     assert result["new_payment_monthly"] == 1500.0 and result["new_payment_source"] == "manual_terms"  # 150k × 12% / 12
-    assert result["loan_terms"] == {"amount": 150000.0, "rate_pct": 12.0, "term_months": None, "interest_only": True}
+    assert {k: result["loan_terms"][k] for k in ("amount", "rate_pct", "term_months", "interest_only", "structure")} == {"amount": 150000.0, "rate_pct": 12.0, "term_months": None, "interest_only": True, "structure": "interest_only"}
     assert result["debt_service_after_monthly"] == round(11897.0 - 6750.0 + 1500.0, 2)
     bank, tax = result["candidates"]
     assert bank["numerator_after"] == 131063.0 + 108000.0 and tax["numerator_after"] == 70000.0 + 108000.0
@@ -199,7 +199,7 @@ def test_levers_offer_the_officer_add_back_and_interest_only_when_they_raise_cov
     assert comp["apply"]["add_backs"][0]["amount_monthly"] == 8000.0 and comp["apply"]["add_backs"][0]["source"] == "tax_return"
     assert comp["dscr_after"] == round((131063.0 + 96000.0) / (evaluation["debt_service_after_monthly"] * 12), 2)
     io = levers["interest_only"]
-    assert io["apply"] == {"new_loan_interest_only": True, "new_payment_monthly": None}
+    assert io["apply"] == {"new_loan_interest_only": True, "new_loan_structure": "interest_only", "new_loan_interest_only_months": None, "new_payment_monthly": None}
     assert io["dscr_after"] == round(131063.0 / ((evaluation["debt_service_before_new_payment_monthly"] + 1500.0) * 12), 2)
     assert io["dscr_after"] > evaluation["headline_after"]
     # Once applied, neither lever is offered again.
