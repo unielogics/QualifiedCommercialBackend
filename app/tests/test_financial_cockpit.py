@@ -1012,3 +1012,9 @@ def test_a_schedule_row_edited_in_place_takes_the_figures_and_the_payee_link() -
     assert row.vendor_key is None and row.status == "dismissed" and row.count_in_dscr is False
     apply_debt_row_patch(row, {"lender": "  "})
     assert row.lender == "Arya"  # a blank name keeps the old one
+    row.mca_modified, row.mca_modification_note = True, "renegotiated in May"
+    assert "mca_modified" in apply_debt_row_patch(row, {"category": "term_loan"})
+    assert row.category == "term_loan" and row.mca_modified is None and row.mca_modification_note is None  # the advance questions leave with the type
+    row.mca_modified = True
+    apply_debt_row_patch(row, {"category": "mca"})
+    assert row.mca_modified is True  # an advance keeps its answer

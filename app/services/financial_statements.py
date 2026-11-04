@@ -570,6 +570,12 @@ def apply_debt_row_patch(row: Any, changes: dict[str, Any]) -> list[str]:
         if getattr(row, key, None) != value:
             setattr(row, key, value)
             changed.append(key)
+    if "category" in changes and getattr(row, "category", None) not in debt_types.ADVANCE_DEBT_TYPES:
+        # An answer to a question only advances are asked leaves with the type.
+        for field in ("mca_modified", "mca_modification_note"):
+            if getattr(row, field, None) is not None:
+                setattr(row, field, None)
+                changed.append(field)
     if "monthly_payment" in changes and changes["monthly_payment"] is not None and "payment_amount" not in changes:
         # The desk typed the month; a per-payment cadence read earlier no longer describes it.
         if getattr(row, "payment_amount", None) is not None:
