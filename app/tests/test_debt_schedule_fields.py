@@ -606,3 +606,65 @@ def test_the_modal_row_reads_like_the_links_row():
     problems = fs.debt_row_problems(rows)
     assert [p["index"] for p in problems] == [2]
     assert set(problems[0]["missing"]) == {"debt_type", "original_amount", "rate", "payment_status"}
+
+
+# --- adopting an uploaded schedule keeps every answer the AI read -------------
+
+
+def _adopted(*lines: dict) -> list[dict]:
+    from app.services.financial_statements import debt_rows_from_body, document_debts_as_body
+
+    rows = debt_rows_from_body(document_debts_as_body({"debts": list(lines)}))
+    assert rows is not None
+    return rows
+
+
+def test_adopting_reads_the_older_extraction_shape_and_keeps_delinquent() -> None:
+    late, ok, unknown = _adopted(
+        {"lender": "Ally", "current": False, "rate_pct": 11.89, "secured_by": "2025 RAM 1500", "monthly_payment": 1090.38},
+        {"lender": "Stellantis", "current": True, "rate_pct": 10.11, "monthly_payment": 1166.74},
+        {"lender": "Chase", "current": None, "monthly_payment": 500},
+    )
+    # A delinquent debt must arrive delinquent. It used to arrive blank, which
+    # reads as "nobody asked" instead of "behind on payments".
+    assert late["payment_status"] == "delinquent"
+    assert ok["payment_status"] == "current"
+    assert unknown["payment_status"] is None
+    assert late["secured"] == "secured" and late["collateral"] == "2025 RAM 1500"
+    assert ok["secured"] is None
+    assert late["rate"] == 11.89
+
+
+def test_adopting_reads_the_current_extraction_shape() -> None:
+    advance, term = _adopted(
+        {
+            "lender": "Fox Funding", "debt_type": "mca", "interest_rate": 0, "payment_status": "delinquent",
+            "secured": "unsecured", "mca_modified": True, "monthly_payment": 4200, "current_balance": 31000,
+            "maturity_date": "2027-03-01", "origination_date": "2026-03-01",
+        },
+        {"lender": "First Bank", "debt_type": "Term loan", "interest_rate": "7.25%", "payment_status": "current",
+         "secured": "secured", "mca_modified": True, "monthly_payment": 2100},
+    )
+    assert advance["debt_type"] == "mca" and advance["payment_status"] == "delinquent"
+    assert advance["secured"] == "unsecured"
+    # A 0% rate is an answer, not a gap.
+    assert advance["rate"] == 0
+    assert advance["mca_modified"] is True
+    assert advance["maturity_on"] is not None and advance["originated_on"] is not None
+    assert term["rate"] == 7.25 and term["payment_status"] == "current" and term["secured"] == "secured"
+    # The modification question belongs to advances; the cleaner drops it here.
+    assert term["mca_modified"] is None
+
+
+def test_adopting_turns_free_text_status_and_flags_into_the_form_vocabulary() -> None:
+    past_due, related, boolean_secured, yes_secured, no_secured = _adopted(
+        {"lender": "A", "payment_status": "30 days past due"},
+        {"lender": "B", "payment_status": "related party"},
+        {"lender": "C", "secured": False},
+        {"lender": "D", "secured": "yes"},
+        {"lender": "E", "secured": "no"},
+    )
+    assert past_due["payment_status"] == "delinquent"
+    assert related["payment_status"] is None
+    assert boolean_secured["secured"] == "unsecured"
+    assert yes_secured["secured"] == "secured" and no_secured["secured"] == "unsecured"

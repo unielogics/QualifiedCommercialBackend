@@ -486,9 +486,64 @@ def _money_or_none(value: Any) -> Decimal | None:
     return -amount if negative else amount
 
 
+def _first_present(line: dict[str, Any], *keys: str) -> Any:
+    """The first of these keys the line actually carries. Not `or`: a rate of
+    0 is a 0% promotion, and `or` would step over it to the next key."""
+    for key in keys:
+        value = line.get(key)
+        if value is not None and (not isinstance(value, str) or value.strip()):
+            return value
+    return None
+
+
+_DELINQUENT_WORDS = re.compile(
+    r"\b(delinquent|past[ _]?due|not current|late|default(ed)?|arrears)\b"
+)
+
+
+def _document_payment_status(line: dict[str, Any]) -> str | None:
+    """"current" or "delinquent" off a schedule line, whichever way the AI
+    wrote it: the prompt asks for `payment_status`, older reads carry a
+    `current` true/false. Anything else stays unanswered, so the completeness
+    check asks for it instead of the row guessing."""
+    text = str(line.get("payment_status") or "").strip().casefold().replace("-", " ")
+    if text in _PAYMENT_STATUS_CHOICES:
+        return text
+    if text and _DELINQUENT_WORDS.search(text):
+        return "delinquent"
+    current = line.get("current")
+    if isinstance(current, bool):
+        return "current" if current else "delinquent"
+    return None
+
+
+def _document_secured(line: dict[str, Any]) -> str | None:
+    """"secured" or "unsecured" off a schedule line. A line that names what
+    backs it is secured, whatever else it said."""
+    raw = line.get("secured")
+    if isinstance(raw, bool):
+        return "secured" if raw else "unsecured"
+    text = str(raw or "").strip().casefold()
+    if text in _SECURED_CHOICES:
+        return text
+    if text in _YES:
+        return "secured"
+    if text in _NO:
+        return "unsecured"
+    if str(_first_present(line, "secured_by", "collateral") or "").strip():
+        return "secured"
+    return None
+
+
 def document_debts_as_body(document: dict[str, Any] | None) -> dict[str, Any]:
     """The lines the AI read off an uploaded debt schedule, as the desk's form
-    body, so they can be adopted as the file's own rows with one click."""
+    body, so they can be adopted as the file's own rows with one click.
+
+    Both shapes the AI has written are read (`interest_rate` / `rate_pct`,
+    `payment_status` / `current`, `secured` / `secured_by`), and what comes out
+    uses only the values the form stores, so the row cleaner downstream never
+    has to discard an answer it cannot read. The MCA modification answer rides
+    along; the cleaner keeps it only on an advance."""
     debts: list[dict[str, Any]] = []
     for line in (document or {}).get("debts") or []:
         if not isinstance(line, dict):
@@ -496,21 +551,21 @@ def document_debts_as_body(document: dict[str, Any] | None) -> dict[str, Any]:
         lender = str(line.get("lender") or line.get("creditor") or line.get("name") or "").strip()
         if not lender:
             continue
-        current = line.get("current")
-        status = "current" if current is True else ("past_due" if current is False else None)
         debts.append(
             {
                 "lender": lender,
-                "debt_type": line.get("debt_type") or line.get("type"),
+                "debt_type": _first_present(line, "debt_type", "type"),
                 "original_amount": line.get("original_amount"),
-                "balance": line.get("current_balance") if line.get("current_balance") is not None else line.get("balance"),
-                "rate": line.get("rate_pct") if line.get("rate_pct") is not None else line.get("rate"),
+                "balance": _first_present(line, "current_balance", "balance"),
+                "rate": _first_present(line, "interest_rate", "rate_pct", "rate"),
                 "monthly_payment": line.get("monthly_payment"),
-                "originated_on": line.get("origination_date") or line.get("originated_on"),
-                "maturity_on": line.get("maturity_date") or line.get("maturity_on"),
-                "collateral": line.get("secured_by") or line.get("collateral"),
-                "secured": "yes" if line.get("secured_by") else None,
-                "payment_status": status,
+                "originated_on": _first_present(line, "origination_date", "originated_on", "origin_date"),
+                "maturity_on": _first_present(line, "maturity_date", "maturity_on"),
+                "collateral": _first_present(line, "collateral", "secured_by"),
+                "secured": _document_secured(line),
+                "payment_status": _document_payment_status(line),
+                "mca_modified": line.get("mca_modified"),
+                "mca_modification_note": _first_present(line, "mca_modification_note", "mca_note"),
                 "notes": "Adopted from the uploaded debt schedule.",
             }
         )
