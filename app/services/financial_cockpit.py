@@ -1240,6 +1240,15 @@ def proposed_payment(terms: dict[str, Any] | None) -> dict[str, Any] | None:
         "term_months": months,
         "monthly_payment": _round(monthly),
         "annual_payment": _round(monthly * 12),
+        # The structure travels with the terms: the schedule, the package and
+        # the offering price on it (proposed_terms_block), and the plan link
+        # reads the treatment.
+        "structure": terms.get("structure"),
+        "interest_only_months": int(terms.get("interest_only_months") or 0),
+        "interest_only": bool(terms.get("interest_only")),
+        "payment_stated": bool(terms.get("payment_stated")),
+        "treatment": terms.get("treatment"),
+        "retained_annual_debt_service": terms.get("retained_annual_debt_service"),
     }
 
 
