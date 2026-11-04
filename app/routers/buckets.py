@@ -3251,10 +3251,13 @@ async def restore_admin_file(
     )
     await db.flush()
     affected_profiles = await profiles.affected_profiles_for_file(db, file)
+    # updated_at is server-generated (onupdate) and expired by the flush above;
+    # reading it here would lazy-load outside the async context and 500 the
+    # restore. Stamp the event from the clock instead.
     await capital_readiness.advisory_recompute_profiles(
         db,
         affected_profiles,
-        event_key=f"file-restored:{file.id}:{file.updated_at.isoformat()}",
+        event_key=f"file-restored:{file.id}:{_now().isoformat()}",
     )
     await db.commit()
     await db.refresh(file)

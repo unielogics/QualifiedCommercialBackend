@@ -47,6 +47,16 @@ def test_restore_rejects_rows_whose_storage_was_already_removed() -> None:
     assert "predates recovery retention" in source
 
 
+def test_restore_never_reads_the_expired_server_timestamp() -> None:
+    # After the flush, updated_at is expired (server onupdate); touching it in
+    # an async session raises MissingGreenlet and the restore 500s (seen live
+    # 2026-11-04). The recompute key comes from the clock instead.
+    source = inspect.getsource(buckets.restore_admin_file)
+
+    assert "file.updated_at" not in source
+    assert "file-restored:" in source and "_now().isoformat()" in source
+
+
 def test_bucket_file_legal_hold_always_blocks_deletion() -> None:
     row = BucketFile(legal_hold=True)
 
