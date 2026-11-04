@@ -5,6 +5,7 @@ import hashlib
 import logging
 import re
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import uuid4
 
 import boto3
@@ -63,6 +64,90 @@ async def _put_pdf(key: str, raw: bytes) -> None:
     )
 
 
+async def bank_statement_slot(db: AsyncSession, bucket_id) -> Any:
+    """The checklist row a bank statement satisfies on this file, or None.
+
+    What an upload gets routed to after analysis (`reconcile_uploaded_file`),
+    found here up front so a statement Plaid pulls lands on the same row the
+    moment it is stored: the open "six months of bank statements" requirement
+    first, else any open row whose name reads as bank statements. Closed and
+    signature rows never qualify.
+    """
+    from app.models.bucket import BucketRequestedDocument
+    from app.services.bucket_evidence import classifications_for_requested_doc
+
+    rows = list(
+        (
+            await db.execute(
+                select(BucketRequestedDocument)
+                .where(
+                    BucketRequestedDocument.bucket_id == bucket_id,
+                    BucketRequestedDocument.requires_signature.is_(False),
+                    BucketRequestedDocument.status.not_in(("closed", "not_applicable")),
+                )
+                .order_by(BucketRequestedDocument.created_at.asc())
+            )
+        ).scalars().all()
+    )
+    for row in rows:
+        if row.requirement_key == "business_bank_statements_6_months":
+            return row
+    # A fallback row has to take several files: six statements on a one-file
+    # row is what the upload router refuses, so it is not done here either.
+    for row in rows:
+        if row.allow_multiple_files and "bank_statement" in classifications_for_requested_doc(row.name, row.category):
+            return row
+    return None
+
+
+def _month_facts(month: dict) -> dict:
+    """One asset-report month in the words the statement reader uses, so the
+    coverage, the cockpit and the AI read a Plaid month like a PDF month."""
+    return {
+        "month": month.get("month"),
+        "statement_period": month.get("month"),
+        "total_deposits_and_credits": month.get("total_deposits"),
+        "total_withdrawals_and_debits": month.get("total_withdrawals"),
+        "beginning_balance": month.get("beginning_balance"),
+        "ending_balance": month.get("ending_balance"),
+        "average_ledger_balance": month.get("average_ledger_balance"),
+        "low_daily_balance": month.get("low_daily_balance"),
+        "nsf_or_overdraft_count": month.get("nsf_count"),
+    }
+
+
+def asset_report_key_facts(account_rows: list[dict], observed_months: list[str]) -> dict:
+    """The asset report's key facts, shaped like an analysed statement's.
+
+    Before this the facts were bare month names, so the account counter and the
+    cockpit dropped the report for lacking a bank and a last-four, and Evidence
+    labelled it an upload. Each month row now carries the account's bank and
+    digits and the month's figures; a single-account report also names them at
+    the top the way a one-account statement does.
+    """
+    rows: list[dict] = []
+    banks: list[str] = []
+    masks: list[str] = []
+    for entry in account_rows:
+        account = entry.get("account") or {}
+        bank = str(account.get("institution") or "").strip()
+        mask = str(account.get("mask") or "").strip()
+        if bank and bank not in banks:
+            banks.append(bank)
+        if mask and mask not in masks:
+            masks.append(mask)
+        for month in entry.get("months") or []:
+            if not isinstance(month, dict):
+                continue
+            rows.append({**_month_facts(month), "bank": bank or None, "account_last4": mask or None, "account_name": account.get("name_hint")})
+    facts: dict = {"months": rows or [{"month": month} for month in observed_months], "source": "plaid_assets"}
+    if len(banks) == 1:
+        facts["bank"] = banks[0]
+    if len(masks) == 1:
+        facts["account_last4"] = masks[0]
+    return facts
+
+
 async def ingest_asset_report(
     db: AsyncSession, asset_report_id: str
 ) -> PlaidAssetReport:
@@ -119,9 +204,15 @@ async def ingest_asset_report(
     prefix = get_settings().buckets_s3_prefix.strip("/")
     key = f"{prefix}/plaid-assets/{profile.primary_bucket_id}/{file_id}-{filename}"
     await _put_pdf(key, pdf)
+    # The same checklist row an uploaded statement is routed to, linked at
+    # birth: the report's analysis is written whole below, so nothing would
+    # otherwise reconcile it and the requirement stayed "requested".
+    slot = await bank_statement_slot(db, profile.primary_bucket_id)
+    institutions = sorted({str((row.get("account") or {}).get("institution") or "").strip() for row in account_rows} - {""})
     file = BucketFile(
         id=file_id,
         bucket_id=profile.primary_bucket_id,
+        requested_document_id=slot.id if slot is not None else None,
         file_name=filename,
         s3_key=key,
         content_type="application/pdf",
@@ -130,9 +221,13 @@ async def ingest_asset_report(
         status="uploaded",
         content_hash=digest,
         extraction_status="completed",
+        source_kind="plaid",
+        source_detail=(" / ".join(institutions) or "Plaid Assets")[:200],
     )
     db.add(file)
     await db.flush()
+    if slot is not None:
+        slot.status = "uploaded"
     analysis = BucketFileAnalysis(
         bucket_file_id=file.id,
         bucket_id=file.bucket_id,
@@ -151,7 +246,7 @@ async def ingest_asset_report(
             "source": "plaid_assets",
             "verified": True,
             "asset_report_id": report.asset_report_id,
-            "key_facts": {"months": [{"month": month} for month in observed_months]},
+            "key_facts": asset_report_key_facts(account_rows, observed_months),
             "accounts": account_rows,
         },
         analyzed_at=_now(),
@@ -432,6 +527,12 @@ async def sync_item(
     fresh = [row for row in listing.get("statements", []) if row["statement_id"] not in existing]
     skipped = len(listing.get("statements", [])) - len(fresh)
     pulled = failed = 0
+    # Every statement Plaid pulls lands on the bank-statement checklist row the
+    # way an upload does, so the requirement, the coverage and Evidence see it.
+    # Held by id: the per-statement rollback below expires every loaded row,
+    # and a stale ORM object would have poisoned every later statement.
+    slot = await bank_statement_slot(db, profile.primary_bucket_id) if fresh else None
+    slot_id = slot.id if slot is not None else None
     for statement in fresh[:MAX_STATEMENTS_PER_SYNC]:
         try:
             raw = await plaid_client.statements_download(token, statement["statement_id"])
@@ -454,6 +555,7 @@ async def sync_item(
             file = BucketFile(
                 id=file_id,
                 bucket_id=profile.primary_bucket_id,
+                requested_document_id=slot_id,
                 application_plaid_item_id=item.id,
                 plaid_statement_id=statement["statement_id"],
                 statement_period=period,
@@ -463,9 +565,19 @@ async def sync_item(
                 size_bytes=len(raw),
                 uploaded_by_name="Plaid",
                 status="uploaded",
+                source_kind="plaid",
+                source_detail=(item.institution_name or "Plaid")[:200],
             )
             db.add(file)
             await db.flush()
+            if slot_id is not None:
+                # A room upload flips its row to "uploaded" the moment it is
+                # stored; a statement Plaid pulled is treated the same.
+                from app.models.bucket import BucketRequestedDocument
+
+                requested = await db.get(BucketRequestedDocument, slot_id)
+                if requested is not None and requested.status == "requested":
+                    requested.status = "uploaded"
             from app.services.bucket_ai import enqueue_file_analysis
 
             await enqueue_file_analysis(db, file)

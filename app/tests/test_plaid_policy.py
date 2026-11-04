@@ -76,7 +76,9 @@ def test_statements_only_can_use_the_pdf_fallback():
 
 
 @pytest.mark.asyncio
-async def test_linked_profile_uses_dealer_policy_as_authority():
+async def test_linked_profile_uses_dealer_policy_as_authority(monkeypatch):
+    # The deployment has both products, so the dealer's preference is what shows.
+    monkeypatch.setattr(plaid_policy.plaid_client, "products", lambda: ["assets", "statements"])
     dealer = SimpleNamespace(
         plaid_assets_enabled=False,
         plaid_statements_enabled=True,

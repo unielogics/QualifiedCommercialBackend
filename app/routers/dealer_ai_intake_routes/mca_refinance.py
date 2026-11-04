@@ -683,7 +683,9 @@ async def mca_router_secure_room(
     """Open this file's secure room, where the bank connection and the
     agreements live. The client is already verified on this intake."""
     intake = await core._load_public_intake(db, token)
-    return await core._secure_room_handoff(db, intake, request, tab="todo")
+    # The card this answers is titled "Connect your bank account": the room
+    # opens on banking, where Plaid is first, not on the general to-do list.
+    return await core._secure_room_handoff(db, intake, request, tab="banking")
 
 @core.mca_router.post("/{token}/book-call", response_model=core.DealerIntakeResponse)
 async def book_mca_refinance_call(

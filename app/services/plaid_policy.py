@@ -72,10 +72,49 @@ class PlaidProductPolicy:
             raise PlaidProductUnavailable(unavailable, self.available_products)
 
 
-def from_owner(owner: DealerBusiness | ApplicationProfile) -> PlaidProductPolicy:
+def deployment_products() -> list[str]:
+    """What this deployment may ask Plaid for. The allowlist the account has
+    been enabled for; an unreadable setting falls back to Assets, the product
+    every deployment has had."""
+    try:
+        return list(plaid_client.products())
+    except plaid_client.PlaidUnavailable:
+        return ["assets"]
+
+
+def preferred_products(owner: DealerBusiness | ApplicationProfile) -> list[str]:
+    """What the file asks for, before the deployment allowlist is applied —
+    the flags on the row, for the desk to show as the file's setting."""
+    return [
+        product
+        for product, selected in (
+            ("assets", bool(owner.plaid_assets_enabled)),
+            ("statements", bool(owner.plaid_statements_enabled)),
+        )
+        if selected
+    ]
+
+
+def from_owner(
+    owner: DealerBusiness | ApplicationProfile, *, available: Iterable[str] | None = None
+) -> PlaidProductPolicy:
+    """The products a file actually gets: what it prefers, among what this
+    deployment may call.
+
+    The preference lives on the row — statement PDFs on for every file by
+    default, the owner's call, because a bank-produced statement is the
+    evidence a lender reads. The allowlist (DEALER_OS_PLAID_PRODUCTS) is what
+    Plaid has enabled for the account. Until Plaid turns a product on, a file
+    that prefers it simply does not request it in Link, is not asked to consent
+    to it, and is never nagged to authorize it; the moment the allowlist grows,
+    every such file gets the product on its next Link or sync, with no second
+    edit. Keeping the two apart is what lets the default flip today while the
+    Plaid account is still Assets-only.
+    """
+    allowed = set(available if available is not None else deployment_products())
     return PlaidProductPolicy(
-        assets_enabled=bool(owner.plaid_assets_enabled),
-        statements_enabled=bool(owner.plaid_statements_enabled),
+        assets_enabled=bool(owner.plaid_assets_enabled) and "assets" in allowed,
+        statements_enabled=bool(owner.plaid_statements_enabled) and "statements" in allowed,
     )
 
 

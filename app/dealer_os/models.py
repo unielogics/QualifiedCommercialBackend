@@ -151,7 +151,7 @@ class DealerBusiness(TimestampMixin, Base):
         Boolean, nullable=False, default=True, server_default=text("true")
     )
     plaid_statements_enabled: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=text("false")
+        Boolean, nullable=False, default=True, server_default=text("true")
     )
     plaid_policy_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     plaid_policy_updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(

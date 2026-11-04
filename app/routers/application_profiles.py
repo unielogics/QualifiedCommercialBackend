@@ -1981,6 +1981,25 @@ async def create_application_room_request(
     )
 
 
+def _room_reminder_copy(purpose: str) -> tuple[str, str]:
+    """Where the room opens and what the message asks, per kind of request.
+
+    The bank connection is asked for by name and first — the owner: "plaid
+    needs to be the first option available" — with the six-month upload as the
+    fallback in the same sentence, so the client who cannot or will not connect
+    still knows what to do. The sentence is dropped into the delivery
+    template as "<rep> has asked you to <purpose> for <business>".
+    """
+    if purpose == "bank_connect":
+        return (
+            "tab=banking",
+            "connect the business bank through Plaid (read-only) or upload six months of bank statements",
+        )
+    if purpose == "business_banking":
+        return "tab=banking", "connect or upload business bank statements"
+    return "tab=todo", "complete the requested application items"
+
+
 @router.post("/{profile_id}/room/reminders", response_model=RoomRequestResult)
 async def send_application_room_reminder(
     profile_id: UUID,
@@ -1993,12 +2012,7 @@ async def send_application_room_reminder(
     if user.role in {Role.CLIENT, Role.DEALER, Role.VENDOR, Role.LENDER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only scoped staff may send room reminders")
     link = await _profile_room_link(db, profile)
-    query = "tab=banking" if payload.purpose == "business_banking" else "tab=todo"
-    purpose = (
-        "connect or upload business bank statements"
-        if payload.purpose == "business_banking"
-        else "complete the requested application items"
-    )
+    query, purpose = _room_reminder_copy(payload.purpose)
     email = profiles.normalized_email(str(payload.recipient_email) if payload.recipient_email else link.recipient_email)
     phone = profiles.normalized_phone(payload.recipient_phone)
     channels = ", ".join(
@@ -3147,6 +3161,7 @@ async def _application_bank_state(
         evidence_summary=profiles.application_evidence_summary(manual_evidence),
         assets_enabled=policy.assets_enabled,
         statements_enabled=policy.statements_enabled,
+        statements_preferred=bool(getattr(policy_owner, "plaid_statements_enabled", policy.statements_enabled)),
         selected_products=policy.selected_products,
         available_products=policy.available_products,
         consent_product_scope=consent_scope,
@@ -4390,8 +4405,16 @@ async def update_application_plaid_settings(
         assets_enabled=payload.assets_enabled,
         statements_enabled=payload.statements_enabled,
     )
+    # Judged by what the choice does today: a preference the deployment cannot
+    # honour yet (statements on an Assets-only account) is stored and waits,
+    # as the migration's default does; a choice that leaves nothing to ask
+    # Plaid for is refused.
+    effective = plaid_policy.PlaidProductPolicy(
+        assets_enabled=proposed.assets_enabled and "assets" in plaid_policy.deployment_products(),
+        statements_enabled=proposed.statements_enabled and "statements" in plaid_policy.deployment_products(),
+    )
     try:
-        proposed.validate()
+        effective.validate()
     except plaid_policy.InvalidPlaidPolicy as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except plaid_policy.PlaidProductUnavailable as exc:

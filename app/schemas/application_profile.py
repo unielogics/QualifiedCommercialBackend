@@ -70,7 +70,7 @@ class ApplicationProfileRead(BaseModel):
     communication_locale_source: str = "system_default"
     communication_locale_updated_at: datetime | None = None
     plaid_assets_enabled: bool = True
-    plaid_statements_enabled: bool = False
+    plaid_statements_enabled: bool = True
     plaid_policy_updated_at: datetime | None = None
     plaid_policy_updated_by_user_id: UUID | None = None
     vertical: str
@@ -739,6 +739,10 @@ class ApplicationBankState(BaseModel):
     evidence_summary: ApplicationEvidenceSummary = Field(default_factory=ApplicationEvidenceSummary)
     assets_enabled: bool = False
     statements_enabled: bool = False
+    #: The file's own setting for statement PDFs, before the deployment
+    #: allowlist is applied: True with `statements_enabled` False means the
+    #: file wants them and the Plaid account is not enabled for the product yet.
+    statements_preferred: bool = False
     selected_products: list[str] = Field(default_factory=list)
     available_products: list[str] = Field(default_factory=list)
     consent_product_scope: list[str] = Field(default_factory=list)
@@ -1029,7 +1033,9 @@ class RoomRequestCreate(BaseModel):
 
 
 class RoomReminderCreate(BaseModel):
-    purpose: Literal["documents", "business_banking", "room"] = "room"
+    #: `bank_connect` is the desk asking for a Plaid connection by name, upload
+    #: as the fallback; `business_banking` is the older neutral wording.
+    purpose: Literal["documents", "business_banking", "bank_connect", "room"] = "room"
     recipient_email: EmailStr | None = None
     recipient_phone: str | None = Field(default=None, max_length=48)
     email_room_link: bool = True

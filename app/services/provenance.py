@@ -53,12 +53,13 @@ DOCUMENT_SOURCES: dict[str, str] = {
     "vendor": "Delivered by a connected provider",
     "capital_os": "Mirrored from Capital OS",
     "email": "Arrived by email",
+    "plaid": "Pulled from the bank through Plaid",
 }
 
 #: Sources where there is no human actor to record. A null user id on any other
 #: source means the identity was lost, which is the thing this module exists to
 #: stop, so the two cases must stay distinguishable.
-UNATTENDED_SOURCES = frozenset({"generated", "vendor", "system"})
+UNATTENDED_SOURCES = frozenset({"generated", "vendor", "system", "plaid"})
 
 #: What the client themselves can be the source of. Anything else arriving with
 #: a client actor is a bug in the calling route.

@@ -163,8 +163,11 @@ class ApplicationProfile(TimestampMixin, Base):
     plaid_assets_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true"
     )
+    # On for every file (0254): statement PDFs are the evidence a lender reads.
+    # Honoured only once the deployment's Plaid account has the product — see
+    # plaid_policy.from_owner.
     plaid_statements_enabled: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="false"
+        Boolean, nullable=False, default=True, server_default="true"
     )
     plaid_policy_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     plaid_policy_updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
