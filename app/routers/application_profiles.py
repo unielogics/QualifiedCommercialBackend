@@ -135,6 +135,7 @@ from app.schemas.application_profile import (
     PlaidAssetReportCreate,
     PlaidAssetReportRead,
     ProfileCreditLinkReport,
+    ProviderCreditLinkRequest,
     PublicBankVerificationRead,
     PublicFileOwnerConsentRead,
     PublicFileOwnerConsentResult,
@@ -3024,6 +3025,98 @@ async def list_owner_credit_candidates(
     owner = _application_owner_only(await _owner_for_profile(db, profile, owner_id))
     candidates = await credit_links.candidate_pulls(db, profile, owner)
     return [OwnerCreditCandidateRead(**candidate.read()) for candidate in candidates]
+
+
+def _require_provider_catalog(user):
+    if _role_value(user) not in ("super_admin", "loan_exec"):
+        raise HTTPException(403, "The provider-wide credit catalog is restricted to authorized internal staff")
+
+
+@router.get("/{profile_id}/owners/{owner_id}/provider-applicants")
+async def provider_credit_applicants(profile_id: UUID, owner_id: UUID, user: CurrentUser,
+    query: str = "", page: int = 1, archived: bool = False, db: AsyncSession = Depends(get_db)):
+    from app.services import isoftpull_catalog
+    from app.services.isoftpull_session import IsoftpullSessionError
+
+    _require_provider_catalog(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    await _owner_for_profile(db, profile, owner_id)
+    if not 1 <= page <= 10000 or len(query) > 120:
+        raise HTTPException(422, "Invalid search or page")
+    try:
+        return await isoftpull_catalog.applicants(query, page, archived)
+    except IsoftpullSessionError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@router.get("/{profile_id}/owners/{owner_id}/provider-applicants/{applicant_id}/reports")
+async def provider_existing_reports(profile_id: UUID, owner_id: UUID, applicant_id: str,
+    user: CurrentUser, pull_type: str = "soft_pull", db: AsyncSession = Depends(get_db)):
+    from app.services import isoftpull_catalog
+    from app.services.isoftpull_session import IsoftpullSessionError
+
+    _require_provider_catalog(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    await _owner_for_profile(db, profile, owner_id)
+    try:
+        rows, _ = await isoftpull_catalog.reports(applicant_id, pull_type)
+        return {"items": rows}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except IsoftpullSessionError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@router.post("/{profile_id}/owners/{owner_id}/provider-credit-link", response_model=FileOwnerRead)
+async def link_provider_credit(profile_id: UUID, owner_id: UUID, payload: ProviderCreditLinkRequest,
+    user: CurrentUser, db: AsyncSession = Depends(get_db)):
+    from datetime import timedelta
+
+    from app.constants import SOFT_PULL_VALIDITY_DAYS
+    from app.services import credit_report_archive, isoftpull_catalog
+    from app.services.isoftpull_session import IsoftpullSessionError
+
+    _require_provider_catalog(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    owner = _application_owner_only(await _owner_for_profile(db, profile, owner_id))
+    if payload.confirm_identity is not True:
+        raise HTTPException(422, "Confirm that the report belongs to this owner and you are authorized to use it for this file")
+    if not profile.client_id:
+        raise HTTPException(409, "Link a client to the application before importing credit")
+    try:
+        report_id = str(payload.report_id)
+        parsed, html, pulled_at = await isoftpull_catalog.retrieve(payload.applicant_id, report_id, payload.pull_type)
+    except ValueError as exc:
+        raise HTTPException(422, "Invalid provider report selection") from exc
+    except IsoftpullSessionError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    # Serialize imports on this file, and reuse an already imported provider report.
+    await db.execute(select(ApplicationProfile).where(ApplicationProfile.id == profile.id).with_for_update())
+    await db.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(report_id, 0))))
+    pull = await db.scalar(select(CreditPull).where(or_(
+        CreditPull.bureau_response["provider_report_id"].astext == report_id,
+        *(CreditPull.bureau_response["reports"][bureau]["link"].astext.endswith("/" + report_id) for bureau in ("transunion", "equifax", "experian")),
+    )).limit(1))
+    if pull is None:
+        name = str(parsed.get("personal_info", {}).get("name") or "").strip().split()
+        pull = CreditPull(client_id=profile.client_id, status="completed", legal_first_name=name[0] if name else None,
+            legal_last_name=" ".join(name[1:]) if len(name) > 1 else None, fico=parsed.get("best_score"),
+            pulled_at=pulled_at, expires_at=pulled_at + timedelta(days=SOFT_PULL_VALIDITY_DAYS),
+            notes="Imported existing provider report; identity and authorized file use confirmed by staff",
+            bureau_response={"provider_report_id": report_id, "provider_applicant_id": payload.applicant_id, "parsed_report": parsed,
+                "provider_report_url": f"/client/reports/{report_id}"})
+        db.add(pull)
+        await db.flush()
+        archive = credit_report_archive.archive_report_html(pull.id, html)
+        if archive:
+            pull.bureau_response = {**pull.bureau_response, "report_s3_key": archive}
+    try:
+        await credit_links.link_pull(db, profile, owner, pull, actor=user, how=credit_links.HOW_MANUAL)
+    except credit_links.LinkConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    await db.commit()
+    await db.refresh(owner)
+    return profiles.owner_read(owner)
 
 
 @router.post("/{profile_id}/owners/{owner_id}/credit-link", response_model=FileOwnerRead)

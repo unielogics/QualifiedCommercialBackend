@@ -95,6 +95,7 @@ def pull_facts(pull: Any) -> dict[str, Any]:
         "report_available": extras["report_available"],
         "attention": extras["attention"],
         "report_import_status": (getattr(pull, "bureau_response", None) or {}).get("report_import_status"),
+        "credit_risk": ((getattr(pull, "bureau_response", None) or {}).get("parsed_report") or {}).get("intelligence"),
         "pulled_at": pulled.isoformat() if pulled else None,
         "expires_at": expires.isoformat() if expires else None,
         "expired": bool(expires and expires < datetime.now(UTC)),

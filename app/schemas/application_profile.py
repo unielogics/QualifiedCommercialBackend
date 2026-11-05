@@ -614,6 +614,7 @@ class FileOwnerRead(BaseModel):
     credit_score_verified: bool = False
     credit_report_available: bool = False
     credit_report_import_status: str | None = None
+    credit_risk: dict | None = None
     credit_link_how: str | None = None
     credit_attention: str | None = None
     credit_expires_at: str | None = None
@@ -1607,6 +1608,13 @@ class OwnerCreditCandidateRead(BaseModel):
 class OwnerCreditLinkRequest(BaseModel):
     pull_id: UUID
     confirm_other_client: bool = False
+
+
+class ProviderCreditLinkRequest(BaseModel):
+    applicant_id: str = Field(pattern=r"^\d{1,20}$")
+    report_id: UUID
+    pull_type: Literal["soft_pull", "hard_pull"] = "soft_pull"
+    confirm_identity: bool = False
 
 
 class ProfileCreditLinkReport(BaseModel):

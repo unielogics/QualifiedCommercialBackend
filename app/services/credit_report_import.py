@@ -14,7 +14,7 @@ from app.services import credit_report_archive, isoftpull_report_parser
 from app.services.isoftpull_session import IsoftpullSessionError
 
 log = logging.getLogger(__name__)
-IMPORT_VERSION = 1
+IMPORT_VERSION = 2
 
 
 class ReportImportUnavailable(Exception):
@@ -59,7 +59,7 @@ async def import_existing_report(db, pull) -> dict:
         reports = raw.get("reports") or {}
         link = next((node.get("link") for bureau in ("transunion", "equifax", "experian")
                      if isinstance(node := reports.get(bureau), dict)
-                     and node.get("status") == "success" and node.get("link")), None)
+                     and node.get("status") == "success" and node.get("link")), None) or raw.get("provider_report_url")
         if not link:
             raise ReportImportUnavailable("No provider report link is stored for this pull. No new credit pull was made.")
         try:
@@ -76,6 +76,9 @@ async def import_existing_report(db, pull) -> dict:
             if key:
                 raw["report_s3_key"] = key
 
+    from app.services.credit_risk_review import analyze_report
+
+    parsed["intelligence"] = analyze_report(parsed, as_of=pull.pulled_at)
     raw["parsed_report"] = parsed
     raw["report_imported_at"] = datetime.now(UTC).isoformat()
     raw.update(report_import_version=IMPORT_VERSION, report_import_status="completed",
