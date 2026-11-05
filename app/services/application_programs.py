@@ -3415,6 +3415,11 @@ async def get_program_readiness(
     # This function is on both sides of that cycle, so ordering it here fixes
     # both paths: re-taking a row lock the transaction already holds is free,
     # so the later acquisitions become no-ops rather than new edges in a graph.
+    #
+    # That holds only while the caller has not locked the profile itself. A
+    # caller that does must take the bucket lock first, as
+    # run_profile_collection_outreach now does: it locked the profile and
+    # arrived here second, which put the profile before the bucket again.
     if profile.primary_bucket_id is not None:
         await db.execute(
             select(Bucket.id).where(Bucket.id == profile.primary_bucket_id).with_for_update()

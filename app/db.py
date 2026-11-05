@@ -7,7 +7,7 @@ import logging
 import random
 from collections.abc import AsyncIterator, Awaitable, Callable
 
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -68,6 +68,36 @@ def is_transient_conflict(exc: BaseException) -> bool:
     return transient_conflict_code(exc) is not None
 
 
+def _held_instances(db: AsyncSession) -> list[object]:
+    """The persistent instances the session tracks as the caller hands over."""
+
+    identity_map = getattr(db, "identity_map", None)
+    return list(identity_map.values()) if identity_map is not None else []
+
+
+async def _reload_held(db: AsyncSession, held: list[object]) -> None:
+    """Put back what a rollback took from the caller.
+
+    A rollback expires every instance the session tracks, and an async session
+    can only reload an expired one inside an await. The work reloads what it
+    fetches itself, but the signed-in user arrives already loaded: the next
+    plain read of ``user.role`` raised ``MissingGreenlet``, so a deadlock the
+    retry had healed still answered 500.
+    """
+
+    for item in held:
+        try:
+            await db.refresh(item)
+        except InvalidRequestError:
+            continue  # the row is gone or the instance left the session: nothing to read from it
+
+
+def _statement_head(exc: DBAPIError) -> str:
+    """Which statement lost, for the log. The SQL text only, never its parameters."""
+
+    return " ".join(str(getattr(exc, "statement", "") or "").split())[:120] or "unknown statement"
+
+
 async def retry_transient_conflicts[T](
     db: AsyncSession,
     work: Callable[[], Awaitable[T]],
@@ -81,9 +111,12 @@ async def retry_transient_conflicts[T](
 
     ``work`` must own its whole unit — reload what it needs and commit when it
     is done — because the rollback discards every pending change on ``db``.
+    What the caller already held when it called (the signed-in user) is
+    reloaded here, so reading its columns still works on the next attempt.
     Any other error, and the last conflict, propagate unchanged.
     """
 
+    held = _held_instances(db)
     for attempt in range(1, attempts + 1):
         try:
             return await work()
@@ -94,8 +127,9 @@ async def retry_transient_conflicts[T](
             await db.rollback()
             delay = 0.05 * (2 ** (attempt - 1)) + random.uniform(0, 0.05)
             log.warning(
-                "%s: transaction aborted (SQLSTATE %s), attempt %d of %d; retrying in %d ms",
-                label, code, attempt, attempts, round(delay * 1000),
+                "%s: transaction aborted (SQLSTATE %s) at %r, attempt %d of %d; retrying in %d ms",
+                label, code, _statement_head(exc), attempt, attempts, round(delay * 1000),
             )
             await sleep(delay)
+            await _reload_held(db, held)
     raise AssertionError("unreachable: the last attempt returns or raises")

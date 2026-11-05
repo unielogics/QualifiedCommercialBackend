@@ -18,7 +18,7 @@ from app.models.application_profile import (
     ApplicationRequirementState,
     ApplicationRoomDelivery,
 )
-from app.models.bucket import BucketUploadLink
+from app.models.bucket import Bucket, BucketUploadLink
 from app.models.client import Client
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
@@ -517,21 +517,41 @@ async def send_requirements_email(
 
 
 async def run_missing_item_email_pass(db: AsyncSession, *, limit: int = 100) -> dict[str, int]:
-    rows = list(
-        (
-            await db.execute(
-                select(ApplicationProfile)
-                .where(
-                    ApplicationProfile.missing_item_email_enabled.is_(True),
-                    ApplicationProfile.underwriting_status.in_(
-                        ["submitted", "collecting_docs", "in_underwriting", "term_sheet_provided", "approved"]
-                    ),
+    eligible = (
+        ApplicationProfile.missing_item_email_enabled.is_(True),
+        ApplicationProfile.underwriting_status.in_(
+            ["submitted", "collecting_docs", "in_underwriting", "term_sheet_provided", "approved"]
+        ),
+    )
+    due_first = ApplicationProfile.missing_item_email_next_send_at.asc().nullsfirst()
+    candidates = (
+        await db.execute(
+            select(ApplicationProfile.id, ApplicationProfile.primary_bucket_id)
+            .where(*eligible)
+            .order_by(due_first)
+            .limit(limit)
+        )
+    ).all()
+    # BUCKET BEFORE PROFILE, the order get_program_readiness documents: locking
+    # the profiles first and reaching each bucket through readiness is the
+    # reverse, and a file opened while the pass ran was a lock cycle. Buckets go
+    # in id order so nothing else that takes several can cross this.
+    bucket_ids = sorted({bucket_id for _, bucket_id in candidates if bucket_id is not None})
+    if bucket_ids:
+        await db.execute(select(Bucket.id).where(Bucket.id.in_(bucket_ids)).order_by(Bucket.id).with_for_update())
+    rows = (
+        list(
+            (
+                await db.execute(
+                    select(ApplicationProfile)
+                    .where(ApplicationProfile.id.in_([profile_id for profile_id, _ in candidates]), *eligible)
+                    .order_by(due_first)
+                    .with_for_update(skip_locked=True)
                 )
-                .order_by(ApplicationProfile.missing_item_email_next_send_at.asc().nullsfirst())
-                .with_for_update(skip_locked=True)
-                .limit(limit)
-            )
-        ).scalars().all()
+            ).scalars().all()
+        )
+        if candidates
+        else []
     )
     sent = failed = skipped = 0
     for profile in rows:
@@ -547,6 +567,13 @@ async def run_missing_item_email_pass(db: AsyncSession, *, limit: int = 100) -> 
 
 
 async def run_profile_collection_outreach(db: AsyncSession, profile: ApplicationProfile) -> ApplicationRoomDelivery | None:
+    # BUCKET BEFORE PROFILE, the order get_program_readiness documents. This
+    # used to lock the profile first and reach the bucket through readiness, the
+    # reverse, and the page schedules it after every program-readiness read, so
+    # a file opened at the same moment could meet it half-way and Postgres
+    # killed one of the two as the loser of the lock cycle.
+    if profile.primary_bucket_id is not None:
+        await db.execute(select(Bucket.id).where(Bucket.id == profile.primary_bucket_id).with_for_update())
     # Several analysis/program/readiness callbacks may finish together. Lock
     # and refresh the profile so only one sees the current cadence as due.
     profile = (await db.execute(select(ApplicationProfile).where(

@@ -2973,8 +2973,11 @@ async def delete_application_owner(
 async def get_application_verification(
     profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> FileOwnerRequirementState:
-    profile = await profiles.load_profile(db, profile_id, user)
-    return await profiles.verification_state(db, profile)
+    async def work() -> FileOwnerRequirementState:
+        profile = await profiles.load_profile(db, profile_id, user)
+        return await profiles.verification_state(db, profile)
+
+    return await retry_transient_conflicts(db, work, label="verification")
 
 
 def _business_label(profile: ApplicationProfile, intake: PublicUnderwritingIntake | None, client: Client | None) -> str:

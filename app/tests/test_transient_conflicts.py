@@ -4,11 +4,16 @@ answers 503 with Retry-After instead of a 500."""
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import String, delete
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from app.db import is_transient_conflict, retry_transient_conflicts, transient_conflict_code
 
@@ -85,3 +90,69 @@ async def test_a_conflict_that_outlives_the_retries_answers_503_and_anything_els
     assert response.headers["retry-after"] == "1"
     with pytest.raises(DBAPIError):
         await database_conflict_handler(request, _unique_violation())
+
+
+class _Base(DeclarativeBase):
+    pass
+
+
+class _Caller(_Base):
+    """Stands in for the signed-in user: loaded before the route's work starts."""
+
+    __tablename__ = "retry_callers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    role: Mapped[str] = mapped_column(String(20))
+
+
+@asynccontextmanager
+async def _session_holding_the_caller() -> AsyncIterator[tuple[AsyncSession, _Caller]]:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(_Base.metadata.create_all)
+    async with AsyncSession(engine, expire_on_commit=False) as db:
+        db.add(_Caller(id=1, role="super_admin"))
+        await db.commit()
+        caller = await db.get(_Caller, 1)  # what the sign-in dependency hands the route
+        assert caller is not None
+        yield db, caller
+    await engine.dispose()
+
+
+async def test_the_caller_can_still_be_read_when_the_retry_runs() -> None:
+    """A rollback expires every loaded instance, and an async session can only
+    reload one inside an await. The visibility check reads ``user.role`` as a
+    plain attribute, so the second attempt raised MissingGreenlet and a deadlock
+    the retry had healed still answered 500 (seen on evidence-workspace)."""
+
+    async with _session_holding_the_caller() as (db, caller):
+        roles: list[str] = []
+
+        async def work() -> str:
+            roles.append(caller.role)
+            if len(roles) == 1:
+                raise _deadlock()
+            return "done"
+
+        assert await retry_transient_conflicts(db, work, label="t", sleep=AsyncMock()) == "done"
+        assert roles == ["super_admin", "super_admin"]
+
+
+async def test_a_caller_removed_while_waiting_does_not_break_the_retry() -> None:
+    async with _session_holding_the_caller() as (db, caller):
+        attempts = 0
+
+        async def removed_meanwhile(_delay: float) -> None:
+            await db.execute(delete(_Caller).where(_Caller.id == 1))
+            await db.commit()
+
+        async def work() -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                assert caller.role == "super_admin"
+                raise _deadlock()
+            return "done"
+
+        assert await retry_transient_conflicts(db, work, label="t", sleep=removed_meanwhile) == "done"
+        assert attempts == 2
