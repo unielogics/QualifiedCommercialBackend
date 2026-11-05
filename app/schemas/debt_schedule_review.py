@@ -122,6 +122,9 @@ class DebtScheduleReviewRead(BaseModel):
     counts: dict[str, int] = Field(default_factory=dict)
     #: The schedule has been filed as the document on the checklist (our PDF of the rows is behind the slot).
     filed: bool = False
+    draft_pending: bool = False
+    draft_family_id: str | None = None
+    draft_revision: int | None = None
 
 
 class DebtReviewLineWrite(BaseModel):

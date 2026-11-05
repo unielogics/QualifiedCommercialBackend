@@ -1056,6 +1056,11 @@ class DealerDebt(TimestampMixin, Base):
     mca_modification_note: Mapped[str | None] = mapped_column(Text)
     origin: Mapped[str] = mapped_column(String(16), default="ai_draft", server_default="ai_draft")
     status: Mapped[str] = mapped_column(String(16), default="active", server_default="active")
+    # A duplicate remains addressable for evidence and extraction suppression.
+    # Only active canonical rows contribute to financial projections.
+    duplicate_of_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_debts.id", ondelete="SET NULL"), index=True
+    )
     vendor_key: Mapped[str | None] = mapped_column(String(60))
     evidence: Mapped[dict | None] = mapped_column(JSONB)
     notes: Mapped[str | None] = mapped_column(Text)

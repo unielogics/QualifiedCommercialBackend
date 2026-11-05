@@ -193,6 +193,8 @@ from app.models.financial_worksheet import (  # noqa: F401
     FinancialWorksheet,
 )
 from app.models.financial_worksheet_edit import FinancialWorksheetEdit  # noqa: F401
+from app.models.financial_debt_evidence import FinancialDebtEvidence  # noqa: F401
+from app.models.financial_form_version import FinancialFormFamily, FinancialFormDraft, FinancialFormVersion, FinancialFormImport  # noqa: F401
 from app.models.inline_image import InlineImage  # noqa: F401
 from app.models.message_attachment import MessageAttachment  # noqa: F401
 from app.models.notification import Notification  # noqa: F401

@@ -21,12 +21,14 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
 
+from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.application_profile import ApplicationProfile
 from app.models.financial_statement import FinancialStatement, FinancialStatementOwner
 from app.services import debt_types, pfs_schema
+from app.services.debt_terms import DebtTermsError, monthly_source, normalize_terms
 from app.services.extracted_facts import canonical_field_aliases
 
 log = logging.getLogger(__name__)
@@ -114,6 +116,8 @@ async def save_statement(
     Totals are written here rather than on read so the underwriting metric never
     depends on walking a JSON document, and so the two can never disagree.
     """
+    from app.services.financial_workspace_legacy import protect_projection
+    await protect_projection(db, profile, "pfs")
     totals = pfs_schema.totals(body)
     now = datetime.now(UTC)
 
@@ -328,6 +332,9 @@ DEBT_COLUMNS = (
     "mca_modified",
     "mca_modification_note",
     "notes",
+    "factor_rate",
+    "payment_amount",
+    "payment_frequency",
 )
 
 #: The same columns, worded for a header row — the downloadable workbook and
@@ -348,6 +355,9 @@ DEBT_COLUMN_LABELS = (
     "MCA modified for lower sales?",
     "How the advance was modified",
     "Notes",
+    "Factor rate (×)",
+    "Payment amount",
+    "Payment frequency",
 )
 assert len(DEBT_COLUMN_LABELS) == len(DEBT_COLUMNS)
 
@@ -484,6 +494,11 @@ def _money_or_none(value: Any) -> Decimal | None:
     except InvalidOperation:
         return None
     return -amount if negative else amount
+
+
+def _blank_or_amount(value: Any) -> Decimal | None:
+    """Compatibility for draft adapters; an unreported amount stays unknown."""
+    return _money_or_none(value)
 
 
 def _first_present(line: dict[str, Any], *keys: str) -> Any:
@@ -643,6 +658,9 @@ def document_debts_as_body(document: dict[str, Any] | None) -> dict[str, Any]:
                 "balance": _first_present(line, "current_balance", "balance"),
                 "rate": _first_present(line, "interest_rate", "rate_pct", "rate"),
                 "monthly_payment": line.get("monthly_payment"),
+                "factor_rate": line.get("factor_rate"),
+                "payment_amount": line.get("payment_amount"),
+                "payment_frequency": line.get("payment_frequency"),
                 "originated_on": _first_present(line, "origination_date", "originated_on", "origin_date"),
                 "maturity_on": _first_present(line, "maturity_date", "maturity_on"),
                 "collateral": _first_present(line, "collateral", "secured_by"),
@@ -681,13 +699,20 @@ def debt_rows_from_body(body: dict[str, Any]) -> list[dict[str, Any]] | None:
             str(raw.get(key) if raw.get(key) is not None else "").strip() for key in DEBT_COLUMNS
         ):
             continue
+        # The legacy form tolerates unreadable numeric text as unknown. The
+        # workspace validates its editable cells before reaching this cleaner.
+        prepared = {**raw, "monthly_payment": _money_or_none(raw.get("monthly_payment")), "rate": _rate(raw.get("rate"))}
+        try:
+            normalized = normalize_terms(prepared)
+        except DebtTermsError as error:
+            raise HTTPException(422, str(error)) from error
         lender = str(raw.get("lender") or "").strip()
         # A figure nobody typed is unknown, not nought. Writing 0 into
         # `monthly_payment` tells the DSCR engine this obligation costs nothing
         # a month, which is how a daily-paying advance disappears out of the
         # denominator and makes coverage look better than it is.
         balance = _money_or_none(raw.get("balance"))
-        monthly = _money_or_none(raw.get("monthly_payment"))
+        monthly = normalized["monthly_payment"]
         # A slug the form chose, or the slug a typed value means ("LOC",
         # "Term", a label picked in a spreadsheet). Unrecognised text is kept.
         debt_type = debt_types.normalize_debt_type(raw.get("debt_type"))
@@ -702,8 +727,10 @@ def debt_rows_from_body(body: dict[str, Any]) -> list[dict[str, Any]] | None:
                 "debt_type": debt_type,
                 "original_amount": _money_or_none(raw.get("original_amount")),
                 "balance": balance,
-                "rate": _rate(raw.get("rate")),
+                "rate": _rate(normalized.get("rate")),
                 "monthly_payment": monthly,
+                "monthly_payment_source": normalized.get("monthly_payment_source"),
+                **{key: normalized[key] for key in ("factor_rate", "payment_amount", "payment_frequency") if key in normalized},
                 # Which stored row this line came from, when the form was seeded
                 # from one. Identity is what lets a save update a row in place
                 # instead of deleting it and inserting a copy — the copy was the
@@ -764,6 +791,9 @@ def debt_row_problems(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]
             for field in REQUIRED_DEBT_FIELDS
             if row.get(field) in (None, "") or (field == "lender" and row.get(field) == "Unnamed lender")
         ]
+        if row.get("debt_type") in debt_types.ADVANCE_DEBT_TYPES and row.get("factor_rate") is not None:
+            # A contract's factor is its pricing answer, never an invented APR.
+            missing = [field for field in missing if field != "rate"]
         if row.get("debt_type") in debt_types.ADVANCE_DEBT_TYPES:
             missing.extend(field for field in ADVANCE_REQUIRED_DEBT_FIELDS if row.get(field) is None)
         if missing:
@@ -824,10 +854,15 @@ def debt_key_facts(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 # collect them. It does now, and the analyzer's own schedule
                 # extraction reads both by name.
                 "original_amount": (
-                    float(row["original_amount"]) if row.get("original_amount") else None
+                    float(row["original_amount"]) if row.get("original_amount") is not None else None
                 ),
                 "current_balance": float(row["balance"]) if row.get("balance") is not None else None,
                 "monthly_payment": float(row["monthly_payment"]) if row.get("monthly_payment") is not None else None,
+                "rate": float(row["rate"]) if row.get("rate") is not None else None,
+                "factor_rate": float(row["factor_rate"]) if row.get("factor_rate") is not None else None,
+                "payment_amount": float(row["payment_amount"]) if row.get("payment_amount") is not None else None,
+                "payment_frequency": row.get("payment_frequency"),
+                "monthly_payment_source": row.get("monthly_payment_source"),
                 "maturity_date": row["maturity_on"].isoformat() if row.get("maturity_on") else None,
                 # The rest of the row, so a reader of the facts sees what the
                 # PDF shows: what the debt is, its rate, whether it is current,
@@ -846,19 +881,23 @@ def debt_key_facts(rows: list[dict[str, Any]]) -> dict[str, Any]:
             }
             for row in rows
         ],
-        "total_monthly_debt_service": float(sum((row["monthly_payment"] or 0) for row in rows)),
-        "total_outstanding_balance": float(sum((row["balance"] or 0) for row in rows)),
+        "total_monthly_debt_service": float(sum((row["monthly_payment"] or 0) for row in rows)) if all(row.get("monthly_payment") is not None for row in rows) else None,
+        "total_outstanding_balance": float(sum((row["balance"] or 0) for row in rows)) if all(row.get("balance") is not None for row in rows) else None,
     }
 
 
 #: Everything the schedule form is allowed to write. Every other column on
 #: DealerDebt belongs to somebody else — `count_in_dscr` is toggled from the
-#: DSCR composer, `term_months` / `payment_amount` / `payment_frequency` /
-#: `factor_rate` / `payoff_amount` come from the refinance workbench, and
-#: `vendor_key` / `evidence` / `document_id` record where a row was read from.
+#: DSCR composer, `term_months` / `payoff_amount` come from the refinance workbench, and
+#: `vendor_key` / `document_id` record where a row was read from. Existing
+#: `evidence` is preserved while its monthly-payment source marker is updated.
 #: `dealer_id` and `origin` are identity, not answers. A save must leave all of
 #: them exactly as it found them.
 def _apply_debt_form_fields(target: Any, row: dict[str, Any]) -> None:
+    try:
+        row.update(normalize_terms(row, previous=target if getattr(target, "lender", None) is not None else None))
+    except DebtTermsError as error:
+        raise HTTPException(422, str(error)) from error
     target.lender = row["lender"]
     # `category` is the column that already existed for this; the form calls it
     # "type of debt" because that is what a schedule calls it. Falls back to the
@@ -868,6 +907,11 @@ def _apply_debt_form_fields(target: Any, row: dict[str, Any]) -> None:
     target.balance = row.get("balance")
     target.rate = row.get("rate")
     target.monthly_payment = row.get("monthly_payment")
+    for key in ("factor_rate", "payment_amount", "payment_frequency"):
+        if key in row:
+            setattr(target, key, row[key])
+    evidence = getattr(target, "evidence", None)
+    target.evidence = {**(evidence if isinstance(evidence, dict) else {}), "monthly_payment_source": row.get("monthly_payment_source")}
     target.originated_on = row.get("originated_on")
     target.maturity_on = row.get("maturity_on")
     target.secured = row.get("secured")
@@ -931,6 +975,9 @@ async def save_debt_rows(
     """
     if rows is None:
         return
+
+    from app.services.financial_workspace_legacy import protect_projection
+    await protect_projection(db, profile, "debt_schedule")
 
     from app.dealer_os.models import DealerDebt
 
@@ -1070,6 +1117,10 @@ async def debt_body_for_profile(
                 "balance": "" if row.balance is None else str(row.balance),
                 "rate": "" if row.rate is None else str(row.rate),
                 "monthly_payment": "" if row.monthly_payment is None else str(row.monthly_payment),
+                "factor_rate": str(row.factor_rate) if row.factor_rate is not None else "",
+                "payment_amount": str(row.payment_amount) if row.payment_amount is not None else "",
+                "payment_frequency": row.payment_frequency or "",
+                "monthly_payment_source": monthly_source(row),
                 "originated_on": row.originated_on.isoformat() if row.originated_on else "",
                 "maturity_on": row.maturity_on.isoformat() if row.maturity_on else "",
                 "secured": row.secured or "",

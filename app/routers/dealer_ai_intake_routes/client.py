@@ -398,12 +398,15 @@ async def read_client_financial_statement(
     intake = await core._load_client_intake(db, user, intake_id, allow_pending_signing=True)
     profile = await profile_service.provision_profile_for_intake(db, intake)
     statement = await financial_statements.latest_for_profile(db, profile.id)
+    from app.services.financial_workspace_legacy import managed_snapshot
+
+    managed = await managed_snapshot(db, profile, "pfs")
     await db.commit()
     return {
         "schema": pfs_schema.describe(),
         "statement_id": str(statement.id) if statement else None,
         "status": statement.status if statement else None,
-        "body": (statement.body if statement else None) or pfs_schema.empty_body(),
+        "body": managed["body"] if managed else (statement.body if statement else None) or pfs_schema.empty_body(),
     }
 
 @core.client_router.put("/{intake_id}/financial-statement")
@@ -424,6 +427,14 @@ async def save_client_financial_statement(
 
     intake = await core._load_client_intake(db, user, intake_id)
     profile = await profile_service.provision_profile_for_intake(db, intake)
+    from app.services.financial_workspace_legacy import managed_snapshot, stage_legacy_body
+
+    managed = await managed_snapshot(db, profile, "pfs")
+    if managed is not None:
+        await stage_legacy_body(db, profile, managed, {**(payload.body or {}), "as_of": payload.statement_date}, public=True, submit=payload.submit)
+        statement = await financial_statements.latest_for_profile(db, profile.id)
+        await db.commit()
+        return {"statement_id": str(statement.id) if statement else None, "submitted": bool(payload.submit)}
     statement = await financial_statements.latest_for_profile(db, profile.id)
     saved = await financial_statements.save_statement(
         db,

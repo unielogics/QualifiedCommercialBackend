@@ -422,6 +422,7 @@ _DOC_TYPES = {
     "tax_return",
     "profit_and_loss",
     "balance_sheet",
+    "personal_financial_statement",
     "debt_schedule",
     "loan_agreement",
     "credit_report",
@@ -686,6 +687,10 @@ async def _route_pl_months(
     same null-account path _persist_plan uses for unattributed documents.
     Fill-only-null: a field already populated (statement/manual entry) is kept
     and the conflict is noted, never overwritten."""
+    from .financial_debt_drafts import managed_context
+    if await managed_context(db, dealer_id, "p_and_l") is not None:
+        notes.append("P&L import awaits review in the financial working draft; published period revenue and net income are unchanged.")
+        return 0
     updated = 0
     for m in pl_months:
         y, mo = (int(p) for p in m["month"].split("-"))
@@ -751,6 +756,20 @@ async def _route_debt_rows(
     document provenance."""
     if not debts:
         return 0
+    from .financial_debt_drafts import managed_context, stage_proposals
+    managed = await managed_context(db, dealer_id)
+    if managed is not None:
+        result = await stage_proposals(db, managed, debts, fields=_DEBT_CONTRACT_FIELDS, document_id=document_id)
+        touched = result["created"] + result["updated"]
+        if touched:
+            notes.append(f"Debt schedule: staged {touched} obligation proposal(s) in the working draft; save a version to update financial figures.")
+        elif result.get("schedule_authoritative"):
+            notes.append("Completed saved debt schedule retained. Extracted obligations and contract updates are evidence for explicit review; no financial rows changed.")
+        return touched
+    from app.services.financial_version_selection import accepted_debt_schedule_authority_for_dealer
+    if await accepted_debt_schedule_authority_for_dealer(db, dealer_id):
+        notes.append("Completed saved debt schedule retained; extracted obligations remain document evidence for review.")
+        return 0
     existing = (
         (await db.execute(select(DealerDebt).where(DealerDebt.dealer_id == dealer_id)))
         .scalars()
@@ -768,7 +787,7 @@ async def _route_debt_rows(
         if row is None and key:
             row = next((r for k, r in keyed if key_matches(k, key)), None)
         if row is not None:
-            if row.origin == "admin" or row.status == "dismissed":
+            if row.origin == "admin" or row.status in {"dismissed", "deleted", "duplicate"} or row.duplicate_of_id:
                 continue  # a human owns it (or killed it) — extraction never wins
             changed = False
             for field in _DEBT_CONTRACT_FIELDS:
@@ -812,6 +831,14 @@ async def _route_debt_schedule(
     preference-merged across account rows in the engine, never summed), only
     where currently NULL. Never creates period rows and never overwrites a
     value that statements or a human already set."""
+    from .financial_debt_drafts import managed_context
+    if await managed_context(db, dealer_id) is not None:
+        notes.append("Debt schedule import awaits review in the financial working draft; published period debt service is unchanged.")
+        return 0
+    from app.services.financial_version_selection import accepted_debt_schedule_authority_for_dealer
+    if await accepted_debt_schedule_authority_for_dealer(db, dealer_id):
+        notes.append("Completed saved debt schedule retained; period debt service was not changed by extraction.")
+        return 0
     total = _debts_monthly_total(debts)
     if total <= 0:
         notes.append("Debt schedule stored — no monthly payment amounts to apply.")
@@ -860,7 +887,7 @@ Read every attached page. Extract only facts printed in this page chunk; the app
 
 Return ONLY strict JSON (no markdown, no commentary) with exactly this shape:
 {
-  "doc_type": "bank_statement|tax_return|profit_and_loss|balance_sheet|debt_schedule|loan_agreement|credit_report|other",
+  "doc_type": "bank_statement|tax_return|profit_and_loss|balance_sheet|personal_financial_statement|debt_schedule|loan_agreement|credit_report|other",
   "months": [
     {"month": "YYYY-MM", "total_deposits": number|null, "total_withdrawals": number|null,
      "beginning_balance": number|null, "ending_balance": number|null, "average_ledger_balance": number|null,
@@ -1203,6 +1230,12 @@ async def extract_document(
         doc.detected_kind = detected
         doc.doc_meta = _build_doc_meta(detected, tax_years, pl_months, debts)
 
+        managed_financial_source = False
+        managed_kind = {"profit_and_loss": "p_and_l", "balance_sheet": "balance_sheet", "personal_financial_statement": "pfs"}.get(detected)
+        if managed_kind:
+            from .financial_debt_drafts import register_managed_form_source
+            managed_financial_source = await register_managed_form_source(db, doc, managed_kind, notes)
+
         # --- route by detected type --------------------------------------
         if detected == "bank_statement":
             # Existing statement pipeline, unchanged. Resolve the bank
@@ -1235,14 +1268,15 @@ async def extract_document(
             await _fill_business_identity(db, doc.dealer_id, extraction, notes)
             notes.append(f"Tax return: upserted {upserted} tax year(s) (existing entries kept).")
         elif detected == "profit_and_loss":
-            updated = await _route_pl_months(db, doc.dealer_id, pl_months, notes)
-            notes.append(f"P&L: filled revenue/net income on {updated} month(s).")
-            try:
-                await recompute_snapshot(db, doc.dealer_id)
-            except Exception:
-                logger.exception(
-                    "dealer-os: snapshot recompute failed after P&L extract for %s", doc.dealer_id
-                )
+            if not managed_financial_source:
+                updated = await _route_pl_months(db, doc.dealer_id, pl_months, notes)
+                notes.append(f"P&L: filled revenue/net income on {updated} month(s).")
+                try:
+                    await recompute_snapshot(db, doc.dealer_id)
+                except Exception:
+                    logger.exception(
+                        "dealer-os: snapshot recompute failed after P&L extract for %s", doc.dealer_id
+                    )
         elif detected == "debt_schedule":
             await _route_debt_schedule(db, doc.dealer_id, debts, notes)
             await _route_debt_rows(db, doc.dealer_id, doc.id, debts, notes)

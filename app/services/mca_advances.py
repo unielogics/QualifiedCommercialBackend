@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import re
 import uuid
+from copy import deepcopy
 from datetime import date
 from typing import Any
 
+from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -82,10 +84,17 @@ def advance_read(row: DealerDebt) -> dict[str, Any]:
         "origin": origin,
         "editable": origin == DESK_ORIGIN,
         "source": _SOURCE_BY_ORIGIN.get(origin, origin or "unknown"),
+        "draft_pending": bool(getattr(row, "draft_pending", False)),
+        "draft_family_id": getattr(row, "draft_family_id", None),
+        "draft_revision": getattr(row, "draft_revision", None),
     }
 
 
 async def advance_rows(db: AsyncSession, profile: ApplicationProfile) -> list[DealerDebt]:
+    from app.services import debt_schedule_review
+    snapshot = await debt_schedule_review.workspace_snapshot(db, profile)
+    if snapshot is not None:
+        return _managed_rows(snapshot)
     rows = list(
         (
             await db.execute(
@@ -98,6 +107,16 @@ async def advance_rows(db: AsyncSession, profile: ApplicationProfile) -> list[De
         .all()
     )
     return [row for row in rows if is_advance_row(row)]
+
+
+def _managed_rows(snapshot: dict) -> list[Any]:
+    from app.services.debt_schedule_review import _draft_rows
+    rows = [row for row in _draft_rows(snapshot["body"]) if row.status == "active" and not row.duplicate_of_id and is_advance_row(row)]
+    for row in rows:
+        row.draft_pending = snapshot["draft"]["dirty"]
+        row.draft_family_id = snapshot["family_id"]
+        row.draft_revision = snapshot["draft"]["revision"]
+    return rows
 
 
 def _apply(target: DealerDebt, row: dict[str, Any]) -> None:
@@ -137,10 +156,61 @@ async def save_advances(
     rows: list[dict[str, Any]] | None,
     *,
     origin: str = DESK_ORIGIN,
+    actor: Any = None,
 ) -> list[DealerDebt]:
     """Put the desk's advance rows on the file, touching only what `origin` owns."""
     if rows is None:
         return await advance_rows(db, profile)
+    from app.services import debt_schedule_review
+    from app.services import financial_workspace as workspace
+    from app.services.financial_debt_actions import apply_debt_action
+    snapshot = await debt_schedule_review.workspace_snapshot(db, profile, create=True)
+    if snapshot is not None:
+        body = deepcopy(snapshot["body"])
+        current = {str(row.id): row for row in debt_schedule_review._draft_rows(body)}
+        claimed = set()
+        for incoming in rows:
+            row_id = str(incoming.get("id") or "")
+            target = current.get(row_id) if row_id else None
+            if row_id and (target is None or not is_advance_row(target)):
+                raise HTTPException(404, "That advance is not on this financial draft")
+            if target is not None and (target.status != "active" or target.duplicate_of_id):
+                raise HTTPException(409, "Restore this removed or duplicate obligation in the financial workspace first")
+            if target is None:
+                matches = [row for key, row in current.items() if key not in claimed and row.status == "active"
+                           and row.origin == origin and is_advance_row(row)
+                           and row.lender.strip().casefold() == str(incoming.get("lender") or "").strip().casefold()]
+                if len(matches) > 1:
+                    raise HTTPException(409, "Choose the specific advance row for these same-lender loans")
+                target = matches[0] if matches else None
+            fresh = target is None
+            if fresh:
+                raw = {"id": str(uuid.uuid4()), "lender": incoming.get("lender"), "debt_type": "mca",
+                       "origin": origin, "status": "active", "count_in_dscr": True, "evidence_links": []}
+                body.setdefault("debts", []).append(raw)
+                target = debt_schedule_review._draft_rows({"debts": [raw]})[0]
+            else:
+                raw = next(row for row in body["debts"] if row["id"] == str(target.id))
+            if str(target.id) in claimed:
+                raise HTTPException(409, "The same advance was sent more than once")
+            claimed.add(str(target.id))
+            if target.origin != origin:
+                continue
+            _apply(target, incoming)
+            raw.update({key: getattr(target, key) for key in (
+                "lender", "original_amount", "balance", "payment_amount", "payment_frequency", "factor_rate",
+                "payoff_amount", "maturity_on", "notes", "count_in_dscr", "monthly_payment",
+            )})
+            if fresh:
+                raw["vendor_key"] = target.vendor_key
+        for row_id, target in current.items():
+            if row_id not in claimed and target.status == "active" and target.origin == origin and is_advance_row(target):
+                body = apply_debt_action(body, {"op": "delete", "row_id": row_id}, actor_id=str(getattr(actor, "id", "") or "") or None)
+        if any(row.get("status", "active") == "active" for row in body.get("debts", [])):
+            body["no_debt"] = False
+        result = await workspace.save_draft(db, profile, kind="debt_schedule", family_id=uuid.UUID(snapshot["family_id"]),
+            expected_revision=snapshot["draft"]["revision"], body=body, actor=actor)
+        return _managed_rows(result)
     existing = await advance_rows(db, profile)
     by_id = {str(row.id): row for row in existing}
     claimed: set[str] = set()

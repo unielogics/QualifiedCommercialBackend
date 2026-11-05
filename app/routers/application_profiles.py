@@ -9,6 +9,7 @@ import re
 import secrets
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -236,6 +237,7 @@ from app.services.extracted_facts import (
     facts_resolved_by_review,
     pending_review_group_keys,
 )
+from app.services.financial_workspace_legacy import managed_snapshot, stage_legacy_body
 from app.services.user_access import is_audit_client, is_funding_client
 
 logger = logging.getLogger(__name__)
@@ -1952,18 +1954,30 @@ async def create_application_room_request(
         recipient=email or phone,
         effect=f"Request {payload.name.strip()} from the client",
     )
-    requested = BucketRequestedDocument(
-        bucket_id=profile.primary_bucket_id,
-        name=payload.name.strip(),
-        category=(payload.category or "Other").strip(),
-        description=(payload.instructions or "").strip() or None,
-        required=True,
-        allow_multiple_files=payload.allow_multiple_files,
-        status="requested",
-        is_custom=True,
+    from app.schemas.file_request import FileRequestItem
+    from app.services import file_requests
+
+    file_request_id = uuid4()
+    states = await file_requests.create_batch(
+        db, profile=profile, request_id=file_request_id,
+        items=[FileRequestItem(document_type="other", name=payload.name.strip(), instructions=payload.instructions or "")], user=user,
     )
-    db.add(requested)
-    await db.flush()
+    requested = await db.get(BucketRequestedDocument, states[0].requested_document_id)
+    requested.category = (payload.category or "Other").strip()
+    requested.allow_multiple_files = payload.allow_multiple_files
+    await file_events.emit(
+        db,
+        profile=profile,
+        kind="document.requested",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title=f"We asked for {requested.name}",
+        actor=user,
+        target_type="requested_document",
+        target_id=requested.id,
+    )
+    # Commit the request/task before provider delivery so a channel failure
+    # cannot erase what the client still needs to provide.
+    await db.commit()
     rows = await _deliver_room_request(
         db,
         profile=profile,
@@ -1979,6 +1993,9 @@ async def create_application_room_request(
         requested_document_id=requested.id,
     )
     overall = _delivery_overall(rows)
+    for delivery in rows:
+        delivery.provider_result = {**(delivery.provider_result or {}), "file_request_id": str(file_request_id),
+                                    "requirement_keys": [state.requirement_key for state in states]}
     await profiles.log_profile_action(
         db,
         profile,
@@ -1988,16 +2005,6 @@ async def create_application_room_request(
         target_type="requested_document",
         target_id=requested.id,
         metadata={"delivery_status": overall, "channels": [row.channel for row in rows]},
-    )
-    await file_events.emit(
-        db,
-        profile=profile,
-        kind="document.requested",
-        visibility=file_events.VISIBILITY_CLIENT,
-        title=f"We asked for {requested.name}",
-        actor=user,
-        target_type="requested_document",
-        target_id=requested.id,
     )
     await db.commit()
     return RoomRequestResult(
@@ -2552,6 +2559,7 @@ async def adopt_uploaded_debt_schedule(
     profile = await profiles.load_profile(db, profile_id, user)
     # One adoption at a time per file: a second click waits here and then
     # meets the "already has rows" check instead of writing the rows twice.
+    managed = await debt_schedule_review.workspace_snapshot(db, profile, create=True)
     await db.execute(
         select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update()
     )
@@ -2563,6 +2571,18 @@ async def adopt_uploaded_debt_schedule(
     existing = (cockpit.get("debt") or {}).get("rows") or []
     if existing:
         raise HTTPException(status.HTTP_409_CONFLICT, "The file already has schedule rows; edit those instead of adopting the upload again.")
+    if managed is not None:
+        from app.services.financial_version_selection import active_debt_schedule_rows
+        if active_debt_schedule_rows(managed["body"]):
+            raise HTTPException(409, "The working draft already has schedule rows; review those before adopting another upload")
+        body = {**managed["body"], "debts": [*managed["body"].get("debts", []), *[
+            {**row, "id": row.get("id") or str(uuid4()), "origin": "admin", "status": "active"} for row in rows
+        ]]}
+        result = await stage_legacy_body(db, profile, managed, body, actor=user)
+        await db.commit()
+        cockpit = await financial_cockpit.load_cockpit(db, profile)
+        cockpit["debt"].update(draft_pending=True, draft_family_id=result["family_id"], draft_revision=result["draft"]["revision"])
+        return FinancialCockpitRead(**cockpit)
     await financial_statements.save_debt_rows(db, profile, rows, origin="admin")
     await profiles.log_profile_action(
         db, profile, user, "financial_form.debt_schedule_adopted",
@@ -2588,6 +2608,34 @@ async def patch_debt_schedule_row(
 
     _require_underwriting_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
+    managed = await debt_schedule_review.workspace_snapshot(db, profile, create=True)
+    if managed is not None:
+        from copy import deepcopy
+
+        from app.services.financial_debt_actions import apply_debt_action
+        body = deepcopy(managed["body"])
+        raw = next((row for row in body.get("debts", []) if str(row.get("id")) == str(row_id)), None)
+        if raw is None:
+            raise HTTPException(404, "That schedule row is not in this financial draft")
+        changes = payload.model_dump(exclude_unset=True)
+        if "vendor_key" in changes:
+            from app.services.debt_payee_links import link_payee
+            await link_payee(db, profile, row_id, changes.pop("vendor_key"), actor=user)
+        requested_status = changes.pop("status", None)
+        if requested_status in {"dismissed", "deleted"}:
+            body = apply_debt_action(body, {"op": "delete", "row_id": str(row_id)}, actor_id=str(user.id))
+        elif requested_status == "active" and raw.get("status", "active") != "active":
+            body = apply_debt_action(body, {"op": "restore", "row_id": str(row_id)}, actor_id=str(user.id))
+        raw = next(row for row in body["debts"] if str(row["id"]) == str(row_id))
+        raw.update({"debt_type" if key == "category" else key: value for key, value in changes.items()})
+        if changes or requested_status:
+            result = await stage_legacy_body(db, profile, managed, body, actor=user)
+        else:
+            result = managed
+        await db.commit()
+        cockpit = await financial_cockpit.load_cockpit(db, profile)
+        cockpit["debt"].update(draft_pending=result["draft"]["dirty"], draft_family_id=result["family_id"], draft_revision=result["draft"]["revision"])
+        return FinancialCockpitRead(**cockpit)
     row = (
         await db.execute(
             select(DealerDebt).where(DealerDebt.id == row_id, DealerDebt.profile_id == profile.id)
@@ -2625,6 +2673,14 @@ async def void_debt_schedule(
     """
     _require_underwriting_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
+    managed = await debt_schedule_review.workspace_snapshot(db, profile, create=True)
+    if managed is not None:
+        from app.services.financial_version_selection import active_debt_schedule_rows
+        if active_debt_schedule_rows(managed["body"]):
+            raise HTTPException(409, "Remove or reconcile the active obligations before declaring no outstanding debt")
+        await stage_legacy_body(db, profile, managed, {**managed["body"], "no_debt": True}, actor=user, submit=True)
+        await db.commit()
+        return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
     reason = (payload.reason or "").strip() or "No debt on the business"
     try:
         await application_programs.patch_requirement(
@@ -2663,6 +2719,13 @@ async def restore_debt_schedule(
     """The business does carry debt after all: the schedule is required again."""
     _require_underwriting_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
+    managed = await debt_schedule_review.workspace_snapshot(db, profile, create=True)
+    if managed is not None:
+        result = await stage_legacy_body(db, profile, managed, {**managed["body"], "no_debt": False}, actor=user)
+        await db.commit()
+        cockpit = await financial_cockpit.load_cockpit(db, profile)
+        cockpit["debt"].update(draft_pending=True, draft_family_id=result["family_id"], draft_revision=result["draft"]["revision"])
+        return FinancialCockpitRead(**cockpit)
     await application_programs.patch_requirement(
         db,
         profile,
@@ -2719,10 +2782,11 @@ async def apply_debt_schedule_review(
     profile = await profiles.load_profile(db, profile_id, user)
     # One review at a time per file: a second click waits here and then
     # meets the rows the first one wrote instead of adding them twice.
+    managed = await debt_schedule_review.workspace_snapshot(db, profile, create=True)
     await db.execute(
         select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update()
     )
-    saved = await debt_schedule_review.apply_review(db, profile, user, payload.lines)
+    saved = await debt_schedule_review.apply_review(db, profile, user, payload.lines, workspace_draft=managed) if managed is not None else await debt_schedule_review.apply_review(db, profile, user, payload.lines)
     kept = [line.lender for line in payload.lines if line.keep]
     taken_off = [line.lender for line in payload.lines if not line.keep]
     await profiles.log_profile_action(
@@ -2750,7 +2814,7 @@ async def apply_debt_schedule_review(
                 target_id=profile.id,
             )
     await db.commit()
-    if not filed:
+    if not filed and managed is None:
         # A schedule filed earlier stays current with the rows: the same refresh
         # the form's draft saves queue (a no-op while nothing was ever filed).
         await drafted_forms.enqueue_form_refresh(
@@ -2783,7 +2847,7 @@ async def put_advances(
     draft rows are shown beside them and never overwritten."""
     _require_underwriting_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
-    rows = await mca_advances.save_advances(db, profile, [row.model_dump() for row in payload.rows])
+    rows = await mca_advances.save_advances(db, profile, [row.model_dump() for row in payload.rows], actor=user)
     await profiles.log_profile_action(
         db,
         profile,
@@ -5823,6 +5887,9 @@ async def _statement_read(
 ) -> FinancialStatementRead:
     payload = financial_statements.serialize(statement)
     payload["owners"] = await _owner_links(db, profile, statement)
+    draft = await managed_snapshot(db, profile, "pfs", statement_id=statement.id)
+    if draft:
+        payload["body"] = draft["body"]
     return FinancialStatementRead(**payload)
 
 
@@ -6024,6 +6091,11 @@ async def update_financial_statement(
     profile = await profiles.load_profile(db, profile_id, user)
     _require_statement_staff(user)
     statement = await _statement_or_404(db, profile, statement_id)
+    managed = await managed_snapshot(db, profile, "pfs", statement_id=statement_id)
+    if managed:
+        await stage_legacy_body(db, profile, managed, payload.body or {}, actor=user)
+        await db.commit()
+        return await _statement_read(db, profile, statement)
     await financial_statements.save_statement(
         db,
         profile,
@@ -6072,6 +6144,12 @@ async def submit_financial_statement(
     profile = await profiles.load_profile(db, profile_id, user)
     _require_statement_staff(user)
     statement = await _statement_or_404(db, profile, statement_id)
+    managed = await managed_snapshot(db, profile, "pfs", statement_id=statement_id)
+    if managed:
+        await stage_legacy_body(db, profile, managed, managed["body"], actor=user, submit=True)
+        await db.commit()
+        await db.refresh(statement)
+        return await _statement_read(db, profile, statement)
     requested = await _personal_financials_slot(db, profile)
     await _file_statement(
         db,
@@ -6130,6 +6208,9 @@ async def mint_financial_statement_link(
         statement_id=statement.id,
         created_by=user.id,
     )
+    managed = await managed_snapshot(db, profile, "pfs", statement_id=statement_id)
+    if managed:
+        link.financial_family_id = UUID(managed["family_id"])
     await profiles.log_profile_action(
         db, profile, user, "financial_statement.link_minted",
         "Created a share link for a personal financial statement",
@@ -6189,6 +6270,12 @@ async def public_financial_form(token: str, db: AsyncSession = Depends(get_db)) 
         body = financial_statements.seed_pfs_applicant(body, prefill)
         schema = pfs_schema.describe()
 
+    managed = await managed_snapshot(db, profile, link.kind, statement_id=link.statement_id if link.kind == "pfs" else None, family_id=getattr(link, "financial_family_id", None))
+    if managed:
+        body = managed["body"]
+        if link.kind == "debt_schedule":
+            body = {**body, "debts": [{**row, "editable": row.get("origin", row.get("owner")) == "client_form", "owner": row.get("origin", row.get("owner"))}
+                                       for row in body.get("debts", []) if row.get("status", "active") == "active"]}
     await db.commit()
     return {
         "kind": link.kind,
@@ -6218,6 +6305,11 @@ async def save_public_financial_form_draft(
     """
     link = await _open_link_or_404(db, token)
     profile = await db.get(ApplicationProfile, link.profile_id)
+    managed = await managed_snapshot(db, profile, link.kind, statement_id=link.statement_id if link.kind == "pfs" else None, family_id=getattr(link, "financial_family_id", None))
+    if managed:
+        await stage_legacy_body(db, profile, managed, payload.body or {}, public=True)
+        await db.commit()
+        return {"saved": True}
 
     if link.kind == "debt_schedule":
         await financial_statements.save_debt_rows(
@@ -6280,6 +6372,15 @@ async def submit_public_financial_form(
     """
     link = await _open_link_or_404(db, token)
     profile = await db.get(ApplicationProfile, link.profile_id)
+    managed = await managed_snapshot(db, profile, link.kind, statement_id=link.statement_id if link.kind == "pfs" else None, family_id=getattr(link, "financial_family_id", None))
+    if managed:
+        if link.kind == "debt_schedule" and "debts" not in (payload.body or {}):
+            raise HTTPException(422, "No debt schedule was sent")
+        await stage_legacy_body(db, profile, managed, payload.body or {}, public=True, submit=True,
+                                actor=SimpleNamespace(id=None, name=link.invitee_email or "Borrower", email=link.invitee_email or ""))
+        link.completed_at = datetime.now(UTC)
+        await db.commit()
+        return {"completed": True}
 
     if link.kind == "debt_schedule":
         rows = financial_statements.debt_rows_from_body(payload.body)
@@ -6475,7 +6576,7 @@ def _uploaded_statements(analyses: list[dict]) -> list[UploadedStatementFigures]
     return [UploadedStatementFigures(**row) for row in extract_personal_financial_statements(analyses)]
 
 
-def _uploaded_debt_figures(analyses: list[dict]) -> tuple[int, float, float] | None:
+def _uploaded_debt_figures(analyses: list[dict]) -> tuple[int, float | None, float | None] | None:
     """A debt schedule read off an upload: obligations, monthly, outstanding.
 
     None when nothing on the slot read as a schedule, and None again when one
@@ -6492,15 +6593,13 @@ def _uploaded_debt_figures(analyses: list[dict]) -> tuple[int, float, float] | N
     # The document's own stated totals win. They come off its total line, which
     # is what a lender reads; summing the rows is the fallback for a schedule
     # that lists obligations without totalling them.
-    total_monthly = float(
-        schedule.get("total_monthly_debt_service")
-        or sum(_form_amount(item.get("monthly_payment")) for item in listed)
-    )
-    total_balance = float(
-        schedule.get("total_outstanding_balance")
-        or sum(_form_amount(item.get("current_balance")) for item in listed)
-    )
-    if not listed and not total_monthly and not total_balance:
+    total_monthly = schedule.get("total_monthly_debt_service")
+    total_balance = schedule.get("total_outstanding_balance")
+    if total_monthly is None and listed and all(item.get("monthly_payment") is not None for item in listed):
+        total_monthly = float(sum(_form_amount(item["monthly_payment"]) for item in listed))
+    if total_balance is None and listed and all(item.get("current_balance") is not None for item in listed):
+        total_balance = float(sum(_form_amount(item["current_balance"]) for item in listed))
+    if not listed and total_monthly is None and total_balance is None:
         return None
     return len(listed), total_monthly, total_balance
 
@@ -6525,12 +6624,15 @@ async def _slot_analyses(
     if slot is None:
         return [], False
 
+    from app.services.financial_version_selection import current_financial_file_clause
+
     files = list(
         (
             await db.execute(
                 select(BucketFile).where(
                     BucketFile.requested_document_id == slot.id,
                     BucketFile.deleted_at.is_(None),
+                    current_financial_file_clause(BucketFile.id),
                 )
             )
         )
@@ -6539,6 +6641,7 @@ async def _slot_analyses(
     )
     if not files:
         return [], False
+
 
     rows = list(
         (
@@ -6651,13 +6754,19 @@ async def financial_forms_status(
 
     # --- business debt schedule -----------------------------------------
     from app.dealer_os.models import DealerDebt
+    from app.services.financial_version_selection import (
+        accepted_debt_schedule_snapshot,
+        active_debt_schedule_rows,
+    )
+    from app.services.financial_workspace import facts_for_body
 
     slot = await _requested_slot(db, profile, "debt_schedule")
-    rows = list(
+    accepted_debt = await accepted_debt_schedule_snapshot(db, profile.id)
+    rows = [] if accepted_debt is not None else list(
         (
             await db.execute(
                 select(DealerDebt).where(
-                    DealerDebt.profile_id == profile.id, DealerDebt.status == "active"
+                    DealerDebt.profile_id == profile.id, DealerDebt.status == "active", DealerDebt.duplicate_of_id.is_(None)
                 )
             )
         )
@@ -6672,11 +6781,18 @@ async def financial_forms_status(
         else "none"
     )
     row_count = len(rows)
-    total_monthly = float(sum((row.monthly_payment or 0) for row in rows))
-    total_balance = float(sum((row.balance or 0) for row in rows))
+    total_monthly = float(sum((row.monthly_payment or 0) for row in rows)) if all(row.monthly_payment is not None for row in rows) else None
+    total_balance = float(sum((row.balance or 0) for row in rows)) if all(row.balance is not None for row in rows) else None
     figures_from = "form" if rows else None
     pending = False
-    if source == "uploaded":
+    if accepted_debt is not None:
+        accepted_facts = facts_for_body("debt_schedule", accepted_debt.body)
+        source = "filled"
+        row_count = len(active_debt_schedule_rows(accepted_debt.body))
+        total_monthly = accepted_facts.get("total_monthly_debt_service")
+        total_balance = accepted_facts.get("total_outstanding_balance")
+        figures_from = "form"
+    elif source == "uploaded":
         analyses, pending = await _slot_analyses(db, slot)
         analyses = financial_cockpit.without_set_aside_schedules(
             analyses, await financial_cockpit.set_aside_schedule_files(db, profile)
@@ -6691,15 +6807,15 @@ async def financial_forms_status(
             kind="debt_schedule",
             label=_FORM_LABEL["debt_schedule"],
             requested=slot is not None,
-            satisfied=bool(slot and slot.status == "uploaded"),
-            voided=(await financial_cockpit.debt_schedule_state(db, profile)).get("voided"),
+            satisfied=accepted_debt is not None or bool(slot and slot.status == "uploaded"),
+            voided=(await financial_cockpit.debt_schedule_state(db, profile)).get("voided") if accepted_debt is None else None,
             source=source,
             row_count=row_count,
             total_monthly=total_monthly,
             total_balance=total_balance,
             figures_from=figures_from,
             analysis_pending=pending,
-            updated_at=max((row.updated_at for row in rows), default=None),
+            updated_at=accepted_debt.created_at if accepted_debt is not None else max((row.updated_at for row in rows), default=None),
         )
     )
 
@@ -6714,11 +6830,12 @@ async def _bucket_analyses(db: AsyncSession, bucket_id: UUID) -> list[dict]:
     """Every completed analysis in the room, newest per file — for a form with
     no checklist row of its own (the dealer checklist has no balance-sheet
     row), whose upload can still be anywhere in the bucket."""
+    from app.services.financial_version_selection import current_financial_file_clause
     files = list(
         (
             await db.execute(
                 select(BucketFile).where(
-                    BucketFile.bucket_id == bucket_id, BucketFile.deleted_at.is_(None)
+                    BucketFile.bucket_id == bucket_id, BucketFile.deleted_at.is_(None), current_financial_file_clause(BucketFile.id)
                 )
             )
         )
@@ -6913,15 +7030,19 @@ async def mint_financial_form_link(
     statement_id = None
     if kind == "pfs":
         statement = await financial_statements.latest_for_profile(db, profile.id)
-        if statement is None:
+        managed = await managed_snapshot(db, profile, "pfs")
+        if statement is None and managed is None:
             statement = await financial_statements.save_statement(
                 db, profile, body=pfs_schema.empty_body(), actor_user_id=user.id
             )
-        statement_id = statement.id
+        statement_id = statement.id if statement else None
 
     link, token = await financial_statements.mint_link(
         db, profile, kind=kind, statement_id=statement_id, created_by=user.id
     )
+    managed = await managed_snapshot(db, profile, kind)
+    if managed:
+        link.financial_family_id = UUID(managed["family_id"])
     await profiles.log_profile_action(
         db, profile, user, "financial_form.link_minted",
         f"Created a share link for the {_FORM_LABEL[kind].lower()}",
@@ -6948,6 +7069,9 @@ async def read_debt_schedule_body(
     """
     profile = await profiles.load_profile(db, profile_id, user)
     _require_statement_staff(user)
+    managed = await managed_snapshot(db, profile, "debt_schedule")
+    if managed:
+        return managed["body"]
     return await financial_statements.debt_body_for_profile(db, profile, origin="admin")
 
 
@@ -7019,6 +7143,9 @@ async def _announce_debt_schedule_filed(db: AsyncSession, profile: ApplicationPr
 async def _debt_schedule_filed(db: AsyncSession, profile: ApplicationProfile) -> bool:
     """Whether the schedule has been filed as the document that satisfies the
     checklist row: the slot is received and holds our drafted PDF of the rows."""
+    from app.services.financial_version_selection import accepted_debt_schedule_authority
+    if await accepted_debt_schedule_authority(db, profile.id):
+        return True
     if profile.primary_bucket_id is None:
         return False
     slot = await _requested_slot(db, profile, "debt_schedule")
@@ -7046,6 +7173,18 @@ async def _file_schedule_from_rows(
     """
     if profile.primary_bucket_id is None:
         return False, "This file has no document room to file the schedule into."
+    managed = await debt_schedule_review.workspace_snapshot(db, profile, create=True)
+    if managed is not None:
+        from app.services import financial_workspace as workspace
+        from app.services.financial_version_selection import debt_schedule_completion
+        completion = debt_schedule_completion(managed["body"])
+        if not completion["complete"]:
+            return False, completion["reason"]
+        await workspace.publish_version(db, profile, kind="debt_schedule", family_id=UUID(managed["family_id"]),
+            expected_revision=managed["draft"]["revision"],
+            base_version_id=UUID(managed["draft"]["base_version_id"]) if managed["draft"].get("base_version_id") else None,
+            idempotency_key=f"legacy-review:{managed['family_id']}:{managed['draft']['revision']}", actor=user, submit=True)
+        return True, None
     body = await financial_statements.debt_body_for_profile(db, profile, origin="admin")
     rows = financial_statements.debt_rows_from_body(body)
     if not rows:
@@ -7087,6 +7226,11 @@ async def save_debt_schedule(
     """
     profile = await profiles.load_profile(db, profile_id, user)
     _require_statement_staff(user)
+    managed = await managed_snapshot(db, profile, "debt_schedule")
+    if managed:
+        result = await stage_legacy_body(db, profile, managed, payload.body or {}, actor=user, submit=payload.submit)
+        await db.commit()
+        return {"row_count": sum(row.get("status", "active") == "active" for row in result["body"].get("debts", [])), "submitted": bool(payload.submit)}
     rows = financial_statements.debt_rows_from_body(payload.body)
     if rows is None:
         # Nothing was sent — an editor that never finished loading. Not a
@@ -7150,6 +7294,9 @@ async def read_business_statement_body(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
     profile = await profiles.load_profile(db, profile_id, user)
     _require_statement_staff(user)
+    managed = await managed_snapshot(db, profile, kind)
+    if managed:
+        return {**managed["body"], "status": "draft" if managed["draft"]["dirty"] else "submitted", "statement_id": None}
     prefill = await financial_statements.form_prefill(db, profile)
     body, statement = await business_statements.body_for_profile(db, profile, kind, prefill)
     return {
@@ -7320,6 +7467,12 @@ async def save_business_statement(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
     profile = await profiles.load_profile(db, profile_id, user)
     _require_statement_staff(user)
+    managed = await managed_snapshot(db, profile, kind)
+    if managed:
+        await stage_legacy_body(db, profile, managed, payload.body or {}, actor=user, submit=payload.submit)
+        statement = await business_statements.latest_for_profile(db, profile.id, kind)
+        await db.commit()
+        return {"statement_id": statement.id if statement else None, "status": statement.status if statement else "draft", "submitted": bool(payload.submit)}
 
     statement = await business_statements.save(
         db, profile, kind=kind, body=payload.body, status="draft", actor_user_id=user.id
@@ -7403,7 +7556,8 @@ async def _mint_packet(db: AsyncSession, profile: ApplicationProfile, user: User
         await business_statements.ensure_slot(db, profile, kind, required=False)
 
     statement = await financial_statements.latest_for_profile(db, profile.id)
-    if statement is None:
+    managed = await managed_snapshot(db, profile, "pfs")
+    if statement is None and managed is None:
         statement = await financial_statements.save_statement(
             db, profile, body=pfs_schema.empty_body(), actor_user_id=user.id
         )
@@ -7417,12 +7571,15 @@ async def _mint_packet(db: AsyncSession, profile: ApplicationProfile, user: User
             db,
             profile,
             kind=kind,
-            statement_id=statement.id if kind == "pfs" else None,
+            statement_id=statement.id if kind == "pfs" and statement else None,
             created_by=user.id,
             token=f"{base}.{kind}",
         )
         link.packet_id = packet_id
-        if kind == "pfs" and statement.status == "submitted":
+        managed_kind = await managed_snapshot(db, profile, kind)
+        if managed_kind:
+            link.financial_family_id = UUID(managed_kind["family_id"])
+        if kind == "pfs" and statement and statement.status == "submitted":
             link.completed_at = now
         expires_at = link.expires_at
     await db.flush()
@@ -7817,6 +7974,14 @@ async def financial_form_pdf(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
     profile = await profiles.load_profile(db, profile_id, user)
     _require_statement_staff(user)
+    managed = await managed_snapshot(db, profile, kind)
+    if managed:
+        if not managed["current_version_id"]:
+            raise HTTPException(404, "Save a financial version before downloading its PDF")
+        from app.services.financial_workspace import version_pdf
+        content, name = await version_pdf(db, profile, UUID(managed["current_version_id"]))
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "financial-version.pdf"
+        return Response(content, media_type="application/pdf", headers={"Content-Disposition": f'inline; filename="{safe_name}"', "Cache-Control": "no-store"})
 
     prefill = await financial_statements.form_prefill(db, profile)
     business = prefill.get("business_name") or "the business"

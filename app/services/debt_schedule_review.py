@@ -30,9 +30,12 @@ from __future__ import annotations
 
 import re
 import uuid
+from copy import deepcopy
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
+from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -669,9 +672,110 @@ async def schedule_documents(db: AsyncSession, profile: ApplicationProfile) -> l
 
 
 async def read_review(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
-    review = build_review(await load_rows(db, profile), await schedule_documents(db, profile))
+    snapshot = await workspace_snapshot(db, profile)
+    if snapshot is not None:
+        rows = _draft_rows(snapshot["body"])
+    else:
+        rows = await load_rows(db, profile)
+    review = build_review(rows, await schedule_documents(db, profile))
     review["profile_id"] = str(profile.id)
+    if snapshot is not None:
+        review.update(draft_pending=snapshot["draft"]["dirty"], draft_family_id=snapshot["family_id"],
+                      draft_revision=snapshot["draft"]["revision"])
     return review
+
+
+async def workspace_snapshot(db: Any, profile: ApplicationProfile, *, create: bool = False) -> dict | None:
+    """Use the shared versioned draft on real sessions, retaining legacy test/caller compatibility."""
+    if not isinstance(getattr(db, "info", None), dict) or db.info.get("financial_workspace_publishing"):
+        return None
+    from app.services import financial_workspace as workspace
+    from app.services.financial_workspace_legacy import managed_snapshot
+
+    await workspace.lock_financial_profile(db, profile)
+    snapshot = await managed_snapshot(db, profile, "debt_schedule")
+    if snapshot is None and create:
+        family, _draft = await workspace.resolve_family(db, profile, kind="debt_schedule")
+        snapshot = await workspace.load_workspace(db, profile, kind="debt_schedule", family_id=family.id)
+    return snapshot
+
+
+def _draft_rows(body: dict) -> list[Any]:
+    rows = []
+    for raw in body.get("debts", []):
+        cleaned = (fs.debt_rows_from_body({"debts": [raw]}) or [{}])[0]
+        values = {column.key: None for column in DealerDebt.__table__.columns}
+        values.update({**raw, **cleaned, "id": uuid.UUID(str(raw["id"])),
+                       "category": raw.get("debt_type") or raw.get("category") or "loan",
+                       "origin": raw.get("origin") or "admin", "status": raw.get("status", "active"),
+                       "count_in_dscr": raw.get("count_in_dscr", True), "evidence": raw.get("evidence") or {}})
+        rows.append(SimpleNamespace(**values))
+    return rows
+
+
+async def _apply_managed_review(db: AsyncSession, profile: ApplicationProfile, user: Any,
+                                lines: list[Any], snapshot: dict) -> dict[str, int]:
+    from app.services import financial_workspace as workspace
+    from app.services.financial_debt_actions import apply_debt_action
+
+    body = deepcopy(snapshot["body"])
+    items, _sources = document_lines(await schedule_documents(db, profile))
+    by_key = {item["key"]: item for item in items}
+    claimed = set()
+    saved = {"kept": 0, "added": 0, "updated": 0, "removed": 0, "restored": 0}
+    actor = str(getattr(user, "id", "") or "") or None
+    stamp = datetime.now(UTC).isoformat()
+    for line in lines:
+        rows = body.setdefault("debts", [])
+        row = next((raw for raw in rows if str(raw["id"]) == str(line.row_id)), None) if line.row_id else None
+        if line.row_id and row is None:
+            raise HTTPException(404, "That debt row is not in this financial draft")
+        if row is not None and row["id"] in claimed:
+            raise HTTPException(409, "The same obligation was sent more than once")
+        if row is None:
+            matches = [raw for raw in rows if raw["id"] not in claimed
+                       and str(raw.get("lender") or "").strip().casefold() == line.lender.strip().casefold()]
+            if len(matches) > 1:
+                raise HTTPException(409, "Choose the specific schedule row for these same-lender loans")
+            row = matches[0] if matches else None
+        fresh = row is None
+        if fresh:
+            row = {"id": str(uuid.uuid4()), "lender": line.lender, "debt_type": line.debt_type or "loan",
+                   "origin": "admin", "status": "active", "count_in_dscr": line.debt_type != "credit_card",
+                   "evidence_links": []}
+            rows.append(row)
+        claimed.add(row["id"])
+        before = deepcopy(row)
+        item = by_key.get(line.key)
+        if line.keep:
+            saved["kept"] += 1
+            if row.get("status", "active") != "active" or row.get("duplicate_of_id"):
+                body = apply_debt_action(body, {"op": "restore", "row_id": row["id"]}, actor_id=actor)
+                row = next(raw for raw in body["debts"] if raw["id"] == row["id"])
+                saved["restored"] += 1
+            changes = _changes(line, SimpleNamespace(category=row.get("debt_type")))
+            row.update({"debt_type" if key == "category" else key: value for key, value in changes.items()})
+            row["origin"] = "admin"
+            row["evidence"] = {**(row.get("evidence") or {}), "reviewed": {"by": actor, "at": stamp}}
+            source_id = line.file_id or (item or {}).get("file_id")
+            if source_id:
+                source = await workspace.source_file_for_profile(db, profile, uuid.UUID(str(source_id)))
+                links = row.setdefault("evidence_links", [])
+                if not any(str(link.get("file_id")) == str(source.id) for link in links):
+                    links.append({"file_id": str(source.id), "role": "supporting"})
+            saved["added" if fresh else "updated"] += int(fresh or row != before)
+        else:
+            row["evidence"] = {**(row.get("evidence") or {}), "removed": {
+                "reason": line.remove_reason or "not_a_loan", "note": line.remove_note, "by": actor, "at": stamp}}
+            body = apply_debt_action(body, {"op": "delete", "row_id": row["id"]}, actor_id=actor)
+            saved["removed"] += int(fresh or before.get("status", "active") == "active")
+    if any(row.get("status", "active") == "active" and not row.get("duplicate_of_id") for row in body.get("debts", [])):
+        body["no_debt"] = False
+    result = await workspace.save_draft(db, profile, kind="debt_schedule", family_id=uuid.UUID(snapshot["family_id"]),
+        expected_revision=snapshot["draft"]["revision"], body=body, actor=user)
+    snapshot.clear()
+    snapshot.update(result)
+    return saved
 
 
 # ---------------------------------------------------------------------------
@@ -770,6 +874,7 @@ async def apply_review(
     profile: ApplicationProfile,
     user: Any,
     lines: list[Any],
+    *, workspace_draft: dict | None = None,
 ) -> dict[str, int]:
     """Write the desk's decisions onto the file's schedule. Does not commit.
 
@@ -780,6 +885,9 @@ async def apply_review(
     evidence only, so it does not come back and no reader summing the columns
     can count it.
     """
+    snapshot = workspace_draft if workspace_draft is not None else await workspace_snapshot(db, profile, create=True)
+    if snapshot is not None:
+        return await _apply_managed_review(db, profile, user, lines, snapshot)
     rows = await load_rows(db, profile)
     document_items, _sources = document_lines(await schedule_documents(db, profile))
     by_key = {item["key"]: item for item in document_items}

@@ -334,14 +334,20 @@ async def open_public_collection_form(
     statement_id = None
     if kind == "pfs":
         statement = await financial_statements.latest_for_profile(db, profile.id)
-        if statement is None:
+        from app.services.financial_workspace_legacy import managed_snapshot
+        managed = await managed_snapshot(db, profile, "pfs")
+        if statement is None and managed is None:
             statement = await financial_statements.save_statement(
                 db, profile, body=pfs_schema.empty_body()
             )
-        statement_id = statement.id
+        statement_id = statement.id if statement else None
     link, form_token = await financial_statements.mint_link(
         db, profile, kind=kind, statement_id=statement_id, ttl_days=1
     )
+    from app.services.financial_workspace_legacy import managed_snapshot
+    managed_form = await managed_snapshot(db, profile, kind)
+    if managed_form:
+        link.financial_family_id = UUID(managed_form["family_id"])
     await profiles.log_profile_action(
         db,
         profile,

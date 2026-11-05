@@ -298,6 +298,8 @@ async def send_requirements_email(
     user: User | None,
     initiation_source: str,
     retry_failed: bool = False,
+    delivery_key: str | None = None,
+    file_request_id: str | None = None,
 ) -> ApplicationRoomDelivery:
     requested_keys = list(dict.fromkeys(requirement_keys))
     if not requested_keys:
@@ -343,7 +345,7 @@ async def send_requirements_email(
     automatic = initiation_source == "automatic_missing_item"
     task_labels = {}
     if automatic:
-        tasks = await collection_tasks.outreach_tasks(db, profile.id, requirement_keys=active_keys)
+        tasks = await collection_tasks.outreach_tasks(db, profile.id, requirement_keys=active_keys, due_only=True)
         task_labels = {key: task.label for task in tasks for key in task.requirement_keys}
         approved_keys = {key for task in tasks for key in task.requirement_keys}
         active_keys = [key for key in active_keys if key in approved_keys]
@@ -371,7 +373,7 @@ async def send_requirements_email(
             raise HTTPException(status.HTTP_409_CONFLICT, "The 24-hour email cadence has not elapsed")
         idempotency_key = _idempotency_key(profile.id, *sorted(active_keys), timestamp.date().isoformat())
     else:
-        idempotency_key = _idempotency_key(
+        idempotency_key = delivery_key or _idempotency_key(
             profile.id,
             *sorted(active_keys),
             initiation_source,
@@ -443,6 +445,12 @@ async def send_requirements_email(
             attachments.append((template.filename, template.content, template.content_type))
             attachment_names.add(template.filename)
     body = intro + "\n\nRequested items:\n" + "\n".join(f"- {label}" for label in labels)
+    instructions = [
+        f"{row.label}: {(getattr(row, 'provenance', None) or {}).get('request_instructions')}"
+        for row in requirements if (getattr(row, "provenance", None) or {}).get("request_instructions")
+    ]
+    if instructions:
+        body += "\n\n" + "\n".join(instructions)
     body += f"\n\nOpen your secure application room:\n{room_url}\n\n"
     if attachments:
         body += (
@@ -478,6 +486,7 @@ async def send_requirements_email(
             "requirement_keys": active_keys,
             "ai_composed": ai_composed,
             "attachment_names": sorted(attachment_names),
+            **({"file_request_id": file_request_id} if file_request_id else {}),
         },
         created_by_user_id=user.id if user else None,
         initiation_source=initiation_source,

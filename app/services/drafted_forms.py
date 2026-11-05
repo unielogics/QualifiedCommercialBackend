@@ -429,7 +429,11 @@ async def refresh_saved_form(
     """
     if profile is None or getattr(profile, "primary_bucket_id", None) is None:
         return None
+    from app.services.financial_workspace import has_managed_family
+
     try:
+        if await has_managed_family(db, profile, kind):
+            return None
         plan = await _plan_refresh(db, profile, kind, body=body, statement=statement)
     except Exception:  # noqa: BLE001
         # Reading and rendering only. Nothing was written, so there is nothing
@@ -564,6 +568,15 @@ async def enqueue_form_refresh(
     if profile_id is None or not has_room:
         # No document room means there is nothing to file into, so there is
         # nothing to hold back either.
+        return None
+
+    from app.services.financial_workspace import has_managed_family
+
+    try:
+        if await has_managed_family(db, profile, kind):
+            return None
+    except Exception:  # A failed guard must never overwrite immutable history.
+        log.exception("Could not check financial draft ownership kind=%s", kind)
         return None
 
     now = datetime.now(UTC)

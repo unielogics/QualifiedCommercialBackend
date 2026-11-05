@@ -5492,8 +5492,9 @@ def _json_from_ai_text(text: str) -> dict[str, Any]:
 
 
 def _latest_result_for_intake(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    from app.services.financial_publication import review_is_financially_stale
     review = intake.latest_review if intake.latest_review else None
-    if review and isinstance(review.result, dict):
+    if review and not review_is_financially_stale(review) and isinstance(review.result, dict):
         return review.result
     if isinstance(intake.result_snapshot, dict):
         return intake.result_snapshot
@@ -5507,15 +5508,17 @@ async def _lead_management_context(
     files_snapshot: list[BucketFile] | None = None,
 ) -> dict[str, Any]:
     docs_by_id = {str(doc.id): doc for doc in intake.bucket.requested_documents}
+    source_files = files_snapshot
+    if source_files is None:
+        from app.services.financial_workspace import filter_current_files
+        source_files = await filter_current_files(db, _active_files(intake.bucket))
+    from app.services.financial_publication import current_version_context
+    financial_versions = await current_version_context(db, visible_file_ids={file.id for file in source_files})
     files = []
     for file in sorted(
         (
             item
-            for item in (
-                files_snapshot
-                if files_snapshot is not None
-                else _active_files(intake.bucket)
-            )
+            for item in source_files
             if not _is_package_readiness_output(item)
         ),
         key=lambda item: item.created_at,
@@ -5560,6 +5563,8 @@ async def _lead_management_context(
             "description": intake.bucket.description,
         },
         "files": files,
+        "financial_versions": financial_versions,
+        "financial_authority": "Use current financial_versions for financial figures. Older intake state, chat messages, and superseded documents are historical context and must not replace the saved versions.",
         "missing_documents": missing_docs,
         "latest_review": _latest_result_for_intake(intake),
         "chat_history": chat_history,
@@ -5707,6 +5712,7 @@ async def _collect_packet_financials(
             "credit": credit,
             "program_fit": program_fit,
         }
+    from app.services.financial_version_selection import current_financial_file_clause
     rows = (
         await db.execute(
             select(BucketFileAnalysis)
@@ -5715,6 +5721,7 @@ async def _collect_packet_financials(
                 BucketFileAnalysis.bucket_id == intake.bucket_id,
                 BucketFileAnalysis.bucket_id == BucketFile.bucket_id,
                 BucketFileAnalysis.bucket_file_id.in_(active_ids),
+                current_financial_file_clause(BucketFile.id),
                 BucketFile.deleted_at.is_(None),
                 BucketFile.status == "uploaded",
                 BucketFileAnalysis.content_hash == BucketFile.content_hash,
@@ -8232,6 +8239,14 @@ async def _submit_pfs_form(
     if req is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Personal financial statement is not requested on this intake")
 
+    from app.services import financial_statements as statements
+    mapped = statements.from_legacy_submission(assets=list(payload.assets), liabilities=list(payload.liabilities),
+                                               owner_full_name=payload.owner_full_name, statement_date=payload.statement_date)
+    mapped["as_of"] = payload.statement_date
+    version_file = await _submit_managed_intake_financial(db, intake, "pfs", mapped, actor_name=actor_name, actor_email=actor_email)
+    if version_file is not None:
+        return version_file
+
     from app.services.dealer_forms_pdf import render_pfs_pdf
 
     key_facts = _pfs_key_facts(payload)
@@ -8338,6 +8353,11 @@ async def _submit_debt_schedule_form(
     )
     if req is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Debt schedule is not requested on this intake")
+    version_file = await _submit_managed_intake_financial(db, intake, "debt_schedule", {
+        "business_name": payload.business_name, "debts": [row.model_dump(mode="json") for row in payload.debts],
+    }, actor_name=actor_name, actor_email=actor_email)
+    if version_file is not None:
+        return version_file
     if req.status == "uploaded":
         raise HTTPException(status.HTTP_409_CONFLICT, "A debt schedule has already been submitted for this file")
 
@@ -8389,6 +8409,24 @@ async def _submit_debt_schedule_form(
     return stored
 
 
+async def _submit_managed_intake_financial(db, intake, kind: str, body: dict, *, actor_name: str, actor_email: str):
+    from types import SimpleNamespace
+
+    from app.services import application_profiles as profiles
+    from app.services.financial_workspace_legacy import managed_snapshot, stage_legacy_body
+
+    if not isinstance(getattr(db, "info", None), dict):
+        return None
+    profile = await profiles.provision_profile_for_intake(db, intake)
+    snapshot = await managed_snapshot(db, profile, kind)
+    if snapshot is None:
+        return None
+    saved = await stage_legacy_body(db, profile, snapshot, body, public=True, submit=True,
+        actor=SimpleNamespace(id=None, name=actor_name, email=actor_email))
+    await db.commit()
+    return await db.get(BucketFile, UUID(saved["saved_version"]["pdf_file_id"]))
+
+
 async def _persist_client_debt_rows(
     db: AsyncSession,
     intake: PublicUnderwritingIntake,
@@ -8422,6 +8460,12 @@ async def _persist_client_debt_rows(
 
     try:
         profile = await profile_service.provision_profile_for_intake(db, intake)
+        from app.services.financial_workspace_legacy import managed_snapshot, stage_legacy_body
+
+        managed = await managed_snapshot(db, profile, "debt_schedule")
+        if managed is not None:
+            await stage_legacy_body(db, profile, managed, {"debts": rows}, public=True)
+            return
         await financial_statements.save_debt_rows(db, profile, rows, origin="client_form")
     except Exception:  # noqa: BLE001
         log.exception(

@@ -308,7 +308,7 @@ async def sync_collection_tasks(
     grouped: dict[str, list[ApplicationRequirementState]] = {}
     for state in states:
         metadata = state.provenance or {}
-        if state.status == "stale" and metadata.get("inactive_definition"):
+        if metadata.get("cancelled_at") or (state.status == "stale" and metadata.get("inactive_definition")):
             continue
         kind = metadata.get("requirement_kind", "document")
         identity = canonical_identity(
@@ -783,7 +783,8 @@ async def materialize_external_requirements(
 
 
 async def outreach_tasks(
-    db: AsyncSession, profile_id: uuid.UUID, *, requirement_keys: list[str] | None = None
+    db: AsyncSession, profile_id: uuid.UUID, *, requirement_keys: list[str] | None = None,
+    due_only: bool = False,
 ) -> list[ApplicationCollectionTask]:
     rows = list(
         (
@@ -803,7 +804,8 @@ async def outreach_tasks(
     return [
         row
         for row in rows
-        if requirement_keys is None or set(row.requirement_keys).intersection(requirement_keys)
+        if (requirement_keys is None or set(row.requirement_keys).intersection(requirement_keys))
+        and (not due_only or row.next_attempt_at is None or row.next_attempt_at <= timestamp())
     ]
 
 
@@ -844,6 +846,13 @@ def task_read(task: ApplicationCollectionTask, *, public: bool = False) -> dict:
                 "disclosure_text",
                 "disclosure_version",
                 "requested_document_ids",
+                "minimum_count",
+                "required_months",
+                "required_years",
+                "quantity",
+                "unit",
+                "subject",
+                "period",
                 "prefill",
             }
         }

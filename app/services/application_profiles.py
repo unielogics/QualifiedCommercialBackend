@@ -1792,8 +1792,12 @@ async def intelligence_state(db: AsyncSession, profile: ApplicationProfile) -> A
     if annual_debt is None:
         monthly_debt = _metric_number(key_metrics, "monthly_debt_service", "debt_service_monthly")
         annual_debt = monthly_debt * 12 if monthly_debt is not None else None
+    from app.services import financial_version_selection
+    accepted_debt = await financial_version_selection.accepted_debt_schedule_snapshot(db, profile.id)
+    if accepted_debt is not None:
+        annual_debt = float(financial_version_selection.debt_schedule_monthly(accepted_debt.body)) * 12
     deterministic_dscr = calculate_dscr(ebitda, annual_debt)
-    dscr = deterministic_dscr if deterministic_dscr is not None else _metric_number(key_metrics, "estimated_dscr", "dscr")
+    dscr = deterministic_dscr if deterministic_dscr is not None or accepted_debt is not None else _metric_number(key_metrics, "estimated_dscr", "dscr")
     has_assets = bool(intake and intake.asset_rows)
     is_real_estate = profile.vertical == "real_estate" or has_assets
     revenue = _metric_number(key_metrics, "annualized_revenue", "annual_revenue", "gross_revenue")
@@ -1801,7 +1805,7 @@ async def intelligence_state(db: AsyncSession, profile: ApplicationProfile) -> A
     metrics = [
         IntelligenceMetric(key="requested", label="Requested", value=requested, unit="USD", status="ready" if requested is not None else "needs_evidence", source="intake", action=None if requested is not None else "edit_profile"),
         IntelligenceMetric(key="revenue", label="Annualized revenue", value=revenue, unit="USD", status="ready" if revenue is not None else "needs_evidence", source="latest_review", action=None if revenue is not None else "request_bank_or_tax_evidence"),
-        IntelligenceMetric(key="dscr", label="DSCR", value=dscr, unit="x", status="ready" if dscr is not None else "needs_evidence", source="deterministic: bankable EBITDA / annual debt service" if deterministic_dscr is not None else "latest AI review", action=None if dscr is not None else "request_debt_schedule", confidence=1.0 if deterministic_dscr is not None else 0.65 if dscr is not None else None),
+        IntelligenceMetric(key="dscr", label="DSCR", value=dscr, unit="x", status="not_applicable" if accepted_debt is not None and annual_debt == 0 else "ready" if dscr is not None else "needs_evidence", source="completed saved debt schedule" if accepted_debt is not None else "deterministic: bankable EBITDA / annual debt service" if deterministic_dscr is not None else "latest AI review", action=None if dscr is not None or accepted_debt is not None and annual_debt == 0 else "request_bank_or_tax_evidence" if accepted_debt is not None else "request_debt_schedule", confidence=1.0 if deterministic_dscr is not None or accepted_debt is not None else 0.65 if dscr is not None else None),
         IntelligenceMetric(key="ltv", label="LTV", applicable=is_real_estate, value=ltv, unit="%", status=("ready" if ltv is not None else "needs_evidence") if is_real_estate else "not_applicable", source="collateral evidence" if is_real_estate else None, action="request_property_evidence" if is_real_estate and ltv is None else None),
     ]
     return ApplicationIntelligenceRead(

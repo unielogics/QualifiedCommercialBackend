@@ -47,6 +47,7 @@ from app.schemas.capital_readiness import (
     ReadinessActionPatch,
     ReadinessActionRead,
 )
+from app.services import financial_version_selection
 from app.services.capital_readiness_ingestion import ingest_profile_financial_periods
 from app.services.financial_fact_citations import (
     financial_period_citation_status,
@@ -414,6 +415,7 @@ async def _current_evidence_sources(
     from contributing to the current score without rewriting the old row.
     """
 
+    from app.services.financial_version_selection import current_financial_file_clause
     files: dict[UUID, BucketFile] = {}
     if profile.primary_bucket_id is not None:
         primary = list(
@@ -423,6 +425,7 @@ async def _current_evidence_sources(
                         BucketFile.bucket_id == profile.primary_bucket_id,
                         BucketFile.deleted_at.is_(None),
                         BucketFile.status == "uploaded",
+                        current_financial_file_clause(BucketFile.id),
                     )
                 )
             )
@@ -432,9 +435,13 @@ async def _current_evidence_sources(
         files.update({row.id: row for row in primary})
     if profile.intake_id is not None:
         linked = await selected_files_for_intake(db, profile.intake_id)
+        if linked:
+            from app.services.financial_workspace import filter_current_files
+            linked = await filter_current_files(db, linked)
         files.update({row.id: row for row in linked})
     if not files:
         return {}, {}
+
 
     analyses = list(
         (
@@ -1897,6 +1904,7 @@ def _fingerprint(
     requirement_states: list[ApplicationRequirementState],
     canonical_entities: set[str],
     program_commercial_terms: dict[UUID, list[Any]],
+    accepted_debt_version_id: UUID | None = None,
 ) -> str:
     body = {
         "profile_id": str(profile.id),
@@ -1908,6 +1916,7 @@ def _fingerprint(
             profile, "self_reported_readiness_diagnostic", None
         ),
         "current_dscr": _float(profile.underwriting_current_dscr),
+        "accepted_debt_version_id": str(accepted_debt_version_id) if accepted_debt_version_id else None,
         "use_of_funds_revision": profile.use_of_funds_revision,
         "use_of_funds": profile.use_of_funds or [],
         "periods": sorted(
@@ -2826,6 +2835,7 @@ async def recompute(
         .scalars()
         .all()
     )
+    accepted_debt = await financial_version_selection.accepted_debt_schedule_snapshot(db, profile.id)
     fingerprint = _fingerprint(
         profile,
         periods,
@@ -2837,6 +2847,7 @@ async def recompute(
         requirement_states,
         canonical_entities,
         program_commercial_terms,
+        accepted_debt.id if accepted_debt is not None else None,
     )
     if current is not None and current.evidence_fingerprint == fingerprint:
         return current
@@ -3143,14 +3154,18 @@ async def recompute(
     for key, label, unit, aliases in banking_observations:
         fact = next((fact_map.get(alias) for alias in aliases if fact_map.get(alias)), None)
         value = _decimal(_normalized_fact_value(fact)) if fact is not None else None
+        accepted_debt_metric = key == "monthly_debt_payments" and accepted_debt is not None
+        if accepted_debt_metric:
+            value = financial_version_selection.debt_schedule_monthly(accepted_debt.body)
+            fact = None
         metrics.append(
             _metric(
                 key=key,
                 label=_t(locale, label),
                 value=value,
                 unit=unit,
-                metric_status="observed" if value is not None else "unavailable",
-                confidence=Decimal(fact.confidence)
+                metric_status="accepted" if accepted_debt_metric else "observed" if value is not None else "unavailable",
+                confidence=Decimal("1") if accepted_debt_metric else Decimal(fact.confidence)
                 if fact is not None and fact.confidence is not None
                 else None,
                 source={
@@ -3158,6 +3173,7 @@ async def recompute(
                     "fact_id": str(fact.id) if fact is not None else None,
                     "fact_status": "accepted" if fact is not None else None,
                     "threshold_policy": None,
+                    **({"kind": "accepted_debt_schedule", "version_id": str(accepted_debt.id)} if accepted_debt_metric else {}),
                 },
             )
         )

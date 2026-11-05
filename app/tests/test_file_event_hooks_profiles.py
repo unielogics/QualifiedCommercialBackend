@@ -91,7 +91,19 @@ def test_every_site_calls_emit_with_its_tier_before_the_commit():
         for tier in tiers:
             assert tier in src, (handler.__name__, tier)
         boundary = "await db.commit()" if "await db.commit()" in src else "await db.flush()"
-        assert src.index("file_events.emit(") < src.index(boundary), handler.__name__
+        emission = src.index("file_events.emit(")
+        if "stage_legacy_body(" in src:
+            # Versioned submissions emit through the publication service;
+            # the remaining inline emit belongs to the legacy-only branch.
+            from app.services.financial_publication import after_publication
+
+            published = inspect.getsource(after_publication)
+            assert '"document.received"' in published and CLIENT in published
+            assert "file_events.emit(" in published
+            assert src.index("stage_legacy_body(") < src.index(boundary)
+            assert src.find(boundary, emission) > emission, handler.__name__
+        else:
+            assert emission < src.index(boundary), handler.__name__
     # The public form submit has two branches, each with its own commit.
     assert inspect.getsource(profiles_router.submit_public_financial_form).count("file_events.emit(") == 2
     # The underwriting write emits the desk note as note.added, and no hook here carries a body.

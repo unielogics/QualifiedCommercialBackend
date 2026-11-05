@@ -132,7 +132,8 @@ def test_the_two_new_columns_are_on_the_schedule_in_order():
     assert (
         fs.DEBT_COLUMNS.index("mca_modification_note") == fs.DEBT_COLUMNS.index("mca_modified") + 1
     )
-    assert fs.DEBT_COLUMNS[-1] == "notes"
+    assert fs.DEBT_COLUMNS[fs.DEBT_COLUMNS.index("mca_modification_note") + 1] == "notes"
+    assert fs.DEBT_COLUMNS[-3:] == ("factor_rate", "payment_amount", "payment_frequency")
     assert len(fs.DEBT_COLUMN_LABELS) == len(fs.DEBT_COLUMNS)
 
 

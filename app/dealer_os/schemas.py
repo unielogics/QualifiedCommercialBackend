@@ -2730,6 +2730,10 @@ class DebtScheduleConfirmationRead(BaseModel):
     confirmed_at: datetime | None = None
     confirmed_by_user_id: UUID | None = None
     note: str | None = None
+    source_sha256: str | None = None
+    financial_version_id: UUID | None = None
+    financial_version_number: int | None = None
+    financial_version_content_hash: str | None = None
 
 
 class DocRequestPatch(BaseModel):
@@ -2849,6 +2853,10 @@ class DebtRead(BaseModel):
     collateral: str | None = None
     document_id: UUID | None = None
     count_in_dscr: bool = True
+    duplicate_of_id: UUID | None = None
+    draft_pending: bool = False
+    draft_family_id: UUID | None = None
+    draft_revision: int | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -2897,6 +2905,11 @@ class DebtDraftResult(BaseModel):
     skipped_admin: int = 0     # rows a human owns — never touched
     total_monthly: float = 0.0
     debts: list[DebtRead] = []
+    draft_pending: bool = False
+    draft_family_id: UUID | None = None
+    draft_revision: int | None = None
+    schedule_authoritative: bool = False
+    suggestions: list[dict] = []
 
 
 # --- MCA-style statement-only readiness --------------------------------------
@@ -2961,6 +2974,9 @@ class DscrComponentRead(BaseModel):
     count_in_dscr: bool = True
     vendor_key: str | None = None
     document_id: UUID | None = None
+    draft_pending: bool = False
+    draft_family_id: UUID | None = None
+    draft_revision: int | None = None
 
 
 class DscrSuggestionRead(BaseModel):

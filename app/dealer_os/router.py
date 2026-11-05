@@ -538,6 +538,7 @@ from .services import (
     decision,
     delivery_log,
     file_chat,
+    financial_debt_drafts as debt_drafts,
     qc_master_application,
     rep_workflows,
     routing_resolution,
@@ -3844,8 +3845,10 @@ async def _application_workflow_state(
             "Bank evidence exception accepted; the six-month standard remains an underwriting condition."
         )
 
-    step_3_blockers = workflow_readiness.financial_confirmation_blockers(profile)
     debt_confirmation, debts, debt_sha256 = await _debt_schedule_confirmation(db, dealer)
+    step_3_blockers = workflow_readiness.financial_confirmation_blockers(
+        profile, accepted_debt_schedule=bool(debt_confirmation and debt_confirmation.get("financial_version_id")),
+    )
     debt_confirmed = bool(
         debt_confirmation
         and debt_confirmation.get("source_sha256") == debt_sha256
@@ -5507,6 +5510,9 @@ async def delete_dealer_document(
                 .with_for_update()
             )
         ).scalars().all()
+    retained_version_ids = await debt_drafts.version_file_ids(db, bucket_file_ids)
+    recovery_archive["retained_version_file_ids"] = [str(value) for value in retained_version_ids]
+    bucket_files = [row for row in bucket_files if row.id not in retained_version_ids]
     for bucket_file in bucket_files:
         await buckets_link.soft_delete_mirrored_file(
             db,
@@ -5536,16 +5542,24 @@ async def delete_dealer_document(
     await db.execute(sa_delete(DealerTaxFiling).where(DealerTaxFiling.document_id.in_(target_ids)))
     # Debt rows are underwriting evidence. Removing their source document
     # retires them from calculations but must not erase their retained history.
-    await db.execute(
-        sa_update(DealerDebt)
-        .where(DealerDebt.document_id.in_(target_ids), DealerDebt.origin != "admin")
-        .values(status="dismissed", document_id=None)
-    )
-    await db.execute(
-        sa_update(DealerDebt)
-        .where(DealerDebt.document_id.in_(target_ids), DealerDebt.origin == "admin")
-        .values(document_id=None)
-    )
+    debt_retirement_staged = await debt_drafts.retire_document_rows(db, dealer.id, target_ids, actor=user)
+    if debt_retirement_staged:
+        # Restore must not later replay pre-version facts into the published
+        # projection. Reconciliation is retained in the working draft.
+        recovery_archive["debts_staged"] = recovery_archive["debts_deleted"] + recovery_archive["debts_detached"]
+        recovery_archive["debts_deleted"], recovery_archive["debts_detached"] = [], []
+        document_recovery.set_archive(document, recovery_archive)
+    else:
+        await db.execute(
+            sa_update(DealerDebt)
+            .where(DealerDebt.document_id.in_(target_ids), DealerDebt.origin != "admin")
+            .values(status="dismissed", document_id=None)
+        )
+        await db.execute(
+            sa_update(DealerDebt)
+            .where(DealerDebt.document_id.in_(target_ids), DealerDebt.origin == "admin")
+            .values(document_id=None)
+        )
     await db.execute(
         sa_delete(DealerAddback).where(
             DealerAddback.document_id.in_(target_ids), DealerAddback.status != "verified"
@@ -16618,6 +16632,17 @@ async def list_debts(
 ) -> list[DealerDebt]:
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    managed = await debt_drafts.managed_context(db, dealer.id)
+    if managed is not None:
+        from app.services import financial_version_selection
+        accepted = await financial_version_selection.accepted_debt_schedule_snapshot(db, managed.profile.id)
+        if accepted is not None:
+            published = list((await db.execute(select(DealerDebt).where(DealerDebt.dealer_id == dealer.id))).scalars().all())
+            return [DebtRead.model_validate(row) for row in debt_drafts.accepted_debt_views(
+                published, financial_version_selection.active_debt_schedule_rows(accepted.body),
+            )]
+        return [DebtRead.model_validate(debt_drafts.read_row(row, managed.snapshot))
+                for row in managed.snapshot["body"].get("debts", []) if not debt_drafts.inactive(row)]
     return list(
         (
             await db.execute(
@@ -16644,6 +16669,12 @@ async def _debt_schedule_confirmation(
             )
         ).scalars().all()
     )
+    from app.services import financial_version_selection
+    accepted = await financial_version_selection.accepted_debt_schedule_snapshot_for_dealer(db, dealer.id)
+    if accepted is not None:
+        rows = debt_drafts.accepted_debt_views(rows, financial_version_selection.active_debt_schedule_rows(accepted.body))
+        confirmation = workflow_readiness.accepted_debt_confirmation(accepted, rows)
+        return confirmation, rows, confirmation["source_sha256"]
     source_sha256 = workflow_readiness.debt_source_hash(rows)
     profile = (
         await db.execute(
@@ -16680,6 +16711,10 @@ async def get_debt_schedule_confirmation(
         confirmed_at=confirmation.get("confirmed_at"),
         confirmed_by_user_id=confirmation.get("confirmed_by_user_id"),
         note=confirmation.get("note"),
+        source_sha256=source_sha256,
+        financial_version_id=confirmation.get("financial_version_id"),
+        financial_version_number=confirmation.get("financial_version_number"),
+        financial_version_content_hash=confirmation.get("financial_version_content_hash"),
     )
 
 
@@ -16696,6 +16731,8 @@ async def put_debt_schedule_confirmation(
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     previous, rows, source_sha256 = await _debt_schedule_confirmation(db, dealer)
+    if previous and previous.get("financial_version_id"):
+        return DebtScheduleConfirmationRead(**previous, confirmed=True, stale=False)
     if payload.status == "no_business_debt" and rows:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -16762,6 +16799,14 @@ async def draft_debt_schedule(
     rolled, _ = await _vendor_rollup(db, dealer)
     proposals = vendors.draft_debt_rows(rolled)
 
+    managed = await debt_drafts.managed_context(db, dealer.id)
+    if managed is not None:
+        result = await debt_drafts.stage_proposals(db, managed, proposals, fields=("monthly_payment",), actor=user, source="vendor_rollup")
+        await log_action(db, dealer.id, user, "debts.draft_staged", "debt",
+                         after={key: value for key, value in result.items() if key != "debts"})
+        await db.commit()
+        return DebtDraftResult(**result)
+
     existing = {
         d.vendor_key: d
         for d in (
@@ -16803,7 +16848,7 @@ async def draft_debt_schedule(
                 )
             )
             created += 1
-        elif row.origin == "admin" or row.status == "dismissed":
+        elif row.origin == "admin" or row.status != "active" or row.duplicate_of_id:
             skipped += 1
         else:
             row.monthly_payment = p["monthly_payment"]
@@ -16850,6 +16895,12 @@ async def create_debt(
             * refinance_svc.FREQUENCY_MONTHLY_MULT[fields["payment_frequency"]],
             2,
         )
+    managed = await debt_drafts.managed_context(db, dealer.id)
+    if managed is not None:
+        draft_row = await debt_drafts.edit_row(db, managed, op="create", fields=fields, actor=user)
+        await log_action(db, dealer.id, user, "debts.create_staged", "debt", entity_id=UUID(draft_row["id"]), after=jsonable_encoder(draft_row))
+        await db.commit()
+        return DebtRead.model_validate(draft_row)
     row = DealerDebt(dealer_id=dealer.id, origin="admin", status="active", **fields)
     db.add(row)
     await log_action(db, dealer.id, user, "debts.create", "debt", after=body.model_dump(mode="json"))
@@ -16870,6 +16921,13 @@ async def patch_debt(
     what stops a later re-draft from overwriting the correction."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    managed = await debt_drafts.managed_context(db, dealer.id)
+    if managed is not None:
+        draft_row = await debt_drafts.edit_row(db, managed, op="update", row_id=debt_id,
+                                               fields=body.model_dump(exclude_unset=True), actor=user)
+        await log_action(db, dealer.id, user, "debts.update_staged", "debt", entity_id=debt_id, after=jsonable_encoder(draft_row))
+        await db.commit()
+        return DebtRead.model_validate(draft_row)
     row = (
         await db.execute(
             select(DealerDebt).where(DealerDebt.id == debt_id, DealerDebt.dealer_id == dealer.id)
@@ -16900,12 +16958,22 @@ async def patch_debt(
 
 @router.delete("/dealers/{dealer_id}/debts/{debt_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_debt(
-    dealer_id: UUID, debt_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    dealer_id: UUID, debt_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db),
+    response: Response = None,
 ) -> None:
     """Delete a hand-added row; a DRAFTED row is dismissed instead so the next
     draft does not resurrect it."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    managed = await debt_drafts.managed_context(db, dealer.id)
+    if managed is not None:
+        draft_row = await debt_drafts.edit_row(db, managed, op="delete", row_id=debt_id, actor=user)
+        await log_action(db, dealer.id, user, "debts.delete_staged", "debt", entity_id=debt_id)
+        await db.commit()
+        if response is not None:
+            response.headers["X-Financial-Draft-Pending"] = "true"
+            response.headers["X-Financial-Family-Id"] = draft_row["draft_family_id"]
+        return
     row = (
         await db.execute(
             select(DealerDebt).where(DealerDebt.id == debt_id, DealerDebt.dealer_id == dealer.id)
@@ -16990,6 +17058,8 @@ async def dscr_composition(
         .scalars()
         .all()
     )
+    if inputs.accepted_debt_rows is not None:
+        debts = debt_drafts.accepted_debt_views(debts, inputs.accepted_debt_rows)
     events, _ov, _sn = await _load_vendor_inputs(db, dealer)
     observed = refinance_svc.observed_monthly(events, debts)
     months_covered = {p["period"].replace(day=1) for p in inputs.periods if p.get("period")}
@@ -17003,15 +17073,15 @@ async def dscr_composition(
         # counts too) — the same basis the engine's drafted pool uses, so the
         # composer's itemization always sums to the headline denominator.
         _stated_eq = refinance_svc.monthly_equivalent(d)
-        stated = round(_stated_eq, 2) if _stated_eq > 0 else None
-        effective = obs if (obs is not None and obs > 0) else (stated or 0.0)
+        stated = round(_stated_eq, 2) if _stated_eq > 0 or inputs.accepted_debt_rows is not None else None
+        effective = (stated or 0.0) if inputs.accepted_debt_rows is not None else obs if (obs is not None and obs > 0) else (stated or 0.0)
         components.append(
             DscrComponentRead(
                 debt_id=d.id,
                 lender=d.lender,
                 category=d.category,
                 origin=d.origin,
-                source="contract" if d.document_id else ("drafted" if d.origin == "ai_draft" else "manual"),
+                source="accepted_debt_schedule" if inputs.accepted_debt_rows is not None else "contract" if d.document_id else ("drafted" if d.origin == "ai_draft" else "manual"),
                 stated_monthly=stated,
                 observed_monthly=obs,
                 effective_monthly=round(effective, 2),
@@ -17050,6 +17120,7 @@ async def dscr_composition(
         and v.category != "credit_card"
         and v.is_recurring
         and not any(refinance_svc.key_matches(k, v.key) for k in covered_keys)
+        and inputs.accepted_debt_rows is None
     ]
 
     net_series = [
@@ -17150,6 +17221,49 @@ async def dscr_component_action(
     require_team(user)
     dealer = await _load_visible_dealer(db, dealer_id, user)
 
+    managed = await debt_drafts.managed_context(db, dealer.id)
+    if managed is not None:
+        if payload.action == "toggle":
+            if payload.debt_id is None or payload.count_in_dscr is None:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "toggle needs debt_id and count_in_dscr")
+            draft_row = await debt_drafts.edit_row(db, managed, op="update", row_id=payload.debt_id,
+                fields={"count_in_dscr": payload.count_in_dscr}, actor=user)
+        elif payload.action == "add_vendor":
+            if not payload.vendor_key:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "add_vendor needs vendor_key")
+            existing = next((row for row in managed.snapshot["body"].get("debts", []) if row.get("vendor_key") == payload.vendor_key), None)
+            if existing is not None:
+                if debt_drafts.inactive(existing):
+                    raise HTTPException(409, "Restore this deleted or duplicate obligation in the financial workspace first")
+                draft_row = await debt_drafts.edit_row(db, managed, op="update", row_id=UUID(existing["id"]),
+                    fields={"count_in_dscr": True}, actor=user)
+            else:
+                events, _ov, _sn = await _load_vendor_inputs(db, dealer)
+                vendor = next((row for row in vendors.rollup_vendors(events) if row.key == payload.vendor_key), None)
+                if vendor is None:
+                    raise HTTPException(404, "No observed vendor with that key")
+                if vendor.direction >= 0:
+                    raise HTTPException(422, "Inflow vendors can't be debt service")
+                draft_row = await debt_drafts.edit_row(db, managed, op="create", actor=user, fields={
+                    "lender": (vendor.sample_description or vendor.key)[:180], "category": vendor.category if vendor.category in ("floorplan", "loan", "credit_card") else "loan",
+                    "monthly_payment": round(abs(vendor.monthly_average), 2), "count_in_dscr": True, "vendor_key": vendor.key,
+                    "evidence": {"source": "dscr_composer", "observed_months": vendor.months, "observed_count": vendor.count},
+                })
+        else:
+            raise HTTPException(422, "Unknown action")
+        published = (await db.execute(select(DealerDebt).where(
+            DealerDebt.id == UUID(draft_row["id"]), DealerDebt.dealer_id == dealer.id,
+        ))).scalar_one_or_none()
+        effective = refinance_svc.monthly_equivalent(published) if published is not None and published.status == "active" and published.count_in_dscr else 0.0
+        stated = debt_drafts.monthly(draft_row)
+        await log_action(db, dealer.id, user, "debts.dscr_staged", "debt", entity_id=UUID(draft_row["id"]), after=jsonable_encoder(draft_row))
+        await db.commit()
+        return DscrComponentRead(debt_id=UUID(draft_row["id"]), lender=draft_row["lender"], category=draft_row["category"],
+            origin=draft_row["origin"], source="contract" if draft_row.get("document_id") else "manual",
+            stated_monthly=stated, effective_monthly=effective, count_in_dscr=draft_row["count_in_dscr"],
+            vendor_key=draft_row.get("vendor_key"), document_id=draft_row.get("document_id"),
+            draft_pending=True, draft_family_id=draft_row["draft_family_id"], draft_revision=draft_row["draft_revision"])
+
     if payload.action == "toggle":
         if payload.debt_id is None or payload.count_in_dscr is None:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "toggle needs debt_id and count_in_dscr")
@@ -17185,6 +17299,8 @@ async def dscr_component_action(
             )
         ).scalar_one_or_none()
         if existing is not None:
+            if existing.status != "active" or existing.duplicate_of_id:
+                raise HTTPException(409, "Restore this deleted or duplicate obligation in the financial workspace first")
             existing.status, existing.count_in_dscr, existing.origin = "active", True, "admin"
             row = existing
         else:
@@ -19317,7 +19433,7 @@ def _refi_program_specs(settings: dict) -> list[dict]:
 
 
 async def _refi_debt_rows(db: AsyncSession, dealer) -> list[DealerDebt]:
-    return (
+    rows = (
         (
             await db.execute(
                 select(DealerDebt)
@@ -19328,6 +19444,11 @@ async def _refi_debt_rows(db: AsyncSession, dealer) -> list[DealerDebt]:
         .scalars()
         .all()
     )
+    from app.services import financial_version_selection
+    accepted = await financial_version_selection.accepted_debt_schedule_snapshot_for_dealer(db, dealer.id)
+    if accepted is not None:
+        return debt_drafts.accepted_debt_views(rows, financial_version_selection.active_debt_schedule_rows(accepted.body))
+    return rows
 
 
 @router.get("/dealers/{dealer_id}/refinance", response_model=RefinanceRead)
@@ -19887,6 +20008,8 @@ async def _application_pre_screen_state(
             )
         ).scalars().all()
     )
+    if getattr(metric_inputs, "accepted_debt_rows", None) is not None:
+        debts = debt_drafts.accepted_debt_views(debts, metric_inputs.accepted_debt_rows)
     official_statements_complete = len(statement_months) >= 6 and not missing_statement_months
     deposit_period_rows = [row for row in period_rows if row.get("deposits") is not None]
     estimated_annualized_bank_sales = None
@@ -20136,6 +20259,8 @@ async def _application_pre_screen_state(
         ),
     )
 
+    if getattr(metric_inputs, "accepted_debt_rows", None) is not None:
+        application_facts["monthly_debt_payments"] = financial_snapshot.get("monthly_debt_payments")
     application_facts.update(
         {
             "official_bank_statements": official_statements_complete,

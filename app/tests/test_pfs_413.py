@@ -477,11 +477,14 @@ def test_debt_key_facts_keep_the_shape_the_dscr_reads():
     assert set(facts) == {"debts", "total_monthly_debt_service", "total_outstanding_balance"}
     assert facts["total_monthly_debt_service"] == 350.0
     assert facts["total_outstanding_balance"] == 3000.0
+    assert facts["debts"][0]["monthly_payment_source"] == "stated"
+    assert all(facts["debts"][0][field] is None for field in ("rate", "factor_rate", "payment_amount", "payment_frequency"))
     # The five keys `extract_debt_schedule` and the DSCR metric read, by name;
     # the rest of the row (type, rate, status, the advance question) rides
     # beside them so a reader of the facts sees what the PDF shows.
     assert {"lender", "original_amount", "current_balance", "monthly_payment", "maturity_date"} <= set(facts["debts"][0])
     assert {"debt_type", "interest_rate", "payment_status", "mca_modified"} <= set(facts["debts"][0])
+    assert {"factor_rate", "payment_amount", "payment_frequency", "monthly_payment_source"} <= set(facts["debts"][0])
 
 
 # ---------------------------------------------------------------------------
@@ -693,12 +696,12 @@ def test_the_schedule_pdf_carries_every_column_the_borrower_filled():
 
 
 def test_a_note_hangs_under_its_own_obligation():
-    """Spanning the table rather than squeezing a twelfth column, so a long
+    """Spanning the table rather than squeezing another column, so a long
     note wraps without shrinking every figure on the row."""
     from app.services import dealer_forms_pdf as pdf
 
     row = pdf._schedule_row_html({"lender": "A", "notes": "Balloon due in 2027"})
-    assert "colspan='12'" in row
+    assert f"colspan='{len(pdf._SCHEDULE_COLUMNS)}'" in row
     assert "Note: Balloon due in 2027" in row
 
 

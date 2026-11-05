@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from app.dealer_os.services import financial_snapshot
 
 
@@ -118,6 +120,117 @@ def test_missing_activity_remains_null_instead_of_displaying_fake_zero() -> None
     assert snapshot["returned_items"] is None
     assert snapshot["credit_quality_tier"] is None
     assert snapshot["sources"]["returned_items"]["status"] == "unavailable"
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_accepted_schedule_overrides_stale_profile_monthly_debt(confirmed: bool) -> None:
+    snapshot = financial_snapshot.build(
+        profile=_profile(
+            annual_cash_flow_available_for_debt=240_000,
+            monthly_debt_payments=30_000,
+            field_confirmations={"annual_cash_flow_available_for_debt": {}} if confirmed else {},
+        ),
+        required_owners=[],
+        metric_tree={"dscr": {
+            "schedule_authoritative": True,
+            "monthly_debt_service": 10_000,
+            "current": 1.1,
+        }},
+        period_rows=[],
+        statement_months=[],
+        suggestions={"monthly_debt_payments": {"value": 50_000}},
+        negative_balance_days_90=None,
+        nsf_count=None,
+    )
+
+    assert snapshot["monthly_debt_payments"] == 10_000
+    assert snapshot["annual_cash_flow_available_for_debt"] == 240_000
+    assert snapshot["dscr"] == 2.0
+    assert snapshot["sources"]["monthly_debt_payments"]["source"] == "accepted_debt_schedule"
+    assert snapshot["sources"]["monthly_debt_payments"]["label"] == "Saved debt schedule"
+    assert snapshot["sources"]["dscr"]["source"] == "accepted_debt_schedule"
+    assert snapshot["sources"]["dscr"]["status"] == ("confirmed" if confirmed else "estimated")
+
+
+@pytest.mark.parametrize("accepted_monthly", [0, None])
+def test_no_positive_accepted_debt_blocks_stale_ratios(accepted_monthly: float | None) -> None:
+    snapshot = financial_snapshot.build(
+        profile=_profile(
+            annual_cash_flow_available_for_debt=240_000,
+            monthly_debt_payments=10_000,
+            field_confirmations={
+                "annual_cash_flow_available_for_debt": {},
+                "monthly_debt_payments": {},
+            },
+        ),
+        required_owners=[],
+        metric_tree={"dscr": {
+            "schedule_authoritative": True,
+            "monthly_debt_service": accepted_monthly,
+            "current": 2.5,
+            "draft": 2.0,
+            "cash_flow": 1.5,
+        }},
+        period_rows=[],
+        statement_months=[],
+        suggestions={},
+        negative_balance_days_90=None,
+        nsf_count=None,
+    )
+
+    assert snapshot["monthly_debt_payments"] == accepted_monthly
+    assert snapshot["dscr"] is None
+    assert snapshot["sources"]["dscr"]["status"] == "unavailable"
+
+
+@pytest.mark.parametrize("engine_current", [1.75, None])
+def test_accepted_schedule_without_entered_cash_flow_uses_only_engine_current(
+    engine_current: float | None,
+) -> None:
+    snapshot = financial_snapshot.build(
+        profile=_profile(monthly_debt_payments=40_000),
+        required_owners=[],
+        metric_tree={"dscr": {
+            "schedule_authoritative": True,
+            "monthly_debt_service": 10_000,
+            "current": engine_current,
+            "draft": 9,
+            "cash_flow": 8,
+        }},
+        period_rows=[],
+        statement_months=[],
+        suggestions={"annual_cash_flow_available_for_debt": {"value": 120_000}},
+        negative_balance_days_90=None,
+        nsf_count=None,
+    )
+
+    # Annual cash-flow display retains the established suggestion policy, while
+    # DSCR uses the engine's accepted-schedule numerator when none was entered.
+    assert snapshot["annual_cash_flow_available_for_debt"] == 120_000
+    assert snapshot["monthly_debt_payments"] == 10_000
+    assert snapshot["dscr"] == engine_current
+    assert snapshot["sources"]["dscr"]["status"] == (
+        "verified" if engine_current is not None else "unavailable"
+    )
+
+
+def test_accepted_schedule_preserves_explicit_zero_annual_cash_flow() -> None:
+    snapshot = financial_snapshot.build(
+        profile=_profile(annual_cash_flow_available_for_debt=0, monthly_debt_payments=40_000),
+        required_owners=[],
+        metric_tree={"dscr": {
+            "schedule_authoritative": True,
+            "monthly_debt_service": 10_000,
+            "current": 2,
+        }},
+        period_rows=[],
+        statement_months=[],
+        suggestions={},
+        negative_balance_days_90=None,
+        nsf_count=None,
+    )
+
+    assert snapshot["dscr"] == 0
 
 
 def test_capacity_uses_modelled_path_not_requested_amount() -> None:

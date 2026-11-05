@@ -347,6 +347,18 @@ async def list_loan_todo(
                 )
             )
 
+    # Staff file requests project the same coverage/task state as the secure
+    # room, without creating a second legacy Document checklist on the loan.
+    profile = (await db.execute(select(ApplicationProfile).where(
+        ApplicationProfile.loan_id == loan_id,
+    ))).scalar_one_or_none()
+    if profile is not None:
+        from app.services.file_requests import loan_todo_items
+        out.extend(TodoItemRead(**item) for item in await loan_todo_items(
+            db, profile, want_pending=want_pending, want_completed=want_completed,
+        ))
+        await db.commit()
+
     # Calls on THIS loan, audience-scoped (clients never see AI-source
     # or other clients' events — enforced by _scope_calendar_for_audience).
     now = _dt.now(UTC)

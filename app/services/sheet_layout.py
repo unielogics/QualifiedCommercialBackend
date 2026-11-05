@@ -45,13 +45,14 @@ from typing import Any
 
 from app.services import business_statement_schema as bss
 from app.services import pfs_schema
+from app.services.debt_terms import PAYMENT_FREQUENCIES, normalize_terms
 from app.services.debt_types import DEBT_TYPE_SLUGS, DEBT_TYPES
 from app.services.financial_statements import DEBT_COLUMN_LABELS, DEBT_COLUMNS
 
 LAYOUT_VERSION = "qc_sheets.v1"
 
 #: The debt schedule has no schema module of its own; the version travels here.
-DEBT_SCHEMA_VERSION = "qc_ds.v1"
+DEBT_SCHEMA_VERSION = "qc_ds.v2"
 
 KINDS: tuple[str, ...] = ("p_and_l", "balance_sheet", "debt_schedule", "pfs")
 
@@ -120,12 +121,13 @@ _PFS_MONEY_COLUMNS = frozenset(
 _PFS_DATE_COLUMNS = frozenset({"date_of_quotation", "date_purchased", "when_due"})
 _PFS_COUNT_COLUMNS = frozenset({"number_of_shares"})
 
-_DEBT_MONEY = frozenset({"original_amount", "balance", "monthly_payment"})
+_DEBT_MONEY = frozenset({"original_amount", "balance", "monthly_payment", "payment_amount"})
 _DEBT_DATES = frozenset({"originated_on", "maturity_on"})
 _DEBT_CHOICES: dict[str, tuple[str, ...]] = {
     "debt_type": DEBT_TYPE_SLUGS,
     "secured": ("secured", "unsecured"),
     "payment_status": ("current", "delinquent"),
+    "payment_frequency": PAYMENT_FREQUENCIES,
     "mca_modified": ("yes", "no"),
 }
 #: What the grid and the workbook show for a choice whose stored value is a
@@ -139,6 +141,9 @@ _DEBT_OPTION_LABELS: dict[str, tuple[tuple[str, str], ...]] = {
 _DEBT_HINTS: dict[str, str] = {
     "mca_modified": "Only for a merchant cash advance or revenue-based advance: did the funder modify it for lower sales?",
     "mca_modification_note": "Only for an advance that was modified: what changed.",
+    "factor_rate": "Contract factor multiple, not an annual interest rate.",
+    "payment_amount": "The contract's amount per payment, before conversion to a monthly equivalent.",
+    "monthly_payment": "Calculated from native payment amount and frequency when those terms are entered or changed; otherwise the stated monthly amount.",
 }
 
 _ORDINAL = re.compile(r"^r(\d+)$")
@@ -686,13 +691,16 @@ def _debt_columns() -> tuple[Column, ...]:
         "mca_modified": 16,
         "mca_modification_note": 28,
         "notes": 30,
+        "factor_rate": 16,
+        "payment_amount": 17,
+        "payment_frequency": 19,
     }
     return tuple(
         Column(
             index,
             label,
             widths.get(key, 15),
-            "right" if key in _DEBT_MONEY or key == "rate" else "left",
+            "right" if key in _DEBT_MONEY or key in {"rate", "factor_rate"} else "left",
         )
         for index, (key, label) in enumerate(zip(DEBT_COLUMNS, DEBT_COLUMN_LABELS, strict=True), start=1)
     )
@@ -703,6 +711,8 @@ def _debt_cell_type(key: str) -> tuple[str, str]:
         return "money", "money"
     if key == "rate":
         return "rate", "ratio"
+    if key == "factor_rate":
+        return "rate", "text"
     if key in _DEBT_DATES:
         return "date", "date"
     if key in _DEBT_CHOICES:
@@ -869,7 +879,7 @@ def debt_totals(body: Mapping[str, Any] | None) -> dict[str, Decimal]:
         if not isinstance(row, dict):
             continue
         out["total_balance"] += pfs_schema._amount(row.get("balance"))
-        out["total_monthly_payment"] += pfs_schema._amount(row.get("monthly_payment"))
+        out["total_monthly_payment"] += pfs_schema._amount(normalize_terms(row, strict=False).get("monthly_payment"))
     return out
 
 

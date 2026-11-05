@@ -69,6 +69,9 @@ class AdvanceRead(AdvanceIn):
     origin: str
     editable: bool
     source: str
+    draft_pending: bool = False
+    draft_family_id: UUID | None = None
+    draft_revision: int | None = None
 
 
 class AdvancesWrite(BaseModel):

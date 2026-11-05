@@ -1,9 +1,10 @@
 """Canonical evidence-backed financial values for Field Desk surfaces.
 
 The PDF, routing engine, Step 3, and the application sidebar used to choose
-their own sources.  This module keeps that precedence deterministic: confirmed
-staff values win, then entered values, then verified calculations, then clearly
-labelled estimates.  Missing evidence remains null instead of becoming zero.
+their own sources.  Accepted debt schedules govern monthly debt service;
+otherwise confirmed staff values win, then entered values, then verified
+calculations, then clearly labelled estimates.  Missing evidence remains null
+instead of becoming zero.
 """
 
 from __future__ import annotations
@@ -161,17 +162,38 @@ def build(
 
     confirmations = dict(getattr(profile, "field_confirmations", None) or {})
     dscr_metrics = dict(metric_tree.get("dscr") or {})
+    schedule_authoritative = dscr_metrics.get("schedule_authoritative") is True
+    cash_flow_for_dscr = annual_cash_flow
+    if schedule_authoritative:
+        monthly_debt = _number(dscr_metrics.get("monthly_debt_service"))
+        sources["monthly_debt_payments"] = _source(
+            status="verified" if monthly_debt is not None else "unavailable",
+            source="accepted_debt_schedule",
+            label="Saved debt schedule",
+            evidence="Monthly debt service from the accepted financial form version.",
+        )
+        # Preserve entered cash-flow assumptions, but let the engine choose its
+        # evidence-based numerator when there is no entered annual cash flow.
+        cash_flow_for_dscr = _number(
+            getattr(profile, "annual_cash_flow_available_for_debt", None)
+        )
     dscr = None
-    if annual_cash_flow is not None and monthly_debt is not None and monthly_debt > 0:
-        dscr = round(annual_cash_flow / (monthly_debt * 12), 3)
-        both_confirmed = {
-            "annual_cash_flow_available_for_debt",
-            "monthly_debt_payments",
-        }.issubset(confirmations)
+    if cash_flow_for_dscr is not None and monthly_debt is not None and monthly_debt > 0:
+        dscr = round(cash_flow_for_dscr / (monthly_debt * 12), 3)
+        both_confirmed = (
+            "annual_cash_flow_available_for_debt" in confirmations
+            and (schedule_authoritative or "monthly_debt_payments" in confirmations)
+        )
         sources["dscr"] = _source(
             status="confirmed" if both_confirmed else "estimated",
-            source="confirmed_financial_profile" if both_confirmed else "financial_profile",
-            label="Confirmed calculation" if both_confirmed else "Estimated from financial profile",
+            source=(
+                "accepted_debt_schedule" if schedule_authoritative
+                else "confirmed_financial_profile" if both_confirmed else "financial_profile"
+            ),
+            label=(
+                "Saved debt schedule calculation" if schedule_authoritative
+                else "Confirmed calculation" if both_confirmed else "Estimated from financial profile"
+            ),
             evidence="Annual cash flow divided by twelve months of scheduled debt service.",
         )
     else:
@@ -180,6 +202,13 @@ def build(
             (dscr_metrics.get("draft"), "estimated", "identified_bank_activity", "Estimated from bank activity"),
             (dscr_metrics.get("cash_flow"), "estimated", "bank_cash_flow", "Cash-flow estimate"),
         )
+        if schedule_authoritative:
+            # An accepted zero-debt declaration has no DSCR denominator.  Old
+            # bank estimates must not resurrect a ratio or replace its zero.
+            candidates = (
+                ((dscr_metrics.get("current"), "verified", "accepted_debt_schedule", "Saved debt schedule calculation"),)
+                if monthly_debt is not None and monthly_debt > 0 else ()
+            )
         for raw, status, source, label in candidates:
             value = _number(raw)
             if value is not None:

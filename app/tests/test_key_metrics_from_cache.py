@@ -266,6 +266,50 @@ def test_dscr_does_not_mix_debt_for_other_entity_currency_or_period():
         assert km["estimated_debt_burden"] == 60_000
 
 
+def _accepted_schedule(monthly: float = 2000, **overrides: Any) -> dict:
+    return {"kind": "debt_schedule", "authoritative": True, "debt_service_for_dscr": monthly,
+            "source_file_id": "saved-pdf", "version_id": "accepted-v2", "key_facts": {},
+            "source": {"kind": "accepted_financial_version", "file_id": "saved-pdf", "version_id": "accepted-v2"},
+            **overrides}
+
+
+def test_accepted_schedule_overrides_ai_and_partial_other_family_with_pinned_source():
+    result = {"key_metrics": {"estimated_debt_burden": 999999, "estimated_dscr": 99, "dscr_basis": "model"}}
+    partial = _analysis("debt_schedule", {"total_monthly_debt_service": None, "debts": [{"lender": "New draft"}]}, "partial-pdf")
+    ai._compute_key_metrics_from_cache(result, [TAX, DEBTS, partial], accepted_debt_schedule=_accepted_schedule())
+    metrics = result["key_metrics"]
+    assert metrics["estimated_debt_burden"] == 24000
+    assert metrics["estimated_dscr"] == round(80000 / 24000, 2) and metrics["dscr_basis"] == "tax_return"
+    assert metrics["debt_service_citation"]["file_id"] == "saved-pdf"
+    assert metrics["debt_service_citation"]["version_id"] == "accepted-v2"
+
+
+def test_explicit_zero_accepted_debt_clears_stale_ai_dscr():
+    result = {"key_metrics": {"estimated_debt_burden": 60000, "estimated_dscr": 1.33, "dscr_basis": "tax_return"}}
+    ai._compute_key_metrics_from_cache(result, [TAX, DEBTS], accepted_debt_schedule=_accepted_schedule(0))
+    assert result["key_metrics"]["estimated_debt_burden"] == 0
+    assert result["key_metrics"]["estimated_dscr"] is None
+    assert "dscr_basis" not in result["key_metrics"]
+
+
+def test_accepted_schedule_uses_existing_typed_pl_ebitda_policy_without_matching_debt_dates():
+    result = {"key_metrics": {"estimated_dscr": 99}}
+    ai._compute_key_metrics_from_cache(result, [_typed_pl()], accepted_debt_schedule=_accepted_schedule())
+    assert result["key_metrics"]["estimated_dscr"] == round(140000 / 24000, 2)
+    assert result["key_metrics"]["dscr_basis"] == "profit_and_loss_ebitda"
+
+
+def test_accepted_debt_cannot_preserve_a_ratio_with_unknown_ebitda_or_known_scope_conflict():
+    missing_ebitda = _analysis("tax_return", {**TAX["key_facts"], "interest": None}, "t1")
+    for analyses, accepted in (([missing_ebitda], _accepted_schedule()),
+                               ([TAX], _accepted_schedule(business_name="Other LLC")),
+                               ([TAX], _accepted_schedule(currency="CAD"))):
+        result = {"key_metrics": {"estimated_dscr": 99}}
+        ai._compute_key_metrics_from_cache(result, analyses, accepted_debt_schedule=accepted)
+        assert result["key_metrics"]["estimated_debt_burden"] == 24000
+        assert result["key_metrics"]["estimated_dscr"] is None
+
+
 def test_tax_revenue_trend_requires_same_identity_currency_basis_and_cutoff():
     prior_facts = {**TAX["key_facts"], "tax_year": "2024", "period_start": "2024-01-01", "period_end": "2024-12-31", "gross_receipts": 600_000}
     prior = _analysis("tax_return", prior_facts, "t0")

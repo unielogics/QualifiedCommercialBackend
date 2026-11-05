@@ -2964,6 +2964,17 @@ async def _files_for_removal(db: AsyncSession, bucket_id: UUID, file_ids: list[U
     return list(rows.scalars().all())
 
 
+async def _retained_financial_version_files(db: AsyncSession, file_ids: list[UUID]) -> set[UUID]:
+    if not file_ids or not isinstance(getattr(db, "info", None), dict):
+        return set()
+    from app.models.financial_form_version import FinancialFormVersion
+
+    rows = (await db.execute(select(FinancialFormVersion.source_file_id, FinancialFormVersion.pdf_file_id).where(
+        (FinancialFormVersion.source_file_id.in_(file_ids)) | (FinancialFormVersion.pdf_file_id.in_(file_ids)),
+    ))).all()
+    return {file_id for row in rows for file_id in row if file_id in file_ids}
+
+
 async def _soft_delete_file(
     db: AsyncSession,
     bucket_id: UUID,
@@ -3027,6 +3038,9 @@ async def delete_admin_file(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
     if file.deleted_at is not None:
         return
+    if file.id in await _retained_financial_version_files(db, [file.id]):
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "Saved financial versions are kept in History. Correct the form and save a new version to update it.")
     if await retention_holds.is_effective_file_soft_deletion_prohibited(db, file):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -3059,6 +3073,7 @@ async def remove_admin_files(
     await _load_bucket_or_404(db, bucket_id)
     wanted = list(dict.fromkeys(payload.file_ids))
     by_id = {row.id: row for row in await _files_for_removal(db, bucket_id, wanted)}
+    retained_financial = await _retained_financial_version_files(db, wanted)
     now = _now()
     removed: list[UUID] = []
     blocked: list[BucketFileRemovalBlocked] = []
@@ -3068,6 +3083,10 @@ async def remove_admin_files(
         file = by_id.get(file_id)
         if file is None or file.deleted_at is not None:
             missing.append(file_id)
+            continue
+        if file_id in retained_financial:
+            blocked.append(BucketFileRemovalBlocked(file_id=file.id, file_name=file.file_name,
+                                                   reason="Saved financial versions are kept in History; save a corrected version instead."))
             continue
         if await retention_holds.is_effective_file_soft_deletion_prohibited(db, file):
             blocked.append(

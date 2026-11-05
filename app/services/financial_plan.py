@@ -207,7 +207,7 @@ def obligations(debt: dict[str, Any], recurring: dict[str, Any]) -> list[dict[st
     used: set[str] = set()
     out: list[dict[str, Any]] = []
     source = service.get("source") or "none"
-    rows_in_service = source in {"debt_schedule_rows", "debt_schedule_rows+bank_observed"}
+    rows_in_service = source in {"debt_schedule_rows", "debt_schedule_rows+bank_observed", "accepted_debt_schedule"}
     for row in rows:
         linked = None
         vendor_key = row.get("vendor_key")
@@ -249,6 +249,8 @@ def obligations(debt: dict[str, Any], recurring: dict[str, Any]) -> list[dict[st
                 "origin": row.get("origin"),
             }
         )
+    if service.get("schedule_authoritative"):
+        return out
     if source == "debt_schedule_document":
         # The schedule the client uploaded, read by the AI: its lines are the
         # obligations until the desk adopts them as rows or enters its own.

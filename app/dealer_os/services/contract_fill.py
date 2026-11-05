@@ -116,6 +116,15 @@ _PROGRAM_FOR_PURPOSE = {
 }
 
 
+def _application_dscr(profile: Any, financial_fallbacks: dict[str, Any]) -> float | None:
+    if financial_fallbacks.get("debt_schedule_authoritative"):
+        return financial_fallbacks.get("dscr")
+    if (profile and profile.annual_cash_flow_available_for_debt is not None
+            and profile.monthly_debt_payments and float(profile.monthly_debt_payments) > 0):
+        return float(profile.annual_cash_flow_available_for_debt) / (float(profile.monthly_debt_payments) * 12)
+    return financial_fallbacks.get("dscr")
+
+
 async def build_values(
     db: AsyncSession,
     dealer: DealerBusiness,
@@ -150,16 +159,7 @@ async def build_values(
         if profile and profile.annual_sales is not None
         else financial_fallbacks.get("annual_sales")
     )
-    dscr_value = financial_fallbacks.get("dscr")
-    if (
-        profile
-        and profile.annual_cash_flow_available_for_debt is not None
-        and profile.monthly_debt_payments
-        and float(profile.monthly_debt_payments) > 0
-    ):
-        dscr_value = float(profile.annual_cash_flow_available_for_debt) / (
-            float(profile.monthly_debt_payments) * 12
-        )
+    dscr_value = _application_dscr(profile, financial_fallbacks)
     full_addr = ", ".join(
         x for x in (dealer.address, dealer.city, f"{dealer.state or ''} {dealer.zip or ''}".strip()) if x
     )
