@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.routers.dealer_ai_intake as core
-from app.services import onboarding_consent
+from app.services import business_profile, onboarding_consent
 
 __all__ = [
     "claim_capital_readiness_diagnostic",
@@ -186,6 +186,7 @@ async def claim_capital_readiness_diagnostic(
         "privacy_version": payload.privacy_version,
     }
     state["capital_readiness_claim"] = {**state["capital_readiness_claim"], **onboarding_consent.choices_record(payload)}
+    state.update(business_profile.state_entry(payload))
     intake.intake_state = state
     intake.source_kind = "client_capital_readiness"
     intake.source_detail = "Consented Capital Readiness diagnostic"

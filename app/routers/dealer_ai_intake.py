@@ -129,6 +129,7 @@ from app.services import (
     booking_notify,
     booking_reminders,
     bucket_archive,  # noqa: F401  (handlers reach this through core)
+    business_profile,
     equipment_financing,
     file_events,  # noqa: F401  (handlers reach this through core)
     inline_images,  # noqa: F401  (handlers reach this through core)
@@ -158,6 +159,7 @@ from app.services.bucket_ai import (
     upload_link_visible_summary,
 )
 from app.services.bucket_requests import is_open_request
+from app.services.business_profile import BusinessProfileFields
 from app.services.dealer_ai_intelligence_pdf import (
     render_dealer_intelligence_pdf,  # noqa: F401  (handlers reach this through core)
 )
@@ -682,7 +684,7 @@ class CapitalReadinessDiagnostic(BaseModel):
     result: CapitalReadinessDiagnosticResult
 
 
-class CapitalReadinessClaimRequest(BaseModel):
+class CapitalReadinessClaimRequest(BusinessProfileFields):
     """Consent-bound handoff from the public diagnostic after authentication."""
 
     idempotency_key: UUID
@@ -709,7 +711,7 @@ class CapitalReadinessClaimResponse(BaseModel):
     readiness: CapitalReadinessRead
 
 
-class DealerIntakeStart(PublicIntakeAttribution):
+class DealerIntakeStart(PublicIntakeAttribution, BusinessProfileFields):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
     phone: RequiredPhone
@@ -732,7 +734,7 @@ class DealerIntakeStart(PublicIntakeAttribution):
         return None if value == "" else value
 
 
-class FundingReviewStart(PublicIntakeAttribution):
+class FundingReviewStart(PublicIntakeAttribution, BusinessProfileFields):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
     phone: RequiredPhone
@@ -975,11 +977,29 @@ class AdminLeadContactUpdate(BaseModel):
     referral_source: str | None = Field(default=None, max_length=180)
     # Program fit needs it and the client may not have said; the desk can.
     years_in_business: float | None = Field(default=None, ge=0, le=150)
+    # The desk's correction of what the client said they do and where it is online.
+    business_website: str | None = Field(default=None, max_length=255)
+    business_description: str | None = Field(default=None, max_length=1000)
 
     @field_validator("phone", "business_name", "loan_purpose", "referral_source", mode="before")
     @classmethod
     def blank_to_none(cls, value: object) -> object:
         return None if value == "" else value
+
+    @field_validator("business_website", mode="before")
+    @classmethod
+    def check_website(cls, value: object) -> object:
+        if value in (None, ""):
+            return value
+        business_profile.normalize_website(value)
+        return value
+
+    @field_validator("business_description", mode="before")
+    @classmethod
+    def check_description(cls, value: object) -> object:
+        if value in (None, ""):
+            return value
+        return business_profile.clean_description(value)
 
 
 class DealerLeadNoteCreate(BaseModel):
@@ -1534,6 +1554,19 @@ class PackageReadinessGenerationRead(BaseModel):
 YEARS_IN_BUSINESS_KEYS = ("years_in_business", "time_in_business_years", "business_age_years")
 
 
+def _business_profile(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    """What the client said the business is and where it is online, for the AI
+    to read and not ask again. Empty when the file predates the question."""
+    declared = business_profile.of_intake(intake)
+    if not (declared["website"] or declared["website_none"] or declared["description"]):
+        return {}
+    return {
+        "website": declared["website"],
+        "has_no_website": declared["website_none"],
+        "description": declared["description"],
+    }
+
+
 def _years_in_business(intake: PublicUnderwritingIntake) -> float | None:
     """How long the business has operated, from wherever the file learned it:
     the desk, the intake's declaration, the chat, or the review snapshot."""
@@ -1584,6 +1617,12 @@ class DealerIntakeRead(ORMModel):
     estimated_credit_score: int | None
     referral_source: str | None
     years_in_business: float | None = None
+    #: What the client said on the first screen (the desk's correction wins).
+    #: website_none is true when they answered N/A, so "has no website" reads
+    #: differently from a file that was never asked.
+    business_website: str | None = None
+    business_website_none: bool = False
+    business_description: str | None = None
     asset_rows: list[dict[str, Any]] | None
     intake_state: dict[str, Any] | None
     result_snapshot: dict[str, Any] | None
@@ -4024,6 +4063,7 @@ def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "requested_loan_amount": float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else None,
         "estimated_credit_score": intake.estimated_credit_score,
         "credit_pull": _credit_pull_state(intake) or None,
+        "business_profile": _business_profile(intake) or None,
         "business_name": intake.business_name,
         "referral_source": intake.referral_source,
         "entity_structure": _entity_structure(intake),
@@ -4168,6 +4208,7 @@ def _main_street_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         else None,
         "estimated_credit_score": intake.estimated_credit_score,
         "credit_pull": _credit_pull_state(intake) or None,
+        "business_profile": _business_profile(intake) or None,
         "business_name": intake.business_name,
         "referral_source": intake.referral_source,
         "entity_structure": _entity_structure(intake),
@@ -4303,6 +4344,7 @@ def _funding_review_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "requested_loan_amount": float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else basics.get("requested_amount"),
         "estimated_credit_tier": basics.get("estimated_credit_tier"),
         "credit_pull": _credit_pull_state(intake) or None,
+        "business_profile": _business_profile(intake) or None,
         "investor_name": intake.business_name,
         "target_property_address": basics.get("target_property_address"),
         "transaction_type": basics.get("transaction_type"),
@@ -7176,6 +7218,10 @@ async def _response(
     )
     intake_read = DealerIntakeRead.model_validate(intake)
     intake_read.years_in_business = _years_in_business(intake)
+    declared_business = business_profile.of_intake(intake)
+    intake_read.business_website = declared_business["website"]
+    intake_read.business_website_none = declared_business["website_none"]
+    intake_read.business_description = declared_business["description"]
     intake_read.bucket_name = intake.bucket.name
     # Redact internal-only data from the public/uploader payload. The dealer
     # sees only whitelisted intake_state keys and a sanitized review result.
@@ -9964,7 +10010,7 @@ async def _load_mca_intake_by_session(db: AsyncSession, request: Request) -> tup
     return intake, challenge, session_token
 
 
-class McaRefiStart(PublicIntakeAttribution):
+class McaRefiStart(PublicIntakeAttribution, BusinessProfileFields):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
     phone: RequiredPhone
@@ -10135,6 +10181,7 @@ def _mca_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "mca_terms_summary": state.get("mca_terms_summary"),
         "mca_refinance_policy": mca_refinance_policy.evaluate(intake, bucket=intake.bucket),
         "credit_pull": _credit_pull_state(intake) or None,
+        "business_profile": _business_profile(intake) or None,
         "checklist_status": checklist,
         "chat_facts": state.get("chat_facts") if isinstance(state.get("chat_facts"), list) else [],
         "baseline_document_policy": {

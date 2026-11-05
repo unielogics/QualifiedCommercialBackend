@@ -986,6 +986,21 @@ async def update_lead_contact(
         values_logged = ["years_in_business"]
     else:
         values_logged = []
+    business_keys = [key for key in ("business_website", "business_description") if key in values]
+    if business_keys:
+        # Not columns either: the desk's words sit in desk_facts and win on read,
+        # so correcting a website never rewrites what the client typed.
+        state = core._intake_state(intake)
+        facts = dict(state.get("desk_facts") or {})
+        if "business_website" in values:
+            website, none = core.business_profile.normalize_website(values.pop("business_website"))
+            facts["business_website"] = website
+            facts["business_website_none"] = none
+        if "business_description" in values:
+            facts["business_description"] = core.business_profile.clean_description(values.pop("business_description"))
+        state["desk_facts"] = facts
+        intake.intake_state = state
+        values_logged = [*values_logged, *business_keys]
     if "full_name" in values and values["full_name"] is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Principal name is required")
     if "email" in values and values["email"] is None:

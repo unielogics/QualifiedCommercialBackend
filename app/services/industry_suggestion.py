@@ -75,6 +75,16 @@ async def _activity_text(db: AsyncSession, profile: ApplicationProfile) -> str |
         value = row.normalized_value or (row.value.get("value") if isinstance(row.value, dict) else None)
         if value and str(value).strip():
             return str(value).strip()
+    # No document has described the business yet: use what the client said on
+    # the first screen. A document's reading is more precise, so it goes first.
+    if profile.intake_id:
+        from app.models.public_underwriting_intake import PublicUnderwritingIntake
+        from app.services import business_profile
+
+        intake = await db.get(PublicUnderwritingIntake, profile.intake_id)
+        described = business_profile.of_intake(intake)["description"] if intake is not None else None
+        if described:
+            return described
     return None
 
 

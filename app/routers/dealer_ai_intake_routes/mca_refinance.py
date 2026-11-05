@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.routers.dealer_ai_intake as core
-from app.services import onboarding_consent
+from app.services import business_profile, onboarding_consent
 
 __all__ = [
     "execute_public_intake_chat_action",
@@ -193,6 +193,7 @@ async def start_mca_refinance(
                 "requested_term_months": payload.requested_term_months,
             },
             **({"signup_attribution": attribution} if attribution else {}),
+            **business_profile.state_entry(payload),
             **({"mca_details": seeded} if seeded else {}),
             "legal_acceptance": {
                 "terms_accepted": payload.terms_accepted,

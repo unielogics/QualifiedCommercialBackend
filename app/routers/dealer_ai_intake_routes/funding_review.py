@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.routers.dealer_ai_intake as core
-from app.services import onboarding_consent
+from app.services import business_profile, onboarding_consent
 
 __all__ = [
     "start_funding_review",
@@ -116,6 +116,7 @@ async def start_funding_review(
                 else {}
             ),
             **({"signup_attribution": attribution} if attribution else {}),
+            **business_profile.state_entry(payload),
             "funding_review_basics": basics,
             "legal_acceptance": {
                 "terms_accepted": payload.terms_accepted,

@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 import app.routers.dealer_ai_intake as core
-from app.services import onboarding_consent
+from app.services import business_profile, onboarding_consent
 
 __all__ = [
     "start_dealer_intake",
@@ -117,6 +117,7 @@ async def start_dealer_intake(
             else {}
         ),
         **({"signup_attribution": attribution} if attribution else {}),
+        **business_profile.state_entry(payload),
         **({"funding_intent": payload.funding_intent} if payload.funding_intent else {}),
         **(
             {"main_street_details": {"intent": "equipment", "industry": "other"}}
