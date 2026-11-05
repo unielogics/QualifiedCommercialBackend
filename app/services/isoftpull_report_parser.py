@@ -218,6 +218,19 @@ def _parse_credit_scores(soup: BeautifulSoup) -> list[CreditScore]:
     if sec is None:
         return []
     scores: list[CreditScore] = []
+    # The current viewer uses score cards; older reports retain label/value rows.
+    cards = sec.select(".creditScoreCard")
+    if cards:
+        for card in cards:
+            model_node = card.select_one(".model")
+            score_node = card.select_one(".score")
+            if model_node is None:
+                continue
+            value = _normalize(score_node.get_text()) if score_node else ""
+            score = int(value) if value.isdigit() and 300 <= int(value) <= 850 else None
+            reasons = [_normalize(item.get_text()) for item in card.select(".reasonList li")]
+            scores.append(CreditScore(model=_normalize(model_node.get_text()), score=score, reason_codes=reasons))
+        return scores
     # Each score lives in its own ".div-row" block with two adjacent
     # label/value pairs (Score Model + Score) and an optional Reason Codes
     # block. Walk the div-row children in order.

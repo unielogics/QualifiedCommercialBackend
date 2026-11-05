@@ -45,7 +45,7 @@ async def import_existing_report(db, pull) -> dict:
     raw = dict(pull.bureau_response or {})
     parsed = stored_report(raw)
     source = "full_feed" if raw.get("full_feed") else "scraped"
-    if parsed is None:
+    if parsed is None or (not parsed.get("scores") and not raw.get("full_feed")):
         settings = get_settings()
         if not settings.isoftpull_login_email or not settings.isoftpull_login_password:
             raise ReportImportUnavailable(

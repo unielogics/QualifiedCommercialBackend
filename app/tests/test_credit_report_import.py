@@ -23,6 +23,27 @@ def test_fico_four_is_selected_from_html_and_legacy_saved_report():
     assert imports.stored_report({"parsed_report": legacy})["best_score"] == 661
 
 
+def test_current_score_cards_keep_model_score_and_reasons():
+    report = parse_report_html('''<div id="credit_score"><div class="creditScoreModels">
+      <div class="creditScoreCard"><div class="creditScoreCardHead">
+        <span class="model">FICO 4</span><span class="scoreWrap">
+          <span class="score fair">661</span><span class="scoreBand fair">Fair</span>
+        </span></div><div class="creditScoreCardBody">
+          <ul class="reasonList"><li>Example bureau reason</li></ul>
+        </div></div></div></div>''')
+    assert report.best_score == report.fico_4 == 661
+    assert report.best_score_model == "fico_4"
+    assert report.scores[0].reason_codes == ["Example bureau reason"]
+
+
+def test_current_score_cards_never_use_a_band_as_the_score():
+    report = parse_report_html('''<div id="credit_score"><div class="creditScoreCard">
+      <span class="model">FICO 4</span><span class="scoreBand">661</span>
+    </div></div>''')
+    assert report.best_score is None
+    assert report.scores[0].score is None
+
+
 def test_full_feed_import_includes_scores_and_report_sections():
     report = parse_full_feed({"full_feed": {
         "credit_score": {"fico_4": {"score": "661"}, "fico_8": {"score": "NA"}},
@@ -71,6 +92,25 @@ async def test_missing_credentials_preserves_the_existing_pull(monkeypatch):
     with pytest.raises(imports.ReportImportUnavailable, match="No new credit pull"):
         await imports.import_existing_report(SimpleNamespace(), pull)
     assert pull.fico is None
+
+
+async def test_incomplete_saved_parse_can_be_reimported(monkeypatch):
+    from app.services import isoftpull_report_parser
+
+    monkeypatch.setattr("app.config.get_settings", lambda: SimpleNamespace(isoftpull_login_email="reader", isoftpull_login_password="configured"))
+    report = parse_full_feed({"full_feed": {"credit_score": {"fico_4": {"score": 661}}}})
+    fetch = AsyncMock(return_value=(report, None))
+    monkeypatch.setattr(isoftpull_report_parser, "fetch_report", fetch)
+    pull = SimpleNamespace(id=uuid4(), client_id=uuid4(), fico=None, notes=None,
+        pulled_at=datetime(2026, 11, 3, tzinfo=UTC), expires_at=None,
+        bureau_response={"parsed_report": {"scores": [], "trade_accounts": [{"fields": {"company": "Example"}}]},
+            "reports": {"transunion": {"status": "success", "link": "https://app.isoftpull.com/report/example"}}})
+    rows = Mock()
+    rows.all.return_value = []
+    db = SimpleNamespace(flush=AsyncMock(), scalars=AsyncMock(return_value=rows), scalar=AsyncMock(return_value=None))
+    await imports.import_existing_report(db, pull)
+    assert pull.fico == 661
+    fetch.assert_awaited_once_with("https://app.isoftpull.com/report/example", raise_access_errors=True)
 
 
 async def test_borrower_cannot_import_report_before_profile_lookup():
