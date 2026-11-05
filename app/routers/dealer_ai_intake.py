@@ -546,6 +546,15 @@ async def _guard_arf_attribution(db: AsyncSession, payload: BaseModel) -> None:
 
 
 class PublicIntakeAttribution(BaseModel):
+    entry_url: str | None = Field(default=None, max_length=2048)
+
+    @field_validator("entry_url", mode="before")
+    @classmethod
+    def safe_entry_url(cls, value: object) -> str | None:
+        from app.services.intake_source import safe_source_url
+
+        return safe_source_url(value)
+
     source: str | None = Field(default=None, max_length=64)
     page: str | None = Field(default=None, max_length=300)
     program: str | None = Field(default=None, max_length=120)
@@ -769,6 +778,7 @@ def _public_intake_attribution(
         for key, value in payload.model_dump(
             include={
                 "source",
+                "entry_url",
                 "page",
                 "program",
                 "vertical",
@@ -1713,6 +1723,7 @@ async def _secure_room_handoff(
 
 
 class DealerIntakeResponse(BaseModel):
+    application_source: dict[str, Any] | None = None
     intake: DealerIntakeRead
     mca_refinance_policy: dict[str, Any] | None = None
     communication_locale: Literal["en", "es"] = "en"
@@ -7251,7 +7262,10 @@ async def _response(
     current_requested_documents = await locked_file_requests.current_public_request_documents(
         db, list(intake.bucket.requested_documents)
     )
+    from app.services.intake_source import source_for_intake
+
     return DealerIntakeResponse(
+        application_source=source_for_intake(intake) if include_management or admin_thread else None,
         intake=intake_read,
         mca_refinance_policy=mca_policy,
         communication_locale=(
