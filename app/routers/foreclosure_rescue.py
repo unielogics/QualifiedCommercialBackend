@@ -35,7 +35,6 @@ from app.routers.buckets import _generate_passcode
 from app.routers.dealer_ai_intake import _hash_token, _new_public_token, _record_resume_email
 from app.services import business_profile, intake_retention, onboarding_consent
 from app.services import clerk as clerk_service
-from app.services import intake_retention
 from app.services.foreclosure_rescue import (
     AMORTIZATION_MONTHS,
     CLOSING_DOCUMENTS,
