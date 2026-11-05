@@ -28,3 +28,16 @@ def test_other_documents_and_missing_bank_facts_are_not_reinterpreted():
     inputs = [{"classification": "other", "key_facts": {"transactions": [{"value": 1}]}},
               {"classification": "bank_statement", "key_facts": None}]
     assert summary_analyses(inputs) == inputs
+
+
+def test_deterministic_export_is_compacted_even_when_its_document_classification_is_preserved():
+    inputs = [{"ai_classification": "debt_schedule", "key_facts": {
+        "source": "transactions_export", "transactions": [{"amount": 100}] * 2000,
+        "debts": [{"lender": "Bank"}], "total_deposits_and_credits": 100,
+    }}]
+    output = summary_analyses(inputs)
+    assert "transactions" not in output[0]["key_facts"]
+    assert output[0]["ai_classification"] == "debt_schedule"
+    assert output[0]["key_facts"]["debts"] == [{"lender": "Bank"}]
+    assert output[0]["key_facts"]["total_deposits_and_credits"] == 100
+    assert len(inputs[0]["key_facts"]["transactions"]) == 2000

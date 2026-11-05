@@ -16,7 +16,10 @@ def summary_analyses(analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for item in analyses:
         classes = {item.get("ai_classification"), item.get("classification"),
                    *(item.get("classifications") or [])}
-        if "bank_statement" not in classes or not isinstance(item.get("key_facts"), dict):
+        source_facts = item.get("key_facts")
+        if not isinstance(source_facts, dict) or (
+            "bank_statement" not in classes and source_facts.get("source") != "transactions_export"
+        ):
             result.append(item)
             continue
         removed = 0
