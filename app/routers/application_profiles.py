@@ -3626,7 +3626,7 @@ async def _application_room_state(
             else None
         ),
         capabilities=["documents", "ownership", "owner_credit", "business_banking", "agreements"],
-        owners=[profiles.owner_read(owner) for owner in owner_rows],
+        owners=[profiles.owner_read(owner, include_credit_risk=False) for owner in owner_rows],
         verification=verification,
         precall=room_precall,
         banking=banking,
@@ -3726,7 +3726,7 @@ async def public_application_room_create_owner(
     )
     await db.commit()
     await db.refresh(row)
-    return profiles.owner_read(row)
+    return profiles.owner_read(row, include_credit_risk=False)
 
 
 @router.patch("/public/room/{token}/owners/{owner_id}", response_model=FileOwnerRead)
@@ -3753,7 +3753,7 @@ async def public_application_room_update_owner(
     )
     await db.commit()
     await db.refresh(owner)
-    return profiles.owner_read(owner)
+    return profiles.owner_read(owner, include_credit_risk=False)
 
 
 @router.delete("/public/room/{token}/owners/{owner_id}", status_code=status.HTTP_204_NO_CONTENT)

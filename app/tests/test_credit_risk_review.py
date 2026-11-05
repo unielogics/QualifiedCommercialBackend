@@ -63,3 +63,15 @@ def test_high_utilization_is_explicitly_advisory():
 def test_unavailable_report_is_limited_not_a_clean_bill_of_health():
     result = analyze_report({})
     assert result["level"] == "limited" and result["limitations"]
+
+
+def test_borrower_projection_excludes_staff_risk_findings():
+    from uuid import uuid4
+
+    from app.models.application_profile import ApplicationOwner
+    from app.services.application_profiles import owner_read
+
+    owner = ApplicationOwner(id=uuid4(), profile_id=uuid4(), first_name="Example", last_name="Owner", ownership_pct=100, backfill_needs_review=False,
+        credit_summary={"credit_risk": {"flag_count": 1, "flags": [{"title": "Staff review"}]}})
+    assert owner_read(owner).credit_risk["flag_count"] == 1
+    assert owner_read(owner, include_credit_risk=False).credit_risk is None

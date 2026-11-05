@@ -1182,7 +1182,7 @@ async def resolve_profile(
     return profile
 
 
-def owner_read(owner: ApplicationOwner | DealerOwner) -> FileOwnerRead:
+def owner_read(owner: ApplicationOwner | DealerOwner, *, include_credit_risk: bool = True) -> FileOwnerRead:
     summary = getattr(owner, "credit_summary", None)
     summary = summary if isinstance(summary, dict) else {}
     attention = summary.get("attention")
@@ -1217,7 +1217,7 @@ def owner_read(owner: ApplicationOwner | DealerOwner) -> FileOwnerRead:
         credit_score_verified=bool(summary.get("score_verified")),
         credit_report_available=bool(summary.get("report_available")),
         credit_report_import_status=summary.get("report_import_status"),
-        credit_risk=summary.get("credit_risk"),
+        credit_risk=summary.get("credit_risk") if include_credit_risk else None,
         credit_link_how=summary.get("linked_how"),
         credit_attention=attention,
         credit_expires_at=summary.get("expires_at"),
