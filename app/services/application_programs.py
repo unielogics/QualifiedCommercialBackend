@@ -284,6 +284,33 @@ def _is_lending_applicable(context: dict[str, Any]) -> bool:
     return context.get("intent_kind") not in {"non_lending", "route_out"}
 
 
+#: The analysis provider that marks a PDF as one we drew from typed answers
+#: (`drafted_forms.DRAFTED_FORM_PROVIDER`; a test holds the two together).
+_DRAFTED_FORM_PROVIDER = "drafted_form"
+
+#: What a drafted form's analysis calls the form, as the dashboard names it.
+_FORM_KIND_BY_CLASSIFICATION = {
+    "personal_financial_statement": "pfs",
+    "debt_schedule": "debt_schedule",
+    "current_p_and_l": "p_and_l",
+    "balance_sheet": "balance_sheet",
+}
+
+
+def evidence_origin(file: BucketFile, analysis: BucketFileAnalysis | None) -> tuple[str, str | None]:
+    """Whether a file is a document somebody sent or a form somebody filled in.
+
+    The desk reads these differently: an upload is judged by the AI's reading
+    of the pages, while a filled form carries answers that can be read back
+    directly, and the PDF is only our rendering of them.
+    """
+    if getattr(analysis, "provider", None) == _DRAFTED_FORM_PROVIDER:
+        return "filled_form", _FORM_KIND_BY_CLASSIFICATION.get(getattr(analysis, "classification", None) or "")
+    if getattr(file, "source_kind", None) == "generated" and getattr(file, "source_detail", None) == "signed_document":
+        return "signed", None
+    return "uploaded", None
+
+
 async def _evidence_inventory(
     db: AsyncSession, profile: ApplicationProfile
 ) -> tuple[list[BucketFile], dict[uuid.UUID, BucketFileAnalysis], set[str]]:
@@ -3561,6 +3588,7 @@ async def get_program_readiness(
         if definition is not None:
             _complete, contribution = _coverage_for_files(definition, [file], available_analyses, counted_accounts=_counted_bank_accounts(profile))
         inferred_decision = "accepted" if link.verified_at else "processing"
+        origin, form_kind = evidence_origin(file, available_analyses.get(file.id))
         return ApplicationRequirementEvidenceRead(
             file_id=file.id,
             file_name=file.file_name,
@@ -3592,6 +3620,8 @@ async def get_program_readiness(
                     unlocked_copy_requests.get(file.id),
                 )
             ),
+            origin=origin,
+            form_kind=form_kind,
         )
 
     bank_state = next(

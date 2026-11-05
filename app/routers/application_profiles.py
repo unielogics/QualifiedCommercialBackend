@@ -180,6 +180,7 @@ from app.schemas.financial_cockpit import (
     FinancialPlanWrite,
     StatementRereadResult,
 )
+from app.schemas.form_answers import FormAnswerFile, FormAnswersRead
 from app.schemas.retention import LegalHoldChange, RetentionStatusRead
 from app.schemas.use_of_funds import (
     UseOfFundsPatch,
@@ -202,6 +203,7 @@ from app.services import (
     file_events,
     financial_cockpit,
     financial_statements,
+    form_answers,
     funding_programs,
     intake_lifecycle,
     intake_retention,
@@ -6970,6 +6972,145 @@ async def read_business_statement_body(
         "status": statement.status if statement else None,
         "statement_id": statement.id if statement else None,
     }
+
+
+async def _form_answer_files(
+    db: AsyncSession,
+    slot: BucketRequestedDocument | None,
+    *,
+    extra_file_id: UUID | None = None,
+) -> list[FormAnswerFile]:
+    """The documents behind a form: what was uploaded to its slot, and the PDF we
+    drew when it was filled in. Each says which of the two it is."""
+    conditions = []
+    if slot is not None:
+        conditions.append(BucketFile.requested_document_id == slot.id)
+    if extra_file_id is not None:
+        conditions.append(BucketFile.id == extra_file_id)
+    if not conditions:
+        return []
+    files = list(
+        (
+            await db.execute(
+                select(BucketFile)
+                .where(or_(*conditions), BucketFile.deleted_at.is_(None), BucketFile.status == "uploaded")
+                .order_by(BucketFile.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not files:
+        return []
+    analyses = (
+        (
+            await db.execute(
+                select(BucketFileAnalysis)
+                .where(BucketFileAnalysis.bucket_file_id.in_([file.id for file in files]), BucketFileAnalysis.status != "pending")
+                .order_by(BucketFileAnalysis.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    provider_by_file: dict[UUID, str | None] = {}
+    for row in analyses:
+        provider_by_file.setdefault(row.bucket_file_id, row.provider)
+    return [
+        FormAnswerFile(
+            file_id=file.id,
+            file_name=file.file_name,
+            created_at=file.created_at,
+            origin="filled_form" if provider_by_file.get(file.id) == drafted_forms.DRAFTED_FORM_PROVIDER else "uploaded",
+        )
+        for file in files
+    ]
+
+
+@router.get("/{profile_id}/financial-forms/{kind}/answers", response_model=FormAnswersRead)
+async def financial_form_answers(
+    profile_id: UUID,
+    kind: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FormAnswersRead:
+    """What was put on a form, in short: the headline figures, only the lines
+    that were answered, and the file behind it.
+
+    A filled form is read from what we hold. An upload is read from what the AI
+    took off it, and says so, because a typed figure and a scanned one carry
+    different weight. Staff only, like every other route on these forms.
+    """
+    if kind not in form_answers.FORM_LABELS:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    slot = await _requested_slot(db, profile, kind)
+    uploaded = slot is not None and slot.status == "uploaded"
+    stored_file_id: UUID | None = None
+
+    if kind == "pfs":
+        statement = await financial_statements.latest_for_profile(db, profile.id)
+        stored_file_id = statement.bucket_file_id if statement else None
+        if statement is not None and statement.status == "submitted":
+            answers = form_answers.pfs_answers_from_statement(statement)
+        elif uploaded:
+            analyses, _pending = await _slot_analyses(db, slot)
+            answers = form_answers.pfs_answers_from_uploads(_extract_pfs(analyses))
+        elif statement is not None:
+            answers = form_answers.pfs_answers_from_statement(statement)
+        else:
+            answers = form_answers.empty_answers("pfs", "Nothing has been filled in or uploaded yet.")
+    elif kind == "debt_schedule":
+        from app.dealer_os.models import DealerDebt
+
+        rows = list(
+            (
+                await db.execute(
+                    select(DealerDebt)
+                    .where(DealerDebt.profile_id == profile.id, DealerDebt.status == "active")
+                    .order_by(DealerDebt.created_at.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if rows:
+            answers = form_answers.debt_answers_from_rows(rows)
+        elif uploaded:
+            analyses, _pending = await _slot_analyses(db, slot)
+            answers = form_answers.debt_answers_from_upload(_extract_debts(analyses))
+        else:
+            answers = form_answers.empty_answers("debt_schedule", "Nothing has been filled in or uploaded yet.")
+    else:
+        statement = await business_statements.latest_for_profile(db, profile.id, kind)
+        stored_file_id = statement.bucket_file_id if statement is not None and getattr(statement, "bucket_file_id", None) else None
+        if statement is not None and statement.status == "submitted":
+            answers = form_answers.business_answers_from_statement(kind, statement)
+        elif uploaded:
+            analyses, _pending = await _slot_analyses(db, slot)
+            wanted = business_statement_schema.SCHEMA_FOR[kind].classification
+            facts = next((item.get("key_facts") for item in analyses if item.get("classification") == wanted), None)
+            answers = form_answers.business_answers_from_upload(kind, facts)
+        elif statement is not None:
+            answers = form_answers.business_answers_from_statement(kind, statement)
+        else:
+            answers = form_answers.empty_answers(kind, "Nothing has been filled in or uploaded yet.")
+
+    answers["files"] = await _form_answer_files(db, slot, extra_file_id=stored_file_id)
+    return FormAnswersRead(**answers)
+
+
+def _extract_pfs(analyses: list[dict]) -> list[dict]:
+    from app.services.public_underwriting_packet_pdf import extract_personal_financial_statements
+
+    return extract_personal_financial_statements(analyses)
+
+
+def _extract_debts(analyses: list[dict]) -> dict | None:
+    from app.services.public_underwriting_packet_pdf import extract_debt_schedule
+
+    return extract_debt_schedule(analyses)
 
 
 @router.put("/{profile_id}/financial-forms/{kind}")

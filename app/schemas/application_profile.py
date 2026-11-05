@@ -208,6 +208,11 @@ class ApplicationRequirementEvidenceRead(BaseModel):
     evidence_claims: list[dict] = Field(default_factory=list)
     is_password_protected: bool = False
     unlocked_copy_request: UnlockedCopyRequestStateRead | None = None
+    #: Where the file came from: a document somebody uploaded, a form somebody
+    #: typed (the PDF is ours), or a certificate we generated when they signed.
+    origin: Literal["uploaded", "filled_form", "signed"] = "uploaded"
+    #: For a filled form, which one: pfs, debt_schedule, p_and_l, balance_sheet.
+    form_kind: str | None = None
 
 
 class ApplicationEvidenceOptionRead(BaseModel):
