@@ -85,6 +85,8 @@ async def test_import_updates_linked_owners_without_another_bureau_pull(monkeypa
     assert parsed["best_score"] == pull.fico == owner.credit_score == client.fico == 661
     assert owner.credit_summary["linked_how"] == "manual"
     assert owner.credit_summary["score_verified"]
+    assert owner.credit_summary["credit_risk"]["version"] == 1
+    assert imports.stored_report(pull.bureau_response)["intelligence"] == parsed["intelligence"]
     assert intake.intake_state["credit_pull"]["fico"] == 661
     assert intake.intake_state["credit_pull"]["fico_source"] == "full_feed:fico_4"
     assert intake.intake_state["credit_pull"]["attempted_at"] == "original"

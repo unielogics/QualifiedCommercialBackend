@@ -24,7 +24,11 @@ class ReportImportUnavailable(Exception):
 def stored_report(raw: dict) -> dict | None:
     report = isoftpull_report_parser.parse_full_feed(raw)
     if report is not None:
-        return report.to_dict()
+        parsed = report.to_dict()
+        saved = raw.get("parsed_report")
+        if isinstance(saved, dict) and isinstance(saved.get("intelligence"), dict):
+            parsed["intelligence"] = saved["intelligence"]
+        return parsed
     saved = raw.get("parsed_report")
     if not isinstance(saved, dict) or not saved:
         return None
