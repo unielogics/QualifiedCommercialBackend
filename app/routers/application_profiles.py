@@ -187,6 +187,7 @@ from app.schemas.financial_cockpit import (
     StatementRereadResult,
 )
 from app.schemas.form_answers import FormAnswerFile, FormAnswersRead
+from app.schemas.requirement_library import RequirementAddWrite, RequirementLibraryRead
 from app.schemas.retention import LegalHoldChange, RetentionStatusRead
 from app.schemas.use_of_funds import (
     UseOfFundsPatch,
@@ -7967,3 +7968,180 @@ async def email_financial_form_link(
     )
     await db.commit()
     return _room_delivery_read(delivery)
+
+
+# ---------------------------------------------------------------------------
+# Requirements the desk adds to one file from the library.
+# (app/services/requirement_library.py)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{profile_id}/requirement-library", response_model=RequirementLibraryRead)
+async def get_requirement_library(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RequirementLibraryRead:
+    """Every document and form the desk can add to this file, one per key."""
+    from app.models.application_profile import ApplicationRequirementState
+    from app.schemas.requirement_library import LibraryCategoryRead, LibraryItemRead
+    from app.services import requirement_library as library
+
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    candidates = await library.library_candidates(db)
+    states = (
+        await db.execute(
+            select(ApplicationRequirementState).where(ApplicationRequirementState.profile_id == profile.id)
+        )
+    ).scalars().all()
+    on_file = {
+        state.requirement_key
+        for state in states
+        if not (state.provenance or {}).get("inactive_definition")
+    }
+    added = {entry["key"] for entry in library.clean_entries(profile.extra_requirements)}
+    items = [
+        LibraryItemRead(
+            key=item.key,
+            label=item.label,
+            category=item.category,
+            category_label=library.category_label(item.category),
+            kind=item.kind,
+            required_level=item.required_level,
+            description=item.description,
+            form_kind=item.form_kinds[0] if item.form_kinds else None,
+            form_kinds=list(item.form_kinds),
+            client_visible=item.client_visible,
+            verification_required=item.verification_required,
+            source=item.source,
+            on_file=item.key in on_file or item.key in added,
+            added=item.key in added,
+            source_requirement_id=item.requirement_id,
+        )
+        for item in candidates
+    ]
+    categories = [
+        LibraryCategoryRead(key=key, label=library.category_label(key))
+        for key in dict.fromkeys(item.category for item in candidates)
+    ]
+    return RequirementLibraryRead(profile_id=profile.id, items=items, categories=categories)
+
+
+@router.post("/{profile_id}/requirements", response_model=ApplicationProgramReadiness)
+async def add_application_requirement(
+    profile_id: UUID,
+    payload: RequirementAddWrite,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationProgramReadiness:
+    """Add one library requirement (or a custom one) to this file's checklist.
+
+    Idempotent for a key already added; 409 for a key the file already requires
+    through its policy or a selected program. Returns the refreshed readiness.
+    """
+    from app.services import requirement_library as library
+
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    before = await application_programs.get_program_readiness(db, profile)
+    on_file = {
+        item.requirement_key: {
+            "program_keys": list(item.source_program_keys or []),
+            "policy_keys": list(item.source_policy_keys or []),
+        }
+        for item in before.requirements
+    }
+    plan = await library.plan_add(
+        db,
+        profile,
+        requirement_key=payload.requirement_key,
+        custom=payload.custom.model_dump() if payload.custom else None,
+        required_level=payload.required_level,
+        note=payload.note,
+        user_id=user.id,
+        on_file=on_file,
+        user_name=(user.name or user.email),
+    )
+    if plan.already:
+        await db.commit()
+        return before
+    profile.extra_requirements = library.with_entry(profile, plan.entry)
+    await db.flush()
+    readiness = await application_programs.get_program_readiness(db, profile)
+    label = next(
+        (item.label for item in readiness.requirements if item.requirement_key == plan.entry["key"]), plan.label
+    )
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "requirement.added",
+        f"Added {label} to the checklist",
+        target_type="application_requirement",
+        target_id=profile.id,
+        metadata={
+            "requirement_key": plan.entry["key"],
+            "required_level": plan.entry["required_level"],
+            "custom": plan.entry["custom"],
+            "note": plan.entry.get("note"),
+        },
+    )
+    await file_events.emit(
+        db,
+        profile=profile,
+        kind="requirement.added",
+        visibility=file_events.VISIBILITY_TEAM,
+        title=f"Added {label} to the checklist",
+        actor=user,
+        target_type="application_requirement",
+        target_id=profile.id,
+        meta={"requirement_key": plan.entry["key"]},
+    )
+    await db.commit()
+    return readiness
+
+
+@router.delete("/{profile_id}/requirements/{requirement_key}/added", response_model=ApplicationProgramReadiness)
+async def remove_added_application_requirement(
+    profile_id: UUID,
+    requirement_key: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationProgramReadiness:
+    """Take a requirement the desk added off this file. 404 for anything the
+    desk did not add: a program's or the policy's requirement is waived or set
+    aside instead, never removed."""
+    from app.services import requirement_library as library
+
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    entry = library.find_entry(profile, requirement_key)
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That requirement was not added to this file")
+    profile.extra_requirements = library.without_entry(profile, requirement_key)
+    await db.flush()
+    readiness = await application_programs.get_program_readiness(db, profile)
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "requirement.removed",
+        f"Took {requirement_key} off the checklist",
+        target_type="application_requirement",
+        target_id=profile.id,
+        metadata={"requirement_key": requirement_key},
+    )
+    await file_events.emit(
+        db,
+        profile=profile,
+        kind="requirement.removed",
+        visibility=file_events.VISIBILITY_TEAM,
+        title=f"Took {requirement_key.replace('_', ' ')} off the checklist",
+        actor=user,
+        target_type="application_requirement",
+        target_id=profile.id,
+        meta={"requirement_key": requirement_key},
+    )
+    await db.commit()
+    return readiness

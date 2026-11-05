@@ -69,6 +69,7 @@ from app.services import (
     locked_file_requests,
     mca_refinance_policy,
     provenance,
+    requirement_library,
 )
 from app.services import funding_programs as program_catalog
 from app.services.activity_log import log_activity
@@ -110,6 +111,7 @@ EXPECTED_CLASSIFICATIONS: dict[str, set[str]] = {
     "business_bank_statements_6_months": {"bank_statement"},
     "business_tax_returns_2_years": {"tax_return"},
     "ytd_p_and_l_balance_sheet": {"current_p_and_l", "profit_and_loss", "balance_sheet"},
+    "ytd_profit_and_loss": {"current_p_and_l", "profit_and_loss"},
     "business_debt_schedule": {"debt_schedule"},
     "owner_personal_financial_statement": {"personal_financial_statement"},
     "real_estate_schedule": {"real_estate_schedule"},
@@ -2822,6 +2824,7 @@ async def _materialize_requirements(
     grouped: dict[uuid.UUID, list[AICollectionRequirement]],
     policies: list[ApplicationEvidencePolicySelection],
     grouped_policies: dict[uuid.UUID, list[AICollectionRequirement]],
+    extra_requirements: list[requirement_library.ExtraDefinition] | None = None,
 ) -> tuple[list[ApplicationRequirementState], dict[uuid.UUID, list[str]]]:
     from app.services import collection_tasks
 
@@ -2838,6 +2841,11 @@ async def _materialize_requirements(
     criteria_versions = {
         item.playbook_id: item.playbook_version for item in [*selections, *policies]
     }
+    # Requirements the desk added to this file keep the version of the playbook
+    # they were copied from; a program's own pinned version wins a shared playbook.
+    for extra in extra_requirements or []:
+        criteria_versions.setdefault(extra.requirement.playbook_id, extra.version)
+    extra_by_key = {extra.requirement.requirement_key: extra for extra in extra_requirements or []}
     existing = {
         item.requirement_key: item
         for item in (
@@ -2890,6 +2898,11 @@ async def _materialize_requirements(
     for policy in policies:
         for requirement in grouped_policies.get(policy.playbook_id, []):
             merge_requirement(requirement, policy_key=policy.policy_key)
+    # Requirements the desk added behave like the initial checklist, but a key a
+    # program or the policy already requires keeps that definition.
+    for extra in extra_requirements or []:
+        if extra.requirement.requirement_key not in merged:
+            merge_requirement(extra.requirement, policy_key=requirement_library.STAFF_POLICY_KEY)
 
     # Lender checklist definitions use the same evidence engine as program
     # requirements, but remain independently versioned by their offering.
@@ -2974,6 +2987,15 @@ async def _materialize_requirements(
         definition_metadata = collection_tasks.definition_metadata(
             requirement, version=criteria_versions.get(requirement.playbook_id, 1)
         )
+        staff_added = extra_by_key.get(key)
+        if staff_added is not None and requirement_library.STAFF_POLICY_KEY in source_policies:
+            definition_metadata = {
+                **definition_metadata,
+                "staff_added": requirement_library.provenance_note(
+                    staff_added.entry,
+                    requirement_library.form_kinds_for(key, getattr(requirement, "canonical_key", None)),
+                ),
+            }
         if (state.provenance or {}).get("source_kind") == "lender":
             definition_metadata = {**definition_metadata, **{
                 name: (state.provenance or {}).get(name)
@@ -3423,6 +3445,9 @@ async def get_program_readiness(
     grouped = await _selection_requirements(db, selections, context)
     policies = await ensure_evidence_policy(db, profile) if lending_applicable else []
     grouped_policies = await _policy_requirements(db, policies, context)
+    extra_requirements = (
+        await requirement_library.extra_definitions(db, profile) if lending_applicable else []
+    )
     states, per_selection = await _materialize_requirements(
         db,
         profile,
@@ -3430,6 +3455,7 @@ async def get_program_readiness(
         grouped,
         policies,
         grouped_policies,
+        extra_requirements=extra_requirements,
     )
     overrides = await _active_overrides(db, selections)
     requirement_map = {item.requirement_key: item for item in states}
@@ -3443,6 +3469,10 @@ async def get_program_readiness(
             can_waive[row.requirement_key] = (
                 can_waive.get(row.requirement_key, False) or row.can_underwriter_waive
             )
+    for extra in extra_requirements:
+        key = extra.requirement.requirement_key
+        visibility[key] = visibility.get(key, False) or _client_visible(extra.requirement)
+        can_waive[key] = can_waive.get(key, False) or bool(extra.requirement.can_underwriter_waive)
     for state in states:
         visibility.setdefault(state.requirement_key, bool((state.provenance or {}).get("client_visible")))
         can_waive.setdefault(state.requirement_key, False)
