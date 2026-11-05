@@ -3,6 +3,20 @@
 The owner credit step links a completed pull and imports its existing report.
 It must not initiate a new inquiry to recover a missing local score.
 
+## Automatic Operation
+
+Manual linking, automatic matches, sweeps, and signed authorizations all import
+through the shared linking flow. Dealer-owner pulls use the same report importer.
+No individual client or report ID is hardcoded in the workflow.
+
+A separate scheduler job runs every five minutes in both manual and automatic
+matching modes. It backfills existing linked reports and retries provider failures
+in batches of 20, with per-report delays increasing from five minutes to one hour.
+Only completed pulls still linked to an owner or file credit record are eligible; it never creates a
+new inquiry. A service-account login/terms block stops the current batch.
+The UI automatically refreshes pending report imports and shows provider failures
+without clearing the association, original pull date, or a known real score.
+
 ## Data Sources
 
 - Full Feed JSON, when supplied by the provider, is mapped to the native report viewer.
@@ -10,6 +24,7 @@ It must not initiate a new inquiry to recover a missing local score.
 - The report's parsed fields are stored on the pull; original HTML is archived using the existing KMS-encrypted report archive.
 - FICO 8, FICO 4, FICO 2, and Vantage 4 are supported headline models. An intelligence-check proxy is never presented as a verified bureau score.
 - Imported scores synchronize to every owner already linked to that pull. The latest pull updates its own subject's client record, never an email-matched client.
+- File credit snapshots referencing that exact pull are refreshed too, preserving unrelated intake data.
 
 ## Configuration
 

@@ -89,9 +89,13 @@ def quiet(monkeypatch):
 
     record = AsyncMock()
     progress = AsyncMock()
+    from app.services import credit_report_import
+
+    import_report = AsyncMock(return_value=None)
+    monkeypatch.setattr(credit_report_import, "ensure_report_imported", import_report)
     monkeypatch.setattr(credit_links, "_record", record)
     monkeypatch.setattr(credit_links, "_progress", progress)
-    return SimpleNamespace(record=record, progress=progress)
+    return SimpleNamespace(record=record, progress=progress, import_report=import_report)
 
 
 # --- words and evidence ---------------------------------------------------------

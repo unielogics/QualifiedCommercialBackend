@@ -73,15 +73,25 @@ async def test_import_updates_linked_owners_without_another_bureau_pull(monkeypa
         pulled_at=datetime(2026, 11, 3, tzinfo=UTC), expires_at=None,
         bureau_response={"full_feed": {"credit_score": {"fico_4": {"score": 661}}}})
     owner = SimpleNamespace(credit_score=None, credit_tier=None, credit_summary={"linked_how": "manual"})
+    intake = SimpleNamespace(intake_state={"other": "preserved", "credit_pull": {"pull_id": str(pull.id), "fico": None, "attempted_at": "original"}})
     client = SimpleNamespace(fico=None)
     rows = Mock()
     rows.all.return_value = [owner]
-    db = SimpleNamespace(flush=AsyncMock(), scalars=AsyncMock(return_value=rows),
+    intakes = Mock()
+    intakes.all.return_value = [intake]
+    db = SimpleNamespace(flush=AsyncMock(), scalars=AsyncMock(side_effect=[rows, rows, intakes]),
         scalar=AsyncMock(return_value=pull.id), get=AsyncMock(return_value=client))
     parsed = await imports.import_existing_report(db, pull)
     assert parsed["best_score"] == pull.fico == owner.credit_score == client.fico == 661
     assert owner.credit_summary["linked_how"] == "manual"
     assert owner.credit_summary["score_verified"]
+    assert intake.intake_state["credit_pull"]["fico"] == 661
+    assert intake.intake_state["credit_pull"]["fico_source"] == "full_feed:fico_4"
+    assert intake.intake_state["credit_pull"]["attempted_at"] == "original"
+    assert intake.intake_state["other"] == "preserved"
+    from sqlalchemy.dialects import postgresql
+    query = str(db.scalars.await_args.args[0].compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+    assert str(pull.id) in query and "pull_id" in query
     assert pull.pulled_at == datetime(2026, 11, 3, tzinfo=UTC)
     new_pull.assert_not_awaited()
 

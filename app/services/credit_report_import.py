@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import logging
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import String, cast, func, or_, select
 
 from app.models.application_profile import ApplicationOwner
 from app.models.credit_pull import CreditPull
+from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.services import credit_report_archive, isoftpull_report_parser
 from app.services.isoftpull_session import IsoftpullSessionError
+
+log = logging.getLogger(__name__)
+IMPORT_VERSION = 1
 
 
 class ReportImportUnavailable(Exception):
@@ -38,9 +43,7 @@ def stored_report(raw: dict) -> dict | None:
 
 async def import_existing_report(db, pull) -> dict:
     from app.config import get_settings
-    from app.dealer_os.models import DealerOwner
     from app.models.client import Client
-    from app.services.credit_links import pull_facts, tier_for
 
     raw = dict(pull.bureau_response or {})
     parsed = stored_report(raw)
@@ -75,6 +78,9 @@ async def import_existing_report(db, pull) -> dict:
 
     raw["parsed_report"] = parsed
     raw["report_imported_at"] = datetime.now(UTC).isoformat()
+    raw.update(report_import_version=IMPORT_VERSION, report_import_status="completed",
+               report_import_error=None, report_import_next_retry_at=None,
+               report_import_access_blocked=False)
     pull.bureau_response = raw
     if parsed.get("best_score") is not None:
         pull.fico = parsed["best_score"]
@@ -84,13 +90,7 @@ async def import_existing_report(db, pull) -> dict:
         pull.notes = "; ".join(notes)
     await db.flush()
 
-    facts = pull_facts(pull)
-    for model in (ApplicationOwner, DealerOwner):
-        owners = (await db.scalars(select(model).where(model.credit_pull_id == pull.id))).all()
-        for owner in owners:
-            owner.credit_score = pull.fico
-            owner.credit_tier = tier_for(pull.fico)
-            owner.credit_summary = {**(owner.credit_summary or {}), **facts}
+    await sync_linked_owners(db, pull)
     latest = await db.scalar(select(CreditPull.id).where(
         CreditPull.client_id == pull.client_id, CreditPull.status == "completed",
     ).order_by(CreditPull.pulled_at.desc()).limit(1))
@@ -100,3 +100,97 @@ async def import_existing_report(db, pull) -> dict:
             client.fico = pull.fico
     await db.flush()
     return parsed
+
+
+async def sync_linked_owners(db, pull) -> None:
+    from app.dealer_os.models import DealerOwner
+    from app.dealer_os.services import credit_quality
+    from app.services.credit_links import pull_facts, tier_for
+    from app.services.credit_pull_core import intake_credit_state
+
+    facts = pull_facts(pull)
+    for model in (ApplicationOwner, DealerOwner):
+        owners = (await db.scalars(select(model).where(model.credit_pull_id == pull.id))).all()
+        for owner in owners:
+            owner.credit_score = pull.fico
+            owner.credit_tier = tier_for(pull.fico)
+            owner.credit_summary = {**(owner.credit_summary or {}), **facts}
+            if isinstance(owner, DealerOwner):
+                quality = credit_quality.summary(pull.fico)
+                owner.credit_tier = quality["quality_tier"] if quality else None
+                owner.credit_summary = {**owner.credit_summary, **(quality or {})}
+    intakes = (await db.scalars(select(PublicUnderwritingIntake).where(
+        PublicUnderwritingIntake.intake_state["credit_pull"]["pull_id"].astext == str(pull.id),
+    ))).all()
+    for intake in intakes:
+        state = dict(intake.intake_state or {})
+        state["credit_pull"] = {**(state.get("credit_pull") or {}), **intake_credit_state(pull)}
+        intake.intake_state = state
+    await db.flush()
+
+
+async def ensure_report_imported(db, pull) -> dict | None:
+    """Every linking path imports, or records a retryable provider failure."""
+    now = datetime.now(UTC)
+    try:
+        return await import_existing_report(db, pull)
+    except ReportImportUnavailable as exc:
+        raw = dict(pull.bureau_response or {})
+        attempts = int(raw.get("report_import_attempts") or 0) + 1
+        delay = min(60, 5 * 2 ** min(attempts - 1, 4))
+        raw.update(report_import_status="pending", report_import_error=str(exc)[:600],
+                   report_import_access_blocked=isinstance(exc.__cause__, IsoftpullSessionError),
+                   report_import_attempts=attempts, report_import_attempted_at=now.isoformat(),
+                   report_import_next_retry_at=(now + timedelta(minutes=delay)).isoformat())
+        pull.bureau_response = raw
+        await db.flush()
+        await sync_linked_owners(db, pull)
+        return None
+
+
+async def run_pending_report_imports(batch_size: int = 20) -> dict[str, int]:
+    """Backfill/retry linked reports in any linking mode; never run new pulls."""
+    from app.db import SessionLocal
+    from app.dealer_os.models import DealerOwner
+
+    now = datetime.now(UTC).isoformat()
+    linked = or_(
+        select(ApplicationOwner.id).where(ApplicationOwner.credit_pull_id == CreditPull.id,
+            ApplicationOwner.archived_at.is_(None)).exists(),
+        select(DealerOwner.id).where(DealerOwner.credit_pull_id == CreditPull.id).exists(),
+        select(PublicUnderwritingIntake.id).where(
+            PublicUnderwritingIntake.intake_state["credit_pull"]["pull_id"].astext == cast(CreditPull.id, String),
+        ).exists(),
+    )
+    statement = select(CreditPull.id).where(
+        CreditPull.status == "completed", linked,
+        or_(func.coalesce(CreditPull.bureau_response["report_import_version"].astext, "") != str(IMPORT_VERSION),
+            CreditPull.bureau_response["report_import_status"].astext == "pending"),
+        func.coalesce(CreditPull.bureau_response["report_import_next_retry_at"].astext, "") <= now,
+    ).order_by(func.coalesce(CreditPull.bureau_response["report_import_attempted_at"].astext, ""), CreditPull.created_at).limit(batch_size)
+    async with SessionLocal() as db:
+        ids = list((await db.scalars(statement)).all())
+    result = {"checked": 0, "imported": 0, "pending": 0, "failed": 0}
+    for pull_id in ids:
+        try:
+            async with SessionLocal() as db:
+                pull = await db.scalar(select(CreditPull).where(CreditPull.id == pull_id, linked,
+                    CreditPull.status == "completed").with_for_update(skip_locked=True))
+                if pull is None:
+                    continue
+                raw = pull.bureau_response or {}
+                if raw.get("report_import_version") == IMPORT_VERSION and raw.get("report_import_status") == "completed":
+                    continue
+                if (raw.get("report_import_next_retry_at") or "") > now:
+                    continue
+                result["checked"] += 1
+                report = await ensure_report_imported(db, pull)
+                await db.commit()
+                result["imported" if report is not None else "pending"] += 1
+                if report is None and (pull.bureau_response or {}).get("report_import_access_blocked"):
+                    # A service-account login/terms block affects the whole batch.
+                    break
+        except Exception:
+            result["failed"] += 1
+            log.exception("Existing credit report import failed for pull %s", pull_id)
+    return result

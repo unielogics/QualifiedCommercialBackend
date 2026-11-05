@@ -63,6 +63,14 @@ async def job_credit_link_sweep() -> None:
     await run_scheduled_sweep()
 
 
+async def job_credit_report_imports() -> None:
+    from app.services.credit_report_import import run_pending_report_imports
+
+    result = await run_pending_report_imports()
+    if result["checked"]:
+        log.info("Existing credit report imports: %s", result)
+
+
 def start_scheduler() -> None:
     """Idempotent — safe to call from FastAPI startup hooks (which fire
     on every uvicorn reload in dev). `replace_existing=True` collapses
@@ -98,6 +106,17 @@ def start_scheduler() -> None:
         "interval",
         minutes=30,
         id="credit_link_sweep",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # Import already-linked reports regardless of manual/automatic matching mode.
+    scheduler.add_job(
+        _wrap(job_credit_report_imports),
+        "interval",
+        minutes=5,
+        id="credit_report_imports",
         replace_existing=True,
         coalesce=True,
         max_instances=1,

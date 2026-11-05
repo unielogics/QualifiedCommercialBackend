@@ -613,6 +613,7 @@ class FileOwnerRead(BaseModel):
     credit_fico_source: str | None = None
     credit_score_verified: bool = False
     credit_report_available: bool = False
+    credit_report_import_status: str | None = None
     credit_link_how: str | None = None
     credit_attention: str | None = None
     credit_expires_at: str | None = None

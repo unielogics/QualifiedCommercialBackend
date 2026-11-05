@@ -94,6 +94,7 @@ def pull_facts(pull: Any) -> dict[str, Any]:
         "score_verified": extras["score_verified"],
         "report_available": extras["report_available"],
         "attention": extras["attention"],
+        "report_import_status": (getattr(pull, "bureau_response", None) or {}).get("report_import_status"),
         "pulled_at": pulled.isoformat() if pulled else None,
         "expires_at": expires.isoformat() if expires else None,
         "expired": bool(expires and expires < datetime.now(UTC)),
@@ -369,6 +370,9 @@ async def link_pull(
         old = await db.get(CreditPull, previous)
         if old is not None and old.application_owner_id == owner.id:
             old.application_owner_id = None
+    from app.services.credit_report_import import ensure_report_imported
+
+    await ensure_report_imported(db, pull)
     now = datetime.now(UTC)
     facts = pull_facts(pull)
     if pull.application_owner_id is None:
@@ -382,6 +386,7 @@ async def link_pull(
         "linked_how": how,
         "linked_at": now.isoformat(),
         "linked_by": str(actor.id) if actor is not None and getattr(actor, "id", None) else None,
+        "report_import_status": (pull.bureau_response or {}).get("report_import_status"),
     }
     for field_name in ("dob", "street", "city", "state", "zip"):
         if not getattr(owner, field_name, None) and getattr(pull, field_name, None):

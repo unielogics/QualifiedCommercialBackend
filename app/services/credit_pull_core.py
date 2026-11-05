@@ -119,6 +119,8 @@ def credit_status_extras(pull: CreditPull | None) -> dict:
         attention = "The bureau returned no score; the 720 shown is a stand-in from the identity check, not a bureau score."
     else:
         attention = None
+    if response.get("report_import_status") == "pending":
+        attention = response.get("report_import_error") or "The linked report import is pending and will retry automatically."
     return {
         "fico_source": source,
         "score_verified": verified,

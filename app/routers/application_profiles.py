@@ -3046,14 +3046,6 @@ async def link_owner_credit(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "This pull was run for another client. Confirm it is the same person to link it.",
         )
-    from app.services.credit_report_import import ReportImportUnavailable, import_existing_report
-
-    try:
-        await import_existing_report(db, pull)
-    except ReportImportUnavailable:
-        # Keep the association even if provider access needs attention. The
-        # owner still gets an explicit import-pending status, never a fake score.
-        pass
     try:
         await credit_links.link_pull(db, profile, owner, pull, actor=user, how=credit_links.HOW_MANUAL)
     except credit_links.LinkConflict as conflict:
@@ -3256,16 +3248,8 @@ async def submit_public_application_credit_consent(
         owner.invite_token_hash = token_hash
         await db.commit()
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "We could not complete the credit check right now; please try again shortly") from None
-    pull.application_owner_id = owner.id
-    owner.credit_pull_id = pull.id
-    owner.credit_score = pull.fico
-    owner.credit_tier = _credit_tier(pull.fico)
-    owner.credit_pulled_at = pull.pulled_at or datetime.now(UTC)
-    owner.credit_summary = {"status": str(pull.status), "expires_at": pull.expires_at.isoformat() if pull.expires_at else None}
+    await credit_links.link_pull(db, profile, owner, pull, how=credit_links.HOW_SIGNATURE)
     await profiles.log_profile_action(db, profile, None, "owner.soft_pull", f"Credit returned for {owner.full_name}", target_type="owner", target_id=owner.id, metadata={"tier": owner.credit_tier})
-    from app.dealer_os.services import application_precall
-
-    await application_precall.on_progress(db, profile, commit=False)
     await db.commit()
     return PublicFileOwnerConsentResult(completed=True, credit_tier=owner.credit_tier, credit_score_band=_score_band(owner.credit_score))
 

@@ -21036,6 +21036,7 @@ async def list_owners(
         if owner.credit_pulled_at is None or quality is None:
             continue
         expected_summary = {
+            **dict(owner.credit_summary or {}),
             **quality,
             "provider_status": "completed",
             "score_source": "verified_soft_pull",
@@ -21373,17 +21374,23 @@ async def _run_owner_soft_pull(
         logger.exception("dealer-os: soft pull failed for owner %s", owner_pk)
         return await _record_provider_failure("failed", type(exc).__name__, f"Credit pull failed: {exc}")
 
+    from app.services.credit_links import pull_facts
+    from app.services.credit_report_import import ensure_report_imported
+
+    await ensure_report_imported(db, pull)
     # CreditPull stores the normalized provider result in `fico`. Looking up a
     # nonexistent `score` attribute made successful pulls appear pending.
     owner.credit_score = getattr(pull, "fico", None)
     owner.credit_tier = _credit_tier(owner.credit_score)
     owner.credit_summary = {
+        **pull_facts(pull),
+        "report_import_status": (pull.bureau_response or {}).get("report_import_status"),
         "score_band": _credit_score_band(owner.credit_score),
         "quality_tier": owner.credit_tier,
         "provider_status": "completed",
         "score_source": "verified_soft_pull",
     }
-    owner.credit_pulled_at = datetime.now(timezone.utc)
+    owner.credit_pulled_at = pull.pulled_at or datetime.now(timezone.utc)
     owner.credit_pull_id = pull.id
     owner.credit_workflow_status = "completed"
     owner.credit_provider_error_category = None
