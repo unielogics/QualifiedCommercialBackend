@@ -275,12 +275,20 @@ def _is_lending_applicable(context: dict[str, Any]) -> bool:
 
 
 async def _evidence_inventory(
-    db: AsyncSession, profile: ApplicationProfile
+    db: AsyncSession, profile: ApplicationProfile, *, include_pending_financial: bool = False
 ) -> tuple[list[BucketFile], dict[uuid.UUID, BucketFileAnalysis], set[str]]:
     state = await profiles.evidence_state(db, profile)
     ids = [item.id for item in state.files]
     if not ids:
         return [], {}, set()
+    from app.services.financial_version_selection import (
+        PendingFinancialAnalysis,
+        current_financial_file_clause,
+        financial_coverage_file_ids,
+        pending_financial_original_ids,
+    )
+    if include_pending_financial:
+        ids = list(await financial_coverage_file_ids(db, ids))
     files = list(
         (
             await db.execute(
@@ -288,6 +296,7 @@ async def _evidence_inventory(
                     BucketFile.id.in_(ids),
                     BucketFile.deleted_at.is_(None),
                     BucketFile.status == "uploaded",
+                    *([] if include_pending_financial else [current_financial_file_clause(BucketFile.id)]),
                 )
             )
         )
@@ -324,6 +333,10 @@ async def _evidence_inventory(
         ):
             continue
         latest.setdefault(analysis.bucket_file_id, analysis)
+    if include_pending_financial:
+        pending_ids = await pending_financial_original_ids(db, ids)
+        latest = {file_id: PendingFinancialAnalysis(analysis) if file_id in pending_ids else analysis
+                  for file_id, analysis in latest.items()}
     classifications = {
         analysis.classification
         for analysis in latest.values()
@@ -1286,7 +1299,7 @@ async def _requested_document(
     if requested is None and form_kind in {"pfs", "debt_schedule", "p_and_l", "balance_sheet"}:
         from app.routers.application_profiles import _requested_slot
         requested = await _requested_slot(db, profile, form_kind)
-    if requested is None:
+    if requested is None and not collection_config.get("file_request_id"):
         requested = (
             await db.execute(
                 select(BucketRequestedDocument)
@@ -1305,6 +1318,9 @@ async def _requested_document(
         "playbook_id": str(requirement.playbook_id),
         "form_kind": form_kind,
     }
+    if collection_config.get("file_request_id"):
+        source = {"kind": "staff_request", "file_request_id": collection_config["file_request_id"],
+                  "collection_config": collection_config}
     if requested is None:
         requested = BucketRequestedDocument(
             bucket_id=profile.primary_bucket_id,
@@ -1432,6 +1448,13 @@ def _analysis_supports(analysis: BucketFileAnalysis | None) -> set[str]:
     return {re.sub(r"[^a-z0-9]+", "_", str(value).casefold()).strip("_") for value in raw if value}
 
 
+def _received_evidence_classes(analysis: Any) -> set[str]:
+    """Routing a received upload is separate from accepting its financial facts."""
+    if analysis is not None and getattr(analysis, "financial_mapping_pending", False):
+        return {str(analysis.classification)} if analysis.classification else set()
+    return analysis_classifications(analysis)
+
+
 def _coverage_for_files(
     requirement: AICollectionRequirement,
     files: list[BucketFile],
@@ -1509,7 +1532,7 @@ def _coverage_for_files(
         support_categories: set[str] = set()
         for file in files:
             analysis = analyses.get(file.id)
-            classifications.update(analysis_classifications(analysis))
+            classifications.update(_received_evidence_classes(analysis))
             support_categories.update(_analysis_supports(analysis))
         has_profit_and_loss = bool(
             {"current_p_and_l", "profit_and_loss"}.intersection(classifications)
@@ -1559,9 +1582,9 @@ def _matching_evidence_files(
     classified = [
         file
         for file in files
+        if not (getattr(requirement, "collection_config", None) or {}).get("explicit_assignment_only")
         if (analysis := analyses.get(file.id))
-        and analysis.status == "completed"
-        and analysis_classifications(analysis).intersection(expected)
+        and _received_evidence_classes(analysis).intersection(expected)
     ]
     matches = list({file.id: file for file in [*explicit, *classified]}.values())
     if trust_preferred:
@@ -1941,6 +1964,12 @@ def _automatic_evidence_decision(
             analysis.confidence if analysis else None,
         )
     if analysis is None or analysis.status in {"pending", "running"}:
+        if analysis is not None and getattr(analysis, "financial_mapping_pending", False):
+            return (
+                "processing", "financial_mapping_pending",
+                "This upload is received and waiting for staff review and filing.",
+                analysis.confidence,
+            )
         return (
             "processing",
             "analysis_pending",
@@ -2237,6 +2266,7 @@ async def _reconcile_evidence_decisions(
         }
         retained_staff_review = (
             current is not None
+            and not getattr(analysis, "financial_mapping_pending", False)
             and current.actor_kind == "staff"
             and current.content_hash == content_hash
             and current.analysis_version == analysis_version
@@ -2321,7 +2351,7 @@ async def _reconcile_evidence_decisions(
             > (link.verified_at.replace(tzinfo=UTC) if link.verified_at.tzinfo is None else link.verified_at)
             for value in (getattr(analysis, "analyzed_at", None), getattr(file, "created_at", None))
         )
-        changed_evidence = bool(current and (
+        changed_evidence = bool(getattr(analysis, "financial_mapping_pending", False)) or bool(current and (
             current.content_hash != content_hash or current.analysis_version != analysis_version
         )) or newer_evidence
         if (link.verified_by_user_id is not None and not retained_staff_review
@@ -2362,7 +2392,7 @@ async def _materialize_requirements(
 ) -> tuple[list[ApplicationRequirementState], dict[uuid.UUID, list[str]]]:
     from app.services import collection_tasks
 
-    files, analyses, _classifications = await _evidence_inventory(db, profile)
+    files, analyses, _classifications = await _evidence_inventory(db, profile, include_pending_financial=True)
     inventory = {file.id: file for file in files}
     intake = (
         await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
@@ -2434,7 +2464,8 @@ async def _materialize_requirements(
     for state in existing.values():
         metadata = state.provenance or {}
         external = metadata.get("external_definition")
-        if metadata.get("source_kind") == "lender" and external and state.requirement_key not in merged:
+        if (metadata.get("source_kind") in {"lender", "staff_request"} and external
+                and not metadata.get("cancelled_at") and state.requirement_key not in merged):
             definition = {
                 "id": state.id, "playbook_id": state.id, "requirement_key": state.requirement_key,
                 "label": state.label, "category": state.category, "required_level": state.required_level,
@@ -2511,10 +2542,11 @@ async def _materialize_requirements(
         definition_metadata = collection_tasks.definition_metadata(
             requirement, version=criteria_versions.get(requirement.playbook_id, 1)
         )
-        if (state.provenance or {}).get("source_kind") == "lender":
+        if (state.provenance or {}).get("source_kind") in {"lender", "staff_request"}:
             definition_metadata = {**definition_metadata, **{
                 name: (state.provenance or {}).get(name)
-                for name in ("source_kind", "source_key", "catalog_approved", "external_definition", "definition_version", "definition_id")
+                for name in ("source_kind", "source_key", "catalog_approved", "external_definition", "definition_version", "definition_id",
+                             "file_request_id", "request_fingerprint", "request_item", "request_instructions", "requested_by_user_id", "request_batches")
             }}
         state.provenance = {**(state.provenance or {}), **definition_metadata, "inactive_definition": False}
         if not collection_tasks.collects_file(requirement):
@@ -3046,7 +3078,7 @@ async def get_program_readiness(
             links_by_state[link.requirement_state_id].append((link, file))
     all_links = [link for rows in links_by_state.values() for link, _file in rows]
     latest_decisions = await _latest_evidence_decisions(db, all_links)
-    available_files, available_analyses, _available_classes = await _evidence_inventory(db, profile)
+    available_files, available_analyses, _available_classes = await _evidence_inventory(db, profile, include_pending_financial=True)
     unlocked_copy_requests = await locked_file_requests.request_states_for_files(
         db,
         profile=profile,

@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.application_profile import ApplicationTaxonomyEntry
 from app.models.user import User
+from app.services import financial_version_selection
 
 from ..models import (
     DealerApplicationPreScreen,
@@ -31,7 +32,13 @@ from ..models import (
     DealerOwner,
     DealerProgramRuleResolution,
 )
-from . import application_prescreen, credit_quality, recurrence, workflow_readiness
+from . import (
+    application_prescreen,
+    credit_quality,
+    financial_debt_drafts,
+    recurrence,
+    workflow_readiness,
+)
 from .lender_neutral_routing import (
     RULES_VERSION,
     TERM_DISPLAY_NAME,
@@ -209,6 +216,11 @@ async def build_context(
             )
         ).scalars().all()
     )
+    accepted_debt = await financial_version_selection.accepted_debt_schedule_snapshot_for_dealer(db, dealer.id)
+    if accepted_debt is not None:
+        debts = financial_debt_drafts.accepted_debt_views(
+            debts, financial_version_selection.active_debt_schedule_rows(accepted_debt.body),
+        )
     pre_screen = (
         await db.execute(
             select(DealerApplicationPreScreen).where(
@@ -483,6 +495,34 @@ async def build_context(
     )
     metrics = dict(routing.get("calculated_metrics") or {})
     snapshot = dict(financial_snapshot or {})
+    annual_cash_flow = float(profile.annual_cash_flow_available_for_debt) if profile and profile.annual_cash_flow_available_for_debt is not None else snapshot.get("annual_cash_flow_available_for_debt")
+    monthly_debt = float(profile.monthly_debt_payments) if profile and profile.monthly_debt_payments is not None else snapshot.get("monthly_debt_payments")
+    dscr = snapshot.get("dscr") if snapshot.get("dscr") is not None else metrics.get("dscr")
+    dscr_source = ((snapshot.get("sources") or {}).get("dscr") or {}).get("label") or metrics.get("dscr_source") or "unavailable"
+    financial_sources = dict(snapshot.get("sources") or {})
+    debt_confirmation = None
+    if accepted_debt is not None:
+        monthly_debt = float(financial_version_selection.debt_schedule_monthly(accepted_debt.body))
+        debt_confirmation = workflow_readiness.accepted_debt_confirmation(accepted_debt, debts)
+        prior_monthly_source = financial_sources.get("monthly_debt_payments") or {}
+        dscr = (round(float(annual_cash_flow) / (monthly_debt * 12), 3) if annual_cash_flow is not None and monthly_debt > 0
+                else snapshot.get("dscr") if monthly_debt > 0 and prior_monthly_source.get("source") == "accepted_debt_schedule"
+                else None)
+        dscr_source = "Completed saved debt schedule" if dscr is not None else "No outstanding scheduled debt" if monthly_debt == 0 else "Annual cash flow is unavailable"
+        financial_sources["monthly_debt_payments"] = {
+            "status": "confirmed", "source": "accepted_debt_schedule", "label": "Completed saved debt schedule",
+            "version_id": str(accepted_debt.id), "evidence": debt_confirmation["note"],
+        }
+        financial_sources["dscr"] = {
+            "status": "unavailable" if dscr is None else "confirmed" if annual_cash_flow is not None
+            and "annual_cash_flow_available_for_debt" in (getattr(profile, "field_confirmations", None) or {})
+            else "estimated" if annual_cash_flow is not None else "verified",
+            "source": "accepted_debt_schedule", "label": dscr_source,
+            "version_id": str(accepted_debt.id), "version_number": accepted_debt.version_number,
+            "content_hash": getattr(accepted_debt, "body_sha256", None),
+            "evidence": "Existing annual cash flow divided by twelve months of accepted scheduled debt service."
+            if annual_cash_flow is not None and monthly_debt > 0 else debt_confirmation["note"],
+        }
 
     return {
         "generated_at": datetime.now(UTC),
@@ -525,16 +565,17 @@ async def build_context(
         },
         "financial": {
             "annual_sales": float(profile.annual_sales) if profile and profile.annual_sales is not None else snapshot.get("annual_sales"),
-            "annual_cash_flow_available_for_debt": float(profile.annual_cash_flow_available_for_debt) if profile and profile.annual_cash_flow_available_for_debt is not None else snapshot.get("annual_cash_flow_available_for_debt"),
-            "monthly_debt_payments": float(profile.monthly_debt_payments) if profile and profile.monthly_debt_payments is not None else snapshot.get("monthly_debt_payments"),
-            "dscr": snapshot.get("dscr") if snapshot.get("dscr") is not None else metrics.get("dscr"),
-            "dscr_source": ((snapshot.get("sources") or {}).get("dscr") or {}).get("label") or metrics.get("dscr_source") or "unavailable",
+            "annual_cash_flow_available_for_debt": annual_cash_flow,
+            "monthly_debt_payments": monthly_debt,
+            "dscr": dscr,
+            "dscr_source": dscr_source,
             "avg_daily_balance": snapshot.get("avg_daily_balance"),
             "negative_balance_days_90": snapshot.get("negative_balance_days_90"),
             "returned_items": snapshot.get("returned_items"),
             "average_monthly_deposits": snapshot.get("average_monthly_deposits"),
             "annualized_deposits": snapshot.get("annualized_deposits"),
-            "sources": snapshot.get("sources") or {},
+            "sources": financial_sources,
+            "debt_schedule_authoritative": accepted_debt is not None,
             "statement_months": statement_months,
             "missing_statement_months": missing_statement_months,
             "standard_statement_target": STATEMENT_MONTH_TARGET,
@@ -549,6 +590,8 @@ async def build_context(
         },
         "debts": debt_rows,
         "debt_source_sha256": workflow_readiness.debt_source_hash(debts),
+        "debt_schedule_authoritative": accepted_debt is not None,
+        "debt_schedule_confirmation": debt_confirmation,
         "documents": docs_reviewed,
         "routing": routing,
         "route_key": route_key,
@@ -629,7 +672,8 @@ def build_readiness(context: dict[str, Any]) -> dict[str, Any]:
     )
     has_tax = any(row["classification"].lower() == "tax return" and row["status"] == "extracted" for row in documents)
     debt_confirmation = dict((getattr(profile, "field_confirmations", None) or {}).get("debt_schedule") or {})
-    has_debt_schedule = bool(
+    accepted_debt_schedule = bool(context.get("debt_schedule_authoritative"))
+    has_debt_schedule = accepted_debt_schedule or bool(
         debt_confirmation.get("source_sha256") == context.get("debt_source_sha256")
         and (
             debt_confirmation.get("status") == "schedule_confirmed" and bool(context.get("debts"))
@@ -643,7 +687,7 @@ def build_readiness(context: dict[str, Any]) -> dict[str, Any]:
     human_status = _text(getattr(profile, "human_review_status", "pending")) or "pending"
     financial_confirmations = dict(getattr(profile, "field_confirmations", None) or {})
     financial_confirmed = all(
-        financial.get(field) is not None and field in financial_confirmations
+        financial.get(field) is not None and (field in financial_confirmations or field == "monthly_debt_payments" and accepted_debt_schedule)
         for field in workflow_readiness.FINANCIAL_CONFIRMATION_FIELDS
     )
 

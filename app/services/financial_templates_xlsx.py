@@ -67,6 +67,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 from app.services import business_statement_schema as bss
 from app.services import pfs_schema, sheet_layout
+from app.services.debt_terms import FREQUENCY_MONTHLY_MULT
 from app.services.financial_statements import DEBT_COLUMNS
 from app.services.sheet_layout import (  # noqa: F401 — re-exported; callers read them here
     DEBT_ROWS,
@@ -116,7 +117,7 @@ ATTACHMENT_FILENAMES: dict[str, str] = {
 
 MONEY_FORMAT = '#,##0.00;(#,##0.00);"-"'
 DATE_FORMAT = "yyyy-mm-dd"
-RATE_FORMAT = "0.00"
+RATE_FORMAT = "0.000"
 
 _AUTHOR = "Qualified Commercial"
 #: Pinned so two builds are byte-identical. Not a year that appears in a cell.
@@ -173,8 +174,9 @@ class _Form:
         self.row = 0
         self.cells: dict[str, int] = {}
         self.keys_beside_inputs = sheet.kind != "debt_schedule"
-        self.key_column = 3 if self.keys_beside_inputs else len(sheet.columns) + 1
-        self.last_column = max(column.c for column in sheet.columns)
+        self.monthly_equivalent_column = len(sheet.columns) + 1 if sheet.kind == "debt_schedule" else None
+        self.key_column = 3 if self.keys_beside_inputs else len(sheet.columns) + 2
+        self.last_column = self.monthly_equivalent_column or max(column.c for column in sheet.columns)
         self._validations: dict[tuple[str, ...], DataValidation] = {}
         # Every keyed or named cell's address, from the layout's (c, r), so a
         # formula can be resolved before the cell it points at is written.
@@ -188,6 +190,8 @@ class _Form:
                     self.refs.setdefault(cell.xlsx_name, address)
         for column in sheet.columns:
             self.ws.column_dimensions[get_column_letter(column.c)].width = column.width
+        if self.monthly_equivalent_column:
+            self.ws.column_dimensions[get_column_letter(self.monthly_equivalent_column)].width = 23
         self.ws.column_dimensions[get_column_letter(self.key_column)].hidden = True
 
     def resolve(self, formula: str) -> str:
@@ -302,6 +306,10 @@ class _Form:
             for index, key in enumerate(DEBT_COLUMNS, start=1):
                 self.ws.cell(row=self.row + 1, column=index, value=key)
             self.ws.row_dimensions[self.row + 1].hidden = True
+            if self.monthly_equivalent_column:
+                target = self.ws.cell(row=self.row, column=self.monthly_equivalent_column, value="Monthly equivalent (calculated)")
+                target.font, target.fill, target.alignment = _HEADING_FONT, _HEADING_FILL, _WRAP
+                self.ws.cell(row=self.row + 1, column=self.monthly_equivalent_column, value="monthly_equivalent")
 
     def data(self, row: Row) -> None:
         self.row += 1
@@ -311,6 +319,10 @@ class _Form:
             target = self.ws.cell(row=self.row, column=cell.c)
             target.protection = _UNLOCKED
             target.fill = _INPUT_FILL
+            if cell.hint:
+                target.comment = Comment(cell.hint, _AUTHOR)
+            if self.monthly_equivalent_column and cell.key and cell.key.endswith(".monthly_payment"):
+                target.comment = Comment("An explicit Monthly payment overrides the calculated monthly equivalent. Leave it blank to calculate from Payment amount and Payment frequency.", _AUTHOR)
             if cell.type == "money":
                 target.number_format = MONEY_FORMAT
             elif cell.type == "rate":
@@ -320,6 +332,20 @@ class _Form:
             elif cell.type == "select" and cell.options:
                 self._validation(tuple(cell.options)).add(target)
             self._name(cell.xlsx_name, self.row, cell.c)
+        if self.monthly_equivalent_column:
+            amount = self.refs[f"r{row.ordinal}.payment_amount"]
+            frequency = self.refs[f"r{row.ordinal}.payment_frequency"]
+            stated = self.refs[f"r{row.ordinal}.monthly_payment"]
+            choices = ",".join(f'{frequency}="{key}"' for key in FREQUENCY_MONTHLY_MULT)
+            multiplier = '""'
+            for key, value in reversed(list(FREQUENCY_MONTHLY_MULT.items())):
+                multiplier = f'IF({frequency}="{key}",{value},{multiplier})'
+            formula = f'=IF(ISNUMBER({stated}),{stated},IF(AND(ISNUMBER({amount}),OR({choices})),ROUND({amount}*{multiplier},2),""))'
+            target = self.ws.cell(row=self.row, column=self.monthly_equivalent_column, value=formula)
+            target.number_format, target.alignment = MONEY_FORMAT, _RIGHT
+            target.comment = Comment("Retains an explicit Monthly payment input, including zero. Otherwise calculates from known native amount and frequency. Daily uses 21 business days; weekly 4.33; biweekly 2.165. A factor rate is not APR.", _AUTHOR)
+            # Export-only convenience column: canonical defined names remain
+            # exactly the schema's stored/editable fields.
 
     def totals(self, row: Row) -> None:
         self.row += 1
@@ -327,7 +353,12 @@ class _Form:
             if cell.type == "label":
                 self.ws.cell(row=self.row, column=cell.c, value=cell.label).font = _BOLD
                 continue
-            target = self.ws.cell(row=self.row, column=cell.c, value=self.resolve(cell.formula))
+            formula = self.resolve(cell.formula)
+            if self.monthly_equivalent_column and cell.compute == "total_monthly_payment":
+                column = get_column_letter(self.monthly_equivalent_column)
+                rows = [item.r for item in self.sheet.rows if item.kind == "data"]
+                formula = f"=SUM({column}{min(rows)}:{column}{max(rows)})" if rows else "=0"
+            target = self.ws.cell(row=self.row, column=cell.c, value=formula)
             target.number_format = MONEY_FORMAT
             target.font = _BOLD
             self._name(cell.xlsx_name, self.row, cell.c)

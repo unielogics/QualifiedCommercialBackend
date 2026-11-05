@@ -94,6 +94,8 @@ async def save(
     borrower on their own link.
     """
     schema = _kind_or_raise(kind)
+    from app.services.financial_workspace_legacy import protect_projection
+    await protect_projection(db, profile, kind)
     if statement is None:
         statement = await latest_for_profile(db, profile.id, kind)
     if statement is None:

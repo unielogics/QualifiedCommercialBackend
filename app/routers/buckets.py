@@ -2797,6 +2797,14 @@ async def delete_admin_file(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
     if file.deleted_at is not None:
         return
+    if isinstance(getattr(db, "info", None), dict):
+        from app.models.financial_form_version import FinancialFormVersion
+        retained_version = (await db.execute(select(FinancialFormVersion.id).where(
+            (FinancialFormVersion.source_file_id == file.id) | (FinancialFormVersion.pdf_file_id == file.id),
+        ).limit(1))).scalar_one_or_none()
+        if retained_version is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT,
+                "Saved financial versions are kept in History. Correct the form and save a new version to update it.")
     if await retention_holds.is_effective_file_soft_deletion_prohibited(db, file):
         raise HTTPException(
             status.HTTP_409_CONFLICT,

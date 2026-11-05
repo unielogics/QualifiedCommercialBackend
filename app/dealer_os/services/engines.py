@@ -20,6 +20,8 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services import financial_version_selection
+from app.services.debt_terms import normalize_terms
 from app.services.underwriting_intelligence import calculate_dscr
 
 from ..models import (
@@ -144,8 +146,8 @@ def compute_metrics(
                             (dos_debts), used when no period carries observed
                             debt service.
 
-    A fallback is only consulted when the observed value is missing — anything
-    extracted from a statement or set by a human always wins. Each metric
+    A completed saved debt schedule supersedes every automated denominator.
+    Before that boundary, fallbacks fill gaps in observed values. Each metric
     reports its `source` so the UI can show where the number came from.
     """
     fallbacks = fallbacks or {}
@@ -176,14 +178,16 @@ def compute_metrics(
     ebitda_bankable = _round2(ebitda_adjusted * BANKABLE_FACTOR) if ebitda_adjusted is not None else None
 
     # --- DSCR --------------------------------------------------------------
-    # Denominator precedence: statement-carried debt service > OBSERVED
+    # Completed saved schedule first. Before completion: statement debt service > OBSERVED
     # ledger debits to debt-like lenders (loans/floorplan — credit cards
     # excluded: a card paid monthly is operating spend routed through a
     # card, not debt service, unless an admin confirms a carried balance
     # on the schedule) > the drafted schedule total.
-    monthly_ds = _avg(p.get("debt_service") for p in periods)
-    ds_source = "periods"
-    if monthly_ds is None:
+    schedule_authoritative = bool(fallbacks.get("debt_schedule_authoritative"))
+    monthly_ds = (float(fallbacks.get("debt_schedule_monthly") or 0) if schedule_authoritative
+                  else _avg(p.get("debt_service") for p in periods))
+    ds_source = "accepted_debt_schedule" if schedule_authoritative else "periods"
+    if monthly_ds is None and not schedule_authoritative:
         # ONE composed denominator: the schedule (observed-wins per row,
         # human toggles law) PLUS observed debits to lenders NOT on the
         # schedule — the two are disjoint by construction, so an include/
@@ -209,7 +213,7 @@ def compute_metrics(
     # DRAFT DSCR: when nothing is confirmed, the system still derives a
     # ratio from IDENTIFIED debt-like activity (cards included) vs the
     # inbound-derived numerator — never a blank tile, never an infinity.
-    draft_ds = (fallbacks or {}).get("debt_service_draft_monthly")
+    draft_ds = None if schedule_authoritative else fallbacks.get("debt_service_draft_monthly")
     dscr_draft = None
     if draft_ds and float(draft_ds) > 0 and ebitda_bankable is not None:
         dscr_draft = round(ebitda_bankable / (float(draft_ds) * 12.0), 3)
@@ -322,6 +326,7 @@ def compute_metrics(
         },
         "dscr": {
             "source": ds_source,
+            "schedule_authoritative": schedule_authoritative,
             "cash_flow": dscr_cash_flow,
             "at_goal": dscr_at_goal,
             "draft": dscr_draft,
@@ -418,6 +423,7 @@ class MetricInputs:
     target_rows: list
     targets: dict[str, float | None]
     fallbacks: dict[str, float | None]
+    accepted_debt_rows: list[dict] | None = None
 
     @property
     def addbacks_annual_verified(self) -> float:
@@ -445,6 +451,10 @@ async def load_metric_inputs(
     out of the drafted pool AND their vendors suppressed from the observed/
     draft ledger tiers (otherwise a removed lender's debits would re-enter as
     an "unscheduled" observed lender and the removal would never move DSCR)."""
+    accepted_version = await financial_version_selection.accepted_debt_schedule_snapshot_for_dealer(db, dealer_id)
+    accepted_rows = None if accepted_version is None else [
+        normalize_terms(row) for row in financial_version_selection.active_debt_schedule_rows(accepted_version.body)
+    ]
     # Per-account rows mean one calendar month can span several rows. Fetch a
     # wider window, collapse to one dict per month (flow fields summed across
     # accounts, balance fields preferring the primary operating account, then
@@ -589,14 +599,12 @@ async def load_metric_inputs(
         for p in period_rows
     ]
 
-    # Fallbacks for figures bank statements cannot carry. Observed values
-    # always win; these only fill a gap that would otherwise leave the metric
-    # permanently null.
+    # Before a complete schedule is saved, observed values fill missing terms.
     # The debt schedule IS the DSCR denominator ledger (0129): every active
     # row with count_in_dscr contributes. For vendor-linked rows the OBSERVED
     # monthly debits win over the stated figure (primary source = what the
     # statements actually show); stated monthly_payment is the fallback.
-    dscr_debt_rows = (
+    dscr_debt_rows = [] if accepted_rows is not None else (
         (
             await db.execute(
                 select(DealerDebt).where(
@@ -613,7 +621,7 @@ async def load_metric_inputs(
 
     _removed_vendor_keys: list = []   # real vendor keys — containment matching
     _removed_exact_keys: set = set()  # name-derived — EXACT ledger-key equality only
-    if exclude_debt_ids:
+    if exclude_debt_ids and accepted_rows is None:
         # What-if removal: the rows leave the schedule pool here, and the
         # removed LENDER's identity joins the suppression below so its debits
         # can't resurface through any tier. Fetched by id — NOT from the
@@ -654,7 +662,7 @@ async def load_metric_inputs(
     draft_ds_monthly = None
     observed_avg_by_debt: dict = {}
     event_rows = []
-    if period_rows:
+    if period_rows and accepted_rows is None:
         from ..models import DealerCategoryRule
         from .vendors import rollup_vendors
 
@@ -718,6 +726,19 @@ async def load_metric_inputs(
                     .scalars()
                     .all()
                 )
+                # Reconciled aliases are tombstones, not fresh unscheduled
+                # lenders. Keep per-canonical-row observed attribution intact.
+                reconciled_rows = (
+                    (await db.execute(select(DealerDebt).where(
+                        DealerDebt.dealer_id == dealer_id,
+                        DealerDebt.status.in_(["dismissed", "deleted", "duplicate"]),
+                    ))).scalars().all()
+                )
+                reconciled_keys = [r.vendor_key for r in reconciled_rows if r.vendor_key]
+                reconciled_exact = {
+                    identity for r in reconciled_rows if not r.vendor_key
+                    if (identity := _row_identity(None, r.lender))
+                }
                 # What-if removals suppress exactly like human exclusions.
                 excluded_rows = list(excluded_rows) + _removed_vendor_keys
                 # Vendors covered by ANY active schedule row are the
@@ -735,7 +756,8 @@ async def load_metric_inputs(
                     if amt >= 0:
                         continue
                     ev_key = normalize_vendor(r.description or "")
-                    if ev_key in _removed_exact_keys or any(_km(x, ev_key) for x in excluded_rows):
+                    if (ev_key in _removed_exact_keys or ev_key in reconciled_exact
+                            or any(_km(x, ev_key) for x in [*excluded_rows, *reconciled_keys])):
                         continue
                     mkey = date(r.period.year, r.period.month, 1)
                     if ev_key in debt_keys and not any(_km(x, ev_key) for x in scheduled_keys):
@@ -804,6 +826,12 @@ async def load_metric_inputs(
             if stated > 0:
                 drafted_monthly += stated
     drafted_monthly = round(drafted_monthly, 2)
+    if accepted_rows is not None:
+        # Accepted obligations have stable identities. Separate loans at the
+        # same lender each count, even when they share one banking payee.
+        drafted_monthly = float(financial_version_selection.debt_schedule_monthly(
+            accepted_version.body, exclude_debt_ids=exclude_debt_ids,
+        ))
     # DSCR-at-goal: the payment the funding goal implies at the desk's
     # conventional terms — gives the tile a meaningful ratio even at zero
     # current debt ("there is always a DSCR ratio").
@@ -839,10 +867,12 @@ async def load_metric_inputs(
         addback_rows=addback_rows,
         target_rows=target_rows,
         targets=targets,
+        accepted_debt_rows=accepted_rows,
         fallbacks={
+            "debt_schedule_authoritative": accepted_rows is not None,
             "debt_service_observed_monthly": observed_ds_monthly or None,
             "debt_service_draft_monthly": draft_ds_monthly or None,
-            "debt_schedule_monthly": drafted_monthly or None,
+            "debt_schedule_monthly": drafted_monthly if accepted_rows is not None else drafted_monthly or None,
             "goal_monthly_payment": goal_payment,
             "tax_ebitda_annual": _tax_ebitda(latest_filing),
         },

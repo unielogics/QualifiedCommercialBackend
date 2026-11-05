@@ -285,6 +285,7 @@ def statement_profitability_diagnostics(analysis: BucketFileAnalysis) -> list[di
 
 async def ingest_profile_financial_periods(db: AsyncSession, profile: ApplicationProfile) -> int:
     """Called under the profile lock during recalc; no provider call or commit."""
+    from app.services.financial_version_selection import current_financial_file_clause
     selected_files = await selected_files_for_intake(db, profile.intake_id) if profile.intake_id else []
     source_scope = []
     if profile.primary_bucket_id is not None:
@@ -302,6 +303,7 @@ async def ingest_profile_financial_periods(db: AsyncSession, profile: Applicatio
                 BucketFileAnalysis.bucket_id == BucketFile.bucket_id,
                 BucketFile.deleted_at.is_(None),
                 BucketFile.status == "uploaded",
+                current_financial_file_clause(BucketFile.id),
                 BucketFileAnalysis.status == "completed",
                 BucketFileAnalysis.content_hash == BucketFile.content_hash,
             )

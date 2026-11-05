@@ -152,7 +152,7 @@ _PFS_STYLE = """
 """
 
 
-def build_pfs_413_html(*, body: dict, statement_date: str) -> str:
+def build_pfs_413_html(*, body: dict, statement_date: str, financial_totals: dict | None = None) -> str:
     """The Form 413 statement, laid out the way a lender expects to read it.
 
     Assets and liabilities side by side with net worth beneath, then income and
@@ -168,12 +168,16 @@ def build_pfs_413_html(*, body: dict, statement_date: str) -> str:
     from app.services import pfs_schema
 
     totals = pfs_schema.totals(body)
+    if financial_totals is not None:
+        totals.update({key: value for key, value in financial_totals.items() if key in totals})
     applicant = body.get("applicant") or {}
     assets = body.get("assets") or {}
     liabilities = body.get("liabilities") or {}
 
     def _money(value) -> str:
-        return f"${float(value or 0):,.2f}"
+        if value is None and financial_totals is not None:
+            return "&mdash;"
+        return f"${float(pfs_schema._amount(value)):,.2f}"
 
     def _amount_cell(value) -> str:
         """A figure, dimmed when it is zero.
@@ -181,7 +185,9 @@ def build_pfs_413_html(*, body: dict, statement_date: str) -> str:
         Most lines on a 413 are zero until someone fills them in. Printing all
         of them at the same weight buries the four that were answered.
         """
-        number = float(value or 0)
+        if value in (None, "") and financial_totals is not None:
+            return "<td class='num zero'>&mdash;</td>"
+        number = float(pfs_schema._amount(value))
         klass = "num zero" if number == 0 else "num"
         return f"<td class='{klass}'>{_money(number)}</td>"
 
@@ -200,7 +206,7 @@ def build_pfs_413_html(*, body: dict, statement_date: str) -> str:
         cells = "".join(
             "<tr>"
             + "".join(
-                f"<td>{html.escape(str(row.get(column, '') or ''))}</td>" for column in spec.columns
+                f"<td>{html.escape(str(row.get(field_key, row.get(column, '')) or ''))}</td>" for field_key, column in spec.fields
             )
             + "</tr>"
             for row in rows
@@ -257,7 +263,7 @@ def build_pfs_413_html(*, body: dict, statement_date: str) -> str:
 
         <div class="networth">
           <span class="k">Net worth</span>
-          <span class="{net_class}">{_money(net_worth)}</span>
+          <span class="{net_class}">{_money(totals['net_worth'])}</span>
         </div>
 
         <div class="cols">
@@ -293,7 +299,7 @@ def build_pfs_413_html(*, body: dict, statement_date: str) -> str:
     return doc
 
 
-def render_pfs_413_pdf(*, body: dict, statement_date: str) -> bytes:
+def render_pfs_413_pdf(*, body: dict, statement_date: str, financial_totals: dict | None = None) -> bytes:
     """The Form 413 statement as PDF bytes.
 
     Kept alongside `render_pfs_pdf` rather than replacing it, so flows still on
@@ -301,18 +307,20 @@ def render_pfs_413_pdf(*, body: dict, statement_date: str) -> bytes:
     """
     from weasyprint import HTML
 
-    pdf = HTML(string=build_pfs_413_html(body=body, statement_date=statement_date)).write_pdf()
+    pdf = HTML(string=build_pfs_413_html(body=body, statement_date=statement_date, financial_totals=financial_totals)).write_pdf()
     if pdf is None:
         raise RuntimeError("weasyprint returned no PDF bytes")
     return pdf
 
 
 def _statement_money(value: Any) -> str:
+    if value is None:
+        return "&mdash;"
     amount = float(value or 0)
     return f"(${abs(amount):,.2f})" if amount < 0 else f"${amount:,.2f}"
 
 
-def _statement_section_html(section: Any, values: dict[str, Any], subtotal: Any) -> str:
+def _statement_section_html(section: Any, values: dict[str, Any], subtotal: Any, *, preserve_unknowns: bool = False) -> str:
     """One schema section as a table: its lines, then its subtotal. A contra
     line is labelled as the schema labels it ("Less: …") and shown as typed."""
     from app.services.pfs_schema import _amount
@@ -320,7 +328,7 @@ def _statement_section_html(section: Any, values: dict[str, Any], subtotal: Any)
     lines = "".join(
         f"<tr><td>{html.escape(row.label)}"
         f"{' <span class=chip>add-back</span>' if row.addback else ''}</td>"
-        f"<td class='num'>{_statement_money(_amount(values.get(row.key)))}</td></tr>"
+        f"<td class='num'>{_statement_money(None if preserve_unknowns and values.get(row.key) in (None, '') else _amount(values.get(row.key)))}</td></tr>"
         for row in section.rows
     )
     return (
@@ -353,7 +361,7 @@ def _statement_notes_html(body: dict) -> str:
     return f"<div class='notes'><strong>Notes.</strong> {html.escape(notes)}</div>" if notes else ""
 
 
-def build_p_and_l_html(*, body: dict) -> str:
+def build_p_and_l_html(*, body: dict, financial_totals: dict | None = None) -> str:
     """The profit and loss statement as a lender reads it: revenue, operating
     expenses, the line below, then the EBITDA memo built from the add-back
     flags. Split from the render so the layout can be tested without
@@ -362,22 +370,25 @@ def build_p_and_l_html(*, body: dict) -> str:
 
     schema = bss.SCHEMA_FOR["p_and_l"]
     totals = schema.totals(body)
+    if financial_totals is not None:
+        totals.update({key: value for key, value in financial_totals.items() if key in totals})
     header = body.get("header") or {}
     sections = body.get("sections") or {}
     by_key = {section.key: section for section in schema.sections}
     period = bss.period_label("p_and_l", body) or "period not stated"
 
     revenue = _statement_section_html(
-        by_key["revenue"], sections.get("revenue") or {}, totals["gross_profit"]
+        by_key["revenue"], sections.get("revenue") or {}, totals["gross_profit"], preserve_unknowns=financial_totals is not None
     )
     opex = _statement_section_html(
         by_key["operating_expenses"],
         sections.get("operating_expenses") or {},
         totals["total_operating_expenses"],
+        preserve_unknowns=financial_totals is not None,
     )
     other_description = str((sections.get("operating_expenses") or {}).get("other_description") or "").strip()
     below = _statement_section_html(
-        by_key["below_the_line"], sections.get("below_the_line") or {}, totals["net_income"]
+        by_key["below_the_line"], sections.get("below_the_line") or {}, totals["net_income"], preserve_unknowns=financial_totals is not None
     )
     addbacks = [row for section in schema.sections for row in section.rows if row.addback]
     memo_rows = "".join(
@@ -424,22 +435,25 @@ def build_p_and_l_html(*, body: dict) -> str:
     return doc
 
 
-def render_p_and_l_pdf(*, body: dict) -> bytes:
+def render_p_and_l_pdf(*, body: dict, financial_totals: dict | None = None) -> bytes:
     from weasyprint import HTML
 
-    pdf = HTML(string=build_p_and_l_html(body=body)).write_pdf()
+    pdf = HTML(string=build_p_and_l_html(body=body, financial_totals=financial_totals)).write_pdf()
     if pdf is None:
         raise RuntimeError("weasyprint returned no PDF bytes")
     return pdf
 
 
-def build_balance_sheet_html(*, body: dict) -> str:
+def build_balance_sheet_html(*, body: dict, financial_totals: dict | None = None) -> str:
     """The balance sheet with the identity line and any unreconciled
     difference printed, so a reader sees what the borrower saw."""
     from app.services import business_statement_schema as bss
 
     schema = bss.SCHEMA_FOR["balance_sheet"]
     totals = schema.totals(body)
+    if financial_totals is not None:
+        totals.update({key: value for key, value in financial_totals.items() if key in totals})
+        totals["equity_implied"] = False
     header = body.get("header") or {}
     sections = body.get("sections") or {}
     by_key = {section.key: section for section in schema.sections}
@@ -447,7 +461,7 @@ def build_balance_sheet_html(*, body: dict) -> str:
 
     def part(key: str) -> str:
         return _statement_section_html(
-            by_key[key], sections.get(key) or {}, totals[by_key[key].subtotal_key]
+            by_key[key], sections.get(key) or {}, totals[by_key[key].subtotal_key], preserve_unknowns=financial_totals is not None
         )
 
     equity_note = (
@@ -507,16 +521,16 @@ def build_balance_sheet_html(*, body: dict) -> str:
     return doc
 
 
-def render_balance_sheet_pdf(*, body: dict) -> bytes:
+def render_balance_sheet_pdf(*, body: dict, financial_totals: dict | None = None) -> bytes:
     from weasyprint import HTML
 
-    pdf = HTML(string=build_balance_sheet_html(body=body)).write_pdf()
+    pdf = HTML(string=build_balance_sheet_html(body=body, financial_totals=financial_totals)).write_pdf()
     if pdf is None:
         raise RuntimeError("weasyprint returned no PDF bytes")
     return pdf
 
 
-# The full schedule needs eleven columns, which does not fit a portrait page at
+# The full schedule includes native contract terms and does not fit a portrait page at
 # a readable size. Landscape, and the notes hang under their own obligation as a
 # spanning row so a long one wraps instead of squeezing every other column.
 _SCHEDULE_STYLE = """
@@ -545,6 +559,9 @@ _SCHEDULE_COLUMNS = (
     "Secured",
     "Status",
     "Collateral",
+    "Factor (×)",
+    "Payment amount",
+    "Frequency",
 )
 
 
@@ -556,28 +573,35 @@ def _cell(value: Any) -> str:
 
 
 def _money_cell(value: Any) -> str:
-    if value in (None, "", 0):
+    if value in (None, ""):
         return "&mdash;"
     try:
-        return f"${float(value):,.0f}"
+        return f"${float(value):,.2f}"
     except (TypeError, ValueError):
         return html.escape(str(value))
 
 
 def _schedule_row_html(row: dict[str, Any]) -> str:
+    from app.services.debt_terms import normalize_terms
+
+    row = normalize_terms(row)
     rate = row.get("rate")
+    factor = row.get("factor_rate")
     cells = [
         f"<td>{_cell(row.get('lender'))}</td>",
         f"<td>{_cell(row.get('debt_type'))}</td>",
         f"<td class='num'>{_money_cell(row.get('original_amount'))}</td>",
         f"<td class='num'>{_money_cell(row.get('balance'))}</td>",
         f"<td class='num'>{(f'{float(rate):g}%' if rate not in (None, '') else '&mdash;')}</td>",
-        f"<td class='num'>{_money_cell(row.get('monthly_payment'))}</td>",
+        f"<td class='num'>{_money_cell(row.get('monthly_payment'))}{' <small>calculated</small>' if row.get('monthly_payment_source') == 'native_terms' else ''}</td>",
         f"<td>{_cell(row.get('originated_on'))}</td>",
         f"<td>{_cell(row.get('maturity_on'))}</td>",
         f"<td>{_cell((row.get('secured') or '').title() or None)}</td>",
         f"<td>{_cell((row.get('payment_status') or '').title() or None)}</td>",
         f"<td>{_cell(row.get('collateral'))}</td>",
+        f"<td class='num'>{(f'{float(factor):.3f}×' if factor is not None else '&mdash;')}</td>",
+        f"<td class='num'>{_money_cell(row.get('payment_amount'))}</td>",
+        f"<td>{_cell((row.get('payment_frequency') or '').title() or None)}</td>",
     ]
     out = f"<tr>{''.join(cells)}</tr>"
     note = str(row.get("notes") or "").strip()
@@ -592,10 +616,11 @@ def _schedule_row_html(row: dict[str, Any]) -> str:
 def render_debt_schedule_pdf(
     *,
     business_name: str,
-    total_balance: float,
-    total_monthly: float,
+    total_balance: float | None,
+    total_monthly: float | None,
     debts: list[tuple[str, float, float]] | None = None,
     rows: list[dict[str, Any]] | None = None,
+    no_debt: bool = False,
 ) -> bytes:
     """The schedule as a lender reads it.
 
@@ -604,7 +629,7 @@ def render_debt_schedule_pdf(
     collateral and any note — and is what the borrower's form and the desk's
     editor both send. `debts` is the older three-tuple, still used where a
     caller genuinely only holds lender, balance and payment; it renders the
-    narrow table rather than eleven columns of em dashes.
+    narrow table rather than a full schedule of em dashes.
     """
     from weasyprint import HTML
 
@@ -614,9 +639,9 @@ def render_debt_schedule_pdf(
         totals = (
             "<tr class='totals'>"
             "<td colspan='3'>Total</td>"
-            f"<td class='num'>${total_balance:,.0f}</td>"
+            f"<td class='num'>{_statement_money(total_balance)}</td>"
             "<td></td>"
-            f"<td class='num'>${total_monthly:,.0f}</td>"
+            f"<td class='num'>{_statement_money(total_monthly)}</td>"
             f"<td colspan='{len(_SCHEDULE_COLUMNS) - 6}'></td>"
             "</tr>"
         )
@@ -625,7 +650,7 @@ def render_debt_schedule_pdf(
         table = f"<table><tr>{header}</tr>{body_rows}{totals}</table>"
         summary = (
             f"{count} obligation{'' if count == 1 else 's'} &middot; "
-            f"${total_monthly:,.0f} a month &middot; ${total_balance:,.0f} outstanding"
+            f"{_statement_money(total_monthly)} a month &middot; {_statement_money(total_balance)} outstanding"
         )
     else:
         style = _STYLE
@@ -636,8 +661,8 @@ def render_debt_schedule_pdf(
         table = (
             "<table><tr><th>Lender</th><th>Current balance</th><th>Monthly payment</th></tr>"
             f"{narrow}"
-            f"<tr class='totals'><td>Total</td><td>${total_balance:,.2f}</td>"
-            f"<td>${total_monthly:,.2f}</td></tr></table>"
+            f"<tr class='totals'><td>Total</td><td>{_statement_money(total_balance)}</td>"
+            f"<td>{_statement_money(total_monthly)}</td></tr></table>"
         )
         summary = ""
 
@@ -647,6 +672,7 @@ def render_debt_schedule_pdf(
       <body>
         <h1>Business Debt Schedule</h1>
         <div class="muted">{html.escape(business_name)}{f" &middot; {summary}" if summary else ""}</div>
+        {'<p>The business declares that it has no outstanding business debt.</p>' if no_debt else ''}
         {table}
         <div class="disclaimer">
           {html.escape(FORM_DISCLAIMER)} Submitted electronically {datetime.now(UTC).isoformat()}.

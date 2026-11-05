@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Iterable
-
+from collections.abc import Iterable
+from typing import Any
 
 FINANCIAL_CONFIRMATION_FIELDS = (
     "annual_sales",
@@ -46,12 +46,26 @@ def debt_source_hash(rows: Iterable[Any]) -> str:
     ).hexdigest()
 
 
-def financial_confirmation_blockers(profile: Any | None) -> list[str]:
+def accepted_debt_confirmation(version: Any, rows: Iterable[Any]) -> dict:
+    """Bridge an already accepted immutable version to legacy workflow reads."""
+    return {
+        "status": "no_business_debt" if (version.body or {}).get("no_debt") is True else "schedule_confirmed",
+        "source_sha256": debt_source_hash(rows),
+        "confirmed_at": version.created_at,
+        "confirmed_by_user_id": getattr(version, "actor_user_id", None),
+        "note": f"Completed saved debt schedule v{version.version_number}.",
+        "financial_version_id": str(version.id),
+        "financial_version_number": version.version_number,
+        "financial_version_content_hash": getattr(version, "body_sha256", None),
+    }
+
+
+def financial_confirmation_blockers(profile: Any | None, *, accepted_debt_schedule: bool = False) -> list[str]:
     if profile is None:
         return [
             "Confirm annual sales.",
             "Confirm annual cash flow available for debt.",
-            "Confirm monthly debt payments.",
+            *([] if accepted_debt_schedule else ["Confirm monthly debt payments."]),
         ]
     confirmations = dict(getattr(profile, "field_confirmations", None) or {})
     labels = {
@@ -61,6 +75,8 @@ def financial_confirmation_blockers(profile: Any | None) -> list[str]:
     }
     blockers = []
     for field in FINANCIAL_CONFIRMATION_FIELDS:
+        if field == "monthly_debt_payments" and accepted_debt_schedule:
+            continue
         if getattr(profile, field, None) is None or field not in confirmations:
             blockers.append(f"Confirm {labels[field]}.")
     return blockers

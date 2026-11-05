@@ -360,6 +360,22 @@ def _missing_for_program(values: dict[str, str], base_missing: list[str], progra
     return sorted(missing)
 
 
+def _financial_confirmation_missing(profile: Any, *, accepted_debt_schedule: bool = False) -> set[str]:
+    field_confirmations = dict(profile.field_confirmations or {})
+    missing = {
+        label for field, label in (
+            ("annual_sales", "annual sales confirmation"),
+            ("annual_cash_flow_available_for_debt", "annual cash flow confirmation"),
+            ("monthly_debt_payments", "monthly debt payment confirmation"),
+        )
+        if field not in field_confirmations and not (field == "monthly_debt_payments" and accepted_debt_schedule)
+    }
+    debt_confirmation = dict(field_confirmations.get("debt_schedule") or {})
+    if not accepted_debt_schedule and debt_confirmation.get("status") not in {"schedule_confirmed", "no_business_debt"}:
+        missing.add("confirmed debt schedule or no-business-debt acknowledgment")
+    return missing
+
+
 async def generate_envelope(
     db: AsyncSession,
     dealer: DealerBusiness,
@@ -672,27 +688,9 @@ async def generate_envelope(
         "package_programs": package_snapshot,
     }
     values_by_program: dict[str, dict[str, Any]] = {}
-    field_confirmations = dict(profile.field_confirmations or {})
-    financial_confirmation_missing = {
-        label
-        for field, label in (
-            ("annual_sales", "annual sales confirmation"),
-            (
-                "annual_cash_flow_available_for_debt",
-                "annual cash flow confirmation",
-            ),
-            ("monthly_debt_payments", "monthly debt payment confirmation"),
-        )
-        if field not in field_confirmations
-    }
-    debt_confirmation = dict(field_confirmations.get("debt_schedule") or {})
-    if debt_confirmation.get("status") not in {
-        "schedule_confirmed",
-        "no_business_debt",
-    }:
-        financial_confirmation_missing.add(
-            "confirmed debt schedule or no-business-debt acknowledgment"
-        )
+    financial_confirmation_missing = _financial_confirmation_missing(
+        profile, accepted_debt_schedule=bool(context.get("debt_schedule_authoritative")),
+    )
     for program_key in selected_programs:
         values = dict(base_values)
         values["selected_program"] = program_key

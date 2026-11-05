@@ -327,6 +327,7 @@ def extract_debt_schedule(analyses: list[dict[str, Any]]) -> dict[str, Any] | No
     total_outstanding_balance = 0.0
     debts: list[dict[str, Any]] = []
     found = False
+    monthly_complete = balance_complete = True
     for item in analyses:
         if item.get("classification") != "debt_schedule":
             continue
@@ -336,18 +337,25 @@ def extract_debt_schedule(analyses: list[dict[str, Any]]) -> dict[str, Any] | No
         found = True
         monthly = _num(facts.get("total_monthly_debt_service"))
         outstanding = _num(facts.get("total_outstanding_balance"))
+        rows = facts.get("debts")
+        listed = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+        if monthly is None and listed and all(_num(row.get("monthly_payment")) is not None for row in listed):
+            monthly = sum(_num(row["monthly_payment"]) for row in listed)
+        if outstanding is None and listed and all(_num(row.get("current_balance")) is not None for row in listed):
+            outstanding = sum(_num(row["current_balance"]) for row in listed)
+        monthly_complete = monthly_complete and monthly is not None
+        balance_complete = balance_complete and outstanding is not None
         if monthly is not None:
             total_monthly_debt_service += monthly
         if outstanding is not None:
             total_outstanding_balance += outstanding
-        rows = facts.get("debts")
         if isinstance(rows, list):
             debts.extend(row for row in rows if isinstance(row, dict))
     if not found:
         return None
     return {
-        "total_monthly_debt_service": round(total_monthly_debt_service, 2) if total_monthly_debt_service else None,
-        "total_outstanding_balance": round(total_outstanding_balance, 2) if total_outstanding_balance else None,
+        "total_monthly_debt_service": round(total_monthly_debt_service, 2) if monthly_complete else None,
+        "total_outstanding_balance": round(total_outstanding_balance, 2) if balance_complete else None,
         "debts": debts,
     }
 

@@ -1389,8 +1389,8 @@ class FinancialFormStatus(BaseModel):
     statement_id: UUID | None = None
     #: Rows on the business debt schedule, and what they come to.
     row_count: int = 0
-    total_monthly: float = 0
-    total_balance: float = 0
+    total_monthly: float | None = 0
+    total_balance: float | None = 0
     net_worth: float | None = None
     updated_at: datetime | None = None
     #: True when a staff member completed it rather than the borrower.

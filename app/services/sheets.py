@@ -110,7 +110,7 @@ class _Loaded:
     """One sheet as it currently stands: the body a save would patch, the row
     that holds it, and how it is reported."""
 
-    __slots__ = ("body", "statement", "status", "completed", "rev")
+    __slots__ = ("body", "statement", "status", "completed", "rev", "draft")
 
     def __init__(
         self,
@@ -126,6 +126,7 @@ class _Loaded:
         self.status = status
         self.completed = completed
         self.rev = rev
+        self.draft = None
 
 
 
@@ -379,6 +380,18 @@ async def _load(
     worksheet: FinancialWorksheet,
 ) -> _Loaded:
     """One sheet's current body, through the reader that already owns it."""
+    from app.services import financial_workspace
+
+    draft = await financial_workspace.existing_draft(db, profile, kind)
+    if draft is not None:
+        body = financial_workspace.active_body(kind, draft.body)
+        if kind == "debt_schedule":
+            for row in body.get("debts") or []:
+                row["owner"] = row.get("origin") or row.get("owner") or "admin"
+                row["editable"] = origin == "admin" or row["owner"] == origin
+        loaded = _Loaded(body, None, status="draft", completed=False, rev=worksheet.revision)
+        loaded.draft = draft
+        return loaded
     if kind in bss.KINDS:
         body, statement = await business_statements.body_for_profile(
             db, profile, kind, dict(prefill)
@@ -603,6 +616,34 @@ async def _save_kind(
     source's rows matched but untouched. A grid that wrote rows itself would
     lose all three rules on its first keystroke.
     """
+    if loaded.draft is not None:
+        from types import SimpleNamespace
+
+        from app.models.financial_form_version import FinancialFormFamily
+        from app.services import financial_workspace
+
+        draft = loaded.draft
+        family = await db.get(FinancialFormFamily, draft.family_id)
+        if kind == "debt_schedule":
+            for row in body.get("debts") or []:
+                if not row.get("id"):
+                    row["id"] = str(uuid.uuid4())
+            before = {str(row["id"]): row for row in draft.body.get("debts") or [] if row.get("id")}
+            wanted = {str(row["id"]): row for row in body.get("debts") or [] if row.get("id")}
+            rows = []
+            for key, previous in before.items():
+                owner = previous.get("origin") or previous.get("owner") or "admin"
+                if previous.get("status", "active") != "active" or origin != "admin" and owner != origin:
+                    rows.append(previous)
+                elif key in wanted:
+                    rows.append({**previous, **wanted.pop(key)})
+                else:
+                    rows.append({**previous, "status": "dismissed", "duplicate_of_id": None})
+                wanted.pop(key, None)
+            rows.extend({**row, "origin": origin, "status": "active"} for row in wanted.values())
+            body = {**draft.body, **body, "debts": rows}
+        saved = await financial_workspace.stage_draft(db, profile, family, draft, body, actor=SimpleNamespace(id=actor_user_id))
+        return saved
     if kind in bss.KINDS:
         return await business_statements.save(
             db,
@@ -641,6 +682,11 @@ async def _stored_body(
     body was stored verbatim; the debt schedule is re-read, because its save
     normalises figures, drops a line nobody filled in, and refuses a row this
     origin does not own — all of which the grid needs to be told about."""
+    from app.models.financial_form_version import FinancialFormDraft
+    from app.services import financial_workspace
+
+    if isinstance(saved, FinancialFormDraft):
+        return financial_workspace.active_body(kind, saved.body)
     if kind == "debt_schedule":
         return await financial_statements.debt_body_for_profile(db, profile, origin=origin)
     return dict(getattr(saved, "body", None) or body)
@@ -864,14 +910,7 @@ async def apply_row_op(
         touched = fresh["id"] if fresh is not None else row_id
         schedules[spec.key] = rows
         body["schedules"] = schedules
-        saved = await financial_statements.save_statement(
-            db,
-            profile,
-            body=body,
-            status=loaded.status,
-            actor_user_id=actor_user_id,
-            statement=loaded.statement,
-        )
+        saved = await _save_kind(db, profile, kind, loaded, body, origin=origin, actor_user_id=actor_user_id)
         worksheet.revision = int(worksheet.revision) + 1
         await _stamp_sheet_rev(db, kind, getattr(saved, "id", None), worksheet.revision)
         await db.flush()
@@ -909,16 +948,11 @@ async def apply_row_op(
     rows = _apply_rows(rows, op=op, row_id=row_id, after=after)
     # Only what somebody typed is written — `debt_rows_from_body` drops the
     # blank lines, so the minted padding goes no further than this answer.
-    await financial_statements.save_debt_rows(
-        db,
-        profile,
-        financial_statements.debt_rows_from_body({"debts": rows}),
-        origin=origin,
-    )
+    saved = await _save_kind(db, profile, kind, loaded, {**loaded.body, "debts": rows}, origin=origin, actor_user_id=actor_user_id)
     worksheet.revision = int(worksheet.revision) + 1
     await db.flush()
     await _announce(db, worksheet, [_row_announcement(row_id, worksheet.revision)])
-    stored = await financial_statements.debt_body_for_profile(db, profile, origin=origin)
+    stored = await _stored_body(db, profile, kind, saved, {**loaded.body, "debts": rows}, origin=origin)
     body = {**stored, "debts": _reconciled(rows, stored.get("debts") or [])}
     return {
         "rows": _row_payloads(kind, body, exact="debts"),

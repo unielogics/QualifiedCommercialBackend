@@ -97,6 +97,37 @@ def test_a_submitted_statement_reports_filled_with_the_forms_own_figures():
     extractor.assert_not_called()
 
 
+@pytest.mark.parametrize("no_debt", [False, True])
+def test_financial_overview_uses_accepted_schedule_even_when_legacy_slot_still_says_requested(no_debt):
+    from app.schemas.application_profile import FinancialFormStatus
+    from app.services import financial_version_selection
+
+    schedule = {"no_debt": no_debt, "debts": [] if no_debt else [
+        {"id": str(uuid.uuid4()), "lender": f"Lender {index}", "balance": "1000", "monthly_payment": "100"}
+        for index in range(5)
+    ]}
+    accepted = SimpleNamespace(body=schedule, created_at=datetime.now(UTC))
+    profile, db = _profile(), _db(rows=[SimpleNamespace(lender="Extra detected payee") for _ in range(30)])
+    with (
+        patch.object(profiles, "load_profile", AsyncMock(return_value=profile)),
+        patch.object(financial_statements, "latest_for_profile", AsyncMock(return_value=None)),
+        patch.object(router, "_requested_slot", AsyncMock(return_value=_slot(status="requested"))),
+        patch.object(router, "_business_statement_status", AsyncMock(side_effect=lambda _db, _profile, kind: FinancialFormStatus(kind=kind, label=kind))),
+        patch.object(router, "_packets_for_profile", AsyncMock(return_value=[])),
+        patch.object(financial_version_selection, "accepted_debt_schedule_snapshot", AsyncMock(return_value=accepted)),
+        patch.object(router, "_slot_analyses", AsyncMock()) as uploaded,
+    ):
+        response = _run(router.financial_forms_status(profile.id, _user(), db))
+    status = next(form for form in response.forms if form.kind == "debt_schedule")
+    assert status.satisfied and status.source == "filled" and not status.analysis_pending
+    assert status.row_count == (0 if no_debt else 5)
+    assert status.total_monthly == (0 if no_debt else 500)
+    assert status.total_balance == (0 if no_debt else 5000)
+    assert status.updated_at == accepted.created_at
+    db.execute.assert_not_awaited()
+    uploaded.assert_not_awaited()
+
+
 def test_a_recognised_upload_on_the_slot_reports_uploaded_with_the_documents_figures():
     analyses = [{"classification": "current_p_and_l", "key_facts": {"net_income": 5}}]
     status, slot_reads, bucket_reads, extractor = _status(

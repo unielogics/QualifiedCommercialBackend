@@ -56,6 +56,11 @@ class FinancialFormLink(TimestampMixin, Base):
     statement_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("financial_statements.id", ondelete="CASCADE")
     )
+    # Bind a forwarded link to its selected owner/reporting-period family.
+    # It must not silently follow a newer statement for another person.
+    financial_family_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("financial_form_families.id", ondelete="CASCADE"), index=True
+    )
     #: SHA-256 of the token. The token itself is shown once, at mint time.
     token_hash: Mapped[str] = mapped_column(String(96), nullable=False, unique=True, index=True)
     label: Mapped[str | None] = mapped_column(String(120))
