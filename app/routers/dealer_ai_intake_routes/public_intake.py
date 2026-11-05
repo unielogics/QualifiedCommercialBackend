@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 import app.routers.dealer_ai_intake as core
+from app.services import onboarding_consent
 
 __all__ = [
     "start_dealer_intake",
@@ -135,6 +136,7 @@ async def start_dealer_intake(
             "terms_version": payload.terms_version or core.TERMS_VERSION,
             "privacy_version": payload.privacy_version or core.PRIVACY_VERSION,
             **core._request_audit(request),
+            **onboarding_consent.choices_record(payload),
         },
     }
     intake = core.PublicUnderwritingIntake(
@@ -164,6 +166,9 @@ async def start_dealer_intake(
         )
     await db.commit()
     intake = await core._load_public_intake(db, token)
+    await onboarding_consent.record_for_start(
+        db, intake, payload, request, entry="starting an equipment financing application" if business_equipment else "starting an application"
+    )
     email_record = await core._record_resume_email(
         intake,
         token=token,

@@ -117,6 +117,10 @@ class ApplicationSmsState(BaseModel):
     provider_available: bool = False
     blocked_reason: str | None = None
     grants: list[SmsConsentOut] = Field(default_factory=list)
+    #: What the client chose when they started the application, kept whether
+    #: they agreed or not: {"transactional": bool, "marketing": bool,
+    #: "asked_at": iso or None}. None when the file predates the choice.
+    onboarding_choice: dict | None = None
 
 
 class ApplicationSmsPreferencePatch(BaseModel):
@@ -653,10 +657,24 @@ def _contact_for_owner(
     return next((item for item in contacts if item.email == owner_email), None)
 
 
+def _onboarding_choice(intake: PublicUnderwritingIntake | None) -> dict | None:
+    """What the client ticked, or declined, on the first screen of the file."""
+    legal = ((intake.intake_state or {}).get("legal_acceptance") or {}) if intake else {}
+    choices = legal.get("sms_choices")
+    if not isinstance(choices, dict):
+        return None
+    return {
+        "transactional": bool(choices.get("transactional")),
+        "marketing": bool(choices.get("marketing")),
+        "asked_at": legal.get("timestamp"),
+    }
+
+
 async def _sms_state(db: AsyncSession, profile: ApplicationProfile) -> ApplicationSmsState:
     intake = (
         await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
     )
+    onboarding_choice = _onboarding_choice(intake)
     client = await db.get(Client, profile.client_id) if profile.client_id else None
     phone = consent_delivery.normalize_phone(
         (intake.phone if intake else None) or (client.phone if client else None)
@@ -680,6 +698,7 @@ async def _sms_state(db: AsyncSession, profile: ApplicationProfile) -> Applicati
             provider_available=provider_ready,
             blocked_reason="No mobile number is on this file.",
             grants=grants,
+            onboarding_choice=onboarding_choice,
         )
     opted_out = await is_opted_out(db, phone)
     transactional = await sms_consent_svc.consent_for(db, phone_e164=phone, kind="transactional")
@@ -701,6 +720,7 @@ async def _sms_state(db: AsyncSession, profile: ApplicationProfile) -> Applicati
         provider_available=provider_ready,
         blocked_reason=reason,
         grants=grants,
+        onboarding_choice=onboarding_choice,
     )
 
 

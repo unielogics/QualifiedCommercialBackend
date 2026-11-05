@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.routers.dealer_ai_intake as core
+from app.services import onboarding_consent
 
 __all__ = [
     "start_funding_review",
@@ -122,12 +123,14 @@ async def start_funding_review(
                 "terms_version": payload.terms_version or core.TERMS_VERSION,
                 "privacy_version": payload.privacy_version or core.PRIVACY_VERSION,
                 **core._request_audit(request),
+                **onboarding_consent.choices_record(payload),
             },
         },
     )
     db.add(intake)
     await db.commit()
     intake = await core._load_public_intake(db, token)
+    await onboarding_consent.record_for_start(db, intake, payload, request, entry="starting a real estate funding review")
     await core._record_resume_email(
         intake,
         token=token,

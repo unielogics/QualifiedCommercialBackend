@@ -34,7 +34,7 @@ from app.models.user import User
 from app.routers.buckets import _generate_passcode
 from app.routers.dealer_ai_intake import _hash_token, _new_public_token, _record_resume_email
 from app.services import clerk as clerk_service
-from app.services import intake_retention
+from app.services import intake_retention, onboarding_consent
 from app.services.foreclosure_rescue import (
     AMORTIZATION_MONTHS,
     CLOSING_DOCUMENTS,
@@ -95,6 +95,10 @@ class ForeclosureRescueIntakeCreate(BaseModel):
     owner_contact_consent: bool = False
     terms_accepted: bool
     privacy_accepted: bool
+    # Only an owner submitting for themselves can agree to texts; an attorney or
+    # broker cannot consent for the client, whose phone number they typed.
+    sms_transactional_consent: bool = False
+    sms_marketing_consent: bool = False
 
     @model_validator(mode="after")
     def validate_conditional_fields(self):
@@ -531,11 +535,13 @@ async def _create_foreclosure_rescue(
                 "ip_address": request.client.host if request.client else None,
                 "user_agent": request.headers.get("user-agent"),
                 "timestamp": datetime.now(UTC).isoformat(),
+                **(onboarding_consent.choices_record(payload) if actor is None and payload.submitter_type == "owner_direct" else {}),
             },
         },
     )
     db.add(intake)
     await db.flush()
+    owner_consent_payload = payload if actor is None and payload.submitter_type == "owner_direct" else None
     await _audit(
         db,
         intake,
@@ -552,6 +558,8 @@ async def _create_foreclosure_rescue(
         ),
     )
     await db.commit()
+    if owner_consent_payload is not None:
+        await onboarding_consent.record_for_start(db, intake, owner_consent_payload, request, entry="submitting their foreclosure rescue request")
     if send_resume_email:
         await _record_resume_email(
             intake,

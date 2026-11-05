@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.routers.dealer_ai_intake as core
+from app.services import onboarding_consent
 
 __all__ = [
     "claim_capital_readiness_diagnostic",
@@ -184,10 +185,24 @@ async def claim_capital_readiness_diagnostic(
         "terms_version": payload.terms_version,
         "privacy_version": payload.privacy_version,
     }
+    state["capital_readiness_claim"] = {**state["capital_readiness_claim"], **onboarding_consent.choices_record(payload)}
     intake.intake_state = state
     intake.source_kind = "client_capital_readiness"
     intake.source_detail = "Consented Capital Readiness diagnostic"
     profile = await core.profiles_service.provision_profile_for_intake(db, intake)
+    try:
+        async with db.begin_nested():
+            await onboarding_consent.record_choices(
+                db,
+                profile,
+                phone=payload.phone,
+                consenter_name=(payload.full_name or locked_user.name or client.name),
+                payload=payload,
+                request=request,
+                entry="opening their Main Street application",
+            )
+    except Exception:  # noqa: BLE001 - the claim must complete either way
+        core.log.exception("onboarding consent could not be recorded claim=%s", payload.idempotency_key)
     snapshot = await core.capital_readiness_service.recompute(
         db,
         profile,

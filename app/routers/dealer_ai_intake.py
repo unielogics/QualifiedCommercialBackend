@@ -696,6 +696,9 @@ class CapitalReadinessClaimRequest(BaseModel):
     privacy_accepted: bool
     terms_version: str = Field(default=TERMS_VERSION, max_length=32)
     privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
+    # Texts are optional (the disclosure says so); declining starts the file just the same.
+    sms_transactional_consent: bool = False
+    sms_marketing_consent: bool = False
 
 
 class CapitalReadinessClaimResponse(BaseModel):
@@ -715,6 +718,9 @@ class DealerIntakeStart(PublicIntakeAttribution):
     privacy_accepted: bool = False
     terms_version: str = Field(default=TERMS_VERSION, max_length=32)
     privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
+    # Texts are optional (the disclosure says so); declining starts the file just the same.
+    sms_transactional_consent: bool = False
+    sms_marketing_consent: bool = False
     preferred_language: Language = Language.EN
     capital_readiness_diagnostic: CapitalReadinessDiagnostic | None = None
     requested_amount: float | None = Field(default=None, ge=0, le=100_000_000)
@@ -741,6 +747,9 @@ class FundingReviewStart(PublicIntakeAttribution):
     privacy_accepted: bool = False
     terms_version: str = Field(default=TERMS_VERSION, max_length=32)
     privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
+    # Texts are optional (the disclosure says so); declining starts the file just the same.
+    sms_transactional_consent: bool = False
+    sms_marketing_consent: bool = False
     preferred_language: Language = Language.EN
     capital_readiness_diagnostic: CapitalReadinessDiagnostic | None = None
 
@@ -9976,6 +9985,9 @@ class McaRefiStart(PublicIntakeAttribution):
     privacy_accepted: bool = False
     terms_version: str = Field(default=TERMS_VERSION, max_length=32)
     privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
+    # Texts are optional (the disclosure says so); declining starts the file just the same.
+    sms_transactional_consent: bool = False
+    sms_marketing_consent: bool = False
     preferred_language: Language = Language.EN
 
     @field_validator("phone", "business_name", "payment_frequency", mode="before")
