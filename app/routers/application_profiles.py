@@ -7816,3 +7816,35 @@ async def request_financial_form(
     )
     await db.commit()
     return {"requested": True, "already": False}
+
+
+@router.post(
+    "/{profile_id}/financial-forms/{kind}/email-link",
+    response_model=RoomDeliveryReceipt,
+)
+async def email_financial_form_link(
+    profile_id: UUID,
+    kind: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RoomDeliveryReceipt:
+    """Put the form on the checklist and email the client the link that fills it in.
+
+    The one click for the desk when a file has no debt schedule (or personal
+    statement, or business statement) yet. See `form_link_email` for what it
+    writes and why a second click does not mail the client twice.
+    """
+    from app.services import form_link_email
+
+    _require_underwriting_actor(user)
+    if kind not in _FORM_SLOT_CATEGORY:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
+    # On the checklist first. Idempotent, and it commits its own write.
+    await request_financial_form(profile_id, kind, user, db)
+    profile = await profiles.load_profile(db, profile_id, user)
+    slot = await _requested_slot(db, profile, kind)
+    delivery = await form_link_email.email_form_link(
+        db, profile=profile, kind=kind, label=_FORM_LABEL[kind], slot=slot, user=user
+    )
+    await db.commit()
+    return _room_delivery_read(delivery)
