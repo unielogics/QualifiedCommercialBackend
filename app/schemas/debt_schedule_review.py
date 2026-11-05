@@ -120,6 +120,8 @@ class DebtScheduleReviewRead(BaseModel):
     #: read / on_schedule / removed lines, and every required answer still
     #: missing across the lines that are staying.
     counts: dict[str, int] = Field(default_factory=dict)
+    #: The schedule has been filed as the document on the checklist (our PDF of the rows is behind the slot).
+    filed: bool = False
 
 
 class DebtReviewLineWrite(BaseModel):
@@ -168,6 +170,8 @@ class DebtReviewLineWrite(BaseModel):
 
 class DebtScheduleReviewWrite(BaseModel):
     lines: list[DebtReviewLineWrite] = Field(max_length=80)
+    #: Also file the saved rows as the debt schedule on the checklist (counts as received).
+    file_as_schedule: bool = False
 
 
 class DebtScheduleReviewSaved(BaseModel):
@@ -181,3 +185,7 @@ class DebtScheduleReviewSaved(BaseModel):
 class DebtScheduleReviewResult(BaseModel):
     review: DebtScheduleReviewRead
     saved: DebtScheduleReviewSaved
+    #: The schedule was filed on the checklist by this save.
+    filed: bool = False
+    #: Why it was not, when filing was asked for: the schedule form's own sentence.
+    filing_problem: str | None = None

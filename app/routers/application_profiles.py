@@ -2694,7 +2694,9 @@ async def get_debt_schedule_review(
     approved and the balance. Staff only, like the rest of the schedule."""
     profile = await profiles.load_profile(db, profile_id, user)
     _require_statement_staff(user)
-    return DebtScheduleReviewRead(**await debt_schedule_review.read_review(db, profile))
+    review = await debt_schedule_review.read_review(db, profile)
+    review["filed"] = await _debt_schedule_filed(db, profile)
+    return DebtScheduleReviewRead(**review)
 
 
 @router.post("/{profile_id}/debt-schedule/review", response_model=DebtScheduleReviewResult)
@@ -2706,7 +2708,12 @@ async def apply_debt_schedule_review(
 ) -> DebtScheduleReviewResult:
     """Save the desk's decisions on the lines: the ones kept become (or update)
     the file's schedule rows with the answers given, the ones taken off are
-    dismissed (kept as history, never deleted) so they do not return."""
+    dismissed (kept as history, never deleted) so they do not return.
+
+    With `file_as_schedule` the saved rows are also filed as the debt schedule on
+    the checklist, the way the desk's own submit files it (one PDF per slot,
+    refreshed in place). The rows are saved either way; a schedule still missing
+    answers is not filed, and the answer says why in the form's own words."""
     _require_underwriting_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
     # One review at a time per file: a second click waits here and then
@@ -2728,10 +2735,33 @@ async def apply_debt_schedule_review(
         target_id=profile.id,
         metadata={"saved": saved, "kept": kept[:40], "removed": taken_off[:40]},
     )
+    filed, filing_problem = False, None
+    if payload.file_as_schedule:
+        filed, filing_problem = await _file_schedule_from_rows(db, profile, user)
+        if filed:
+            await profiles.log_profile_action(
+                db,
+                profile,
+                user,
+                "financial_form.debt_schedule_filed",
+                "Filed the reviewed debt schedule as the schedule on the checklist",
+                target_type="financial_form",
+                target_id=profile.id,
+            )
     await db.commit()
+    if not filed:
+        # A schedule filed earlier stays current with the rows: the same refresh
+        # the form's draft saves queue (a no-op while nothing was ever filed).
+        await drafted_forms.enqueue_form_refresh(
+            db, profile, "debt_schedule", actor_name=user.name or user.email, actor_email=user.email
+        )
+    review = await debt_schedule_review.read_review(db, profile)
+    review["filed"] = await _debt_schedule_filed(db, profile)
     return DebtScheduleReviewResult(
-        review=DebtScheduleReviewRead(**await debt_schedule_review.read_review(db, profile)),
+        review=DebtScheduleReviewRead(**review),
         saved=DebtScheduleReviewSaved(**saved),
+        filed=filed,
+        filing_problem=filing_problem,
     )
 
 
@@ -6917,6 +6947,122 @@ async def read_debt_schedule_body(
     return await financial_statements.debt_body_for_profile(db, profile, origin="admin")
 
 
+async def _file_debt_schedule(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    user: User,
+    rows: list[dict],
+    *,
+    business_name: str,
+) -> bool:
+    """File the schedule as the document that satisfies the checklist row.
+
+    Renders the PDF from the rows and puts it behind the file's debt schedule
+    slot (the one drafted-form document the slot ever has, refreshed in place),
+    marking the slot received. Returns False, filing nothing, when the file has
+    no such slot. Does not commit.
+    """
+    slot = await _requested_slot(db, profile, "debt_schedule")
+    if slot is None:
+        return False
+    facts = financial_statements.debt_key_facts(rows)
+    await drafted_forms.refresh_form_pdf(
+        db,
+        bucket_id=profile.primary_bucket_id,
+        upload_link_id=None,
+        requested_document=slot,
+        pdf_bytes=dealer_forms_pdf.render_debt_schedule_pdf(
+            business_name=business_name,
+            # The full row, not three columns of it. The borrower was
+            # asked for type, rate, dates, collateral and status; a PDF
+            # that drops them sends a partner back to ask again.
+            rows=rows,
+            total_balance=facts["total_outstanding_balance"],
+            total_monthly=facts["total_monthly_debt_service"],
+        ),
+        file_label="Business Debt Schedule",
+        classification="debt_schedule",
+        key_facts=facts,
+        actor_name=user.name or user.email,
+        actor_email=user.email,
+        summary=(
+            f"Business Debt Schedule completed by {user.name or user.email} "
+            "on the borrower's behalf."
+        ),
+        # Submit is what marks the requirement met; a draft save
+        # refreshes the same document without flipping it.
+        mark_uploaded=True,
+    )
+    return True
+
+
+async def _announce_debt_schedule_filed(db: AsyncSession, profile: ApplicationProfile, user: User) -> None:
+    """The timeline row the desk's own submit writes (see `save_debt_schedule`), for
+    the review's "file it as the schedule"."""
+    await file_events.emit(
+        db,
+        profile=profile,
+        kind="document.received",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title=f"{_FORM_LABEL['debt_schedule']} was submitted",
+        actor=user,
+        target_type="financial_form",
+        target_id=profile.id,
+        meta={"kind": "debt_schedule"},
+    )
+
+
+async def _debt_schedule_filed(db: AsyncSession, profile: ApplicationProfile) -> bool:
+    """Whether the schedule has been filed as the document that satisfies the
+    checklist row: the slot is received and holds our drafted PDF of the rows."""
+    if profile.primary_bucket_id is None:
+        return False
+    slot = await _requested_slot(db, profile, "debt_schedule")
+    if slot is None or slot.status != "uploaded":
+        return False
+    existing = await drafted_forms._existing_drafted_form(
+        db,
+        bucket_id=profile.primary_bucket_id,
+        requested_document_id=slot.id,
+        classification="debt_schedule",
+    )
+    return existing is not None
+
+
+async def _file_schedule_from_rows(
+    db: AsyncSession, profile: ApplicationProfile, user: User
+) -> tuple[bool, str | None]:
+    """File the schedule as it stands on the file, the way the desk's submit does.
+
+    The rows are read back off the file (the form body, so the PDF is the form's
+    own), held to the same seven required answers, and filed through
+    `_file_debt_schedule`. Returns (filed, the sentence for why not): a schedule
+    still missing answers is refused in the words of the 422 the form shows,
+    never filed half-empty.
+    """
+    if profile.primary_bucket_id is None:
+        return False, "This file has no document room to file the schedule into."
+    body = await financial_statements.debt_body_for_profile(db, profile, origin="admin")
+    rows = financial_statements.debt_rows_from_body(body)
+    if not rows:
+        return False, "There are no lines on the schedule to file."
+    problems = await financial_statements.debt_submit_problems(db, profile, rows, origin="admin")
+    if problems:
+        return False, financial_statements.describe_debt_problems(problems)
+    if await _requested_slot(db, profile, "debt_schedule") is None:
+        # Every file carries the debt schedule; this one has no checklist row
+        # yet. The idempotent request puts it there (and commits its own write).
+        await request_financial_form(profile.id, "debt_schedule", user, db)
+    prefill = await financial_statements.form_prefill(db, profile)
+    filed = await _file_debt_schedule(
+        db, profile, user, rows, business_name=prefill.get("business_name") or "the business"
+    )
+    if not filed:
+        return False, "The debt schedule could not be put on the checklist."
+    await _announce_debt_schedule_filed(db, profile, user)
+    return True, None
+
+
 @router.put("/{profile_id}/financial-forms/debt-schedule")
 async def save_debt_schedule(
     profile_id: UUID,
@@ -6955,36 +7101,9 @@ async def save_debt_schedule(
     await financial_statements.save_debt_rows(db, profile, rows, origin="admin")
 
     if payload.submit:
-        slot = await _requested_slot(db, profile, "debt_schedule")
-        if slot is not None:
-            facts = financial_statements.debt_key_facts(rows)
-            await drafted_forms.refresh_form_pdf(
-                db,
-                bucket_id=profile.primary_bucket_id,
-                upload_link_id=None,
-                requested_document=slot,
-                pdf_bytes=dealer_forms_pdf.render_debt_schedule_pdf(
-                    business_name=(payload.body or {}).get("business_name") or "the business",
-                    # The full row, not three columns of it. The borrower was
-                    # asked for type, rate, dates, collateral and status; a PDF
-                    # that drops them sends a partner back to ask again.
-                    rows=rows,
-                    total_balance=facts["total_outstanding_balance"],
-                    total_monthly=facts["total_monthly_debt_service"],
-                ),
-                file_label="Business Debt Schedule",
-                classification="debt_schedule",
-                key_facts=facts,
-                actor_name=user.name or user.email,
-                actor_email=user.email,
-                summary=(
-                    f"Business Debt Schedule completed by {user.name or user.email} "
-                    "on the borrower's behalf."
-                ),
-                      # Submit is what marks the requirement met; a draft save
-                      # refreshes the same document without flipping it.
-                      mark_uploaded=True,
-                  )
+        await _file_debt_schedule(
+            db, profile, user, rows, business_name=(payload.body or {}).get("business_name") or "the business"
+        )
         await file_events.emit(
             db,
             profile=profile,

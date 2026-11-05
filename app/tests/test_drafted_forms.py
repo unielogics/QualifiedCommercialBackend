@@ -361,16 +361,21 @@ async def test_a_draft_save_then_a_submit_leaves_one_document_not_two():
 
     # Every one of the four forms files through the in-place path, and each
     # asks it to mark the requirement met — which a draft save never does.
+    # The desk's debt schedule submit files through `_file_debt_schedule`, which the
+    # review's "file it as the schedule" shares, so the one place that does it is pinned.
     for source in (
         inspect.getsource(business_statements.file_pdf),
         inspect.getsource(ap._file_statement),
         inspect.getsource(ap.submit_public_financial_form),
-        inspect.getsource(ap.save_debt_schedule),
+        inspect.getsource(ap._file_debt_schedule),
     ):
         assert "store_form_pdf(" not in source, (
             "a submit that creates its own document leaves the draft's behind"
         )
         assert "refresh_form_pdf(" in source and "mark_uploaded=True" in source
+    for handler in (ap.save_debt_schedule, ap._file_schedule_from_rows):
+        assert "_file_debt_schedule(" in inspect.getsource(handler), handler.__name__
+        assert "store_form_pdf(" not in inspect.getsource(handler), handler.__name__
 
 
 def test_every_worksheet_write_refreshes_the_document_the_ai_reads():
