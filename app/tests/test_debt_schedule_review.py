@@ -129,16 +129,19 @@ def test_a_line_names_the_answers_it_still_lacks_and_an_advance_is_asked_for_a_f
          "payment_status": "current", "interest_rate": 7.25, "original_amount": 50000},
         {"lender": "Bank of Two", "debt_type": "term_loan", "current_balance": 10000},
         {"lender": "Fast Advance", "debt_type": "mca", "factor_rate": 1.35, "current_balance": 9000,
+         "original_amount": 30000, "monthly_payment": 4000, "payment_status": "current", "mca_modified": "no"},
+        {"lender": "Unasked Advance", "debt_type": "mca", "factor_rate": 1.3, "current_balance": 9000,
          "original_amount": 30000, "monthly_payment": 4000, "payment_status": "current"},
         {"lender": "Typeless", "current_balance": 100},
     ])])
     assert _by_key(review, "bank-of-main")["missing"] == []
     assert _by_key(review, "bank-of-two")["missing"] == ["rate", "original_amount", "payment", "payment_status"]
     assert _by_key(review, "fast-advance")["missing"] == []  # a factor answers the advance's price question
+    assert _by_key(review, "unasked-advance")["missing"] == ["mca_modified"]  # the form asks every advance this
     assert _by_key(review, "typeless")["missing"][0] == "debt_type"
-    # Interest, original amount and balance still open across the lines that stay:
-    # Bank of Two (rate, original amount) and Typeless (rate, original amount).
-    assert review["counts"]["missing_answers"] == 4
+    # Every required answer still open across the lines that stay: Bank of Two (4),
+    # Unasked Advance (1) and Typeless (type, rate, original amount, payment, status).
+    assert review["counts"]["missing_answers"] == 4 + 1 + 5
 
 
 def test_a_rate_the_file_gives_is_a_percent_and_a_factor_is_kept_apart_from_it():
@@ -222,6 +225,63 @@ def test_a_removed_file_only_line_shows_the_figures_it_had_from_the_snapshot_not
                evidence={"source": "debt_schedule_review", "proposed": {"balance": 37388.38, "monthly_payment": 4000.0}})
     removed = dsr.build_review([row], [])["removed"][0]
     assert removed["balance"] == 37388.38 and removed["monthly_payment"] == 4000.0
+
+
+def test_every_cell_says_what_the_file_gave_and_in_whose_words():
+    cells = _by_key(dsr.build_review([], [_document()]), "alpha-funding")["from_file"]
+    assert cells["payment_frequency"] == {"value": "daily", "wording": "weekday", "note": None, "derived": False}
+    assert cells["payment_amount"]["value"] == 359.62 and cells["payment_amount"]["wording"] is None  # the same figure, no extra words
+    assert cells["monthly_payment"] == {"value": 7552.02, "wording": None, "note": None, "derived": True}  # worked out by us
+    assert cells["balance"]["value"] == 13665.71 and cells["balance"]["note"] == "Oct 22 letter; not a verified payoff"
+    assert cells["debt_type"]["value"] == "mca" and cells["payment_status"]["value"] == "current"
+    assert "rate" not in cells and "original_amount" not in cells and "factor_rate" not in cells  # the file never said
+
+
+def test_a_cadence_the_file_could_not_say_keeps_its_wording_so_the_cell_can_explain_itself():
+    cells = _by_key(dsr.build_review([], [_document()]), "credibly")["from_file"]
+    assert cells["payment_frequency"]["value"] is None and cells["payment_frequency"]["wording"] == "recurring"
+    assert "monthly_payment" not in cells  # nothing to work a month out from
+    cells = _by_key(dsr.build_review([], [_document()]), "mystery-8449090040")["from_file"]
+    assert cells["balance"] == {"value": None, "wording": None, "note": "Not confirmed", "derived": False}
+
+
+def test_a_monthly_payment_is_the_file_saying_the_month_not_a_per_payment_amount():
+    review = dsr.build_review([], [_document([
+        {"lender": "Monthly Bank", "debt_type": "term_loan", "per_payment_amount": "$800", "payment_frequency": "monthly"},
+    ])])
+    line = _by_key(review, "monthly-bank")
+    assert (line["payment_amount"], line["payment_frequency"], line["monthly_payment"]) == (None, None, 800.0)
+    cells = line["from_file"]
+    assert "payment_amount" not in cells
+    assert cells["payment_frequency"]["value"] == "monthly"
+    assert cells["monthly_payment"] == {"value": 800.0, "wording": "$800", "note": None, "derived": False}
+
+
+def test_the_rest_of_the_twelve_field_row_is_read_off_the_file_and_off_the_row():
+    doc = _document([{"lender": "Gamma Bank", "debt_type": "term_loan", "origination_date": "2021-03-01",
+                      "maturity_date": "2030-09-03", "secured_by": "2025 RAM 1500", "secured": "yes"}])
+    line = _by_key(dsr.build_review([], [doc]), "gamma-bank")
+    assert (line["originated_on"], line["maturity_on"], line["secured"], line["collateral"]) == ("2021-03-01", "2030-09-03", "secured", "2025 RAM 1500")
+    from datetime import date
+
+    row = _row("Gamma Bank", category="term_loan", maturity_on=date(2031, 1, 15), collateral=None, notes="Called the lender", mca_modified=None)
+    merged = _by_key(dsr.build_review([row], [doc]), "gamma-bank")
+    assert merged["maturity_on"] == "2031-01-15"  # the row's date, not the file's
+    assert merged["originated_on"] == "2021-03-01" and merged["collateral"] == "2025 RAM 1500"  # blanks fill from the file
+    assert merged["notes"] == "Called the lender"
+
+
+def test_our_own_placeholder_note_is_not_shown_as_the_desks_note():
+    for placeholder in (dsr.SAVED_NOTE, "Adopted from the uploaded debt schedule."):
+        assert dsr.build_review([_row("Local Bank", notes=placeholder)], [])["lines"][0]["notes"] is None
+
+
+def test_an_advance_that_was_modified_for_lower_sales_is_read_as_an_answer_not_a_blank():
+    doc = _document([{"lender": "Fast Advance", "debt_type": "mca", "mca_modified": "yes", "mca_modification_note": "Remittance cut in May"}])
+    line = _by_key(dsr.build_review([], [doc]), "fast-advance")
+    assert line["mca_modified"] is True and line["mca_modification_note"] == "Remittance cut in May"
+    assert "mca_modified" not in line["missing"]
+    assert line["from_file"]["mca_modified"]["value"] is True
 
 
 def test_the_answer_is_always_a_valid_response_whatever_legacy_rows_hold():
@@ -502,6 +562,58 @@ async def test_rows_written_by_a_review_are_ordinary_schedule_rows_to_every_read
     assert body[0]["lender"] == "Alpha Funding" and float(body[0]["balance"]) == 100.0
 
 
+@pytest.mark.asyncio
+async def test_the_detail_columns_are_written_and_what_the_desk_sends_wins_over_what_the_file_said(desk):
+    desk.documents = [_document([{"lender": "Gamma Bank", "debt_type": "term_loan", "origination_date": "2021-03-01",
+                                  "maturity_date": "2030-09-03", "secured_by": "2025 RAM 1500"}])]
+    from datetime import date
+
+    await _apply(desk, _line("gamma-bank", "Gamma Bank", debt_type="term_loan", maturity_on=None, originated_on="2021-04-02",
+                             secured="secured", collateral="Truck", notes="Called the lender"))
+    row = desk.rows[0]
+    assert row.originated_on == date(2021, 4, 2)  # typed over the file's date
+    assert row.maturity_on is None  # cleared by the desk, so it stays cleared
+    assert (row.secured, row.collateral, row.notes) == ("secured", "Truck", "Called the lender")
+
+
+@pytest.mark.asyncio
+async def test_a_cell_left_alone_keeps_what_the_file_said_on_a_new_row(desk):
+    desk.documents = [_document([{"lender": "Gamma Bank", "debt_type": "term_loan", "maturity_date": "2030-09-03", "secured_by": "Truck"}])]
+    from datetime import date
+
+    await _apply(desk, _line("gamma-bank", "Gamma Bank", debt_type="term_loan", balance=5))
+    assert desk.rows[0].maturity_on == date(2030, 9, 3) and desk.rows[0].collateral == "Truck"
+
+
+@pytest.mark.asyncio
+async def test_the_advance_answers_land_on_an_advance_and_are_ignored_on_anything_else(desk):
+    await _apply(desk, _line("adv", "Fast Advance", debt_type="mca", mca_modified=True, mca_modification_note="Remittance cut in May"),
+                 _line("loan", "Plain Loan", debt_type="term_loan", mca_modified=True, mca_modification_note="not asked"))
+    advance, loan = desk.rows
+    assert advance.mca_modified is True and advance.mca_modification_note == "Remittance cut in May"
+    assert loan.mca_modified is None and loan.mca_modification_note is None
+
+
+@pytest.mark.asyncio
+async def test_the_advance_answers_follow_a_row_whose_type_is_already_an_advance(desk):
+    row = _row("Fast Advance", category="mca")
+    desk.rows.append(row)
+    await _apply(desk, _line("x", "Fast Advance", row_id=row.id, mca_modified=False))  # the type cell was not changed
+    assert row.mca_modified is False
+
+
+@pytest.mark.asyncio
+async def test_an_untouched_note_cell_does_not_erase_our_placeholder_and_a_typed_one_replaces_it(desk):
+    row = _row("Alpha Funding", notes=dsr.SAVED_NOTE)
+    desk.rows.append(row)
+    await _apply(desk, _line("a", "Alpha Funding", row_id=row.id, balance=7, notes=None))
+    assert row.notes == dsr.SAVED_NOTE
+    await _apply(desk, _line("a", "Alpha Funding", row_id=row.id, notes="Payoff letter requested"))
+    assert row.notes == "Payoff letter requested"
+    await _apply(desk, _line("a", "Alpha Funding", row_id=row.id, notes=None))
+    assert row.notes is None  # a note the desk wrote can be cleared
+
+
 # --- the request shapes ------------------------------------------------------
 
 
@@ -510,6 +622,15 @@ def test_the_write_schema_keeps_every_answer_inside_what_a_schedule_can_hold():
     DebtReviewLineWrite(key="k", lender="L", rate=999.999, factor_rate=5)
     for bad in ({"rate": -0.1}, {"rate": 1000}, {"factor_rate": 0.99}, {"factor_rate": 35}, {"balance": -1}, {"balance": 1_000_000_001},
                 {"original_amount": -5}, {"payment_frequency": "hourly"}, {"payment_status": "late"}, {"lender": ""}, {"remove_reason": "because"}):
+        with pytest.raises(ValidationError):
+            DebtReviewLineWrite(key="k", **{"lender": "L", **bad})
+
+
+def test_the_detail_columns_are_bounded_too():
+    DebtReviewLineWrite(key="k", lender="L", originated_on="2021-03-01", maturity_on="2030-09-03", secured="unsecured",
+                        collateral="x" * 500, notes="y" * 2000, mca_modified=False, mca_modification_note="z" * 1000)
+    for bad in ({"originated_on": "03/01/2021"}, {"maturity_on": "someday"}, {"secured": "maybe"}, {"collateral": "x" * 501},
+                {"notes": "y" * 2001}, {"mca_modification_note": "z" * 1001}):
         with pytest.raises(ValidationError):
             DebtReviewLineWrite(key="k", **{"lender": "L", **bad})
 
@@ -543,9 +664,29 @@ def test_a_schedule_row_can_now_be_corrected_on_its_rate_original_amount_and_sta
     assert row.rate is None
 
 
+def test_the_row_patch_writes_the_rest_of_the_twelve_field_row():
+    from datetime import date
+
+    row = SimpleNamespace(lender="Bank", category="mca", monthly_payment=None, balance=None, payoff_amount=None, payment_amount=None,
+                          payment_frequency=None, count_in_dscr=True, vendor_key=None, status="active", original_amount=None, rate=None,
+                          factor_rate=None, payment_status=None, originated_on=None, maturity_on=None, secured=None, collateral=None,
+                          notes=None, mca_modified=None, mca_modification_note=None)
+    changed = fs.apply_debt_row_patch(row, {"originated_on": "2021-03-01", "maturity_on": date(2030, 9, 3), "secured": "Secured",
+                                            "collateral": "  2025   RAM 1500 ", "notes": " Called the lender ", "mca_modified": "yes",
+                                            "mca_modification_note": "Cut in May"})
+    assert set(changed) == {"originated_on", "maturity_on", "secured", "collateral", "notes", "mca_modified", "mca_modification_note"}
+    assert (row.originated_on, row.maturity_on, row.secured) == (date(2021, 3, 1), date(2030, 9, 3), "secured")
+    assert (row.collateral, row.notes, row.mca_modified, row.mca_modification_note) == ("2025 RAM 1500", "Called the lender", True, "Cut in May")
+    assert fs.apply_debt_row_patch(row, {"secured": "maybe"}) == [] and row.secured == "secured"  # unreadable: left alone
+    fs.apply_debt_row_patch(row, {"maturity_on": None, "notes": "  ", "collateral": ""})
+    assert row.maturity_on is None and row.notes is None and row.collateral is None
+    assert "mca_modified" in fs.apply_debt_row_patch(row, {"category": "term_loan"}) and row.mca_modified is None  # the advance answers leave with the type
+
+
 def test_the_cockpit_patch_schema_bounds_the_new_answers_the_same_way():
-    DebtRowPatch(rate=0, factor_rate=1.35, original_amount=1, payment_status="delinquent")
-    for bad in ({"rate": 1000}, {"factor_rate": 0.5}, {"original_amount": -1}, {"payment_status": "late"}):
+    DebtRowPatch(rate=0, factor_rate=1.35, original_amount=1, payment_status="delinquent", originated_on="2021-03-01", secured="secured", mca_modified=True)
+    for bad in ({"rate": 1000}, {"factor_rate": 0.5}, {"original_amount": -1}, {"payment_status": "late"}, {"secured": "maybe"},
+                {"originated_on": "03/01/2021"}, {"collateral": "x" * 501}, {"notes": "y" * 2001}):
         with pytest.raises(ValidationError):
             DebtRowPatch(**bad)
 

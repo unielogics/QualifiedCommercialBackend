@@ -548,6 +548,14 @@ ROW_PATCH_FIELDS = (
     "rate",
     "factor_rate",
     "payment_status",
+    # The rest of the twelve-field row, so one writer can correct any cell of it.
+    "originated_on",
+    "maturity_on",
+    "secured",
+    "collateral",
+    "notes",
+    "mca_modified",
+    "mca_modification_note",
     "count_in_dscr",
     "vendor_key",
     "status",
@@ -582,6 +590,17 @@ def apply_debt_row_patch(row: Any, changes: dict[str, Any]) -> list[str]:
             value = _choice(value, _PAYMENT_STATUS_CHOICES)
             if value is None:
                 continue  # an unreadable answer leaves the stored one alone
+        if key in {"originated_on", "maturity_on"} and value is not None:
+            value = value if isinstance(value, date) else _date(value)
+        if key == "secured" and value is not None:
+            value = _choice(value, _SECURED_CHOICES)
+            if value is None:
+                continue
+        if key in {"collateral", "notes", "mca_modification_note"} and value is not None:
+            value = " ".join(str(value).split()) if key != "notes" else str(value).strip()
+            value = value[: {"collateral": 500, "notes": 2000, "mca_modification_note": 1000}[key]] or None
+        if key == "mca_modified" and value is not None and not isinstance(value, bool):
+            value = _yes_no(value)
         if getattr(row, key, None) != value:
             setattr(row, key, value)
             changed.append(key)

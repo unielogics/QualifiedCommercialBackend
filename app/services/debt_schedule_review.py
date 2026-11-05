@@ -175,33 +175,105 @@ def _raw_primitives(raw: dict[str, Any]) -> dict[str, Any]:
     return kept
 
 
+def _words(value: Any) -> str | None:
+    text = _clean(value, 120)
+    return text or None
+
+
+def _cell(value: Any, raw: Any, *, note: str | None = None, derived: bool = False) -> dict[str, Any] | None:
+    """What the file said about one cell: the value in our vocabulary, the
+    file's own words when they are not just that value again ("weekday" read as
+    daily), its caveat for the cell, and whether we worked the value out."""
+    wording = _words(raw)
+    shown = _words(value) if value is not None else None
+    if wording is not None and shown is not None and wording.casefold() == shown.casefold():
+        wording = None
+    if value is None and wording is None and note is None:
+        return None
+    return {"value": value, "wording": wording, "note": note, "derived": derived}
+
+
+def _iso(value: Any) -> str | None:
+    return value.isoformat() if hasattr(value, "isoformat") else None
+
+
 def normalise_line(raw: dict[str, Any]) -> dict[str, Any] | None:
     """One debt line off a document, in the vocabulary a schedule row stores.
 
     Both shapes the analyzer has written are read (`interest_rate` /
     `rate_pct`, `payment_status` / `current`, `per_payment_amount` /
     `payment_amount`). Returns None for a line that names no lender.
+
+    `from_file` says, cell by cell, what the file gave and in whose words: the
+    review shows it on hover, marks a cell the desk changed, and puts a row
+    back to it.
     """
-    lender = _clean(fs._first_present(raw, "lender", "creditor", "funder", "name"), 180)
+    pick = fs._first_present
+    lender = _clean(pick(raw, "lender", "creditor", "funder", "name"), 180)
     if not lender:
         return None
-    declared = fs._first_present(raw, "debt_type", "type", "kind", "category")
+    declared = pick(raw, "debt_type", "type", "kind", "category")
     debt_type = debt_types.normalize_debt_type(declared) or ""
-    payment_amount = _number(
-        fs._first_present(raw, "payment_amount", "per_payment_amount", "payment", "installment_amount", "installment")
-    )
-    cadence = cadence_of(fs._first_present(raw, "payment_frequency", "frequency", "cadence", "payment_cadence"))
+    amount_raw = pick(raw, "payment_amount", "per_payment_amount", "payment", "installment_amount", "installment")
+    payment_amount = _number(amount_raw)
+    cadence_raw = pick(raw, "payment_frequency", "frequency", "cadence", "payment_cadence")
+    cadence = cadence_of(cadence_raw)
     monthly = _number(raw.get("monthly_payment"))
+    derived = False
     if monthly is None and payment_amount is not None and cadence is not None:
         monthly = cockpit.monthly_equivalent(payment_amount, cadence)
-    original = _number(
-        fs._first_present(raw, "original_amount", "funded_amount", "amount_approved", "approved_amount", "loan_amount", "original_balance")
-    )
-    balance = _number(fs._first_present(raw, "current_balance", "balance", "outstanding_balance"))
-    rate = fs._rate(fs._first_present(raw, "interest_rate", "rate_pct", "rate", "apr"))
-    originated = fs._date(fs._first_present(raw, "origination_date", "originated_on", "origin_date", "originated_date"))
-    maturity = fs._date(fs._first_present(raw, "maturity_date", "maturity_on"))
+        derived = cadence != "monthly"
+    original_raw = pick(raw, "original_amount", "funded_amount", "amount_approved", "approved_amount", "loan_amount", "original_balance")
+    original = _number(original_raw)
+    balance_raw = pick(raw, "current_balance", "balance", "outstanding_balance")
+    balance = _number(balance_raw)
+    rate_raw = pick(raw, "interest_rate", "rate_pct", "rate", "apr")
+    rate = fs._rate(rate_raw)
+    factor_raw = pick(raw, "factor_rate", "factor")
+    factor = _factor(factor_raw)
+    originated_raw = pick(raw, "origination_date", "originated_on", "origin_date", "originated_date")
+    originated = fs._date(originated_raw)
+    maturity_raw = pick(raw, "maturity_date", "maturity_on")
+    maturity = fs._date(maturity_raw)
     advance = debt_type in debt_types.ADVANCE_DEBT_TYPES
+    status_raw = pick(raw, "payment_status")
+    if status_raw is None and isinstance(raw.get("current"), bool):
+        status_raw = raw["current"]
+    status = fs._document_payment_status(raw)
+    secured_raw = pick(raw, "secured")
+    secured = fs._document_secured(raw)
+    collateral_raw = pick(raw, "collateral", "secured_by")
+    collateral = _clean(collateral_raw) or None
+    mca_raw = raw.get("mca_modified")
+    mca_modified = fs._yes_no(mca_raw) if advance else None
+    mca_note_raw = raw.get("mca_modification_note") or raw.get("mca_note")
+    mca_note = (_clean(mca_note_raw) or None) if advance else None
+    balance_note = _clean(raw.get("balance_note"), _NOTE_LIMIT) or None
+    payment_note = _clean(pick(raw, "per_payment_note", "payment_note"), _NOTE_LIMIT) or None
+    # A payment per business day or week keeps its cadence; a monthly one is
+    # simply the month; an amount whose cadence the file does not say keeps the
+    # amount and leaves the question open.
+    kept_amount = None if cadence == "monthly" else payment_amount
+    kept_cadence = cadence if cadence in {"daily", "weekly", "biweekly"} else None
+    kept_monthly = monthly if monthly is not None else (payment_amount if cadence == "monthly" else None)
+    cells = {
+        "lender": _cell(lender, lender),
+        "debt_type": _cell(debt_type or None, declared),
+        "original_amount": _cell(original, original_raw),
+        "balance": _cell(balance, balance_raw, note=balance_note),
+        "rate": _cell(rate, rate_raw),
+        "factor_rate": _cell(factor, factor_raw),
+        "payment_amount": _cell(kept_amount, None if cadence == "monthly" else amount_raw, note=payment_note),
+        "payment_frequency": _cell(kept_cadence if cadence != "monthly" else "monthly", cadence_raw, note=payment_note),
+        "monthly_payment": _cell(kept_monthly, raw.get("monthly_payment") if raw.get("monthly_payment") is not None else (amount_raw if cadence == "monthly" else None), derived=derived),
+        "payment_status": _cell(status, status_raw),
+        "originated_on": _cell(_iso(originated), originated_raw),
+        "maturity_on": _cell(_iso(maturity), maturity_raw),
+        "secured": _cell(secured, secured_raw),
+        "collateral": _cell(collateral, collateral_raw),
+        "mca_modified": _cell(mca_modified, mca_raw) if advance else None,
+        "mca_modification_note": _cell(mca_note, mca_note_raw) if advance else None,
+    }
     return {
         "lender": lender,
         "debt_type": debt_type,
@@ -209,27 +281,23 @@ def normalise_line(raw: dict[str, Any]) -> dict[str, Any] | None:
         "original_amount": original,
         "balance": balance,
         "rate": rate,
-        "factor_rate": _factor(fs._first_present(raw, "factor_rate", "factor")),
-        # A payment per business day or week keeps its cadence; a monthly one is
-        # simply the month; an amount whose cadence the file does not say keeps
-        # the amount and leaves the question open.
-        "payment_amount": None if cadence == "monthly" else payment_amount,
-        "payment_frequency": cadence if cadence in {"daily", "weekly", "biweekly"} else None,
-        "monthly_payment": monthly if monthly is not None else (payment_amount if cadence == "monthly" else None),
-        "payment_status": fs._document_payment_status(raw),
-        "balance_note": _clean(raw.get("balance_note"), _NOTE_LIMIT) or None,
-        "payment_note": _clean(fs._first_present(raw, "per_payment_note", "payment_note"), _NOTE_LIMIT) or None,
+        "factor_rate": factor,
+        "payment_amount": kept_amount,
+        "payment_frequency": kept_cadence,
+        "monthly_payment": kept_monthly,
+        "payment_status": status,
+        "balance_note": balance_note,
+        "payment_note": payment_note,
         "notes_from_file": _notes_from_file(raw),
-        # Kept for a row that is created from the line; never shown as a question.
+        "from_file": {name: cell for name, cell in cells.items() if cell is not None},
+        # Kept for a row that is created from the line.
         "extras": {
             "originated_on": originated,
             "maturity_on": maturity,
-            "secured": fs._document_secured(raw),
-            "collateral": _clean(fs._first_present(raw, "collateral", "secured_by")) or None,
-            "mca_modified": fs._yes_no(raw.get("mca_modified")) if advance else None,
-            "mca_modification_note": (_clean(raw.get("mca_modification_note") or raw.get("mca_note")) or None)
-            if advance
-            else None,
+            "secured": secured,
+            "collateral": collateral,
+            "mca_modified": mca_modified,
+            "mca_modification_note": mca_note,
         },
         "raw": _raw_primitives(raw),
     }
@@ -311,7 +379,11 @@ def _hint(line: dict[str, Any]) -> dict[str, str] | None:
 
 
 def _missing(line: dict[str, Any]) -> list[str]:
-    """Which answers a line still lacks, in the order the review asks them."""
+    """Which required answers a line still lacks, in the order the review asks
+    them. The same required set as the schedule form (type, original amount,
+    balance, rate, monthly payment, current or delinquent, and for an advance
+    whether it was modified), with one difference: an advance answers its price
+    with a factor rate, never a percent."""
     missing: list[str] = []
     if not line.get("debt_type"):
         missing.append("debt_type")
@@ -328,12 +400,15 @@ def _missing(line: dict[str, Any]) -> list[str]:
         missing.append("payment")
     if not line.get("payment_status"):
         missing.append("payment_status")
+    if line.get("advance") and line.get("mca_modified") is None:
+        missing.append("mca_modified")
     return missing
 
 
-#: The three the desk was asked to get: what it costs, what it was and what is left.
-_THE_THREE = ("rate", "factor_rate", "original_amount", "balance")
 _PAYMENT_FIGURES = ("payment_amount", "payment_frequency", "monthly_payment")
+#: The extra columns a schedule row carries beyond the figures: where they come
+#: from on a row, and on a document line's `extras`.
+_DETAIL_FIELDS = ("originated_on", "maturity_on", "secured", "collateral", "mca_modified", "mca_modification_note")
 
 
 def _row_figures(row: Any) -> dict[str, Any]:
@@ -367,6 +442,20 @@ def _row_figures(row: Any) -> dict[str, Any]:
     }
 
 
+def _detail_value(name: str, value: Any) -> Any:
+    """A detail column as the review carries it: dates as ISO text, the secured
+    word only when it is one we know, an advance answer as a bool."""
+    if value is None or value == "":
+        return None
+    if name in {"originated_on", "maturity_on"}:
+        return value.isoformat() if hasattr(value, "isoformat") else str(value)
+    if name == "secured":
+        return value if value in {"secured", "unsecured"} else None
+    if name == "mca_modified":
+        return bool(value)
+    return str(value)
+
+
 def _line_from(
     key: str,
     *,
@@ -391,6 +480,8 @@ def _line_from(
     notes: list[str] = []
     balance_note = payment_note = None
     file_id = file_name = None
+    from_file = None
+    detail: dict[str, Any] = {name: None for name in _DETAIL_FIELDS}
     if document_line is not None:
         lender = document_line["lender"]
         debt_type = document_line["debt_type"]
@@ -398,9 +489,18 @@ def _line_from(
         notes = list(document_line["notes_from_file"])
         balance_note, payment_note = document_line.get("balance_note"), document_line.get("payment_note")
         file_id, file_name = document_line.get("file_id"), document_line.get("file_name")
+        from_file = document_line.get("from_file")
+        detail.update({name: _detail_value(name, document_line["extras"].get(name)) for name in _DETAIL_FIELDS})
+    note = None
     if row is not None:
         lender = str(row.lender or lender)
         debt_type = debt_types.normalize_debt_type(row.category) or debt_type
+        for name in _DETAIL_FIELDS:
+            stored_detail = _detail_value(name, getattr(row, name, None))
+            if stored_detail is not None:
+                detail[name] = stored_detail
+        stored_note = (getattr(row, "notes", None) or "").strip()
+        note = stored_note if stored_note and stored_note not in {SAVED_NOTE, _ADOPTED_NOTE} else None
         stored = _row_figures(row)
         # The three payment figures describe one payment; they come from the row
         # together or from the file together, never an amount from one beside a
@@ -429,9 +529,12 @@ def _line_from(
         "advance": advance,
         **figures,
         "count_in_dscr": bool(getattr(row, "count_in_dscr", True)) if row is not None else debt_type != "credit_card",
+        **detail,
+        "notes": note,
         "balance_note": balance_note,
         "payment_note": payment_note,
         "notes_from_file": notes,
+        "from_file": from_file,
         "removed_reason": removed.get("reason") if removed.get("reason") in REMOVE_REASONS else None,
         "removed_by": removed.get("by_name") or None,
         "removed_at": removed.get("at"),
@@ -505,9 +608,7 @@ def build_review(rows: list[Any], documents: list[dict[str, Any]]) -> dict[str, 
             "read": sum(1 for line in lines if line["state"] == "read"),
             "on_schedule": sum(1 for line in lines if line["state"] == "on_schedule"),
             "removed": len(removed),
-            "missing_answers": sum(
-                1 for line in staying for name in line["missing"] if name in _THE_THREE
-            ),
+            "missing_answers": sum(len(line["missing"]) for line in staying),
         },
     }
 
@@ -603,8 +704,12 @@ def _payment_changes(line: Any) -> dict[str, Any]:
     return {"monthly_payment": monthly, "payment_amount": None, "payment_frequency": None}
 
 
-def _changes(line: Any) -> dict[str, Any]:
-    """The patch a kept line makes on its row, from only the fields it sent."""
+def _changes(line: Any, row: Any | None = None) -> dict[str, Any]:
+    """The patch a kept line makes on its row, from only the fields it sent.
+
+    The advance answers (modified for lower sales, and what changed) go only
+    onto an advance: a row whose type is anything else has nobody asking them.
+    """
     sent = line.model_fields_set
     changes: dict[str, Any] = {"lender": line.lender}
     if line.debt_type:
@@ -613,6 +718,16 @@ def _changes(line: Any) -> dict[str, Any]:
         if name in sent:
             changes[name] = getattr(line, name)
     changes.update(_payment_changes(line))
+    for name in ("originated_on", "maturity_on", "secured", "collateral", "notes"):
+        if name in sent:
+            changes[name] = getattr(line, name)
+    effective_type = debt_types.normalize_debt_type(line.debt_type) or (
+        debt_types.normalize_debt_type(getattr(row, "category", None)) if row is not None else None
+    )
+    if effective_type in debt_types.ADVANCE_DEBT_TYPES:
+        for name in ("mca_modified", "mca_modification_note"):
+            if name in sent:
+                changes[name] = getattr(line, name)
     return changes
 
 
@@ -700,11 +815,13 @@ async def apply_review(
                     count_in_dscr=(debt_types.normalize_debt_type(line.debt_type) != "credit_card"),
                     notes=SAVED_NOTE if item is not None else None,
                 )
-                fs.apply_debt_row_patch(row, _changes(line))
                 if item is not None:
+                    # What the file said goes on first and what the desk sent
+                    # goes over it, so a cell the desk cleared stays cleared.
                     for name, value in item["extras"].items():
                         if value is not None:
                             setattr(row, name, value)
+                fs.apply_debt_row_patch(row, _changes(line))
                 row.evidence = {
                     "source": "debt_schedule_review",
                     "file_id": str(line.file_id) if line.file_id else (item or {}).get("file_id"),
@@ -718,7 +835,12 @@ async def apply_review(
                 saved["added"] += 1
             else:
                 restoring = row.status != "active"
-                changed = fs.apply_debt_row_patch(row, _changes(line))
+                changes = _changes(line, row)
+                if not changes.get("notes") and (row.notes or "").strip() in {"", SAVED_NOTE, _ADOPTED_NOTE}:
+                    # The review shows our own placeholder as an empty Note cell;
+                    # leaving it empty is not a request to erase it.
+                    changes.pop("notes", None)
+                changed = fs.apply_debt_row_patch(row, changes)
                 evidence = {
                     key: value for key, value in _evidence(row).items() if key not in {"removed", "proposed"}
                 }

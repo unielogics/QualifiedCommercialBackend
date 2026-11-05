@@ -9,6 +9,7 @@ still owed.
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Literal
 from uuid import UUID
 
@@ -47,6 +48,22 @@ class DebtReviewSourceRead(BaseModel):
     line_count: int = 0
 
 
+class DebtReviewFileCell(BaseModel):
+    """What the file said about one cell of a line, and in whose words.
+
+    The review shows it on hover, marks a cell the desk changed from it, and
+    puts a row back to it. `value` is in our vocabulary ("daily"); `wording` is
+    the file's own ("weekday") when that is not just the value again; `note` is
+    the file's caveat for the cell ("Not confirmed"); `derived` is true for a
+    value we worked out (a month from a per-payment amount and how often).
+    """
+
+    value: str | float | bool | None = None
+    wording: str | None = None
+    note: str | None = None
+    derived: bool = False
+
+
 class DebtReviewLineRead(BaseModel):
     #: Stable within one reading: the lender's slug (with -2, -3 for repeats), or row:<id>.
     key: str
@@ -70,13 +87,25 @@ class DebtReviewLineRead(BaseModel):
     monthly_payment: float | None = None
     payment_status: PaymentStatus | None = None
     count_in_dscr: bool = True
+    #: The rest of the twelve-field row. Dates are ISO text.
+    originated_on: str | None = None
+    maturity_on: str | None = None
+    secured: Literal["secured", "unsecured"] | None = None
+    collateral: str | None = None
+    mca_modified: bool | None = None
+    mca_modification_note: str | None = None
+    #: The desk's own note on the row (our placeholder note is not shown).
+    notes: str | None = None
     #: What the file said about the balance and the payment, to sit under their boxes.
     balance_note: str | None = None
     payment_note: str | None = None
     notes_from_file: list[str] = Field(default_factory=list)
+    #: Cell by cell, what the file gave and in whose words; None for a row the file never named.
+    from_file: dict[str, DebtReviewFileCell] | None = None
     hint: DebtReviewHint | None = None
-    #: Which answers the line still lacks: debt_type, rate (factor_rate for an
-    #: advance), original_amount, balance, payment, payment_status.
+    #: Which required answers the line still lacks: debt_type, rate (factor_rate
+    #: for an advance), original_amount, balance, payment, payment_status, and
+    #: mca_modified for an advance.
     missing: list[str] = Field(default_factory=list)
     removed_reason: RemoveReason | None = None
     removed_by: str | None = None
@@ -88,8 +117,8 @@ class DebtScheduleReviewRead(BaseModel):
     sources: list[DebtReviewSourceRead] = Field(default_factory=list)
     lines: list[DebtReviewLineRead] = Field(default_factory=list)
     removed: list[DebtReviewLineRead] = Field(default_factory=list)
-    #: read / on_schedule / removed lines, and the interest, original amount and
-    #: balance answers still missing across the lines that are staying.
+    #: read / on_schedule / removed lines, and every required answer still
+    #: missing across the lines that are staying.
     counts: dict[str, int] = Field(default_factory=dict)
 
 
@@ -114,6 +143,14 @@ class DebtReviewLineWrite(BaseModel):
     payment_frequency: Cadence | None = None
     monthly_payment: float | None = Field(default=None, ge=0, le=_MONEY_CEILING)
     payment_status: PaymentStatus | None = None
+    originated_on: date | None = None
+    maturity_on: date | None = None
+    secured: Literal["secured", "unsecured"] | None = None
+    collateral: str | None = Field(default=None, max_length=500)
+    notes: str | None = Field(default=None, max_length=2000)
+    #: Asked of an advance and nothing else; ignored on any other type.
+    mca_modified: bool | None = None
+    mca_modification_note: str | None = Field(default=None, max_length=1000)
 
     @model_validator(mode="after")
     def _a_payment_says_how_often(self) -> DebtReviewLineWrite:

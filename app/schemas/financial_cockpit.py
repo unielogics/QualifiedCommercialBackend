@@ -177,6 +177,14 @@ class DebtRowPatch(BaseModel):
     rate: float | None = Field(default=None, ge=0, le=999.999)
     factor_rate: float | None = Field(default=None, ge=1, le=5)
     payment_status: Literal["current", "delinquent"] | None = None
+    originated_on: date | None = None
+    maturity_on: date | None = None
+    secured: Literal["secured", "unsecured"] | None = None
+    collateral: str | None = Field(default=None, max_length=500)
+    notes: str | None = Field(default=None, max_length=2000)
+    #: Asked of an advance and nothing else: modified for lower sales, and what changed.
+    mca_modified: bool | None = None
+    mca_modification_note: str | None = Field(default=None, max_length=1000)
     count_in_dscr: bool | None = None
     #: The recurring payee (its key) this row is seen as in the statements; "" unlinks.
     vendor_key: str | None = Field(default=None, max_length=60)
