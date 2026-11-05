@@ -44,6 +44,37 @@ def _workbook(text: str) -> spreadsheets.Workbook:
     return spreadsheets.read_workbook(text.encode("utf-8"), "csv", file_name="export.csv")
 
 
+def test_movement_lines_keep_original_type_location_currency_and_do_not_change_totals():
+    text = "Date,Description,Amount,Type,Currency,Reference,Account\n" + "\n".join(
+        f"2026-05-{day:02d},Terse description,{-100 if day % 2 else 150},Internal Transfer,USD,REF{day},XXXX1111"
+        for day in range(1, 6)
+    )
+    facts = read_export(_workbook(text))
+    assert facts["transactions"][0]["kind"] == "Internal Transfer"
+    assert facts["transactions"][0]["source_row"] == 2 and facts["transactions"][0]["account_last4"] == "1111"
+    assert facts["transactions"][0]["currency"] == facts["currency"] == "USD"
+    assert facts["total_deposits_and_credits"] == 300 and facts["total_withdrawals_and_debits"] == 300
+    assert not facts["transactions_complete"] and not facts["account_identity_ambiguous"]
+
+
+def test_mixed_account_export_retains_last_four_per_row_and_flags_origin_ambiguity():
+    text = "Date,Description,Amount,Type,Account\n" + "\n".join(
+        f"2026-05-{day:02d},Transfer,{(-100 if day % 2 else 100)},Transfer,XXXX{1111 if day < 3 else 2222}"
+        for day in range(1, 6)
+    )
+    facts = read_export(_workbook(text))
+    assert facts["account_identity_ambiguous"]
+    assert {row["account_last4"] for row in facts["transactions"]} == {"1111", "2222"}
+
+
+def test_positive_amount_with_ambiguous_type_never_guesses_movement_direction():
+    text = "Date,Description,Amount,Type\n" + "\n".join(
+        f"2026-05-{day:02d},Transfer,100,Transfer" for day in range(1, 6)
+    )
+    facts = read_export(_workbook(text))
+    assert all(row["direction"] is None and "signed_amount" not in row for row in facts["transactions"])
+
+
 def test_money_and_dates_read_the_way_banks_print_them() -> None:
     assert (
         parse_money("$1,234.56") == 1234.56

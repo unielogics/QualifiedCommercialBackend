@@ -334,6 +334,7 @@ def _statement_record(
                 "description": str(raw.get("description") or "").strip()[:140],
                 "amount": _num(raw.get("amount")),
                 "type": kind if kind in OVERDRAFT_TYPES else "other",
+                **({"page": _int(raw.get("page"))} if (_int(raw.get("page")) or 0) > 0 else {}),
             }
         )
     return {
@@ -362,7 +363,9 @@ def _finalize_month(month: dict[str, Any]) -> dict[str, Any]:
     for field in _BANK_AMOUNTS:
         month[field] = _round(month.get(field))
     month["negative_dates"] = sorted(set(month.get("negative_dates") or []))
-    if month["negative_dates"]:
+    # Aggregates already sum account-days. A shared calendar date on two
+    # accounts must not replace that count with the shorter union of dates.
+    if month["negative_dates"] and month.get("negative_days") is None:
         month["negative_days"] = len(month["negative_dates"])
     fees = sum(
         item["amount"]
@@ -635,6 +638,7 @@ def bank_months(
         members.setdefault(key, set()).add(key)
         for record in records:
             record["file_id"] = str(item.get("file_id") or "")
+            record["file_name"] = str(item.get("file_name") or "")
             record["accepted"] = bool(item.get("accepted"))
             slot = per_account.setdefault(key, {})
             prior = slot.get(record["month"])
@@ -681,6 +685,7 @@ def bank_months(
                     "accepted": False,
                     "negative_dates": [],
                     "overdraft_items": [],
+                    "risk_sources": [],
                 }
                 for field in _BANK_AMOUNTS + _BANK_COUNTS:
                     agg[field] = None
@@ -690,8 +695,17 @@ def bank_months(
                 agg["file_ids"].append(record["file_id"])
             agg["accepted"] = agg["accepted"] or record["accepted"]
             agg["negative_dates"].extend(record.get("negative_dates") or [])
+            source = {
+                "file_id": record["file_id"], "file_name": record["file_name"],
+                "account": labels[key],
+                **{field: record.get(field) for field in (
+                    "negative_dates", "negative_days", "nsf", "returned_checks", "low_balance"
+                )},
+            }
+            agg["risk_sources"].append(source)
             agg["overdraft_items"].extend(
-                {**item, "account": labels[key]} for item in record.get("overdraft_items") or []
+                {**item, "account": labels[key], "file_id": record["file_id"],
+                 "file_name": record["file_name"]} for item in record.get("overdraft_items") or []
             )
             for field in _BANK_AMOUNTS + _BANK_COUNTS:
                 if record.get(field) is not None:
@@ -706,6 +720,7 @@ def bank_months(
         for month_key in sorted(months):
             record = dict(months[month_key])
             file_id = record.pop("file_id", None)
+            file_name = record.pop("file_name", "")
             for other in record.pop("other_accounts", None) or []:
                 subs[other["last4"]] = {
                     **subs.get(other["last4"], {}),
@@ -714,8 +729,15 @@ def bank_months(
             record["label"] = month_label(month_key)
             record["accounts"] = [labels[key]]
             record["file_ids"] = [file_id] if file_id else []
+            record["risk_sources"] = [{
+                "file_id": file_id or "", "file_name": file_name, "account": labels[key],
+                **{field: record.get(field) for field in (
+                    "negative_dates", "negative_days", "nsf", "returned_checks", "low_balance"
+                )},
+            }]
             record["overdraft_items"] = [
-                {**item, "account": labels[key]} for item in record.get("overdraft_items") or []
+                {**item, "account": labels[key], "file_id": file_id,
+                 "file_name": file_name} for item in record.get("overdraft_items") or []
             ]
             series.append(_finalize_month(record))
         accounts.append(
@@ -2038,6 +2060,12 @@ def build_cockpit(
     """
     months, accounts = bank_months(analyses, counted_accounts, account_aliases)
     bank = bank_summary(months)
+    from app.services.account_movements import build_account_movements
+
+    movement_analyses = [{**item, "movement_account_key": file_account_identity(
+        item.get("key_facts") if isinstance(item.get("key_facts"), dict) else {},
+    )[0]} for item in analyses]
+    account_movements = build_account_movements(movement_analyses, accounts)
     for account in accounts:
         account["summary"] = bank_summary(account["series"])
     narrowed = any(not a["counted"] for a in accounts)
@@ -2141,6 +2169,7 @@ def build_cockpit(
             "months": months,
             "summary": bank,
             "accounts": accounts,
+            "account_movements": account_movements,
             "recurring": recurring,
             "recurring_credits": credits,
             "overdrafts": overdrafts,
@@ -2433,6 +2462,7 @@ def _analysis_rows(
             {
                 "file_id": str(file.id),
                 "file_name": file.file_name,
+                "content_hash": getattr(analysis, "content_hash", None) or getattr(file, "content_hash", None),
                 "classification": classification,
                 "classifications": sorted(classifications),
                 "key_facts": facts,
