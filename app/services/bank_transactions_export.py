@@ -27,6 +27,7 @@ from app.services.spreadsheets import Workbook
 
 MIN_ROWS = 5
 MAX_ROWS = 60_000
+MOVEMENT_LINE_LIMIT = 2_000
 SOURCE = "transactions_export"
 
 _DATE_HEADERS = (
@@ -81,6 +82,8 @@ _CREDIT_HEADERS = (
 _BALANCE_HEADERS = ("balance", "running balance", "ending balance", "available balance", "saldo")
 _TYPE_HEADERS = ("type", "transaction type", "category", "tipo", "details")
 _ACCOUNT_HEADERS = ("account", "account number", "account #", "acct", "cuenta")
+_CURRENCY_HEADERS = ("currency", "currency code", "iso currency")
+_REFERENCE_HEADERS = ("transaction id", "reference", "bank reference", "trace number")
 _OVERDRAFT = re.compile(
     r"\b(nsf|insufficient funds|overdraft|od fee|returned item|return(?:ed)? (?:check|payment|deposit)|unpaid item|chargeback fee)\b",
     re.I,
@@ -115,6 +118,8 @@ class Columns:
     header_row: int
     #: True when a signed amount column puts withdrawals as negatives.
     signed: bool = True
+    currency: int | None = None
+    reference: int | None = None
 
 
 def _norm(text: str) -> str:
@@ -213,6 +218,8 @@ def find_columns(rows: list[list[str]]) -> Columns | None:
             kind=kind,
             account=account,
             header_row=index,
+            currency=_find(cells, _CURRENCY_HEADERS),
+            reference=_find(cells, _REFERENCE_HEADERS),
         )
     return None
 
@@ -224,6 +231,10 @@ class Txn:
     amount: float  # signed: deposits positive, withdrawals negative
     balance: float | None
     kind: str
+    source_row: int | None = None
+    currency: str | None = None
+    reference: str | None = None
+    account_last4: str | None = None
 
 
 def _signed_amount(row: list[str], cols: Columns) -> float | None:
@@ -263,7 +274,7 @@ def _signed_amount(row: list[str], cols: Columns) -> float | None:
 
 def read_transactions(rows: list[list[str]], cols: Columns) -> list[Txn]:
     out: list[Txn] = []
-    for row in rows[cols.header_row + 1 : cols.header_row + 1 + MAX_ROWS]:
+    for source_row, row in enumerate(rows[cols.header_row + 1 : cols.header_row + 1 + MAX_ROWS], start=cols.header_row + 2):
         if not row or cols.date >= len(row):
             continue
         on = parse_date(row[cols.date])
@@ -283,7 +294,13 @@ def read_transactions(rows: list[list[str]], cols: Columns) -> list[Txn]:
             else None
         )
         kind = str(row[cols.kind] if cols.kind is not None and cols.kind < len(row) else "").strip()
-        out.append(Txn(on=on, description=description, amount=amount, balance=balance, kind=kind))
+        currency = str(row[cols.currency]).strip().upper() if cols.currency is not None and cols.currency < len(row) else ""
+        currency = currency if re.fullmatch(r"[A-Z]{3}", currency) and currency != "XXX" else None
+        reference = str(row[cols.reference]).strip()[:80] if cols.reference is not None and cols.reference < len(row) else None
+        account_digits = re.sub(r"\D", "", str(row[cols.account])) if cols.account is not None and cols.account < len(row) else ""
+        out.append(Txn(on=on, description=description, amount=amount, balance=balance, kind=kind,
+                       source_row=source_row, currency=currency, reference=reference,
+                       account_last4=account_digits[-4:] if len(account_digits) >= 4 else None))
     out.sort(key=lambda t: t.on)
     return out
 
@@ -292,10 +309,25 @@ def _r2(value: float) -> float:
     return round(value + 0.0, 2)
 
 
+def _movement_lines(txns: list[Txn], cols: Columns) -> list[dict[str, Any]]:
+    signed_convention = any(row.amount < 0 for row in txns) or cols.debit is not None and cols.credit is not None
+    lines = []
+    for row in txns[:MOVEMENT_LINE_LIMIT]:
+        positive_known = signed_convention or bool(re.search(r"\b(?:credit|deposit|cr|received)\b", row.kind, re.I))
+        direction = "out" if row.amount < 0 else "in" if positive_known else None
+        line = {"date": row.on.isoformat(), "description": row.description[:240], "amount": abs(row.amount),
+                "direction": direction, "kind": row.kind[:80], "currency": row.currency, "reference": row.reference,
+                "source_row": row.source_row, "sheet": "", "balance_after": row.balance, "account_last4": row.account_last4}
+        if direction is not None:
+            line["signed_amount"] = row.amount
+        lines.append(line)
+    return lines
+
+
 def _cadence(dates: list[date]) -> str:
     if len(dates) < 2:
         return "irregular"
-    gaps = sorted((b - a).days for a, b in zip(dates, dates[1:]) if (b - a).days > 0)
+    gaps = sorted((b - a).days for a, b in zip(dates, dates[1:], strict=False) if (b - a).days > 0)
     if not gaps:
         return "irregular"
     median = gaps[len(gaps) // 2]
@@ -320,7 +352,7 @@ def _recurring(txns: list[Txn], *, debits: bool, keep: int = 25) -> list[dict[st
             continue
         groups[key].append(t)
     out: list[dict[str, Any]] = []
-    for key, items in groups.items():
+    for items in groups.values():
         if len(items) < 2:
             continue
         amounts = [abs(t.amount) for t in items]
@@ -470,12 +502,24 @@ def read_export(workbook: Workbook, *, file_name: str = "") -> dict[str, Any] | 
         if not months:
             continue
         last4 = _account_last4(sheet.rows, cols, file_name)
+        account_values = {re.sub(r"\D", "", str(row[cols.account])) for row in sheet.rows[cols.header_row + 1 :]
+                          if cols.account is not None and cols.account < len(row) and len(re.sub(r"\D", "", str(row[cols.account]))) >= 4}
         facts: dict[str, Any] = {
             "source": SOURCE,
             "sheet": sheet.name,
             "transactions_read": len(txns),
             "truncated": sheet.truncated_rows or len(txns) >= MAX_ROWS,
+            # Preserve actual source lines for account-movement review. Existing
+            # monthly arithmetic remains unchanged and still reads every row.
+            "transactions": [{**line, "sheet": sheet.name} for line in _movement_lines(txns, cols)],
+            "transactions_truncated": bool(sheet.truncated_rows or len(txns) > MOVEMENT_LINE_LIMIT),
+            "transaction_lines_complete": not sheet.truncated_rows and len(txns) <= MOVEMENT_LINE_LIMIT,
+            # An uploaded activity export does not prove the entire calendar
+            # month's coverage, even when every row in that export was read.
+            "transactions_complete": False,
+            "transaction_scope": "uploaded_export_rows",
             "account_last4": last4,
+            "account_identity_ambiguous": len(account_values) > 1,
             "statement_period": f"{months[0]['first_transaction']} to {months[-1]['last_transaction']}",
             "beginning_balance": months[0]["beginning_balance"],
             "ending_balance": months[-1]["ending_balance"],
@@ -497,6 +541,9 @@ def read_export(workbook: Workbook, *, file_name: str = "") -> dict[str, Any] | 
         }
         low = [m["low_daily_balance"] for m in months if m["low_daily_balance"] is not None]
         facts["low_daily_balance"] = min(low) if low else None
+        currencies = {row.currency for row in txns if row.currency}
+        if len(currencies) == 1 and all(row.currency for row in txns):
+            facts["currency"] = next(iter(currencies))
         return facts
     return None
 
