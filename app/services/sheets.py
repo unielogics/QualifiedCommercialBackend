@@ -217,6 +217,8 @@ def _cell_payload(cell: sheet_layout.Cell) -> dict[str, Any]:
         out["label"] = cell.label
     if cell.options:
         out["options"] = list(cell.options)
+    if cell.option_labels:
+        out["option_labels"] = dict(cell.option_labels)
     if cell.compute is not None:
         out["compute"] = cell.compute
     if cell.source is not None:

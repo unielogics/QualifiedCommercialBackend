@@ -86,7 +86,7 @@ def test_audit_alone_is_not_a_grant_for_a_broker_and_the_manager_is_not_rep_tier
 def test_super_admin_inherits_all_operator_accounts() -> None:
     user = SimpleNamespace(role=Role.SUPER_ADMIN, account_access_types=[])
 
-    assert _account_types(user) == ["audit", "field_desk", "funding"]
+    assert _account_types(user) == ["audit", "capital", "field_desk", "funding"]
 
 
 def test_new_files_default_to_live_and_gated() -> None:

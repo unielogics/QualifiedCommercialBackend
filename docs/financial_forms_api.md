@@ -139,8 +139,8 @@ Existing consent, communication-window, cadence, and retry limits apply.
 
 ## Deployment and legacy baseline adoption
 
-Apply migrations in order: `0242_financial_workspace` (file
-`0242_financial_workspace_versions.py`), then `0243_financial_debt_evidence`.
+Apply migrations after `0258_extra_requirements`: `0259_financial_workspace`
+(file `0259_financial_workspace_versions.py`), then `0260_financial_debt_evidence`.
 Deploy the updated backend before the workspace frontend. Saving requires an
 application document room, the existing PDF rendering dependencies, and working
 bucket/KMS storage permissions; PDF imports additionally require the configured

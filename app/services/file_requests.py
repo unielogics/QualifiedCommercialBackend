@@ -72,7 +72,9 @@ def batch_fingerprint(items: list[FileRequestItem]) -> str:
 
 
 async def lock_profile(db: AsyncSession, profile: ApplicationProfile) -> None:
-    await db.execute(select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update())
+    from app.services.financial_workspace import lock_financial_profile
+
+    await lock_financial_profile(db, profile)
 
 
 async def request_states(db: AsyncSession, profile_id: UUID, request_id: UUID | None = None) -> list[ApplicationRequirementState]:

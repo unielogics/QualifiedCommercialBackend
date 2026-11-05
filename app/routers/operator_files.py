@@ -47,6 +47,7 @@ from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.schemas.operator_file import (
+    AttentionQueue,
     BucketIntakeLinkOption,
     BucketIntakeLinkOptions,
     BucketIntakeLinkRead,
@@ -76,6 +77,7 @@ from app.schemas.operator_file import (
     UnifiedStage,
 )
 from app.scoping import regional_manager_broker_ids_subquery, scope_client_query, scope_loan_query
+from app.services import attention_queue
 from app.services import application_profiles as profiles
 from app.services import (
     capital_readiness,
@@ -2300,9 +2302,9 @@ async def link_bucket_to_intake(
     await capital_readiness.advisory_recompute_for_intake(
         db,
         intake.id,
-        event_key=f"bucket-intake-linked:{link.id}:{review.id}",
+        event_key=f"bucket-intake-linked:{link.id}:{review.id if review else 'manual'}",
     )
-    return _link_result(link, audit_ids, review.id, "bucket_intake_linked")
+    return _link_result(link, audit_ids, review.id if review else None, "bucket_intake_linked")
 
 
 @router.get("/bucket-intake-links", response_model=list[BucketIntakeLinkRead])
@@ -2375,9 +2377,9 @@ async def update_bucket_intake_link(
     await capital_readiness.advisory_recompute_for_intake(
         db,
         intake.id,
-        event_key=f"bucket-intake-link-updated:{link.id}:{review.id}",
+        event_key=f"bucket-intake-link-updated:{link.id}:{review.id if review else 'manual'}",
     )
-    return _link_result(link, audit_ids, review.id, "bucket_intake_link_updated")
+    return _link_result(link, audit_ids, review.id if review else None, "bucket_intake_link_updated")
 
 
 @router.delete("/bucket-intake-links/{link_id}", response_model=BucketIntakeLinkResult)
@@ -2412,10 +2414,10 @@ async def unlink_bucket_from_intake(
     await capital_readiness.advisory_recompute_for_intake(
         db,
         intake.id,
-        event_key=f"bucket-intake-unlinked:{link.id}:{review.id}",
+        event_key=f"bucket-intake-unlinked:{link.id}:{review.id if review else 'manual'}",
     )
     return _link_result(
-        link, audit_ids, review.id, "bucket_intake_unlinked", link_status="unlinked"
+        link, audit_ids, review.id if review else None, "bucket_intake_unlinked", link_status="unlinked"
     )
 
 
@@ -2728,7 +2730,7 @@ def _write_link_audits(
 def _link_result(
     link: BucketIntakeLink,
     audit_ids: list[UUID],
-    review_id: UUID,
+    review_id: UUID | None,
     action: str,
     *,
     link_status: str = "active",
@@ -2744,3 +2746,16 @@ def _link_result(
         review_id=review_id,
         status=link_status,  # type: ignore[arg-type]
     )
+
+
+@router.get("/attention", response_model=AttentionQueue)
+async def get_attention_queue(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    limit: int = Query(60, ge=1, le=200),
+) -> AttentionQueue:
+    """What is stalling on the desk, each row carrying the link that opens its file."""
+
+    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "The attention queue is a desk view")
+    return await attention_queue.load_attention_queue(db, limit=limit)

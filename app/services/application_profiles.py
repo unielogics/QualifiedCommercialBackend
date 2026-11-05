@@ -76,6 +76,7 @@ from app.services.bucket_evidence import (
     classifications_for_requested_doc,
     effective_file_classification,
     statement_months_from_analysis,
+    statement_period_month,
 )
 from app.services.deal_economics import calculate_deal_earnings, optional_float
 from app.services.dealer_partner_access import (
@@ -306,6 +307,7 @@ async def client_evidence_banking_summary(
                     item.status in satisfied_states
                     or item.verified_coverage_complete
                 ),
+                coverage_complete=bool(getattr(item, "coverage_complete", False)),
                 evidence_count=item.evidence_count,
                 accepted_evidence_count=accepted_count,
                 processing_evidence_count=processing_count,
@@ -375,6 +377,7 @@ async def client_evidence_banking_summary(
                 and uploaded_count == 0
                 and not verification.business_banking_complete
             ),
+            counted_accounts=list(getattr(profile, "counted_bank_accounts", None) or []),
         ),
     )
 
@@ -520,10 +523,9 @@ async def capture_extracted_profile_facts(
                         "source_analysis_id": str(analysis.id), "status": "suggested",
                     }
     key_facts = payload.get("key_facts") if isinstance(payload.get("key_facts"), dict) else {}
-    period = str(key_facts.get("statement_period") or "")
-    month_match = re.search(r"(20\d{2})[-/](0[1-9]|1[0-2])", period)
-    if analysis.classification == "bank_statement" and month_match and not file.statement_period:
-        file.statement_period = f"{month_match.group(1)}-{month_match.group(2)}"
+    month = statement_period_month(key_facts.get("statement_period"))
+    if analysis.classification == "bank_statement" and month and not file.statement_period:
+        file.statement_period = month
     await db.flush()
     return [profile.id for profile in profiles]
 
@@ -812,6 +814,11 @@ def _canonical_funding_category(value: object | None) -> str | None:
         return normalize_funding_intent(value)
     except ValueError:
         return str(value).strip() or None if value is not None else None
+
+
+# The one rule every writer of funding_category applies; exported for routers
+# outside this module so the column stays one vocabulary.
+canonical_funding_category = _canonical_funding_category
 
 
 def _split_name(name: str) -> tuple[str, str]:
@@ -1104,21 +1111,21 @@ async def resolve_profile(
             profile.deal_id = source.id
             profile.client_id = source.client_id
             profile.vertical = "real_estate"
-            profile.funding_category = source.deal_type
+            profile.funding_category = _canonical_funding_category(source.deal_type)
         elif isinstance(source, Loan):
             profile.loan_id = source.id
             profile.client_id = source.client_id
             profile.vertical = "mca" if "mca" in str(source.type).lower() else "real_estate"
-            profile.funding_category = str(source.type)
+            profile.funding_category = _canonical_funding_category(str(source.type))
             profile.entity_type = str(source.entity_type) if source.entity_type else None
         elif isinstance(source, PublicUnderwritingIntake):
             profile.intake_id = source.id
             profile.client_id = source.client_id
             profile.primary_bucket_id = source.bucket_id
             profile.vertical = _vertical_for_intake(source)
-            profile.funding_category = (source.intake_state or {}).get(
-                "funding_intent"
-            ) or source.loan_purpose
+            profile.funding_category = _canonical_funding_category(
+                (source.intake_state or {}).get("funding_intent") or source.loan_purpose
+            )
             detail = (source.intake_state or {}).get("main_street_details") or {}
             profile.industry = detail.get("industry")
         else:
@@ -1175,7 +1182,12 @@ async def resolve_profile(
     return profile
 
 
-def owner_read(owner: ApplicationOwner | DealerOwner) -> FileOwnerRead:
+def owner_read(owner: ApplicationOwner | DealerOwner, *, include_credit_risk: bool = True) -> FileOwnerRead:
+    summary = getattr(owner, "credit_summary", None)
+    summary = summary if isinstance(summary, dict) else {}
+    attention = summary.get("attention")
+    if owner.credit_score is None and str(attention or "").startswith("The bureau returned no score;"):
+        attention = "The report is linked, but its score has not been imported. Import the existing report; do not request a new pull."
     return FileOwnerRead(
         id=owner.id,
         full_name=owner.full_name,
@@ -1200,6 +1212,15 @@ def owner_read(owner: ApplicationOwner | DealerOwner) -> FileOwnerRead:
         credit_required=owner.credit_required,
         credit_complete=owner.credit_complete,
         credit_contact_complete=owner.credit_contact_complete,
+        credit_pull_id=getattr(owner, "credit_pull_id", None),
+        credit_fico_source=summary.get("fico_source"),
+        credit_score_verified=bool(summary.get("score_verified")),
+        credit_report_available=bool(summary.get("report_available")),
+        credit_report_import_status=summary.get("report_import_status"),
+        credit_risk=summary.get("credit_risk") if include_credit_risk else None,
+        credit_link_how=summary.get("linked_how"),
+        credit_attention=attention,
+        credit_expires_at=summary.get("expires_at"),
         backfill_needs_review=getattr(owner, "backfill_needs_review", False),
         source="dealer" if isinstance(owner, DealerOwner) else "application",
     )
@@ -1226,6 +1247,57 @@ async def owner_rows(db: AsyncSession, profile: ApplicationProfile) -> list[Appl
     )
 
 
+REQUIRED_STATEMENT_MONTHS = 6
+
+
+def banking_is_complete(*, connected: bool, months: set[str] | frozenset[str], override: bool) -> bool:
+    """The owner's rule for business banking: an active bank connection, or six
+    accepted statement months from any source (uploads, statement PDFs Plaid
+    pulled), or the desk's explicit override. Either road completes it."""
+    return connected or len(months) >= REQUIRED_STATEMENT_MONTHS or override
+
+
+async def plaid_statement_months(db: AsyncSession, profile: ApplicationProfile) -> set[str]:
+    """The statement months Plaid put on this file, whatever the state of the
+    connection they came through: the pulled PDFs by their period, and the
+    asset report by the months its analysis lists. Only this environment's
+    connections count — a sandbox pull never completes a production file."""
+    if not profile.primary_bucket_id:
+        return set()
+    months: set[str] = set()
+    rows = (
+        await db.execute(
+            select(BucketFile.statement_period)
+            .join(ApplicationPlaidItem, ApplicationPlaidItem.id == BucketFile.application_plaid_item_id)
+            .where(
+                BucketFile.bucket_id == profile.primary_bucket_id,
+                BucketFile.statement_period.is_not(None),
+                BucketFile.status == "uploaded",
+                BucketFile.deleted_at.is_(None),
+                ApplicationPlaidItem.environment == plaid_client.environment(),
+            )
+        )
+    ).scalars().all()
+    months.update(str(value) for value in rows if re.fullmatch(r"\d{4}-\d{2}", str(value or "")))
+    reports = (
+        await db.execute(
+            select(BucketFileAnalysis.analysis)
+            .join(BucketFile, BucketFile.id == BucketFileAnalysis.bucket_file_id)
+            .where(
+                BucketFile.bucket_id == profile.primary_bucket_id,
+                BucketFile.source_kind == "plaid",
+                BucketFile.application_plaid_item_id.is_(None),
+                BucketFile.status == "uploaded",
+                BucketFile.deleted_at.is_(None),
+                BucketFileAnalysis.status == "completed",
+            )
+        )
+    ).scalars().all()
+    for payload in reports:
+        months.update(statement_months_from_analysis(payload if isinstance(payload, dict) else None))
+    return months
+
+
 async def verification_state(
     db: AsyncSession, profile: ApplicationProfile
 ) -> FileOwnerRequirementState:
@@ -1239,6 +1311,10 @@ async def verification_state(
     months = sorted({month for bank in banks for month in bank.statement_months})
     manual_evidence = await manual_statement_evidence(db, profile)
     manual_months = manual_evidence.months
+    # Every statement month on the file from any source: a live connection's,
+    # an accepted upload's, and a PDF Plaid pulled even if that connection has
+    # since gone. The owner's rule: "plaid or pdf upload of 6 months" completes.
+    evidence_months = set(months) | set(manual_months) | await plaid_statement_months(db, profile)
     ownership_blockers: list[str] = []
     if not owners:
         ownership_blockers.append("Add at least one owner")
@@ -1251,15 +1327,15 @@ async def verification_state(
     if pending:
         credit_blockers.append(f"{len(pending)} required owner credit authorization(s) pending")
     banking_blockers: list[str] = []
-    banking_complete = (
-        bool(banks)
-        or len(manual_months) >= 6
-        or bool(profile.bank_verification_override_at and manual_evidence.file_count)
+    banking_complete = banking_is_complete(
+        connected=bool(banks),
+        months=evidence_months,
+        override=bool(profile.bank_verification_override_at and manual_evidence.file_count),
     )
     if not banking_complete:
-        if manual_months:
+        if evidence_months:
             banking_blockers.append(
-                f"{len(manual_months)} of 6 statement months accepted; add the missing periods"
+                f"{len(evidence_months)} of 6 statement months accepted; add the missing periods"
             )
         elif manual_evidence.pending_analysis_count:
             banking_blockers.append("Uploaded bank statements are still being analyzed")
@@ -1280,7 +1356,7 @@ async def verification_state(
         missing_credit_contact_owner_ids=[owner.id for owner in missing_contact],
         bank_linked=bool(banks),
         bank_connection_count=len(banks),
-        bank_statement_months=len(set(months) | set(manual_months)),
+        bank_statement_months=len(evidence_months),
         credit_returned=not pending,
         owner_credit_complete=ready_step_2 and not pending,
         business_banking_complete=banking_complete,
@@ -1388,6 +1464,10 @@ async def manual_statement_evidence(
                 .where(
                     BucketFile.id.in_(file_ids),
                     BucketFile.application_plaid_item_id.is_(None),
+                    # The Plaid asset report is bank data, not an upload; it is
+                    # counted through the connection, and labelling it
+                    # "Uploaded statements" here was the audit's mislabel.
+                    or_(BucketFile.source_kind.is_(None), BucketFile.source_kind != "plaid"),
                 )
                 .order_by(
                     BucketFile.id,

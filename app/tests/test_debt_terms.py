@@ -131,17 +131,17 @@ def test_xlsx_keeps_old_monthly_input_and_adds_locked_native_equivalent_formula(
     workbook = load_workbook(BytesIO(financial_templates_xlsx.build_workbook("debt_schedule")))
     assert _named(workbook, "ds.r1.monthly_payment").coordinate == "F7"
     factor = _named(workbook, "ds.r1.factor_rate")
-    assert factor.coordinate == "M7" and "%" not in factor.number_format
-    assert _named(workbook, "ds.r1.payment_amount").coordinate == "N7"
+    assert factor.coordinate == "O7" and "%" not in factor.number_format
+    assert _named(workbook, "ds.r1.payment_amount").coordinate == "P7"
     frequency = _named(workbook, "ds.r1.payment_frequency")
-    assert frequency.coordinate == "O7"
-    equivalent = workbook.active["P7"]
+    assert frequency.coordinate == "Q7"
+    equivalent = workbook.active["R7"]
     assert equivalent.protection.locked and not _named(workbook, "ds.r1.monthly_payment").protection.locked
-    assert all(value in equivalent.value for value in ("N7", "O7", "F7", "21.0", "4.33", "2.165", "ROUND("))
+    assert all(value in equivalent.value for value in ("P7", "Q7", "F7", "21.0", "4.33", "2.165", "ROUND("))
     # A stated F value, including zero, wins over conflicting native terms.
     assert equivalent.value.startswith('=IF(ISNUMBER(F7),F7,IF(AND(')
     assert "overrides" in _named(workbook, "ds.r1.monthly_payment").comment.text
-    assert _named(workbook, "ds.total_monthly_payment").value == "=SUM(P7:P21)"
+    assert _named(workbook, "ds.total_monthly_payment").value == "=SUM(R7:R21)"
     assert any(frequency.coordinate in validation.sqref for validation in frequency.parent.data_validations.dataValidation)
 
 
@@ -156,3 +156,20 @@ def test_schema_and_pdf_distinguish_factor_multiple_native_amount_cadence_and_ap
     assert cells["r1.factor_rate"].format == "text"
     assert cells["r1.payment_frequency"].options == ("daily", "weekly", "biweekly", "monthly")
     assert sheet_layout.DEBT_SCHEMA_VERSION == "qc_ds.v2"
+
+
+def test_main_mca_answers_and_native_contract_terms_round_trip_together():
+    raw = {"debts": [{"lender": "Fundbox", "debt_type": "MCA", "balance": "40000",
+        "factor_rate": "1.38", "payment_amount": "420", "payment_frequency": "daily",
+        "mca_modified": False, "mca_modification_note": "No change", "notes": "Contract reviewed"}]}
+    validated = financial_workspace.validate_body("debt_schedule", raw)
+    rows = financial_statements.debt_rows_from_body(validated)
+    facts = financial_statements.debt_key_facts(rows)
+    assert rows[0]["mca_modified"] is False and rows[0]["mca_modification_note"] == "No change"
+    assert facts["debts"][0]["factor_rate"] == 1.38 and facts["debts"][0]["payment_frequency"] == "daily"
+    assert facts["total_monthly_debt_service"] == 8820
+    rendered = dealer_forms_pdf.build_debt_schedule_html(business_name="Little Star Therapy", rows=rows,
+        total_balance=40000, total_monthly=8820)
+    assert "1.380×" in rendered and "$420.00" in rendered and "Daily" in rendered
+    assert "Modified by the funder for lower sales or revenue: No" in rendered
+    assert "Contract reviewed" in rendered and raw["debts"][0]["mca_modified"] is False

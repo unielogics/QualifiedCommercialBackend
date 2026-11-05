@@ -139,8 +139,52 @@ async def refresh_advisory_projections(db: AsyncSession, profile: ApplicationPro
             await db.refresh(profile)
 
 
+async def record_staff_debt_publication_review(db: AsyncSession, profile: ApplicationProfile, *, family: FinancialFormFamily, version: FinancialFormVersion, file: BucketFile, actor: Any = None) -> None:
+    """An explicit staff save is a content-bound human evidence review.
+
+    Use the same append-only decision hook as an underwriting override. Never
+    infer human verification from an uploaded original, borrower, or AI draft.
+    This runs before advisory refresh, in the publication transaction.
+    """
+    from app.enums import Role
+    from app.services.financial_version_selection import is_accepted_debt_schedule_version
+
+    staff_roles = {Role.SUPER_ADMIN, Role.REGIONAL_MANAGER, Role.BROKER, Role.LOAN_EXEC, Role.FIELD_REP}
+    actor_id = getattr(actor, "id", None)
+    if not (family.kind == "debt_schedule" and actor_id is not None and getattr(actor, "role", None) in staff_roles
+            and getattr(version, "source", None) == "form" and is_accepted_debt_schedule_version(version)
+            and getattr(version, "actor_user_id", None) == actor_id
+            and getattr(family, "current_version_id", None) == version.id
+            and getattr(version, "pdf_file_id", None) == file.id):
+        return
+    from app.models.application_profile import (
+        ApplicationRequirementEvidence,
+        ApplicationRequirementState,
+    )
+    from app.schemas.application_profile import EvidenceDecisionOverride
+    from app.services import application_programs
+
+    # First-use requirements need their canonical evidence links before the
+    # standard staff decision can bind this immutable generated PDF to them.
+    await application_programs.get_program_readiness(db, profile)
+    states = (await db.execute(select(ApplicationRequirementState).join(
+        ApplicationRequirementEvidence,
+        ApplicationRequirementEvidence.requirement_state_id == ApplicationRequirementState.id,
+    ).where(ApplicationRequirementState.profile_id == profile.id,
+            ApplicationRequirementEvidence.file_id == file.id,
+            ApplicationRequirementEvidence.removed_at.is_(None)))).scalars().all()
+    for state in states:
+        await application_programs.override_evidence_decision(
+            db, profile=profile, requirement_key=state.requirement_key, file_id=file.id,
+            payload=EvidenceDecisionOverride(decision="accepted", reason_code="other", confirmed=True,
+                reason=f"Staff reviewed and explicitly saved the complete business debt schedule as immutable version {version.version_number} ({version.id})."),
+            user=actor,
+        )
+
+
 async def after_publication(db: AsyncSession, profile: ApplicationProfile, *, family: FinancialFormFamily, version: FinancialFormVersion, file: BucketFile, actor: Any = None, submit: bool = False) -> None:
     await invalidate_financial_review_caches(db, profile, version)
+    await record_staff_debt_publication_review(db, profile, family=family, version=version, file=file, actor=actor)
     loan_id = getattr(profile, "loan_id", None)
     if loan_id:
         from app.services.activity_log import mark_loan_dirty

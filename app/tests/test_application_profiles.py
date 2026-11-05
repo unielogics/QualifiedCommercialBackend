@@ -1023,3 +1023,64 @@ async def test_evidence_inventory_omits_preview_resolvers_for_non_staff() -> Non
         result = await get_application_evidence(profile_id, user, SimpleNamespace())
 
     assert result.files[0].preview_url is None
+
+
+@pytest.mark.asyncio
+async def test_evidence_file_url_carries_parsed_sheets_for_a_spreadsheet() -> None:
+    profile_id = uuid4()
+    file_id = uuid4()
+    file = SimpleNamespace(
+        id=file_id,
+        file_name="debt_schedule.xlsx",
+        s3_key="private/evidence/debt_schedule.xlsx",
+        content_type="application/octet-stream",
+        status="uploaded",
+        deleted_at=None,
+        content_hash=None,
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=file), commit=AsyncMock())
+    user = SimpleNamespace(id=uuid4(), role=Role.LOAN_EXEC)
+    parsed = {"kind": "xlsx", "sheet_names": ["Debts"], "sheets": [{"name": "Debts", "rows": [["Lender", "Balance"]], "total_rows": 1, "total_cols": 2}], "warnings": []}
+
+    with (
+        patch("app.routers.application_profiles.profiles.load_profile", AsyncMock(return_value=SimpleNamespace(id=profile_id))),
+        patch(
+            "app.routers.application_profiles.profiles.evidence_state",
+            AsyncMock(return_value=SimpleNamespace(files=[SimpleNamespace(id=file_id)])),
+        ),
+        patch("app.routers.application_profiles.profiles.log_profile_action", AsyncMock()),
+        patch("app.routers.buckets._download_url", return_value="https://storage.example/signed"),
+        patch("app.routers.buckets._sheet_preview_payload", return_value=parsed) as preview,
+    ):
+        result = await get_application_evidence_file_url(profile_id, file_id, user, db)
+
+    assert result["sheets"] == parsed
+    assert result["url"] == "https://storage.example/signed"
+    preview.assert_called_once_with(file)
+
+
+@pytest.mark.asyncio
+async def test_newest_analysis_per_file_ignores_queue_placeholders() -> None:
+    """A forced re-analysis queues a placeholder newer than the completed row;
+    the newest-row readers must not let it hide the completed analysis."""
+    from app.routers.application_profiles import _bucket_analyses
+
+    statements = []
+    file = SimpleNamespace(id=uuid4())
+
+    async def execute(statement):
+        statements.append(statement)
+        if len(statements) == 1:
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [file]))
+        completed = SimpleNamespace(
+            bucket_file_id=file.id, status="completed", classification="current_p_and_l",
+            analysis={"key_facts": {"revenue": 4520000}},
+        )
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [completed]))
+
+    result = await _bucket_analyses(SimpleNamespace(execute=execute), uuid4())
+
+    sql = str(statements[1].compile(compile_kwargs={"literal_binds": True}))
+    assert "status != 'pending'" in sql
+    assert result == [{"classification": "current_p_and_l", "key_facts": {"revenue": 4520000}}]
+

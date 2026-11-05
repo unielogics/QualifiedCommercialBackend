@@ -9984,7 +9984,7 @@ async def _persist_appointment_intake_classification(
     ).scalar_one_or_none()
     if profile is not None:
         profile.vertical = application_vertical_for(lead_type)
-        profile.funding_category = funding_intent
+        profile.funding_category = application_profile_service.canonical_funding_category(funding_intent)
 
 
 async def _start_rep_appointment_application(
@@ -11414,7 +11414,7 @@ async def _prepare_underwriting_review_room(
             ),
             "debt_schedule": (
                 "Current business debt schedule",
-                "Upload the current debt schedule showing lender, balance, and payment for each obligation.",
+                "Upload the current debt schedule: for each obligation the lender, type of debt, original amount, current balance, interest rate, monthly payment and whether it is current or delinquent.",
                 "debt_schedule",
             ),
             "use_of_funds_support": (
@@ -21161,6 +21161,7 @@ async def list_owners(
         if owner.credit_pulled_at is None or quality is None:
             continue
         expected_summary = {
+            **dict(owner.credit_summary or {}),
             **quality,
             "provider_status": "completed",
             "score_source": "verified_soft_pull",
@@ -21498,17 +21499,23 @@ async def _run_owner_soft_pull(
         logger.exception("dealer-os: soft pull failed for owner %s", owner_pk)
         return await _record_provider_failure("failed", type(exc).__name__, f"Credit pull failed: {exc}")
 
+    from app.services.credit_links import pull_facts
+    from app.services.credit_report_import import ensure_report_imported
+
+    await ensure_report_imported(db, pull)
     # CreditPull stores the normalized provider result in `fico`. Looking up a
     # nonexistent `score` attribute made successful pulls appear pending.
     owner.credit_score = getattr(pull, "fico", None)
     owner.credit_tier = _credit_tier(owner.credit_score)
     owner.credit_summary = {
+        **pull_facts(pull),
+        "report_import_status": (pull.bureau_response or {}).get("report_import_status"),
         "score_band": _credit_score_band(owner.credit_score),
         "quality_tier": owner.credit_tier,
         "provider_status": "completed",
         "score_source": "verified_soft_pull",
     }
-    owner.credit_pulled_at = datetime.now(timezone.utc)
+    owner.credit_pulled_at = pull.pulled_at or datetime.now(timezone.utc)
     owner.credit_pull_id = pull.id
     owner.credit_workflow_status = "completed"
     owner.credit_provider_error_category = None

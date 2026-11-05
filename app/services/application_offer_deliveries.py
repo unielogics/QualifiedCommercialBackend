@@ -56,6 +56,7 @@ from app.services.application_terms_pdf import (
 from app.services.application_terms_pdf import (
     render_terms_pdf,
 )
+from app.services.local_time import local_stamp
 from app.services.merchant_offer_pdf import (
     filename_for as merchant_offer_filename,
 )
@@ -600,9 +601,9 @@ def compose_body(
         item_deadline = (item_expiries or {}).get(item.key, expires_at)
         parts.append(
             "Response deadline: "
-            + item_deadline.astimezone(UTC).strftime("%B %d, %Y at %I:%M %p UTC")
+            + local_stamp(item_deadline, fmt="%B %-d, %Y at %-I:%M %p")
         )
-    nearest_deadline = expires_at.astimezone(UTC).strftime("%B %d, %Y at %I:%M %p UTC")
+    nearest_deadline = local_stamp(expires_at, fmt="%B %-d, %Y at %-I:%M %p")
     parts.extend(
         [
             "",
@@ -633,7 +634,7 @@ def compose_body_html(
         lines = "".join(f"<li>{escape(line)}</li>" for line in item.lines)
         url = item_links[item.key]
         item_deadline = (item_expiries or {}).get(item.key, expires_at)
-        formatted_deadline = item_deadline.astimezone(UTC).strftime("%B %d, %Y at %I:%M %p UTC")
+        formatted_deadline = local_stamp(item_deadline, fmt="%B %-d, %Y at %-I:%M %p")
         sections.append(
             '<section style="border:1px solid #dbe3ec;border-radius:10px;padding:18px;margin:18px 0">'
             f'<h2 style="font-size:18px;color:#13233d;margin:0 0 10px">{escape(item.title)}</h2>'
@@ -642,7 +643,7 @@ def compose_body_html(
             f'<p style="font-size:13px;color:#68778b"><strong>Response deadline:</strong> {escape(formatted_deadline)}</p>'
             "</section>"
         )
-    nearest_deadline = expires_at.astimezone(UTC).strftime("%B %d, %Y at %I:%M %p UTC")
+    nearest_deadline = local_stamp(expires_at, fmt="%B %-d, %Y at %-I:%M %p")
     return (
         '<!doctype html><html><body style="margin:0;background:#f5f7fa;font-family:Arial,sans-serif;color:#25364d">'
         '<div style="max-width:720px;margin:0 auto;background:white">'
@@ -717,7 +718,7 @@ def append_response_page(
 
     from weasyprint import HTML
 
-    deadline = expires_at.astimezone(UTC).strftime("%B %d, %Y at %I:%M %p UTC")
+    deadline = local_stamp(expires_at, fmt="%B %-d, %Y at %-I:%M %p")
     html = f"""
     <html><head><meta charset="utf-8"><style>
     @page {{ size: Letter; margin: 0; }}

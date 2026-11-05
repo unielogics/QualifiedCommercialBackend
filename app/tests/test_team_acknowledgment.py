@@ -97,7 +97,7 @@ def test_the_batch_statements_compile_to_distinct_on_with_the_right_order():
 async def test_auth_me_says_when_acknowledgment_is_still_needed():
     from app.routers.auth import me
 
-    settings = SimpleNamespace(frontend_app_url="https://f", rep_app_url="https://r", audit_app_url="https://a")
+    settings = SimpleNamespace(frontend_app_url="https://f", rep_app_url="https://r", audit_app_url="https://a", capital_app_url="https://c")
     with patch("app.routers.auth.account_types", return_value=[]), patch("app.routers.auth.has_product_access", return_value=False), \
          patch("app.services.user_access.get_settings", return_value=settings):
         with patch.object(ack, "latest_acceptance", AsyncMock(return_value=None)):

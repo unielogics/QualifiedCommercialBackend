@@ -25,7 +25,7 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.application_profile import ApplicationProfile
-from app.models.bucket import BucketFile, BucketFileAnalysis
+from app.models.bucket import Bucket, BucketFile, BucketFileAnalysis
 from app.models.financial_form_version import (
     FinancialFormDraft,
     FinancialFormFamily,
@@ -121,10 +121,14 @@ def validate_body(kind: str, raw: dict) -> dict:
             raise HTTPException(422, "Remove the no-debt declaration while active obligations are listed")
         normalized_rows = []
         for row in body.get("debts") or []:
+            if "debt_type" in row:
+                row["debt_type"] = financial_statements.normalize_debt_type(row["debt_type"])
             if row.get("status", "active") not in {"active", "dismissed", "duplicate"}:
                 raise HTTPException(422, "Invalid debt row status")
             if row.get("duplicate_of_id") and _uuid(row["duplicate_of_id"]) is None:
                 raise HTTPException(422, "Invalid duplicate row")
+            if isinstance(row.get("mca_modified"), bool):
+                row["mca_modified"] = "yes" if row["mca_modified"] else "no"
             try:
                 normalized_rows.append(normalize_terms(row))
             except DebtTermsError as error:
@@ -155,7 +159,7 @@ def validate_body(kind: str, raw: dict) -> dict:
                 date.fromisoformat(text)
             except ValueError:
                 raise HTTPException(422, f"Enter an ISO date for {cell.key}") from None
-        if cell.options and text not in cell.options:
+        if cell.options and text not in cell.options and not (kind == "debt_schedule" and cell.key and cell.key.endswith(".debt_type")):
             raise HTTPException(422, f"Choose a valid option for {cell.key}")
     return _json(body)
 
@@ -261,11 +265,18 @@ async def has_managed_family(db: AsyncSession, profile: Any, kind: str) -> bool:
     return await existing_family(db, profile.id, kind) is not None
 
 
+async def lock_financial_profile(db: AsyncSession, profile: ApplicationProfile) -> None:
+    """Use readiness's BUCKET BEFORE PROFILE order for every workspace writer."""
+    if getattr(profile, "primary_bucket_id", None) is not None:
+        await db.execute(select(Bucket.id).where(Bucket.id == profile.primary_bucket_id).with_for_update())
+    await db.execute(select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update())
+
+
 async def existing_draft(db: AsyncSession, profile: ApplicationProfile, kind: str) -> FinancialFormDraft | None:
     family = await existing_family(db, profile.id, kind)
     if family is None:
         return None
-    await db.execute(select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update())
+    await lock_financial_profile(db, profile)
     return (await db.execute(select(FinancialFormDraft).where(FinancialFormDraft.family_id == family.id).execution_options(populate_existing=True))).scalar_one_or_none()
 
 
@@ -290,13 +301,13 @@ async def _legacy_body(db: AsyncSession, profile: ApplicationProfile, kind: str)
         scope = or_(scope, and_(DealerDebt.profile_id.is_(None), DealerDebt.dealer_id == profile.dealer_id))
     rows = list((await db.execute(select(DealerDebt).where(scope).order_by(DealerDebt.created_at))).scalars().all())
     links = await debt_evidence_by_row(db, profile.id)
-    names = ("id", "lender", "original_amount", "balance", "rate", "monthly_payment", "originated_on", "maturity_on", "secured", "payment_status", "collateral", "notes", "status", "origin", "vendor_key", "evidence", "count_in_dscr", "payment_amount", "payment_frequency", "factor_rate", "payoff_amount", "document_id", "duplicate_of_id")
+    names = ("id", "lender", "original_amount", "balance", "rate", "monthly_payment", "originated_on", "maturity_on", "secured", "payment_status", "collateral", "mca_modified", "mca_modification_note", "notes", "status", "origin", "vendor_key", "evidence", "count_in_dscr", "payment_amount", "payment_frequency", "factor_rate", "payoff_amount", "document_id", "duplicate_of_id")
     debts = []
     for row in rows:
         if row.profile_id is None:
             row.profile_id = profile.id
         item = {name: _json(getattr(row, name, None)) for name in names}
-        item["debt_type"] = "" if row.category == "loan" else row.category
+        item["debt_type"] = financial_statements.normalize_debt_type(row.category)
         item["evidence_links"] = links.get(str(row.id), links.get(row.id, []))
         item["monthly_payment_source"] = monthly_source(row)
         item["editable"] = True
@@ -338,7 +349,7 @@ async def _baseline_files(db: AsyncSession, profile: ApplicationProfile, kind: s
 async def resolve_family(db: AsyncSession, profile: ApplicationProfile, *, kind: str, family_id: UUID | None = None, actor: Any = None) -> tuple[FinancialFormFamily, FinancialFormDraft]:
     _kind(kind)
     # The profile lock serializes first-open and publication across all kinds.
-    await db.execute(select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update())
+    await lock_financial_profile(db, profile)
     family = await db.get(FinancialFormFamily, family_id) if family_id else await existing_family(db, profile.id, kind)
     if family_id and (family is None or family.profile_id != profile.id or family.kind != kind):
         raise HTTPException(404, "Financial form family not found")
@@ -400,7 +411,7 @@ async def create_family(db: AsyncSession, profile: ApplicationProfile, *, kind: 
     identity["subject"] = str(identity.get("subject") or ("applicant" if kind == "pfs" else "business"))[:180]
     if kind == "debt_schedule":
         identity = {"subject": "business"}
-    await db.execute(select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update())
+    await lock_financial_profile(db, profile)
     key = body_hash(identity)
     existing = (await db.execute(select(FinancialFormFamily).where(FinancialFormFamily.profile_id == profile.id, FinancialFormFamily.kind == kind, FinancialFormFamily.identity_key == key))).scalar_one_or_none()
     if existing:
@@ -841,6 +852,10 @@ async def current_financial_file_ids(db: AsyncSession, file_ids: Iterable[UUID])
     ids = set(file_ids)
     if not ids:
         return set()
+    if not isinstance(getattr(db, "info", None), dict):
+        # Legacy lightweight adapters cannot hold managed-version state.
+        # Real AsyncSession readers always resolve the current pointers below.
+        return ids
     rows = list((await db.execute(select(FinancialFormVersion, FinancialFormFamily.current_version_id).join(FinancialFormFamily, FinancialFormFamily.id == FinancialFormVersion.family_id).where(or_(FinancialFormVersion.source_file_id.in_(ids), FinancialFormVersion.pdf_file_id.in_(ids))))).all())
     historical: set[UUID] = set()
     current: set[UUID] = set()
@@ -1295,7 +1310,7 @@ async def propose_import(db: AsyncSession, profile: ApplicationProfile, *, kind:
         candidates = await _families(db, profile.id, kind)
         family = next((candidate for candidate in candidates if _compatible_identity(candidate, identity)), None)
         if family is None:
-            await db.execute(select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update())
+            await lock_financial_profile(db, profile)
             family = FinancialFormFamily(id=uuid4(), profile_id=profile.id, kind=kind, identity_key=body_hash(identity), identity=identity, label=LABELS[kind] + (f" · {identity['subject']}" if identity.get("subject") not in {"business", "applicant"} else ""), created_at=now())
             db.add(family)
             await db.flush()

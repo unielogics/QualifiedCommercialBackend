@@ -75,6 +75,11 @@ class ApplicationTermSheet(TimestampMixin, Base):
     payments_per_year: Mapped[float] = mapped_column(Numeric(8, 3), nullable=False)
     custom_repayment_label: Mapped[str | None] = mapped_column(String(80))
     debt_service_treatment: Mapped[str] = mapped_column(String(20), nullable=False)
+    #: amortizing | simple_interest | interest_only (None on rows saved before
+    #: the structure existed: those were amortizing), and the months of the
+    #: term that are interest-only before principal starts.
+    loan_structure: Mapped[str | None] = mapped_column(String(20))
+    interest_only_months: Mapped[int | None] = mapped_column(Integer)
     retained_annual_debt_service: Mapped[float | None] = mapped_column(Numeric(14, 2))
     periodic_payment: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
     payment_count: Mapped[int] = mapped_column(Integer, nullable=False)

@@ -86,6 +86,16 @@ class Bucket(TimestampMixin, Base):
             "name_sync_mode IN ('linked','custom')",
             name="ck_buckets_name_sync_mode",
         ),
+        # One vocabulary for what kind of room this is. Free text here once held
+        # a partner's name as a "type"; operator_files derives the vertical from
+        # these values, so each keeps its substring (main_street, mca, dealer).
+        CheckConstraint(
+            "bucket_type IS NULL OR bucket_type IN ("
+            "'general','loan_file','underwriting','application_profile',"
+            "'dealer_ai_intake','main_street_intake','real_estate_ai_intake',"
+            "'mca_refinance_intake','commercial_foreclosure_rescue','business_capital_referral')",
+            name="ck_buckets_bucket_type",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -218,6 +228,10 @@ class BucketRequestedDocument(TimestampMixin, Base):
     required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     allow_multiple_files: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="requested", server_default="requested")
+    # A closed ask is no longer owed. The reason names what closed it (today:
+    # the bucket's archive) so a restore can reopen exactly that set.
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
     is_custom: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     # Generic e-sign extension (credit-authorization forms, and any future
     # "have the client sign X" requested document) — reuses the SAME
@@ -820,7 +834,7 @@ class BucketAIChatAction(TimestampMixin, Base):
         Index("ix_bucket_ai_chat_actions_message", "source_message_id", "created_at"),
         Index("ix_bucket_ai_chat_actions_profile_status", "profile_id", "status"),
         CheckConstraint(
-            "action_type IN ('upload_own','complete_now','download_template','email_template')",
+            "action_type IN ('upload_own','complete_now','download_template','email_template','open_worksheet')",
             name="ck_bucket_ai_chat_action_type",
         ),
         CheckConstraint(

@@ -125,3 +125,26 @@ async def test_bank_report_reuses_canonical_rollup_and_only_offers_outgoing_paye
     with patch("app.dealer_os.router._vendor_rollup", AsyncMock(return_value=([incoming, outgoing], 9))) as rollup:
         assert await links._payees(db, profile) == [outgoing]
     rollup.assert_awaited_once_with(db, dealer)
+
+
+@pytest.mark.asyncio
+async def test_uploaded_statement_payees_work_without_a_dealer_ledger():
+    from app.services import application_programs
+
+    db = SimpleNamespace(info={})
+    profile = SimpleNamespace(id=uuid4(), dealer_id=None, primary_bucket_id=uuid4())
+    file = SimpleNamespace(id=uuid4(), file_name="bank statement.pdf", statement_period=None)
+    analysis = SimpleNamespace(status="completed", classification="bank_statement", analyzed_at=None,
+                               document_type_candidates=[], analysis={"key_facts": {
+                                   "bank": "Example bank", "account_last4": "1234",
+                                   "statement_period": "2026-05-01 to 2026-05-31",
+                                   "recurring_debits": [{"payee": "ONDECK ACH DEBIT 4471", "occurrences": 21,
+                                                         "total_amount": 6300, "average_amount": 300,
+                                                         "cadence": "daily", "kind_guess": "merchant_cash_advance"}],
+                               }})
+    with patch.object(application_programs, "_evidence_inventory", AsyncMock(return_value=([file], {file.id: analysis}, {}))), \
+         patch.object(application_programs, "accepted_evidence_file_ids", AsyncMock(return_value={file.id})):
+        payees = await links._payees(db, profile)
+    assert len(payees) == 1
+    assert payees[0].sample_description == "ONDECK ACH DEBIT 4471"
+    assert payees[0].monthly_average == 6300 and payees[0].count == 21 and payees[0].months == 1

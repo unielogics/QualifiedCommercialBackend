@@ -88,6 +88,32 @@ async def source_funding_data(
     return None, None, purpose, dealer
 
 
+def seed_refinance_budget(profile: ApplicationProfile, intake: Any, requested_amount: Decimal | None) -> bool:
+    """An MCA refinance file's budget is the refinance; fill it in once.
+
+    The borrower declared the amount at the start of the intake. Asking the
+    desk to type the same number into a one-line budget before the AI would
+    select a program left every MCA file at "Budget needed".
+    """
+    if getattr(profile, "use_of_funds", None) or (getattr(profile, "use_of_funds_revision", 0) or 0):
+        return False
+    if not str(getattr(intake, "variant", "") or "").startswith("mca"):
+        return False
+    amount = _money(requested_amount)
+    if amount is None:
+        state = getattr(intake, "intake_state", None) or {}
+        declared = state.get("mca_qualification") if isinstance(state.get("mca_qualification"), dict) else {}
+        amount = _money(declared.get("requested_amount"))
+    if amount is None or amount <= 0:
+        return False
+    profile.use_of_funds = [UseOfFundsItem(
+        id="mca_refinance", category="debt_refinance", label="Pay off active merchant cash advances", amount=amount,
+    ).model_dump(mode="json")]
+    profile.use_of_funds_revision = 1
+    profile.use_of_funds_updated_at = datetime.now(UTC)
+    return True
+
+
 def validated_items(raw: object) -> list[UseOfFundsItem] | None:
     """Legacy data is read only if it already has the complete structured shape."""
     if not isinstance(raw, list):

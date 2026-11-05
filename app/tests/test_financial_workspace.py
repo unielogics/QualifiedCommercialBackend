@@ -143,6 +143,18 @@ async def test_staging_a_draft_never_projects_figures_or_writes_a_pdf():
 
 
 @pytest.mark.asyncio
+async def test_workspace_writers_lock_bucket_before_profile_like_readiness():
+    from app.models.application_profile import ApplicationProfile
+    from app.models.bucket import Bucket
+
+    profile, _, _ = context("debt_schedule")
+    db = SimpleNamespace(execute=AsyncMock())
+    await ws.lock_financial_profile(db, profile)
+    assert [call.args[0].column_descriptions[0]["entity"] for call in db.execute.await_args_list] == [Bucket, ApplicationProfile]
+    assert all("FOR UPDATE" in str(call.args[0]) for call in db.execute.await_args_list)
+
+
+@pytest.mark.asyncio
 async def test_pdf_storage_failure_leaves_pointer_projections_and_version_rows_untouched():
     db = Memory()
     profile, family, draft = context()

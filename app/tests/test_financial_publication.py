@@ -123,6 +123,34 @@ async def test_review_context_scope_requires_bucket_and_visible_file_intersectio
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["borrower", "original", "partial", "different_actor", "superseded"])
+async def test_only_explicit_current_staff_saved_complete_pdf_proves_human_review(change):
+    actor = SimpleNamespace(id=uuid4(), role="broker")
+    file = SimpleNamespace(id=uuid4())
+    version = SimpleNamespace(id=uuid4(), version_number=2, source="form", status="filed",
+        actor_user_id=actor.id, pdf_file_id=file.id,
+        body={"debts": [{"lender": "Kapfi", "balance": "100", "monthly_payment": "10"}]})
+    family = SimpleNamespace(kind="debt_schedule", current_version_id=version.id)
+    if change == "borrower":
+        actor.role = "client"
+    elif change == "original":
+        version.source, version.status = "original", "original"
+    elif change == "partial":
+        version.body["debts"][0]["monthly_payment"] = None
+    elif change == "different_actor":
+        version.actor_user_id = uuid4()
+    else:
+        family.current_version_id = uuid4()
+    with patch("app.services.application_programs.get_program_readiness", AsyncMock()) as readiness, patch(
+        "app.services.application_programs.override_evidence_decision", AsyncMock()
+    ) as review:
+        await publication.record_staff_debt_publication_review(SimpleNamespace(), SimpleNamespace(),
+            family=family, version=version, file=file, actor=actor)
+    readiness.assert_not_awaited()
+    review.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_advisory_failure_does_not_fail_publication_or_start_a_model_run():
     @asynccontextmanager
     async def nested():

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,6 +43,7 @@ from app.models.notification import Notification
 from app.models.user import User
 from app.services import file_contacts, file_links, file_team
 from app.services.application_profiles import find_profile
+from app.services.local_time import firm_zone, local_stamp
 
 log = logging.getLogger(__name__)
 
@@ -392,23 +394,33 @@ def _mask(email: str) -> str:
     return f"{local[:1]}***@{domain}" if domain else "***"
 
 
-def _fmt_when(value: datetime) -> str:
-    return value.astimezone(UTC).strftime("%b %d, %I:%M %p UTC")
+def _fmt_when(value: datetime, tz: ZoneInfo | None = None) -> str:
+    return local_stamp(value, tz)
 
 
-def render_digest(business: str, events: list[FileEvent], *, titles_only: bool, link: str | None) -> tuple[str, str, str]:
-    """(subject, text, html) — what happened, in order, and where to look."""
+def render_digest(
+    business: str,
+    events: list[FileEvent],
+    *,
+    titles_only: bool,
+    link: str | None,
+    tz: ZoneInfo | None = None,
+) -> tuple[str, str, str]:
+    """(subject, text, html) — what happened, in order, and where to look.
+
+    Times are the reader's, in the firm's zone; nobody reads a digest in UTC.
+    """
     count = len(events)
     subject = f"{count} update{'s' if count != 1 else ''} on {business}"
     ordered = sorted(events, key=lambda e: e.created_at)
     lines: list[str] = []
     items: list[str] = []
     for event in ordered:
-        line = f"{_fmt_when(event.created_at)} — {event.title}"
+        line = f"{_fmt_when(event.created_at, tz)} — {event.title}"
         detail = "" if titles_only or not event.body else f"\n    {event.body}"
         lines.append(f"• {line}{detail}")
         items.append(
-            f"<li><strong>{html.escape(event.title)}</strong> <span style=\"color:#64748b\">{html.escape(_fmt_when(event.created_at))}</span>"
+            f"<li><strong>{html.escape(event.title)}</strong> <span style=\"color:#64748b\">{html.escape(_fmt_when(event.created_at, tz))}</span>"
             + ("" if titles_only or not event.body else f"<br><span>{html.escape(event.body)}</span>")
             + "</li>"
         )
@@ -428,6 +440,7 @@ async def drain_notices(db: AsyncSession, *, limit: int = 300) -> int:
     from app.services.messaging.outbox import Draft, Subject, deliver_email
 
     settings = await _settings(db)
+    tz = await firm_zone(db)
     cutoff = datetime.now(UTC) - DRAIN_DELAY
     events = list(
         (
@@ -460,7 +473,7 @@ async def drain_notices(db: AsyncSession, *, limit: int = 300) -> int:
                         continue
                     if not visible:
                         continue
-                    subject, text, html_body = render_digest(business, visible, titles_only=recipient.titles_only, link=recipient.link)
+                    subject, text, html_body = render_digest(business, visible, titles_only=recipient.titles_only, link=recipient.link, tz=tz)
                     outcome = await deliver_email(
                         db,
                         Draft(to=recipient.email, subject=subject, body_text=text, body_html=html_body),

@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
-EDITABLE_DEBT_FIELDS = frozenset({"lender", "debt_type", "original_amount", "balance", "rate", "monthly_payment", "factor_rate", "payment_amount", "payment_frequency", "originated_on", "maturity_on", "secured", "payment_status", "collateral", "notes"})
+EDITABLE_DEBT_FIELDS = frozenset({"lender", "debt_type", "original_amount", "balance", "rate", "monthly_payment", "factor_rate", "payment_amount", "payment_frequency", "originated_on", "maturity_on", "secured", "payment_status", "collateral", "mca_modified", "mca_modification_note", "notes"})
 
 
 def merge_source_debts(current: dict, incoming: dict, *, origin: str = "client_form") -> dict:

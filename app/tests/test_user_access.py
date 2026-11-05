@@ -328,7 +328,8 @@ def test_external_rows_ignore_console_grants() -> None:
 
 
 def test_what_a_role_may_be_granted() -> None:
-    assert allowed_console_keys(Role.SUPER_ADMIN) == {"funding", "field_desk", "audit"}
+    assert allowed_console_keys(Role.SUPER_ADMIN) == {"funding", "field_desk", "audit", "capital"}
+    assert allowed_console_keys(Role.CAPITAL_PARTNER) == {"capital"}
     assert allowed_console_keys(Role.BROKER) == {"funding", "field_desk"}
     assert allowed_console_keys(Role.REGIONAL_MANAGER) == {"funding"}
     assert allowed_console_keys(Role.FIELD_REP) == {"field_desk", "audit", "funding"}
@@ -336,13 +337,20 @@ def test_what_a_role_may_be_granted() -> None:
 
 
 def test_console_links_follow_settings_and_grants() -> None:
-    settings = SimpleNamespace(frontend_app_url="https://f/", rep_app_url="https://r", audit_app_url="https://a/")
+    settings = SimpleNamespace(
+        frontend_app_url="https://f/", rep_app_url="https://r", audit_app_url="https://a/", capital_app_url="https://c/"
+    )
     with patch.object(user_access, "get_settings", return_value=settings):
         assert console_links(_staff(Role.SUPER_ADMIN)) == [
             {"key": "funding", "label": "Funding", "url": "https://f"},
             {"key": "field_desk", "label": "Field Desk", "url": "https://r"},
             {"key": "audit", "label": "Audit", "url": "https://a"},
+            {"key": "capital", "label": "Capital Partners", "url": "https://c"},
         ]
+        # A capital partner opens the member portal and nothing else; a stale
+        # grant on the row changes nothing.
+        assert [c["key"] for c in console_links(_staff(Role.CAPITAL_PARTNER))] == ["capital"]
+        assert [c["key"] for c in console_links(_staff(Role.CAPITAL_PARTNER, ["funding"]))] == ["capital"]
         assert [c["key"] for c in console_links(_staff(Role.FIELD_REP))] == ["field_desk", "audit"]
         assert [c["key"] for c in console_links(_staff(Role.FIELD_REP, ["funding"]))] == ["funding", "field_desk", "audit"]
         assert [c["key"] for c in console_links(_staff(Role.BROKER, ["field_desk"]))] == ["funding", "field_desk", "audit"]

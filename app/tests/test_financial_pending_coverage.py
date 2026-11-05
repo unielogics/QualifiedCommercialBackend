@@ -12,8 +12,12 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.dialects import sqlite
 
-from app.models.application_profile import ApplicationRequirementState
-from app.models.bucket import BucketFile
+from app.models.application_profile import (
+    ApplicationRequirementEvidence,
+    ApplicationRequirementState,
+)
+from app.models.bucket import BucketFile, BucketFileAnalysis
+from app.models.funding_program import ApplicationRequirementEvidenceDecision
 from app.services import application_programs as programs
 from app.services import collection_tasks
 from app.services.bucket_evidence import analysis_classifications, analysis_usability
@@ -37,7 +41,7 @@ class Rows:
         return self.values
 
     def scalar_one_or_none(self):
-        return None
+        return self.values[0] if len(self.values) == 1 else None
 
 
 def _selector_sql(clause):
@@ -191,26 +195,27 @@ async def test_received_financial_upload_routes_to_checklist_and_pauses_add_file
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scenario", ["pending", "filed", "legacy_complete_save"])
+@pytest.mark.parametrize("scenario", ["pending", "filed", "legacy_complete_save", "staff_reviewed_save", "borrower_save"])
 async def test_real_requirement_materialization_accepts_complete_saved_schedule(scenario):
-    filed = scenario != "pending"
+    filed = scenario not in {"pending", "borrower_save"}
+    strict_review = scenario in {"staff_reviewed_save", "borrower_save"}
     profile_id, file_id, slot_id = uuid4(), uuid4(), uuid4()
     state = ApplicationRequirementState(
         id=uuid4(), profile_id=profile_id, requirement_key="business_debt_schedule",
         label="Business debt schedule", category="Debts", required_level="required",
-        status="requested", requested_document_id=slot_id, verification_required=False,
+        status="requested", requested_document_id=slot_id, verification_required=strict_review,
         source_program_keys=[], source_policy_keys=[],
         provenance={"source_kind": "lender", "requirement_kind": "document",
                     "catalog_approved": True, "client_visible": True,
                     "canonical_key": "business_debt_schedule",
                     "collection_config": {"evidence_classes": ["debt_schedule"]},
                     "external_definition": {"visibility": ["borrower", "underwriter"],
-                                            "completion_mode": "ai_can_complete"}},
+                                            "completion_mode": "requires_human_verify" if strict_review else "ai_can_complete"}},
     )
     file = SimpleNamespace(id=file_id, file_name="Schedule.pdf", requested_document_id=slot_id,
-                           content_hash="a" * 64, created_at=datetime.now(UTC), statement_period=None)
+                           content_hash="a" * 64, created_at=datetime.now(UTC), statement_period=None, deleted_at=None)
     raw = source_analysis(file_id)
-    analysis = raw if filed else PendingFinancialAnalysis(raw)
+    analysis = raw if scenario != "pending" else PendingFinancialAnalysis(raw)
     inventory = ([file], {file_id: analysis}, set())
     if scenario == "legacy_complete_save":
         # An older Save used status=published. Execute the real coverage/body
@@ -231,13 +236,45 @@ async def test_real_requirement_materialization_accepts_complete_saved_schedule(
                            verified_by_user_id=None, provenance={}, reason=None)
     slot = SimpleNamespace(id=slot_id, requires_signature=False, status="uploaded")
     added = []
+    decisions = []
+    def add(row):
+        added.append(row)
+        if isinstance(row, ApplicationRequirementEvidenceDecision):
+            row.id = row.id or uuid4()
+            row.created_at = datetime.now(UTC)
+            decisions.append(row)
+    async def execute(statement):
+        model = statement.column_descriptions[0]["entity"]
+        if model is ApplicationRequirementState:
+            return Rows([state])
+        if model is ApplicationRequirementEvidence:
+            return Rows([link])
+        if model is BucketFileAnalysis:
+            return Rows([raw])
+        if model is ApplicationRequirementEvidenceDecision:
+            key = statement.compile().params.get("idempotency_key_1")
+            return Rows([row for row in decisions if key is None or row.idempotency_key == key])
+        if getattr(model, "__name__", "") == "ApplicationCollectionTask":
+            return Rows([row for row in added if row.__class__.__name__ == "ApplicationCollectionTask"])
+        return Rows([])
     db = SimpleNamespace(
-        execute=AsyncMock(side_effect=lambda stmt: Rows([state] if stmt.column_descriptions[0]["entity"] is ApplicationRequirementState else [])),
-        get=AsyncMock(return_value=None), flush=AsyncMock(), add=added.append,
+        execute=AsyncMock(side_effect=execute),
+        get=AsyncMock(side_effect=lambda model, _id: file if model is BucketFile else None), flush=AsyncMock(), add=add,
     )
     # Decision lookup also needs the scalar accessor; no stored decisions means
     # the real local evidence validator computes processing/accepted itself.
-    with patch.object(programs, "_evidence_inventory", AsyncMock(return_value=inventory)), patch.object(programs, "_accepted_entity_aliases", AsyncMock(return_value=set())), patch.object(collection_tasks, "latest_responses", AsyncMock(return_value={})), patch.object(programs, "_requested_document", AsyncMock(return_value=slot)), patch.object(programs, "_sync_requirement_evidence", AsyncMock(return_value=[link])):
+    profile = SimpleNamespace(id=profile_id, intake_id=None, funding_category=None)
+    async def refresh(_db, _profile):
+        return await programs._materialize_requirements(_db, _profile, [], {}, [], {})
+    with patch.object(programs, "_evidence_inventory", AsyncMock(return_value=inventory)), patch.object(programs, "_accepted_entity_aliases", AsyncMock(return_value=set())), patch.object(collection_tasks, "latest_responses", AsyncMock(return_value={})), patch.object(programs, "_requested_document", AsyncMock(return_value=slot)), patch.object(programs, "_sync_requirement_evidence", AsyncMock(return_value=[link])), patch.object(programs, "get_program_readiness", AsyncMock(side_effect=refresh)):
+        if strict_review:
+            from app.services.financial_publication import record_staff_debt_publication_review
+
+            actor = SimpleNamespace(id=uuid4(), role="broker" if scenario == "staff_reviewed_save" else "client")
+            saved = SimpleNamespace(id=uuid4(), version_number=2, source="form", status="filed", actor_user_id=actor.id,
+                pdf_file_id=file_id, body={"debts": [{"lender": "Kapfi", "balance": "100", "monthly_payment": "10"}]})
+            family = SimpleNamespace(kind="debt_schedule", current_version_id=saved.id)
+            await record_staff_debt_publication_review(db, profile, family=family, version=saved, file=file, actor=actor)
         await programs._materialize_requirements(db, SimpleNamespace(id=profile_id, intake_id=None, funding_category=None), [], {}, [], {})
     assert state.status == ("verified" if filed else "received_unverified")
     assert state.provenance["coverage"]["current"] == 1
@@ -245,4 +282,10 @@ async def test_real_requirement_materialization_accepts_complete_saved_schedule(
     assert slot.status == ("uploaded" if filed else "requested")
     task = next(row for row in added if row.__class__.__name__ == "ApplicationCollectionTask")
     assert task.status == ("completed" if filed else "in_review")
+    if strict_review:
+        staff = [row for row in decisions if row.actor_kind == "staff"]
+        assert bool(staff) is (scenario == "staff_reviewed_save")
+        if staff:
+            assert staff[-1].decision == "accepted" and staff[-1].content_hash == file.content_hash
+            assert staff[-1].analysis_id == raw.id and staff[-1].actor_user_id == actor.id
     assert raw.status == "completed" and raw.analysis["key_facts"]["total_outstanding_balance"] == 900000

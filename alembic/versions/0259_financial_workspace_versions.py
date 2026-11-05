@@ -1,7 +1,7 @@
 """Separate financial working drafts from immutable dated PDF versions.
 
-Revision ID: 0242_financial_workspace
-Revises: 0241_production_legal_retention
+Revision ID: 0259_financial_workspace
+Revises: 0258_extra_requirements
 """
 
 import sqlalchemy as sa
@@ -9,8 +9,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0242_financial_workspace"
-down_revision = "0241_production_legal_retention"
+revision = "0259_financial_workspace"
+down_revision = "0258_extra_requirements"
 branch_labels = None
 depends_on = None
 

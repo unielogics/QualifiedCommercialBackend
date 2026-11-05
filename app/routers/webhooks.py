@@ -613,15 +613,41 @@ async def ses_events(request: Request) -> Response:
         return Response(status_code=status.HTTP_202_ACCEPTED)
 
     detail = ""
+    # Who it bounced for, from the event itself. Not every outbound email has a
+    # ledger row — several senders reach SES directly — so the address in the
+    # payload is the only way to honour feedback for a send we never recorded.
+    recipients: list[str] = []
     if event_type == "Bounce":
         bounce = event.get("bounce") or {}
         detail = f"{bounce.get('bounceType', 'Bounce')}/{bounce.get('bounceSubType', '')}".strip("/")
+        recipients = [
+            str(item.get("emailAddress") or "")
+            for item in (bounce.get("bouncedRecipients") or [])
+            if isinstance(item, dict) and item.get("emailAddress")
+        ]
     elif event_type == "Complaint":
-        detail = str((event.get("complaint") or {}).get("complaintFeedbackType") or "complaint")
+        complaint = event.get("complaint") or {}
+        detail = str(complaint.get("complaintFeedbackType") or "complaint")
+        recipients = [
+            str(item.get("emailAddress") or "")
+            for item in (complaint.get("complainedRecipients") or [])
+            if isinstance(item, dict) and item.get("emailAddress")
+        ]
+    if not recipients:
+        # Older SES notification shapes carry only the envelope destination.
+        recipients = [
+            str(address)
+            for address in ((event.get("mail") or {}).get("destination") or [])
+            if address
+        ]
 
     async with SessionLocal() as db:
         await outbox.mark_delivery(
-            db, provider_message_id=message_id, event=event_type, detail=detail
+            db,
+            provider_message_id=message_id,
+            event=event_type,
+            detail=detail,
+            recipients=recipients,
         )
         await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

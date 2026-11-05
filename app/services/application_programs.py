@@ -9,10 +9,11 @@ import re
 import uuid
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -62,7 +63,14 @@ from app.schemas.application_profile import (
     ProgramReadinessItem,
 )
 from app.services import application_profiles as profiles
-from app.services import equipment_financing, file_events, locked_file_requests, provenance
+from app.services import (
+    equipment_financing,
+    file_events,
+    locked_file_requests,
+    mca_refinance_policy,
+    provenance,
+    requirement_library,
+)
 from app.services import funding_programs as program_catalog
 from app.services.activity_log import log_activity
 from app.services.bucket_evidence import (
@@ -83,7 +91,7 @@ from app.services.program_rules import (
     evaluate_rules,
     validate_rules,
 )
-from app.services.use_of_funds import source_funding_data
+from app.services.use_of_funds import seed_refinance_budget, source_funding_data
 from app.services.use_of_funds import summarize as summarize_use_of_funds
 
 SATISFIED_STATES = {"verified", "waived", "not_applicable"}
@@ -96,10 +104,14 @@ OPEN_UNDERWRITING_STATES = {
     "approved",
 }
 LEVEL_RANK = {"optional": 0, "recommended": 1, "required": 2}
+# Automatic routing pins the best-ranked eligible published programs, at most
+# this many. Requirements are the union across every pinned selection.
+AUTO_SELECT_LIMIT = 3
 EXPECTED_CLASSIFICATIONS: dict[str, set[str]] = {
     "business_bank_statements_6_months": {"bank_statement"},
     "business_tax_returns_2_years": {"tax_return"},
     "ytd_p_and_l_balance_sheet": {"current_p_and_l", "profit_and_loss", "balance_sheet"},
+    "ytd_profit_and_loss": {"current_p_and_l", "profit_and_loss"},
     "business_debt_schedule": {"debt_schedule"},
     "owner_personal_financial_statement": {"personal_financial_statement"},
     "real_estate_schedule": {"real_estate_schedule"},
@@ -274,6 +286,33 @@ def _is_lending_applicable(context: dict[str, Any]) -> bool:
     return context.get("intent_kind") not in {"non_lending", "route_out"}
 
 
+#: The analysis provider that marks a PDF as one we drew from typed answers
+#: (`drafted_forms.DRAFTED_FORM_PROVIDER`; a test holds the two together).
+_DRAFTED_FORM_PROVIDER = "drafted_form"
+
+#: What a drafted form's analysis calls the form, as the dashboard names it.
+_FORM_KIND_BY_CLASSIFICATION = {
+    "personal_financial_statement": "pfs",
+    "debt_schedule": "debt_schedule",
+    "current_p_and_l": "p_and_l",
+    "balance_sheet": "balance_sheet",
+}
+
+
+def evidence_origin(file: BucketFile, analysis: BucketFileAnalysis | None) -> tuple[str, str | None]:
+    """Whether a file is a document somebody sent or a form somebody filled in.
+
+    The desk reads these differently: an upload is judged by the AI's reading
+    of the pages, while a filled form carries answers that can be read back
+    directly, and the PDF is only our rendering of them.
+    """
+    if getattr(analysis, "provider", None) == _DRAFTED_FORM_PROVIDER:
+        return "filled_form", _FORM_KIND_BY_CLASSIFICATION.get(getattr(analysis, "classification", None) or "")
+    if getattr(file, "source_kind", None) == "generated" and getattr(file, "source_detail", None) == "signed_document":
+        return "signed", None
+    return "uploaded", None
+
+
 async def _evidence_inventory(
     db: AsyncSession, profile: ApplicationProfile, *, include_pending_financial: bool = False
 ) -> tuple[list[BucketFile], dict[uuid.UUID, BucketFileAnalysis], set[str]]:
@@ -345,15 +384,16 @@ async def _evidence_inventory(
     return files, latest, classifications
 
 
-async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
-    intake = (
-        await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
-    )
-    requested_amount, amount_source, loan_purpose, dealer = await source_funding_data(
-        db, profile, intake=intake,
-    )
-    budget = summarize_use_of_funds(profile, requested_amount, amount_source, dealer=dealer)
-    files, latest_analyses, _classifications = await _evidence_inventory(db, profile)
+async def accepted_evidence_file_ids(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    files: list[BucketFile],
+    latest_analyses: dict[uuid.UUID, BucketFileAnalysis],
+) -> set[uuid.UUID]:
+    """Files whose latest analysis the evidence review accepted, or that a
+    person verified before decisions were recorded, keyed to the content the
+    file holds now (a re-upload or a newer analysis version starts over).
+    Shared by program fit and the financial cockpit so both read the same set."""
     evidence_links = list(
         (
             await db.execute(
@@ -374,7 +414,7 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
     )
     latest_decisions = await _latest_evidence_decisions(db, evidence_links)
     current_files = {file.id: file for file in files}
-    accepted_file_ids = {
+    return {
         link.file_id
         for link in evidence_links
         if (
@@ -387,6 +427,22 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         )
         or (latest_decisions.get(link.id) is None and link.verified_at is not None)
     }
+
+
+async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
+    intake = (
+        await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    )
+    requested_amount, amount_source, loan_purpose, dealer = await source_funding_data(
+        db, profile, intake=intake,
+    )
+    if seed_refinance_budget(profile, intake, requested_amount):
+        amount_source = amount_source or "intake.mca_qualification"
+        if requested_amount is None:
+            requested_amount = Decimal(str(profile.use_of_funds[0]["amount"]))
+    budget = summarize_use_of_funds(profile, requested_amount, amount_source, dealer=dealer)
+    files, latest_analyses, _classifications = await _evidence_inventory(db, profile)
+    accepted_file_ids = await accepted_evidence_file_ids(db, profile, files, latest_analyses)
     accepted_classifications = {
         classification
         for file_id, analysis in latest_analyses.items()
@@ -397,12 +453,18 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
     accepted_bank_months: set[str] = set()
     accepted_tax_years: set[str] = set()
     accepted_nsf_counts: list[float] = []
+    counted_accounts = _counted_bank_accounts(profile)
     for file in files:
         if file.id not in accepted_file_ids:
             continue
         analysis = latest_analyses.get(file.id)
         classification = effective_file_classification(file.file_name, analysis)
         if classification == "bank_statement":
+            if counted_accounts:
+                from app.services.financial_cockpit import bank_file_counted
+
+                if not bank_file_counted(analysis.analysis if analysis else None, counted_accounts):
+                    continue
             if file.statement_period:
                 accepted_bank_months.add(file.statement_period)
             accepted_bank_months.update(
@@ -431,6 +493,15 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         or metrics.get("fico")
     )
     intake_state = dict(intake.intake_state or {}) if intake else {}
+    mca_bucket_id = getattr(profile, "primary_bucket_id", None) or getattr(intake, "bucket_id", None)
+    mca_bucket = await db.get(Bucket, mca_bucket_id) if mca_bucket_id else None
+    mca_policy = mca_refinance_policy.evaluate(intake, bucket=mca_bucket)
+    # A model observation can tighten a cap, never establish the missing
+    # declaration needed to open automatic matching. An upload count is not an
+    # MCA count, and unknown does not mean zero or one active position.
+    mca_count = mca_policy["active_mca_count"]
+    if "active_mca_count_required" in mca_policy["reason_codes"] and mca_policy["review_mode"] != "manual_review":
+        mca_count = None
     main_street_details = intake_state.get("main_street_details")
     main_street_details = main_street_details if isinstance(main_street_details, dict) else {}
     stated_intent = normalize_intent(main_street_details.get("intent"))
@@ -523,6 +594,9 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         "naics_code_valid": naics_verified,
         "loan_purpose": loan_purpose,
         "requested_amount": _float(requested_amount),
+        "active_mca_count": mca_count,
+        "requested_term_months": mca_policy["requested_term_months"],
+        "mca_refinance_policy": mca_policy,
         "use_of_funds_total": budget.total if budget.items else None,
         "real_estate_equipment_amount": budget.real_estate_equipment_amount if budget.items else None,
         "real_estate_equipment_pct": budget.real_estate_equipment_pct,
@@ -569,6 +643,19 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         ApplicationExtractedFact.status == "accepted",
     ))).scalars().all())
     context["fact_sources"] = _fit_fact_sources(context, reviewed_facts, files, latest_analyses)
+    # Six accepted statements say more than "needs information". Revenue and
+    # cash flow are estimated from them when no P&L or tax return is on file;
+    # the estimate is labelled as one, and a person can replace it.
+    from app.services.public_underwriting_packet_pdf import extract_bank_months
+
+    statement_rows = extract_bank_months([
+        {"file_id": str(file.id), "classification": "bank_statement",
+         "key_facts": (latest_analyses[file.id].analysis or {}).get("key_facts") or {}}
+        for file in files
+        if file.id in accepted_file_ids and file.id in latest_analyses
+        and effective_file_classification(file.file_name, latest_analyses[file.id]) == "bank_statement"
+    ], limit=120)
+    apply_statement_estimates(context, context["fact_sources"], accepted_months=len(accepted_bank_months), bank_rows=statement_rows)
     # Reviewed margins retain the exact snapshot lineage, not an AI estimate.
     for field in ("gross_margin_pct", "net_margin_pct"):
         if reviewed_profitability_facts(readiness_snapshot).get(field) is not None:
@@ -592,6 +679,95 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
             if current_sources:
                 context["fact_sources"][field] = {"verification_status": "verified", "source_refs": source_rows[:24]}
     return context
+
+
+#: Facts the rules may evaluate. A staff-reviewed fact is verified; a value the
+#: file itself carries (snapshot metrics, the intake's declaration) is
+#: provisional; an estimate from accepted statements says so. What stays out:
+#: unknown, conflicting accepted facts, and a self-reported figure the review
+#: flagged — a rule cannot pass on those, only ask.
+EVALUABLE_FACT_STATUSES = frozenset({"verified", "provisional", "estimated_from_deposits", "estimated_from_statements"})
+
+_ESTIMATE_WORDING = {
+    "estimated_from_deposits": "estimated from bank deposits",
+    "estimated_from_statements": "estimated from bank statements",
+}
+
+
+def evaluation_values(context: dict[str, Any], fact_sources: dict[str, Any]) -> dict[str, Any]:
+    """The context the rules see: financial facts blanked unless their source
+    status is one a rule may act on. The AI's estimates count; a person
+    corrects or overrides them on the file."""
+    values = dict(context)
+    for field in FINANCIAL_FIT_FIELDS:
+        status = (fact_sources.get(field) or {}).get("verification_status")
+        if status not in EVALUABLE_FACT_STATUSES:
+            values[field] = None
+    return values
+
+
+def estimate_notes(fact_sources: dict[str, Any], rule_fields: set[str]) -> list[str]:
+    """One line per estimate a program's rules relied on, for the desk."""
+    notes: list[str] = []
+    for field in sorted(rule_fields):
+        status = (fact_sources.get(field) or {}).get("verification_status")
+        wording = _ESTIMATE_WORDING.get(str(status))
+        if wording:
+            notes.append(f"{field.replace('_', ' ').capitalize()} {wording}; a person can replace it")
+    return notes
+
+
+def estimate_annualized_deposits(rows: list[dict[str, Any]]) -> float | None:
+    """Mean monthly deposits times twelve, from at least three statement months."""
+    values = [float(row["deposits"]) for row in rows if row.get("deposits") is not None]
+    if len(values) < 3:
+        return None
+    return round(sum(values) / len(values) * 12, 2)
+
+
+def estimate_cash_flow_from_statements(rows: list[dict[str, Any]]) -> float | None:
+    """Annualized net movement of the operating account: deposits less withdrawals.
+
+    Not earnings. An estimate for program fit when no P&L or tax return is on
+    file, from at least three statement months that carry both figures.
+    """
+    pairs = [(float(row["deposits"]), float(row["withdrawals"])) for row in rows
+             if row.get("deposits") is not None and row.get("withdrawals") is not None]
+    if len(pairs) < 3:
+        return None
+    return round(sum(deposits - withdrawals for deposits, withdrawals in pairs) / len(pairs) * 12, 2)
+
+
+def apply_statement_estimates(context: dict[str, Any], fact_sources: dict[str, Any], *, accepted_months: int, bank_rows: list[dict[str, Any]]) -> list[str]:
+    """Fill revenue and cash flow from accepted statements when nothing better exists.
+
+    Returns the keys that were estimated; ``context["estimated_fit_facts"]``
+    carries the same list so every reader can label them.
+    """
+    estimated: list[str] = []
+    if context.get("annualized_deposits") is None:
+        deposits = estimate_annualized_deposits(bank_rows)
+        if deposits is not None:
+            context["annualized_deposits"] = deposits
+            context["deposits"] = deposits
+            fact_sources["annualized_deposits"] = {"verification_status": "estimated_from_statements", "source_refs": []}
+            fact_sources["deposits"] = fact_sources["annualized_deposits"]
+            estimated.append("annualized_deposits")
+    deposits = context.get("annualized_deposits")
+    if context.get("annual_revenue") is None and deposits and accepted_months >= 6:
+        context["annual_revenue"] = deposits
+        context["revenue"] = deposits
+        fact_sources["annual_revenue"] = {"verification_status": "estimated_from_deposits", "source_refs": []}
+        fact_sources["revenue"] = fact_sources["annual_revenue"]
+        estimated.extend(["annual_revenue", "revenue"])
+    if context.get("cash_flow") is None:
+        cash_flow = estimate_cash_flow_from_statements(bank_rows)
+        if cash_flow is not None:
+            context["cash_flow"] = cash_flow
+            fact_sources["cash_flow"] = {"verification_status": "estimated_from_statements", "source_refs": []}
+            estimated.append("cash_flow")
+    context["estimated_fit_facts"] = estimated
+    return estimated
 
 
 def _expanded_naics_prefixes(values: list[str]) -> tuple[list[str], bool]:
@@ -776,10 +952,7 @@ async def published_candidates(
                 }
             )
     fact_sources = context.get("fact_sources") or {}
-    evaluation_context = dict(context)
-    for field in FINANCIAL_FIT_FIELDS:
-        if (fact_sources.get(field) or {}).get("verification_status") != "verified":
-            evaluation_context[field] = None
+    evaluation_context = evaluation_values(context, fact_sources)
     intent_outside_lending = context.get("intent_kind") in {"non_lending", "route_out"}
 
     catalog = await program_catalog.catalog_rows(db)
@@ -847,6 +1020,16 @@ async def published_candidates(
             if item.program_key == equipment_financing.PROGRAM_KEY
             else None
         )
+        mca_assessment = (
+            mca_refinance_policy.evaluate_fit_context(evaluation_context)
+            if item.program_key == "mca_refinance" else None
+        )
+        intake_mca_policy = context.get("mca_refinance_policy")
+        if mca_assessment is not None and isinstance(intake_mca_policy, dict) and intake_mca_policy.get("review_mode") == "manual_review":
+            # Preserve a more conservative declared/typed payoff or position
+            # count even when another funding source currently asks for less.
+            mca_assessment = intake_mca_policy
+        mca_blocked = mca_assessment is not None and not mca_assessment["auto_underwriting_allowed"]
         if intent_outside_lending:
             recommendation_status = "not_eligible"
             reasons = ["Current intake intent is not routed to lending"]
@@ -858,6 +1041,11 @@ async def published_candidates(
             recommendation_status = "not_eligible"
             reasons = scope_reasons or ["Product is outside the current file scope"]
             eligible = False
+        elif mca_blocked:
+            recommendation_status = "custom_review" if mca_assessment["review_mode"] == "manual_review" else "needs_information"
+            reasons = [mca_refinance_policy.message(mca_assessment)]
+            eligible = False
+            rule_state = "fail" if recommendation_status == "custom_review" else "unknown"
         elif not has_fit_rule or result is None:
             recommendation_status = "criteria_unavailable"
             reasons = [
@@ -912,12 +1100,12 @@ async def published_candidates(
                 criteria_status=(
                     "published" if has_fit_rule and rules_valid else "invalid"
                 ),
-                fit_score=round((result.confidence if result else 0) * 100, 2),
-                confidence=result.confidence if result else 0,
+                fit_score=0 if mca_blocked else round((result.confidence if result else 0) * 100, 2),
+                confidence=0 if mca_blocked else result.confidence if result else 0,
                 priority=priority,
                 preference_score=preference_score,
                 preference_reasons=preference_reasons,
-                reasons=list(dict.fromkeys(reasons)),
+                reasons=list(dict.fromkeys([*reasons, *estimate_notes(fact_sources, _rule_fields((playbook.rules or {}).get("fit")))])),
                 scope_status="matched" if scope_state is True else "unknown" if scope_state is None else "outside_scope",
                 rule_state=rule_state,
                 rule_results=[{**row, "observed": (str(row["required"] if row["required"] is not None else row["field"]) in context.get("evidence_available", set())) if row["operator"] == "evidence_available" else _context_field(context, row["field"]),
@@ -926,6 +1114,8 @@ async def published_candidates(
                               for row in (getattr(result, "results", []) if result is not None else [])],
                 fact_sources={field: fact_sources[field] for field in (_rule_fields((playbook.rules or {}).get("fit")) | scope_fact_fields) if field in fact_sources},
                 evidence_gaps=list(dict.fromkeys([
+                    *(["active_mca_count"] if mca_assessment and "active_mca_count_required" in mca_assessment["reason_codes"] else []),
+                    *(["requested_amount"] if mca_assessment and "requested_amount_required" in mca_assessment["reason_codes"] else []),
                     *(
                         missing_fields
                         if rule_state == "unknown"
@@ -934,10 +1124,13 @@ async def published_candidates(
                     ),
                     *(scope_reasons if scope_state is None else []),
                 ])),
-                requires_review=any(
+                # A person looks at any verdict that rests on a fact nobody reviewed:
+                # an estimate, a snapshot figure, the intake's own declaration.
+                requires_review=bool(mca_blocked) or any(
                     _context_field(context, field) is not None
                     and (field in FINANCIAL_FIT_FIELDS and (fact_sources.get(field) or {}).get("verification_status") != "verified")
-                    for field in [*missing_fields, *(missing_scope_fields if scope_state is None else [])]
+                    for field in [*missing_fields, *(missing_scope_fields if scope_state is None else []),
+                                  *_rule_fields((playbook.rules or {}).get("fit"))]
                 ),
             )
         )
@@ -960,12 +1153,33 @@ async def published_candidates(
     )
 
 
+def _automatic_candidates(
+    profile: ApplicationProfile,
+    candidates: list[ProgramFitCandidate],
+) -> list[ProgramFitCandidate]:
+    """Return up to ``AUTO_SELECT_LIMIT`` eligible candidates in ranked order.
+
+    ``published_candidates`` already sorts best-first, so the first eligible
+    rows are the ones automatic routing pins. At most one row per program key.
+    """
+    picked: list[ProgramFitCandidate] = []
+    seen: set[str] = set()
+    for item in candidates:
+        if not item.eligible or item.program_key in seen:
+            continue
+        seen.add(item.program_key)
+        picked.append(item)
+        if len(picked) >= AUTO_SELECT_LIMIT:
+            break
+    return picked
+
+
 def _automatic_candidate(
     profile: ApplicationProfile,
     candidates: list[ProgramFitCandidate],
 ) -> ProgramFitCandidate | None:
-    eligible = next((item for item in candidates if item.eligible), None)
-    return eligible
+    picked = _automatic_candidates(profile, candidates)
+    return picked[0] if picked else None
 
 
 async def active_selections(
@@ -985,6 +1199,39 @@ async def active_selections(
             )
         )
         .scalars()
+        .all()
+    )
+
+
+async def profiles_with_active_selection(
+    db: AsyncSession, program_key: str
+) -> list[ApplicationProfile]:
+    """Load the files still holding this program, so readiness can be refreshed.
+
+    Retiring a program changes what every one of these files should be told.
+    Bounding the refresh to the files that actually selected it keeps an admin
+    click from fanning out across the whole vertical.
+    """
+
+    if not program_key or not hasattr(db, "execute"):
+        return []
+    return list(
+        (
+            await db.execute(
+                select(ApplicationProfile)
+                .join(
+                    ApplicationProgramSelection,
+                    ApplicationProgramSelection.profile_id == ApplicationProfile.id,
+                )
+                .where(
+                    ApplicationProgramSelection.program_key == program_key,
+                    ApplicationProgramSelection.removed_at.is_(None),
+                )
+                .order_by(ApplicationProfile.id)
+            )
+        )
+        .scalars()
+        .unique()
         .all()
     )
 
@@ -1048,40 +1295,45 @@ async def _auto_select(
     active = await active_selections(db, profile.id)
     if active or profile.program_selection_mode != "auto":
         return active
-    candidate = _automatic_candidate(profile, candidates)
-    if candidate is None or candidate.playbook_id is None or candidate.playbook_version is None:
+    pinned: list[tuple[ApplicationProgramSelection, ProgramFitCandidate]] = []
+    for candidate in _automatic_candidates(profile, candidates):
+        if candidate.playbook_id is None or candidate.playbook_version is None:
+            continue
+        row = ApplicationProgramSelection(
+            profile_id=profile.id,
+            playbook_id=candidate.playbook_id,
+            playbook_version=candidate.playbook_version,
+            program_key=candidate.program_key,
+            program_name=candidate.program_name,
+            source="ai_auto",
+            fit_score=candidate.fit_score,
+            fit_confidence=candidate.confidence,
+            fit_reasons=[*candidate.reasons, *candidate.preference_reasons],
+        )
+        db.add(row)
+        pinned.append((row, candidate))
+    if not pinned:
         return []
-    row = ApplicationProgramSelection(
-        profile_id=profile.id,
-        playbook_id=candidate.playbook_id,
-        playbook_version=candidate.playbook_version,
-        program_key=candidate.program_key,
-        program_name=candidate.program_name,
-        source="ai_auto",
-        fit_score=candidate.fit_score,
-        fit_confidence=candidate.confidence,
-        fit_reasons=[*candidate.reasons, *candidate.preference_reasons],
-    )
-    db.add(row)
     await db.flush()
-    await profiles.log_profile_action(
-        db,
-        profile,
-        None,
-        "programs.auto_selected",
-        f"Pinned {candidate.program_name} version {candidate.playbook_version} from published criteria",
-        target_type="application_program",
-        target_id=row.id,
-        metadata={
-            "program_key": candidate.program_key,
-            "playbook_id": str(candidate.playbook_id),
-            "playbook_version": candidate.playbook_version,
-            "fit_confidence": candidate.confidence,
-            "preference_score": candidate.preference_score,
-            "preference_reasons": candidate.preference_reasons,
-        },
-    )
-    return [row]
+    for row, candidate in pinned:
+        await profiles.log_profile_action(
+            db,
+            profile,
+            None,
+            "programs.auto_selected",
+            f"Pinned {candidate.program_name} version {candidate.playbook_version} from published criteria",
+            target_type="application_program",
+            target_id=row.id,
+            metadata={
+                "program_key": candidate.program_key,
+                "playbook_id": str(candidate.playbook_id),
+                "playbook_version": candidate.playbook_version,
+                "fit_confidence": candidate.confidence,
+                "preference_score": candidate.preference_score,
+                "preference_reasons": candidate.preference_reasons,
+            },
+        )
+    return [row for row, _ in pinned]
 
 
 async def set_programs(
@@ -1293,6 +1545,12 @@ async def _requested_document(
                 BucketRequestedDocument.bucket_id == profile.primary_bucket_id,
                 BucketRequestedDocument.requirement_key == requirement.requirement_key,
             )
+            # A closed ask (an archived room, a merged duplicate) must not
+            # shadow the open one carrying the same key.
+            .order_by(
+                case((BucketRequestedDocument.status == "closed", 1), else_=0),
+                BucketRequestedDocument.created_at,
+            )
             .limit(1)
         )
     ).scalar_one_or_none()
@@ -1311,6 +1569,8 @@ async def _requested_document(
                 .limit(1)
             )
         ).scalar_one_or_none()
+    if requested is None and form_kind is None:
+        requested = await _adopt_room_request(db, profile.primary_bucket_id, requirement)
     source = {
         "kind": "program_readiness",
         "program_keys": program_keys,
@@ -1336,7 +1596,7 @@ async def _requested_document(
         )
         db.add(requested)
         await db.flush()
-    else:
+    elif _created_by_program_readiness(requested):
         requested.name = requirement.label
         requested.category = request_category
         requested.description = (
@@ -1348,7 +1608,121 @@ async def _requested_document(
         requested.requirement_source = source
         if requested.status == "not_applicable":
             requested.status = "requested"
+    else:
+        # The room's own ask: seeded by an intake template, typed by the desk,
+        # or adopted on an earlier pass. The client has already read its name
+        # and the signature flows look it up by that name, so the wording
+        # stays; only the link to the requirement is recorded.
+        requested.requirement_key = requirement.requirement_key
+        requested.requirement_source = {**source, "adopted": True}
+        if requested.status == "not_applicable":
+            requested.status = "requested"
     return requested
+
+
+#: Requirements satisfied by signing in the room rather than uploading, keyed
+#: to the signature kind the room's own ask carries.
+SIGNATURE_REQUIREMENTS: dict[str, str] = {"signed_credit_authorization": "credit_authorization"}
+
+
+def _created_by_program_readiness(requested: BucketRequestedDocument) -> bool:
+    """True for an ask the readiness engine minted itself and may reword freely."""
+    source = requested.requirement_source if isinstance(requested.requirement_source, dict) else {}
+    return source.get("kind") == "program_readiness" and not source.get("adopted")
+
+
+def _adoption_classes(requirement: AICollectionRequirement) -> set[str]:
+    """What an uploaded document must read as to satisfy ``requirement``.
+
+    The curated map, not the label-derived one: a label such as "Current
+    advance terms" also reads as rent (the keyword sits inside "current"), and
+    adoption must not pair rows on an accident like that.
+    """
+    key = getattr(requirement, "canonical_key", None) or requirement.requirement_key
+    curated = EXPECTED_CLASSIFICATIONS.get(key)
+    return set(curated) if curated else set(_expected_classes(requirement))
+
+
+def adoptable_room_request(
+    candidates: list[BucketRequestedDocument],
+    *,
+    requirement_key: str,
+    expected: set[str],
+    file_counts: dict[uuid.UUID, int] | None = None,
+) -> BucketRequestedDocument | None:
+    """The room's own ask for the same document as ``requirement_key``, if any.
+
+    A signature requirement adopts the row the client signs; a document
+    requirement adopts a non-signature row whose name reads as one of the
+    expected document types. With several, the row already holding files wins,
+    then the oldest.
+    """
+    signature_kind = SIGNATURE_REQUIREMENTS.get(requirement_key)
+    matches: list[BucketRequestedDocument] = []
+    for row in candidates:
+        if signature_kind:
+            if row.requires_signature and row.signature_kind == signature_kind:
+                matches.append(row)
+            continue
+        if row.requires_signature:
+            continue
+        if classifications_for_requested_doc(row.name, row.category) & expected:
+            matches.append(row)
+    if not matches:
+        return None
+    counts = file_counts or {}
+    matches.sort(key=lambda row: (-counts.get(row.id, 0), row.created_at or datetime.max.replace(tzinfo=UTC)))
+    return matches[0]
+
+
+async def _adopt_room_request(
+    db: AsyncSession, bucket_id: uuid.UUID, requirement: AICollectionRequirement
+) -> BucketRequestedDocument | None:
+    """Adopt the room's existing ask instead of minting a second one.
+
+    Intake templates seed a checklist the moment a room is born ("Last 6
+    months bank statements", "Credit Report Authorization"), and the readiness
+    playbook names the same documents differently. Minting a second ask left
+    a room with two rows for one document: the client's uploads on the first,
+    the application waiting on the second, and the client told to send again
+    what they had already sent.
+    """
+    candidates = list(
+        (
+            await db.execute(
+                select(BucketRequestedDocument)
+                .where(
+                    BucketRequestedDocument.bucket_id == bucket_id,
+                    BucketRequestedDocument.requirement_key.is_(None),
+                    BucketRequestedDocument.status.notin_(["closed", "not_applicable"]),
+                )
+                .order_by(BucketRequestedDocument.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not candidates:
+        return None
+    file_counts: dict[uuid.UUID, int] = {}
+    if len(candidates) > 1:
+        rows = (
+            await db.execute(
+                select(BucketFile.requested_document_id, func.count())
+                .where(
+                    BucketFile.bucket_id == bucket_id,
+                    BucketFile.deleted_at.is_(None),
+                    BucketFile.status == "uploaded",
+                    BucketFile.requested_document_id.in_([row.id for row in candidates]),
+                )
+                .group_by(BucketFile.requested_document_id)
+            )
+        ).all()
+        file_counts = {row[0]: int(row[1]) for row in rows}
+    key = getattr(requirement, "canonical_key", None) or requirement.requirement_key
+    return adoptable_room_request(
+        candidates, requirement_key=key, expected=_adoption_classes(requirement), file_counts=file_counts
+    )
 
 
 def _expected_classes(requirement: AICollectionRequirement) -> set[str]:
@@ -1415,13 +1789,77 @@ def _merged_review_checks(requirements: list[AICollectionRequirement]) -> list[d
             for field, label in (("objective_text", "Document review objective"),
                                  ("completion_criteria", "Document completion requirements")):
                 instructions = str(getattr(requirement, field, "") or "").strip()
-                if instructions:
+                # "Collect Last 6 months business bank statements" names the
+                # document; it instructs nothing. Treating it as a check sent
+                # every baseline requirement through the grounded page review,
+                # which cannot run over six statements, and the file sat at
+                # "received" with everything in hand.
+                if instructions and not _is_bare_request(instructions, getattr(requirement, "label", None)):
                     for start in range(0, len(instructions), 2000):
                         part = instructions[start:start + 2000]
                         check = {"key": "custom_" + hashlib.sha256(part.encode()).hexdigest()[:20],
                                  "label": label, "instructions": part, "severity": "review"}
                         unique.setdefault(json.dumps(check, sort_keys=True), check)
     return [unique[key] for key in sorted(unique)]
+
+
+_BARE_REQUEST_WORDS = frozenset({
+    "collect", "please", "provide", "upload", "send", "share", "submit", "attach", "the", "your", "a", "an",
+    "of", "for", "this", "these", "those", "file", "files", "document", "documents", "latest", "current",
+    "copy", "copies", "all", "and", "or", "to", "us", "me", "from", "client", "borrower",
+})
+
+
+_BOILERPLATE_CRITERIA = re.compile(
+    r"^\s*a readable [a-z0-9_ ]+ documents? (is|are) linked and verified\.?\s*$", re.IGNORECASE
+)
+
+
+def _is_bare_request(text: str, label: str | None) -> bool:
+    """True when ``text`` only asks for the document and instructs nothing.
+
+    The words left after the requirement's own label and the asking words are
+    removed are the instruction. None left, no instruction. The generated
+    completion criteria ("A readable bank_statement document is linked and
+    verified.") restate the validation every file already passes, so they
+    count as bare too.
+    """
+    if _BOILERPLATE_CRITERIA.match(str(text or "")):
+        return True
+    value = re.sub(r"[^a-z0-9 ]+", " ", str(text or "").casefold())
+    if label:
+        value = value.replace(re.sub(r"[^a-z0-9 ]+", " ", str(label).casefold()), " ")
+    words = [word for word in value.split() if word not in _BARE_REQUEST_WORDS and not word.isdigit()]
+    return not words
+
+
+_CHECKS_NOT_RUN_MARKERS = (
+    "exceeds the ai review", "bounded ai document review", "unavailable", "searchable pdf",
+    "cannot be quoted reliably", "password protected", "did not return", "could not be retrieved",
+)
+
+
+def _checks_could_not_run(check_assessment: dict[str, Any] | None) -> str | None:
+    """The reason the grounded document checks did not run, or None if they did."""
+    if not isinstance(check_assessment, dict) or check_assessment.get("status") != "unknown":
+        return None
+    if check_assessment.get("checks"):
+        return None
+    reason = str(check_assessment.get("reason") or "")
+    lowered = reason.casefold()
+    return reason if any(marker in lowered for marker in _CHECKS_NOT_RUN_MARKERS) else None
+
+
+def _verifiable_without_a_person(requirement: AICollectionRequirement, file: BucketFile, requires_human: bool) -> bool:
+    """Whether an accepted file may be verified by the AI alone.
+
+    A certificate the system generated from the client's own signature in the
+    room is verified by construction; asking a person to confirm it again is
+    a queue, not a control.
+    """
+    if getattr(file, "source_kind", None) == "generated" and getattr(file, "source_detail", None) == "signed_document":
+        return True
+    return not _requires_human_verification(requirement) and not requires_human
 
 
 def _review_checks_fingerprint(checks: list[dict[str, Any]]) -> str:
@@ -1455,12 +1893,27 @@ def _received_evidence_classes(analysis: Any) -> set[str]:
     return analysis_classifications(analysis)
 
 
+def _counted_bank_accounts(profile: ApplicationProfile | None) -> list[str]:
+    return list(getattr(profile, "counted_bank_accounts", None) or [])
+
+
 def _coverage_for_files(
     requirement: AICollectionRequirement,
     files: list[BucketFile],
     analyses: dict[uuid.UUID, BucketFileAnalysis],
+    counted_accounts: list[str] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     expected = _expected_classes(requirement)
+    if counted_accounts and _configured_period_count(requirement, "months"):
+        # The desk chose which checking accounts count: a statement from
+        # another account neither adds a month nor blocks the requirement.
+        from app.services.financial_cockpit import bank_file_counted
+
+        files = [
+            file
+            for file in files
+            if bank_file_counted(getattr(analyses.get(file.id), "analysis", None), counted_accounts)
+        ]
     expired_ids = [str(file.id) for file in files if _file_is_expired(requirement, file)]
     matched_count = len(files)
     files = [file for file in files if not _file_is_expired(requirement, file)]
@@ -2113,6 +2566,18 @@ def _automatic_evidence_decision(
                 "A published do-not-accept check failed; review the grounded findings and source pages.",
                 analysis.confidence,
             )
+        not_run = _checks_could_not_run(check_assessment)
+        if not_run:
+            # The file itself passed: right type, right business, right period,
+            # read with high confidence. The grounded checks could not run on
+            # this evidence; that is a note for a person, not a reason to keep
+            # asking the client. A person can still override.
+            return (
+                "accepted", identity_warning["code"] if identity_warning else "checks_not_run",
+                "Accepted on file validation (document type, business and period). The published document "
+                f"checks could not run on this evidence: {not_run.rstrip('.')}. A person can override."
+                + (" " + identity_warning["message"] if identity_warning else ""), analysis.confidence,
+            )
         return (
             "needs_more", "document_review_pending",
             str((check_assessment or {}).get("reason") or
@@ -2344,7 +2809,7 @@ async def _reconcile_evidence_decisions(
             effective[link.id] = row
 
         accepted = effective[link.id].decision == "accepted"
-        can_auto_verify = accepted and not _requires_human_verification(requirement) and not requires_human
+        can_auto_verify = accepted and _verifiable_without_a_person(requirement, file, requires_human)
         newer_evidence = any(
             isinstance(value, datetime) and isinstance(link.verified_at, datetime)
             and (value.replace(tzinfo=UTC) if value.tzinfo is None else value)
@@ -2389,6 +2854,7 @@ async def _materialize_requirements(
     grouped: dict[uuid.UUID, list[AICollectionRequirement]],
     policies: list[ApplicationEvidencePolicySelection],
     grouped_policies: dict[uuid.UUID, list[AICollectionRequirement]],
+    extra_requirements: list[requirement_library.ExtraDefinition] | None = None,
 ) -> tuple[list[ApplicationRequirementState], dict[uuid.UUID, list[str]]]:
     from app.services import collection_tasks
 
@@ -2405,6 +2871,11 @@ async def _materialize_requirements(
     criteria_versions = {
         item.playbook_id: item.playbook_version for item in [*selections, *policies]
     }
+    # Requirements the desk added to this file keep the version of the playbook
+    # they were copied from; a program's own pinned version wins a shared playbook.
+    for extra in extra_requirements or []:
+        criteria_versions.setdefault(extra.requirement.playbook_id, extra.version)
+    extra_by_key = {extra.requirement.requirement_key: extra for extra in extra_requirements or []}
     existing = {
         item.requirement_key: item
         for item in (
@@ -2457,6 +2928,11 @@ async def _materialize_requirements(
     for policy in policies:
         for requirement in grouped_policies.get(policy.playbook_id, []):
             merge_requirement(requirement, policy_key=policy.policy_key)
+    # Requirements the desk added behave like the initial checklist, but a key a
+    # program or the policy already requires keeps that definition.
+    for extra in extra_requirements or []:
+        if extra.requirement.requirement_key not in merged:
+            merge_requirement(extra.requirement, policy_key=requirement_library.STAFF_POLICY_KEY)
 
     # Lender checklist definitions use the same evidence engine as program
     # requirements, but remain independently versioned by their offering.
@@ -2542,6 +3018,15 @@ async def _materialize_requirements(
         definition_metadata = collection_tasks.definition_metadata(
             requirement, version=criteria_versions.get(requirement.playbook_id, 1)
         )
+        staff_added = extra_by_key.get(key)
+        if staff_added is not None and requirement_library.STAFF_POLICY_KEY in source_policies:
+            definition_metadata = {
+                **definition_metadata,
+                "staff_added": requirement_library.provenance_note(
+                    staff_added.entry,
+                    requirement_library.form_kinds_for(key, getattr(requirement, "canonical_key", None)),
+                ),
+            }
         if (state.provenance or {}).get("source_kind") in {"lender", "staff_request"}:
             definition_metadata = {**definition_metadata, **{
                 name: (state.provenance or {}).get(name)
@@ -2579,7 +3064,7 @@ async def _materialize_requirements(
         desired_sources = {file.id: "automatic" for file in matched_files}
         links = await _sync_requirement_evidence(db, state, inventory, desired_sources)
         linked_files = [inventory[row.file_id] for row in links]
-        _coverage_complete, coverage = _coverage_for_files(requirement, linked_files, analyses)
+        _coverage_complete, coverage = _coverage_for_files(requirement, linked_files, analyses, counted_accounts=_counted_bank_accounts(profile))
         from app.services.document_qualification_review import current_assessment
         check_assessment = current_assessment(
             (state.provenance or {}).get("ai_document_review"), review_checks, linked_files,
@@ -2621,7 +3106,7 @@ async def _materialize_requirements(
         accepted_files = [inventory[row.file_id] for row in accepted_links]
         accepted_complete, accepted_coverage = _coverage_for_files(
             requirement, accepted_files, analyses
-        )
+        , counted_accounts=_counted_bank_accounts(profile))
         if requested and not requested.requires_signature:
             requested.status = "uploaded" if accepted_complete else "requested"
         state.evidence_file_id = linked_files[0].id if linked_files else None
@@ -2646,8 +3131,11 @@ async def _materialize_requirements(
             "review_checks_fingerprint": _review_checks_fingerprint(review_checks),
             "requires_human": requires_human,
             "ai_document_review": check_assessment,
-            "review_checks_status": "verified" if review_checks and accepted_complete
-            else "pending" if review_checks else "not_required",
+            "review_checks_status": (
+                "not_run" if review_checks and accepted_complete and _checks_could_not_run(check_assessment)
+                else "verified" if review_checks and accepted_complete
+                else "pending" if review_checks else "not_required"
+            ),
         }
         if state.status not in {"waived", "not_applicable"}:
             if linked_files:
@@ -2941,6 +3429,33 @@ async def get_program_readiness(
 ) -> ApplicationProgramReadiness:
     # Readiness GETs may perform deterministic first-use materialization. Lock
     # this profile so simultaneous tabs cannot race the active unique indexes.
+    #
+    # BUCKET BEFORE PROFILE, and nowhere the other way round. Two paths hold
+    # both of these row locks inside one transaction, and until this line they
+    # took them in opposite orders:
+    #
+    #   /evidence-workspace          bucket (ensure_supporting_document_group)
+    #                                then profile (here)
+    #   /requirements/ai-review      profile (here, via
+    #                                accept_high_confidence_ai_evidence)
+    #                                then bucket (same function, later)
+    #
+    # The dashboard fires both at once for an open file, and Postgres broke the
+    # cycle the only way it can — by killing one with DeadlockDetectedError,
+    # which surfaced as an intermittent 500 on the evidence workspace.
+    #
+    # This function is on both sides of that cycle, so ordering it here fixes
+    # both paths: re-taking a row lock the transaction already holds is free,
+    # so the later acquisitions become no-ops rather than new edges in a graph.
+    #
+    # That holds only while the caller has not locked the profile itself. A
+    # caller that does must take the bucket lock first, as
+    # run_profile_collection_outreach now does: it locked the profile and
+    # arrived here second, which put the profile before the bucket again.
+    if profile.primary_bucket_id is not None:
+        await db.execute(
+            select(Bucket.id).where(Bucket.id == profile.primary_bucket_id).with_for_update()
+        )
     await db.execute(
         select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update()
     )
@@ -2961,9 +3476,15 @@ async def get_program_readiness(
     )
     lending_applicable = lending_applicable or manual_lending_override
     selections = stored_selections if lending_applicable else []
+    retired_keys = await program_catalog.retired_program_keys(
+        db, [item.program_key for item in selections]
+    )
     grouped = await _selection_requirements(db, selections, context)
     policies = await ensure_evidence_policy(db, profile) if lending_applicable else []
     grouped_policies = await _policy_requirements(db, policies, context)
+    extra_requirements = (
+        await requirement_library.extra_definitions(db, profile) if lending_applicable else []
+    )
     states, per_selection = await _materialize_requirements(
         db,
         profile,
@@ -2971,6 +3492,7 @@ async def get_program_readiness(
         grouped,
         policies,
         grouped_policies,
+        extra_requirements=extra_requirements,
     )
     overrides = await _active_overrides(db, selections)
     requirement_map = {item.requirement_key: item for item in states}
@@ -2984,6 +3506,10 @@ async def get_program_readiness(
             can_waive[row.requirement_key] = (
                 can_waive.get(row.requirement_key, False) or row.can_underwriter_waive
             )
+    for extra in extra_requirements:
+        key = extra.requirement.requirement_key
+        visibility[key] = visibility.get(key, False) or _client_visible(extra.requirement)
+        can_waive[key] = can_waive.get(key, False) or bool(extra.requirement.can_underwriter_waive)
     for state in states:
         visibility.setdefault(state.requirement_key, bool((state.provenance or {}).get("client_visible")))
         can_waive.setdefault(state.requirement_key, False)
@@ -3127,8 +3653,9 @@ async def get_program_readiness(
         definition = requirement_definitions.get(state.requirement_key)
         contribution: dict[str, Any] = {}
         if definition is not None:
-            _complete, contribution = _coverage_for_files(definition, [file], available_analyses)
+            _complete, contribution = _coverage_for_files(definition, [file], available_analyses, counted_accounts=_counted_bank_accounts(profile))
         inferred_decision = "accepted" if link.verified_at else "processing"
+        origin, form_kind = evidence_origin(file, available_analyses.get(file.id))
         return ApplicationRequirementEvidenceRead(
             file_id=file.id,
             file_name=file.file_name,
@@ -3160,6 +3687,8 @@ async def get_program_readiness(
                     unlocked_copy_requests.get(file.id),
                 )
             ),
+            origin=origin,
+            form_kind=form_kind,
         )
 
     bank_state = next(
@@ -3212,6 +3741,7 @@ async def get_program_readiness(
                 fit_reasons=list(item.fit_reasons or []),
                 selected_at=item.selected_at,
                 needs_scope_review=item.needs_scope_review,
+                program_retired=item.program_key in retired_keys,
             )
             for item in selections
         ],
@@ -3650,6 +4180,11 @@ async def accept_high_confidence_ai_evidence(
         # Serialize click/double-clicks on the bucket, not on an expensive
         # provider call. The normal scheduler drains the queued review.
         bucket = await db.get(Bucket, profile.primary_bucket_id, with_for_update=True)
+        if bucket is not None:
+            from app.services import mca_refinance_policy
+            policy = await mca_refinance_policy.for_bucket(db, bucket)
+            if policy is not None and not policy["auto_underwriting_allowed"]:
+                bucket = None  # File/evidence acceptance is retained without queueing underwriting.
         if bucket is not None:
             queued_review = (await db.execute(select(BucketAIReview).where(
                 BucketAIReview.bucket_id == bucket.id,

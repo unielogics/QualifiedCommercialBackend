@@ -1364,6 +1364,24 @@ async def verified_protected_download_url(
     return url
 
 
+async def verified_protected_bytes(file: BucketFile) -> bytes | None:
+    """The protected artifact's exact bytes, or None when they cannot be verified.
+
+    Same integrity rules as `verified_protected_download_url`, for callers that
+    package the document instead of signing a link to it.
+    """
+
+    if file.retention_class not in RETENTION_CLASSES:
+        return None
+    if file.status != "uploaded" or not file.content_hash:
+        return None
+    return await _get_private_bytes(
+        file.s3_key,
+        version_id=file.s3_version_id,
+        expected_sha256=file.content_hash,
+    )
+
+
 def _content_addressed_key(key: str, digest: str) -> str:
     """Return an S3 key whose identity is bound to the exact PDF bytes."""
 

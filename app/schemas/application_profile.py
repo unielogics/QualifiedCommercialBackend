@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
@@ -70,7 +70,7 @@ class ApplicationProfileRead(BaseModel):
     communication_locale_source: str = "system_default"
     communication_locale_updated_at: datetime | None = None
     plaid_assets_enabled: bool = True
-    plaid_statements_enabled: bool = False
+    plaid_statements_enabled: bool = True
     plaid_policy_updated_at: datetime | None = None
     plaid_policy_updated_by_user_id: UUID | None = None
     vertical: str
@@ -160,6 +160,10 @@ class ApplicationProgramSelectionRead(BaseModel):
     fit_reasons: list[str] = Field(default_factory=list)
     selected_at: datetime
     needs_scope_review: bool = False
+    # A retired program keeps serving the file off its pinned playbook version.
+    # Nothing is detached under a client mid-underwriting; the desk is told so
+    # it can swap or remove the selection deliberately.
+    program_retired: bool = False
 
 
 class EvidencePolicySelectionRead(BaseModel):
@@ -204,6 +208,11 @@ class ApplicationRequirementEvidenceRead(BaseModel):
     evidence_claims: list[dict] = Field(default_factory=list)
     is_password_protected: bool = False
     unlocked_copy_request: UnlockedCopyRequestStateRead | None = None
+    #: Where the file came from: a document somebody uploaded, a form somebody
+    #: typed (the PDF is ours), or a certificate we generated when they signed.
+    origin: Literal["uploaded", "filled_form", "signed"] = "uploaded"
+    #: For a filled form, which one: pfs, debt_schedule, p_and_l, balance_sheet.
+    form_kind: str | None = None
 
 
 class ApplicationEvidenceOptionRead(BaseModel):
@@ -440,6 +449,9 @@ class ApplicationUnderwritingRead(BaseModel):
     forecast_origination_earnings: float | None = None
     forecast_earnings: float | None = None
     estimated_close_date: date | None = None
+    #: When the acceptance was recorded and which terms it answered.
+    accepted_at: datetime | None = None
+    accepted_terms_ref: dict[str, Any] | None = None
     qc_fee_cap_percent: float | None = None
     qc_fee_review_required: bool = False
     qc_fee_review_reason: str | None = None
@@ -469,6 +481,9 @@ class ApplicationUnderwritingPatch(BaseModel):
         default=None, ge=0, allow_inf_nan=False
     )
     estimated_close_date: date | None = None
+    #: The terms the acceptance answers (kind, id, version, amount, rate_pct,
+    #: term_months, label); None clears it with the amount.
+    accepted_terms_ref: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def matching_origination_point_aliases(self) -> ApplicationUnderwritingPatch:
@@ -599,6 +614,15 @@ class FileOwnerRead(BaseModel):
     credit_required: bool = False
     credit_complete: bool = False
     credit_contact_complete: bool = False
+    credit_pull_id: UUID | None = None
+    credit_fico_source: str | None = None
+    credit_score_verified: bool = False
+    credit_report_available: bool = False
+    credit_report_import_status: str | None = None
+    credit_risk: dict | None = None
+    credit_link_how: str | None = None
+    credit_attention: str | None = None
+    credit_expires_at: str | None = None
     backfill_needs_review: bool = False
     source: Literal["application", "dealer"] = "application"
 
@@ -735,6 +759,10 @@ class ApplicationBankState(BaseModel):
     evidence_summary: ApplicationEvidenceSummary = Field(default_factory=ApplicationEvidenceSummary)
     assets_enabled: bool = False
     statements_enabled: bool = False
+    #: The file's own setting for statement PDFs, before the deployment
+    #: allowlist is applied: True with `statements_enabled` False means the
+    #: file wants them and the Plaid account is not enabled for the product yet.
+    statements_preferred: bool = False
     selected_products: list[str] = Field(default_factory=list)
     available_products: list[str] = Field(default_factory=list)
     consent_product_scope: list[str] = Field(default_factory=list)
@@ -754,6 +782,8 @@ class BusinessBankEvidence(BaseModel):
     processing_files: int = 0
     needs_attention_files: int = 0
     reconnect_required: bool = False
+    #: Account keys the desk chose to count (empty: every account counts).
+    counted_accounts: list[str] = Field(default_factory=list)
 
 
 class ClientEvidenceRequirementRead(BaseModel):
@@ -762,6 +792,9 @@ class ClientEvidenceRequirementRead(BaseModel):
     required_level: Literal["required", "recommended", "optional"]
     status: RequirementStateStatus
     complete: bool = False
+    # Everything asked for has arrived and is only awaiting review. The room
+    # says "checking" rather than asking the client for it again.
+    coverage_complete: bool = False
     evidence_count: int = 0
     accepted_evidence_count: int = 0
     processing_evidence_count: int = 0
@@ -1020,7 +1053,9 @@ class RoomRequestCreate(BaseModel):
 
 
 class RoomReminderCreate(BaseModel):
-    purpose: Literal["documents", "business_banking", "room"] = "room"
+    #: `bank_connect` is the desk asking for a Plaid connection by name, upload
+    #: as the fallback; `business_banking` is the older neutral wording.
+    purpose: Literal["documents", "business_banking", "bank_connect", "room"] = "room"
     recipient_email: EmailStr | None = None
     recipient_phone: str | None = Field(default=None, max_length=48)
     email_room_link: bool = True
@@ -1416,6 +1451,9 @@ class FinancialFormStatus(BaseModel):
     total_liabilities: float | None = None
     total_equity: float | None = None
     balances: bool | None = None
+    #: The debt schedule only: the desk's declaration that the business carries
+    #: no debt ({reason, by, by_user_id, at}), which sets the request aside.
+    voided: dict | None = None
 
 
 class FinancialFormPacket(BaseModel):
@@ -1545,3 +1583,46 @@ class WorksheetLinkCreate(BaseModel):
     ttl_days: int | None = None
     label: str | None = None
     invitee_email: str | None = None
+
+
+class OwnerCreditCandidateRead(BaseModel):
+    """A completed pull that could be an owner's, with the evidence for it."""
+
+    pull_id: str
+    status: str
+    score: int | None = None
+    fico_source: str | None = None
+    score_verified: bool = False
+    report_available: bool = False
+    attention: str | None = None
+    pulled_at: str | None = None
+    expires_at: str | None = None
+    expired: bool = False
+    first_name: str | None = None
+    last_name: str | None = None
+    email: str | None = None
+    dob_on_file: bool = False
+    client_id: str | None = None
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    confidence: str
+    why: str
+    linked_to_this_owner: bool = False
+    linked_elsewhere: bool = False
+
+
+class OwnerCreditLinkRequest(BaseModel):
+    pull_id: UUID
+    confirm_other_client: bool = False
+
+
+class ProviderCreditLinkRequest(BaseModel):
+    applicant_id: str = Field(pattern=r"^\d{1,20}$")
+    report_id: UUID
+    pull_type: Literal["soft_pull", "hard_pull"] = "soft_pull"
+    confirm_identity: bool = False
+
+
+class ProfileCreditLinkReport(BaseModel):
+    profile_id: str
+    linked: list[dict[str, Any]] = Field(default_factory=list)
+    waiting: list[dict[str, Any]] = Field(default_factory=list)

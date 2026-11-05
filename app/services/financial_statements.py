@@ -15,7 +15,9 @@ and the richer form can land behind it.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
 
@@ -25,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.application_profile import ApplicationProfile
 from app.models.financial_statement import FinancialStatement, FinancialStatementOwner
-from app.services import pfs_schema
+from app.services import debt_types, pfs_schema
 from app.services.debt_terms import DebtTermsError, monthly_source, normalize_terms
 from app.services.extracted_facts import canonical_field_aliases
 
@@ -327,6 +329,8 @@ DEBT_COLUMNS = (
     "secured",
     "payment_status",
     "collateral",
+    "mca_modified",
+    "mca_modification_note",
     "notes",
     "factor_rate",
     "payment_amount",
@@ -348,12 +352,51 @@ DEBT_COLUMN_LABELS = (
     "Secured or unsecured",
     "Payment status",
     "Collateral",
+    "MCA modified for lower sales?",
+    "How the advance was modified",
     "Notes",
     "Factor rate (×)",
     "Payment amount",
     "Payment frequency",
 )
 assert len(DEBT_COLUMN_LABELS) == len(DEBT_COLUMNS)
+
+#: The type-of-debt vocabulary lives in `debt_types`; re-exported here because
+#: everything that prints or stores the schedule already imports this module.
+DEBT_TYPES = debt_types.DEBT_TYPES
+DEBT_TYPE_SLUGS = debt_types.DEBT_TYPE_SLUGS
+ADVANCE_DEBT_TYPES = debt_types.ADVANCE_DEBT_TYPES
+normalize_debt_type = debt_types.normalize_debt_type
+debt_type_label = debt_types.debt_type_label
+
+#: What a schedule is incomplete without. The owner: "not all the fields are
+#: mandatory, but lender name, type of debt, original amount, balance, interest
+#: rate, monthly payment, current or delinquent we need it." The dates, whether
+#: it is secured, the collateral and the note may stay blank. An advance also
+#: has to say whether the funder modified it for lower sales.
+REQUIRED_DEBT_FIELDS: tuple[str, ...] = (
+    "lender",
+    "debt_type",
+    "original_amount",
+    "balance",
+    "rate",
+    "monthly_payment",
+    "payment_status",
+)
+ADVANCE_REQUIRED_DEBT_FIELDS: tuple[str, ...] = ("mca_modified",)
+
+#: How a missing answer is named back to the person, in the words the form
+#: uses for the field.
+_DEBT_FIELD_WORDS: dict[str, str] = {
+    "lender": "lender name",
+    "debt_type": "type of debt",
+    "original_amount": "original amount",
+    "balance": "current balance",
+    "rate": "interest rate",
+    "monthly_payment": "monthly payment",
+    "payment_status": "current or delinquent",
+    "mca_modified": "whether the advance was modified for lower sales",
+}
 
 #: What the row's two choice fields accept. Anything else is discarded rather
 #: than stored, so a stray value cannot end up rendered on a schedule we send
@@ -365,6 +408,22 @@ _PAYMENT_STATUS_CHOICES = {"current", "delinquent"}
 def _choice(value: Any, allowed: set[str]) -> str | None:
     text = str(value or "").strip().lower()
     return text if text in allowed else None
+
+
+_YES = frozenset({"yes", "y", "true", "1"})
+_NO = frozenset({"no", "n", "false", "0"})
+
+
+def _yes_no(value: Any) -> bool | None:
+    """A yes-or-no answer, or None for "not asked" / "not answered"."""
+    if isinstance(value, bool):
+        return value
+    text = str(value if value is not None else "").strip().casefold()
+    if text in _YES:
+        return True
+    if text in _NO:
+        return False
+    return None
 
 
 def _date(value: Any) -> date | None:
@@ -382,22 +441,237 @@ def _date(value: Any) -> date | None:
         return None
 
 
+#: What `dos_debts.rate` can hold — Numeric(6, 3). A figure past it is an
+#: amount typed into the wrong box, and reads as "no rate" rather than a 500
+#: at flush.
+_RATE_CEILING = 999.999
+
+
 def _rate(value: Any) -> float | None:
-    """An interest rate as a number. "7.25%" and "7.25" mean the same thing."""
-    text = str(value or "").strip().rstrip("%").replace(",", "")
+    """An interest rate as a number. "7.25%", "7.25" and 7.25 mean the same
+    thing; a typed 0 is a 0% promotion, not a blank."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        number = float(value)
+    else:
+        text = str(value).strip().rstrip("%").replace(",", "")
+        if not text:
+            return None
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+    if not 0 <= number <= _RATE_CEILING:
+        return None
+    return number
+
+
+_MONEY_NOISE = re.compile(r"[,$\s]")
+
+
+def _money_or_none(value: Any) -> Decimal | None:
+    """A typed figure, or None when the field is blank or not a number.
+
+    Not nought. "TBD" or "n/a" in a monthly payment used to parse as 0, and 0
+    in `monthly_payment` tells the DSCR engine the obligation costs nothing a
+    month. An unknown figure stays unknown, and the completeness check names
+    it. Parentheses are the accountant's minus; a typed 0 is kept.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        return Decimal(str(value))
+    text = _MONEY_NOISE.sub("", str(value))
     if not text:
         return None
+    negative = text.startswith("(") and text.endswith(")")
+    text = text.strip("()")
+    if text.startswith("-"):
+        negative, text = True, text[1:]
     try:
-        return float(text)
-    except ValueError:
+        amount = Decimal(text)
+    except InvalidOperation:
         return None
+    return -amount if negative else amount
 
 
-def _blank_or_amount(value: Any) -> Any:
-    """A typed figure, or None when the field was left empty."""
-    if value is None or (isinstance(value, str) and not value.strip()):
-        return None
-    return pfs_schema._amount(value)
+def _blank_or_amount(value: Any) -> Decimal | None:
+    """Compatibility for draft adapters; an unreported amount stays unknown."""
+    return _money_or_none(value)
+
+
+def _first_present(line: dict[str, Any], *keys: str) -> Any:
+    """The first of these keys the line actually carries. Not `or`: a rate of
+    0 is a 0% promotion, and `or` would step over it to the next key."""
+    for key in keys:
+        value = line.get(key)
+        if value is not None and (not isinstance(value, str) or value.strip()):
+            return value
+    return None
+
+
+_DELINQUENT_WORDS = re.compile(
+    r"\b(delinquent|past[ _]?due|not current|late|default(ed)?|arrears)\b"
+)
+
+
+def _document_payment_status(line: dict[str, Any]) -> str | None:
+    """"current" or "delinquent" off a schedule line, whichever way the AI
+    wrote it: the prompt asks for `payment_status`, older reads carry a
+    `current` true/false. Anything else stays unanswered, so the completeness
+    check asks for it instead of the row guessing."""
+    text = str(line.get("payment_status") or "").strip().casefold().replace("-", " ")
+    if text in _PAYMENT_STATUS_CHOICES:
+        return text
+    if text and _DELINQUENT_WORDS.search(text):
+        return "delinquent"
+    current = line.get("current")
+    if isinstance(current, bool):
+        return "current" if current else "delinquent"
+    return None
+
+
+def _document_secured(line: dict[str, Any]) -> str | None:
+    """"secured" or "unsecured" off a schedule line. A line that names what
+    backs it is secured, whatever else it said."""
+    raw = line.get("secured")
+    if isinstance(raw, bool):
+        return "secured" if raw else "unsecured"
+    text = str(raw or "").strip().casefold()
+    if text in _SECURED_CHOICES:
+        return text
+    if text in _YES:
+        return "secured"
+    if text in _NO:
+        return "unsecured"
+    if str(_first_present(line, "secured_by", "collateral") or "").strip():
+        return "secured"
+    return None
+ROW_PATCH_FIELDS = (
+    "lender",
+    "category",
+    "monthly_payment",
+    "balance",
+    "payoff_amount",
+    "payment_amount",
+    "payment_frequency",
+    # The three answers a lender asks of every line, and whether it is being
+    # paid on time. They were missing here, so a row could be created with
+    # them (the form) but never corrected on the cockpit or by the review.
+    "original_amount",
+    "rate",
+    "factor_rate",
+    "payment_status",
+    # The rest of the twelve-field row, so one writer can correct any cell of it.
+    "originated_on",
+    "maturity_on",
+    "secured",
+    "collateral",
+    "notes",
+    "mca_modified",
+    "mca_modification_note",
+    "count_in_dscr",
+    "vendor_key",
+    "status",
+)
+
+
+def apply_debt_row_patch(row: Any, changes: dict[str, Any]) -> list[str]:
+    """Write the sent fields onto a schedule row; returns the names changed.
+
+    A category is normalised to the closed debt-type vocabulary (an unknown
+    word is kept as typed, lower-cased). A monthly figure typed by the desk
+    replaces a per-payment cadence; an empty vendor key unlinks the payee.
+    """
+    changed: list[str] = []
+    for key in ROW_PATCH_FIELDS:
+        if key not in changes:
+            continue
+        value = changes[key]
+        if key == "category" and value is not None:
+            value = debt_types.normalize_debt_type(value) or str(value).strip().lower()[:24]
+        if key == "lender" and value is not None:
+            value = str(value).strip()[:180] or getattr(row, "lender", None)
+        if key == "vendor_key":
+            value = (str(value).strip()[:60] or None) if value is not None else None
+        if key in {"monthly_payment", "balance", "payoff_amount", "payment_amount", "original_amount"} and value is not None:
+            value = round(float(value), 2)
+        if key in {"rate", "factor_rate"} and value is not None:
+            # `rate` is a percent a year; a factor ("1.35") belongs in `factor_rate`
+            # and nowhere else, which is why the two are separate keys.
+            value = round(float(value), 3)
+        if key == "payment_status" and value is not None:
+            value = _choice(value, _PAYMENT_STATUS_CHOICES)
+            if value is None:
+                continue  # an unreadable answer leaves the stored one alone
+        if key in {"originated_on", "maturity_on"} and value is not None:
+            value = value if isinstance(value, date) else _date(value)
+        if key == "secured" and value is not None:
+            value = _choice(value, _SECURED_CHOICES)
+            if value is None:
+                continue
+        if key in {"collateral", "notes", "mca_modification_note"} and value is not None:
+            value = " ".join(str(value).split()) if key != "notes" else str(value).strip()
+            value = value[: {"collateral": 500, "notes": 2000, "mca_modification_note": 1000}[key]] or None
+        if key == "mca_modified" and value is not None and not isinstance(value, bool):
+            value = _yes_no(value)
+        if getattr(row, key, None) != value:
+            setattr(row, key, value)
+            changed.append(key)
+    if "category" in changes and getattr(row, "category", None) not in debt_types.ADVANCE_DEBT_TYPES:
+        # An answer to a question only advances are asked leaves with the type.
+        for field in ("mca_modified", "mca_modification_note"):
+            if getattr(row, field, None) is not None:
+                setattr(row, field, None)
+                changed.append(field)
+    if "monthly_payment" in changes and changes["monthly_payment"] is not None and "payment_amount" not in changes:
+        # The desk typed the month; a per-payment cadence read earlier no longer describes it.
+        if getattr(row, "payment_amount", None) is not None:
+            row.payment_amount = None
+            row.payment_frequency = None
+            changed.append("payment_amount")
+    return changed
+
+
+def document_debts_as_body(document: dict[str, Any] | None) -> dict[str, Any]:
+    """The lines the AI read off an uploaded debt schedule, as the desk's form
+    body, so they can be adopted as the file's own rows with one click.
+
+    Both shapes the AI has written are read (`interest_rate` / `rate_pct`,
+    `payment_status` / `current`, `secured` / `secured_by`), and what comes out
+    uses only the values the form stores, so the row cleaner downstream never
+    has to discard an answer it cannot read. The MCA modification answer rides
+    along; the cleaner keeps it only on an advance."""
+    debts: list[dict[str, Any]] = []
+    for line in (document or {}).get("debts") or []:
+        if not isinstance(line, dict):
+            continue
+        lender = str(line.get("lender") or line.get("creditor") or line.get("name") or "").strip()
+        if not lender:
+            continue
+        debts.append(
+            {
+                "lender": lender,
+                "debt_type": _first_present(line, "debt_type", "type"),
+                "original_amount": line.get("original_amount"),
+                "balance": _first_present(line, "current_balance", "balance"),
+                "rate": _first_present(line, "interest_rate", "rate_pct", "rate"),
+                "monthly_payment": line.get("monthly_payment"),
+                "factor_rate": line.get("factor_rate"),
+                "payment_amount": line.get("payment_amount"),
+                "payment_frequency": line.get("payment_frequency"),
+                "originated_on": _first_present(line, "origination_date", "originated_on", "origin_date"),
+                "maturity_on": _first_present(line, "maturity_date", "maturity_on"),
+                "collateral": _first_present(line, "collateral", "secured_by"),
+                "secured": _document_secured(line),
+                "payment_status": _document_payment_status(line),
+                "mca_modified": line.get("mca_modified"),
+                "mca_modification_note": _first_present(line, "mca_modification_note", "mca_note"),
+                "notes": "Adopted from the uploaded debt schedule.",
+            }
+        )
+    return {"debts": debts}
 
 
 def debt_rows_from_body(body: dict[str, Any]) -> list[dict[str, Any]] | None:
@@ -417,8 +691,19 @@ def debt_rows_from_body(body: dict[str, Any]) -> list[dict[str, Any]] | None:
     for raw in (body or {}).get("debts") or []:
         if not isinstance(raw, dict):
             continue
+        # A line with nothing on it is someone tabbing through, not an
+        # obligation. A line with anything on it — a type, an amount, a note —
+        # is kept, so what was typed is never silently dropped and the
+        # completeness check can say what it still lacks.
+        if not any(
+            str(raw.get(key) if raw.get(key) is not None else "").strip() for key in DEBT_COLUMNS
+        ):
+            continue
+        # The legacy form tolerates unreadable numeric text as unknown. The
+        # workspace validates its editable cells before reaching this cleaner.
+        prepared = {**raw, "monthly_payment": _money_or_none(raw.get("monthly_payment")), "rate": _rate(raw.get("rate"))}
         try:
-            normalized = normalize_terms(raw)
+            normalized = normalize_terms(prepared)
         except DebtTermsError as error:
             raise HTTPException(422, str(error)) from error
         lender = str(raw.get("lender") or "").strip()
@@ -426,10 +711,12 @@ def debt_rows_from_body(body: dict[str, Any]) -> list[dict[str, Any]] | None:
         # `monthly_payment` tells the DSCR engine this obligation costs nothing
         # a month, which is how a daily-paying advance disappears out of the
         # denominator and makes coverage look better than it is.
-        balance = _blank_or_amount(raw.get("balance"))
+        balance = _money_or_none(raw.get("balance"))
         monthly = normalized["monthly_payment"]
-        if not lender and not balance and not monthly:
-            continue
+        # A slug the form chose, or the slug a typed value means ("LOC",
+        # "Term", a label picked in a spreadsheet). Unrecognised text is kept.
+        debt_type = debt_types.normalize_debt_type(raw.get("debt_type"))
+        advance = debt_type in debt_types.ADVANCE_DEBT_TYPES
         out.append(
             {
                 # Which stored row this line came from, when the form was
@@ -437,10 +724,10 @@ def debt_rows_from_body(body: dict[str, Any]) -> list[dict[str, Any]] | None:
                 # place instead of deleting and recreating them.
                 "id": str(raw.get("id") or "").strip() or None,
                 "lender": (lender or "Unnamed lender")[:180],
-                "debt_type": (str(raw.get("debt_type") or "").strip() or None),
-                "original_amount": _blank_or_amount(raw.get("original_amount")),
+                "debt_type": debt_type,
+                "original_amount": _money_or_none(raw.get("original_amount")),
                 "balance": balance,
-                "rate": normalized.get("rate"),
+                "rate": _rate(normalized.get("rate")),
                 "monthly_payment": monthly,
                 "monthly_payment_source": normalized.get("monthly_payment_source"),
                 **{key: normalized[key] for key in ("factor_rate", "payment_amount", "payment_frequency") if key in normalized},
@@ -453,10 +740,108 @@ def debt_rows_from_body(body: dict[str, Any]) -> list[dict[str, Any]] | None:
                 "secured": _choice(raw.get("secured"), _SECURED_CHOICES),
                 "payment_status": _choice(raw.get("payment_status"), _PAYMENT_STATUS_CHOICES),
                 "collateral": (str(raw.get("collateral") or "").strip() or None),
+                # Asked of an advance and nothing else. An answer left on a row
+                # whose type was then changed is an answer to a question nobody
+                # asked, so it goes with the type.
+                "mca_modified": _yes_no(raw.get("mca_modified")) if advance else None,
+                "mca_modification_note": (
+                    (str(raw.get("mca_modification_note") or "").strip() or None) if advance else None
+                ),
                 "notes": str(raw.get("notes") or "").strip() or None,
+                # Whether the saver may write this row. The request is not
+                # believed about this — a body that marked its own rows
+                # read-only would skip the completeness check — so every row
+                # starts writable and `debt_submit_problems` turns off the ones
+                # the file says belong to another source. Never stored.
+                "editable": True,
             }
         )
     return out
+
+
+def mark_foreign_rows(rows: list[dict[str, Any]], existing: list[Any], *, origin: str) -> None:
+    """Set `editable` from the file: a row whose id resolves to a stored row
+    another origin owns is one this saver cannot write, and the completeness
+    check must not hold the saver to it. Decided here from the stored rows,
+    never from the request."""
+    foreign = {str(row.id) for row in existing if row.origin != origin}
+    for row in rows:
+        row["editable"] = (row.get("id") or "") not in foreign
+
+
+def debt_row_problems(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Which required answers each row still lacks, for a submit.
+
+    A draft is never checked: the page autosaves half-typed rows on purpose,
+    and refusing them would lose what someone had typed so far. A submit is
+    the borrower's finished answer, and a lender reading a schedule without a
+    type, a rate or whether it is current has to come back and ask — which is
+    what the owner is paying this form to stop.
+
+    A row the saver cannot write (`editable` False on the seeded body) is
+    skipped: a borrower is not kept from submitting by a desk row they have no
+    way to complete. Rows are numbered from one, the way the form shows them.
+    """
+    problems: list[dict[str, Any]] = []
+    for index, row in enumerate(rows or [], start=1):
+        if row.get("editable") is False:
+            continue
+        missing = [
+            field
+            for field in REQUIRED_DEBT_FIELDS
+            if row.get(field) in (None, "") or (field == "lender" and row.get(field) == "Unnamed lender")
+        ]
+        if row.get("debt_type") in debt_types.ADVANCE_DEBT_TYPES and row.get("factor_rate") is not None:
+            # A contract's factor is its pricing answer, never an invented APR.
+            missing = [field for field in missing if field != "rate"]
+        if row.get("debt_type") in debt_types.ADVANCE_DEBT_TYPES:
+            missing.extend(field for field in ADVANCE_REQUIRED_DEBT_FIELDS if row.get(field) is None)
+        if missing:
+            lender = row.get("lender")
+            problems.append(
+                {
+                    "index": index,
+                    "lender": None if lender in (None, "", "Unnamed lender") else lender,
+                    "missing": missing,
+                }
+            )
+    return problems
+
+
+async def debt_submit_problems(
+    db: AsyncSession, profile: ApplicationProfile, rows: list[dict[str, Any]], *, origin: str
+) -> list[dict[str, Any]]:
+    """`debt_row_problems` for a submit on a file: the rows another source owns
+    are read off the file's own schedule and skipped, everything else is held
+    to the required answers."""
+    from app.dealer_os.models import DealerDebt
+
+    existing = list(
+        (
+            await db.execute(
+                select(DealerDebt).where(
+                    DealerDebt.profile_id == profile.id,
+                    DealerDebt.status == "active",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    mark_foreign_rows(rows, existing, origin=origin)
+    return debt_row_problems(rows)
+
+
+def describe_debt_problems(problems: list[dict[str, Any]]) -> str:
+    """The problems as one sentence per obligation, for a 422 the page shows
+    as written: "Obligation 2 (Newtek) still needs: interest rate, current or
+    delinquent." """
+    lines: list[str] = []
+    for problem in problems:
+        who = f" ({problem['lender']})" if problem.get("lender") else ""
+        words = ", ".join(_DEBT_FIELD_WORDS.get(field, field.replace("_", " ")) for field in problem["missing"])
+        lines.append(f"Obligation {problem['index']}{who} still needs: {words}.")
+    return " ".join(lines)
 
 
 def debt_key_facts(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -479,6 +864,20 @@ def debt_key_facts(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "payment_frequency": row.get("payment_frequency"),
                 "monthly_payment_source": row.get("monthly_payment_source"),
                 "maturity_date": row["maturity_on"].isoformat() if row.get("maturity_on") else None,
+                # The rest of the row, so a reader of the facts sees what the
+                # PDF shows: what the debt is, its rate, whether it is current,
+                # and — for an advance — whether the funder modified it. `type`
+                # is the key the cockpit's document reader already looks at.
+                "debt_type": row.get("debt_type"),
+                "type": row.get("debt_type"),
+                "debt_type_label": debt_types.debt_type_label(row.get("debt_type")),
+                "interest_rate": float(row["rate"]) if row.get("rate") is not None else None,
+                "originated_date": row["originated_on"].isoformat() if row.get("originated_on") else None,
+                "secured": row.get("secured"),
+                "payment_status": row.get("payment_status"),
+                "collateral": row.get("collateral"),
+                "mca_modified": row.get("mca_modified"),
+                "mca_modification_note": row.get("mca_modification_note"),
             }
             for row in rows
         ],
@@ -511,12 +910,15 @@ def _apply_debt_form_fields(target: Any, row: dict[str, Any]) -> None:
     for key in ("factor_rate", "payment_amount", "payment_frequency"):
         if key in row:
             setattr(target, key, row[key])
-    target.evidence = {**(target.evidence if isinstance(target.evidence, dict) else {}), "monthly_payment_source": row.get("monthly_payment_source")}
+    evidence = getattr(target, "evidence", None)
+    target.evidence = {**(evidence if isinstance(evidence, dict) else {}), "monthly_payment_source": row.get("monthly_payment_source")}
     target.originated_on = row.get("originated_on")
     target.maturity_on = row.get("maturity_on")
     target.secured = row.get("secured")
     target.payment_status = row.get("payment_status")
     target.collateral = row.get("collateral")
+    target.mca_modified = row.get("mca_modified")
+    target.mca_modification_note = row.get("mca_modification_note")
     target.notes = row.get("notes")
 
 
@@ -659,9 +1061,15 @@ async def save_debt_rows(
             _apply_debt_form_fields(target, row)
         # else: somebody else's row. Seen, matched, left alone.
 
+    # A row the saver no longer lists is retired, not deleted: `dos_debts` is
+    # one of the retention-guarded history tables (0239), whose BEFORE DELETE
+    # trigger refuses a physical delete outside a governed purge — the delete
+    # that used to sit here 500'd the borrower's link the moment they removed
+    # an obligation. "dismissed" is the status the dealer desk already uses for
+    # the same thing, and every schedule reader selects `status == "active"`.
     for row in existing:
         if str(row.id) not in claimed and row.origin == origin:
-            await db.delete(row)
+            row.status = "dismissed"
     await db.flush()
 
 
@@ -699,12 +1107,16 @@ async def debt_body_for_profile(
                 "owner": row.origin,
                 "lender": row.lender,
                 # "loan" is the column's historic default, not something anyone
-                # typed, so it seeds as blank rather than as an answer.
-                "debt_type": "" if (row.category or "loan") == "loan" else row.category,
-                "original_amount": str(row.original_amount) if row.original_amount is not None else "",
-                "balance": str(row.balance) if row.balance is not None else "",
-                "rate": str(row.rate) if row.rate is not None else "",
-                "monthly_payment": str(row.monthly_payment) if row.monthly_payment is not None else "",
+                # typed, so it seeds as blank rather than as an answer. A value
+                # typed before the list existed ("LOC", "Term") seeds as the
+                # slug it means, so the form's list shows it selected.
+                "debt_type": debt_types.normalize_debt_type(row.category) or "",
+                # A stored 0 is an answer (a 0% promotion, a paid-down line)
+                # and seeds as "0", not as a blank the check would then name.
+                "original_amount": "" if row.original_amount is None else str(row.original_amount),
+                "balance": "" if row.balance is None else str(row.balance),
+                "rate": "" if row.rate is None else str(row.rate),
+                "monthly_payment": "" if row.monthly_payment is None else str(row.monthly_payment),
                 "factor_rate": str(row.factor_rate) if row.factor_rate is not None else "",
                 "payment_amount": str(row.payment_amount) if row.payment_amount is not None else "",
                 "payment_frequency": row.payment_frequency or "",
@@ -714,6 +1126,8 @@ async def debt_body_for_profile(
                 "secured": row.secured or "",
                 "payment_status": row.payment_status or "",
                 "collateral": row.collateral or "",
+                "mca_modified": "" if row.mca_modified is None else ("yes" if row.mca_modified else "no"),
+                "mca_modification_note": row.mca_modification_note or "",
                 "notes": row.notes or "",
             }
             for row in rows

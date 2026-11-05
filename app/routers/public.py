@@ -31,6 +31,7 @@ import asyncio
 import logging
 import time
 import uuid
+from dataclasses import asdict
 from datetime import date, datetime, timezone, tzinfo
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -42,7 +43,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.dealer_os.models import DealerRepAppointment
-from app.dealer_os.schemas import BookingAvailabilityRead
+from app.dealer_os.schemas import BookingAvailabilityRead, SmsDisclosureOut
 from app.dealer_os.services import consent_delivery
 from app.dealer_os.services import sms_consent as sms_consent_service
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus
@@ -62,6 +63,15 @@ from app.services.team_calendar import effective_booking_settings, lock_calendar
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/public", tags=["public"])
+
+
+@router.get("/sms-disclosure", response_model=SmsDisclosureOut)
+async def public_sms_disclosure() -> SmsDisclosureOut:
+    """The exact wording of the SMS and legal checkboxes, for any page that
+    asks for them. Fetched, never typed into a component, so what is on screen
+    and what is stored as proof are the same string."""
+
+    return SmsDisclosureOut(**asdict(sms_consent_service.disclosure()))
 
 INVESTOR_INBOX = "franco@qualifiedcommercial.com"
 SUPPORT_INBOX = "support@qualifiedcommercial.com"

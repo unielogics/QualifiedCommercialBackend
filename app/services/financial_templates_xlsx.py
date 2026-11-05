@@ -209,16 +209,32 @@ class _Form:
         )
         self.cells[key] = row
 
+    #: Excel keeps an inline list formula only up to 255 characters; past that
+    #: it strips the validation on open with a repair prompt. The debt-type
+    #: labels run past it, so a long list is written down a hidden column of
+    #: the same sheet and the validation points at that range instead.
+    INLINE_LIST_LIMIT = 255
+
     def _validation(self, options: tuple[str, ...]) -> DataValidation:
         """One list validation per option set per sheet."""
         found = self._validations.get(options)
         if found is None:
-            found = DataValidation(
-                type="list", formula1='"' + ",".join(options) + '"', allow_blank=True
-            )
+            inline = '"' + ",".join(options) + '"'
+            formula = inline if len(inline) <= self.INLINE_LIST_LIMIT else self._list_range(options)
+            found = DataValidation(type="list", formula1=formula, allow_blank=True)
             self.ws.add_data_validation(found)
             self._validations[options] = found
         return found
+
+    def _list_range(self, options: tuple[str, ...]) -> str:
+        """The options written down the next free hidden column past the key
+        column, as an absolute range this sheet's validations can point at."""
+        column = self.key_column + 1 + len([o for o in self._validations if len('"' + ",".join(o) + '"') > self.INLINE_LIST_LIMIT])
+        letter = get_column_letter(column)
+        for index, option in enumerate(options, start=1):
+            self.ws.cell(row=index, column=column, value=option)
+        self.ws.column_dimensions[letter].hidden = True
+        return f"'{self.ws.title}'!${letter}$1:${letter}${len(options)}"
 
     def line(self, text: str, font: Font) -> None:
         """A title or subtitle: one styled cell in column A."""
@@ -330,7 +346,10 @@ class _Form:
             elif cell.type == "date":
                 target.number_format = DATE_FORMAT
             elif cell.type == "select" and cell.options:
-                self._validation(tuple(cell.options)).add(target)
+                # A person picking from a list in Excel reads labels; the
+                # upload is read back for the slug each label means.
+                shown = tuple(label for _value, label in cell.option_labels) if cell.option_labels else tuple(cell.options)
+                self._validation(shown).add(target)
             self._name(cell.xlsx_name, self.row, cell.c)
         if self.monthly_equivalent_column:
             amount = self.refs[f"r{row.ordinal}.payment_amount"]

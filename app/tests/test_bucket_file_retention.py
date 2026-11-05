@@ -11,11 +11,15 @@ from app.routers import buckets
 
 
 def test_bucket_file_delete_retains_storage_for_recovery() -> None:
-    source = inspect.getsource(buckets.delete_admin_file)
-    assert 'file.delete_storage_status = "retained_soft_delete"' in source
-    assert "_delete_s3_object" not in source
-    assert "selectinload(BucketFile.public_shares)" in source
-    assert "file.public_shares.clear()" in source
+    helper = inspect.getsource(buckets._soft_delete_file)
+    assert 'file.delete_storage_status = "retained_soft_delete"' in helper
+    assert "_delete_s3_object" not in helper
+    assert "file.public_shares.clear()" in helper
+    loader = inspect.getsource(buckets._files_for_removal)
+    assert "selectinload(BucketFile.public_shares)" in loader
+    route = inspect.getsource(buckets.delete_admin_file)
+    assert "_files_for_removal(" in route and "_soft_delete_file(" in route
+    assert "_delete_s3_object" not in route
 
 
 def test_bucket_archive_does_not_delete_or_reject_protected_files() -> None:
@@ -41,6 +45,16 @@ def test_restore_rejects_rows_whose_storage_was_already_removed() -> None:
     assert "retained_soft_delete" in source
     assert '"delete_failed"' not in source
     assert "predates recovery retention" in source
+
+
+def test_restore_never_reads_the_expired_server_timestamp() -> None:
+    # After the flush, updated_at is expired (server onupdate); touching it in
+    # an async session raises MissingGreenlet and the restore 500s (seen live
+    # 2026-11-04). The recompute key comes from the clock instead.
+    source = inspect.getsource(buckets.restore_admin_file)
+
+    assert "file.updated_at" not in source
+    assert "file-restored:" in source and "_now().isoformat()" in source
 
 
 def test_bucket_file_legal_hold_always_blocks_deletion() -> None:

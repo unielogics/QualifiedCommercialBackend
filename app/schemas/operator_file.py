@@ -450,3 +450,26 @@ class IntakePromotionResult(BaseModel):
     client_id: UUID
     created: bool
     audit_id: UUID
+
+
+class AttentionItem(BaseModel):
+    """One thing on the desk that is stalling, with the one link that fixes it."""
+
+    kind: Literal["intake_no_files", "no_client_entry", "request_overdue", "action_items_stale"]
+    severity: Literal["warn", "bad"]
+    title: str
+    detail: str
+    age_days: int
+    count: int = 1
+    href: str
+    bucket_id: UUID | None = None
+    intake_id: UUID | None = None
+    profile_id: UUID | None = None
+    link_last_sent_at: datetime | None = None
+    actions: list[Literal["resend_link"]] = Field(default_factory=list)
+
+
+class AttentionQueue(BaseModel):
+    generated_at: datetime
+    items: list[AttentionItem]
+    counts: dict[str, int]

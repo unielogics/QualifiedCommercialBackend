@@ -1,6 +1,9 @@
 # ruff: noqa: I001
 """ORM models — single import surface so Alembic autogenerate sees everything."""
 
+from app.capital_partners import (
+    models as capital_partners_models,  # noqa: F401  (Capital Partners — isolated cp_* tables)
+)
 from app.dealer_os import (
     models as dealer_os_models,  # noqa: F401  (Dealer OS — isolated dos_* tables)
 )

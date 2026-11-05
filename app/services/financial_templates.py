@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from io import BytesIO
 
+from app.services import debt_types
+
 TEMPLATE_VERSION = "2026.1"
 
 
@@ -159,23 +161,65 @@ def _debt_schedule() -> FinancialTemplate:
     sheet.title = "Debt Schedule"
     sheet.append([f"Business Debt Schedule · QC template v{TEMPLATE_VERSION}"])
     sheet.append(["Enter each current obligation. Do not include personal debt unless it guarantees the business obligation."])
-    sheet.append(["Creditor", "Debt type", "Original amount", "Current balance", "Rate %", "Monthly payment", "Maturity", "Secured by", "Current?"])
+    # The same columns the online form asks for, in the same order, so a
+    # borrower's accountant filling the workbook answers what the lender reads.
+    # The type and the yes/no columns are lists, so what comes back is one of
+    # our words (the reader maps a label to its slug).
+    sheet.append(
+        [
+            "Creditor",
+            "Debt type",
+            "Original amount",
+            "Current balance",
+            "Rate %",
+            "Monthly payment",
+            "Origination date",
+            "Maturity date",
+            "Secured or unsecured",
+            "Current or delinquent",
+            "Type of collateral",
+            "MCA modified for lower sales? (advances only)",
+            "How the advance was modified",
+            "Notes",
+        ]
+    )
     for row in range(4, 29):
-        sheet.append([None] * 9)
+        sheet.append([None] * 14)
         sheet[f"C{row}"].number_format = '$#,##0.00'
         sheet[f"D{row}"].number_format = '$#,##0.00'
         sheet[f"E{row}"].number_format = '0.00%'
         sheet[f"F{row}"].number_format = '$#,##0.00'
         sheet[f"G{row}"].number_format = 'mm/dd/yyyy'
+        sheet[f"H{row}"].number_format = 'mm/dd/yyyy'
     total_row = 29
     sheet[f"A{total_row}"] = "Totals"
     sheet[f"D{total_row}"] = f"=SUM(D4:D{total_row - 1})"
     sheet[f"F{total_row}"] = f"=SUM(F4:F{total_row - 1})"
     sheet[f"D{total_row}"].number_format = sheet[f"F{total_row}"].number_format = '$#,##0.00'
-    validation = DataValidation(type="list", formula1='"Yes,No"', allow_blank=True)
-    sheet.add_data_validation(validation)
-    validation.add(f"I4:I{total_row - 1}")
-    _style_sheet(sheet, {"A": 24, "B": 20, "C": 16, "D": 16, "E": 11, "F": 17, "G": 14, "H": 24, "I": 12})
+    # The type list runs past Excel's 255-character limit for an inline list
+    # (Excel strips such a validation on open), so its labels sit down a hidden
+    # column and the validation points at that range.
+    type_labels = [label for _slug, label in debt_types.DEBT_TYPES]
+    for index, label in enumerate(type_labels, start=1):
+        sheet[f"P{index}"] = label
+    sheet.column_dimensions["P"].hidden = True
+    lists = (
+        ("B", f"'Debt Schedule'!$P$1:$P${len(type_labels)}"),
+        ("I", '"Secured,Unsecured"'),
+        ("J", '"Current,Delinquent"'),
+        ("L", '"Yes,No"'),
+    )
+    for column, formula in lists:
+        validation = DataValidation(type="list", formula1=formula, allow_blank=True)
+        sheet.add_data_validation(validation)
+        validation.add(f"{column}4:{column}{total_row - 1}")
+    _style_sheet(
+        sheet,
+        {
+            "A": 24, "B": 30, "C": 16, "D": 16, "E": 11, "F": 17, "G": 14, "H": 14,
+            "I": 20, "J": 20, "K": 24, "L": 30, "M": 30, "N": 30,
+        },
+    )
     return FinancialTemplate(
         kind="debt_schedule_xlsx",
         filename=f"QC-Business-Debt-Schedule-v{TEMPLATE_VERSION}.xlsx",

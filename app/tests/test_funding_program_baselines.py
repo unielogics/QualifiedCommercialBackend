@@ -1,4 +1,5 @@
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -29,9 +30,14 @@ def test_every_baseline_is_a_valid_detached_reviewable_draft(key):
     )
     validate_rules(draft.rules, enforce_supported_fields=True)
     assert baseline.needs_review
-    assert baseline.source_urls[0].startswith("https://qualifiedcommercial.com/")
+    # Two provenances: a snapshot of the public site, or a lender's own
+    # guideline kept in the repository under docs/program_sources (see
+    # test_repository_backed_sources_point_at_files_in_the_repository).
+    assert baseline.source_urls[0].startswith(
+        ("https://qualifiedcommercial.com/", "repo://docs/program_sources/")
+    )
     assert all(
-        note.startswith(("Website:", "Proposed QC policy:", "Review:"))
+        note.startswith(("Website:", "Lender guideline:", "Proposed QC policy:", "Review:"))
         for note in baseline.source_notes
     )
     assert len({row.requirement_key for row in baseline.requirements}) == len(baseline.requirements)
@@ -214,3 +220,16 @@ def test_staged_documents_and_nonwaivable_sba_eligibility():
         by_key("revenue_based_financing")["owner_identification"]["blocks_stage"] == "underwriting"
     )
     assert "ez_bank_verification_payoffs" in by_key("ez_term")
+
+
+@pytest.mark.parametrize("key", sorted(CATALOG))
+def test_repository_backed_sources_point_at_files_in_the_repository(key):
+    # A `repo://` source is a transcription's evidence. It has to be a file
+    # somebody can open and compare the rules against, not a path that was
+    # true on one machine. Resolved from the repository root, not the cwd.
+    root = Path(__file__).resolve().parents[2]
+    for url in suggested_baseline(key)["source_urls"]:
+        if url.startswith("repo://"):
+            target = root / url.removeprefix("repo://")
+            assert target.is_file(), f"{key}: {url} is not a file in the repository"
+            assert target.suffix in {".pdf", ".txt", ".md"}

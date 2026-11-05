@@ -87,6 +87,7 @@ class ScrapedReport:
 
     # Convenience aliases for the gating layer
     fico_8: int | None = None
+    fico_4: int | None = None
     fico_2: int | None = None
     vantage_4: int | None = None
     best_score: int | None = None
@@ -94,6 +95,7 @@ class ScrapedReport:
 
     # Diagnostics
     raw_html_length: int = 0
+    additional_sections: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -216,6 +218,19 @@ def _parse_credit_scores(soup: BeautifulSoup) -> list[CreditScore]:
     if sec is None:
         return []
     scores: list[CreditScore] = []
+    # The current viewer uses score cards; older reports retain label/value rows.
+    cards = sec.select(".creditScoreCard")
+    if cards:
+        for card in cards:
+            model_node = card.select_one(".model")
+            score_node = card.select_one(".score")
+            if model_node is None:
+                continue
+            value = _normalize(score_node.get_text()) if score_node else ""
+            score = int(value) if value.isdigit() and 300 <= int(value) <= 850 else None
+            reasons = [_normalize(item.get_text()) for item in card.select(".reasonList li")]
+            scores.append(CreditScore(model=_normalize(model_node.get_text()), score=score, reason_codes=reasons))
+        return scores
     # Each score lives in its own ".div-row" block with two adjacent
     # label/value pairs (Score Model + Score) and an optional Reason Codes
     # block. Walk the div-row children in order.
@@ -366,50 +381,106 @@ def parse_report_html(html: str) -> ScrapedReport:
     except Exception:  # noqa: BLE001
         log.exception("collections parse failed")
 
-    # Score summary aliases
+    select_headline_score(report)
+    return report
+
+
+def select_headline_score(report: ScrapedReport) -> None:
+    """Choose a supported bureau model, not an identity-check proxy."""
     for s in report.scores:
-        m = s.model.upper().replace(" ", "_")
-        if m == "FICO_8" and report.fico_8 is None:
+        value = str(s.score).strip()
+        s.score = int(value) if value.isdigit() and 300 <= int(value) <= 850 else None
+        m = re.sub(r"[^A-Z0-9]", "", s.model.upper().replace("SCORE", ""))
+        if m == "FICO8" and report.fico_8 is None:
             report.fico_8 = s.score
-        elif m == "FICO_2" and report.fico_2 is None:
+        elif m == "FICO4" and report.fico_4 is None:
+            report.fico_4 = s.score
+        elif m == "FICO2" and report.fico_2 is None:
             report.fico_2 = s.score
-        elif m == "VANTAGE_4" and report.vantage_4 is None:
+        elif m == "VANTAGE4" and report.vantage_4 is None:
             report.vantage_4 = s.score
 
     if report.fico_8 is not None:
         report.best_score, report.best_score_model = report.fico_8, "fico_8"
+    elif report.fico_4 is not None:
+        report.best_score, report.best_score_model = report.fico_4, "fico_4"
     elif report.fico_2 is not None:
         report.best_score, report.best_score_model = report.fico_2, "fico_2"
     elif report.vantage_4 is not None:
         report.best_score, report.best_score_model = report.vantage_4, "vantage_4"
 
+
+
+def parse_full_feed(body: dict) -> ScrapedReport | None:
+    """Map the provider's Full Feed JSON to the same in-platform report."""
+    feed = body.get("full_feed")
+    if not isinstance(feed, dict) or not feed:
+        return None
+
+    def fields(node):
+        return {str(k): str(v) for k, v in node.items() if v is not None} if isinstance(node, dict) else {}
+
+    def records(node):
+        return [fields(item) for item in node if isinstance(item, dict)] if isinstance(node, list) else []
+
+    report = ScrapedReport(personal_info=fields(feed.get("personal_information")))
+    for model, node in (feed.get("credit_score") or {}).items():
+        if not isinstance(node, dict):
+            continue
+        value = str(node.get("score", "")).strip()
+        score = int(value) if value.isdigit() and 300 <= int(value) <= 850 else None
+        reasons = node.get("reason_codes") or node.get("no_score_reason") or []
+        report.scores.append(CreditScore(model=model, score=score, reason_codes=[str(r) for r in reasons]))
+    for key, cls, target in (("address_history", AddressRecord, report.addresses), ("employment_history", EmploymentRecord, report.employment)):
+        history = feed.get(key) or {}
+        if isinstance(history, dict):
+            for period, items in history.items():
+                target.extend(cls(period=period, fields=item) for item in records(items))
+    risk = feed.get("identity_risk") or {}
+    report.identity_risk = IdentityRisk(**{name: fields(risk.get(name)) for name in ("ofac", "mla", "fraud_shield")})
+    report.trade_accounts = [TradeAccount(fields=item) for item in records(feed.get("trade_accounts"))]
+    report.inquiries = [Inquiry(fields=item) for item in records(feed.get("inquiries"))]
+    report.collections = records(feed.get("collections"))
+    report.public_records = records(feed.get("public_record") or feed.get("public_records"))
+    mapped = {"credit_score", "personal_information", "address_history", "employment_history", "identity_risk", "trade_accounts", "inquiries", "collections", "public_record", "public_records"}
+    report.additional_sections = {key: value for key, value in feed.items() if key not in mapped and value}
+    report.additional_sections.update({key: value for key, value in risk.items() if key not in ("ofac", "mla", "fraud_shield") and value})
+    select_headline_score(report)
     return report
 
 
 async def fetch_and_parse(report_link: str) -> ScrapedReport | None:
-    """Fetch a report URL via the cached dashboard session and parse.
+    """Fetch a report URL via the cached dashboard session and parse."""
+    parsed, _html = await fetch_report(report_link)
+    return parsed
 
-    Returns None when the parser couldn't load the page at all (session
-    failure / network / non-200). A parsed report with empty fields is
-    still a valid result and gets returned — callers should check
-    `best_score is None` to detect a parser break, not the return value.
+
+async def fetch_report(report_link: str, *, raise_access_errors: bool = False) -> tuple[ScrapedReport | None, str | None]:
+    """Fetch a report URL via the cached dashboard session: (parsed, html).
+
+    Both are None when the page could not be loaded at all (session failure,
+    network, non-200). A parsed report with empty fields is still a valid
+    result — callers should check `best_score is None` to detect a parser
+    break, not the return value. The html is handed back so it can be kept.
     """
     if not report_link:
-        return None
+        return None, None
     try:
         session = get_session()
         resp = await session.fetch(report_link)
     except IsoftpullSessionError as exc:
+        if raise_access_errors:
+            raise
         log.warning("iSoftPull session unavailable while scraping report: %s", exc)
-        return None
+        return None, None
     except Exception as exc:  # noqa: BLE001
         log.warning("Network error while scraping iSoftPull report: %s", exc)
-        return None
+        return None, None
 
     if resp.status_code != 200:
         log.warning(
             "iSoftPull report fetch returned %d for %s", resp.status_code, report_link
         )
-        return None
+        return None, None
 
-    return parse_report_html(resp.text)
+    return parse_report_html(resp.text), resp.text

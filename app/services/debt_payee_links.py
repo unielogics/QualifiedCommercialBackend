@@ -7,6 +7,7 @@ not add a loan, change its payment, or create a financial document version.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -23,6 +24,18 @@ def _belongs_to_profile(row, profile) -> bool:
 
 
 async def _payees(db, profile):
+    if isinstance(getattr(db, "info", None), dict):
+        from app.services import application_programs, financial_cockpit
+
+        files, latest, _classes = await application_programs._evidence_inventory(db, profile)
+        accepted = await application_programs.accepted_evidence_file_ids(db, profile, files, latest)
+        analyses = financial_cockpit._analysis_rows(files, latest, accepted)
+        observed = financial_cockpit.recurring_payments(analyses).get("payees") or []
+        if observed:
+            return [SimpleNamespace(key=row["key"], sample_description=row["payee"], direction=-1,
+                                    category=row["kind"], monthly_average=row.get("monthly_average") or 0,
+                                    months=row.get("months_seen") or 0, count=row.get("occurrences") or 0)
+                    for row in observed]
     if not profile.dealer_id:
         return []
     dealer = await db.get(DealerBusiness, profile.dealer_id)
@@ -52,7 +65,7 @@ async def inventory(db, profile) -> dict:
         debts = accepted_debt_views(debts, active_debt_schedule_rows(accepted.body))
     payees = await _payees(db, profile)
     return {
-        "available": bool(profile.dealer_id),
+        "available": bool(getattr(profile, "primary_bucket_id", None) or profile.dealer_id or payees),
         "schedule_complete": accepted is not None,
         "obligations": [{"id": str(row.id), "lender": row.lender, "vendor_key": row.vendor_key,
                          "monthly_payment": str(row.monthly_payment) if row.monthly_payment is not None else None}
@@ -76,7 +89,7 @@ async def link_payee(db, profile, row_id: UUID, vendor_key: str | None, *, actor
     if accepted is None and (row.status != "active" or row.duplicate_of_id):
         raise HTTPException(409, "Restore the obligation before linking its bank payee")
     if vendor_key is not None:
-        if not profile.dealer_id or vendor_key not in {payee.key for payee in await _payees(db, profile)}:
+        if vendor_key not in {payee.key for payee in await _payees(db, profile)}:
             raise HTTPException(422, "Choose an outgoing payee observed in this file's bank statements")
     row.vendor_key = vendor_key
     row.evidence = {**(row.evidence if isinstance(row.evidence, dict) else {}), "payee_link": {

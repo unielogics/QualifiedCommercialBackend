@@ -55,6 +55,22 @@ async def job_lender_submission_delivery() -> None:
         await drain_delivery_queue()
 
 
+async def job_credit_link_sweep() -> None:
+    """Automatic mode only: attach unowned credit pulls to the owners carrying
+    their names and tell the desk what connected (services/credit_links.py)."""
+    from app.services.credit_links import run_scheduled_sweep
+
+    await run_scheduled_sweep()
+
+
+async def job_credit_report_imports() -> None:
+    from app.services.credit_report_import import run_pending_report_imports
+
+    result = await run_pending_report_imports()
+    if result["checked"]:
+        log.info("Existing credit report imports: %s", result)
+
+
 def start_scheduler() -> None:
     """Idempotent — safe to call from FastAPI startup hooks (which fire
     on every uvicorn reload in dev). `replace_existing=True` collapses
@@ -78,6 +94,29 @@ def start_scheduler() -> None:
         "interval",
         seconds=30,
         id="lender_submission_delivery",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # Credit pulls nobody linked yet: every half hour in automatic mode the
+    # sweep attaches them to the owners carrying their names.
+    scheduler.add_job(
+        _wrap(job_credit_link_sweep),
+        "interval",
+        minutes=30,
+        id="credit_link_sweep",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # Import already-linked reports regardless of manual/automatic matching mode.
+    scheduler.add_job(
+        _wrap(job_credit_report_imports),
+        "interval",
+        minutes=5,
+        id="credit_report_imports",
         replace_existing=True,
         coalesce=True,
         max_instances=1,
@@ -114,6 +153,19 @@ def start_scheduler() -> None:
         "interval",
         minutes=2,
         id="evaluate_pending_prequals",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # What the AI can fill in on its own: a NAICS suggestion for unclassified
+    # files, and the grounded document checks for requirements waiting on
+    # them. Bounded per tick; a person's classification or verification wins.
+    scheduler.add_job(
+        _wrap(job_profile_enrichment),
+        "interval",
+        minutes=2,
+        id="profile_enrichment",
         replace_existing=True,
         coalesce=True,
         max_instances=1,
@@ -522,6 +574,15 @@ async def job_admin_activity_digest() -> None:
     from app.services.admin_activity import run_admin_activity_digest  # local import to avoid circular
 
     await run_admin_activity_digest()
+
+
+async def job_profile_enrichment() -> None:
+    """Industry suggestions and pending document checks, a few files per tick."""
+    from app.db import SessionLocal
+    from app.services.profile_enrichment import enrich_profiles
+
+    async with SessionLocal() as db:
+        await enrich_profiles(db)
 
 
 async def job_evaluate_pending_prequals() -> None:

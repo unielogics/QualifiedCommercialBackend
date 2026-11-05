@@ -808,7 +808,7 @@ async def test_deleting_package_bucket_row_retains_immutable_artifact_bytes() ->
     )
     db = SimpleNamespace(
         execute=AsyncMock(
-            return_value=SimpleNamespace(scalar_one_or_none=lambda: file)
+            return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [file]))
         ),
         commit=AsyncMock(),
         flush=AsyncMock(),

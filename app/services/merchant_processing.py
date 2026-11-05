@@ -36,6 +36,7 @@ from app.models.bucket import BucketFile, BucketFileAnalysis
 from app.models.lender import Lender
 from app.models.merchant_processing_offer import MerchantProcessingOffer
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
+from app.services.local_time import local_stamp
 
 log = logging.getLogger(__name__)
 
@@ -557,7 +558,7 @@ def partner_email_bodies(
 
     terms = offer.terms or {}
     accepted = offer.client_response == STATUS_ACCEPTED
-    when = offer.client_response_at.strftime("%b %d, %Y %I:%M %p UTC") if offer.client_response_at else "-"
+    when = local_stamp(offer.client_response_at, fmt="%b %-d, %Y %-I:%M %p") if offer.client_response_at else "-"
     subject = f"Processing offer {'accepted' if accepted else 'declined'}: {business_name}"
     headline = (
         f"{business_name} accepted the processing offer you prepared."

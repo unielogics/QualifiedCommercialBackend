@@ -163,8 +163,11 @@ class ApplicationProfile(TimestampMixin, Base):
     plaid_assets_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true"
     )
+    # On for every file (0254): statement PDFs are the evidence a lender reads.
+    # Honoured only once the deployment's Plaid account has the product — see
+    # plaid_policy.from_owner.
     plaid_statements_enabled: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="false"
+        Boolean, nullable=False, default=True, server_default="true"
     )
     plaid_policy_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     plaid_policy_updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -180,6 +183,27 @@ class ApplicationProfile(TimestampMixin, Base):
     )
     use_of_funds_revision: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
+    )
+    #: Account keys (bank + last four, as financial_cockpit names them) the desk
+    #: chose to count toward the statement-months requirement and to read by
+    #: default in the cockpit. Empty means every account counts.
+    counted_bank_accounts: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    #: The financial plan (app/services/financial_plan.py): obligations the
+    #: new loan pays off, payees that are not operating spend, the new payment.
+    financial_plan: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    #: Requirements the desk added to this file from the library (app/services/
+    #: requirement_library.py): [{key, source_requirement_id, required_level, note,
+    #: added_by, added_at, custom}]. Materialized like evidence-policy requirements.
+    extra_requirements: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    #: Account keys the desk declared to be the same account: {key: canonical key}.
+    bank_account_aliases: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
     use_of_funds_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     use_of_funds_updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -230,6 +254,10 @@ class ApplicationProfile(TimestampMixin, Base):
     )
     underwriting_approved_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
     underwriting_accepted_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    #: When the acceptance was recorded, and which terms it answered:
+    #: {kind, id, version, amount, rate_pct, term_months, label}.
+    underwriting_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    accepted_terms_ref: Mapped[dict | None] = mapped_column(JSONB)
     underwriting_funded_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
     underwriting_term_sheet_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
     underwriting_current_dscr: Mapped[float | None] = mapped_column(Numeric(8, 4))
@@ -247,6 +275,12 @@ class ApplicationProfile(TimestampMixin, Base):
     forecast_fee_points: Mapped[Decimal | None] = mapped_column(Numeric(7, 4))
     forecast_consulting_fee: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
     estimated_close_date: Mapped[date | None] = mapped_column(Date)
+    #: Stipulations to close: [{id, text, source, status, note, updated_at,
+    #: updated_by}], listed once the client accepts; see
+    #: app/services/closing_stipulations.py.
+    closing_stipulations: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
     program_selection_mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default="auto", server_default="auto"
     )

@@ -13,8 +13,10 @@ financial form content, not a signed-document certificate.
 from __future__ import annotations
 
 import html
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
+
+from app.services import debt_types
 
 FORM_DISCLAIMER = (
     "This form is provided for underwriting processing convenience only. It does not "
@@ -548,6 +550,7 @@ _SCHEDULE_STYLE = """
 """
 
 _SCHEDULE_COLUMNS = (
+    "#",
     "Lender",
     "Type",
     "Original",
@@ -581,21 +584,64 @@ def _money_cell(value: Any) -> str:
         return html.escape(str(value))
 
 
-def _schedule_row_html(row: dict[str, Any]) -> str:
+def _date_cell(value: Any) -> str:
+    """A date the way a US lender reads one, mm/dd/yyyy. The form stores ISO;
+    anything else is shown as given rather than dropped."""
+    if isinstance(value, datetime):
+        value = value.date()
+    if isinstance(value, date):
+        return value.strftime("%m/%d/%Y")
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return "&mdash;"
+    try:
+        return date.fromisoformat(text[:10]).strftime("%m/%d/%Y")
+    except ValueError:
+        return html.escape(text)
+
+
+def _row_note_html(row: dict[str, Any]) -> str:
+    """The spanning line under an obligation: the advance question's answer
+    when the row is an advance, then any note. Nothing when there is neither."""
+    parts: list[str] = []
+    if debt_types.is_advance_type(row.get("debt_type")):
+        modified = row.get("mca_modified")
+        if modified is None:
+            answer = "not stated"
+        elif modified:
+            answer = "Yes"
+            detail = str(row.get("mca_modification_note") or "").strip()
+            if detail:
+                answer += f" &mdash; {html.escape(detail)}"
+        else:
+            answer = "No"
+        parts.append(f"Modified by the funder for lower sales or revenue: {answer}")
+    note = str(row.get("notes") or "").strip()
+    if note:
+        parts.append(f"Note: {html.escape(note)}")
+    if not parts:
+        return ""
+    return f"<tr class='note'><td colspan='{len(_SCHEDULE_COLUMNS)}'>{' &middot; '.join(parts)}</td></tr>"
+
+
+def _schedule_row_html(row: dict[str, Any], number: int | None = None) -> str:
     from app.services.debt_terms import normalize_terms
 
     row = normalize_terms(row)
     rate = row.get("rate")
     factor = row.get("factor_rate")
     cells = [
+        # "Debt #1" on the owner's list, and the number the completeness
+        # message names an obligation by.
+        f"<td class='num'>{number if number is not None else '&mdash;'}</td>",
         f"<td>{_cell(row.get('lender'))}</td>",
-        f"<td>{_cell(row.get('debt_type'))}</td>",
+        f"<td>{_cell(debt_types.debt_type_label(row.get('debt_type')))}</td>",
         f"<td class='num'>{_money_cell(row.get('original_amount'))}</td>",
         f"<td class='num'>{_money_cell(row.get('balance'))}</td>",
         f"<td class='num'>{(f'{float(rate):g}%' if rate not in (None, '') else '&mdash;')}</td>",
         f"<td class='num'>{_money_cell(row.get('monthly_payment'))}{' <small>calculated</small>' if row.get('monthly_payment_source') == 'native_terms' else ''}</td>",
-        f"<td>{_cell(row.get('originated_on'))}</td>",
-        f"<td>{_cell(row.get('maturity_on'))}</td>",
+        f"<td>{_date_cell(row.get('originated_on'))}</td>",
+        f"<td>{_date_cell(row.get('maturity_on'))}</td>",
         f"<td>{_cell((row.get('secured') or '').title() or None)}</td>",
         f"<td>{_cell((row.get('payment_status') or '').title() or None)}</td>",
         f"<td>{_cell(row.get('collateral'))}</td>",
@@ -603,17 +649,10 @@ def _schedule_row_html(row: dict[str, Any]) -> str:
         f"<td class='num'>{_money_cell(row.get('payment_amount'))}</td>",
         f"<td>{_cell((row.get('payment_frequency') or '').title() or None)}</td>",
     ]
-    out = f"<tr>{''.join(cells)}</tr>"
-    note = str(row.get("notes") or "").strip()
-    if note:
-        out += (
-            f"<tr class='note'><td colspan='{len(_SCHEDULE_COLUMNS)}'>"
-            f"Note: {html.escape(note)}</td></tr>"
-        )
-    return out
+    return f"<tr>{''.join(cells)}</tr>" + _row_note_html(row)
 
 
-def render_debt_schedule_pdf(
+def build_debt_schedule_html(
     *,
     business_name: str,
     total_balance: float | None,
@@ -621,28 +660,29 @@ def render_debt_schedule_pdf(
     debts: list[tuple[str, float, float]] | None = None,
     rows: list[dict[str, Any]] | None = None,
     no_debt: bool = False,
-) -> bytes:
-    """The schedule as a lender reads it.
+) -> str:
+    """The schedule as a lender reads it, as HTML; `render_debt_schedule_pdf`
+    prints it. Split out so the layout is testable where WeasyPrint is not
+    installed (the host venv), the way `build_pfs_413_html` is.
 
     Two shapes in, because two kinds of caller produce them. `rows` carries the
     full record — type, original amount, rate, both dates, secured, status,
-    collateral and any note — and is what the borrower's form and the desk's
-    editor both send. `debts` is the older three-tuple, still used where a
-    caller genuinely only holds lender, balance and payment; it renders the
-    narrow table rather than a full schedule of em dashes.
+    collateral, the advance question and any note — and is what the borrower's
+    form, the on-screen modal and the desk's editor all send. `debts` is the
+    older three-tuple, still used by the advance-terms form, which genuinely
+    only holds funder, payback and payment; it renders the narrow table rather
+    than eleven columns of em dashes.
     """
-    from weasyprint import HTML
-
     if rows is not None:
         header = "".join(f"<th>{column}</th>" for column in _SCHEDULE_COLUMNS)
-        body_rows = "".join(_schedule_row_html(row) for row in rows)
+        body_rows = "".join(_schedule_row_html(row, number) for number, row in enumerate(rows, start=1))
         totals = (
             "<tr class='totals'>"
-            "<td colspan='3'>Total</td>"
+            "<td colspan='4'>Total</td>"
             f"<td class='num'>{_statement_money(total_balance)}</td>"
             "<td></td>"
             f"<td class='num'>{_statement_money(total_monthly)}</td>"
-            f"<td colspan='{len(_SCHEDULE_COLUMNS) - 6}'></td>"
+            f"<td colspan='{len(_SCHEDULE_COLUMNS) - 7}'></td>"
             "</tr>"
         )
         count = len(rows)
@@ -680,7 +720,31 @@ def render_debt_schedule_pdf(
       </body>
     </html>
     """
-    pdf = HTML(string=body).write_pdf()
+    return body
+
+
+def render_debt_schedule_pdf(
+    *,
+    business_name: str,
+    total_balance: float | None,
+    total_monthly: float | None,
+    debts: list[tuple[str, float, float]] | None = None,
+    rows: list[dict[str, Any]] | None = None,
+    no_debt: bool = False,
+) -> bytes:
+    """`build_debt_schedule_html`, printed."""
+    from weasyprint import HTML
+
+    pdf = HTML(
+        string=build_debt_schedule_html(
+            business_name=business_name,
+            total_balance=total_balance,
+            total_monthly=total_monthly,
+            debts=debts,
+            rows=rows,
+            no_debt=no_debt,
+        )
+    ).write_pdf()
     if pdf is None:
         raise RuntimeError("weasyprint returned no PDF bytes")
     return pdf

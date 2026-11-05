@@ -270,6 +270,52 @@ def build_presentation_html(arrangement: dict[str, Any], computed: dict[str, Any
         out.append(f'<tr><th>Total</th><th class="n">{_money(total)}</th><th class="muted">{_e(("of a " + _money(adv["requested"]) + " request") if adv["requested"] else "")}{_e(remainder)}</th></tr>')
         out.append("</tbody></table>")
 
+    # 5a. The business after the plan: original, modification, impact. Printed
+    # only when the desk has a plan on the file; the figures are the cockpit's.
+    if arr.get("plan_modifications") or arr.get("plan_dscr_after") not in (None, ""):
+        out.append("<h2>5a. The business after the plan</h2>")
+        out.append(
+            '<p class="muted">Underwriting\'s plan for the file: what changes at funding and what it does to the figures. '
+            "The original column is the file as read; the plan column is an assumption until funding and is not a commitment.</p>"
+        )
+
+        def _x(value: Any) -> str:
+            number = pa._num(value) if value not in (None, "") else None
+            return f"{number:.2f}x" if number is not None else "—"
+
+        def _delta(before: Any, after: Any, render) -> str:
+            if before in (None, "") or after in (None, ""):
+                return "—"
+            change = pa._num(after) - pa._num(before)
+            sign = "+" if change > 0 else ("−" if change < 0 else "")
+            return f"{sign}{render(abs(change))}"
+
+        rows = [
+            ("Debt service coverage" + (f" ({_e(arr.get('plan_dscr_basis'))})" if arr.get("plan_dscr_basis") else ""), arr.get("plan_dscr_before"), arr.get("plan_dscr_after"), _x, lambda v: f"{v:.2f}x"),
+            ("Income available for debt service, a year", arr.get("plan_income_before"), arr.get("plan_income_after"), _money, _money),
+            ("Debt service, a month", arr.get("plan_debt_service_before"), arr.get("plan_debt_service_after"), _money, _money),
+            ("Net cash flow, a month", arr.get("plan_net_cash_before"), arr.get("plan_net_cash_after"), _money, _money),
+            ("Ending balance, last month", arr.get("plan_ending_before"), arr.get("plan_ending_after"), _money, _money),
+        ]
+        out.append("<table><thead><tr><th>Figure</th><th class=\"n\">Original</th><th class=\"n\">With the plan</th><th class=\"n\">Change</th></tr></thead><tbody>")
+        for label, before, after, render, render_delta in rows:
+            if before in (None, "") and after in (None, ""):
+                continue
+            out.append(
+                f'<tr><td>{label}</td><td class="n">{render(before) if before not in (None, "") else "—"}</td>'
+                f'<td class="n">{render(after) if after not in (None, "") else "—"}</td><td class="n">{_delta(before, after, render_delta)}</td></tr>'
+            )
+        out.append("</tbody></table>")
+        lines = [line.strip() for line in str(arr.get("plan_modifications") or "").splitlines() if line.strip()]
+        if lines:
+            out.append("<p><b>What changes.</b></p><ul>" + "".join(f"<li>{_e(line)}</li>" for line in lines) + "</ul>")
+        if arr.get("plan_loan"):
+            out.append(f'<p><b>New loan in the plan.</b> {_e(arr.get("plan_loan"))}.</p>')
+        if arr.get("plan_note"):
+            out.append(f'<p class="muted">{_e(arr.get("plan_note"))}</p>')
+        if arr.get("plan_as_of"):
+            out.append(f'<p class="muted">Figures as read from the file on {_e(arr.get("plan_as_of"))}.</p>')
+
     # 6. Policy buildout
     out.append("<h2>6. Policy buildout — does the product support program coverage?</h2>")
     for key in ("with", "without"):

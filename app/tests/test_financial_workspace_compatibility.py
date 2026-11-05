@@ -151,9 +151,9 @@ async def test_linking_payoff_rejects_another_profiles_document_before_mutation(
 async def test_version_originals_and_pdfs_cannot_be_removed_through_bucket_trash():
     from app.routers import buckets
     file = SimpleNamespace(id=uuid4(), deleted_at=None)
-    def result(row):
-        return SimpleNamespace(scalar_one_or_none=lambda: row)
-    db = SimpleNamespace(info={}, execute=AsyncMock(side_effect=[result(file), result(uuid4())]), commit=AsyncMock())
+    files = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [file]))
+    versions = SimpleNamespace(all=lambda: [(file.id, file.id)])
+    db = SimpleNamespace(info={}, execute=AsyncMock(side_effect=[files, versions]), commit=AsyncMock())
     with patch.object(buckets, "_load_bucket_or_404", AsyncMock()):
         with pytest.raises(HTTPException) as error:
             await buckets.delete_admin_file(uuid4(), file.id, SimpleNamespace(), SimpleNamespace(id=uuid4()), db)

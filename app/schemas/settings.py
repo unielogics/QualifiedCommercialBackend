@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
@@ -248,6 +248,27 @@ class LetterheadSettings(BaseModel):
     signature_s3_key: str | None = None
 
 
+# --- Section: email footer ----------------------------------------------
+
+
+class EmailFooterSettings(BaseModel):
+    """The sign-off appended to email sent from a file's communications tab.
+
+    One firm-wide template rather than a field per operator, with the sender
+    substituted in — the wording and the disclaimer are the firm's, the name on
+    the bottom is whoever pressed send. Placeholders, each dropped along with
+    its line when we do not hold the value:
+
+        {name} {title} {email} {phone}
+
+    Empty `text` disables it. Nothing is appended to automated mail, which
+    carries its own footers and its own unsubscribe obligations.
+    """
+
+    enabled: bool = True
+    text: str = ""
+
+
 # --- Aggregate ----------------------------------------------------------
 
 _DEFAULT_TRANSACTION_CHECKLISTS: dict[str, LoanTypeChecklist] = {
@@ -370,6 +391,17 @@ class ProspectOutreachAISettings(BaseModel):
         return cleaned
 
 
+class CreditLinkingSettings(BaseModel):
+    """Whether credit pulls attach to file owners on their own or only by hand.
+
+    `last_run` is the most recent sweep report (app/services/credit_links.py);
+    the dedicated /credit-links routes own this section.
+    """
+
+    mode: Literal["manual", "automatic"] = "manual"
+    last_run: dict[str, Any] | None = None
+
+
 class AppSettingsData(BaseModel):
     """Full settings blob. Each section has sensible defaults so a bare table
     row still produces usable values for the UI."""
@@ -389,6 +421,7 @@ class AppSettingsData(BaseModel):
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     simulator: SimulatorSettings = Field(default_factory=SimulatorSettings)
     letterhead: LetterheadSettings = Field(default_factory=LetterheadSettings)
+    email_footer: EmailFooterSettings = Field(default_factory=EmailFooterSettings)
     prequal_auto_approval: PrequalAutoApprovalSettings = Field(
         default_factory=PrequalAutoApprovalSettings
     )
@@ -403,6 +436,7 @@ class AppSettingsData(BaseModel):
         default_factory=MerchantProcessingSettings
     )
     file_updates: FileUpdatesSettings = Field(default_factory=FileUpdatesSettings)
+    credit_linking: CreditLinkingSettings = Field(default_factory=CreditLinkingSettings)
 
 
 class AppSettingsRead(BaseModel):
@@ -426,8 +460,10 @@ class AppSettingsUpdate(BaseModel):
     property_intelligence: PropertyIntelligenceSettings | None = None
     dscr_pricing: DscrPricingSettings | None = None
     admin_notifications: AdminNotificationSettings | None = None
+    email_footer: EmailFooterSettings | None = None
     merchant_processing: MerchantProcessingSettings | None = None
     file_updates: FileUpdatesSettings | None = None
+    credit_linking: CreditLinkingSettings | None = None
 
 
 # --- Signature image upload ---------------------------------------------

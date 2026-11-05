@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
+from app.capital_partners import router_admin as capital_admin_router
+from app.capital_partners import router_member as capital_member_router
+from app.capital_partners import router_public as capital_public_router
 from app.config import get_settings
-from app.db import SessionLocal
+from app.db import SessionLocal, transient_conflict_code
 from app.dealer_os import crm_router as dealer_os_crm_router
 from app.dealer_os import prospect_outreach_router as dealer_os_prospect_outreach_router
 from app.dealer_os import prospect_router as dealer_os_prospect_router
@@ -52,6 +57,7 @@ from app.routers import (
     communications_audit,
     contracts,
     credit,
+    credit_links,
     deal_chat,
     deal_secretary,
     dealer_ai_intake,
@@ -88,6 +94,7 @@ from app.routers import (
     payments,
     prequal,
     production_packages,
+    public_links,
     public_payments,
     rates,
     regional_managers,
@@ -140,8 +147,29 @@ app.add_middleware(
     allow_headers=["*"],
     # Let browser fetch() read the download filename the server sets (dealer-named
     # package.zip / intelligence.pdf); without this the header is hidden cross-origin.
-    expose_headers=["Content-Disposition"],
+    # Retry-After rides along so a browser client can pace its own retry.
+    expose_headers=["Content-Disposition", "Retry-After"],
 )
+
+
+@app.exception_handler(DBAPIError)
+async def database_conflict_handler(request: Request, exc: DBAPIError) -> JSONResponse:
+    """A deadlock or serialization failure the route could not retry away is
+    a busy database, not a broken one: say so with 503 and Retry-After. Every
+    other database error keeps the default path (logged traceback, 500)."""
+
+    code = transient_conflict_code(exc)
+    if code is None:
+        raise exc
+    log.warning(
+        "%s %s: transaction aborted (SQLSTATE %s) after retries; answering 503",
+        request.method, request.url.path, code,
+    )
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "The database was busy with a concurrent change. Please retry."},
+        headers={"Retry-After": "1"},
+    )
 
 # Added last, so it is the outermost layer and every request carries an id
 # before anything else runs. Until now there was no middleware here but CORS,
@@ -230,6 +258,9 @@ for r in [
     dealer_os_crm_router.router,
     dealer_os_prospect_router.router,
     dealer_os_prospect_outreach_router.router,
+    capital_public_router.router,
+    capital_member_router.router,
+    capital_admin_router.router,
     meta.router,
     funding_programs.public_router,
     business_capital.public_router,
@@ -268,6 +299,7 @@ for r in [
     messages.router,
     notifications.router,
     operator_files.router,
+    public_links.router,
     public_payments.router,
     payments.router,
     ai_tasks.router,
@@ -300,6 +332,7 @@ for r in [
     calendar.router,
     billing.router,
     credit.router,
+    credit_links.router,
     intake.router,
     rates.router,
     regional_managers.router,

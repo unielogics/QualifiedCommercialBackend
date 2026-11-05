@@ -17,6 +17,7 @@ NAVY = "#0B1D3A"
 TEAL = "#0f766e"
 TEAL_LT = "#21d3c7"
 RED = "#b91c1c"
+GOLD = "#b45309"
 INK = "#111827"
 SLATE = "#334155"
 MUTE = "#64748b"
@@ -258,15 +259,20 @@ _MONTH_LABELS = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Se
 
 
 def _period_key(period: Any) -> tuple[str, str] | None:
-    """('2026-01-01 to 2026-01-31') -> ('2026-01', 'Jan 2026'). Returns None if unparseable."""
-    text = str(period or "").strip()
-    m = re.search(r"(\d{4})[-/](\d{1,2})", text)
-    if not m:
+    """('2026-05-30 to 2026-06-30') -> ('2026-06', 'Jun 2026'). Returns None if unparseable.
+
+    The closing month, as everywhere else a statement period is read: taking
+    the first month filed a May-30-to-June-30 cycle under May, so six
+    consecutive statements deduped to five and the review kept asking for
+    the sixth.
+    """
+    from app.services.bucket_evidence import statement_period_month
+
+    key = statement_period_month(period)
+    if key is None:
         return None
-    year, month = m.group(1), int(m.group(2))
-    if not 1 <= month <= 12:
-        return None
-    return (f"{year}-{month:02d}", f"{_MONTH_LABELS[month]} {year}")
+    year, month = key.split("-")
+    return (key, f"{_MONTH_LABELS[int(month)]} {year}")
 
 
 def _month_record(source: dict[str, Any]) -> dict[str, Any] | None:
@@ -925,6 +931,164 @@ def _dual_axis_chart_svg(
     return "".join(parts), width
 
 
+def _schedule_chart_svg(
+    rows: list[dict[str, Any]], *, title: str, width: int = 660, height: int = 230
+) -> tuple[str, int]:
+    """The payment schedule as a picture: one stacked column per period
+    (principal in navy, interest in teal) on the left axis, and the principal
+    still out as a share of the loan (the investor's exposure) as a red line
+    on the right axis, 100% down to zero. Returns (svg, logical_width)."""
+    pad_l, pad_r, pad_t, pad_b = 64, 52, 64, 34
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+    x0, x1, y0, y1 = pad_l, width - pad_r, pad_t, height - pad_b
+    n = max(1, len(rows))
+    payments = [float(r.get("payment") or 0.0) for r in rows]
+    vmax = (max(payments) if payments else 1.0) * 1.15 or 1.0
+    STEPS = 4
+    slot = plot_w / n
+    bar_w = max(1.5, min(14.0, slot * 0.68))
+
+    def px(i: int) -> float:
+        return x0 + slot * (i + 0.5)
+
+    def py(v: float) -> float:
+        return y1 - (v / vmax) * plot_h
+
+    def py_pct(v: float) -> float:
+        return y1 - (v / 100.0) * plot_h
+
+    parts: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff" stroke="{LINE}" stroke-width="1" rx="8"/>',
+        f'<text x="16" y="24" font-family="Arial" font-size="13" font-weight="700" fill="{INK}">{escape(title)}</text>',
+    ]
+    for g in range(STEPS + 1):
+        frac = g / STEPS
+        gy = y1 - frac * plot_h
+        parts.append(f'<line x1="{x0}" y1="{gy:.1f}" x2="{x1}" y2="{gy:.1f}" stroke="#eef1f6" stroke-width="1"/>')
+        parts.append(
+            f'<text x="{x0 - 8}" y="{gy + 3:.1f}" font-family="Arial" font-size="8" fill="{NAVY}" text-anchor="end">{escape(_fmt_compact(vmax * frac))}</text>'
+        )
+        parts.append(
+            f'<text x="{x1 + 8}" y="{gy + 3:.1f}" font-family="Arial" font-size="8" fill="{RED}" text-anchor="start">{int(round(100 * frac))}%</text>'
+        )
+    parts.append(f'<line x1="{x0}" y1="{y0}" x2="{x0}" y2="{y1}" stroke="{NAVY}" stroke-width="1.5"/>')
+    parts.append(f'<line x1="{x1}" y1="{y0}" x2="{x1}" y2="{y1}" stroke="{RED}" stroke-width="1.5"/>')
+    every = 1 if n <= 24 else (3 if n <= 60 else 12)
+    for i, r in enumerate(rows):
+        period = int(r.get("period") or i + 1)
+        if period == 1 or period % every == 0:
+            parts.append(
+                f'<text x="{px(i):.1f}" y="{y1 + 15:.1f}" font-family="Arial" font-size="8.5" fill="{MUTE}" text-anchor="middle">{period}</text>'
+            )
+        principal = float(r.get("principal") or 0.0)
+        interest = float(r.get("interest") or 0.0)
+        io = r.get("phase") == "interest_only"
+        left = px(i) - bar_w / 2
+        if principal > 0:
+            parts.append(
+                f'<rect x="{left:.1f}" y="{py(principal):.1f}" width="{bar_w:.1f}" height="{y1 - py(principal):.1f}" fill="{NAVY}"/>'
+            )
+        if interest > 0:
+            top = py(principal + interest)
+            parts.append(
+                f'<rect x="{left:.1f}" y="{top:.1f}" width="{bar_w:.1f}" height="{py(principal) - top:.1f}" fill="{TEAL}" opacity="{0.55 if io else 1}"/>'
+            )
+    exposure = [f"{px(i):.1f},{py_pct(float(r.get('exposure_pct') or 0.0)):.1f}" for i, r in enumerate(rows)]
+    if exposure:
+        exposure.insert(0, f"{x0:.1f},{py_pct(100.0):.1f}")
+        parts.append(f'<polyline points="{" ".join(exposure)}" fill="none" stroke="{RED}" stroke-width="2.2"/>')
+    # Counting the interest received as well: the capital still at risk,
+    # which reaches zero at the break-even payment, earlier than the principal.
+    at_risk = [f"{px(i):.1f},{py_pct(float(r.get('cash_at_risk_pct') or 0.0)):.1f}" for i, r in enumerate(rows) if r.get("cash_at_risk_pct") is not None]
+    if at_risk:
+        at_risk.insert(0, f"{x0:.1f},{py_pct(100.0):.1f}")
+        parts.append(f'<polyline points="{" ".join(at_risk)}" fill="none" stroke="{GOLD}" stroke-width="2" stroke-dasharray="5 3"/>')
+    # The legend on its own row under the title, so a long title never runs into it.
+    legend = [("Principal", NAVY), ("Interest", TEAL), ("Principal still out, % of the loan", RED), ("Capital at risk, counting interest received", GOLD)]
+    lx = 16.0
+    for label, color in legend:
+        parts.append(f'<rect x="{lx:.1f}" y="34" width="16" height="10" rx="2" fill="{color}"/>')
+        parts.append(f'<text x="{lx + 21:.1f}" y="43" font-family="Arial" font-size="9.5" fill="{SLATE}">{escape(label)}</text>')
+        lx += 22 + len(label) * 5.6 + 16
+    parts.append("</svg>")
+    return "".join(parts), width
+
+
+def _schedule_block(terms: dict[str, Any], *, compact: bool) -> str:
+    """The schedule as a picture, the principal at risk in words and figures,
+    and (in the full packet) the schedule by year. Nothing when the terms
+    carry no schedule."""
+    rows = [r for r in terms.get("schedule_rows") or [] if isinstance(r, dict)]
+    summary = _record(terms.get("schedule"))
+    if not rows or not summary:
+        return ""
+    amount = _num(summary.get("amount"))
+    rate = _num(summary.get("rate_pct"))
+    title = f"Payment schedule: {_fmt_full(amount) if amount is not None else ''}{f' at {rate:g}%' if rate is not None else ''} {terms.get('describe') or ''}".strip()
+    svg, w = _schedule_chart_svg(rows, title=title, height=190 if compact else 230)
+    uri = _svg_to_png_fit(svg, w, 650)
+    chart = f'<div class="charts"><img src="{uri}" width="650"/></div>' if uri else ""
+    risk = _record(terms.get("risk"))
+    milestones = _record(risk.get("recovery_milestones") or summary.get("recovery_milestones"))
+    facts: list[str] = []
+    wal = _num(risk.get("weighted_average_life_months") or summary.get("weighted_average_life_months"))
+    if wal is not None:
+        facts.append(f"<li><strong>Weighted average life</strong> {wal:g} months</li>")
+    half = _num(milestones.get("50"))
+    full = _num(milestones.get("100"))
+    if half is not None or full is not None:
+        facts.append(
+            "<li><strong>Principal back</strong> "
+            + ", ".join(p for p in (f"half by month {int(half)}" if half is not None else "", f"all by month {int(full)}" if full is not None else "") if p)
+            + "</li>"
+        )
+    exposed = _num(risk.get("full_exposure_months") or summary.get("full_exposure_months"))
+    if exposed:
+        facts.append(f"<li><strong>Fully exposed</strong> {int(exposed)} months before principal starts</li>")
+    breakeven = _num(risk.get("breakeven_month") or summary.get("breakeven_month"))
+    if breakeven:
+        facts.append(f"<li><strong>Capital back, counting interest</strong> month {int(breakeven)}: nothing at risk after that</li>")
+    balloon = _num(summary.get("balloon"))
+    if balloon:
+        facts.append(f"<li><strong>Due at maturity</strong> {_fmt_full(balloon)} ({_num(summary.get('balloon_pct')) or 0:g}% of the loan)</li>")
+    lowest = _num(risk.get("lowest_coverage"))
+    if lowest is not None:
+        io_cov = _num(risk.get("coverage_during_interest_only"))
+        after_cov = _num(risk.get("coverage_after_interest_only"))
+        detail = (
+            f" ({io_cov:.2f}x during the interest-only months, {after_cov:.2f}x once principal starts)"
+            if io_cov is not None and after_cov is not None and io_cov != after_cov
+            else ""
+        )
+        facts.append(f"<li><strong>Lowest coverage on a payment</strong> {lowest:.2f}x{detail}</li>")
+    facts_html = f'<ul class="facts">{"".join(facts)}</ul>' if facts else ""
+    words = f'<p>{escape(str(risk.get("words")))}</p>' if risk.get("words") else ""
+    note = f'<p class="note">{escape(str(terms.get("payment_note")))}</p>' if terms.get("payment_note") else ""
+    by_year = ""
+    if not compact and len(rows) > 1:
+        ppy = int(round(_num(summary.get("periods_per_year")) or 12))
+        years = []
+        for start in range(0, len(rows), ppy):
+            chunk = rows[start : start + ppy]
+            last = chunk[-1]
+            years.append(
+                f"<tr><td class=\"rowhead\">Year {start // ppy + 1}</td>"
+                f'<td class="num">{_fmt_full(sum(float(r.get("payment") or 0) for r in chunk))}</td>'
+                f'<td class="num">{_fmt_full(sum(float(r.get("interest") or 0) for r in chunk))}</td>'
+                f'<td class="num">{_fmt_full(sum(float(r.get("principal") or 0) for r in chunk))}</td>'
+                f'<td class="num">{_fmt_full(_num(last.get("balance")))}</td>'
+                f'<td class="num">{_num(last.get("exposure_pct")) or 0:g}%</td></tr>'
+            )
+        by_year = (
+            '<table class="grid-table"><thead><tr><th>Schedule by year</th><th class="num">Paid</th><th class="num">Interest</th>'
+            '<th class="num">Principal</th><th class="num">Balance at year end</th><th class="num">Still out</th></tr></thead>'
+            f"<tbody>{''.join(years)}</tbody></table>"
+        )
+    return f'<h3>Principal at risk</h3>{chart}{words}{facts_html}{note}{by_year}'
+
+
 def _svg_to_png_datauri(svg: str, scale: float = 2.0) -> str | None:
     """Rasterize an SVG string to a base64 PNG data-URI via PyMuPDF (no native deps)."""
     try:
@@ -1428,6 +1592,98 @@ def _program_fit_section(program_fit: dict[str, Any] | None) -> str:
     )
 
 
+def _plan_section(financials: dict[str, Any], *, compact: bool = False) -> str:
+    """Proposed terms and the desk's plan: what changes at funding and what
+    it does to coverage, as original, with the plan, and the difference.
+    Nothing when the file carries neither terms nor a plan."""
+    plan = _record(financials.get("plan"))
+    terms = _record(financials.get("proposed_terms"))
+    active = bool(plan.get("active"))
+    if not active and not terms:
+        return ""
+    impact = _record(plan.get("impact"))
+
+    def pair(name: str) -> dict[str, Any]:
+        return _record(impact.get(name))
+
+    def x(value: Any) -> str:
+        number = _num(value)
+        return f"{number:.2f}x" if number is not None else "—"
+
+    def delta(p: dict[str, Any], render) -> str:
+        change = _num(p.get("change"))
+        if change is None:
+            return "—"
+        sign = "+" if change > 0 else ("−" if change < 0 else "")
+        return f"{sign}{render(abs(change))}"
+
+    terms_line = ""
+    if terms:
+        amount = _num(terms.get("amount"))
+        rate = _num(terms.get("rate_pct"))
+        payment = _num(terms.get("monthly_payment"))
+        structure = terms.get("describe") or (
+            "interest-only" if terms.get("interest_only") else (f"over {int(terms['term_months'])} months" if _num(terms.get("term_months")) else "")
+        )
+        source = "recorded term sheet" if terms.get("source") == "term_sheet" else "the desk's plan"
+        io_payment = _num(terms.get("payment_io_monthly"))
+        after_payment = _num(terms.get("payment_after_monthly"))
+        if io_payment is not None and after_payment is not None:
+            payment = None  # the step-up says it better than one figure
+        terms_line = (
+            f"<p><strong>Proposed terms ({escape(source)}).</strong> "
+            + escape(
+                " ".join(
+                    part
+                    for part in (
+                        _fmt_full(amount) if amount is not None else "",
+                        f"at {rate:g}%" if rate is not None else "",
+                        structure,
+                        f"— {_fmt_full(payment)} a month" if payment is not None else "",
+                        f"— {_fmt_full(io_payment)} a month for {int(terms.get('interest_only_months') or 0)} months, then {_fmt_full(after_payment)}"
+                        if io_payment is not None and after_payment is not None
+                        else "",
+                        "of interest, principal at maturity" if terms.get("interest_only") and payment is not None else "",
+                    )
+                    if part
+                )
+            )
+            + "</p>"
+        )
+    rows: list[tuple[str, dict[str, Any], Any]] = [
+        ("Debt service coverage" + (f" · {escape(str(pair('dscr').get('basis') or '').replace('_', ' '))}" if pair("dscr").get("basis") else ""), pair("dscr"), x),
+        ("Income available for debt service, a year", pair("income_annual"), lambda v: _fmt_full(_num(v))),
+        ("Debt service, a month", pair("debt_service_monthly"), lambda v: _fmt_full(_num(v))),
+        ("Net cash flow, a month", pair("net_cash_flow_monthly"), lambda v: _fmt_full(_num(v))),
+        ("Ending balance, last month", pair("ending_balance"), lambda v: _fmt_full(_num(v))),
+    ]
+    if compact:
+        rows = rows[:3]
+    table = ""
+    body = [
+        f'<tr><td class="rowhead">{label}</td><td class="num">{render(p.get("before")) if p.get("before") is not None else "—"}</td>'
+        f'<td class="num">{render(p.get("after")) if p.get("after") is not None else "—"}</td><td class="num">{delta(p, lambda n, r=render: r(n))}</td></tr>'
+        for label, p, render in rows
+        if p.get("before") is not None or p.get("after") is not None
+    ]
+    if active and body:
+        table = (
+            '<table class="grid-table"><thead><tr><th>Figure</th><th class="num">Original</th><th class="num">With the plan</th><th class="num">Change</th></tr></thead>'
+            "<tbody>" + "".join(body) + "</tbody></table>"
+        )
+    mods = [m for m in plan.get("modifications") or [] if isinstance(m, dict) and m.get("label")]
+    mods_html = ""
+    if active and mods and not compact:
+        mods_html = "<ul>" + "".join(
+            f"<li>{escape(str(m.get('label')))}{(' — ' + escape(str(m.get('detail')))) if m.get('detail') else ''}</li>" for m in mods[:10]
+        ) + "</ul>"
+    note = f'<p class="note">{escape(str(plan.get("note")))}</p>' if active and plan.get("note") and not compact else ""
+    caveat = '<p class="note">The plan is underwriting\'s assumption until funding; the original column is the file as read.</p>' if active else ""
+    title = "Proposed terms and the desk's plan" if active else "Proposed terms"
+    schedule_html = _schedule_block(terms, compact=compact) if terms else ""
+    return f'<section class="card{" wide" if schedule_html else ""}"><h2>{title}</h2>{terms_line}{mods_html}{table}{note}{caveat}{schedule_html}</section>'
+
+
 def _metric_table(metric_rows: list[dict[str, Any]]) -> str:
     body = "".join(
         "<tr>"
@@ -1698,7 +1954,7 @@ def render_executive_summary_pdf(
     .grid-table td.rowhead {{ font-weight:700; color:{NAVY}; background:{ZEBRA}; }}
     .grid-table tbody tr:nth-child(even) td {{ background:{ZEBRA}; }}
     .charts {{ width:100%; margin-bottom:5px; text-align:center; }}
-    .note {{ color:{MUTE}; font-size:8.5px; margin-top:5px; }}
+    .facts {{ margin: 6px 0 4px 18px; padding: 0; font-size: 10.5px; color: #334155; }} .facts li {{ margin: 2px 0; }} .note {{ color:{MUTE}; font-size:8.5px; margin-top:5px; }}
     .empty {{ color:{MUTE}; font-style:italic; }}
     .footer {{ color:{MUTE}; font-size:8px; margin-top:7px; border-top:1px solid {LINE}; padding-top:5px; }}
   </style>
@@ -1726,6 +1982,7 @@ def render_executive_summary_pdf(
     <td><section class="card summary-card"><h2>Recommended structure</h2><p>{escape(approach)}</p></section></td>
   </tr></table>
   {metric_tiles}
+  {_plan_section(financials, compact=True)}
   <div class="next"><strong>Next desk action</strong>&nbsp;{escape(next_action)}</div>
   <table class="cols"><tr><td>{strengths_html}</td><td>{risks_html}</td></tr></table>
   {mitigants_html}
@@ -1957,7 +2214,7 @@ def render_underwriting_packet_pdf(
     .grid-table td.rowhead {{ font-weight:700; color:{NAVY}; text-align:left; background:#ffffff; }}
     .grid-table tbody tr:nth-child(even) td {{ background:#ffffff; }}
     .charts {{ width:100%; margin-bottom:5px; text-align:center; }}
-    .note {{ color:{MUTE}; font-size:8.5px; font-style:italic; margin-top:5px; }}
+    .facts {{ margin: 6px 0 4px 18px; padding: 0; font-size: 10.5px; color: #334155; }} .facts li {{ margin: 2px 0; }} .note {{ color:{MUTE}; font-size:8.5px; font-style:italic; margin-top:5px; }}
     .empty {{ color:{MUTE}; font-style:italic; }}
     .green {{ border-left:4px solid {TEAL}; }} .amber {{ border-left:4px solid #d97706; }}
     .disclaimer {{ background:#fff7ed; border-color:#fed7aa; color:#7c2d12; }}
@@ -2005,6 +2262,7 @@ def render_underwriting_packet_pdf(
     <td>{_credit_section(credit)}</td>
   </tr></table>
   {_program_readiness_section(financials) if selected_programs else _program_fit_section(loan_program_fit)}
+  {_plan_section(financials)}
 
   <table class="cols"><tr>
     <td>{_bullet_card("Strengths", strengths, "green")}</td>

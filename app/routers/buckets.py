@@ -33,7 +33,9 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, with_loader_criteria
 from sqlalchemy.orm.attributes import set_committed_value
+from starlette.concurrency import run_in_threadpool
 
+import app.services.spreadsheets as spreadsheets
 from app.config import get_settings
 from app.db import get_db
 from app.dealer_os.models import DealerBusiness
@@ -69,6 +71,7 @@ from app.schemas.bucket import (
     BucketActivityRead,
     BucketAIActionItemCreate,
     BucketAIActionItemPatch,
+    BucketAIActionItemQueueRead,
     BucketAIActionItemRead,
     BucketAIChatMessageCreate,
     BucketAIChatResponse,
@@ -82,7 +85,11 @@ from app.schemas.bucket import (
     BucketFileAnnotationCreate,
     BucketFileAnnotationRead,
     BucketFileRead,
+    BucketFileRemovalBlocked,
     BucketFileReviewRead,
+    BucketFileSelection,
+    BucketFileSheetsRead,
+    BucketFilesRemoveResult,
     BucketFileUploadInit,
     BucketFileUploadInitResponse,
     BucketFileUrl,
@@ -100,6 +107,8 @@ from app.schemas.bucket import (
     BucketRequestedDocumentCreate,
     BucketRequestedDocumentRead,
     BucketRequestInfoRead,
+    BucketRequestPasscodeChange,
+    BucketRequestPasscodeChanged,
     BucketRequestUploadedFileRead,
     BucketShareAccessRead,
     BucketShareAccessRequest,
@@ -133,6 +142,8 @@ from app.schemas.retention import LegalHoldChange, RetentionStatusRead
 from app.services import application_profiles as profiles
 from app.services import (
     bucket_archive,
+    bucket_file_archive,
+    bucket_requests,
     bucket_storage_integrity,
     capital_readiness,
     file_events,
@@ -154,6 +165,7 @@ from app.services.bucket_ai import (
     vendor_visible_summary,
     visible_action_items,
 )
+from app.services.bucket_requests import is_open_request
 from app.services.intake_chat_actions import (
     actions_for_messages,
     author_actions_for_message,
@@ -738,6 +750,69 @@ def _review_response(file: BucketFile, annotations: list[BucketFileAnnotation], 
     )
 
 
+# Spreadsheets larger than this are not parsed for preview; the file stays
+# downloadable and the AI path has its own bound.
+MAX_SHEET_PREVIEW_BYTES = 10 * 1024 * 1024
+
+
+def _sheet_preview_payload(file: BucketFile) -> dict | None:
+    """Rows of a spreadsheet for the review screen, or None for other files.
+
+    Synchronous on purpose (boto3 + openpyxl/xlrd); callers run it in a
+    thread. Reads the stored object, never the browser-declared type: .xlsx
+    is often stored as application/octet-stream.
+    """
+
+    if not spreadsheets.is_spreadsheet_name(file.file_name, file.content_type):
+        return None
+    if file.size_bytes and file.size_bytes > MAX_SHEET_PREVIEW_BYTES:
+        return {
+            "error_code": "too_large",
+            "error_message": "This spreadsheet is too large to preview here. Download it to open it.",
+        }
+    bucket, _, _ = _bucket_storage_config()
+    params: dict[str, str] = {"Bucket": bucket, "Key": file.s3_key}
+    version_id = getattr(file, "s3_version_id", None)
+    if version_id:
+        params["VersionId"] = version_id
+    try:
+        raw = _s3_client().get_object(**params)["Body"].read(MAX_SHEET_PREVIEW_BYTES + 1)
+    except Exception as exc:  # noqa: BLE001 - storage trouble is reported, not raised
+        logger.warning("sheet preview: could not read file=%s: %s", file.id, exc)
+        return {"error_code": "unavailable", "error_message": "The file could not be read from storage right now."}
+    if len(raw) > MAX_SHEET_PREVIEW_BYTES:
+        return {
+            "error_code": "too_large",
+            "error_message": "This spreadsheet is too large to preview here. Download it to open it.",
+        }
+    try:
+        workbook = spreadsheets.read_workbook(
+            raw,
+            limits=spreadsheets.PREVIEW_LIMITS,
+            declared_content_type=file.content_type or "",
+            file_name=file.file_name,
+        )
+    except spreadsheets.SpreadsheetError as exc:
+        return {"error_code": exc.code, "error_message": exc.message}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sheet preview: parse failed file=%s: %s", file.id, exc)
+        return {"error_code": "parse_failed", "error_message": "The spreadsheet could not be parsed."}
+    return spreadsheets.preview_payload(workbook)
+
+
+async def _review_with_sheets(
+    file: BucketFile, annotations: list[BucketFileAnnotation], *, preview: bool = True
+) -> BucketFileReviewRead:
+    """The review response, plus parsed sheets when the file is a spreadsheet."""
+
+    response = _review_response(file, annotations, preview=preview)
+    if preview:
+        payload = await run_in_threadpool(_sheet_preview_payload, file)
+        if payload is not None:
+            response.sheets = BucketFileSheetsRead.model_validate(payload)
+    return response
+
+
 def _share_read(share: BucketShare, *, passcode: str | None = None) -> BucketShareRead:
     data = BucketShareRead.model_validate(share)
     data.files = [file for file in data.files if file.status == "uploaded" and file.deleted_at is None]
@@ -995,7 +1070,7 @@ async def _attach_bucket_file_links(db: AsyncSession, buckets: list[Bucket]) -> 
             intake.bucket_id,
             BucketLinkedFileRead(
                 id=intake.id,
-                kind="AI intake",
+                kind="File",
                 label=intake.business_name or intake.full_name,
                 reference=str(intake.id)[:8],
                 email=intake.email,
@@ -1159,9 +1234,29 @@ async def list_buckets(
     buckets = (
         await db.execute(stmt.order_by(Bucket.updated_at.desc()))
     ).scalars().all()
+    # One grouped query for every listed bucket's checklist state, so the
+    # table can show "6 open" without a per-row round trip.
+    request_counts: dict[tuple[UUID, str], int] = {}
+    if buckets:
+        request_counts = {
+            (bucket_id, doc_status): int(count)
+            for bucket_id, doc_status, count in (
+                await db.execute(
+                    select(
+                        BucketRequestedDocument.bucket_id,
+                        BucketRequestedDocument.status,
+                        func.count(BucketRequestedDocument.id),
+                    )
+                    .where(BucketRequestedDocument.bucket_id.in_([bucket.id for bucket in buckets]))
+                    .group_by(BucketRequestedDocument.bucket_id, BucketRequestedDocument.status)
+                )
+            ).all()
+        }
     for bucket in buckets:
         bucket.file_count = len(bucket.files)
         bucket.uploaded_file_count = len([file for file in bucket.files if file.status == "uploaded"])
+        bucket.open_request_count = request_counts.get((bucket.id, "requested"), 0)
+        bucket.closed_request_count = request_counts.get((bucket.id, "closed"), 0)
         bucket.file_names = [
             file.file_name
             for file in bucket.files
@@ -1255,6 +1350,64 @@ async def invite_bucket_vendor(
     await db.commit()
     await db.refresh(vendor)
     return vendor
+
+
+@router.get("/admin/ai-action-items", response_model=list[BucketAIActionItemQueueRead])
+async def list_ai_action_items_across_buckets(
+    item_status: Literal["proposed", "approved", "rejected", "completed"] = Query(
+        default="proposed", alias="status"
+    ),
+    limit: int = Query(default=200, ge=1, le=500),
+    _: User = Depends(require_role(Role.SUPER_ADMIN, Role.LOAN_EXEC)),
+    db: AsyncSession = Depends(get_db),
+) -> list[BucketAIActionItemQueueRead]:
+    """Every AI suggestion across live buckets, oldest first: the desk's inbox.
+
+    Registered ahead of the ``/admin/{bucket_id}`` routes on purpose; the UUID
+    path parameter would otherwise claim this static path.
+    """
+
+    rows = (
+        await db.execute(
+            select(BucketAIActionItem, Bucket.name, Bucket.client_name)
+            .join(Bucket, Bucket.id == BucketAIActionItem.bucket_id)
+            .where(BucketAIActionItem.status == item_status, Bucket.archived_at.is_(None))
+            .order_by(BucketAIActionItem.created_at.asc())
+            .limit(limit)
+        )
+    ).all()
+    bucket_ids = {item.bucket_id for item, _name, _client in rows}
+    intake_by_bucket: dict[UUID, UUID] = {}
+    if bucket_ids:
+        intake_by_bucket = {
+            bucket_id: intake_id
+            for bucket_id, intake_id in (
+                await db.execute(
+                    select(PublicUnderwritingIntake.bucket_id, PublicUnderwritingIntake.id).where(
+                        PublicUnderwritingIntake.bucket_id.in_(bucket_ids)
+                    )
+                )
+            ).all()
+        }
+    out: list[BucketAIActionItemQueueRead] = []
+    for item, bucket_name, client_name in rows:
+        intake_id = intake_by_bucket.get(item.bucket_id)
+        href = (
+            f"/admin/ai-underwriter-leads?lead={intake_id}"
+            if intake_id is not None
+            else f"/admin/buckets?bucket={item.bucket_id}"
+        )
+        out.append(
+            BucketAIActionItemQueueRead(
+                **BucketAIActionItemRead.model_validate(item).model_dump(),
+                bucket_name=bucket_name,
+                client_name=client_name,
+                intake_id=intake_id,
+                href=href,
+                approvable_here=item.route == "admin",
+            )
+        )
+    return out
 
 
 @router.get("/admin/{bucket_id}", response_model=BucketDetail)
@@ -1403,9 +1556,12 @@ async def queue_ai_review(
     db: AsyncSession = Depends(get_db),
 ) -> BucketAIReview:
     bucket = await _load_bucket_or_404(db, bucket_id)
+    from app.services import mca_refinance_policy
+    await mca_refinance_policy.require_automatic(db, bucket)
     context_patch = payload.context.model_dump(exclude_none=True) if payload.context else {}
     if context_patch:
         bucket.ai_context = {**(bucket.ai_context or {}), **context_patch}
+    await mca_refinance_policy.require_automatic(db, bucket)
     active_files = [
         file
         for file in bucket.files
@@ -1656,11 +1812,22 @@ async def delete_bucket(
     # and retained artifacts remain available through the Payments,
     # Agreements, and archived-file views.
     archived_at = _now()
+    # Archiving closes what the client was still being asked for. The reason
+    # names the archive, so a restore reopens exactly this set and nothing else.
+    requested_docs = (
+        await db.execute(
+            select(BucketRequestedDocument).where(BucketRequestedDocument.bucket_id == bucket.id)
+        )
+    ).scalars().all()
+    closed_request_count = bucket_requests.close_open_requests(
+        list(requested_docs), reason=bucket_requests.ARCHIVE_REASON, at=archived_at
+    )
     context = dict(bucket.ai_context or {})
     context["_archive"] = {
         "prior_status": bucket.status,
         "archived_at": archived_at.isoformat(),
         "archived_by_user_id": str(user.id),
+        "closed_request_count": closed_request_count,
     }
     bucket.ai_context = context
     bucket.archived_at = archived_at
@@ -1726,6 +1893,16 @@ async def restore_bucket(
         and prior_status
         and prior_status != "archived"
         else "collecting_documents"
+    )
+    # Only the asks the archive closed come back; anything closed for another
+    # reason stays closed.
+    requested_docs = (
+        await db.execute(
+            select(BucketRequestedDocument).where(BucketRequestedDocument.bucket_id == bucket.id)
+        )
+    ).scalars().all()
+    bucket_requests.reopen_requests_closed_for(
+        list(requested_docs), reason=bucket_requests.ARCHIVE_REASON
     )
     await _log(
         db,
@@ -2770,48 +2947,50 @@ async def admin_upload_complete(
     return file
 
 
-@router.delete("/admin/{bucket_id}/files/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_admin_file(
-    bucket_id: UUID,
-    file_id: UUID,
-    request: Request,
-    user: User = Depends(require_role(Role.SUPER_ADMIN)),
-    db: AsyncSession = Depends(get_db),
-) -> None:
-    await _load_bucket_or_404(db, bucket_id)
-    file = (
-        await db.execute(
-            select(BucketFile)
-            .where(
-                BucketFile.id == file_id,
-                BucketFile.bucket_id == bucket_id,
-            )
-            .options(
-                selectinload(BucketFile.shares),
-                selectinload(BucketFile.public_shares),
-                selectinload(BucketFile.vendor_access),
-            )
-        )
-    ).scalar_one_or_none()
-    if file is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
-    if file.deleted_at is not None:
-        return
-    if isinstance(getattr(db, "info", None), dict):
-        from app.models.financial_form_version import FinancialFormVersion
-        retained_version = (await db.execute(select(FinancialFormVersion.id).where(
-            (FinancialFormVersion.source_file_id == file.id) | (FinancialFormVersion.pdf_file_id == file.id),
-        ).limit(1))).scalar_one_or_none()
-        if retained_version is not None:
-            raise HTTPException(status.HTTP_409_CONFLICT,
-                "Saved financial versions are kept in History. Correct the form and save a new version to update it.")
-    if await retention_holds.is_effective_file_soft_deletion_prohibited(db, file):
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            "This ACH or agreement artifact is protected by retention or legal hold",
-        )
+async def _files_for_removal(db: AsyncSession, bucket_id: UUID, file_ids: list[UUID]) -> list[BucketFile]:
+    """Load the room's rows for these ids with every share relation a removal clears."""
 
-    file.deleted_at = _now()
+    if not file_ids:
+        return []
+    rows = await db.execute(
+        select(BucketFile)
+        .where(BucketFile.bucket_id == bucket_id, BucketFile.id.in_(file_ids))
+        .options(
+            selectinload(BucketFile.shares),
+            selectinload(BucketFile.public_shares),
+            selectinload(BucketFile.vendor_access),
+        )
+    )
+    return list(rows.scalars().all())
+
+
+async def _retained_financial_version_files(db: AsyncSession, file_ids: list[UUID]) -> set[UUID]:
+    if not file_ids or not isinstance(getattr(db, "info", None), dict):
+        return set()
+    from app.models.financial_form_version import FinancialFormVersion
+
+    rows = (await db.execute(select(FinancialFormVersion.source_file_id, FinancialFormVersion.pdf_file_id).where(
+        (FinancialFormVersion.source_file_id.in_(file_ids)) | (FinancialFormVersion.pdf_file_id.in_(file_ids)),
+    ))).all()
+    return {file_id for row in rows for file_id in row if file_id in file_ids}
+
+
+async def _soft_delete_file(
+    db: AsyncSession,
+    bucket_id: UUID,
+    file: BucketFile,
+    *,
+    request: Request,
+    user: User,
+    at: datetime | None = None,
+) -> list[ApplicationProfile]:
+    """Move one file to Removed files and return the applications it touched.
+
+    The caller checks retention first and runs the readiness recompute itself,
+    so a multi-file removal recomputes each application once.
+    """
+
+    file.deleted_at = at or _now()
     file.deleted_by_user_id = user.id
     if provenance.is_internal_package_output(file):
         # Package BucketFiles and immutable underwriting artifacts intentionally
@@ -2841,13 +3020,186 @@ async def delete_admin_file(
         detail=f"{file.file_name} | storage={file.delete_storage_status}",
     )
     await db.flush()
-    affected_profiles = await profiles.affected_profiles_for_file(db, file)
+    return await profiles.affected_profiles_for_file(db, file)
+
+
+@router.delete("/admin/{bucket_id}/files/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_admin_file(
+    bucket_id: UUID,
+    file_id: UUID,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    await _load_bucket_or_404(db, bucket_id)
+    rows = await _files_for_removal(db, bucket_id, [file_id])
+    file = rows[0] if rows else None
+    if file is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
+    if file.deleted_at is not None:
+        return
+    if file.id in await _retained_financial_version_files(db, [file.id]):
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "Saved financial versions are kept in History. Correct the form and save a new version to update it.")
+    if await retention_holds.is_effective_file_soft_deletion_prohibited(db, file):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This ACH or agreement artifact is protected by retention or legal hold",
+        )
+    affected_profiles = await _soft_delete_file(db, bucket_id, file, request=request, user=user)
     await capital_readiness.advisory_recompute_profiles(
         db,
         affected_profiles,
         event_key=f"file-deleted:{file.id}:{file.deleted_at.isoformat()}",
     )
     await db.commit()
+
+
+@router.post("/admin/{bucket_id}/selected-files/remove", response_model=BucketFilesRemoveResult)
+async def remove_admin_files(
+    bucket_id: UUID,
+    payload: BucketFileSelection,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketFilesRemoveResult:
+    """Move the checked files to Removed files in one request.
+
+    Files under retention or legal hold stay and are reported, as are ids that
+    are no longer in the room; everything else moves together, so one refusal
+    never leaves the operator guessing which half was applied.
+    """
+
+    await _load_bucket_or_404(db, bucket_id)
+    wanted = list(dict.fromkeys(payload.file_ids))
+    by_id = {row.id: row for row in await _files_for_removal(db, bucket_id, wanted)}
+    retained_financial = await _retained_financial_version_files(db, wanted)
+    now = _now()
+    removed: list[UUID] = []
+    blocked: list[BucketFileRemovalBlocked] = []
+    missing: list[UUID] = []
+    affected: dict[UUID, ApplicationProfile] = {}
+    for file_id in wanted:
+        file = by_id.get(file_id)
+        if file is None or file.deleted_at is not None:
+            missing.append(file_id)
+            continue
+        if file_id in retained_financial:
+            blocked.append(BucketFileRemovalBlocked(file_id=file.id, file_name=file.file_name,
+                                                   reason="Saved financial versions are kept in History; save a corrected version instead."))
+            continue
+        if await retention_holds.is_effective_file_soft_deletion_prohibited(db, file):
+            blocked.append(
+                BucketFileRemovalBlocked(
+                    file_id=file.id,
+                    file_name=file.file_name,
+                    reason="Protected by retention or legal hold",
+                )
+            )
+            continue
+        touched = await _soft_delete_file(db, bucket_id, file, request=request, user=user, at=now)
+        for profile in touched:
+            affected[profile.id] = profile
+        removed.append(file.id)
+    if removed:
+        await capital_readiness.advisory_recompute_profiles(
+            db,
+            list(affected.values()),
+            event_key=f"files-removed:{bucket_id}:{now.isoformat()}",
+        )
+    await db.commit()
+    return BucketFilesRemoveResult(removed=removed, blocked=blocked, missing=missing)
+
+
+def _attachment_disposition(name: str) -> str:
+    fallback = name.encode("ascii", "ignore").decode("ascii")
+    fallback = fallback.replace("\\", "\\\\").replace('"', '\\"') or "download.zip"
+    return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{quote(name, safe="")}'
+
+
+@router.post("/admin/{bucket_id}/selected-files/archive")
+async def archive_admin_files(
+    bucket_id: UUID,
+    payload: BucketFileSelection,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Download the checked files as one zip. Archived rooms stay readable."""
+
+    from app.services import ach_fee_workflow
+
+    bucket = await _load_bucket_or_404(db, bucket_id, include_archived=True)
+    wanted = list(dict.fromkeys(payload.file_ids))
+    rows = await db.execute(
+        select(BucketFile).where(BucketFile.bucket_id == bucket_id, BucketFile.id.in_(wanted))
+    )
+    by_id = {
+        row.id: row
+        for row in rows.scalars().all()
+        if row.status == "uploaded" and row.deleted_at is None
+    }
+    gone = [file_id for file_id in wanted if file_id not in by_id]
+    if gone:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"{len(gone)} of the selected files are no longer in this room. "
+            "Refresh the room and check them again.",
+        )
+    files = [by_id[file_id] for file_id in wanted]
+    protected_bytes: dict[UUID, bytes] = {}
+    for file in files:
+        if file.retention_class not in PROTECTED_RETENTION_CLASSES:
+            continue
+        verified = await ach_fee_workflow.verified_protected_bytes(file)
+        if verified is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{file.file_name} failed its integrity check and was not packaged.",
+            )
+        protected_bytes[file.id] = verified
+    storage_bucket, _, _ = _bucket_storage_config()
+
+    def read_bytes(file: BucketFile) -> bytes:
+        if file.id in protected_bytes:
+            return protected_bytes[file.id]
+        params: dict[str, str] = {"Bucket": storage_bucket, "Key": file.s3_key}
+        if file.s3_version_id:
+            params["VersionId"] = file.s3_version_id
+        return _s3_client().get_object(**params)["Body"].read()
+
+    try:
+        result = await run_in_threadpool(bucket_file_archive.build_archive, files, read_bytes)
+    except bucket_file_archive.ArchiveTooLargeError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - storage trouble is reported, not raised
+        logger.warning("files archive: bucket=%s could not be read: %s", bucket_id, exc)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "A selected file could not be read from storage right now. Try again in a moment.",
+        ) from exc
+    archive_name = bucket_file_archive.archive_file_name(bucket.name)
+    for file in files:
+        await _log(
+            db,
+            bucket_id,
+            "file_archive_downloaded",
+            request=request,
+            user=user,
+            target_type="file",
+            target_id=str(file.id),
+            detail=f"{file.file_name} | {archive_name}",
+        )
+    await db.commit()
+    return Response(
+        content=result.data,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": _attachment_disposition(archive_name),
+            "Cache-Control": "no-store",
+            "X-Files-Packaged": str(result.files_packaged),
+        },
+    )
 
 
 @router.get("/admin/{bucket_id}/deleted-files", response_model=list[BucketFileRead])
@@ -2918,10 +3270,13 @@ async def restore_admin_file(
     )
     await db.flush()
     affected_profiles = await profiles.affected_profiles_for_file(db, file)
+    # updated_at is server-generated (onupdate) and expired by the flush above;
+    # reading it here would lazy-load outside the async context and 500 the
+    # restore. Stamp the event from the clock instead.
     await capital_readiness.advisory_recompute_profiles(
         db,
         affected_profiles,
-        event_key=f"file-restored:{file.id}:{file.updated_at.isoformat()}",
+        event_key=f"file-restored:{file.id}:{_now().isoformat()}",
     )
     await db.commit()
     await db.refresh(file)
@@ -2976,7 +3331,7 @@ async def admin_file_review(
     annotations = await _file_annotations(db, bucket_id, file_id)
     await _log(db, bucket_id, "file_review_opened", request=request, user=user, target_type="file", target_id=str(file.id), detail=file.file_name)
     await db.commit()
-    return _review_response(file, annotations)
+    return await _review_with_sheets(file, annotations)
 
 
 @router.post("/admin/{bucket_id}/files/{file_id}/annotations", response_model=BucketFileAnnotationRead)
@@ -3208,7 +3563,7 @@ async def vendor_file_review(
     annotations = await _file_annotations(db, bucket_id, file_id)
     await _log(db, bucket_id, "vendor_file_previewed", request=request, user=user, actor_role="vendor", target_type="file", target_id=str(file.id), detail=file.file_name)
     await db.commit()
-    return _review_response(file, annotations, preview=True)
+    return await _review_with_sheets(file, annotations, preview=True)
 
 
 @router.post("/vendor/{bucket_id}/files/{file_id}/download", response_model=BucketFileUrl)
@@ -3490,10 +3845,11 @@ async def _request_access_read(
         allow_notes=link.allow_notes,
         can_use_ai_chat=link.can_use_ai_chat,
         can_view_ai_tasks=link.can_view_ai_tasks,
+        passcode_needs_setup=getattr(link, "passcode_set_by_client_at", None) is None,
         requested_documents=[
             _public_requested_document_read(d, file_reads)
             for d in current_requested_documents
-            if d.status != "not_applicable"
+            if (is_open_request(d) or d.status == "uploaded")
             and (
                 payment_documents_visible
                 or d.signature_kind != "success_fee_agreement"
@@ -3556,6 +3912,32 @@ async def request_link_status(
     link = await _load_upload_link_or_404(db, token)
     await _require_request_access_passcode(db, link, payload, request)
     return await _request_access_read(db, link)
+
+
+@router.post("/request/{token}/passcode", response_model=BucketRequestPasscodeChanged)
+async def request_link_choose_passcode(
+    token: str,
+    payload: BucketRequestPasscodeChange,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketRequestPasscodeChanged:
+    """The client replaces the generated room PIN with six digits of their own.
+
+    The current PIN proves they are in the room. The new one is held to the
+    rules a dealer room already applies (six digits, nothing trivial, not the
+    one we sent) and stored the same way, so staff recovery keeps working.
+    Until this is done the room keeps offering it: a PIN the client chose is
+    one they can come back with.
+    """
+    link = await _load_upload_link_or_404(db, token)
+    await _require_request_access_passcode(db, link, payload, request)
+    problem = client_room.passcode_problem(payload.new_passcode, payload.passcode)
+    if problem:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
+    await client_room.set_passcode(db, link, payload.new_passcode)
+    await _log(db, link.bucket_id, "room_passcode_chosen", request=request, actor_name=link.recipient_name, actor_email=link.recipient_email, actor_role="uploader", target_type="upload_link", target_id=str(link.id))
+    await db.commit()
+    return BucketRequestPasscodeChanged(ok=True, passcode_needs_setup=False)
 
 
 @router.post("/request/{token}/upload-init", response_model=BucketFileUploadInitResponse)
@@ -4211,7 +4593,7 @@ async def shared_file_review(
     annotations = await _file_annotations(db, share.bucket_id, file_id)
     await _log(db, share.bucket_id, "shared_file_review_opened", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="file", target_id=str(file.id), detail=file.file_name)
     await db.commit()
-    return _review_response(file, annotations, preview=share.can_preview)
+    return await _review_with_sheets(file, annotations, preview=share.can_preview)
 
 
 @router.post("/share/{token}/files/{file_id}/download", response_model=BucketFileUrl)

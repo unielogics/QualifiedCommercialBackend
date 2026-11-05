@@ -151,7 +151,7 @@ class DealerBusiness(TimestampMixin, Base):
         Boolean, nullable=False, default=True, server_default=text("true")
     )
     plaid_statements_enabled: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=text("false")
+        Boolean, nullable=False, default=True, server_default=text("true")
     )
     plaid_policy_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     plaid_policy_updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -1048,6 +1048,12 @@ class DealerDebt(TimestampMixin, Base):
     originated_on: Mapped[date | None] = mapped_column(Date)
     secured: Mapped[str | None] = mapped_column(String(16))
     payment_status: Mapped[str | None] = mapped_column(String(16))
+    # The question the schedule asks of a merchant cash advance and nothing
+    # else (0252): whether the funder modified it because sales or revenue
+    # fell, and how. Null on every other kind of debt — a row nobody asked
+    # must not claim an answer.
+    mca_modified: Mapped[bool | None] = mapped_column(Boolean)
+    mca_modification_note: Mapped[str | None] = mapped_column(Text)
     origin: Mapped[str] = mapped_column(String(16), default="ai_draft", server_default="ai_draft")
     status: Mapped[str] = mapped_column(String(16), default="active", server_default="active")
     # A duplicate remains addressable for evidence and extraction suppression.

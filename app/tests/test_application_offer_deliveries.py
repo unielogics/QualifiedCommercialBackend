@@ -77,8 +77,9 @@ def test_plain_and_html_offer_bodies_lock_terms_links_and_individual_deadlines()
     ):
         assert required in text
         assert required in html
-    assert "September 17, 2026 at 12:00 AM UTC" in text
-    assert "September 18, 2026 at 12:00 PM UTC" in text
+    # Deadlines read in the firm's zone: 00:00 UTC on the 17th is 8 PM Eastern on the 16th.
+    assert "September 16, 2026 at 8:00 PM ET" in text
+    assert "September 18, 2026 at 8:00 AM ET" in text
     assert "Hello &lt;Client&gt;" in html
     assert "next=&lt;review&gt;" in html
 
@@ -260,7 +261,7 @@ def test_response_appendix_is_a_valid_extra_pdf_page_with_exact_deadline(
     reader = PdfReader(io.BytesIO(rendered))
     assert len(reader.pages) == 2
     assert "Review and respond securely" in rendered_html[0]
-    assert "September 18, 2026 at 04:30 PM UTC" in rendered_html[0]
+    assert "September 18, 2026 at 12:30 PM ET" in rendered_html[0]
     assert "https://secure.example/respond/abc" in rendered_html[0]
 
 

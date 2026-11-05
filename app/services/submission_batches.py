@@ -36,6 +36,7 @@ from app.schemas.submission_batch import (
     SubmissionBatchRead,
 )
 from app.services import application_profiles, application_programs
+from app.services.local_time import local_stamp
 from app.services.program_rules import evaluate_rules
 from app.services.provider_secrets import _decrypt_fernet, _encrypt_fernet
 
@@ -541,7 +542,7 @@ async def deliver_one(submission_id: UUID) -> str:
             url = f"{get_settings().frontend_app_url.rstrip('/')}/lender-submissions/{token}"
             result = await send_as_user(db, batch.approved_by_user_id, to_emails=[row.recipient_email],
                 subject="Qualified Commercial — financing review package",
-                body_text=f"Hello {row.lender_name},\n\nPlease review the application and supporting documents in your secure package:\n{url}\n\nThe package expires {row.expires_at.date().isoformat()}. A ZIP download is available inside.\n\nQualified Commercial",
+                body_text=f"Hello {row.lender_name},\n\nPlease review the application and supporting documents in your secure package:\n{url}\n\nThe package expires {local_stamp(row.expires_at, fmt='%B %-d, %Y', label=False)}. A ZIP download is available inside.\n\nQualified Commercial",
                 headers={"Message-ID": f"<qc-submission-{row.id}@qualifiedcommercial.com>"})
             row.status = "sent" if result.ok else "failed" if result.detail in {"not_configured", "bad recipients"} else "delivery_unknown"
             row.provider_message_id = result.message_id

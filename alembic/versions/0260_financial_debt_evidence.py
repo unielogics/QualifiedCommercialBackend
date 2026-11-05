@@ -5,8 +5,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0243_financial_debt_evidence"
-down_revision = "0242_financial_workspace"
+revision = "0260_financial_debt_evidence"
+down_revision = "0259_financial_workspace"
 branch_labels = None
 depends_on = None
 

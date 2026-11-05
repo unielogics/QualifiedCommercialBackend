@@ -30,7 +30,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.db import get_db
+from app.db import get_db, retry_transient_conflicts
 from app.dealer_os.models import DealerBusiness, DealerOwner, DealerPlaidItem
 from app.dealer_os.services import bank_consent as dealer_bank_consent
 from app.dealer_os.services import client_room, consent_delivery, plaid_client
@@ -56,6 +56,7 @@ from app.models.bucket import (
     BucketUploadLink,
 )
 from app.models.client import Client
+from app.models.credit_pull import CreditPull
 from app.models.financial_form_link import FinancialFormLink
 from app.models.financial_statement import FinancialStatement, FinancialStatementOwner
 from app.models.financial_worksheet import FinancialFormLinkSheet, FinancialWorksheet
@@ -130,8 +131,12 @@ from app.schemas.application_profile import (
     FundingCategoryRead,
     ManualBankOverrideRequest,
     MissingItemAutomationPatch,
+    OwnerCreditCandidateRead,
+    OwnerCreditLinkRequest,
     PlaidAssetReportCreate,
     PlaidAssetReportRead,
+    ProfileCreditLinkReport,
+    ProviderCreditLinkRequest,
     PublicBankVerificationRead,
     PublicFileOwnerConsentRead,
     PublicFileOwnerConsentResult,
@@ -160,6 +165,30 @@ from app.schemas.application_profile import (
     WorksheetRowOp,
 )
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
+from app.schemas.debt_schedule_review import (
+    DebtScheduleReviewRead,
+    DebtScheduleReviewResult,
+    DebtScheduleReviewSaved,
+    DebtScheduleReviewWrite,
+)
+from app.schemas.financial_cockpit import (
+    AdvanceRead,
+    AdvancesRead,
+    AdvancesWrite,
+    BankAccountRead,
+    BankAccountsRead,
+    BankAccountsWrite,
+    ClosingStipulationsRead,
+    ClosingStipulationsWrite,
+    DebtRowPatch,
+    DebtScheduleVoidWrite,
+    FinancialCockpitRead,
+    FinancialPlanRead,
+    FinancialPlanWrite,
+    StatementRereadResult,
+)
+from app.schemas.form_answers import FormAnswerFile, FormAnswersRead
+from app.schemas.requirement_library import RequirementAddWrite, RequirementLibraryRead
 from app.schemas.retention import LegalHoldChange, RetentionStatusRead
 from app.schemas.use_of_funds import (
     UseOfFundsPatch,
@@ -175,14 +204,20 @@ from app.services import (
     business_statement_schema,
     business_statements,
     capital_readiness,
+    closing_stipulations,
+    credit_links,
     dealer_forms_pdf,
+    debt_schedule_review,
     drafted_forms,
     file_events,
+    financial_cockpit,
     financial_statements,
+    form_answers,
     funding_programs,
     intake_lifecycle,
     intake_retention,
     locked_file_requests,
+    mca_advances,
     merchant_processing,
     missing_item_automation,
     pfs_schema,
@@ -193,6 +228,7 @@ from app.services import (
 )
 from app.services.activity_log import log_activity, mark_loan_dirty
 from app.services.application_plaid_sync import sync_item_background
+from app.services.application_profiles import canonical_funding_category
 from app.services.deal_economics import calculate_deal_earnings, optional_float
 from app.services.extracted_facts import (
     accepted_review_group_keys,
@@ -638,13 +674,7 @@ def _hash_token(token: str) -> str:
 
 
 def _credit_tier(score: int | None) -> str | None:
-    if score is None:
-        return None
-    if score >= 720:
-        return "Tier 1"
-    if score >= 660:
-        return "Tier 2"
-    return "Tier 3"
+    return credit_links.tier_for(score)
 
 
 def _require_profile_bank_client(profile: ApplicationProfile, user: User) -> None:
@@ -715,6 +745,8 @@ def _underwriting_read(
         forecast_origination_earnings=optional_float(earnings.origination_earnings),
         forecast_earnings=optional_float(earnings.total),
         estimated_close_date=profile.estimated_close_date,
+        accepted_at=getattr(profile, "underwriting_accepted_at", None),
+        accepted_terms_ref=getattr(profile, "accepted_terms_ref", None),
         qc_fee_cap_percent=fee_cap_review.get("qc_fee_cap_percent"),  # type: ignore[arg-type]
         qc_fee_review_required=bool(fee_cap_review.get("review_required")),
         qc_fee_review_reason=fee_cap_review.get("reason"),  # type: ignore[arg-type]
@@ -824,8 +856,12 @@ async def resolve_application_profile(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationProfileRead:
-    profile = await profiles.resolve_profile(db, payload.source_kind, payload.source_id, user)
-    await db.commit()
+    async def work():
+        resolved = await profiles.resolve_profile(db, payload.source_kind, payload.source_id, user)
+        await db.commit()
+        return resolved
+
+    profile = await retry_transient_conflicts(db, work, label="application-profiles/resolve")
     await db.refresh(profile)
     return profiles.profile_read(profile)
 
@@ -955,7 +991,18 @@ async def apply_underwriting_changes(
             "approved_amount": float(profile.underwriting_term_sheet_amount),
         }
     if "accepted_amount" in changes:
+        was_accepted = profile.underwriting_accepted_amount is not None
         profile.underwriting_accepted_amount = changes["accepted_amount"]
+        if changes["accepted_amount"] is None:
+            profile.underwriting_accepted_at = None
+            profile.accepted_terms_ref = None
+        elif not was_accepted or "accepted_terms_ref" in changes:
+            profile.underwriting_accepted_at = now
+    if (
+        "accepted_terms_ref" in changes
+        and changes.get("accepted_amount", profile.underwriting_accepted_amount) is not None
+    ):
+        profile.accepted_terms_ref = changes["accepted_terms_ref"]
     if "funded_amount" in changes:
         profile.underwriting_funded_amount = changes["funded_amount"]
     if "term_sheet_amount" in changes:
@@ -1050,11 +1097,18 @@ async def get_application_program_readiness(
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationProgramReadiness:
     _require_underwriting_actor(user)
-    profile = await profiles.load_profile(db, profile_id, user)
-    readiness = await application_programs.get_program_readiness(db, profile)
-    # The first read may pin an AI-selected playbook and materialize stable
-    # requirement rows. Those writes are deterministic and idempotent.
-    await db.commit()
+
+    async def work():
+        loaded = await profiles.load_profile(db, profile_id, user)
+        computed = await application_programs.get_program_readiness(db, loaded)
+        # The first read may pin an AI-selected playbook and materialize stable
+        # requirement rows. Those writes are deterministic and idempotent, so
+        # they are also safe to run again when a concurrent transaction won
+        # the row locks first.
+        await db.commit()
+        return loaded, computed
+
+    profile, readiness = await retry_transient_conflicts(db, work, label="program-readiness")
     from app.routers.application_collection import deliver_due_profile
     background_tasks.add_task(deliver_due_profile, profile.id)
     return readiness
@@ -1068,9 +1122,14 @@ async def get_application_evidence_workspace(
 ) -> ApplicationEvidenceWorkspace:
     """One canonical snapshot for requirements, files, forms, and banking."""
     _require_underwriting_actor(user)
-    profile = await profiles.load_profile(db, profile_id, user)
-    supporting = await profiles.ensure_supporting_document_group(db, profile)
-    readiness = await application_programs.get_program_readiness(db, profile)
+
+    async def work():
+        loaded = await profiles.load_profile(db, profile_id, user)
+        group = await profiles.ensure_supporting_document_group(db, loaded)
+        computed = await application_programs.get_program_readiness(db, loaded)
+        return loaded, group, computed
+
+    profile, supporting, readiness = await retry_transient_conflicts(db, work, label="evidence-workspace")
     verification = await profiles.verification_state(db, profile)
     banking = await _application_bank_state(db, profile, include_statement_files=True)
     forms = await financial_forms_status(profile_id, user, db)
@@ -1906,6 +1965,16 @@ async def create_application_room_request(
     requested = await db.get(BucketRequestedDocument, states[0].requested_document_id)
     requested.category = (payload.category or "Other").strip()
     requested.allow_multiple_files = payload.allow_multiple_files
+    await file_events.emit(
+        db,
+        profile=profile,
+        kind="document.requested",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title=f"We asked for {requested.name}",
+        actor=user,
+        target_type="requested_document",
+        target_id=requested.id,
+    )
     # Commit the request/task before provider delivery so a channel failure
     # cannot erase what the client still needs to provide.
     await db.commit()
@@ -1937,16 +2006,6 @@ async def create_application_room_request(
         target_id=requested.id,
         metadata={"delivery_status": overall, "channels": [row.channel for row in rows]},
     )
-    await file_events.emit(
-        db,
-        profile=profile,
-        kind="document.requested",
-        visibility=file_events.VISIBILITY_CLIENT,
-        title=f"We asked for {requested.name}",
-        actor=user,
-        target_type="requested_document",
-        target_id=requested.id,
-    )
     await db.commit()
     return RoomRequestResult(
         requested_document_id=requested.id,
@@ -1954,6 +2013,25 @@ async def create_application_room_request(
         overall_status=overall,
         deliveries=[_room_delivery_read(row) for row in rows],
     )
+
+
+def _room_reminder_copy(purpose: str) -> tuple[str, str]:
+    """Where the room opens and what the message asks, per kind of request.
+
+    The bank connection is asked for by name and first — the owner: "plaid
+    needs to be the first option available" — with the six-month upload as the
+    fallback in the same sentence, so the client who cannot or will not connect
+    still knows what to do. The sentence is dropped into the delivery
+    template as "<rep> has asked you to <purpose> for <business>".
+    """
+    if purpose == "bank_connect":
+        return (
+            "tab=banking",
+            "connect the business bank through Plaid (read-only) or upload six months of bank statements",
+        )
+    if purpose == "business_banking":
+        return "tab=banking", "connect or upload business bank statements"
+    return "tab=todo", "complete the requested application items"
 
 
 @router.post("/{profile_id}/room/reminders", response_model=RoomRequestResult)
@@ -1968,12 +2046,7 @@ async def send_application_room_reminder(
     if user.role in {Role.CLIENT, Role.DEALER, Role.VENDOR, Role.LENDER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only scoped staff may send room reminders")
     link = await _profile_room_link(db, profile)
-    query = "tab=banking" if payload.purpose == "business_banking" else "tab=todo"
-    purpose = (
-        "connect or upload business bank statements"
-        if payload.purpose == "business_banking"
-        else "complete the requested application items"
-    )
+    query, purpose = _room_reminder_copy(payload.purpose)
     email = profiles.normalized_email(str(payload.recipient_email) if payload.recipient_email else link.recipient_email)
     phone = profiles.normalized_phone(payload.recipient_phone)
     channels = ", ".join(
@@ -2318,6 +2391,475 @@ async def get_application_intelligence(
     return await profiles.intelligence_state(db, profile)
 
 
+@router.get("/{profile_id}/financial-cockpit", response_model=FinancialCockpitRead)
+async def get_financial_cockpit(
+    profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> FinancialCockpitRead:
+    """Every figure the file supports, read without a model: bank months,
+    tax years, tracked expenses, debt service, DSCR and the net-profit
+    conclusion, each naming its source."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
+
+
+@router.post("/{profile_id}/financial-cockpit/reread-statements", response_model=StatementRereadResult)
+async def reread_financial_cockpit_statements(
+    profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> StatementRereadResult:
+    """Queue every bank statement on the file for a fresh AI read, so
+    statements analyzed before recurring payments were extracted carry them."""
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    targets = await financial_cockpit.reread_statements(db, profile)
+    if targets:
+        await profiles.log_profile_action(
+            db,
+            profile,
+            user,
+            "financial_cockpit.statements_reread",
+            f"Queued {len(targets)} bank statement(s) for a fresh read",
+            metadata={"file_ids": [str(file.id) for file in targets]},
+        )
+    await db.commit()
+    return StatementRereadResult(queued=len(targets), file_ids=[file.id for file in targets])
+
+
+@router.get("/{profile_id}/closing-stipulations", response_model=ClosingStipulationsRead)
+async def get_closing_stipulations(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClosingStipulationsRead:
+    """Stipulations to close and the estimated close date, once the client has accepted."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    return ClosingStipulationsRead(**await closing_stipulations.read(db, profile))
+
+
+@router.put("/{profile_id}/closing-stipulations", response_model=ClosingStipulationsRead)
+async def put_closing_stipulations(
+    profile_id: UUID,
+    payload: ClosingStipulationsWrite,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClosingStipulationsRead:
+    """The list as the desk keeps it; an item left out is kept as waived."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    block = await closing_stipulations.write(
+        db, profile, [item.model_dump() for item in payload.items], by=str(getattr(user, "id", "") or "") or None
+    )
+    await db.commit()
+    return ClosingStipulationsRead(**block)
+
+
+@router.post("/{profile_id}/closing-stipulations/seed", response_model=ClosingStipulationsRead)
+async def seed_closing_stipulations(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClosingStipulationsRead:
+    """Add the conditions on the accepted terms as open stipulations, once each."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    block = await closing_stipulations.seed(db, profile, by=str(getattr(user, "id", "") or "") or None)
+    await db.commit()
+    return ClosingStipulationsRead(**block)
+
+
+@router.get("/{profile_id}/financial-plan", response_model=FinancialPlanRead)
+async def get_financial_plan(profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> FinancialPlanRead:
+    """The plan on the file with its evaluation and the levers that would raise coverage."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    cockpit = await financial_cockpit.load_cockpit(db, profile)
+    return FinancialPlanRead(profile_id=profile.id, obligations=cockpit["debt"]["obligations"], **cockpit["plan"])
+
+
+@router.put("/{profile_id}/financial-plan", response_model=FinancialPlanRead)
+async def put_financial_plan(
+    profile_id: UUID, payload: FinancialPlanWrite, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> FinancialPlanRead:
+    """Save the plan: which obligations the new loan pays off, which payees are
+    not operating spend, and the new payment. Coverage, the simulator, the
+    offer and the debt service all re-read it."""
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    record = payload.model_dump()
+    record["updated_at"] = datetime.now(UTC).isoformat()
+    record["updated_by"] = str(user.id)
+    profile.financial_plan = record
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "financial_plan.updated",
+        f"Plan: {len(payload.retire)} obligation(s) paid off by the new loan, {len(payload.exclude)} payee(s) not operating spend"
+        + (f", new payment {payload.new_payment_monthly:,.0f}/mo" if payload.new_payment_monthly else "")
+        + (f", new loan {payload.new_loan_amount:,.0f} at {payload.new_loan_rate_pct or 0:g}% over {payload.new_loan_term_months or 0} months" if payload.new_loan_amount else ""),
+        metadata={"retire": payload.retire, "exclude": payload.exclude},
+    )
+    await db.commit()
+    cockpit = await financial_cockpit.load_cockpit(db, profile)
+    return FinancialPlanRead(profile_id=profile.id, obligations=cockpit["debt"]["obligations"], **cockpit["plan"])
+
+
+@router.get("/{profile_id}/bank-accounts", response_model=BankAccountsRead)
+async def get_bank_accounts(profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> BankAccountsRead:
+    """The checking accounts the AI found on the statements and which ones count."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    accounts = await financial_cockpit.bank_accounts_for_profile(db, profile)
+    return BankAccountsRead(profile_id=profile.id, accounts=[BankAccountRead(**a) for a in accounts], counted=list(profile.counted_bank_accounts or []), aliases=dict(profile.bank_account_aliases or {}))
+
+
+@router.put("/{profile_id}/bank-accounts", response_model=BankAccountsRead)
+async def put_bank_accounts(
+    profile_id: UUID, payload: BankAccountsWrite, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> BankAccountsRead:
+    """Choose which checking accounts count toward the statement requirement
+    and which the cockpit reads by default. An empty list means every account."""
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    if payload.aliases is not None:
+        # Keys fold into the account they belong to; a canonical key never points elsewhere.
+        aliases = {str(k): str(v) for k, v in payload.aliases.items() if k and v and k != v}
+        for key in list(aliases):
+            aliases[key] = financial_cockpit.resolve_alias(aliases[key], aliases)
+        profile.bank_account_aliases = {k: v for k, v in aliases.items() if k != v}
+    accounts = await financial_cockpit.bank_accounts_for_profile(db, profile)
+    known = {a["key"] for a in accounts}
+    # A counted key that was just folded into another account follows it.
+    aliases = dict(profile.bank_account_aliases or {})
+    payload.counted = list(
+        dict.fromkeys(financial_cockpit.resolve_alias(key, aliases) for key in payload.counted)
+    )
+    unknown = [key for key in payload.counted if key not in known]
+    if unknown:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"Unknown account: {', '.join(unknown)}")
+    profile.counted_bank_accounts = list(dict.fromkeys(payload.counted))
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "bank_accounts.counted",
+        "Counting every account" if not payload.counted else f"Counting {len(payload.counted)} account(s): {', '.join(a['label'] for a in accounts if a['key'] in set(payload.counted))}",
+        metadata={"counted": profile.counted_bank_accounts},
+    )
+    await db.commit()
+    accounts = await financial_cockpit.bank_accounts_for_profile(db, profile)
+    return BankAccountsRead(profile_id=profile.id, accounts=[BankAccountRead(**a) for a in accounts], counted=list(profile.counted_bank_accounts or []), aliases=dict(profile.bank_account_aliases or {}))
+
+
+@router.post("/{profile_id}/debt-schedule/adopt-document", response_model=FinancialCockpitRead)
+async def adopt_uploaded_debt_schedule(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FinancialCockpitRead:
+    """The lines the AI read off the uploaded debt schedule become the file's
+    own rows (origin admin), so the schedule, the coverage and the plan read
+    them like a schedule the desk entered; the desk edits them from there."""
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    # One adoption at a time per file: a second click waits here and then
+    # meets the "already has rows" check instead of writing the rows twice.
+    managed = await debt_schedule_review.workspace_snapshot(db, profile, create=True)
+    await db.execute(
+        select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update()
+    )
+    cockpit = await financial_cockpit.load_cockpit(db, profile)
+    document = (cockpit.get("debt") or {}).get("document")
+    rows = financial_statements.debt_rows_from_body(financial_statements.document_debts_as_body(document))
+    if not rows:
+        raise HTTPException(status.HTTP_409_CONFLICT, "The uploaded schedule has no lines the system could read.")
+    existing = (cockpit.get("debt") or {}).get("rows") or []
+    if existing:
+        raise HTTPException(status.HTTP_409_CONFLICT, "The file already has schedule rows; edit those instead of adopting the upload again.")
+    if managed is not None:
+        from app.services.financial_version_selection import active_debt_schedule_rows
+        if active_debt_schedule_rows(managed["body"]):
+            raise HTTPException(409, "The working draft already has schedule rows; review those before adopting another upload")
+        body = {**managed["body"], "debts": [*managed["body"].get("debts", []), *[
+            {**row, "id": row.get("id") or str(uuid4()), "origin": "admin", "status": "active"} for row in rows
+        ]]}
+        result = await stage_legacy_body(db, profile, managed, body, actor=user)
+        await db.commit()
+        cockpit = await financial_cockpit.load_cockpit(db, profile)
+        cockpit["debt"].update(draft_pending=True, draft_family_id=result["family_id"], draft_revision=result["draft"]["revision"])
+        return FinancialCockpitRead(**cockpit)
+    await financial_statements.save_debt_rows(db, profile, rows, origin="admin")
+    await profiles.log_profile_action(
+        db, profile, user, "financial_form.debt_schedule_adopted",
+        f"Adopted {len(rows)} obligation(s) from the uploaded debt schedule onto the file's schedule",
+    )
+    await db.commit()
+    return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
+
+
+@router.patch("/{profile_id}/debt-schedule/rows/{row_id}", response_model=FinancialCockpitRead)
+async def patch_debt_schedule_row(
+    profile_id: UUID,
+    row_id: UUID,
+    payload: DebtRowPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FinancialCockpitRead:
+    """Edit one schedule row in place: the per-month figure, balance and
+    payoff, type, whether it counts in the DSCR, the statement payee it is
+    linked to, or dismiss it. The coverage, the plan and the package read the
+    row as edited; the row keeps its origin."""
+    from app.dealer_os.models import DealerDebt
+
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    managed = await debt_schedule_review.workspace_snapshot(db, profile, create=True)
+    if managed is not None:
+        from copy import deepcopy
+
+        from app.services.financial_debt_actions import apply_debt_action
+        body = deepcopy(managed["body"])
+        raw = next((row for row in body.get("debts", []) if str(row.get("id")) == str(row_id)), None)
+        if raw is None:
+            raise HTTPException(404, "That schedule row is not in this financial draft")
+        changes = payload.model_dump(exclude_unset=True)
+        if "vendor_key" in changes:
+            from app.services.debt_payee_links import link_payee
+            await link_payee(db, profile, row_id, changes.pop("vendor_key"), actor=user)
+        requested_status = changes.pop("status", None)
+        if requested_status in {"dismissed", "deleted"}:
+            body = apply_debt_action(body, {"op": "delete", "row_id": str(row_id)}, actor_id=str(user.id))
+        elif requested_status == "active" and raw.get("status", "active") != "active":
+            body = apply_debt_action(body, {"op": "restore", "row_id": str(row_id)}, actor_id=str(user.id))
+        raw = next(row for row in body["debts"] if str(row["id"]) == str(row_id))
+        raw.update({"debt_type" if key == "category" else key: value for key, value in changes.items()})
+        if changes or requested_status:
+            result = await stage_legacy_body(db, profile, managed, body, actor=user)
+        else:
+            result = managed
+        await db.commit()
+        cockpit = await financial_cockpit.load_cockpit(db, profile)
+        cockpit["debt"].update(draft_pending=result["draft"]["dirty"], draft_family_id=result["family_id"], draft_revision=result["draft"]["revision"])
+        return FinancialCockpitRead(**cockpit)
+    row = (
+        await db.execute(
+            select(DealerDebt).where(DealerDebt.id == row_id, DealerDebt.profile_id == profile.id)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That schedule row is not on this file.")
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
+    changed = financial_statements.apply_debt_row_patch(row, changes)
+    if changed:
+        await db.flush()
+        await profiles.log_profile_action(
+            db, profile, user, "financial_form.debt_schedule_row_edited",
+            f"Edited {row.lender} on the business debt schedule ({', '.join(changed)})",
+        )
+        await db.commit()
+    return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
+
+
+@router.post("/{profile_id}/debt-schedule/void", response_model=FinancialCockpitRead)
+async def void_debt_schedule(
+    profile_id: UUID,
+    payload: DebtScheduleVoidWrite,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FinancialCockpitRead:
+    """The desk declares the business carries no debt.
+
+    Every file carries the debt schedule requirement; this is the one way it
+    is set aside. It is the requirement engine's "not applicable" with the
+    declaration as its reason, so the readiness, the room and the cockpit all
+    read the same decision, and the restore route undoes it.
+    """
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    managed = await debt_schedule_review.workspace_snapshot(db, profile, create=True)
+    if managed is not None:
+        from app.services.financial_version_selection import active_debt_schedule_rows
+        if active_debt_schedule_rows(managed["body"]):
+            raise HTTPException(409, "Remove or reconcile the active obligations before declaring no outstanding debt")
+        await stage_legacy_body(db, profile, managed, {**managed["body"], "no_debt": True}, actor=user, submit=True)
+        await db.commit()
+        return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
+    reason = (payload.reason or "").strip() or "No debt on the business"
+    try:
+        await application_programs.patch_requirement(
+            db,
+            profile,
+            financial_cockpit.DEBT_SCHEDULE_REQUIREMENT,
+            ApplicationRequirementPatch(
+                action="not_applicable", reason=reason, all_programs=True, confirmed=True
+            ),
+            user,
+        )
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_404_NOT_FOUND:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "This file has no debt schedule requirement to void yet; open its readiness first",
+            ) from exc
+        raise
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "debt_schedule.voided",
+        f"Voided the debt schedule: {reason}",
+        target_type="financial_form",
+        target_id=profile.id,
+    )
+    await db.commit()
+    return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
+
+
+@router.post("/{profile_id}/debt-schedule/restore", response_model=FinancialCockpitRead)
+async def restore_debt_schedule(
+    profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> FinancialCockpitRead:
+    """The business does carry debt after all: the schedule is required again."""
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    managed = await debt_schedule_review.workspace_snapshot(db, profile, create=True)
+    if managed is not None:
+        result = await stage_legacy_body(db, profile, managed, {**managed["body"], "no_debt": False}, actor=user)
+        await db.commit()
+        cockpit = await financial_cockpit.load_cockpit(db, profile)
+        cockpit["debt"].update(draft_pending=True, draft_family_id=result["family_id"], draft_revision=result["draft"]["revision"])
+        return FinancialCockpitRead(**cockpit)
+    await application_programs.patch_requirement(
+        db,
+        profile,
+        financial_cockpit.DEBT_SCHEDULE_REQUIREMENT,
+        ApplicationRequirementPatch(
+            action="restore", reason="The debt schedule is required again", confirmed=True
+        ),
+        user,
+    )
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "debt_schedule.restored",
+        "Restored the debt schedule requirement",
+        target_type="financial_form",
+        target_id=profile.id,
+    )
+    await db.commit()
+    return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
+
+
+@router.get("/{profile_id}/debt-schedule/review", response_model=DebtScheduleReviewRead)
+async def get_debt_schedule_review(
+    profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DebtScheduleReviewRead:
+    """Every line the file's debt schedule could carry: what the AI read off the
+    uploaded schedule and the rows already on the file, so the desk can take off
+    what is not a loan and answer the interest rate, the amount originally
+    approved and the balance. Staff only, like the rest of the schedule."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    review = await debt_schedule_review.read_review(db, profile)
+    review["filed"] = await _debt_schedule_filed(db, profile)
+    return DebtScheduleReviewRead(**review)
+
+
+@router.post("/{profile_id}/debt-schedule/review", response_model=DebtScheduleReviewResult)
+async def apply_debt_schedule_review(
+    profile_id: UUID,
+    payload: DebtScheduleReviewWrite,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DebtScheduleReviewResult:
+    """Save the desk's decisions on the lines: the ones kept become (or update)
+    the file's schedule rows with the answers given, the ones taken off are
+    dismissed (kept as history, never deleted) so they do not return.
+
+    With `file_as_schedule` the saved rows are also filed as the debt schedule on
+    the checklist, the way the desk's own submit files it (one PDF per slot,
+    refreshed in place). The rows are saved either way; a schedule still missing
+    answers is not filed, and the answer says why in the form's own words."""
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    # One review at a time per file: a second click waits here and then
+    # meets the rows the first one wrote instead of adding them twice.
+    managed = await debt_schedule_review.workspace_snapshot(db, profile, create=True)
+    await db.execute(
+        select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update()
+    )
+    saved = await debt_schedule_review.apply_review(db, profile, user, payload.lines, workspace_draft=managed) if managed is not None else await debt_schedule_review.apply_review(db, profile, user, payload.lines)
+    kept = [line.lender for line in payload.lines if line.keep]
+    taken_off = [line.lender for line in payload.lines if not line.keep]
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "financial_form.debt_schedule_reviewed",
+        f"Reviewed the debt schedule lines: kept {saved['kept']}, took off {len(taken_off)}"
+        f" ({saved['added']} added, {saved['updated']} corrected, {saved['restored']} put back)",
+        target_type="financial_form",
+        target_id=profile.id,
+        metadata={"saved": saved, "kept": kept[:40], "removed": taken_off[:40]},
+    )
+    filed, filing_problem = False, None
+    if payload.file_as_schedule:
+        filed, filing_problem = await _file_schedule_from_rows(db, profile, user)
+        if filed:
+            await profiles.log_profile_action(
+                db,
+                profile,
+                user,
+                "financial_form.debt_schedule_filed",
+                "Filed the reviewed debt schedule as the schedule on the checklist",
+                target_type="financial_form",
+                target_id=profile.id,
+            )
+    await db.commit()
+    if not filed and managed is None:
+        # A schedule filed earlier stays current with the rows: the same refresh
+        # the form's draft saves queue (a no-op while nothing was ever filed).
+        await drafted_forms.enqueue_form_refresh(
+            db, profile, "debt_schedule", actor_name=user.name or user.email, actor_email=user.email
+        )
+    review = await debt_schedule_review.read_review(db, profile)
+    review["filed"] = await _debt_schedule_filed(db, profile)
+    return DebtScheduleReviewResult(
+        review=DebtScheduleReviewRead(**review),
+        saved=DebtScheduleReviewSaved(**saved),
+        filed=filed,
+        filing_problem=filing_problem,
+    )
+
+
+@router.get("/{profile_id}/advances", response_model=AdvancesRead)
+async def get_advances(profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> AdvancesRead:
+    """The merchant cash advances on the file's debt schedule, whoever wrote them."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    rows = await mca_advances.advance_rows(db, profile)
+    return AdvancesRead(profile_id=profile.id, rows=[AdvanceRead(**mca_advances.advance_read(row)) for row in rows])
+
+
+@router.put("/{profile_id}/advances", response_model=AdvancesRead)
+async def put_advances(
+    profile_id: UUID, payload: AdvancesWrite, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> AdvancesRead:
+    """Record the advances the client described (verbally or otherwise) as the
+    desk's rows on the debt schedule; the client's typed terms and the AI's
+    draft rows are shown beside them and never overwritten."""
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    rows = await mca_advances.save_advances(db, profile, [row.model_dump() for row in payload.rows], actor=user)
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "advances.recorded",
+        f"Recorded {len(payload.rows)} advance(s) from the client's terms",
+        metadata={"lenders": [row.lender for row in payload.rows][:20]},
+    )
+    await db.commit()
+    return AdvancesRead(profile_id=profile.id, rows=[AdvanceRead(**mca_advances.advance_read(row)) for row in rows])
+
+
 @router.post("/{profile_id}/bank-invitations", response_model=VerificationInvitationRead, status_code=status.HTTP_201_CREATED)
 async def create_bank_verification_invitation(
     profile_id: UUID,
@@ -2495,8 +3037,11 @@ async def delete_application_owner(
 async def get_application_verification(
     profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> FileOwnerRequirementState:
-    profile = await profiles.load_profile(db, profile_id, user)
-    return await profiles.verification_state(db, profile)
+    async def work() -> FileOwnerRequirementState:
+        profile = await profiles.load_profile(db, profile_id, user)
+        return await profiles.verification_state(db, profile)
+
+    return await retry_transient_conflicts(db, work, label="verification")
 
 
 def _business_label(profile: ApplicationProfile, intake: PublicUnderwritingIntake | None, client: Client | None) -> str:
@@ -2617,6 +3162,220 @@ async def _public_application_owner(db: AsyncSession, token: str) -> Application
     if profile is not None:
         await arf_channel.require_profile_hosted_permission(db, profile, requested_fields=["credit_data"], capability="credit_pull")
     return owner
+
+
+def _application_owner_only(owner: ApplicationOwner | DealerOwner) -> ApplicationOwner:
+    if isinstance(owner, DealerOwner):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Dealer OS owners carry their own credit flow; link pulls from the dealer room",
+        )
+    return owner
+
+
+@router.get("/{profile_id}/owners/{owner_id}/credit-candidates", response_model=list[OwnerCreditCandidateRead])
+async def list_owner_credit_candidates(
+    profile_id: UUID, owner_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[OwnerCreditCandidateRead]:
+    """Completed pulls that could be this owner's, most trustworthy first."""
+
+    profile = await profiles.load_profile(db, profile_id, user)
+    owner = _application_owner_only(await _owner_for_profile(db, profile, owner_id))
+    candidates = await credit_links.candidate_pulls(db, profile, owner)
+    return [OwnerCreditCandidateRead(**candidate.read()) for candidate in candidates]
+
+
+def _require_provider_catalog(user):
+    if _role_value(user) not in ("super_admin", "loan_exec"):
+        raise HTTPException(403, "The provider-wide credit catalog is restricted to authorized internal staff")
+
+
+@router.get("/{profile_id}/owners/{owner_id}/provider-applicants")
+async def provider_credit_applicants(profile_id: UUID, owner_id: UUID, user: CurrentUser,
+    query: str = "", page: int = 1, archived: bool = False, db: AsyncSession = Depends(get_db)):
+    from app.services import isoftpull_catalog
+    from app.services.isoftpull_session import IsoftpullSessionError
+
+    _require_provider_catalog(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    await _owner_for_profile(db, profile, owner_id)
+    if not 1 <= page <= 10000 or len(query) > 120:
+        raise HTTPException(422, "Invalid search or page")
+    try:
+        return await isoftpull_catalog.applicants(query, page, archived)
+    except IsoftpullSessionError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@router.get("/{profile_id}/owners/{owner_id}/provider-applicants/{applicant_id}/reports")
+async def provider_existing_reports(profile_id: UUID, owner_id: UUID, applicant_id: str,
+    user: CurrentUser, pull_type: str = "soft_pull", db: AsyncSession = Depends(get_db)):
+    from app.services import isoftpull_catalog
+    from app.services.isoftpull_session import IsoftpullSessionError
+
+    _require_provider_catalog(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    await _owner_for_profile(db, profile, owner_id)
+    try:
+        rows, _ = await isoftpull_catalog.reports(applicant_id, pull_type)
+        return {"items": rows}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except IsoftpullSessionError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@router.post("/{profile_id}/owners/{owner_id}/provider-credit-link", response_model=FileOwnerRead)
+async def link_provider_credit(profile_id: UUID, owner_id: UUID, payload: ProviderCreditLinkRequest,
+    user: CurrentUser, db: AsyncSession = Depends(get_db)):
+    from datetime import timedelta
+
+    from app.constants import SOFT_PULL_VALIDITY_DAYS
+    from app.services import credit_report_archive, isoftpull_catalog
+    from app.services.isoftpull_session import IsoftpullSessionError
+
+    _require_provider_catalog(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    owner = _application_owner_only(await _owner_for_profile(db, profile, owner_id))
+    if payload.confirm_identity is not True:
+        raise HTTPException(422, "Confirm that the report belongs to this owner and you are authorized to use it for this file")
+    if not profile.client_id:
+        raise HTTPException(409, "Link a client to the application before importing credit")
+    try:
+        report_id = str(payload.report_id)
+        parsed, html, pulled_at = await isoftpull_catalog.retrieve(payload.applicant_id, report_id, payload.pull_type)
+    except ValueError as exc:
+        raise HTTPException(422, "Invalid provider report selection") from exc
+    except IsoftpullSessionError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    # Serialize imports on this file, and reuse an already imported provider report.
+    await db.execute(select(ApplicationProfile).where(ApplicationProfile.id == profile.id).with_for_update())
+    await db.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(report_id, 0))))
+    pull = await db.scalar(select(CreditPull).where(or_(
+        CreditPull.bureau_response["provider_report_id"].astext == report_id,
+        *(CreditPull.bureau_response["reports"][bureau]["link"].astext.endswith("/" + report_id) for bureau in ("transunion", "equifax", "experian")),
+    )).limit(1))
+    if pull is None:
+        name = str(parsed.get("personal_info", {}).get("name") or "").strip().split()
+        pull = CreditPull(client_id=profile.client_id, status="completed", legal_first_name=name[0] if name else None,
+            legal_last_name=" ".join(name[1:]) if len(name) > 1 else None, fico=parsed.get("best_score"),
+            pulled_at=pulled_at, expires_at=pulled_at + timedelta(days=SOFT_PULL_VALIDITY_DAYS),
+            notes="Imported existing provider report; identity and authorized file use confirmed by staff",
+            bureau_response={"provider_report_id": report_id, "provider_applicant_id": payload.applicant_id, "parsed_report": parsed,
+                "provider_report_url": f"/client/reports/{report_id}"})
+        db.add(pull)
+        await db.flush()
+        archive = credit_report_archive.archive_report_html(pull.id, html)
+        if archive:
+            pull.bureau_response = {**pull.bureau_response, "report_s3_key": archive}
+    try:
+        await credit_links.link_pull(db, profile, owner, pull, actor=user, how=credit_links.HOW_MANUAL)
+    except credit_links.LinkConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    await db.commit()
+    await db.refresh(owner)
+    return profiles.owner_read(owner)
+
+
+@router.post("/{profile_id}/owners/{owner_id}/credit-link", response_model=FileOwnerRead)
+async def link_owner_credit(
+    profile_id: UUID,
+    owner_id: UUID,
+    payload: OwnerCreditLinkRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FileOwnerRead:
+    """Attach one completed pull to this owner by hand."""
+
+    profile = await profiles.load_profile(db, profile_id, user)
+    owner = _application_owner_only(await _owner_for_profile(db, profile, owner_id))
+    pull = await db.get(CreditPull, payload.pull_id)
+    if pull is None or not credit_links.is_completed(pull):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That credit pull is not on record as completed")
+    if profile.client_id and pull.client_id != profile.client_id and not payload.confirm_other_client:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "This pull was run for another client. Confirm it is the same person to link it.",
+        )
+    try:
+        await credit_links.link_pull(db, profile, owner, pull, actor=user, how=credit_links.HOW_MANUAL)
+    except credit_links.LinkConflict as conflict:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(conflict)) from conflict
+    await db.commit()
+    await db.refresh(owner)
+    return profiles.owner_read(owner)
+
+
+@router.delete("/{profile_id}/owners/{owner_id}/credit-link", response_model=FileOwnerRead)
+async def unlink_owner_credit(
+    profile_id: UUID, owner_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> FileOwnerRead:
+    """The owner's credit step goes back to pending; the pull itself stays."""
+
+    profile = await profiles.load_profile(db, profile_id, user)
+    owner = _application_owner_only(await _owner_for_profile(db, profile, owner_id))
+    if owner.credit_pull_id is None:
+        return profiles.owner_read(owner)
+    await credit_links.unlink_pull(db, profile, owner, actor=user)
+    await db.commit()
+    await db.refresh(owner)
+    return profiles.owner_read(owner)
+
+
+@router.get("/{profile_id}/owners/{owner_id}/credit-report")
+async def owner_credit_report(
+    profile_id: UUID, owner_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> dict:
+    from app.services.credit_report_import import stored_report
+
+    if _role_value(user) not in ("super_admin", "loan_exec", "broker"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator-only")
+    profile = await profiles.load_profile(db, profile_id, user)
+    owner = await _owner_for_profile(db, profile, owner_id)
+    pull = await db.get(CreditPull, owner.credit_pull_id) if owner.credit_pull_id else None
+    if pull is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No linked credit pull")
+    return {"owner": profiles.owner_read(owner), "report": stored_report(pull.bureau_response or {})}
+
+
+@router.post("/{profile_id}/owners/{owner_id}/credit-report/import")
+async def import_owner_credit_report(
+    profile_id: UUID, owner_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> dict:
+    from app.services.credit_report_import import ReportImportUnavailable, import_existing_report
+
+    if _role_value(user) not in ("super_admin", "loan_exec", "broker"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator-only")
+    profile = await profiles.load_profile(db, profile_id, user)
+    owner = await _owner_for_profile(db, profile, owner_id)
+    pull = await db.get(CreditPull, owner.credit_pull_id) if owner.credit_pull_id else None
+    if pull is None or not credit_links.is_completed(pull):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No completed linked credit pull")
+    try:
+        report = await import_existing_report(db, pull)
+    except ReportImportUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    await profiles.log_profile_action(
+        db, profile, user, "owner.credit_report_imported", "Imported the existing credit report; no new inquiry",
+        target_type="owner", target_id=owner.id, metadata={"pull_id": str(pull.id), "score": pull.fico},
+    )
+    await db.commit()
+    await db.refresh(owner)
+    return {"owner": profiles.owner_read(owner), "report": report}
+
+
+@router.post("/{profile_id}/credit-links/auto", response_model=ProfileCreditLinkReport)
+async def auto_link_profile_credit(
+    profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> ProfileCreditLinkReport:
+    """Link every owner on this file whose pull matches exactly; say who waits."""
+
+    profile = await profiles.load_profile(db, profile_id, user)
+    if profile.dealer_id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Dealer OS files link credit from the dealer room")
+    report = await credit_links.auto_link_profile(db, profile, actor=user, how=credit_links.HOW_SWEEP)
+    await db.commit()
+    return ProfileCreditLinkReport(**report)
 
 
 @router.get("/public/credit-consent/{token}", response_model=PublicFileOwnerConsentRead)
@@ -2740,16 +3499,8 @@ async def submit_public_application_credit_consent(
         owner.invite_token_hash = token_hash
         await db.commit()
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "We could not complete the credit check right now; please try again shortly") from None
-    pull.application_owner_id = owner.id
-    owner.credit_pull_id = pull.id
-    owner.credit_score = pull.fico
-    owner.credit_tier = _credit_tier(pull.fico)
-    owner.credit_pulled_at = pull.pulled_at or datetime.now(UTC)
-    owner.credit_summary = {"status": str(pull.status), "expires_at": pull.expires_at.isoformat() if pull.expires_at else None}
+    await credit_links.link_pull(db, profile, owner, pull, how=credit_links.HOW_SIGNATURE)
     await profiles.log_profile_action(db, profile, None, "owner.soft_pull", f"Credit returned for {owner.full_name}", target_type="owner", target_id=owner.id, metadata={"tier": owner.credit_tier})
-    from app.dealer_os.services import application_precall
-
-    await application_precall.on_progress(db, profile, commit=False)
     await db.commit()
     return PublicFileOwnerConsentResult(completed=True, credit_tier=owner.credit_tier, credit_score_band=_score_band(owner.credit_score))
 
@@ -2901,6 +3652,7 @@ async def _application_bank_state(
         evidence_summary=profiles.application_evidence_summary(manual_evidence),
         assets_enabled=policy.assets_enabled,
         statements_enabled=policy.statements_enabled,
+        statements_preferred=bool(getattr(policy_owner, "plaid_statements_enabled", policy.statements_enabled)),
         selected_products=policy.selected_products,
         available_products=policy.available_products,
         consent_product_scope=consent_scope,
@@ -3032,7 +3784,7 @@ async def _application_room_state(
             else None
         ),
         capabilities=["documents", "ownership", "owner_credit", "business_banking", "agreements"],
-        owners=[profiles.owner_read(owner) for owner in owner_rows],
+        owners=[profiles.owner_read(owner, include_credit_risk=False) for owner in owner_rows],
         verification=verification,
         precall=room_precall,
         banking=banking,
@@ -3132,7 +3884,7 @@ async def public_application_room_create_owner(
     )
     await db.commit()
     await db.refresh(row)
-    return profiles.owner_read(row)
+    return profiles.owner_read(row, include_credit_risk=False)
 
 
 @router.patch("/public/room/{token}/owners/{owner_id}", response_model=FileOwnerRead)
@@ -3159,7 +3911,7 @@ async def public_application_room_update_owner(
     )
     await db.commit()
     await db.refresh(owner)
-    return profiles.owner_read(owner)
+    return profiles.owner_read(owner, include_credit_risk=False)
 
 
 @router.delete("/public/room/{token}/owners/{owner_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -4144,8 +4896,16 @@ async def update_application_plaid_settings(
         assets_enabled=payload.assets_enabled,
         statements_enabled=payload.statements_enabled,
     )
+    # Judged by what the choice does today: a preference the deployment cannot
+    # honour yet (statements on an Assets-only account) is stored and waits,
+    # as the migration's default does; a choice that leaves nothing to ask
+    # Plaid for is refused.
+    effective = plaid_policy.PlaidProductPolicy(
+        assets_enabled=proposed.assets_enabled and "assets" in plaid_policy.deployment_products(),
+        statements_enabled=proposed.statements_enabled and "statements" in plaid_policy.deployment_products(),
+    )
     try:
-        proposed.validate()
+        effective.validate()
     except plaid_policy.InvalidPlaidPolicy as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except plaid_policy.PlaidProductUnavailable as exc:
@@ -4879,11 +5639,22 @@ async def get_application_evidence_file_url(
             "code": "evidence_source_changed",
             "message": "The cited document version changed. Review the current source before relying on this reference.",
         })
-    from app.routers.buckets import _download_url
+    from starlette.concurrency import run_in_threadpool
+
+    from app.routers.buckets import _download_url, _sheet_preview_payload
 
     await profiles.log_profile_action(db, profile, user, "evidence.preview", f"Opened {file.file_name}", target_type="file", target_id=file.id)
     await db.commit()
-    return {"url": _download_url(file.s3_key, file_name=file.file_name, disposition="inline", content_type=file.content_type), "expires_in": 900}
+    # Spreadsheets also come back as parsed sheets so the evidence workspace
+    # can show the rows the AI read instead of forcing a download.
+    result: dict = {
+        "url": _download_url(file.s3_key, file_name=file.file_name, disposition="inline", content_type=file.content_type),
+        "expires_in": 900,
+    }
+    sheets = await run_in_threadpool(_sheet_preview_payload, file)
+    if sheets is not None:
+        result["sheets"] = sheets
+    return result
 
 
 def _classification_dict(profile: ApplicationProfile) -> dict:
@@ -4967,6 +5738,10 @@ async def confirm_application_classification(
         raise HTTPException(status.HTTP_409_CONFLICT, "Classification changed; review the latest values before confirming")
     before = _classification_dict(profile)
     values = await _validated_classification(db, profile, ClassificationPatch(**payload.model_dump(exclude={"expected_revision"})))
+    # The same rule every other writer applies, so the panel can send a label
+    # and the column still holds one vocabulary.
+    if values.get("funding_category") is not None:
+        values["funding_category"] = canonical_funding_category(values["funding_category"])
     for key, value in values.items():
         setattr(profile, key, value)
     profile.classification_revision += 1
@@ -4999,7 +5774,8 @@ async def confirm_application_classification(
             from app.services.operator_file_links import queue_link_change_review
 
             review = await queue_link_change_review(db, intake=intake, requested_by_user_id=user.id)
-            intake.latest_review_id = review.id
+            if review is not None:
+                intake.latest_review_id = review.id
     await profiles.log_profile_action(db, profile, user, "classification.confirm", "Changed file classification and queued requirement review", metadata={"before": before, "after": _classification_dict(profile), "revision": profile.classification_revision})
     await db.commit()
     await db.refresh(profile)
@@ -5612,6 +6388,16 @@ async def submit_public_financial_form(
             # The page sent no schedule at all. Filing an empty one would
             # tell the file this borrower owes nobody.
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "No debt schedule was sent")
+        # A submit is the finished answer. A row without its type, rate or
+        # whether it is current sends a lender back to ask; the page says which
+        # rows and which answers, in the message, before anything is filed.
+        # Drafts are never checked — the autosave keeps half-typed rows on purpose.
+        problems = await financial_statements.debt_submit_problems(db, profile, rows, origin="client_form")
+        if problems:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                financial_statements.describe_debt_problems(problems),
+            )
         await financial_statements.save_debt_rows(
             db, profile, rows, origin="client_form"
         )
@@ -5861,7 +6647,13 @@ async def _slot_analyses(
         (
             await db.execute(
                 select(BucketFileAnalysis)
-                .where(BucketFileAnalysis.bucket_file_id.in_([f.id for f in files]))
+                .where(
+                    BucketFileAnalysis.bucket_file_id.in_([f.id for f in files]),
+                    # Queue placeholders (status "pending", including the ones
+                    # the drain has consumed) are not analyses; a forced
+                    # re-analysis adds one newer than the completed row.
+                    BucketFileAnalysis.status != "pending",
+                )
                 .order_by(BucketFileAnalysis.created_at.desc())
             )
         )
@@ -5877,6 +6669,7 @@ async def _slot_analyses(
 
     analyses = [
         {
+            "file_id": str(row.bucket_file_id),
             "classification": row.classification,
             "key_facts": (row.analysis or {}).get("key_facts") or {},
         }
@@ -6001,6 +6794,9 @@ async def financial_forms_status(
         figures_from = "form"
     elif source == "uploaded":
         analyses, pending = await _slot_analyses(db, slot)
+        analyses = financial_cockpit.without_set_aside_schedules(
+            analyses, await financial_cockpit.set_aside_schedule_files(db, profile)
+        )
         figures = _uploaded_debt_figures(analyses)
         if figures is not None:
             row_count, total_monthly, total_balance = figures
@@ -6012,6 +6808,7 @@ async def financial_forms_status(
             label=_FORM_LABEL["debt_schedule"],
             requested=slot is not None,
             satisfied=accepted_debt is not None or bool(slot and slot.status == "uploaded"),
+            voided=(await financial_cockpit.debt_schedule_state(db, profile)).get("voided") if accepted_debt is None else None,
             source=source,
             row_count=row_count,
             total_monthly=total_monthly,
@@ -6051,7 +6848,10 @@ async def _bucket_analyses(db: AsyncSession, bucket_id: UUID) -> list[dict]:
         (
             await db.execute(
                 select(BucketFileAnalysis)
-                .where(BucketFileAnalysis.bucket_file_id.in_([f.id for f in files]))
+                .where(
+                    BucketFileAnalysis.bucket_file_id.in_([f.id for f in files]),
+                    BucketFileAnalysis.status != "pending",  # not a queue placeholder
+                )
                 .order_by(BucketFileAnalysis.created_at.desc())
             )
         )
@@ -6275,6 +7075,137 @@ async def read_debt_schedule_body(
     return await financial_statements.debt_body_for_profile(db, profile, origin="admin")
 
 
+async def _file_debt_schedule(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    user: User,
+    rows: list[dict],
+    *,
+    business_name: str,
+) -> bool:
+    """File the schedule as the document that satisfies the checklist row.
+
+    Renders the PDF from the rows and puts it behind the file's debt schedule
+    slot (the one drafted-form document the slot ever has, refreshed in place),
+    marking the slot received. Returns False, filing nothing, when the file has
+    no such slot. Does not commit.
+    """
+    slot = await _requested_slot(db, profile, "debt_schedule")
+    if slot is None:
+        return False
+    facts = financial_statements.debt_key_facts(rows)
+    await drafted_forms.refresh_form_pdf(
+        db,
+        bucket_id=profile.primary_bucket_id,
+        upload_link_id=None,
+        requested_document=slot,
+        pdf_bytes=dealer_forms_pdf.render_debt_schedule_pdf(
+            business_name=business_name,
+            # The full row, not three columns of it. The borrower was
+            # asked for type, rate, dates, collateral and status; a PDF
+            # that drops them sends a partner back to ask again.
+            rows=rows,
+            total_balance=facts["total_outstanding_balance"],
+            total_monthly=facts["total_monthly_debt_service"],
+        ),
+        file_label="Business Debt Schedule",
+        classification="debt_schedule",
+        key_facts=facts,
+        actor_name=user.name or user.email,
+        actor_email=user.email,
+        summary=(
+            f"Business Debt Schedule completed by {user.name or user.email} "
+            "on the borrower's behalf."
+        ),
+        # Submit is what marks the requirement met; a draft save
+        # refreshes the same document without flipping it.
+        mark_uploaded=True,
+    )
+    return True
+
+
+async def _announce_debt_schedule_filed(db: AsyncSession, profile: ApplicationProfile, user: User) -> None:
+    """The timeline row the desk's own submit writes (see `save_debt_schedule`), for
+    the review's "file it as the schedule"."""
+    await file_events.emit(
+        db,
+        profile=profile,
+        kind="document.received",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title=f"{_FORM_LABEL['debt_schedule']} was submitted",
+        actor=user,
+        target_type="financial_form",
+        target_id=profile.id,
+        meta={"kind": "debt_schedule"},
+    )
+
+
+async def _debt_schedule_filed(db: AsyncSession, profile: ApplicationProfile) -> bool:
+    """Whether the schedule has been filed as the document that satisfies the
+    checklist row: the slot is received and holds our drafted PDF of the rows."""
+    from app.services.financial_version_selection import accepted_debt_schedule_authority
+    if await accepted_debt_schedule_authority(db, profile.id):
+        return True
+    if profile.primary_bucket_id is None:
+        return False
+    slot = await _requested_slot(db, profile, "debt_schedule")
+    if slot is None or slot.status != "uploaded":
+        return False
+    existing = await drafted_forms._existing_drafted_form(
+        db,
+        bucket_id=profile.primary_bucket_id,
+        requested_document_id=slot.id,
+        classification="debt_schedule",
+    )
+    return existing is not None
+
+
+async def _file_schedule_from_rows(
+    db: AsyncSession, profile: ApplicationProfile, user: User
+) -> tuple[bool, str | None]:
+    """File the schedule as it stands on the file, the way the desk's submit does.
+
+    The rows are read back off the file (the form body, so the PDF is the form's
+    own), held to the same seven required answers, and filed through
+    `_file_debt_schedule`. Returns (filed, the sentence for why not): a schedule
+    still missing answers is refused in the words of the 422 the form shows,
+    never filed half-empty.
+    """
+    if profile.primary_bucket_id is None:
+        return False, "This file has no document room to file the schedule into."
+    managed = await debt_schedule_review.workspace_snapshot(db, profile, create=True)
+    if managed is not None:
+        from app.services import financial_workspace as workspace
+        from app.services.financial_version_selection import debt_schedule_completion
+        completion = debt_schedule_completion(managed["body"])
+        if not completion["complete"]:
+            return False, completion["reason"]
+        await workspace.publish_version(db, profile, kind="debt_schedule", family_id=UUID(managed["family_id"]),
+            expected_revision=managed["draft"]["revision"],
+            base_version_id=UUID(managed["draft"]["base_version_id"]) if managed["draft"].get("base_version_id") else None,
+            idempotency_key=f"legacy-review:{managed['family_id']}:{managed['draft']['revision']}", actor=user, submit=True)
+        return True, None
+    body = await financial_statements.debt_body_for_profile(db, profile, origin="admin")
+    rows = financial_statements.debt_rows_from_body(body)
+    if not rows:
+        return False, "There are no lines on the schedule to file."
+    problems = await financial_statements.debt_submit_problems(db, profile, rows, origin="admin")
+    if problems:
+        return False, financial_statements.describe_debt_problems(problems)
+    if await _requested_slot(db, profile, "debt_schedule") is None:
+        # Every file carries the debt schedule; this one has no checklist row
+        # yet. The idempotent request puts it there (and commits its own write).
+        await request_financial_form(profile.id, "debt_schedule", user, db)
+    prefill = await financial_statements.form_prefill(db, profile)
+    filed = await _file_debt_schedule(
+        db, profile, user, rows, business_name=prefill.get("business_name") or "the business"
+    )
+    if not filed:
+        return False, "The debt schedule could not be put on the checklist."
+    await _announce_debt_schedule_filed(db, profile, user)
+    return True, None
+
+
 @router.put("/{profile_id}/financial-forms/debt-schedule")
 async def save_debt_schedule(
     profile_id: UUID,
@@ -6305,39 +7236,22 @@ async def save_debt_schedule(
         # Nothing was sent — an editor that never finished loading. Not a
         # clear, and not something to file.
         return {"row_count": 0, "submitted": False}
+    if payload.submit:
+        # The same completeness the borrower's link holds a submit to. The
+        # desk's editor checks before it sends, so this is the stale-client
+        # path; it refuses the whole save rather than file an incomplete PDF.
+        problems = await financial_statements.debt_submit_problems(db, profile, rows, origin="admin")
+        if problems:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                financial_statements.describe_debt_problems(problems),
+            )
     await financial_statements.save_debt_rows(db, profile, rows, origin="admin")
 
     if payload.submit:
-        slot = await _requested_slot(db, profile, "debt_schedule")
-        if slot is not None:
-            facts = financial_statements.debt_key_facts(rows)
-            await drafted_forms.refresh_form_pdf(
-                db,
-                bucket_id=profile.primary_bucket_id,
-                upload_link_id=None,
-                requested_document=slot,
-                pdf_bytes=dealer_forms_pdf.render_debt_schedule_pdf(
-                    business_name=(payload.body or {}).get("business_name") or "the business",
-                    # The full row, not three columns of it. The borrower was
-                    # asked for type, rate, dates, collateral and status; a PDF
-                    # that drops them sends a partner back to ask again.
-                    rows=rows,
-                    total_balance=facts["total_outstanding_balance"],
-                    total_monthly=facts["total_monthly_debt_service"],
-                ),
-                file_label="Business Debt Schedule",
-                classification="debt_schedule",
-                key_facts=facts,
-                actor_name=user.name or user.email,
-                actor_email=user.email,
-                summary=(
-                    f"Business Debt Schedule completed by {user.name or user.email} "
-                    "on the borrower's behalf."
-                ),
-                      # Submit is what marks the requirement met; a draft save
-                      # refreshes the same document without flipping it.
-                      mark_uploaded=True,
-                  )
+        await _file_debt_schedule(
+            db, profile, user, rows, business_name=(payload.body or {}).get("business_name") or "the business"
+        )
         await file_events.emit(
             db,
             profile=profile,
@@ -6390,6 +7304,148 @@ async def read_business_statement_body(
         "status": statement.status if statement else None,
         "statement_id": statement.id if statement else None,
     }
+
+
+async def _form_answer_files(
+    db: AsyncSession,
+    slot: BucketRequestedDocument | None,
+    *,
+    extra_file_id: UUID | None = None,
+) -> list[FormAnswerFile]:
+    """The documents behind a form: what was uploaded to its slot, and the PDF we
+    drew when it was filled in. Each says which of the two it is."""
+    conditions = []
+    if slot is not None:
+        conditions.append(BucketFile.requested_document_id == slot.id)
+    if extra_file_id is not None:
+        conditions.append(BucketFile.id == extra_file_id)
+    if not conditions:
+        return []
+    files = list(
+        (
+            await db.execute(
+                select(BucketFile)
+                .where(or_(*conditions), BucketFile.deleted_at.is_(None), BucketFile.status == "uploaded")
+                .order_by(BucketFile.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not files:
+        return []
+    analyses = (
+        (
+            await db.execute(
+                select(BucketFileAnalysis)
+                .where(BucketFileAnalysis.bucket_file_id.in_([file.id for file in files]), BucketFileAnalysis.status != "pending")
+                .order_by(BucketFileAnalysis.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    provider_by_file: dict[UUID, str | None] = {}
+    for row in analyses:
+        provider_by_file.setdefault(row.bucket_file_id, row.provider)
+    return [
+        FormAnswerFile(
+            file_id=file.id,
+            file_name=file.file_name,
+            created_at=file.created_at,
+            origin="filled_form" if provider_by_file.get(file.id) == drafted_forms.DRAFTED_FORM_PROVIDER else "uploaded",
+        )
+        for file in files
+    ]
+
+
+@router.get("/{profile_id}/financial-forms/{kind}/answers", response_model=FormAnswersRead)
+async def financial_form_answers(
+    profile_id: UUID,
+    kind: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FormAnswersRead:
+    """What was put on a form, in short: the headline figures, only the lines
+    that were answered, and the file behind it.
+
+    A filled form is read from what we hold. An upload is read from what the AI
+    took off it, and says so, because a typed figure and a scanned one carry
+    different weight. Staff only, like every other route on these forms.
+    """
+    if kind not in form_answers.FORM_LABELS:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    slot = await _requested_slot(db, profile, kind)
+    uploaded = slot is not None and slot.status == "uploaded"
+    stored_file_id: UUID | None = None
+
+    if kind == "pfs":
+        statement = await financial_statements.latest_for_profile(db, profile.id)
+        stored_file_id = statement.bucket_file_id if statement else None
+        if statement is not None and statement.status == "submitted":
+            answers = form_answers.pfs_answers_from_statement(statement)
+        elif uploaded:
+            analyses, _pending = await _slot_analyses(db, slot)
+            answers = form_answers.pfs_answers_from_uploads(_extract_pfs(analyses))
+        elif statement is not None:
+            answers = form_answers.pfs_answers_from_statement(statement)
+        else:
+            answers = form_answers.empty_answers("pfs", "Nothing has been filled in or uploaded yet.")
+    elif kind == "debt_schedule":
+        from app.dealer_os.models import DealerDebt
+
+        rows = list(
+            (
+                await db.execute(
+                    select(DealerDebt)
+                    .where(DealerDebt.profile_id == profile.id, DealerDebt.status == "active")
+                    .order_by(DealerDebt.created_at.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if rows:
+            answers = form_answers.debt_answers_from_rows(rows)
+        elif uploaded:
+            analyses, _pending = await _slot_analyses(db, slot)
+            analyses = financial_cockpit.without_set_aside_schedules(
+                analyses, await financial_cockpit.set_aside_schedule_files(db, profile)
+            )
+            answers = form_answers.debt_answers_from_upload(_extract_debts(analyses))
+        else:
+            answers = form_answers.empty_answers("debt_schedule", "Nothing has been filled in or uploaded yet.")
+    else:
+        statement = await business_statements.latest_for_profile(db, profile.id, kind)
+        stored_file_id = statement.bucket_file_id if statement is not None and getattr(statement, "bucket_file_id", None) else None
+        if statement is not None and statement.status == "submitted":
+            answers = form_answers.business_answers_from_statement(kind, statement)
+        elif uploaded:
+            analyses, _pending = await _slot_analyses(db, slot)
+            wanted = business_statement_schema.SCHEMA_FOR[kind].classification
+            facts = next((item.get("key_facts") for item in analyses if item.get("classification") == wanted), None)
+            answers = form_answers.business_answers_from_upload(kind, facts)
+        elif statement is not None:
+            answers = form_answers.business_answers_from_statement(kind, statement)
+        else:
+            answers = form_answers.empty_answers(kind, "Nothing has been filled in or uploaded yet.")
+
+    answers["files"] = await _form_answer_files(db, slot, extra_file_id=stored_file_id)
+    return FormAnswersRead(**answers)
+
+
+def _extract_pfs(analyses: list[dict]) -> list[dict]:
+    from app.services.public_underwriting_packet_pdf import extract_personal_financial_statements
+
+    return extract_personal_financial_statements(analyses)
+
+
+def _extract_debts(analyses: list[dict]) -> dict | None:
+    from app.services.public_underwriting_packet_pdf import extract_debt_schedule
+
+    return extract_debt_schedule(analyses)
 
 
 @router.put("/{profile_id}/financial-forms/{kind}")
@@ -7048,3 +8104,212 @@ async def request_financial_form(
     )
     await db.commit()
     return {"requested": True, "already": False}
+
+
+@router.post(
+    "/{profile_id}/financial-forms/{kind}/email-link",
+    response_model=RoomDeliveryReceipt,
+)
+async def email_financial_form_link(
+    profile_id: UUID,
+    kind: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RoomDeliveryReceipt:
+    """Put the form on the checklist and email the client the link that fills it in.
+
+    The one click for the desk when a file has no debt schedule (or personal
+    statement, or business statement) yet. See `form_link_email` for what it
+    writes and why a second click does not mail the client twice.
+    """
+    from app.services import form_link_email
+
+    _require_underwriting_actor(user)
+    if kind not in _FORM_SLOT_CATEGORY:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
+    # On the checklist first. Idempotent, and it commits its own write.
+    await request_financial_form(profile_id, kind, user, db)
+    profile = await profiles.load_profile(db, profile_id, user)
+    slot = await _requested_slot(db, profile, kind)
+    delivery = await form_link_email.email_form_link(
+        db, profile=profile, kind=kind, label=_FORM_LABEL[kind], slot=slot, user=user
+    )
+    await db.commit()
+    return _room_delivery_read(delivery)
+
+
+# ---------------------------------------------------------------------------
+# Requirements the desk adds to one file from the library.
+# (app/services/requirement_library.py)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{profile_id}/requirement-library", response_model=RequirementLibraryRead)
+async def get_requirement_library(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RequirementLibraryRead:
+    """Every document and form the desk can add to this file, one per key."""
+    from app.models.application_profile import ApplicationRequirementState
+    from app.schemas.requirement_library import LibraryCategoryRead, LibraryItemRead
+    from app.services import requirement_library as library
+
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    candidates = await library.library_candidates(db)
+    states = (
+        await db.execute(
+            select(ApplicationRequirementState).where(ApplicationRequirementState.profile_id == profile.id)
+        )
+    ).scalars().all()
+    on_file = {
+        state.requirement_key
+        for state in states
+        if not (state.provenance or {}).get("inactive_definition")
+    }
+    added = {entry["key"] for entry in library.clean_entries(profile.extra_requirements)}
+    items = [
+        LibraryItemRead(
+            key=item.key,
+            label=item.label,
+            category=item.category,
+            category_label=library.category_label(item.category),
+            kind=item.kind,
+            required_level=item.required_level,
+            description=item.description,
+            form_kind=item.form_kinds[0] if item.form_kinds else None,
+            form_kinds=list(item.form_kinds),
+            client_visible=item.client_visible,
+            verification_required=item.verification_required,
+            source=item.source,
+            on_file=item.key in on_file or item.key in added,
+            added=item.key in added,
+            source_requirement_id=item.requirement_id,
+        )
+        for item in candidates
+    ]
+    categories = [
+        LibraryCategoryRead(key=key, label=library.category_label(key))
+        for key in dict.fromkeys(item.category for item in candidates)
+    ]
+    return RequirementLibraryRead(profile_id=profile.id, items=items, categories=categories)
+
+
+@router.post("/{profile_id}/requirements", response_model=ApplicationProgramReadiness)
+async def add_application_requirement(
+    profile_id: UUID,
+    payload: RequirementAddWrite,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationProgramReadiness:
+    """Add one library requirement (or a custom one) to this file's checklist.
+
+    Idempotent for a key already added; 409 for a key the file already requires
+    through its policy or a selected program. Returns the refreshed readiness.
+    """
+    from app.services import requirement_library as library
+
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    before = await application_programs.get_program_readiness(db, profile)
+    on_file = {
+        item.requirement_key: {
+            "program_keys": list(item.source_program_keys or []),
+            "policy_keys": list(item.source_policy_keys or []),
+        }
+        for item in before.requirements
+    }
+    plan = await library.plan_add(
+        db,
+        profile,
+        requirement_key=payload.requirement_key,
+        custom=payload.custom.model_dump() if payload.custom else None,
+        required_level=payload.required_level,
+        note=payload.note,
+        user_id=user.id,
+        on_file=on_file,
+        user_name=(user.name or user.email),
+    )
+    if plan.already:
+        await db.commit()
+        return before
+    profile.extra_requirements = library.with_entry(profile, plan.entry)
+    await db.flush()
+    readiness = await application_programs.get_program_readiness(db, profile)
+    label = next(
+        (item.label for item in readiness.requirements if item.requirement_key == plan.entry["key"]), plan.label
+    )
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "requirement.added",
+        f"Added {label} to the checklist",
+        target_type="application_requirement",
+        target_id=profile.id,
+        metadata={
+            "requirement_key": plan.entry["key"],
+            "required_level": plan.entry["required_level"],
+            "custom": plan.entry["custom"],
+            "note": plan.entry.get("note"),
+        },
+    )
+    await file_events.emit(
+        db,
+        profile=profile,
+        kind="requirement.added",
+        visibility=file_events.VISIBILITY_TEAM,
+        title=f"Added {label} to the checklist",
+        actor=user,
+        target_type="application_requirement",
+        target_id=profile.id,
+        meta={"requirement_key": plan.entry["key"]},
+    )
+    await db.commit()
+    return readiness
+
+
+@router.delete("/{profile_id}/requirements/{requirement_key}/added", response_model=ApplicationProgramReadiness)
+async def remove_added_application_requirement(
+    profile_id: UUID,
+    requirement_key: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationProgramReadiness:
+    """Take a requirement the desk added off this file. 404 for anything the
+    desk did not add: a program's or the policy's requirement is waived or set
+    aside instead, never removed."""
+    from app.services import requirement_library as library
+
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    entry = library.find_entry(profile, requirement_key)
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That requirement was not added to this file")
+    profile.extra_requirements = library.without_entry(profile, requirement_key)
+    await db.flush()
+    readiness = await application_programs.get_program_readiness(db, profile)
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "requirement.removed",
+        f"Took {requirement_key} off the checklist",
+        target_type="application_requirement",
+        target_id=profile.id,
+        metadata={"requirement_key": requirement_key},
+    )
+    await file_events.emit(
+        db,
+        profile=profile,
+        kind="requirement.removed",
+        visibility=file_events.VISIBILITY_TEAM,
+        title=f"Took {requirement_key.replace('_', ' ')} off the checklist",
+        actor=user,
+        target_type="application_requirement",
+        target_id=profile.id,
+        meta={"requirement_key": requirement_key},
+    )
+    await db.commit()
+    return readiness

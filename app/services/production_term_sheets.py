@@ -104,6 +104,30 @@ async def defaults(db: AsyncSession, profile: ApplicationProfile, parent: Produc
 
     approved = profile.underwriting_approved_amount or profile.underwriting_term_sheet_amount
     put("approved_amount", float(approved) if approved else None, "underwriting")
+    # The loan the desk modelled on the Financials tab, when it is not recorded yet.
+    plan = profile.financial_plan if isinstance(getattr(profile, "financial_plan", None), dict) else {}
+    if plan.get("new_loan_amount") and not plan.get("terms_ref"):
+        put("approved_amount", pa._num(plan.get("new_loan_amount")), "financial_plan")
+        put("rate_pct", pa._num(plan.get("new_loan_rate_pct")), "financial_plan")
+        put("term_months", int(pa._num(plan.get("new_loan_term_months")) or 0) or None, "financial_plan")
+        structure = str(plan.get("new_loan_structure") or "")
+        io_months = int(pa._num(plan.get("new_loan_interest_only_months")) or 0)
+        term = int(pa._num(plan.get("new_loan_term_months")) or 0)
+        if plan.get("new_loan_interest_only") or structure == "interest_only" or (term and io_months >= term):
+            put("repayment_structure", "interest_only", "financial_plan")
+        elif io_months:
+            put("repayment_structure", "interest_only_then_amortizing", "financial_plan")
+            put("interest_only_months", io_months, "financial_plan")
+        elif structure == "simple_interest" and term:
+            # The dealer sheet has no simple-interest structure: a fixed payment
+            # equal to the schedule's carries the same money.
+            from app.services.loan_schedule import build_schedule
+
+            summary = build_schedule(pa._num(plan.get("new_loan_amount")), pa._num(plan.get("new_loan_rate_pct")), term, structure="simple_interest")
+            if summary:
+                put("repayment_structure", "fixed_payment", "financial_plan")
+                put("periodic_payment", summary["payment_after"], "financial_plan")
+                put("lender_payment_override", True, "financial_plan")
     if "approved_amount" not in out:
         put("approved_amount", pa._num(arrangement.get("requested")), "stage_one")
     put("min_activation_amount", pa._num(arrangement.get("min_activation")), "stage_one")
@@ -265,6 +289,9 @@ async def record_sheet(
     if profile.underwriting_status in {"submitted", "collecting_docs", "in_underwriting"}:
         changes["underwriting_status"] = "term_sheet_provided"
     await apply_underwriting_changes(db, profile, user, changes)
+    from app.services import plan_terms_link
+
+    await plan_terms_link.adopt_for_profile(db, profile, plan_terms_link.recorded_from_production_sheet(sheet), user=user)
     await profiles.log_profile_action(
         db, profile, user, "production_term_sheet.recorded",
         f"Term sheet v{version} recorded: {pa.money(float(body['approved_amount']))} at {float(body.get('rate_pct') or 0):g}% for {int(body['term_months'])} months ({term_structure.structure_label(structure['repayment_structure'])})",
@@ -296,6 +323,9 @@ async def withdraw_sheet(db: AsyncSession, *, profile: ApplicationProfile, user:
     sheet.withdrawn_by_user_id = user.id
     sheet.withdraw_reason = reason
     await db.flush()
+    from app.services import plan_terms_link
+
+    await plan_terms_link.release_for_profile(db, profile, str(sheet.id), user=user)
     await profiles.log_profile_action(
         db, profile, user, "production_term_sheet.withdrawn", f"Term sheet v{sheet.version} withdrawn: {reason}",
         target_type="production_term_sheet", target_id=sheet.id, metadata={"reason": reason},

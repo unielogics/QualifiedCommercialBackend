@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, computed_field, field_validator
 
 from app.schemas.application_profile import (
     ClientEvidenceBankingSummary,
@@ -100,24 +100,78 @@ class BucketRequestedDocumentRead(ORMModel):
     source_file_id: UUID | None = None
     replacement_review_state: ReplacementReviewState | None = None
     template_download_url: str | None = None
+    closed_at: datetime | None = None
+    closed_reason: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def source_kind(self) -> Literal["rule", "system", "manual"]:
+        """Rule-driven, system-supporting, or typed by a person."""
+
+        from app.services.bucket_requests import source_kind
+
+        return source_kind(self.requirement_source)  # type: ignore[return-value]
+
+
+
+# The labels the create-room form offered before the kind became a closed set.
+# Folding them here keeps a dashboard still serving the old form working while
+# its own deploy catches up, and matches what migration 0244 did to the rows.
+LEGACY_BUCKET_TYPE_LABELS: dict[str, str] = {
+    "Loan File": "loan_file",
+    "Underwriting": "underwriting",
+    "UrChoice Dealer Funding": "general",
+    "Partner Package": "general",
+    "Borrower": "general",
+    "Funding Opportunity": "general",
+}
+
+
+def fold_legacy_bucket_type(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped:
+        return None
+    return LEGACY_BUCKET_TYPE_LABELS.get(stripped, stripped)
 
 
 class BucketCreate(BaseModel):
     name: str = Field(min_length=1, max_length=180)
-    bucket_type: str | None = Field(default=None, max_length=80)
+    bucket_type: str | None = Field(
+        default=None,
+        max_length=80,
+        pattern=r"^(general|loan_file|underwriting|application_profile|dealer_ai_intake|main_street_intake|real_estate_ai_intake|mca_refinance_intake|commercial_foreclosure_rescue|business_capital_referral)$",
+    )
     client_name: str | None = Field(default=None, max_length=180)
     purpose: str | None = Field(default=None, max_length=255)
     description: str | None = None
 
+    @field_validator("bucket_type", mode="before")
+    @classmethod
+    def _fold_legacy_bucket_type_labels(cls, value: object) -> object:
+        return fold_legacy_bucket_type(value)
+
+
 
 class BucketUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=180)
-    bucket_type: str | None = Field(default=None, max_length=80)
+    bucket_type: str | None = Field(
+        default=None,
+        max_length=80,
+        pattern=r"^(general|loan_file|underwriting|application_profile|dealer_ai_intake|main_street_intake|real_estate_ai_intake|mca_refinance_intake|commercial_foreclosure_rescue|business_capital_referral)$",
+    )
     client_name: str | None = Field(default=None, max_length=180)
     purpose: str | None = Field(default=None, max_length=255)
     description: str | None = None
     status: str | None = Field(default=None, max_length=40)
     name_sync_mode: Literal["linked", "custom"] | None = None
+
+    @field_validator("bucket_type", mode="before")
+    @classmethod
+    def _fold_legacy_bucket_type_labels(cls, value: object) -> object:
+        return fold_legacy_bucket_type(value)
+
 
 
 class BucketLinkedFileRead(BaseModel):
@@ -153,6 +207,10 @@ class BucketRead(ORMModel):
     ] = "unclassified"
     file_count: int = 0
     uploaded_file_count: int = 0
+    # What the client still owes versus what the archive closed, so the list
+    # can show overload (one live bucket carries 17 open asks) at a glance.
+    open_request_count: int = 0
+    closed_request_count: int = 0
     file_names: list[str] = Field(default_factory=list)
     linked_files: list[BucketLinkedFileRead] = Field(default_factory=list)
 
@@ -226,6 +284,17 @@ class BucketRequestAccessRequest(BaseModel):
     passcode: str = Field(min_length=1, max_length=80)
 
 
+class BucketRequestPasscodeChange(BucketRequestAccessRequest):
+    """The client replaces the PIN we generated with six digits of their own."""
+
+    new_passcode: str = Field(min_length=1, max_length=12)
+
+
+class BucketRequestPasscodeChanged(BaseModel):
+    ok: bool = True
+    passcode_needs_setup: bool = False
+
+
 class BucketRequestUploadedFileRead(ORMModel):
     id: UUID
     bucket_id: UUID
@@ -280,6 +349,8 @@ class BucketRequestAccessRead(BaseModel):
     allow_notes: bool
     can_use_ai_chat: bool = True
     can_view_ai_tasks: bool = True
+    # True until the client replaces the generated PIN with one they chose.
+    passcode_needs_setup: bool = False
     requested_documents: list[BucketRequestedDocumentRead]
     files: list[BucketRequestUploadedFileRead] = []
     ai_summary: dict | None = None
@@ -354,6 +425,24 @@ class BucketFileUrl(BaseModel):
     expires_in: int
 
 
+class BucketFileSelection(BaseModel):
+    """Ids of files in one room, as the operator checked them."""
+
+    file_ids: list[UUID] = Field(min_length=1, max_length=200)
+
+
+class BucketFileRemovalBlocked(BaseModel):
+    file_id: UUID
+    file_name: str
+    reason: str
+
+
+class BucketFilesRemoveResult(BaseModel):
+    removed: list[UUID]
+    blocked: list[BucketFileRemovalBlocked]
+    missing: list[UUID]
+
+
 class BucketFileAnnotationCreate(BaseModel):
     page_number: int = Field(default=1, ge=1)
     x: float = Field(ge=0, le=1)
@@ -382,10 +471,38 @@ class BucketFileAnnotationRead(ORMModel):
     updated_at: datetime
 
 
+class BucketSheetPreviewRead(BaseModel):
+    name: str
+    rows: list[list[str]]
+    total_rows: int
+    total_cols: int
+    truncated_rows: bool = False
+    truncated_cols: bool = False
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BucketFileSheetsRead(BaseModel):
+    """A spreadsheet's visible sheets as rows, parsed server-side by the same
+    reader the AI analysis uses, so the review screen shows what the AI saw.
+    When the file could not be read, `error_code` says why (locked,
+    not_a_workbook, empty, parse_failed) and `sheets` is empty."""
+
+    kind: str | None = None
+    sheet_names: list[str] = Field(default_factory=list)
+    sheets: list[BucketSheetPreviewRead] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    encoding: str | None = None
+    delimiter: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
 class BucketFileReviewRead(BaseModel):
     file: BucketFileRead
     preview_url: str | None
     annotations: list[BucketFileAnnotationRead]
+    # Present only for .xlsx / .xls / .csv files (by name or stored type).
+    sheets: BucketFileSheetsRead | None = None
 
 
 class BucketShareCreate(BaseModel):
@@ -771,6 +888,11 @@ class IntakeChatActionResult(BaseModel):
     download_url: str | None = None
     room_url: str | None = None
     delivery: dict | None = None
+    #: The form or worksheet page a "Complete now" / "Open the worksheet" click
+    #: opens. `room_url` stays populated beside it for clients that predate it.
+    form_url: str | None = None
+    #: The worksheet PIN, when the link carries one. Shown by the page once.
+    access_code: str | None = None
 
 
 class BucketAIChatResponse(BaseModel):
@@ -800,6 +922,18 @@ class BucketAIActionItemRead(ORMModel):
     completed_at: datetime | None
     created_at: datetime
     updated_at: datetime
+
+
+class BucketAIActionItemQueueRead(BucketAIActionItemRead):
+    """An action item seen from the desk's queue rather than from its bucket."""
+
+    bucket_name: str
+    client_name: str | None = None
+    intake_id: UUID | None = None
+    href: str
+    # Only an admin-routed item can be approved without choosing a recipient;
+    # the others need the bucket workspace to pick the share, vendor or uploader.
+    approvable_here: bool = True
 
 
 class BucketAIActionItemCreate(BaseModel):

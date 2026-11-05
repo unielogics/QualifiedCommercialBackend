@@ -144,11 +144,9 @@ async def inspect_inventory(db, profile) -> Inventory:
 
 async def process_profile(db, profile, *, apply: bool = False, resolver=None) -> dict:
     if apply:
-        from sqlalchemy import select
+        from app.services.financial_workspace import lock_financial_profile
 
-        from app.models.application_profile import ApplicationProfile
-
-        await db.execute(select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update())
+        await lock_financial_profile(db, profile)
     inventory = await inspect_inventory(db, profile)
     plans = plan_inventory(inventory)
     adopted = []
