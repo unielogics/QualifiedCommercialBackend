@@ -2014,6 +2014,7 @@ def build_cockpit(
     schedule_state: dict[str, Any] | None = None,
     recorded_terms: dict[str, Any] | None = None,
     economics: dict[str, Any] | None = None,
+    schedule_set_aside: set[str] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """The cockpit read model from plain dicts.
@@ -2023,6 +2024,8 @@ def build_cockpit(
     document carries), key_facts, accepted, analyzed_at, period_hint.
     `debts`: the active dos_debts rows as dicts. `proposed_terms`: the loan
     on record (amount, rate_pct, term_months, monthly_payment, source, label).
+    `schedule_set_aside`: ids of debt-schedule files the desk unlinked from the
+    schedule requirement; their lines are not read as the schedule.
     """
     months, accounts = bank_months(analyses, counted_accounts, account_aliases)
     bank = bank_summary(months)
@@ -2039,8 +2042,9 @@ def build_cockpit(
     statement = profit_and_loss(analyses)
     sheet = balance_sheet(analyses)
     rows = debt_rows(debts)
-    document = extract_debt_schedule(_extractor_rows(analyses))
-    documented = documented_debts(analyses)
+    schedule_analyses = without_set_aside_schedules(analyses, schedule_set_aside)
+    document = extract_debt_schedule(_extractor_rows(schedule_analyses))
+    documented = documented_debts(schedule_analyses)
     recurring = recurring_payments(analyses)
     schedule = schedule_block(rows, document, documented, schedule_state)
     service = debt_service(
@@ -2592,6 +2596,7 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
     )
     sheet = await current_term_sheet(db, profile.id)
     schedule_state = await debt_schedule_state(db, profile)
+    set_aside = await set_aside_schedule_files(db, profile)
     recorded_terms, proposed_terms = await recorded_terms_for_profile(db, profile, sheet)
     cockpit = build_cockpit(
         analyses,
@@ -2608,6 +2613,7 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
             "origination_points": getattr(profile, "forecast_fee_points", None),
             "consulting_fee": getattr(profile, "forecast_consulting_fee", None),
         },
+        schedule_set_aside=set_aside,
     )
     cockpit["profile_id"] = str(profile.id)
     return cockpit
@@ -2631,6 +2637,61 @@ async def _declaration(
         "by_user_id": str(user_id) if user_id else None,
         "at": _iso(at),
     }
+
+
+async def set_aside_schedule_files(db: AsyncSession, profile: ApplicationProfile) -> set[str]:
+    """Debt-schedule files the desk unlinked, as ids.
+
+    Unlinking a file from the debt schedule requirement only ends its evidence
+    link; the file stays in the room, and the cockpit reads every
+    debt-schedule file in the room. So an unlinked schedule kept feeding the
+    schedule and its totals, and an Excel uploaded to replace it was summed
+    with it. A file is "set aside" when its link to this requirement was
+    removed and no link holds it now (re-linking brings it back). A file that
+    was never linked is read as before.
+    """
+    from app.models.application_profile import ApplicationRequirementEvidence
+
+    rows = (
+        await db.execute(
+            select(ApplicationRequirementEvidence.file_id, ApplicationRequirementEvidence.removed_at)
+            .join(
+                ApplicationRequirementState,
+                ApplicationRequirementState.id == ApplicationRequirementEvidence.requirement_state_id,
+            )
+            .where(
+                ApplicationRequirementState.profile_id == profile.id,
+                ApplicationRequirementState.requirement_key == DEBT_SCHEDULE_REQUIREMENT,
+            )
+        )
+    ).all()
+    linked = {file_id for file_id, removed_at in rows if removed_at is None}
+    unlinked = {file_id for file_id, removed_at in rows if removed_at is not None}
+    return {str(file_id) for file_id in unlinked - linked}
+
+
+def without_set_aside_schedules(
+    analyses: list[dict[str, Any]], set_aside: set[str] | None
+) -> list[dict[str, Any]]:
+    """The analyses with a set-aside file's debt-schedule reading taken out.
+
+    Only that one reading: the same file may also be a payoff letter or carry
+    bank months, and those stay.
+    """
+    if not set_aside:
+        return analyses
+    kept: list[dict[str, Any]] = []
+    for item in analyses:
+        if str(item.get("file_id")) in set_aside and "debt_schedule" in _classes(item):
+            item = {
+                **item,
+                "classifications": sorted(_classes(item) - {"debt_schedule"}),
+                "classification": None
+                if item.get("classification") == "debt_schedule"
+                else item.get("classification"),
+            }
+        kept.append(item)
+    return kept
 
 
 async def debt_schedule_state(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:

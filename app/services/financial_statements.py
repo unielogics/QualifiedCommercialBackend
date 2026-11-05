@@ -541,6 +541,13 @@ ROW_PATCH_FIELDS = (
     "payoff_amount",
     "payment_amount",
     "payment_frequency",
+    # The three answers a lender asks of every line, and whether it is being
+    # paid on time. They were missing here, so a row could be created with
+    # them (the form) but never corrected on the cockpit or by the review.
+    "original_amount",
+    "rate",
+    "factor_rate",
+    "payment_status",
     "count_in_dscr",
     "vendor_key",
     "status",
@@ -565,8 +572,16 @@ def apply_debt_row_patch(row: Any, changes: dict[str, Any]) -> list[str]:
             value = str(value).strip()[:180] or getattr(row, "lender", None)
         if key == "vendor_key":
             value = (str(value).strip()[:60] or None) if value is not None else None
-        if key in {"monthly_payment", "balance", "payoff_amount", "payment_amount"} and value is not None:
+        if key in {"monthly_payment", "balance", "payoff_amount", "payment_amount", "original_amount"} and value is not None:
             value = round(float(value), 2)
+        if key in {"rate", "factor_rate"} and value is not None:
+            # `rate` is a percent a year; a factor ("1.35") belongs in `factor_rate`
+            # and nowhere else, which is why the two are separate keys.
+            value = round(float(value), 3)
+        if key == "payment_status" and value is not None:
+            value = _choice(value, _PAYMENT_STATUS_CHOICES)
+            if value is None:
+                continue  # an unreadable answer leaves the stored one alone
         if getattr(row, key, None) != value:
             setattr(row, key, value)
             changed.append(key)

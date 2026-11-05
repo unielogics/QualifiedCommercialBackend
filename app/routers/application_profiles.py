@@ -164,6 +164,12 @@ from app.schemas.application_profile import (
     WorksheetRowOp,
 )
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
+from app.schemas.debt_schedule_review import (
+    DebtScheduleReviewRead,
+    DebtScheduleReviewResult,
+    DebtScheduleReviewSaved,
+    DebtScheduleReviewWrite,
+)
 from app.schemas.financial_cockpit import (
     AdvanceRead,
     AdvancesRead,
@@ -199,6 +205,7 @@ from app.services import (
     closing_stipulations,
     credit_links,
     dealer_forms_pdf,
+    debt_schedule_review,
     drafted_forms,
     file_events,
     financial_cockpit,
@@ -2675,6 +2682,57 @@ async def restore_debt_schedule(
     )
     await db.commit()
     return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
+
+
+@router.get("/{profile_id}/debt-schedule/review", response_model=DebtScheduleReviewRead)
+async def get_debt_schedule_review(
+    profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DebtScheduleReviewRead:
+    """Every line the file's debt schedule could carry: what the AI read off the
+    uploaded schedule and the rows already on the file, so the desk can take off
+    what is not a loan and answer the interest rate, the amount originally
+    approved and the balance. Staff only, like the rest of the schedule."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    return DebtScheduleReviewRead(**await debt_schedule_review.read_review(db, profile))
+
+
+@router.post("/{profile_id}/debt-schedule/review", response_model=DebtScheduleReviewResult)
+async def apply_debt_schedule_review(
+    profile_id: UUID,
+    payload: DebtScheduleReviewWrite,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DebtScheduleReviewResult:
+    """Save the desk's decisions on the lines: the ones kept become (or update)
+    the file's schedule rows with the answers given, the ones taken off are
+    dismissed (kept as history, never deleted) so they do not return."""
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    # One review at a time per file: a second click waits here and then
+    # meets the rows the first one wrote instead of adding them twice.
+    await db.execute(
+        select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update()
+    )
+    saved = await debt_schedule_review.apply_review(db, profile, user, payload.lines)
+    kept = [line.lender for line in payload.lines if line.keep]
+    taken_off = [line.lender for line in payload.lines if not line.keep]
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "financial_form.debt_schedule_reviewed",
+        f"Reviewed the debt schedule lines: kept {saved['kept']}, took off {len(taken_off)}"
+        f" ({saved['added']} added, {saved['updated']} corrected, {saved['restored']} put back)",
+        target_type="financial_form",
+        target_id=profile.id,
+        metadata={"saved": saved, "kept": kept[:40], "removed": taken_off[:40]},
+    )
+    await db.commit()
+    return DebtScheduleReviewResult(
+        review=DebtScheduleReviewRead(**await debt_schedule_review.read_review(db, profile)),
+        saved=DebtScheduleReviewSaved(**saved),
+    )
 
 
 @router.get("/{profile_id}/advances", response_model=AdvancesRead)
@@ -6474,6 +6532,7 @@ async def _slot_analyses(
 
     analyses = [
         {
+            "file_id": str(row.bucket_file_id),
             "classification": row.classification,
             "key_facts": (row.analysis or {}).get("key_facts") or {},
         }
@@ -6585,6 +6644,9 @@ async def financial_forms_status(
     pending = False
     if source == "uploaded":
         analyses, pending = await _slot_analyses(db, slot)
+        analyses = financial_cockpit.without_set_aside_schedules(
+            analyses, await financial_cockpit.set_aside_schedule_files(db, profile)
+        )
         figures = _uploaded_debt_figures(analyses)
         if figures is not None:
             row_count, total_monthly, total_balance = figures
@@ -7079,6 +7141,9 @@ async def financial_form_answers(
             answers = form_answers.debt_answers_from_rows(rows)
         elif uploaded:
             analyses, _pending = await _slot_analyses(db, slot)
+            analyses = financial_cockpit.without_set_aside_schedules(
+                analyses, await financial_cockpit.set_aside_schedule_files(db, profile)
+            )
             answers = form_answers.debt_answers_from_upload(_extract_debts(analyses))
         else:
             answers = form_answers.empty_answers("debt_schedule", "Nothing has been filled in or uploaded yet.")

@@ -171,6 +171,12 @@ class DebtRowPatch(BaseModel):
     payoff_amount: float | None = Field(default=None, ge=0, le=1_000_000_000)
     payment_amount: float | None = Field(default=None, ge=0, le=1_000_000_000)
     payment_frequency: Literal["daily", "weekly", "biweekly", "monthly"] | None = None
+    #: What the line was approved for, the interest rate (a PERCENT a year; a
+    #: factor such as 1.35 goes in `factor_rate`) and whether it is being paid on time.
+    original_amount: float | None = Field(default=None, ge=0, le=1_000_000_000)
+    rate: float | None = Field(default=None, ge=0, le=999.999)
+    factor_rate: float | None = Field(default=None, ge=1, le=5)
+    payment_status: Literal["current", "delinquent"] | None = None
     count_in_dscr: bool | None = None
     #: The recurring payee (its key) this row is seen as in the statements; "" unlinks.
     vendor_key: str | None = Field(default=None, max_length=60)
