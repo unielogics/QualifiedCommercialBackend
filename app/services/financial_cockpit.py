@@ -1144,6 +1144,7 @@ def debt_service(
     recurring: dict[str, Any] | None = None,
     declared_none: bool = False,
     schedule_authoritative: bool = False,
+    suppress_observed_additions: bool = False,
 ) -> dict[str, Any]:
     """The monthly debt service and where it came from.
 
@@ -1159,7 +1160,7 @@ def debt_service(
     recurring = recurring or {}
     observed_monthly = recurring.get("observed_debt_service_monthly")
     unexplained_observed = 0.0
-    if rows:
+    if rows and not suppress_observed_additions:
         for payee in recurring.get("payees") or []:
             if payee.get("is_debt") and not any(
                 match_names(row["lender"], payee["payee"]) for row in rows
@@ -1167,7 +1168,7 @@ def debt_service(
                 unexplained_observed += payee.get("monthly_average") or 0
     unexplained_observed = round(unexplained_observed, 2)
     counted = [r for r in rows if r["count_in_dscr"] and r["monthly_payment"] is not None]
-    schedule_monthly = round(sum(r["monthly_payment"] for r in counted), 2) if counted or schedule_authoritative else None
+    schedule_monthly = round(sum(r["monthly_payment"] for r in counted), 2) if counted or schedule_authoritative or suppress_observed_additions and rows else None
     document_monthly = _num(document.get("total_monthly_debt_service")) if document else None
     documented_monthly = (
         round(sum(r["monthly_payment"] for r in documented if r["monthly_payment"]), 2)
@@ -1176,12 +1177,12 @@ def debt_service(
     )
     if schedule_authoritative:
         monthly, source = schedule_monthly, "accepted_debt_schedule"
-    elif schedule_monthly and unexplained_observed:
+    elif schedule_monthly is not None and unexplained_observed:
         monthly, source = (
             round(schedule_monthly + unexplained_observed, 2),
             "debt_schedule_rows+bank_observed",
         )
-    elif schedule_monthly:
+    elif schedule_monthly is not None:
         monthly, source = schedule_monthly, "debt_schedule_rows"
     elif document_monthly:
         monthly, source = document_monthly, "debt_schedule_document"
@@ -1203,6 +1204,8 @@ def debt_service(
         "annual": _round(monthly * 12) if monthly is not None else None,
         "source": source,
         "schedule_authoritative": schedule_authoritative,
+        "working_schedule_complete": suppress_observed_additions,
+        "basis_status": "accepted" if schedule_authoritative else "legacy_explicit" if source == "debt_schedule_rows" and all(row.get("origin") != "ai_draft" for row in counted) else "provisional",
         "declared_none": declared_none,
         # The desk declared no debt while the statements show lender debits:
         # the observed figure wins and the declaration is questioned.
@@ -1358,7 +1361,8 @@ def _mode(values: list[str]) -> str | None:
 
 
 def recurring_payments(
-    analyses: list[dict[str, Any]], *, field: str = "recurring_debits", direction: int = -1
+    analyses: list[dict[str, Any]], *, field: str = "recurring_debits", direction: int = -1,
+    limit: int | None = MAX_RECURRING_PAYEES,
 ) -> dict[str, Any]:
     """Every payee (or payer, for credits) the statements move money to or
     from repeatedly, rolled up across months and classified, with the amount
@@ -1496,7 +1500,7 @@ def recurring_payments(
             }
         )
     payees.sort(key=lambda p: (not p["is_debt"], -(p["monthly_average"] or 0)))
-    payees = payees[:MAX_RECURRING_PAYEES]
+    payees = payees[:limit] if limit is not None else payees
     debt = [p for p in payees if p["is_debt"]]
     mca = [p for p in debt if p["kind"] == "merchant_cash_advance"]
     loans = [p for p in debt if p["kind"] != "merchant_cash_advance"]
@@ -2047,6 +2051,7 @@ def build_cockpit(
     schedule_set_aside: set[str] | None = None,
     now: datetime | None = None,
     accepted_schedule: dict[str, Any] | None = None,
+    working_schedule: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The cockpit read model from plain dicts.
 
@@ -2089,6 +2094,16 @@ def build_cockpit(
                           "voided": {"reason": "No outstanding business debt declared in the completed saved schedule.",
                                      "by": accepted_schedule.get("actor_name"), "at": accepted_schedule.get("saved_at")}
                           if no_debt else None}
+    working_body = (working_schedule or {}).get("body") or {}
+    working_rows = financial_version_selection.active_debt_schedule_rows(working_body)
+    reviewed_ids = {item.get("row_id") for item in (working_body.get("observed_debt_reviews") or {}).values() if item.get("status") == "included" and item.get("actor_id")}
+    human_curated = working_body.get("no_debt") is True or bool(working_rows) and all(row.get("origin") != "ai_draft" or str(row.get("id")) in reviewed_ids for row in working_rows)
+    working_complete = bool(working_schedule and human_curated and financial_version_selection.debt_schedule_completion(working_body)["complete"])
+    legacy_explicit = [row for row in debts if row.get("origin") != "ai_draft"]
+    legacy_complete = bool(legacy_explicit and financial_version_selection.debt_schedule_completion({"debts": legacy_explicit})["complete"])
+    curated = legacy_complete
+    if curated and accepted_schedule is None:
+        debts = [row for row in debts if row.get("origin") != "ai_draft"]
     rows = debt_rows(debts)
     schedule_analyses = without_set_aside_schedules(analyses, schedule_set_aside)
     document = extract_debt_schedule(_extractor_rows(schedule_analyses))
@@ -2103,7 +2118,10 @@ def build_cockpit(
     service = debt_service(
         rows, document, documented, recurring, declared_none=schedule["status"] == "voided",
         schedule_authoritative=accepted_schedule is not None,
+        suppress_observed_additions=curated,
     )
+    service["working_schedule_complete"] = working_complete
+    service["observed_additions_suppressed"] = curated
     if accepted_schedule is not None:
         service["version_id"] = accepted_schedule.get("version_id")
         schedule["version_id"] = accepted_schedule.get("version_id")
@@ -2115,6 +2133,17 @@ def build_cockpit(
     plan_record = plans.normalize_plan(plan)
     debt_block = {"rows": rows, "documented": documented, "service": service}
     obligations = plans.obligations(debt_block, recurring)
+    confirmed_ids = {row["id"] for row in obligations}
+    unresolved_selections = [key for key in plan_record.get("retire", []) if key not in confirmed_ids]
+    review = None
+    if working_schedule is not None:
+        from types import SimpleNamespace
+
+        from app.services import financial_debt_review
+
+        published = SimpleNamespace(id=accepted_schedule.get("version_id"), body=accepted_schedule.get("body")) if accepted_schedule else None
+        review = financial_debt_review.compare(working_schedule, analyses, accounts, account_aliases, published)
+        review["unresolved_previous_selections"] = unresolved_selections
     evaluation = plans.evaluate_plan(
         plan_record,
         obligations_list=obligations,
@@ -2195,9 +2224,11 @@ def build_cockpit(
             "reconciliation": reconciliation,
             "obligations": obligations,
             "schedule": schedule,
+            "review": review,
         },
         "dscr": dscr,
         "plan": {
+            "unresolved_previous_selections": unresolved_selections,
             "record": plan_record,
             "evaluation": evaluation,
             "levers": levers,
@@ -2212,6 +2243,8 @@ def build_cockpit(
         "notes": _notes(coverage, bank, service, proposed, years, statement)
         + schedule_notes(schedule, service),
     }
+    if unresolved_selections:
+        cockpit["notes"].append("Some saved payoff selections refer to unconfirmed or unavailable obligations. Review and add or link the obligations before using those selections.")
 
     # The terms the package and the listing speak of, with the schedule and
     # the principal at risk; and, for the desk only, what the deal costs the
@@ -2658,6 +2691,9 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
     set_aside = await set_aside_schedule_files(db, profile)
     recorded_terms, proposed_terms = await recorded_terms_for_profile(db, profile, sheet)
     accepted_version = await financial_version_selection.accepted_debt_schedule_snapshot(db, profile.id)
+    from app.services.financial_debt_review import working_snapshot
+
+    working_schedule = await working_snapshot(db, profile)
     cockpit = build_cockpit(
         analyses,
         _debt_dicts(debts),
@@ -2677,6 +2713,7 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
         accepted_schedule={"body": accepted_version.body, "key_facts": accepted_version.key_facts,
                            "version_id": str(accepted_version.id), "saved_at": accepted_version.created_at.isoformat(),
                            "actor_name": accepted_version.actor_name} if accepted_version is not None else None,
+        working_schedule=working_schedule,
     )
     cockpit["profile_id"] = str(profile.id)
     return cockpit
