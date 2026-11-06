@@ -47,8 +47,12 @@ from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.schemas.operator_file import (
+    AttentionAction,
+    AttentionActionResult,
+    AttentionHistory,
     AttentionKind,
     AttentionQueue,
+    AttentionView,
     BucketIntakeLinkOption,
     BucketIntakeLinkOptions,
     BucketIntakeLinkRead,
@@ -2164,6 +2168,15 @@ async def _activities_for(row: UnifiedFileRow, db: AsyncSession) -> list[Unified
     return activities[:150]
 
 
+@router.get("/attention/history", response_model=AttentionHistory)
+async def attention_history(user: CurrentUser, item_key: str = Query(..., min_length=1, max_length=120),
+    limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db)) -> AttentionHistory:
+    from app.services.attention_controls import history
+
+    return await history(db, key=item_key, limit=limit, offset=offset, actor=user)
+
+
 @router.get("/{source_kind}/{source_id}", response_model=UnifiedFileDetail)
 async def get_operator_file(
     source_kind: str,
@@ -2764,9 +2777,19 @@ async def get_attention_queue(
     offset: int = Query(0, ge=0),
     kind: AttentionKind | None = Query(None),
     q: str | None = Query(None, max_length=200),
+    view: AttentionView = Query("active"),
 ) -> AttentionQueue:
     """What is stalling on the desk, each row carrying the link that opens its file."""
 
     if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "The attention queue is a desk view")
-    return await attention_queue.load_attention_queue(db, limit=limit, offset=offset, kind=kind, q=q)
+    return await attention_queue.load_attention_queue(db, limit=limit, offset=offset, kind=kind, q=q, view=view)
+
+
+@router.post("/attention/actions", response_model=AttentionActionResult)
+async def attention_action(payload: AttentionAction, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> AttentionActionResult:
+    from app.services.attention_controls import apply_action
+
+    result = await apply_action(db, payload=payload, actor=user)
+    await db.commit()
+    return result

@@ -14,6 +14,7 @@ from app.deps import get_current_user
 from app.enums import Role
 from app.routers.operator_files import get_attention_queue
 from app.schemas.operator_file import AttentionItem, AttentionQueue
+from app.services import attention_controls
 from app.services import attention_queue as aq
 
 NOW = datetime(2026, 11, 6, 16, 0, tzinfo=UTC)
@@ -28,6 +29,7 @@ def item(number, *, kind="intake_no_files", title="Example Company", detail="Wai
 def source(monkeypatch, items):
     for index, name in enumerate(LOADERS):
         monkeypatch.setattr(aq, name, AsyncMock(return_value=items if index == 0 else []))
+    monkeypatch.setattr(attention_controls, "load_controls", AsyncMock(return_value={}))
 
 
 async def test_default_limit_remains_sixty_but_every_row_beyond_two_hundred_is_reachable(monkeypatch):
@@ -99,11 +101,11 @@ async def test_api_default_and_filter_parameters_are_forwarded_with_new_response
         response = await client.get("/operator-files/attention")
         assert response.status_code == 200
         assert response.json() | {"generated_at": "ignored"} == {
-            "generated_at": "ignored", "items": [], "counts": {}, "total": 0, "filtered_total": 0, "limit": 60, "offset": 0}
-        assert loader.await_args.kwargs == {"limit": 60, "offset": 0, "kind": None, "q": None}
+            "generated_at": "ignored", "items": [], "counts": {}, "total": 0, "filtered_total": 0, "limit": 60, "offset": 0, "hidden_total": 0, "status_counts": {}}
+        assert loader.await_args.kwargs == {"limit": 60, "offset": 0, "kind": None, "q": None, "view": "active"}
         response = await client.get("/operator-files/attention", params={"limit": 5, "offset": 10, "kind": "request_overdue", "q": " Alpha "})
     assert response.status_code == 200
-    assert loader.await_args.kwargs == {"limit": 5, "offset": 10, "kind": "request_overdue", "q": " Alpha "}
+    assert loader.await_args.kwargs == {"limit": 5, "offset": 10, "kind": "request_overdue", "q": " Alpha ", "view": "active"}
 
 
 @pytest.mark.parametrize("params", [{"limit": 0}, {"limit": 201}, {"offset": -1}, {"kind": "unknown"}, {"q": "x" * 201}])
