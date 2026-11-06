@@ -200,6 +200,9 @@ class ApplicationRequirementEvidenceRead(BaseModel):
     ai_reason_code: str | None = None
     ai_explanation: str | None = None
     ai_confidence: str | None = None
+    #: Document recognition is separate from confidence that it satisfies this requirement.
+    detected_classification: str | None = None
+    analysis_confidence: str | None = None
     decision_actor: Literal["ai", "staff", "system"] | None = None
     analysis_id: UUID | None = None
     coverage_contribution: dict = Field(default_factory=dict)

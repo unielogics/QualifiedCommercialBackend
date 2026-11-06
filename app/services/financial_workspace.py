@@ -44,6 +44,7 @@ from app.services.debt_terms import (
 from app.services.financial_version_selection import (
     accepted_debt_schedule_snapshot,
     debt_schedule_completion,
+    is_accepted_debt_schedule_version,
 )
 
 KINDS = sheet_layout.KINDS
@@ -472,6 +473,9 @@ async def load_workspace(db: AsyncSession, profile: ApplicationProfile, *, kind:
 
     versions = list((await db.execute(select(FinancialFormVersion).where(FinancialFormVersion.family_id == family.id).order_by(FinancialFormVersion.version_number.desc()))).scalars().all())
     current = next((version for version in versions if version.id == family.current_version_id), None)
+    # An original PDF can be current before its rows have been reviewed. It
+    # does not supply accepted schedule figures merely by having a version id.
+    accepted = current if kind == "debt_schedule" and current and is_accepted_debt_schedule_version(current) else None
     body = copy.deepcopy(draft.body)
     visible = active_body(kind, body)
     shape = sheets._layout_for(kind, visible)
@@ -489,7 +493,7 @@ async def load_workspace(db: AsyncSession, profile: ApplicationProfile, *, kind:
         for cell in row["cells"]:
             if cell.get("key") in shape.by_key:
                 cell["path"] = list(shape.by_key[cell["key"]][1].path or ())
-    return {"kind": kind, "family_id": str(family.id), "label": family.label, "body": body, "schema": sheets._schema_for(kind), "worksheet": {"layout": layout, "values": sheet_layout.flatten(kind, visible), "computed": computed}, "draft": {"revision": draft.revision, "base_version_id": str(draft.base_version_id) if draft.base_version_id else None, "updated_at": draft.updated_at.isoformat(), "dirty": current is None or body_hash(body) != current.body_sha256}, "completion": debt_schedule_completion(body) if kind == "debt_schedule" else None, "accepted_completion": debt_schedule_completion(current.body) if kind == "debt_schedule" and current else None, "current_version_id": str(family.current_version_id) if family.current_version_id else None, "versions": [_version_read(version) for version in versions], "families": [{"id": str(item.id), "kind": item.kind, "label": item.label, "current_version_id": str(item.current_version_id) if item.current_version_id else None} for item in await _families(db, profile.id)], "evidence": evidence}
+    return {"kind": kind, "family_id": str(family.id), "label": family.label, "body": body, "schema": sheets._schema_for(kind), "worksheet": {"layout": layout, "values": sheet_layout.flatten(kind, visible), "computed": computed}, "draft": {"revision": draft.revision, "base_version_id": str(draft.base_version_id) if draft.base_version_id else None, "updated_at": draft.updated_at.isoformat(), "dirty": current is None or body_hash(body) != current.body_sha256}, "completion": debt_schedule_completion(body) if kind == "debt_schedule" else None, "accepted_completion": debt_schedule_completion(accepted.body) if accepted else None, "accepted_version_id": str(accepted.id) if accepted else None, "current_version_id": str(family.current_version_id) if family.current_version_id else None, "versions": [_version_read(version) for version in versions], "families": [{"id": str(item.id), "kind": item.kind, "label": item.label, "current_version_id": str(item.current_version_id) if item.current_version_id else None} for item in await _families(db, profile.id)], "evidence": evidence}
 
 
 def _check_revision(draft: FinancialFormDraft, expected_revision: int) -> None:
