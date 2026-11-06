@@ -11,6 +11,7 @@ matches what was recorded, field by field.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 
@@ -22,6 +23,9 @@ DIFFERENCE_LABELS = {
     "term_months": "term",
     "interest_only": "structure",
     "payment_monthly": "payment",
+    "repayment_config": "repayment schedule",
+    "payments_per_year": "payment cadence",
+    "structure": "structure",
 }
 
 
@@ -40,6 +44,7 @@ def recorded_from_client_terms(row: Any) -> dict[str, Any] | None:
         return None
     periods = _num(getattr(row, "payments_per_year", None)) or 12.0
     payment = _num(getattr(row, "periodic_payment", None))
+    repayment_config = deepcopy(getattr(row, "repayment_config", None))
     return {
         "kind": "client_terms",
         "id": str(row.id),
@@ -51,7 +56,9 @@ def recorded_from_client_terms(row: Any) -> dict[str, Any] | None:
         "interest_only": (getattr(row, "loan_structure", None) or "amortizing") == "interest_only",
         "structure": getattr(row, "loan_structure", None) or "amortizing",
         "interest_only_months": int(getattr(row, "interest_only_months", None) or 0),
-        "payment_monthly": round(payment * periods / 12.0, 2) if payment is not None else None,
+        "repayment_config": repayment_config,
+        "payments_per_year": periods,
+        "payment_monthly": round(float(row.annual_new_debt_service) / 12, 2) if repayment_config is not None else round(payment * periods / 12.0, 2) if payment is not None else None,
         "treatment": str(getattr(row, "debt_service_treatment", None) or "additive"),
         "retained_annual_debt_service": _num(getattr(row, "retained_annual_debt_service", None)),
     }
@@ -70,20 +77,28 @@ def recorded_from_production_sheet(sheet: Any) -> dict[str, Any] | None:
     io_months = int(_num(extra.get("interest_only_months")) or 0)
     term = int(sheet.term_months) if sheet.term_months else None
     fully_io = structure in {"interest_only", "revolving_interest_only"}
+    repayment_config = deepcopy(extra.get("repayment_config"))
+    advanced = None
+    if repayment_config is not None:
+        from app.services.production_term_sheets import sheet_structure
+
+        advanced = sheet_structure(sheet)
     return {
         "kind": "production_term_sheet",
         "id": str(sheet.id),
         "version": int(sheet.version),
         "label": f"Term sheet v{sheet.version}: {sheet.funding_party_name}",
-        "amount": _num(sheet.approved_amount),
+        "amount": _num(advanced.get("payment_basis_amount")) if advanced else _num(sheet.approved_amount),
         "rate_pct": _num(sheet.rate_pct),
         "term_months": term,
         "interest_only": fully_io,
-        "structure": "interest_only" if fully_io else "amortizing",
+        "structure": "interest_only" if fully_io else "simple_interest" if structure == "simple_interest" else "amortizing",
         "interest_only_months": (term or 0)
         if fully_io
-        else (io_months if structure == "interest_only_then_amortizing" else 0),
-        "payment_monthly": _num(sheet.monthly_debt_service),
+        else (io_months if structure == "interest_only_then_amortizing" or structure == "simple_interest" and repayment_config is not None else 0),
+        "repayment_config": repayment_config,
+        "payments_per_year": advanced.get("payments_per_year") if advanced else 12,
+        "payment_monthly": advanced.get("monthly_program_coverage_amount") if advanced else _num(sheet.monthly_debt_service),
         "treatment": str(extra.get("debt_service_treatment") or "additive"),
         "retained_annual_debt_service": _num(extra.get("retained_annual_debt_service")),
     }
@@ -107,12 +122,16 @@ def adopt(
             "new_loan_structure": recorded.get("structure")
             or ("interest_only" if recorded.get("interest_only") else "amortizing"),
             "new_loan_interest_only_months": int(recorded.get("interest_only_months") or 0),
+            "new_loan_repayment_config": deepcopy(recorded.get("repayment_config")),
+            "new_loan_payments_per_year": recorded.get("payments_per_year") if recorded.get("repayment_config") is not None else None,
             "terms_ref": {
                 "kind": recorded.get("kind"),
                 "id": recorded.get("id"),
                 "version": recorded.get("version"),
                 "label": recorded.get("label"),
                 "adopted_at": datetime.now(UTC).isoformat(),
+                "treatment": recorded.get("treatment"),
+                "retained_annual_debt_service": recorded.get("retained_annual_debt_service"),
             },
         }
     )
@@ -148,6 +167,8 @@ def release(plan: dict[str, Any] | None, recorded_id: str | None = None) -> dict
         "new_loan_amount",
         "new_loan_rate_pct",
         "new_loan_term_months",
+        "new_loan_repayment_config",
+        "new_loan_payments_per_year",
     ):
         out[key] = None
     out["new_payment_source"] = None
@@ -176,7 +197,10 @@ def terms_link(
             "rate_pct": _num(loan.get("rate_pct")),
             "term_months": loan.get("term_months"),
             "interest_only": bool(loan.get("interest_only")),
+            "structure": loan.get("structure"),
             "payment_monthly": _num(payment),
+            "repayment_config": deepcopy(loan.get("repayment_config")),
+            "payments_per_year": loan.get("payments_per_year") if loan.get("repayment_config") is not None else None,
         }
         if loan or payment
         else None
@@ -190,9 +214,16 @@ def terms_link(
         state, differences = "recorded_not_in_plan", []
     else:
         differences = []
-        for key in ("amount", "rate_pct", "term_months", "interest_only", "payment_monthly"):
+        advanced_keys = ("payments_per_year", "structure") if loan.get("repayment_config") is not None or recorded.get("repayment_config") is not None else ()
+        for key in ("amount", "rate_pct", "term_months", "interest_only", "payment_monthly", "repayment_config", *advanced_keys):
             a, b = plan_loan.get(key), recorded.get(key)
-            if key == "interest_only":
+            if key == "repayment_config":
+                same = a == b
+            elif key == "structure":
+                same = a == b
+            elif key == "payments_per_year":
+                same = (a or 12) == (b or 12)
+            elif key == "interest_only":
                 same = bool(a) == bool(b) and int(loan.get("interest_only_months") or 0) == int(
                     recorded.get("interest_only_months") or 0
                 )
@@ -252,6 +283,8 @@ async def adopt_for_profile(
                     "term_months",
                     "interest_only",
                     "payment_monthly",
+                    "repayment_config",
+                    "payments_per_year",
                     "treatment",
                 )
             }

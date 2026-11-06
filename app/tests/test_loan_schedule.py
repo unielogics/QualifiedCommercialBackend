@@ -208,9 +208,10 @@ def test_client_terms_price_on_the_schedule_and_keep_their_structure() -> None:
         loan_structure=None,
         interest_only_months=6,
     )
-    assert block == {
+    assert {key: block[key] for key in ("loan_structure", "interest_only_months", "interest_only_payment", "structure_label")} == {
         "loan_structure": "simple_interest",
         "interest_only_months": 6,
         "interest_only_payment": 2000.0,
         "structure_label": "Simple interest",
     }
+    assert block["repayment_config"] is None and block["schedule"] is None

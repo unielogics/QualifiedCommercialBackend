@@ -14,6 +14,7 @@ daily-balance interest.
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 from datetime import date, datetime
 from typing import Any
 
@@ -28,6 +29,7 @@ FACILITY_KINDS: tuple[str, ...] = (
 )
 REPAYMENT_STRUCTURES: tuple[str, ...] = (
     "fully_amortizing",
+    "simple_interest",
     "interest_only",
     "interest_only_then_amortizing",
     "balloon",
@@ -85,6 +87,7 @@ STRUCTURE_FIELDS: tuple[str, ...] = (
     "interest_only_months",
     "amortization_months",
     "balloon_amount",
+    "repayment_config",
     "periodic_payment",
     "post_io_payment",
     "post_io_monthly_equivalent",
@@ -117,6 +120,7 @@ def is_level_payment(structure: dict[str, Any], *, term_months: int) -> bool:
     """Return whether the compatibility payment is a fixed monthly level payment."""
     return bool(
         structure.get("repayment_structure") == "fully_amortizing"
+        and structure.get("repayment_config") is None
         and not structure.get("lender_payment_override")
         and int(structure.get("amortization_months") or term_months) == int(term_months)
         and structure.get("payment_frequency") == "monthly"
@@ -280,6 +284,7 @@ def normalize_input(raw: dict[str, Any], *, entered_on: date | None = None) -> d
     term_months = max(0, _integer(raw.get("term_months")) or 0)
     io_months = max(0, _integer(_pick(raw, "interest_only_months")) or 0)
     amortization_months = _integer(_pick(raw, "amortization_months"))
+    repayment_config = deepcopy(raw["repayment_config"] if "repayment_config" in raw else (raw.get("extra") or {}).get("repayment_config"))
     # Treat repayment_structure as the discriminator. Values left behind after
     # switching the drawer from one structure to another must not change the
     # economics of the newly selected structure.
@@ -291,6 +296,8 @@ def normalize_input(raw: dict[str, Any], *, entered_on: date | None = None) -> d
         amortization_months = None
     elif repayment == "interest_only_then_amortizing":
         amortization_months = amortization_months or max(0, term_months - io_months)
+    elif repayment == "simple_interest" and repayment_config is not None:
+        pass  # The configured flat-interest schedule retains its IO phase.
     else:
         io_months = 0
         if repayment in {"fixed_payment", "custom"}:
@@ -327,6 +334,7 @@ def normalize_input(raw: dict[str, Any], *, entered_on: date | None = None) -> d
         "interest_only_months": io_months,
         "amortization_months": amortization_months,
         "balloon_amount": explicit_balloon,
+        "repayment_config": repayment_config,
         "periodic_payment": _number(_pick(raw, "periodic_payment")),
         "post_io_payment": _number(_pick(raw, "post_io_payment")),
         "monthly_equivalent_payment": _number(_pick(raw, "monthly_equivalent_payment")),
@@ -358,6 +366,8 @@ def normalize_input(raw: dict[str, Any], *, entered_on: date | None = None) -> d
 def calculate(raw: dict[str, Any], *, entered_on: date | None = None) -> dict[str, Any]:
     """Calculate payment snapshots, debt service, balloon, and total repayment."""
     values = normalize_input(raw, entered_on=entered_on)
+    if values["repayment_config"] is not None:
+        return _configured_schedule(values)
     structure = values["repayment_structure"]
     ppy = float(values["payments_per_year"] or 0)
     term_count = period_count(int(values["term_months"] or 0), ppy)
@@ -460,6 +470,42 @@ def calculate(raw: dict[str, Any], *, entered_on: date | None = None) -> dict[st
     return values
 
 
+def _configured_schedule(values: dict[str, Any]) -> dict[str, Any]:
+    """Opt-in bridge; all historical/null-config pricing remains unchanged."""
+    from app.services.loan_schedule import build_schedule
+
+    repayment = values["repayment_structure"]
+    if repayment in {"fixed_payment", "custom"} or values["lender_payment_override"]:
+        raise ValueError("Flexible repayment events cannot be combined with a fixed/custom lender payment override. Use a calculated amortizing or interest-only schedule.")
+    kind = "interest_only" if repayment in {"interest_only", "revolving_interest_only"} else "simple_interest" if repayment == "simple_interest" else "amortizing"
+    schedule = build_schedule(values["payment_basis_amount"], values["effective_rate_pct"], values["term_months"],
+        structure=kind, interest_only_months=values["interest_only_months"],
+        periods_per_year=values["payments_per_year"], repayment_config=values["repayment_config"])
+    if schedule is None:
+        raise ValueError("Flexible repayment requires a positive payment basis and a maturity")
+    ppy = schedule["periods_per_year"]
+    initial = schedule["payment_io"] if schedule["payment_io"] is not None else schedule["payment_after"]
+    after = schedule["payment_after"] if schedule["payment_io"] is not None else None
+    values.update({
+        "repayment_config": schedule["repayment_config"],
+        "amortization_months": schedule["repayment_config"].get("amortization_months"),
+        "periodic_payment": initial, "post_io_payment": after,
+        "post_io_monthly_equivalent": round(after * ppy / 12, 2) if after is not None else None,
+        "monthly_equivalent_payment": round(float(initial or 0) * ppy / 12, 2),
+        "monthly_program_coverage_amount": schedule["coverage_payment_monthly"],
+        "monthly_program_coverage_basis": "Peak rolling 12 months of contractual cash due, including scheduled and maturity balloons",
+        "balloon_amount": schedule["balloon"], "payment_count": schedule["periods"],
+        "annual_debt_service": schedule["coverage_annual_debt_service"],
+        "total_repayment": schedule["total_paid"], "financing_cost": schedule["total_interest"],
+        "schedule": {key: value for key, value in schedule.items() if key not in {"rows", "cash_flows"}},
+        "balloon_events": schedule.get("scheduled_balloons", []),
+        "maturity_balance": schedule["balloon"],
+        "first_year_debt_service": schedule["annual_debt_service"],
+        "max_annual_debt_service": schedule["coverage_annual_debt_service"],
+    })
+    return values
+
+
 def frequency_is_legacy_manual(values: dict[str, Any]) -> bool:
     return values.get("repayment_structure") in {"fixed_payment", "custom"} and values.get("payment_frequency") == "monthly"
 
@@ -482,6 +528,8 @@ def validation_errors(values: dict[str, Any]) -> list[str]:
         errors.append("Choose a supported facility kind.")
     if structure not in REPAYMENT_STRUCTURES:
         errors.append("Choose a supported repayment structure.")
+    if structure == "simple_interest" and values.get("repayment_config") is None:
+        errors.append("Production simple-interest pricing requires an explicit flexible repayment configuration.")
     if frequency not in PAYMENT_FREQUENCIES or float(values.get("payments_per_year") or 0) <= 0:
         errors.append("Choose a valid payment frequency; custom cadence requires payments per year.")
     if rate_structure not in RATE_STRUCTURES:
@@ -512,14 +560,14 @@ def validation_errors(values: dict[str, Any]) -> list[str]:
         errors.append("The draw period cannot exceed the facility term.")
     if structure == "interest_only_then_amortizing" and not (0 < io_months < term):
         errors.append("IO-then-amortizing terms require an interest-only period shorter than the term.")
-    if structure == "interest_only_then_amortizing":
+    if structure == "interest_only_then_amortizing" and values.get("repayment_config") is None:
         remaining = max(0, term - io_months)
         amort = values.get("amortization_months")
         if amort is None or int(amort) < remaining:
             errors.append(
                 "The amortization period cannot be shorter than the remaining term after the interest-only phase."
             )
-    if structure == "balloon":
+    if structure == "balloon" and values.get("repayment_config") is None:
         amort = values.get("amortization_months")
         explicit = values.get("balloon_amount")
         remaining = max(0, term - io_months)
@@ -549,7 +597,7 @@ def validation_errors(values: dict[str, Any]) -> list[str]:
     closing = values.get("closing_estimate_days")
     if closing is not None and not 0 <= int(closing) <= 180:
         errors.append("Estimated closing must be between 0 and 180 business days.")
-    if float(values.get("monthly_equivalent_payment") or 0) <= 0:
+    if float(values.get("monthly_equivalent_payment") or 0) <= 0 and values.get("repayment_config") is None:
         errors.append("Enter a positive payment basis, rate, or lender payment; this database cannot store a zero-payment term sheet.")
     if float(values.get("monthly_program_coverage_amount") or 0) <= 0:
         errors.append("Monthly program coverage must be above zero.")
@@ -568,6 +616,7 @@ def stored_extra(existing: dict[str, Any] | None, values: dict[str, Any]) -> dic
 def public_values(raw: dict[str, Any]) -> dict[str, Any]:
     """Normalize a stored row/dict for API, PDF, and delivery summaries."""
     calculated = calculate(raw)
+    calculated.setdefault("balloon_events", [])
     extra = raw.get("extra") if isinstance(raw.get("extra"), dict) else {}
     for key in (
         "dscr_before",
@@ -586,6 +635,7 @@ def public_values(raw: dict[str, Any]) -> dict[str, Any]:
 def structure_label(value: str) -> str:
     return {
         "fully_amortizing": "Fully amortizing",
+        "simple_interest": "Simple interest",
         "interest_only": "Interest only",
         "interest_only_then_amortizing": "Interest only, then amortizing",
         "balloon": "Amortizing with balloon",
@@ -648,7 +698,9 @@ def payment_summary_text(values: dict[str, Any]) -> str:
     def money(amount: Any) -> str:
         return f"${float(amount):,.2f}"
 
-    if structure == "custom" and values.get("custom_payment_description"):
+    if values.get("repayment_config") is not None:
+        description = f"Starting regular payment: {money(periodic)} {cadence}. Later payments follow the configured {values['repayment_config'].get('after_balloon', 'keep_payment').replace('_', ' ')} schedule. Scheduled balloon principal and maturity cash due are shown separately."
+    elif structure == "custom" and values.get("custom_payment_description"):
         description = str(values["custom_payment_description"])
     elif structure == "interest_only_then_amortizing" and post_io is not None:
         description = (

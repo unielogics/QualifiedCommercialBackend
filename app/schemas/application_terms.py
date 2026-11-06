@@ -6,6 +6,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
+from app.schemas.loan_repayment import LoanRepaymentConfig, validate_repayment_config
+
 FunderType = Literal[
     "bank",
     "credit_union",
@@ -36,7 +38,7 @@ class ClientTermsWrite(BaseModel):
     funder_type: FunderType
     funder_name: str | None = Field(default=None, max_length=160)
     repayment_frequency: RepaymentFrequency
-    custom_payments_per_year: int | None = Field(default=None, ge=1, le=365)
+    custom_payments_per_year: float | None = Field(default=None, ge=1, le=366, allow_inf_nan=False)
     custom_repayment_label: str | None = Field(default=None, max_length=80)
     debt_service_treatment: DebtServiceTreatment = "additive"
     retained_annual_debt_service: float | None = Field(default=None, ge=0, le=1_000_000_000)
@@ -45,6 +47,7 @@ class ClientTermsWrite(BaseModel):
     #: three years). interest_only_months: interest-only months before principal.
     loan_structure: Literal["amortizing", "simple_interest", "interest_only"] | None = None
     interest_only_months: int | None = Field(default=None, ge=0, le=480)
+    repayment_config: LoanRepaymentConfig | None = None
     expiration_days: int = Field(ge=1, le=180)
     closing_estimate_days: int = Field(ge=0, le=180)
     co_brand_enabled: bool = True
@@ -73,6 +76,13 @@ class ClientTermsWrite(BaseModel):
             cleaned.append(text)
         return cleaned
 
+    @field_validator("custom_payments_per_year")
+    @classmethod
+    def _stored_cadence_precision(cls, value):
+        if value is not None and abs(value - round(value, 3)) > 1e-9:
+            raise ValueError("Custom payments per year supports up to three decimal places; the saved cadence must match the quote exactly")
+        return value
+
     @model_validator(mode="after")
     def validate_custom_schedule(self) -> ClientTermsWrite:
         if self.repayment_frequency == "custom" and not self.custom_payments_per_year:
@@ -88,6 +98,13 @@ class ClientTermsWrite(BaseModel):
             raise ValueError("Refinance terms require the annual debt service that will remain after payoff (enter 0 for a full payoff)")
         if self.debt_service_treatment != "refinance":
             self.retained_annual_debt_service = None
+        from app.services.application_terms import CADENCE_PERIODS_PER_YEAR
+
+        if self.repayment_config is not None:
+            self.repayment_config = validate_repayment_config(self.repayment_config, self.term_months,
+                structure=self.loan_structure, interest_only_months=self.interest_only_months,
+                periods_per_year=self.custom_payments_per_year if self.repayment_frequency == "custom" else CADENCE_PERIODS_PER_YEAR[self.repayment_frequency],
+                amount=self.amount, rate_pct=self.apr_pct)
         return self
 
 
@@ -115,6 +132,12 @@ class ClientTermsCalculation(BaseModel):
     interest_only_months: int = 0
     interest_only_payment: float | None = None
     structure_label: str | None = None
+    repayment_config: dict | None = None
+    schedule: dict | None = None
+    balloon_events: list[dict] = Field(default_factory=list)
+    maturity_balance: float | None = None
+    first_year_debt_service: float | None = None
+    max_annual_debt_service: float | None = None
 
 
 class ClientTermsRead(BaseModel):
@@ -130,12 +153,13 @@ class ClientTermsRead(BaseModel):
     funder_type: FunderType | None = None
     funder_name: str | None = None
     repayment_frequency: RepaymentFrequency = "monthly"
-    custom_payments_per_year: int | None = None
+    custom_payments_per_year: float | None = None
     custom_repayment_label: str | None = None
     debt_service_treatment: DebtServiceTreatment = "additive"
     retained_annual_debt_service: float | None = None
     loan_structure: Literal["amortizing", "simple_interest", "interest_only"] | None = None
     interest_only_months: int | None = None
+    repayment_config: dict | None = None
     expiration_days: int | None = None
     closing_estimate_days: int | None = None
     co_brand_enabled: bool = True

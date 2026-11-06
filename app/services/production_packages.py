@@ -1474,6 +1474,8 @@ def _term_sheet_read(sheet: ProductionTermSheet, names: dict[UUID, str]) -> Prod
             "rate_index", "rate_index_rate_pct", "rate_margin_pct", "rate_floor_pct", "rate_cap_pct",
             "rate_as_of", "apr_pct", "custom_rate_description", "initial_draw_amount", "payment_basis_amount", "draw_period_months",
             "interest_only_months", "amortization_months", "balloon_amount", "periodic_payment",
+            "repayment_config", "schedule", "balloon_events", "maturity_balance",
+            "first_year_debt_service", "max_annual_debt_service",
             "post_io_payment", "post_io_monthly_equivalent", "monthly_equivalent_payment",
             "monthly_program_coverage_amount",
             "monthly_program_coverage_basis", "lender_payment_override", "custom_payment_description",

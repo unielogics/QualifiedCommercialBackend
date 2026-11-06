@@ -6,9 +6,10 @@ from datetime import date, datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from app.schemas.application_profile import UnifiedAuditEvent
+from app.schemas.loan_repayment import LoanRepaymentConfig
 
 
 class ProductionPackageResolve(BaseModel):
@@ -243,6 +244,7 @@ class ProductionCapabilities(BaseModel):
 ProductionFacilityKind = Literal["term_loan", "revolving_loc", "heloc", "hybrid", "other"]
 ProductionRepaymentStructure = Literal[
     "fully_amortizing",
+    "simple_interest",
     "interest_only",
     "interest_only_then_amortizing",
     "balloon",
@@ -260,6 +262,7 @@ ProductionDebtServiceTreatment = Literal["additive", "refinance"]
 
 
 class ProductionTermSheetBody(BaseModel):
+    expected_version: int | None = Field(default=None, ge=0)
     funding_party_kind: Literal["Sponsor", "Qualified Commercial LLC", "Lender"]
     lender_id: UUID | None = None
     funding_party_name: str = Field(default="", max_length=180)
@@ -297,6 +300,7 @@ class ProductionTermSheetBody(BaseModel):
     interest_only_months: int | None = Field(default=None, ge=0, le=600)
     amortization_months: int | None = Field(default=None, ge=1, le=1200)
     balloon_amount: float | None = Field(default=None, ge=0)
+    repayment_config: LoanRepaymentConfig | None = None
     periodic_payment: float | None = Field(default=None, ge=0)
     post_io_payment: float | None = Field(default=None, ge=0)
     monthly_equivalent_payment: float | None = Field(default=None, ge=0)
@@ -317,6 +321,13 @@ class ProductionTermSheetBody(BaseModel):
     conditions: str | None = Field(default=None, max_length=4000)
     notes: str | None = Field(default=None, max_length=4000)
     extra: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _repayment_from_extra(cls, raw):
+        if isinstance(raw, dict) and "repayment_config" not in raw and isinstance(raw.get("extra"), dict) and "repayment_config" in raw["extra"]:
+            return {**raw, "repayment_config": raw["extra"]["repayment_config"]}
+        return raw
 
 
 class ProductionTermSheetRead(BaseModel):
@@ -356,6 +367,12 @@ class ProductionTermSheetRead(BaseModel):
     interest_only_months: int = 0
     amortization_months: int | None = None
     balloon_amount: float = 0
+    repayment_config: dict | None = None
+    schedule: dict | None = None
+    balloon_events: list[dict] = Field(default_factory=list)
+    maturity_balance: float | None = None
+    first_year_debt_service: float | None = None
+    max_annual_debt_service: float | None = None
     periodic_payment: float | None = None
     post_io_payment: float | None = None
     post_io_monthly_equivalent: float | None = None

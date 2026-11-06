@@ -30,29 +30,9 @@ def effective_rate_pct(
     """The nominal annual rate (periodic IRR × periods a year, the same
     convention as the stated APR) at which the payments repay the proceeds.
     None when it cannot be found (no proceeds, no payments)."""
-    if proceeds <= 0 or not payments:
-        return None
-    flows = list(payments)
-    if balloon:
-        flows[-1] = flows[-1] + balloon
+    from app.services.loan_schedule import effective_rate_pct as schedule_effective_rate
 
-    def present(rate: float) -> float:
-        return sum(p / (1.0 + rate) ** (i + 1) for i, p in enumerate(flows)) - proceeds
-
-    if sum(flows) <= proceeds:
-        return 0.0
-    lo, hi = 0.0, 1.0
-    if present(hi) > 0:  # more than 100% a period: out of any sensible range
-        return None
-    for _ in range(200):
-        mid = (lo + hi) / 2.0
-        if present(mid) > 0:
-            lo = mid
-        else:
-            hi = mid
-        if hi - lo < 1e-10:
-            break
-    return round((lo + hi) / 2.0 * periods_per_year * 100.0, 2)
+    return schedule_effective_rate(proceeds, payments, balloon, periods_per_year)
 
 
 def internal_economics(
@@ -109,14 +89,15 @@ def internal_economics(
         "words": "",
     }
     if rows and loan_amount:
-        payments = [float(r.get("payment") or 0.0) for r in rows]
-        balloon = float(schedule.get("balloon") or 0.0)
+        from app.services.loan_schedule import schedule_cash_flows
+
+        payments = schedule_cash_flows({**schedule, "rows": rows})
         ppy = float(schedule.get("periods_per_year") or 12.0)
         out["structure_rate_pct"] = effective_rate_pct(
-            loan_amount, payments, balloon=balloon, periods_per_year=ppy
+            loan_amount, payments, periods_per_year=ppy
         )
         out["effective_rate_pct"] = effective_rate_pct(
-            loan_amount - total_fees, payments, balloon=balloon, periods_per_year=ppy
+            loan_amount - total_fees, payments, periods_per_year=ppy
         )
     words: list[str] = []
     if total_fees and loan_amount:
