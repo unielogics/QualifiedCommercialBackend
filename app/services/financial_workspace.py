@@ -344,8 +344,10 @@ def _identity(kind: str, body: dict, statement: Any = None) -> dict:
 
 
 async def _baseline_files(db: AsyncSession, profile: ApplicationProfile, kind: str, statement: Any, identity: dict) -> list[tuple[Any, Any]]:
+    from app.services.document_version_selection import current_document_file_clause
+
     file_id = getattr(statement, "bucket_file_id", None)
-    query = select(BucketFile, BucketFileAnalysis).join(BucketFileAnalysis, BucketFileAnalysis.bucket_file_id == BucketFile.id).where(BucketFile.bucket_id == profile.primary_bucket_id, BucketFile.deleted_at.is_(None), BucketFileAnalysis.status == "completed", BucketFileAnalysis.classification == CLASSIFICATIONS[kind])
+    query = select(BucketFile, BucketFileAnalysis).join(BucketFileAnalysis, BucketFileAnalysis.bucket_file_id == BucketFile.id).where(BucketFile.bucket_id == profile.primary_bucket_id, BucketFile.deleted_at.is_(None), BucketFileAnalysis.status == "completed", BucketFileAnalysis.classification == CLASSIFICATIONS[kind], current_document_file_clause(BucketFile.id))
     if kind == "pfs" and file_id:
         query = query.where(BucketFile.id == file_id)
     result = list((await db.execute(query.order_by(BucketFile.created_at, BucketFileAnalysis.created_at.desc()))).all())
@@ -478,13 +480,13 @@ async def source_files_for_profile(db: AsyncSession, profile: ApplicationProfile
     files = []
     if profile.primary_bucket_id:
         files = list((await db.execute(select(BucketFile).where(
-            BucketFile.bucket_id == profile.primary_bucket_id, BucketFile.status == "uploaded", BucketFile.deleted_at.is_(None),
+            BucketFile.bucket_id == profile.primary_bucket_id, BucketFile.status.in_(["uploaded", "rejected"]), BucketFile.deleted_at.is_(None),
         ).order_by(BucketFile.created_at.desc()))).scalars().all())
     intake_id = getattr(profile, "intake_id", None)
     if intake_id:
         files.extend(await selected_files_for_intake(db, intake_id))
     return list({file.id: file for file in files if getattr(file, "deleted_at", None) is None
-                 and getattr(file, "status", "uploaded") == "uploaded" and not provenance.is_internal_package_output(file)}.values())
+                 and getattr(file, "status", "uploaded") in {"uploaded", "rejected"} and not provenance.is_internal_package_output(file)}.values())
 
 
 async def source_file_for_profile(db: AsyncSession, profile: ApplicationProfile, file_id: UUID) -> BucketFile:
@@ -517,7 +519,11 @@ async def load_workspace(db: AsyncSession, profile: ApplicationProfile, *, kind:
     visible = active_body(kind, body)
     shape = sheets._layout_for(kind, visible)
     files = await source_files_for_profile(db, profile)
-    evidence = [{"file_id": str(file.id), "file_name": file.file_name, "classification": None} for file in files]
+    from app.services.document_version_selection import linked_document_versions
+
+    document_versions = await linked_document_versions(db, files)
+    evidence = [{"file_id": str(file.id), "file_name": file.file_name, "classification": None,
+                 **document_versions.get(str(file.id), {})} for file in files]
     facts = facts_for_body(kind, visible)
     computed = sheets._computed(kind, visible)
     aliases = {"total_balance": "total_outstanding_balance", "total_monthly_payment": "total_monthly_debt_service"}
@@ -548,6 +554,7 @@ async def validate_debt_scope(db: AsyncSession, profile: ApplicationProfile, bod
         raise HTTPException(404, "Debt row not found")
     by_id = {str(row["id"]): row for row in rows}
     file_ids = set()
+    selected_payoff_ids = set()
     document_ids = set()
     for row in rows:
         if row.get("origin", "admin") not in {"admin", "ai_draft", "client_form", "field_desk"}:
@@ -585,6 +592,7 @@ async def validate_debt_scope(db: AsyncSession, profile: ApplicationProfile, bod
                 raise HTTPException(422, "This document is already linked to the obligation")
             seen_links.add(identity)
             if link.get("is_current"):
+                selected_payoff_ids.add(_uuid(link["file_id"]))
                 current_payoffs += 1
                 if link["role"] != "payoff" or current_payoffs > 1:
                     raise HTTPException(422, "Choose exactly one current payoff letter")
@@ -612,6 +620,11 @@ async def validate_debt_scope(db: AsyncSession, profile: ApplicationProfile, bod
     if file_ids:
         for file_id in file_ids:
             await source_file_for_profile(db, profile, file_id)
+    if selected_payoff_ids:
+        from app.services.financial_debt_actions import reviewed_payoff_source_ids
+
+        if selected_payoff_ids != await reviewed_payoff_source_ids(db, selected_payoff_ids):
+            raise HTTPException(409, "Review and select the latest usable payoff document before saving. Failed, rejected, or mismatched sources cannot be used.")
 
 
 async def stage_draft(db: AsyncSession, profile: ApplicationProfile, family: FinancialFormFamily, draft: FinancialFormDraft, body: dict, *, actor: Any = None) -> FinancialFormDraft:
@@ -923,9 +936,11 @@ async def current_financial_file_ids(db: AsyncSession, file_ids: Iterable[UUID])
     return (ids - historical) | (ids & current)
 
 
-async def filter_current_files(db: AsyncSession, files: list[BucketFile]) -> list[BucketFile]:
+async def filter_current_files(db: AsyncSession, files: list[BucketFile], *, include_pending_document_versions: bool = False) -> list[BucketFile]:
+    from app.services.document_version_selection import filter_document_files
+
     selected = await current_financial_file_ids(db, (file.id for file in files))
-    return [file for file in files if file.id in selected]
+    return await filter_document_files(db, [file for file in files if file.id in selected], usable=not include_pending_document_versions)
 
 
 def _source_identity(kind: str, facts: dict) -> dict:
@@ -1477,6 +1492,10 @@ async def propose_import(db: AsyncSession, profile: ApplicationProfile, *, kind:
     file = await db.get(BucketFile, file_id)
     if file is None or file.bucket_id != profile.primary_bucket_id or file.deleted_at is not None or file.status != "uploaded":
         raise HTTPException(404, "Financial source file not found")
+    from app.services.document_version_selection import document_file_ids
+
+    if file.id not in await document_file_ids(db, [file.id], usable=False):
+        raise HTTPException(409, "A newer document version exists. Review the latest version instead.")
     workbook = kind == "real_estate_schedule" and (file.file_name.lower().endswith(".xlsx") or file.content_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     if not workbook and file.content_type != "application/pdf" and not file.file_name.lower().endswith(".pdf"):
         raise HTTPException(422, "Choose an uploaded PDF for field mapping")
@@ -1640,6 +1659,10 @@ async def apply_import(db: AsyncSession, profile: ApplicationProfile, import_id:
                 raise HTTPException(409, "The real estate source changed after mapping. Read its current fields again before applying them")
     if file.content_hash and file.content_hash != imported.content_hash:
         raise HTTPException(409, "The mapped source changed. Remap the current PDF.")
+    from app.services.document_version_selection import document_file_ids
+
+    if file.id not in await document_file_ids(db, [file.id], usable=False):
+        raise HTTPException(409, "A newer document version exists. Remap its latest fields before applying.")
     mappings = {row["key"]: row["value"] for row in imported.mappings}
     if selected_keys is not None:
         if set(selected_keys) - mappings.keys():
@@ -1685,6 +1708,10 @@ async def register_uploaded_financial_document(db: AsyncSession, file: BucketFil
         return False
     kind = next((kind for kind, classification in CLASSIFICATIONS.items() if analysis.classification == classification), None)
     if kind is None or file.deleted_at is not None:
+        return False
+    from app.services.document_version_selection import document_file_ids
+
+    if file.id not in await document_file_ids(db, [file.id], usable=False):
         return False
     profiles = list((await db.execute(select(ApplicationProfile).where(ApplicationProfile.primary_bucket_id == file.bucket_id))).scalars().all())
     if not profiles:

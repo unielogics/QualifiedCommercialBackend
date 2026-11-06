@@ -299,6 +299,9 @@ class BucketUploadLink(TimestampMixin, Base):
 class BucketFile(TimestampMixin, Base):
     __tablename__ = "bucket_files"
     __table_args__ = (
+        UniqueConstraint("document_family_id", "document_version_number", name="uq_bucket_document_version"),
+        Index("ix_bucket_document_family", "document_family_id"),
+        Index("uq_bucket_upload_retry", "bucket_id", "upload_idempotency_key", unique=True, postgresql_where=text("upload_idempotency_key IS NOT NULL")),
         Index("ix_bucket_files_retention", "retention_class", "protected_until"),
         Index("ix_bucket_files_source_entity", "source_entity_type", "source_entity_id"),
         Index(
@@ -318,6 +321,13 @@ class BucketFile(TimestampMixin, Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_family_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False, default=uuid.uuid4)
+    document_version_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    is_current_document_version: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    document_version_status: Mapped[str] = mapped_column(String(24), nullable=False, default="current", server_default="current")
+    supersedes_file_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    duplicate_of_file_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    upload_idempotency_key: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     #: How this document got here, decided by the route rather than the request
     #: body. See services/provenance.py. Null on rows written before the trail
     #: existed, which reads as "not recorded".

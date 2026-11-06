@@ -82,6 +82,7 @@ from app.schemas.bucket import (
     BucketAISummaryRead,
     BucketCreate,
     BucketDetail,
+    BucketDocumentHistoryRead,
     BucketFileAnnotationCreate,
     BucketFileAnnotationRead,
     BucketFileRead,
@@ -146,6 +147,7 @@ from app.services import (
     bucket_requests,
     bucket_storage_integrity,
     capital_readiness,
+    document_versions,
     file_events,
     intake_retention,
     locked_file_requests,
@@ -2583,6 +2585,9 @@ async def admin_upload_init(
                 BucketFile.size_bytes == payload.size_bytes,
                 requested_doc_condition,
                 BucketFile.status == "uploading",
+                BucketFile.supersedes_file_id == payload.replaces_file_id if payload.replaces_file_id else BucketFile.supersedes_file_id.is_(None),
+                BucketFile.upload_idempotency_key == payload.idempotency_key if payload.idempotency_key else BucketFile.upload_idempotency_key.is_(None),
+                BucketFile.uploaded_by_user_id == user.id,
                 BucketFile.deleted_at.is_(None),
             )
             .order_by(BucketFile.created_at.desc())
@@ -2591,7 +2596,7 @@ async def admin_upload_init(
     if existing_file:
         upload_url, headers = _upload_url(existing_file.s3_key, payload.content_type)
         return BucketFileUploadInitResponse(file_id=existing_file.id, upload_url=upload_url, s3_key=existing_file.s3_key, required_headers=headers)
-    if req is not None and not req.allow_multiple_files:
+    if req is not None and not req.allow_multiple_files and not payload.replaces_file_id:
         existing_for_doc = (
             await db.execute(
                 select(BucketFile).where(
@@ -2624,6 +2629,15 @@ async def admin_upload_init(
         source_detail="Admin bucket upload",
         status="uploading",
     )
+    retried = await document_versions.prepare_upload(
+        db, file, replaces_file_id=payload.replaces_file_id,
+        expected_document_version=payload.expected_document_version, idempotency_key=payload.idempotency_key,
+    )
+    if retried is not None:
+        if retried.status == "uploaded":
+            return BucketFileUploadInitResponse(file_id=retried.id, upload_url="", s3_key=retried.s3_key, required_headers={}, already_uploaded=True)
+        upload_url, headers = _upload_url(retried.s3_key, retried.content_type)
+        return BucketFileUploadInitResponse(file_id=retried.id, upload_url=upload_url, s3_key=retried.s3_key, required_headers=headers)
     db.add(file)
     await _log(
         db,
@@ -2749,6 +2763,8 @@ async def _validate_completed_bucket_file(
 ) -> None:
     """Reject a locked PDF before any upload-complete side effects run."""
 
+    await document_versions.lock_family(db, file)
+
     if getattr(file, "status", None) == "rejected":
         prior_reason = getattr(file, "extraction_reason", None) or ""
         if upload_validation.PASSWORD_PROTECTED_PDF_CODE in prior_reason:
@@ -2768,23 +2784,34 @@ async def _validate_completed_bucket_file(
         # BucketFile.s3_key is non-null in production. Keeping this a no-op also
         # preserves local development where a storage upload is unavailable.
         return
+    immutable_key = None
+    immutable_version_id = None
     try:
-        await upload_validation.validate_s3_pdf_upload(
-            s3_key=s3_key,
+        if getattr(file, "document_family_id", None) is not None and file.status == "uploading":
+            immutable_key, immutable_version_id = await upload_validation.seal_s3_upload(s3_key, file_id=file.id)
+        validated_version_id = await upload_validation.validate_s3_pdf_upload(
+            s3_key=immutable_key or s3_key,
             file_name=getattr(file, "file_name", None),
             content_type=getattr(file, "content_type", None),
             expected_size_bytes=getattr(file, "size_bytes", None),
         )
     except upload_validation.UploadInspectionUnavailable as exc:
+        if immutable_key:
+            await upload_validation.discard_s3_upload(immutable_key)
         raise _upload_inspection_unavailable_error() from exc
     except (
         upload_validation.PasswordProtectedPDF,
         upload_validation.UploadTooLarge,
         upload_validation.UploadSizeMismatch,
     ) as exc:
+        if immutable_key:
+            await upload_validation.discard_s3_upload(immutable_key)
         error = _upload_validation_error(exc)
         reason = error.detail["code"]
         file.status = "rejected"
+        file.document_version_status = "rejected"
+        file.is_current_document_version = False
+        await document_versions.mark_received(db, file)
         file.extraction_status = "rejected"
         file.extraction_reason = json.dumps(
             [
@@ -2816,6 +2843,11 @@ async def _validate_completed_bucket_file(
         # same quarantined row. The requested-document remains outstanding.
         await db.commit()
         raise error from exc
+    if immutable_key:
+        file.s3_key = immutable_key
+        file.s3_version_id = immutable_version_id or (validated_version_id if isinstance(validated_version_id, str) else None)
+        file.document_version_status = "pending"
+        file.is_current_document_version = False
 
 
 @router.post("/admin/{bucket_id}/files/complete", response_model=BucketFileRead)
@@ -2880,6 +2912,7 @@ async def admin_upload_complete(
         user=user,
     )
     file.status = "uploaded"
+    await document_versions.mark_received(db, file)
     # A requires_signature item is satisfied by SIGNING, which produces its
     # certificate through the sign flow — never by an arbitrary upload.
     # Without this check a client could attach any file and the desk would
@@ -3312,8 +3345,30 @@ async def admin_file_url(
             file_name=file.file_name,
             disposition=disposition,
             content_type=file.content_type,
+            version_id=file.s3_version_id,
         )
     return BucketFileUrl(url=url, expires_in=900)
+
+
+@router.get("/admin/{bucket_id}/files/{file_id}/versions", response_model=BucketDocumentHistoryRead)
+async def admin_document_versions(
+    bucket_id: UUID, file_id: UUID, user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketDocumentHistoryRead:
+    await _load_bucket_or_404(db, bucket_id)
+    return await document_versions.history(db, bucket_id, file_id, can_upload=True, can_preview=True)
+
+
+@router.post("/request/{token}/files/{file_id}/versions", response_model=BucketDocumentHistoryRead)
+async def request_document_versions(
+    token: str, file_id: UUID, payload: BucketRequestAccessRequest,
+    request: Request, db: AsyncSession = Depends(get_db),
+) -> BucketDocumentHistoryRead:
+    link = await _load_upload_link_or_404(db, token)
+    _require_upload_passcode(link)
+    if not _verify_passcode(payload.passcode or "", link.passcode_hash, attempt_scope=_client_ip(request) or "unknown"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
+    return await document_versions.history(db, link.bucket_id, file_id, can_upload=True, can_preview=False)
 
 
 @router.get("/admin/{bucket_id}/files/{file_id}/review", response_model=BucketFileReviewRead)
@@ -3986,6 +4041,8 @@ async def request_upload_init(
         BucketFile.file_name == payload.file_name,
         BucketFile.size_bytes == payload.size_bytes,
         BucketFile.status == "uploading",
+        BucketFile.supersedes_file_id == payload.replaces_file_id if payload.replaces_file_id else BucketFile.supersedes_file_id.is_(None),
+        BucketFile.upload_idempotency_key == payload.idempotency_key if payload.idempotency_key else BucketFile.upload_idempotency_key.is_(None),
         BucketFile.deleted_at.is_(None),
     ]
     if payload.requested_document_id:
@@ -4002,7 +4059,7 @@ async def request_upload_init(
     if existing_file:
         upload_url, headers = _upload_url(existing_file.s3_key, payload.content_type)
         return BucketFileUploadInitResponse(file_id=existing_file.id, upload_url=upload_url, s3_key=existing_file.s3_key, required_headers=headers)
-    if req is not None and not req.allow_multiple_files:
+    if req is not None and not req.allow_multiple_files and not payload.replaces_file_id:
         existing_for_doc = (
             await db.execute(
                 select(BucketFile).where(
@@ -4034,6 +4091,15 @@ async def request_upload_init(
         source_detail="Secure bucket upload link",
         status="uploading",
     )
+    retried = await document_versions.prepare_upload(
+        db, file, replaces_file_id=payload.replaces_file_id,
+        expected_document_version=payload.expected_document_version, idempotency_key=payload.idempotency_key,
+    )
+    if retried is not None:
+        if retried.status == "uploaded":
+            return BucketFileUploadInitResponse(file_id=retried.id, upload_url="", s3_key=retried.s3_key, required_headers={}, already_uploaded=True)
+        upload_url, headers = _upload_url(retried.s3_key, retried.content_type)
+        return BucketFileUploadInitResponse(file_id=retried.id, upload_url=upload_url, s3_key=retried.s3_key, required_headers=headers)
     db.add(file)
     await _log(db, link.bucket_id, "file_upload_started", request=request, actor_name=payload.uploader_name, actor_email=str(payload.uploader_email) if payload.uploader_email else None, actor_role="uploader", target_type="file", target_id=str(file.id), detail=payload.file_name)
     await db.commit()
@@ -4104,6 +4170,7 @@ async def request_upload_complete(
         actor_role="uploader",
     )
     file.status = "uploaded"
+    await document_versions.mark_received(db, file)
     link.completed_at = _now()
     if req:
         req.status = "uploaded"

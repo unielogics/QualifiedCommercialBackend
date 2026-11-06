@@ -38,6 +38,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -54,6 +55,7 @@ from app.enums import DocStatus
 from app.models.activity import Activity
 from app.models.app_settings import AppSettings
 from app.models.document import Document
+from app.models.document_file_version import DocumentFileVersion
 from app.models.loan import Loan
 from app.services.activity_log import mark_loan_dirty
 from app.services.ai.bedrock_client import get_client, model_heavy
@@ -92,6 +94,7 @@ code fences:
   "notes": "1-2 sentence summary the operator can read",
   "red_flags": ["list of issues; empty array if none"],
   "suggested_checklist_key": "the closest matching item from the loan's checklist, or null"
+  ,"extracted_facts": {"payoff_amount": 12345.67, "payoff_good_through": "YYYY-MM-DD", "current_balance": 12345.67, "original_amount": 20000, "payment_amount": 1000, "payment_frequency": "monthly", "loan_account_last4": "1234", "account_last4": "1234", "statement_month": "YYYY-MM", "tax_year": 2025, "purchase_price": 100000, "loan_amount": 75000}
 }
 
 Strict rules:
@@ -106,6 +109,10 @@ Strict rules:
   - If the document is unreadable / encrypted / blank, set
     confidence=0, document_type="Other", notes="Document
     unreadable or encrypted".
+  - extracted_facts must contain ONLY explicitly printed, named facts. Omit
+    unknown fields. A payoff amount is distinct from original principal and
+    current balance. Never turn the largest amount on a page into a purchase
+    price or loan amount. Dates must identify the actual field they describe.
 """
 
 
@@ -121,6 +128,7 @@ class ScanResult:
     red_flags: list[str] = field(default_factory=list)
     suggested_checklist_key: str | None = None
     raw_response: str | None = None  # for debugging when parse fails
+    extracted_facts: dict[str, Any] = field(default_factory=dict)
 
 
 def _s3():
@@ -206,6 +214,8 @@ def _parse_response(text: str) -> ScanResult:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
         return ScanResult(notes="Could not parse model output", raw_response=text[:600])
+    if not isinstance(data, dict):
+        return ScanResult(notes="Could not parse model output", raw_response=text[:600])
 
     def _str_list(key: str) -> list[str]:
         v = data.get(key)
@@ -217,10 +227,31 @@ def _parse_response(text: str) -> ScanResult:
         if isinstance(v, list):
             for x in v:
                 try:
-                    out.append(float(x))
+                    number = float(x)
+                    if not isinstance(x, bool) and math.isfinite(number):
+                        out.append(number)
                 except (TypeError, ValueError):
                     continue
         return out
+
+    facts = {}
+    proposed = data.get("extracted_facts")
+    if isinstance(proposed, dict):
+        for key, value in proposed.items():
+            if key in {"payoff_amount", "current_balance", "original_amount", "payment_amount", "purchase_price", "loan_amount"}:
+                try:
+                    number = float(value)
+                    if not isinstance(value, bool) and math.isfinite(number) and number >= 0:
+                        facts[key] = number
+                except (ValueError, TypeError):
+                    pass
+            elif key in {"payoff_good_through", "payment_frequency", "loan_account_last4", "account_last4", "statement_month", "tax_year"} and isinstance(value, (str, int)) and not isinstance(value, bool):
+                facts[key] = str(value)[:100]
+    try:
+        confidence = float(data.get("confidence") or 0)
+        confidence = max(0.0, min(confidence, 1.0)) if math.isfinite(confidence) else 0.0
+    except (ValueError, TypeError):
+        confidence = 0.0
 
     return ScanResult(
         document_type=str(data.get("document_type") or "") or None,
@@ -228,10 +259,11 @@ def _parse_response(text: str) -> ScanResult:
         key_dates=_str_list("key_dates"),
         key_amounts=_num_list("key_amounts"),
         matches_expected=bool(data.get("matches_expected")),
-        confidence=float(data.get("confidence") or 0.0),
+        confidence=confidence,
         notes=str(data.get("notes") or "")[:1200],
         red_flags=_str_list("red_flags"),
         suggested_checklist_key=(data.get("suggested_checklist_key") or None),
+        extracted_facts=facts,
     )
 
 
@@ -287,6 +319,27 @@ def _build_ai_message(doc: Document, scan: ScanResult, *, auto_linked: bool) -> 
 
 
 async def scan_document(db: AsyncSession, document_id: UUID) -> ScanResult:
+    from app.services.document_file_versions import scan_snapshot
+
+    doc = await db.get(Document, document_id)
+    version_id = getattr(doc, "current_file_version_id", None) if doc is not None else None
+    result = await _scan_document_current(db, document_id, expected_version_id=version_id)
+    if version_id is not None:
+        version = await db.get(DocumentFileVersion, version_id)
+        if version is not None:
+            current_id = (await db.execute(select(Document.current_file_version_id).where(Document.id == document_id))).scalar_one_or_none()
+            is_current = current_id == version_id
+            version.analysis_status = doc.ai_scan_status if is_current else "scanned" if result.document_type else "failed"
+            version.analysis_snapshot = {
+                **(version.analysis_snapshot or {}), **(scan_snapshot(doc) if is_current else {}),
+                "result": {key: getattr(result, key) for key in ("document_type", "matches_expected", "confidence", "notes", "key_dates", "key_amounts", "red_flags", "extracted_facts")},
+            }
+            if is_current and version.version_number == doc.latest_file_version_number:
+                doc.latest_file_version_status = "failed" if version.analysis_status == "failed" else "current"
+    return result
+
+
+async def _scan_document_current(db: AsyncSession, document_id: UUID, *, expected_version_id: UUID | None = None) -> ScanResult:
     """Run a single document through the vision pipeline and persist
     the outcome onto the Document row. Returns the ScanResult so
     callers (the scheduler tick) can log + decide.
@@ -448,6 +501,16 @@ async def scan_document(db: AsyncSession, document_id: UUID) -> ScanResult:
         return ScanResult(notes=doc.ai_notes)
 
     scan = _parse_response(text)
+    if expected_version_id is not None:
+        # Acquire the stable identity before publishing facts or sending any
+        # notices. A slow old scan remains historical after a replacement.
+        with db.no_autoflush:
+            current_id = (await db.execute(select(Document.current_file_version_id).where(
+                Document.id == document_id,
+            ).with_for_update())).scalar_one_or_none()
+        if current_id != expected_version_id:
+            await db.refresh(doc)
+            return scan
     log.info(
         "scanner: doc=%s type=%r match=%s conf=%.2f",
         doc.id, scan.document_type, scan.matches_expected, scan.confidence,
@@ -469,7 +532,10 @@ async def scan_document(db: AsyncSession, document_id: UUID) -> ScanResult:
             if superseded is not None and superseded.id != doc.id:
                 # Old REQUESTED row gets dropped — its info now
                 # lives on the new RECEIVED+scanned row.
-                await db.delete(superseded)
+                if (getattr(superseded, "latest_file_version_number", 0) or 0) > 0:
+                    superseded.status = DocStatus.SKIPPED
+                else:
+                    await db.delete(superseded)
 
     if doc.checklist_key is not None:
         # Categorized: agreement + confidence drives verify/flag.
@@ -559,13 +625,11 @@ async def scan_document(db: AsyncSession, document_id: UUID) -> ScanResult:
         # canonical fields we know about.
         if scan.named_borrowers:
             extracted["borrower_name"] = scan.named_borrowers[0]
-        if scan.key_amounts:
-            # Heuristic: largest amount → purchase_price / loan_amount
-            # depending on document type. We tag both as the same field
-            # for now; downstream comparison logic does the rest.
-            extracted["purchase_price"] = max(scan.key_amounts)
+        extracted.update(scan.extracted_facts)
         analysis = DocumentAnalysisResult(
             document_id=doc.id,
+            document_version_id=expected_version_id,
+            is_current=True,
             detected_document_type=scan.document_type,
             confidence=_D(f"{float(scan.confidence):.2f}") if scan.confidence is not None else None,
             extracted_facts=extracted or None,

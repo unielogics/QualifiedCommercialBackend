@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 
 def review_is_financially_stale(review: Any) -> bool:
     context = getattr(review, "context_snapshot", None)
-    return isinstance(context, dict) and (context.get("financial_versions_stale") is True or context.get("funding_request_stale") is True)
+    return isinstance(context, dict) and (context.get("financial_versions_stale") is True or context.get("funding_request_stale") is True or context.get("document_versions_stale") is True)
 
 
 async def latest_publication_at(db: AsyncSession, profile_id: UUID) -> datetime | None:

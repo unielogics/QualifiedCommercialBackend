@@ -215,9 +215,13 @@ def document_proposals(body, sources, family_id, preferred_file_id=None):
 
 async def source_documents(db, profile):
     from app.services import financial_workspace as workspace
+    from app.services.document_version_selection import filter_document_files
 
     result = []
-    for file in await workspace.source_files_for_profile(db, profile):
+    sources = await filter_document_files(db, await workspace.source_files_for_profile(db, profile), usable=False)
+    for file in sources:
+        if getattr(file, "status", "uploaded") != "uploaded":
+            continue
         if getattr(file, "source_entity_type", None) in {"financial_form_version", "financial_version"}:
             continue
         query = select(BucketFileAnalysis).where(BucketFileAnalysis.bucket_file_id == file.id, BucketFileAnalysis.status == "completed")

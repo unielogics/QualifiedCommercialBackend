@@ -56,6 +56,10 @@ class Memory:
         return self.objects.get((model, key))
 
     async def execute(self, statement):
+        if str(statement).startswith("SELECT bucket_files.id"):
+            # These publication fixtures contain independent baseline sources;
+            # material replacement SQL is exercised by its own selector tests.
+            return Result(key for model, key in self.objects if model is BucketFile)
         if "financial_form_families.current_version_id" in str(statement) and "JOIN" in str(statement):
             return Result(self.current_rows)
         if "idempotency_key =" in str(statement):
@@ -334,7 +338,7 @@ async def test_applying_selected_mappings_changes_only_draft_and_keeps_source_pr
     profile, family, draft = context()
     file_id, import_id = uuid4(), uuid4()
     imported = FinancialFormImport(id=import_id, family_id=family.id, source_file_id=file_id, content_hash="a" * 64, base_revision=4, status="proposed", proposed_body={}, mappings=[{"key": "cash_on_hand", "value": "400", "source": {"file_id": str(file_id), "content_hash": "a" * 64}}, {"key": "savings_accounts", "value": "600", "source": {"file_id": str(file_id)}}], warnings=[])
-    db.objects.update({(FinancialFormImport, import_id): imported, (FinancialFormFamily, family.id): family, (BucketFile, file_id): SimpleNamespace(bucket_id=profile.primary_bucket_id, deleted_at=None, content_hash="a" * 64)})
+    db.objects.update({(FinancialFormImport, import_id): imported, (FinancialFormFamily, family.id): family, (BucketFile, file_id): SimpleNamespace(id=file_id, bucket_id=profile.primary_bucket_id, deleted_at=None, content_hash="a" * 64)})
     with patch.object(ws, "resolve_family", AsyncMock(return_value=(family, draft))), patch.object(ws, "load_workspace", AsyncMock(return_value={})):
         await ws.apply_import(db, profile, import_id, expected_revision=4, selected_keys=["cash_on_hand"])
     assert draft.revision == 5
@@ -378,7 +382,7 @@ async def test_stale_or_applied_mapping_can_be_remapped_from_cache_without_anoth
     analysis = SimpleNamespace(content_hash="a" * 64, classification="personal_financial_statement", analysis={"key_facts": {}})
     cached = SimpleNamespace(id=uuid4(), family_id=family.id, source_file_id=file_id, content_hash="a" * 64, status="applied", base_revision=1, proposed_body=ws.empty_body("pfs"), mappings=[], warnings=[])
     db.execute = AsyncMock(return_value=Result(scalar=cached))
-    with patch.object(ws, "resolve_family", AsyncMock(return_value=(family, draft))), patch.object(ws, "_extract_full_form", AsyncMock()) as model, patch.object(ws, "_read_file") as storage:
+    with patch.object(ws, "resolve_family", AsyncMock(return_value=(family, draft))), patch.object(ws, "_extract_full_form", AsyncMock()) as model, patch.object(ws, "_read_file") as storage, patch("app.services.document_version_selection.document_file_ids", AsyncMock(return_value={file_id})):
         result = await ws.propose_import(db, profile, kind="pfs", file_id=file_id, family_id=family.id, analysis=analysis)
     assert result["id"] != str(cached.id)
     assert result["status"] == "proposed" and result["base_revision"] == draft.revision

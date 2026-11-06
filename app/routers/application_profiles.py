@@ -165,7 +165,12 @@ from app.schemas.application_profile import (
     WorksheetLinkCreate,
     WorksheetRowOp,
 )
-from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
+from app.schemas.bucket import (
+    BucketEvidenceUploadInit,
+    BucketFileRead,
+    BucketFileUploadInitResponse,
+    BucketUploadComplete,
+)
 from app.schemas.debt_schedule_review import (
     DebtScheduleReviewRead,
     DebtScheduleReviewResult,
@@ -5651,6 +5656,92 @@ async def get_application_evidence(
     return state
 
 
+async def _evidence_version_upload_intake(db: AsyncSession, profile: ApplicationProfile, user: User):
+    """Use the existing intake upload gates, including ownership and signing."""
+    from app.routers import dealer_ai_intake as core
+
+    if not profile.intake_id:
+        if user.role == Role.SUPER_ADMIN:
+            return None
+        raise HTTPException(403, "This file's existing document upload workflow is required")
+    if user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        intake = await core._load_admin_dealer_lead(db, profile.intake_id)
+    elif user.role == Role.DEALER_PARTNER:
+        await core._require_dealer_partner(user, db)
+        intake = await core._load_broker_dealer_lead(db, user, profile.intake_id)
+    elif user.role == Role.CLIENT:
+        intake = await core._load_client_intake(db, user, profile.intake_id)
+    else:
+        raise HTTPException(403, "This file's existing document upload workflow is required")
+    if intake.bucket_id != profile.primary_bucket_id:
+        raise HTTPException(409, "The application evidence source changed; reload before uploading")
+    return intake
+
+
+@router.get("/{profile_id}/evidence/files/{file_id}/versions")
+async def application_evidence_document_versions(
+    profile_id: UUID, file_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db),
+):
+    from app.services.document_versions import history
+
+    profile = await profiles.load_profile(db, profile_id, user)
+    if profile.primary_bucket_id is None:
+        raise HTTPException(404, "Evidence file not found")
+    from app.services.provenance import is_internal_package_output
+    source = await db.get(BucketFile, file_id)
+    if source is None or source.bucket_id != profile.primary_bucket_id or is_internal_package_output(source):
+        raise HTTPException(404, "Evidence file not found")
+    try:
+        await _evidence_version_upload_intake(db, profile, user)
+        can_upload = True
+    except HTTPException:
+        can_upload = False
+    return await history(db, profile.primary_bucket_id, file_id,
+                         can_upload=can_upload, can_preview=_can_review_manual_bank_evidence(user))
+
+
+@router.post("/{profile_id}/evidence/files/upload-init", response_model=BucketFileUploadInitResponse)
+async def application_evidence_upload_init(
+    profile_id: UUID, payload: BucketEvidenceUploadInit, request: Request, user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFileUploadInitResponse:
+    from app.routers import buckets, dealer_ai_intake
+    from app.schemas.bucket import BucketFileUploadInit
+    from app.services.arf_channel import require_bucket_hosted_permission
+
+    profile = await profiles.load_profile(db, profile_id, user)
+    if profile.primary_bucket_id is None:
+        raise HTTPException(404, "Evidence file not found")
+    await require_bucket_hosted_permission(db, profile.primary_bucket_id, capability="document_sharing")
+    intake = await _evidence_version_upload_intake(db, profile, user)
+    if intake is not None:
+        parsed = dealer_ai_intake.DealerFileUploadInit.model_validate(payload.model_dump())
+        return await dealer_ai_intake._start_upload(db, intake, parsed, request,
+            actor_name=user.name or "Underwriter", actor_email=user.email,
+            actor=None if user.role == Role.CLIENT else user,
+            source_kind="client_room" if user.role == Role.CLIENT else "dealer_partner" if user.role == Role.DEALER_PARTNER else "internal_upload",
+            source_detail="Application evidence document version")
+    parsed = BucketFileUploadInit.model_validate({**payload.model_dump(), "uploader_name": user.name or "Underwriter", "uploader_email": user.email})
+    return await buckets.admin_upload_init(profile.primary_bucket_id, parsed, request, user, db)
+
+
+@router.post("/{profile_id}/evidence/files/complete", response_model=BucketFileRead)
+async def application_evidence_upload_complete(
+    profile_id: UUID, payload: BucketUploadComplete, request: Request, background: BackgroundTasks,
+    user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> BucketFileRead:
+    from app.routers import buckets, dealer_ai_intake
+
+    profile = await profiles.load_profile(db, profile_id, user)
+    if profile.primary_bucket_id is None:
+        raise HTTPException(404, "Evidence file not found")
+    intake = await _evidence_version_upload_intake(db, profile, user)
+    if intake is not None:
+        return await dealer_ai_intake._complete_upload(db, intake, dealer_ai_intake.DealerUploadComplete.model_validate(payload.model_dump()), request,
+            actor_name=user.name or "Underwriter", actor_email=user.email)
+    return await buckets.admin_upload_complete(profile.primary_bucket_id, payload, background, request, user, db)
+
+
 @router.get("/{profile_id}/evidence/files/{file_id}/url")
 async def get_application_evidence_file_url(
     profile_id: UUID,
@@ -5658,16 +5749,25 @@ async def get_application_evidence_file_url(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     expected_content_hash: Annotated[str | None, Query(pattern=r"^[a-fA-F0-9]{64}$")] = None,
+    download: bool = False,
 ) -> dict:
     if not _can_review_manual_bank_evidence(user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Evidence review role required")
     profile = await profiles.load_profile(db, profile_id, user)
     evidence = await profiles.evidence_state(db, profile)
-    if file_id not in {row.id for row in evidence.files}:
+    evidence_ids = {row.id for row in evidence.files}
+    primary_id = getattr(profile, "primary_bucket_id", None)
+    if file_id not in evidence_ids and primary_id is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence file not found")
     file = await db.get(BucketFile, file_id)
     if file is None or file.status != "uploaded" or file.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence file not found")
+    if file_id not in evidence_ids:
+        from app.services.provenance import is_internal_package_output
+        # History is available for this file's own primary evidence. Selected
+        # files from linked external buckets retain their exact prior scope.
+        if primary_id is None or getattr(file, "bucket_id", None) != primary_id or is_internal_package_output(file):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence file not found")
     if expected_content_hash is not None and (
         not file.content_hash or file.content_hash.casefold() != expected_content_hash.casefold()
     ):
@@ -5684,7 +5784,8 @@ async def get_application_evidence_file_url(
     # Spreadsheets also come back as parsed sheets so the evidence workspace
     # can show the rows the AI read instead of forcing a download.
     result: dict = {
-        "url": _download_url(file.s3_key, file_name=file.file_name, disposition="inline", content_type=file.content_type),
+        "url": _download_url(file.s3_key, file_name=file.file_name, disposition="attachment" if download else "inline", content_type=file.content_type,
+                             **({"version_id": file.s3_version_id} if getattr(file, "s3_version_id", None) else {})),
         "expires_in": 900,
     }
     sheets = await run_in_threadpool(_sheet_preview_payload, file)
@@ -6745,6 +6846,7 @@ async def _slot_analyses(
     if slot is None:
         return [], False
 
+    from app.services.document_version_selection import current_document_file_clause
     from app.services.financial_version_selection import current_financial_file_clause
 
     files = list(
@@ -6754,6 +6856,7 @@ async def _slot_analyses(
                     BucketFile.requested_document_id == slot.id,
                     BucketFile.deleted_at.is_(None),
                     current_financial_file_clause(BucketFile.id),
+                    current_document_file_clause(BucketFile.id),
                 )
             )
         )
@@ -6955,12 +7058,13 @@ async def _bucket_analyses(db: AsyncSession, bucket_id: UUID) -> list[dict]:
     """Every completed analysis in the room, newest per file — for a form with
     no checklist row of its own (the dealer checklist has no balance-sheet
     row), whose upload can still be anywhere in the bucket."""
+    from app.services.document_version_selection import current_document_file_clause
     from app.services.financial_version_selection import current_financial_file_clause
     files = list(
         (
             await db.execute(
                 select(BucketFile).where(
-                    BucketFile.bucket_id == bucket_id, BucketFile.deleted_at.is_(None), current_financial_file_clause(BucketFile.id)
+                    BucketFile.bucket_id == bucket_id, BucketFile.deleted_at.is_(None), current_financial_file_clause(BucketFile.id), current_document_file_clause(BucketFile.id)
                 )
             )
         )

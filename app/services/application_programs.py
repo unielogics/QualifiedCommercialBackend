@@ -326,6 +326,11 @@ async def _evidence_inventory(
     ids = [item.id for item in state.files]
     if not ids:
         return [], {}, set()
+    from app.services.document_version_selection import (
+        PendingDocumentAnalysis,
+        current_document_file_clause,
+        latest_document_file_clause,
+    )
     from app.services.financial_version_selection import (
         PendingFinancialAnalysis,
         current_financial_file_clause,
@@ -341,6 +346,7 @@ async def _evidence_inventory(
                     BucketFile.id.in_(ids),
                     BucketFile.deleted_at.is_(None),
                     BucketFile.status == "uploaded",
+                    (latest_document_file_clause if include_pending_financial else current_document_file_clause)(BucketFile.id),
                     *([] if include_pending_financial else [current_financial_file_clause(BucketFile.id)]),
                 )
             )
@@ -382,6 +388,9 @@ async def _evidence_inventory(
         pending_ids = await pending_financial_original_ids(db, ids)
         latest = {file_id: PendingFinancialAnalysis(analysis) if file_id in pending_ids else analysis
                   for file_id, analysis in latest.items()}
+        latest = {file_id: PendingDocumentAnalysis(analysis, files_by_id[file_id])
+                  if getattr(files_by_id[file_id], "document_version_status", "current") != "current"
+                  else analysis for file_id, analysis in latest.items()}
     classifications = {
         analysis.classification
         for analysis in latest.values()
@@ -4387,6 +4396,19 @@ async def override_evidence_decision(
     payload: EvidenceDecisionOverride,
     user: User,
 ) -> ApplicationProgramReadiness:
+    if isinstance(db, AsyncSession):
+        from app.services.document_version_selection import document_file_ids, lock_document_roots
+
+        with db.no_autoflush:
+            scoped_ids = await profiles._profile_evidence_file_ids(db, profile)
+            if file_id not in scoped_ids:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence file not found on this application")
+            version_file = await db.get(BucketFile, file_id)
+            await lock_document_roots(db, [version_file])
+            if file_id not in await document_file_ids(db, [file_id], usable=False):
+                raise HTTPException(409, "A newer document version exists. Review its latest version instead.")
+        # Root before readiness's bucket/profile locks, matching analysis and
+        # upload completion. No dirty decision is flushed ahead of that root.
     await get_program_readiness(db, profile)
     state = (
         await db.execute(
@@ -4478,10 +4500,21 @@ async def override_evidence_decision(
             )
             db.add(decision)
     if payload.decision == "accepted":
+        from app.services.document_versions import complete_analysis
+
+        if isinstance(getattr(db, "info", None), dict):
+            if not await complete_analysis(db, file, usable=True, content_hash=content_hash):
+                raise HTTPException(409, "A newer document version exists. Review its latest version instead.")
         link.verified_at = now()
         link.verified_by_user_id = user.id
         link.reason = payload.reason.strip()
     else:
+        if isinstance(getattr(db, "info", None), dict) and payload.decision == "rejected":
+            from app.services.document_versions import mark_received
+
+            file.document_version_status = "rejected"
+            file.is_current_document_version = False
+            await mark_received(db, file)
         link.verified_at = None
         link.verified_by_user_id = None
         link.reason = payload.reason.strip()

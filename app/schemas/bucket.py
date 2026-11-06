@@ -298,6 +298,12 @@ class BucketRequestPasscodeChanged(BaseModel):
 class BucketRequestUploadedFileRead(ORMModel):
     id: UUID
     bucket_id: UUID
+    document_family_id: UUID | None = None
+    document_version_number: int = 1
+    is_current_document_version: bool = True
+    document_version_status: str = "current"
+    supersedes_file_id: UUID | None = None
+    duplicate_of_file_id: UUID | None = None
     requested_document_id: UUID | None
     parent_zip_file_id: UUID | None = None
     zip_entry_path: str | None = None
@@ -357,11 +363,17 @@ class BucketRequestAccessRead(BaseModel):
     evidence_banking_summary: ClientEvidenceBankingSummary | None = None
 
 
-class BucketFileUploadInit(BaseModel):
+class BucketEvidenceUploadInit(BaseModel):
+    replaces_file_id: UUID | None = None
+    expected_document_version: int | None = Field(default=None, ge=1)
+    idempotency_key: UUID | None = None
     requested_document_id: UUID | None = None
     file_name: str = Field(min_length=1, max_length=255)
     content_type: str = "application/octet-stream"
-    size_bytes: int = 0
+    size_bytes: int = Field(default=0, ge=0)
+
+
+class BucketFileUploadInit(BucketEvidenceUploadInit):
     uploader_name: str = Field(min_length=1, max_length=180)
     uploader_email: EmailStr | None = None
     note: str | None = None
@@ -378,6 +390,7 @@ class BucketFileUploadInitResponse(BaseModel):
     upload_url: str
     s3_key: str
     required_headers: dict[str, str]
+    already_uploaded: bool = False
 
 
 class BucketUploadComplete(BaseModel):
@@ -388,6 +401,12 @@ class BucketUploadComplete(BaseModel):
 class BucketFileRead(ORMModel):
     id: UUID
     bucket_id: UUID
+    document_family_id: UUID | None = None
+    document_version_number: int = 1
+    is_current_document_version: bool = True
+    document_version_status: str = "current"
+    supersedes_file_id: UUID | None = None
+    duplicate_of_file_id: UUID | None = None
     requested_document_id: UUID | None
     parent_zip_file_id: UUID | None = None
     zip_entry_path: str | None = None
@@ -423,6 +442,37 @@ class BucketFileRead(ORMModel):
 class BucketFileUrl(BaseModel):
     url: str
     expires_in: int
+
+
+class BucketDocumentVersionRead(ORMModel):
+    id: UUID
+    bucket_id: UUID
+    file_name: str
+    content_type: str
+    size_bytes: int
+    created_at: datetime
+    updated_at: datetime
+    uploaded_by_name: str | None = None
+    status: str
+    document_family_id: UUID
+    document_version_number: int
+    is_current_document_version: bool
+    document_version_status: str
+    supersedes_file_id: UUID | None = None
+    duplicate_of_file_id: UUID | None = None
+    analysis_status: str | None = None
+    analysis_reason_code: str | None = None
+    analysis_review_state: str | None = None
+    can_preview: bool = False
+    can_download: bool = False
+
+
+class BucketDocumentHistoryRead(BaseModel):
+    document_family_id: UUID
+    current_file_id: UUID | None = None
+    latest_file_id: UUID
+    can_upload_new_version: bool
+    versions: list[BucketDocumentVersionRead]
 
 
 class BucketFileSelection(BaseModel):

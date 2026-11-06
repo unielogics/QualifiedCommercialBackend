@@ -11,6 +11,7 @@ import logging
 import mimetypes
 import re
 import zipfile
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from io import BytesIO
 from typing import Any
@@ -2794,19 +2795,21 @@ async def _get_or_create_analysis_row(
 async def _lock_analysis_scope(db: AsyncSession, file: BucketFile) -> None:
     """Serialize review/drain work for one file before analysis-row upsert.
 
-    The file lock is enough to protect the select-then-insert analysis row and
-    cache-consumer replay. Application readiness keeps its own short profile
-    lock only after the model work finishes, so a long AI call cannot block the
-    polling UI or monopolize profile rows.
+    Family root precedes the material-file lock, matching replacement and
+    final-review publication. The same-document replacement waits for this
+    analysis; unrelated documents and ordinary polling remain independent.
+    Readiness takes its short profile lock only after model work finishes.
     """
 
-    await db.execute(
-        select(BucketFile.id)
-        .where(BucketFile.id == file.id)
-        # PostgreSQL FOR NO KEY UPDATE: competing analyzers serialize, while
-        # FK checks from readiness may still take a compatible KEY SHARE lock.
-        .with_for_update(key_share=True)
-    )
+    from app.services.document_version_selection import lock_document_roots
+
+    await lock_document_roots(db, [file])
+    with getattr(db, "no_autoflush", nullcontext()):
+        await db.execute(
+            select(BucketFile.id).where(BucketFile.id == file.id)
+            # NO KEY UPDATE still permits compatible FK key-share checks.
+            .with_for_update(key_share=True)
+        )
 
 
 async def _reconcile_analysis_consumers(
@@ -2818,6 +2821,31 @@ async def _reconcile_analysis_consumers(
     file analyzed before an application profile existed remains permanently
     absent from that profile even when the operator runs the review again.
     """
+    from app.services.document_version_selection import document_file_ids
+
+    version_usable = True
+    if isinstance(getattr(db, "info", None), dict):
+        from app.services.document_versions import complete_analysis
+
+        usability = analysis_usability(analysis)
+        usable = (usability in {"usable", "usable_with_warning"}) if analysis.status == "completed" else False
+        if analysis.status == "completed" and not usable:
+            usable = None
+        if usable:
+            from app.services.document_identity import bucket_identity_conflict
+
+            conflict = await bucket_identity_conflict(db, file, analysis)
+            if conflict:
+                usable = None
+                analysis.usability_status = "needs_review"
+                analysis.analysis = {**(analysis.analysis or {}), "document_version_review": {
+                    "status": "identity_mismatch", "reason": conflict, "action": "upload_as_separate_document",
+                }}
+        version_usable = await complete_analysis(db, file, usable=usable, content_hash=analysis.content_hash)
+        if file.id not in await document_file_ids(db, [file.id], usable=False):
+            # Keep late analysis as history without replaying obsolete facts,
+            # imports, fulfillment, or requirement routing.
+            return
     if analysis.status == "completed":
         from app.services.financial_workspace import register_uploaded_financial_document
         if await register_uploaded_financial_document(db, file, analysis):
@@ -2825,6 +2853,11 @@ async def _reconcile_analysis_consumers(
             # Financial publication, not extraction, promotes its figures.
             return
     await reconcile_uploaded_file(db, file, analysis)
+    if not version_usable:
+        from app.services.application_programs import reconcile_profiles_for_file
+
+        await reconcile_profiles_for_file(db, file)
+        return
     if merchant_processing.is_offer_document(file):
         await merchant_processing.absorb_analysis(db, file, analysis)
         return
@@ -3034,8 +3067,11 @@ async def analyze_bucket_file(
         # must never be analyzed as new evidence or consume another model call.
         return None
     await _lock_analysis_scope(db, file)
-    # Record explicit upload destinations while content analysis runs.
-    await reconcile_uploaded_file(db, file)
+    # Historical work cannot route itself back into active evidence.
+    from app.services.document_version_selection import document_file_ids
+
+    if file.id in await document_file_ids(db, [file.id], usable=False):
+        await reconcile_uploaded_file(db, file)
     if (
         _is_zip_file(getattr(file, "content_type", "") or "", file.file_name)
         and getattr(file, "extraction_status", None) in {"extracted", "partial"}
@@ -3429,7 +3465,7 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
     # review creates circular citations and can double-count financial facts.
     files = [file for file in files if not provenance.is_internal_package_output(file)]
     from app.services.financial_workspace import filter_current_files
-    files = await filter_current_files(db, files)
+    files = await filter_current_files(db, files, include_pending_document_versions=True)
     extracted_zip_parent_ids = {
         file.parent_zip_file_id
         for file in files
@@ -3498,7 +3534,7 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         current_budget_revision = current_budget.revision
         budget_context = use_of_funds.ai_context(current_budget)
         review_context["ai_context"]["use_of_funds"] = budget_context
-        review.context_snapshot = {**review.context_snapshot, "funding_request_stale": False, "use_of_funds": budget_context}
+        review.context_snapshot = {**review.context_snapshot, "funding_request_stale": False, "document_versions_stale": False, "use_of_funds": budget_context}
         current_policy = mca_refinance_policy.evaluate(intake, bucket=bucket, context=review.context_snapshot) if mca_refinance_policy.is_mca_refinance(intake, bucket) else None
         if current_policy is not None and not current_policy["auto_underwriting_allowed"]:
             return await _stop_mca_review(db, review, current_policy, intake)
@@ -3586,6 +3622,11 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
             skipped.append(_skip_file(file, analysis.skip_reason or "skipped", analysis.skip_detail or "This file was not analyzed."))
             continue
         if analysis.status != "completed":
+            continue
+        from app.services.document_version_selection import document_file_ids
+
+        if file.id not in await document_file_ids(db, [file.id], usable=True):
+            skipped.append(_skip_file(file, "latest_document_needs_review", "The latest document version needs review before its figures are included."))
             continue
         data = analysis.analysis or {}
         per_file_analyses.append(
@@ -3684,12 +3725,15 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         # A request can be corrected while the model is reading documents.
         # Preserve the finished analysis as history, but never publish its old
         # request decision, checklist actions or recommendation as current.
-        if screen_profile is not None and not await funding_requests.lock_review_revision(db, screen_profile, int(current_request.get("revision", 0)), current_budget_revision):
+        from app.services.document_version_selection import lock_latest_sources
+
+        documents_current = await lock_latest_sources(db, files)
+        if not documents_current or (screen_profile is not None and not await funding_requests.lock_review_revision(db, screen_profile, int(current_request.get("revision", 0)), current_budget_revision)):
             review.result = result
             review.status = "completed"
             review.completed_at = _now()
-            review.context_snapshot = {**(review.context_snapshot or {}), "funding_request_stale": True}
-            review.progress = {"stage": "complete", "label": "Historical review: funding request changed; run a new review", "percent": 100}
+            review.context_snapshot = {**(review.context_snapshot or {}), "document_versions_stale": not documents_current, "funding_request_stale": documents_current}
+            review.progress = {"stage": "complete", "label": "Historical review: source documents or funding request changed; run a new review", "percent": 100}
             await db.flush()
             return review
         # Reconcile the requested-document checklist: mark an open ask as
@@ -3854,6 +3898,8 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
     request path, so reviews compose from a warm cache. Each file is analyzed
     once; the placeholder row is replaced by analyze_bucket_file's real
     (hash, version) row."""
+    from app.services.document_version_selection import latest_document_file_clause
+
     # Retry ZIP extraction from the durable file state, not from the analysis
     # placeholder. Older workers could consume that placeholder into a cached
     # ZIP-parent skip before extraction succeeded; tying retries to it would
@@ -3866,6 +3912,7 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
                     BucketFile.status == "uploaded",
                     BucketFile.deleted_at.is_(None),
                     BucketFile.extraction_status == "retryable",
+                    latest_document_file_clause(BucketFile.id),
                 )
                 .order_by(BucketFile.created_at.asc())
                 .limit(limit)
@@ -3933,7 +3980,9 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
         # the next pass. analyze_bucket_file still upserts the real hashed row.
         placeholder.content_hash = consumed_placeholder_hash(placeholder.content_hash)
         await db.flush()
-        if file is None or file.deleted_at is not None or file.status != "uploaded":
+        from app.services.document_version_selection import document_file_ids
+
+        if file is None or file.deleted_at is not None or file.status != "uploaded" or file.id not in await document_file_ids(db, [file.id], usable=False):
             await db.commit()
             continue
         review_type = (file.bucket.ai_context or {}).get("review_type") if file.bucket else None
@@ -3967,6 +4016,7 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
                     .where(
                         BucketFile.status == "uploaded",
                         BucketFile.deleted_at.is_(None),
+                        latest_document_file_clause(BucketFile.id),
                         ~current_analysis,
                         or_(
                             BucketFile.source_kind.is_(None),
@@ -4005,7 +4055,7 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
 async def latest_review(db: AsyncSession, bucket_id: UUID) -> BucketAIReview | None:
     from app.services.financial_publication import review_is_financially_stale
 
-    current_financials = and_(BucketAIReview.context_snapshot["financial_versions_stale"].as_boolean().is_not(True), BucketAIReview.context_snapshot["funding_request_stale"].as_boolean().is_not(True))
+    current_financials = and_(BucketAIReview.context_snapshot["financial_versions_stale"].as_boolean().is_not(True), BucketAIReview.context_snapshot["funding_request_stale"].as_boolean().is_not(True), BucketAIReview.context_snapshot["document_versions_stale"].as_boolean().is_not(True))
     completed = (
         await db.execute(
             select(BucketAIReview)

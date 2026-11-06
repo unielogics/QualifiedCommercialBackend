@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import zipfile
 from io import BytesIO
+from uuid import UUID, uuid4
 
 import boto3
 from botocore.config import Config
@@ -207,6 +208,34 @@ def _read_body(response: dict, *, max_bytes: int) -> bytes:
             close()
 
 
+def _seal_s3_upload_sync(s3_key: str, *, file_id: UUID) -> tuple[str, str | None]:
+    """Copy staging bytes to a key which has never had a browser PUT URL.
+
+    Validation runs against this snapshot after the copy, so even a replayed
+    staging upload cannot change the bytes that were validated and retained.
+    """
+    cfg = get_settings()
+    if not cfg.s3_bucket:
+        raise UploadInspectionUnavailable(UPLOAD_INSPECTION_UNAVAILABLE_MESSAGE)
+    prefix = getattr(cfg, "buckets_s3_prefix", "buckets").strip("/")
+    immutable_key = f"{prefix}/immutable-documents/{file_id}/{uuid4().hex}"
+    params = {"Bucket": cfg.s3_bucket, "Key": immutable_key,
+              "CopySource": {"Bucket": cfg.s3_bucket, "Key": s3_key}, "MetadataDirective": "COPY"}
+    kms_key = getattr(cfg, "buckets_kms_key_id", None)
+    if kms_key:
+        params.update(ServerSideEncryption="aws:kms", SSEKMSKeyId=kms_key)
+    try:
+        response = _s3_client().copy_object(**params)
+    except Exception as exc:  # noqa: BLE001 - fail closed before validation/publication
+        raise UploadInspectionUnavailable(UPLOAD_INSPECTION_UNAVAILABLE_MESSAGE) from exc
+    version_id = response.get("VersionId")
+    return immutable_key, version_id if isinstance(version_id, str) and version_id != "null" else None
+
+
+async def seal_s3_upload(s3_key: str, *, file_id: UUID) -> tuple[str, str | None]:
+    return await run_in_threadpool(_seal_s3_upload_sync, s3_key, file_id=file_id)
+
+
 def _validate_s3_pdf_upload_sync(
     *,
     s3_key: str,
@@ -214,7 +243,7 @@ def _validate_s3_pdf_upload_sync(
     content_type: str | None = None,
     expected_size_bytes: int | None = None,
     max_bytes: int = DEFAULT_MAX_UPLOAD_BYTES,
-) -> None:
+) -> str | None:
     """Synchronous implementation; the public API offloads it from the loop."""
 
     cfg = get_settings()
@@ -236,14 +265,17 @@ def _validate_s3_pdf_upload_sync(
     normalized_type = (content_type or "").casefold()
     hinted_pdf = normalized_name.endswith(".pdf") or "application/pdf" in normalized_type
     hinted_zip = normalized_name.endswith(".zip") or "zip" in normalized_type
+    version_id = head.get("VersionId")
+    params = {"Bucket": cfg.s3_bucket, "Key": s3_key}
+    if isinstance(version_id, str) and version_id != "null":
+        params["VersionId"] = version_id
     try:
         if hinted_pdf or hinted_zip:
-            response = client.get_object(Bucket=cfg.s3_bucket, Key=s3_key)
+            response = client.get_object(**params)
             raw = _read_body(response, max_bytes=max_bytes)
         else:
             response = client.get_object(
-                Bucket=cfg.s3_bucket,
-                Key=s3_key,
+                **params,
                 Range="bytes=0-1023",
             )
             prefix = _read_body(response, max_bytes=1024)
@@ -256,8 +288,8 @@ def _validate_s3_pdf_upload_sync(
                 or actual_pdf
                 or actual_zip
             ):
-                return
-            response = client.get_object(Bucket=cfg.s3_bucket, Key=s3_key)
+                return version_id if isinstance(version_id, str) and version_id != "null" else None
+            response = client.get_object(**params)
             raw = _read_body(response, max_bytes=max_bytes)
     except (PasswordProtectedPDF, UploadTooLarge, UploadSizeMismatch):
         raise
@@ -267,6 +299,7 @@ def _validate_s3_pdf_upload_sync(
     if len(raw) != actual_size:
         raise UploadSizeMismatch(UPLOAD_SIZE_MISMATCH_MESSAGE)
     validate_upload_bytes(raw, file_name=file_name, content_type=content_type)
+    return version_id if isinstance(version_id, str) and version_id != "null" else None
 
 
 async def validate_s3_pdf_upload(
@@ -276,7 +309,7 @@ async def validate_s3_pdf_upload(
     content_type: str | None = None,
     expected_size_bytes: int | None = None,
     max_bytes: int = DEFAULT_MAX_UPLOAD_BYTES,
-) -> None:
+) -> str | None:
     """Inspect the actual S3 object written by a presigned browser upload.
 
     Known PDFs are downloaded once. For an upload with opaque metadata, a
@@ -285,7 +318,7 @@ async def validate_s3_pdf_upload(
     transient S3 outage can never turn an uninspected file into accepted data.
     """
 
-    await run_in_threadpool(
+    return await run_in_threadpool(
         _validate_s3_pdf_upload_sync,
         s3_key=s3_key,
         file_name=file_name,

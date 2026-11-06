@@ -34,8 +34,8 @@ from app.models.document import Document
 from app.models.document_analysis_result import DocumentAnalysisResult
 from app.services.ai.audit import record_event
 from app.services.ai.fact_priority import (
-    FactCandidate,
     SOURCE_PRIORITY,
+    FactCandidate,
     resolve_fact_conflict,
 )
 
@@ -200,7 +200,7 @@ async def _collect_candidates_for_client(
         select(DocumentAnalysisResult, Document)
         .join(Document, Document.id == DocumentAnalysisResult.document_id)
         .join(Loan, Loan.id == Document.loan_id)
-        .where(Loan.client_id == client_id)
+        .where(Loan.client_id == client_id, DocumentAnalysisResult.is_current.is_(True))
     )).all()
     for an, doc in rows:
         if exclude_analysis_id is not None and an.id == exclude_analysis_id:

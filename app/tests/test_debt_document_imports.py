@@ -59,11 +59,36 @@ class DB:
     async def execute(self, query):
         self.queries.append(query)
         model, params = query.column_descriptions[0]["entity"], query.compile().params
+        if model is BucketFile:
+            requested = set(params.get("id_1", []))
+            sources = {key: row for (kind, key), row in self.objects.items() if kind is BucketFile}
+            rows = []
+            for key, source in sources.items():
+                if key not in requested or getattr(source, "deleted_at", None) is not None:
+                    continue
+                if getattr(source, "status", "uploaded") == "uploading" or getattr(source, "document_version_status", "current") == "duplicate":
+                    continue
+                family = getattr(source, "document_family_id", None) or key
+                if any(
+                    getattr(other, "bucket_id", None) == source.bucket_id
+                    and (getattr(other, "document_family_id", None) or other_id) == family
+                    and (getattr(other, "document_version_number", None) or 1) > (getattr(source, "document_version_number", None) or 1)
+                    and getattr(other, "status", "uploaded") != "uploading"
+                    and getattr(other, "document_version_status", "current") != "duplicate"
+                    for other_id, other in sources.items()
+                ):
+                    continue
+                allowed = next((value for name, value in params.items() if name.startswith("document_version_status_") and isinstance(value, list)), None)
+                if allowed is not None and getattr(source, "document_version_status", "current") not in allowed:
+                    continue
+                rows.append(key if query.column_descriptions[0]["name"] == "id" else source)
+            return Result(rows)
         if model is BucketFileAnalysis:
-            rows = [row for row in self.analyses if row.bucket_file_id == params["bucket_file_id_1"]]
+            requested = params["bucket_file_id_1"]
+            rows = [row for row in self.analyses if row.bucket_file_id in requested] if isinstance(requested, list) else [row for row in self.analyses if row.bucket_file_id == requested]
             if "content_hash_1" in params:
                 rows = [row for row in rows if row.content_hash == params["content_hash_1"]]
-            return Result(scalar=rows[-1] if rows else None)
+            return Result(reversed(rows), scalar=rows[-1] if rows else None)
         if model is FinancialFormImport:
             rows = [row for row in self.imports if row.family_id == params["family_id_1"] and row.source_file_id == params["source_file_id_1"]]
             if "param_1" in params:
@@ -332,3 +357,28 @@ async def test_declared_acroform_native_terms_override_model_values():
     accepted = body["debts"][0]
     assert accepted["factor_rate"] == "1.380" and accepted["payment_amount"] == "420.00"
     assert accepted["payment_frequency"] == "daily" and accepted["monthly_payment"] == "8820.00"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state,status,deleted", [
+    ("pending", "uploaded", None), ("failed", "uploaded", None),
+    ("rejected", "rejected", None), ("current", "uploaded", ws.now()),
+])
+async def test_replaced_contract_is_not_remapped_or_attached_when_latest_source_is_unusable(state, status, deleted):
+    selected = debt()
+    db, profile, family, draft, source, _raw = context(selected)
+    source.document_family_id = source.id
+    source.document_version_number = 1
+    latest_id = uuid4()
+    db.objects[(BucketFile, latest_id)] = SimpleNamespace(
+        id=latest_id, bucket_id=source.bucket_id, document_family_id=source.id,
+        document_version_number=2, document_version_status=state,
+        status=status, deleted_at=deleted,
+    )
+    before = copy.deepcopy(draft.body)
+    with patch.object(ws, "resolve_family", AsyncMock(return_value=(family, draft))), patch.object(ws, "_extract_full_form", AsyncMock()) as extract:
+        with pytest.raises(HTTPException) as error:
+            await contracts.propose_document_import(db, profile, row_id=UUID(selected["id"]), file_id=source.id, expected_revision=4)
+    assert error.value.status_code == 409
+    extract.assert_not_called()
+    assert not db.imports and not db.versions and draft.body == before

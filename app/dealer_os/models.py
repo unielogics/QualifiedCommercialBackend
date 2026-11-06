@@ -883,9 +883,22 @@ class DealerDocument(TimestampMixin, Base):
     uploaded_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
-    __table_args__ = (Index("ix_dos_documents_dealer_created", "dealer_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_dos_documents_dealer_created", "dealer_id", "created_at"),
+        UniqueConstraint("document_family_id", "document_version_number", name="uq_dos_document_version"),
+        Index("ix_dos_document_family", "document_family_id"),
+        Index("uq_dos_document_upload_retry", "dealer_id", "upload_idempotency_key", unique=True, postgresql_where=text("upload_idempotency_key IS NOT NULL")),
+    )
 
     id: Mapped[uuid.UUID] = _pk()
+    document_family_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False, default=uuid.uuid4)
+    document_version_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    is_current_document_version: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    document_version_status: Mapped[str] = mapped_column(String(24), nullable=False, default="current", server_default="current")
+    supersedes_document_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    upload_idempotency_key: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    upload_request_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     dealer_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
     )

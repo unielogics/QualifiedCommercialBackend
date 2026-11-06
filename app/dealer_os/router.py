@@ -4846,7 +4846,7 @@ async def upsert_period(
 # --- Stream 7: document ingestion --------------------------------------------
 
 MAX_DOCUMENT_BYTES = 15 * 1024 * 1024  # 15MB
-_DOCUMENT_KINDS = {"statement", "pl", "tax", "debt_schedule", "loan_agreement", "other", "archive"}
+_DOCUMENT_KINDS = {"statement", "pl", "tax", "debt_schedule", "loan_agreement", "payoff_letter", "other", "archive"}
 
 
 async def _auto_fulfill_doc_request(
@@ -5061,6 +5061,9 @@ async def upload_document(
     file: UploadFile = File(...),
     kind: str = Form(default="statement"),
     account_id: str = Form(default=""),
+    replaces_document_id: UUID | None = Form(default=None),
+    expected_document_version: int | None = Form(default=None),
+    idempotency_key: UUID | None = Form(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> DealerDocument:
     """Upload one financial document, archive it to S3 best-effort.
@@ -5080,6 +5083,11 @@ async def upload_document(
     skips detection (admin choice wins)."""
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    # Defaults are Form descriptors when older direct callers invoke the
+    # handler outside FastAPI; real HTTP requests are already type-validated.
+    replaces_document_id = replaces_document_id if isinstance(replaces_document_id, UUID) else None
+    expected_document_version = expected_document_version if isinstance(expected_document_version, int) else None
+    idempotency_key = idempotency_key if isinstance(idempotency_key, UUID) else None
     is_dealer = is_audit_client(user)
     if kind not in _DOCUMENT_KINDS:
         raise HTTPException(
@@ -5124,30 +5132,44 @@ async def upload_document(
     # carries the children). account pinning is a single-statement affordance
     # and does not apply to archives — children go through AI detection.
     if archive.is_zip_upload(content_type, filename):
+        if replaces_document_id is not None:
+            raise HTTPException(422, "ZIP is a collection; upload new versions of its individual documents")
         return await _ingest_zip_upload(
             db, dealer, user, is_dealer, kind, filename, content_type, raw
         )
 
-    key = storage.build_key(dealer.id, filename)
-    s3_key = key if storage.put_bytes(key, raw, content_type) else None
-
     doc = DealerDocument(
+        id=uuid4(),
         dealer_id=dealer.id,
         filename=filename,
         content_type=content_type,
         size_bytes=len(raw),
-        s3_key=s3_key,
+        s3_key=None,
         kind=kind,
         status="pending_review" if is_dealer else "uploaded",
         uploaded_by_name=(user.name or user.email or "")[:200],
         uploaded_by_user_id=user.id,
         source_kind=provenance.document_source_for(user),
+        content_hash=hashlib.sha256(raw).hexdigest(),
     )
+    from .services import document_versions as dealer_versions
+    retried = await dealer_versions.prepare(db, doc, replaces_document_id=replaces_document_id,
+        expected_document_version=expected_document_version, pinned_account_id=pinned_account_id,
+        idempotency_key=idempotency_key)
+    if retried is not None:
+        return retried
+    key = storage.build_key(dealer.id, filename)
+    doc.s3_key = key if storage.put_bytes(key, raw, content_type) else None
+    if replaces_document_id is not None and doc.s3_key is None:
+        raise HTTPException(503, "The replacement could not be archived; the prior version and financial figures are unchanged. Retry the upload.")
     db.add(doc)
     await db.flush()
 
     if is_dealer:
-        # No extraction, no bucket push — quarantined until team review.
+        # A replacement mirror is quarantined too. Its metadata can block
+        # stale evidence, but pending_review is never queued for AI extraction.
+        if replaces_document_id is not None:
+            await buckets_link.push_document(db, dealer, doc, len(raw))
         await log_action(
             db, dealer.id, user, "dealer_upload", "document",
             entity_id=doc.id,
@@ -5158,10 +5180,16 @@ async def upload_document(
         await db.refresh(doc)
         return doc
 
-    await extract_document(db, doc, raw, account_id=pinned_account_id)
-    await _auto_fulfill_doc_request(db, dealer.id, doc, user)
+    accepted = await dealer_versions.extract_latest(db, doc, extract_document, raw, account_id=pinned_account_id)
+    if accepted:
+        await _auto_fulfill_doc_request(db, dealer.id, doc, user)
     # Best-effort mirror into the dealer's linked bucket — never fail the
     # upload because the bucket bridge hiccuped.
+    if replaces_document_id is not None:
+        await buckets_link.push_document(db, dealer, doc, len(raw))
+        await db.commit()
+        await db.refresh(doc)
+        return doc
     try:
         await buckets_link.push_document(db, dealer, doc, len(raw))
     except Exception:
@@ -5332,6 +5360,8 @@ async def delete_dealer_document(
     """Soft-delete document evidence and its bucket mirror as one audited act."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    from .services.document_versions import prelock_related
+    await prelock_related(db, dealer.id, doc_id)
     document = (
         await db.execute(
             select(DealerDocument)
@@ -5715,6 +5745,8 @@ async def restore_dealer_document(
     """
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    from .services.document_versions import assert_latest, prelock_related
+    await prelock_related(db, dealer.id, doc_id)
     selected = (
         await db.execute(
             select(DealerDocument)
@@ -5729,6 +5761,7 @@ async def restore_dealer_document(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found for this client")
     if selected.status != "deleted":
         return selected
+    await assert_latest(db, selected)
 
     marker = document_recovery.archive_for(selected)
     if marker is None or marker.get("version") != document_recovery.ARCHIVE_VERSION:
@@ -6175,6 +6208,24 @@ async def document_url(
     )
 
 
+@router.get("/dealers/{dealer_id}/documents/{doc_id}/versions")
+async def dealer_document_versions(
+    dealer_id: UUID, doc_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> dict:
+    from .services.document_versions import history
+
+    require_team_or_dealer_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    doc = await _load_document(db, dealer.id, doc_id)
+    data = await history(db, doc, can_upload=True)
+    if is_audit_client(user):
+        for version in data["versions"]:
+            if version["status"] == "failed":
+                version["can_preview"] = False
+                version["can_download"] = False
+    return data
+
+
 _COVERAGE_MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
 # Legacy declared kinds mapped onto the classifier vocabulary — used when a
 # document predates detected_kind (0114) and only `kind` is available.
@@ -6372,6 +6423,8 @@ async def reextract_document(
             status.HTTP_409_CONFLICT,
             "The original file was not archived to S3 — upload the document again to re-extract it",
         )
+    from .services import document_versions as dealer_versions
+    await dealer_versions.assert_latest(db, doc)
     # Replace, never append: drop this document's prior ledger lines first
     # (document_id makes the ownership exact), remember their months, and
     # rebuild any month the fresh extraction no longer covers.
@@ -6395,7 +6448,7 @@ async def reextract_document(
             )
         )
         await db.flush()
-    await extract_document(db, doc)
+    await dealer_versions.extract_latest(db, doc, extract_document)
     if old_periods:
         try:
             await rebuild_periods(db, dealer.id, sorted(old_periods))
@@ -6450,14 +6503,21 @@ async def approve_dealer_document(
         )
     before_status = doc.status
     doc.error = None
-    await extract_document(db, doc)  # fetches bytes from S3; account detect included
+    from .services import document_versions as dealer_versions
+    accepted = await dealer_versions.extract_latest(db, doc, extract_document)
     await log_action(
         db, dealer.id, user, "dealer_doc.approve", "document",
         entity_id=doc.id,
         before={"status": before_status},
         after={"status": doc.status, "account_id": str(doc.account_id) if doc.account_id else None},
     )
-    await _auto_fulfill_doc_request(db, dealer.id, doc, user)
+    if accepted:
+        await _auto_fulfill_doc_request(db, dealer.id, doc, user)
+    if getattr(doc, "supersedes_document_id", None):
+        await buckets_link.push_document(db, dealer, doc, doc.size_bytes)
+        await db.commit()
+        await db.refresh(doc)
+        return doc
     try:
         await buckets_link.push_document(db, dealer, doc, doc.size_bytes)
     except Exception:
@@ -6486,8 +6546,14 @@ async def reject_dealer_document(
             status.HTTP_409_CONFLICT,
             f"Only documents awaiting review can be rejected (status: {doc.status})",
         )
+    from .services import document_versions as dealer_versions
+    await dealer_versions.assert_latest(db, doc)
     doc.status = "rejected"
+    doc.document_version_status = "rejected"
+    doc.is_current_document_version = False
     doc.error = payload.note.strip()[:2000]
+    if getattr(doc, "supersedes_document_id", None):
+        await buckets_link.push_document(db, dealer, doc, doc.size_bytes)
     await log_action(
         db, dealer.id, user, "dealer_doc.reject", "document",
         entity_id=doc.id,
@@ -6643,6 +6709,26 @@ async def _ingest_bucket_file_core(
     """Shared ingest core (endpoint + background auto-ingest). Idempotent: a
     bucket file already referenced by a DealerDocument is returned as-is,
     never double-counted. Flushes; the caller commits."""
+    bucket_file = (
+        await db.execute(
+            select(BucketFile).where(
+                BucketFile.id == file_id,
+                BucketFile.bucket_id == dealer.bucket_id,
+                BucketFile.deleted_at.is_(None),
+                BucketFile.status == "uploaded",
+            )
+        )
+    ).scalar_one_or_none()
+    if bucket_file is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found in this client's linked bucket")
+
+    from app.services.document_version_selection import document_file_ids, lock_document_roots
+    # Bucket roots precede dealer/file locks everywhere in the bridge. This
+    # also serializes an incoming replacement with analysis of its old source.
+    await lock_document_roots(db, [bucket_file])
+    if bucket_file.id not in await document_file_ids(db, [bucket_file.id], usable=False):
+        raise HTTPException(409, "Only the latest received document version can be ingested")
+
     # Endpoint clicks and upload-complete background sweeps can overlap. Lock
     # the dealer before the existence check so both paths cannot create a
     # second document/ledger plan for the same bucket file.
@@ -6661,18 +6747,6 @@ async def _ingest_bucket_file_core(
     ).scalars().first()
     if existing is not None:
         return existing
-    bucket = await buckets_link.ensure_bucket(db, dealer)
-    bucket_file = (
-        await db.execute(
-            select(BucketFile).where(
-                BucketFile.id == file_id,
-                BucketFile.bucket_id == bucket.id,
-                BucketFile.deleted_at.is_(None),
-            )
-        )
-    ).scalar_one_or_none()
-    if bucket_file is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found in this client's linked bucket")
 
     analysis_q = select(BucketFileAnalysis).where(
         BucketFileAnalysis.bucket_file_id == bucket_file.id,
@@ -6702,8 +6776,12 @@ async def _ingest_bucket_file_core(
         source_kind=bucket_file.source_kind or "capital_os",
         source_detail=(bucket_file.source_detail or "")[:200] or None,
     )
+    await bucket_ingest.prepare_ingested_document(db, doc, bucket_file)
     db.add(doc)
     await db.flush()
+    if doc.status == "pending_review":
+        doc.error = "A new source version is ready for review. Approve it to replace the prior published financial figures."
+        return doc
 
     source_note = f"Ingested from linked bucket file '{bucket_file.file_name}'"
     cached = analysis_row.analysis if analysis_row is not None else None
@@ -6722,6 +6800,7 @@ async def _ingest_bucket_file_core(
         # classified document is a SUCCESS with its summary stored. Treating a
         # tax return as "failed" because it has no monthly bank data was the
         # old behaviour and it discarded fully-extracted filings.
+        doc.doc_meta = {**(doc.doc_meta or {}), "_document_identity_source": dict(cached.get("key_facts") or {})}
         extraction = buckets_link.adapt_analysis_to_extraction(cached)
         rules = await load_active_rules(db, dealer.id)
         plan = apply_extraction(extraction, rules=rules)
@@ -6825,6 +6904,9 @@ async def _ingest_bucket_file_core(
     elif doc.status == "failed":
         doc.extracted = {"months": [], "transactions_count": 0, "notes": [source_note]}
 
+    if doc.status == "failed":
+        doc.document_version_status = "failed"
+        doc.is_current_document_version = False
     await db.flush()
     return doc
 
@@ -6857,10 +6939,12 @@ async def ingest_all_bucket_files(
             )
         ).scalars().all()
     )
+    from app.services.document_version_selection import latest_document_file_clause
     all_ids = (
         await db.execute(
             select(BucketFile.id).where(
-                BucketFile.bucket_id == dealer.bucket_id, BucketFile.deleted_at.is_(None)
+                BucketFile.bucket_id == dealer.bucket_id, BucketFile.deleted_at.is_(None),
+                BucketFile.status == "uploaded", latest_document_file_clause(BucketFile.id),
             )
         )
     ).scalars().all()

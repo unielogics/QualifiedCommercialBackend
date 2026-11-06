@@ -178,7 +178,7 @@ async def test_unselected_obligation_fields_do_not_attach_source_metadata():
                   {"key": f"{original['id']}.balance", "value": "80", "source": {"file_id": str(source_id)}}])
     db.add(imported)
     db.objects[(FinancialFormFamily, family.id)] = family
-    db.objects[(BucketFile, source_id)] = SimpleNamespace(bucket_id=profile.primary_bucket_id, deleted_at=None, content_hash="a" * 64)
+    db.objects[(BucketFile, source_id)] = SimpleNamespace(id=source_id, bucket_id=profile.primary_bucket_id, deleted_at=None, content_hash="a" * 64)
     with patch.object(ws, "resolve_family", AsyncMock(return_value=(family, draft))), patch.object(ws, "load_workspace", AsyncMock(return_value={})):
         await ws.apply_import(db, profile, imported.id, expected_revision=2, selected_keys=["business_name"])
     assert draft.body["business_name"] == "New business"
@@ -202,7 +202,7 @@ async def test_number_only_selection_cannot_create_an_unnamed_imported_obligatio
         ])
     db.add(imported)
     db.objects[(FinancialFormFamily, family.id)] = family
-    db.objects[(BucketFile, source_id)] = SimpleNamespace(bucket_id=profile.primary_bucket_id, deleted_at=None, content_hash="a" * 64)
+    db.objects[(BucketFile, source_id)] = SimpleNamespace(id=source_id, bucket_id=profile.primary_bucket_id, deleted_at=None, content_hash="a" * 64)
     with patch.object(ws, "resolve_family", AsyncMock(return_value=(family, draft))):
         with pytest.raises(HTTPException) as error:
             await ws.apply_import(db, profile, imported.id, expected_revision=2, selected_keys=[f"{proposed['id']}.balance"])

@@ -381,6 +381,7 @@ async def readiness(db: AsyncSession, dealer: DealerBusiness) -> Readiness:
                 .where(
                     DealerDocument.dealer_id == dealer.id,
                     DealerDocument.status != "deleted",
+                    DealerDocument.is_current_document_version.is_(True),
                     or_(DealerDocument.kind == "bank_statement", DealerDocument.detected_kind == "bank_statement"),
                 )
             )
@@ -1349,6 +1350,7 @@ async def archive_stale_drafts(db: AsyncSession, *, now: datetime | None = None,
                     .where(
                         DealerDocument.dealer_id == dealer.id,
                         DealerDocument.status != "deleted",
+                        DealerDocument.is_current_document_version.is_(True),
                     )
                     .limit(1)
                 )

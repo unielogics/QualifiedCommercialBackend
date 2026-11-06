@@ -406,7 +406,7 @@ def test_the_migration_chain_has_one_head():
     from alembic.script import ScriptDirectory
 
     heads = ScriptDirectory.from_config(Config("alembic.ini")).get_heads()
-    assert heads == ["0266_attention_queue_controls"]
+    assert heads == ["0269_dealer_document_versions"]
     assert all(len(head) <= 32 for head in heads)
 
 
