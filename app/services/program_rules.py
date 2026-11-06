@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from numbers import Real
@@ -44,6 +45,7 @@ SUPPORTED_FIT_FIELDS = frozenset(
         "gross_margin_pct",
         "net_margin_pct",
         "annual_revenue",
+        "annual_ebitda",
         "annualized_deposits",
         "deposits",
         "bank_statement_months",
@@ -68,6 +70,81 @@ SUPPORTED_FIT_FIELDS = frozenset(
 
 class ProgramRuleError(ValueError):
     pass
+
+
+def _financial_limits(limits: Any) -> dict:
+    if not isinstance(limits, dict) or set(limits) != {"minimum_annual_ebitda", "currency", "source_reference"}:
+        raise ProgramRuleError("Financial limits require minimum_annual_ebitda, currency, and source_reference")
+    if not _is_number(limits["minimum_annual_ebitda"]):
+        raise ProgramRuleError("minimum_annual_ebitda must be a finite number")
+    if limits["currency"] != "USD":
+        raise ProgramRuleError("Annual EBITDA program limits are denominated in USD; no currency conversion is assumed")
+    source = limits["source_reference"]
+    if not isinstance(source, str) or not 1 <= len(source.strip()) <= 1000:
+        raise ProgramRuleError("An explicit annual EBITDA limit requires a source_reference of 1 to 1000 characters")
+    return {**limits, "source_reference": source.strip()}
+
+
+def _annual_ebitda_leaves(node: Any, *, mandatory: bool = True) -> list[tuple[dict, bool]]:
+    if not isinstance(node, dict):
+        return []
+    if node.get("field") == "annual_ebitda":
+        return [(node, mandatory)]
+    if "not" in node:
+        return _annual_ebitda_leaves(node["not"], mandatory=False)
+    return [leaf for key in ("all", "any") for child in node.get(key, [])
+            for leaf in _annual_ebitda_leaves(child, mandatory=mandatory and key == "all")]
+
+
+def uses_annual_ebitda(rules: dict | None) -> bool:
+    """Include ranking metadata so specialist routes cannot silently ignore it."""
+    rules = rules or {}
+    if "financial_limits" in rules:
+        return True
+    preferences = rules.get("recommendation_preferences")
+    pending = [rules.get("fit"), *[row.get("when") for row in preferences if isinstance(row, dict)]] if isinstance(preferences, list) else [rules.get("fit")]
+    visited = 0
+    while pending:
+        node = pending.pop()
+        visited += 1
+        if visited > 1000:
+            return True  # Invalid oversized specialist policy stays closed.
+        if not isinstance(node, dict):
+            continue
+        if node.get("field") == "annual_ebitda":
+            return True
+        pending.append(node.get("not"))
+        for key in ("all", "any"):
+            if isinstance(node.get(key), list):
+                pending.extend(node[key])
+    return False
+
+
+def compile_financial_limits(rules: dict, limits: dict) -> dict:
+    """Compile an explicitly sourced limit into a reviewable eligibility rule.
+
+    There is one stored rule and one provenance record. A conflicting editor
+    rule, or a rule inside an alternative/negation, must be resolved by staff.
+    """
+    limits = _financial_limits(limits)
+    result = deepcopy(rules)
+    if "fit" in result:
+        _validate_node(result["fit"], depth=0, count=[0], enforce_supported_fields=True)
+    minimum = {"field": "annual_ebitda", "op": "gte", "value": limits["minimum_annual_ebitda"]}
+    leaves = _annual_ebitda_leaves(result.get("fit"))
+    if leaves and (len(leaves) != 1 or not leaves[0][1] or leaves[0][0] != minimum):
+        raise ProgramRuleError("financial_limits conflicts with the annual_ebitda fit rule; use one matching mandatory minimum")
+    if not leaves:
+        fit = result.get("fit")
+        if fit:
+            if isinstance(fit, dict) and set(fit) == {"all"} and isinstance(fit["all"], list):
+                fit["all"].append(minimum)
+            else:
+                result["fit"] = {"all": [fit, minimum]}
+        else:
+            result["fit"] = minimum
+    result["financial_limits"] = limits
+    return result
 
 
 @dataclass(frozen=True)
@@ -98,6 +175,11 @@ def validate_rules(
     """
     if not rules:
         return
+    if "financial_limits" in rules:
+        limits = _financial_limits(rules["financial_limits"])
+        compiled = compile_financial_limits(rules, limits)
+        if compiled.get("fit") != rules.get("fit"):
+            raise ProgramRuleError("financial_limits must have a matching mandatory annual_ebitda fit rule")
     if enforce_supported_fields:
         priority = rules.get("priority", 0)
         if (
@@ -181,6 +263,11 @@ def _validate_node(
     if op not in ALLOWED_OPERATORS:
         raise ProgramRuleError("Unsupported program fit operator")
     value = node.get("value")
+    if field == "annual_ebitda" and (
+        op not in {"present", "eq", "gte", "lte", "gt", "lt"}
+        or op != "present" and not _is_number(value)
+    ):
+        raise ProgramRuleError("annual_ebitda requires present or a numeric comparison in USD")
     if (
         enforce_supported_fields
         and op != "evidence_available"

@@ -2164,6 +2164,7 @@ def build_cockpit(
         service=service,
         proposed=proposed,
         requested_amount=_num(requested_amount),
+        ebitda=metric_review["ebitda"],
     )
     levers = plans.coverage_levers(
         plan_record,
@@ -2304,6 +2305,7 @@ def plan_brief(cockpit: dict[str, Any]) -> dict[str, Any]:
         "dscr_basis": dscr.get("basis"),
         "debt_service_before_monthly": service.get("before"),
         "debt_service_after_monthly": service.get("after"),
+        "ebitda": impact.get("ebitda"),
         "loan": impact.get("loan"),
         "note": summary["note"],
     }

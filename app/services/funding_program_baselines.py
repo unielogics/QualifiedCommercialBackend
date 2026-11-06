@@ -10,7 +10,9 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from app.schemas.funding_program import FundingProgramFinancialLimits
 from app.services.mca_refinance_policy import MAX_ACTIVE_MCAS, MAX_AMOUNT, MAX_TERM_MONTHS
+from app.services.program_rules import compile_financial_limits
 
 BASELINE_VERSION = "qcweb-2026-09-27-v1"
 SITE = "https://qualifiedcommercial.com"
@@ -91,7 +93,7 @@ def taxes(years: int = 2, *, patterns: bool = True, stage: str = "underwriting")
 P_AND_L = document(
     "ytd_p_and_l_balance_sheet",
     "Year-to-date P&L and balance sheet",
-    "Reconcile reporting period, entity, revenue, earnings, assets, liabilities, and debt to source records. Compare like-for-like periods, not partial-year totals against full years.",
+    "Reconcile reporting period, entity, revenue, earnings, assets, liabilities, and debt to source records. Compare like-for-like periods, not partial-year totals against full years. If a published program uses annual EBITDA, reconcile net income + interest + income taxes + depreciation and amortization to any source-reported EBITDA; request missing components rather than substituting bank cash flow or tax-derived estimates. Confirm the business, source currency, cash/accrual basis, original reporting dates and duration. Distinguish full-year EBITDA from an explicitly labelled eligible 6–11 month annualization; shorter or unknown periods remain period figures.",
 )
 DEBT = document(
     "business_debt_schedule",
@@ -1119,6 +1121,9 @@ def suggested_baseline(
     notes.append(
         "Proposed QC policy: qualitative underwriting prompts expand the website's descriptions into staff review records, not an assertion that every prompt is a separate borrower upload. Unless the source specifies a stage, the draft uses underwriting verification; confirm collection timing and conditional applicability before publishing. A document waiver cannot waive legal or program eligibility."
     )
+    notes.append(
+        "Review: annual EBITDA is available as an optional sourced program criterion, not an added threshold in this baseline. It requires a current accepted P&L for the same business, confirmed USD currency and accounting basis, complete net-income/interest/income-tax/D&A reconciliation, and a known eligible reporting duration. Request missing components and preserve full-year versus annualized-period labels; bank cash flow, tax estimates and hypothetical refinance adjustments do not establish this fact."
+    )
     requirements = deepcopy(spec.get("docs", standard_docs()))
     if any(
         row.get("review_checks")
@@ -1158,6 +1163,11 @@ def suggested_baseline(
     sources.append(CENSUS_SOURCE)
     criteria = spec.get("rules", [])
     rules: dict[str, Any] = {"fit": {"all": criteria}} if criteria else {}
+    financial_limits = None
+    if spec.get("financial_limits") is not None:
+        financial_limits = FundingProgramFinancialLimits.model_validate(spec["financial_limits"]).model_dump()
+        rules = compile_financial_limits(rules, financial_limits)
+        notes.append(f"Review: explicit minimum annual EBITDA of USD {financial_limits['minimum_annual_ebitda']:g} is sourced to {financial_limits['source_reference']}. Confirm the source and publish a reviewed criteria version before applying it.")
     if program_key == "mca_refinance":
         # The term is an offer ceiling, not a fabricated requested term. The
         # intrinsic gate applies it whenever an actual term is present.
@@ -1165,7 +1175,7 @@ def suggested_baseline(
                                     "maximum_active_mcas": MAX_ACTIVE_MCAS, "outside_limits_route": "manual_review"}
     if spec.get("recommendation_preferences"):
         rules["recommendation_preferences"] = deepcopy(spec["recommendation_preferences"])
-    if not criteria:
+    if not criteria and financial_limits is None:
         notes.append(
             "Review: the source page does not state sufficient hard fit thresholds. Document traits are prefilled, but add your approved eligibility checks before publishing; no threshold has been invented."
         )
@@ -1229,6 +1239,7 @@ def suggested_baseline(
         "source_urls": sources,
         "source_notes": notes,
         "rules": rules,
+        "financial_limits": financial_limits,
         "requirements": requirements,
         "scopes": scopes,
         "needs_review": True,
