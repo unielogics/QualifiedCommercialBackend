@@ -165,14 +165,15 @@ async def read_request(db: AsyncSession, profile: ApplicationProfile, *, user: U
     budget = await read_budget(db, profile)
     current = getattr(profile, "current_funding_request", None) or {}
     original = current.get("original") or {}
+    can_edit = user is not None and user.role in EDIT_ROLES
     return FundingRequestRead(
         profile_id=profile.id, requested_amount=budget.requested_amount,
         requested_amount_source=budget.requested_amount_source,
         original_requested_amount=float(original["requested_amount"]) if original.get("requested_amount") is not None else budget.requested_amount,
         revision=int(current.get("revision", 0)), use_of_funds_revision=budget.revision,
-        items=budget.items, complete=budget.complete, can_edit=user is not None and user.role in EDIT_ROLES,
-        reason=current.get("reason"), updated_at=current.get("updated_at"),
-        updated_by_user_id=current.get("updated_by_user_id"),
+        items=budget.items, complete=budget.complete, can_edit=can_edit,
+        reason=current.get("reason") if can_edit else None, updated_at=current.get("updated_at"),
+        updated_by_user_id=current.get("updated_by_user_id") if can_edit else None,
         payoff_only_alternative=bool(current.get("payoff_only_alternative", False)),
     )
 

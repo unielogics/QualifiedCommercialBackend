@@ -143,6 +143,24 @@ async def test_profile_request_wins_over_original_intake_without_mutating_it():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("role", [None, *Role])
+async def test_request_read_redacts_internal_change_notes_and_actor_from_noneditors(role):
+    actor_id = uuid4()
+    saved = profile(current_funding_request={
+        "requested_amount": "200000", "revision": 1,
+        "reason": "Private underwriting correction note", "updated_by_user_id": str(actor_id),
+    })
+    with patch.object(use_of_funds, "source_funding_data", source):
+        result = await funding_requests.read_request(
+            SimpleNamespace(), saved, user=SimpleNamespace(role=role) if role is not None else None,
+        )
+    allowed = role in funding_requests.EDIT_ROLES
+    assert result.requested_amount == 200000 and result.can_edit == allowed
+    assert result.reason == ("Private underwriting correction note" if allowed else None)
+    assert result.updated_by_user_id == (actor_id if allowed else None)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("room", [False, True])
 async def test_submitted_budget_cannot_bypass_exactness_through_room_or_staff(room):
     saved = profile()
