@@ -2400,7 +2400,9 @@ async def get_financial_cockpit(
     tax years, tracked expenses, debt service, DSCR and the net-profit
     conclusion, each naming its source."""
     profile = await profiles.load_profile(db, profile_id, user)
-    return FinancialCockpitRead(**await financial_cockpit.load_cockpit(db, profile))
+    from app.services.financial_metric_review import redact_for_external
+
+    return FinancialCockpitRead(**redact_for_external(await financial_cockpit.load_cockpit(db, profile), user))
 
 
 @router.post("/{profile_id}/financial-cockpit/reread-statements", response_model=StatementRereadResult)

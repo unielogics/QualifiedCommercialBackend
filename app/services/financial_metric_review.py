@@ -1,0 +1,386 @@
+"""Source-bound factual inputs; hypothetical financing stays in financial_plan.
+
+The source documents and immutable form versions are never rewritten. A new
+analysis, period, account selection or published debt basis makes a correction
+stale until staff reviews the new evidence. All arithmetic defaults are the
+cockpit's existing underwriting rules, including its labelled tax estimate.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+import uuid
+from datetime import UTC, date, datetime
+from decimal import Decimal
+from types import SimpleNamespace
+from typing import Any
+
+from fastapi import HTTPException
+from sqlalchemy import select
+
+from app.enums import Role
+from app.models.application_profile import ApplicationProfile
+from app.services import public_underwriting_packet_pdf as extraction
+from app.services.public_underwriting_packet_pdf import _num as source_number
+
+
+def stamp(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
+
+
+def number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+        return result if math.isfinite(result) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _entity(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
+def _currency(value: Any) -> str | None:
+    reported = str(value or "").strip().upper()
+    return reported if re.fullmatch(r"[A-Z]{3}", reported) and reported != "XXX" else None
+
+
+def _currency_comparison(source_refs):
+    """Describe the existing ratio's denominations; never convert its amounts."""
+    reported = sorted({str(ref.get("currency")).strip().upper() for ref in source_refs if ref.get("currency")})
+    normalized = [_currency(ref.get("currency")) for ref in source_refs]
+    known = {value for value in normalized if value}
+    mismatch = any(value != "USD" for value in known)
+    unknown = not normalized or any(value is None for value in normalized)
+    status = "mismatch" if mismatch else "unknown" if unknown else "comparable"
+    if mismatch:
+        note = f"Source currency {', '.join(reported)} differs from the USD debt-service denomination. The existing ratio is shown without currency conversion and is not directly comparable."
+    elif unknown:
+        note = "Source currency is unconfirmed against USD debt service. The existing ratio is shown without currency conversion; confirm currency before relying on it."
+    else:
+        note = None
+    return {"numerator_currency": next(iter(known)) if len(known) == 1 and not unknown else None,
+            "denominator_currency": "USD", "source_currencies": reported,
+            "currency_comparable": status == "comparable", "currency_status": status, "currency_note": note,
+            "denominator_currency_basis": "Application debt schedules and debt-service figures are denominated in USD; source amounts are not converted."}
+
+
+def _months(start, end):
+    try:
+        first, last = date.fromisoformat(start), date.fromisoformat(end)
+        return (last.year - first.year) * 12 + last.month - first.month + 1 if last >= first else None
+    except (ValueError, TypeError):
+        return None
+
+
+def prepare(analyses, years, statement, bank, months, accounts, service, *, state=None, entity=None, debt_rows=None):
+    """Apply matching factual corrections before any DSCR or scenario math."""
+    state = state or {}
+    bank = dict(bank)  # A DSCR operand correction never rewrites statement charts.
+    latest = {event["input_key"]: event for event in state.get("events", []) if event.get("input_key")}
+    by_file = {str(item.get("file_id")): item for item in analyses}
+    from app.services.financial_fact_citations import validated_fact_citations_for_analysis
+
+    verified = {key: validated_fact_citations_for_analysis(SimpleNamespace(id=item.get("analysis_id"), bucket_file_id=key,
+                content_hash=item.get("content_hash"), status="completed", analysis={"key_facts": item.get("key_facts"), "financial_fact_citations": item.get("financial_fact_citations")})) for key, item in by_file.items()}
+    debt_context = {key: service.get(key) for key in ("version_id", "source", "monthly", "annual", "schedule_authoritative", "declared_none")}
+    context = {"debt": {**debt_context, "rows_stamp": stamp(debt_rows or [])}, "entity": entity,
+               "accounts": [{"key": a.get("key"), "members": a.get("members"), "counted": a.get("counted")} for a in accounts]}
+    inputs, calculations, results = [], [], []
+
+    def refs(record):
+        source = by_file.get(str(record.get("file_id")), {})
+        facts = source.get("key_facts") or {}
+        return [{"file_id": record.get("file_id"), "file_name": source.get("file_name"),
+                 "analysis_id": source.get("analysis_id"), "content_hash": source.get("content_hash"),
+                 "accepted": bool(source.get("accepted")), "entity": record.get("entity") or record.get("business_name") or facts.get("business_name") or facts.get("entity"),
+                 "period_start": record.get("period_start"), "period_end": record.get("period_end"),
+                 "currency": record.get("currency") or facts.get("currency"), "basis": record.get("basis") or facts.get("basis"),
+                 "facts_stamp": stamp(facts)}]
+
+    def operand(key, label, value, *, source_refs, period, editable=True, unit="currency", fact_keys=None, canonical=None, **extra):
+        field = key.rsplit(".", 1)[-1]
+        if fact_keys is None:
+            fact_keys = ("ebitda",) if field == "reported_ebitda" else (field,)
+        enriched = []
+        for ref in source_refs:
+            facts = (by_file.get(str(ref.get("file_id")), {}).get("key_facts") or {})
+            fact_key = next((alias for alias in fact_keys if source_number(facts.get(alias)) is not None), None)
+            citations = verified.get(str(ref.get("file_id")), {}).get(canonical or field, [])
+            enriched.append({**ref, "fact_key": fact_key or fact_keys[0], "fact_present": fact_key is not None,
+                             "citations": citations, "pages": sorted({c["page"] for c in citations if isinstance(c.get("page"), int)})})
+        source_refs = enriched
+        dependencies = {"entity": entity}
+        if key.startswith("bank."):
+            dependencies["accounts"] = context["accounts"]
+        if key.startswith("debt."):
+            dependencies["debt"] = context["debt"]
+        source_stamp = stamp({"key": key, "original": value, "refs": source_refs, "period": period, "dependencies": dependencies})
+        event = latest.get(key)
+        mismatch = bool(entity and any(ref.get("entity") and _entity(ref["entity"]) != _entity(entity) for ref in source_refs))
+        correction = event if event and event.get("action") == "correct" and event.get("source_stamp") == source_stamp and not mismatch else None
+        effective = correction["value"] if correction else value
+        inputs.append({"key": key, "label": label, "original_value": value, "value": effective,
+                       "unit": unit, "editable": editable and bool(source_refs) and not mismatch, "source_stamp": source_stamp,
+                       "source_refs": source_refs, "period": period, "missing": effective is None,
+                       "correction": correction, "unavailable_reason": "Review the document's business association in Evidence before correcting its financial inputs." if mismatch else None, **extra})
+        return effective
+
+    for year in years:
+        source_refs = refs(year)
+        prefix = f"tax_return:{year.get('file_id')}:{year.get('year')}"
+        period = str(year.get("year") or "Unknown tax period")
+        tax_months = _months(year.get("period_start"), year.get("period_end"))
+        if year.get("period_start") or year.get("period_end"):
+            period += f" ({year.get('period_start') or '?'} – {year.get('period_end') or '?'})"
+        keys = [f"{prefix}.{key}" for key in ("income", "interest", "depreciation")]
+        from app.services.financial_cockpit import _TAX_INCOME_BASES, _TAX_LINE_ALIASES
+
+        income_field = next((key for key, label in _TAX_INCOME_BASES if label == year.get("income_basis")), "income")
+        income_aliases = {"ordinary_business_income": extraction._ORDINARY_BUSINESS_INCOME_ALIASES,
+                          "net_income": extraction._NET_INCOME_ALIASES,
+                          "net_income_per_books": extraction._BOOK_NET_INCOME_ALIASES}.get(income_field, (income_field,))
+        for key, label in (("income", f"Tax income ({year.get('income_basis') or 'unknown basis'})"), ("interest", "Tax interest deduction"), ("depreciation", "Tax depreciation / stated D&A")):
+            year[key] = operand(f"{prefix}.{key}", label, year.get(key), source_refs=source_refs, period=period,
+                                fact_keys=income_aliases if key == "income" else _TAX_LINE_ALIASES[key], canonical=income_field if key == "income" else key)
+        year["ebitda"] = round(year["income"] + (year["interest"] or 0) + (year["depreciation"] or 0), 2) if year["income"] is not None else None
+        year["ebitda_complete"] = all(year.get(key) is not None for key in ("income", "interest", "depreciation"))
+        missing = [key for key in keys if next(i for i in inputs if i["key"] == key)["missing"]]
+        notes = ["Underwriting estimate: tax income + known interest + known depreciation. This is not a reconciliation from net income to full EBITDA; missing deductions contribute zero only to this existing estimate."]
+        if tax_months != 12:
+            notes.append("The tax reporting duration is unknown or is not a full twelve months. This period estimate is not annualized; existing DSCR still uses its reported tax basis without a new annualization assumption.")
+        source_entity = source_refs[0].get("entity")
+        mismatch = bool(entity and source_entity and _entity(entity) != _entity(source_entity))
+        if not source_entity:
+            notes.append("The source business identity is not established.")
+        if mismatch:
+            notes.append("The source names a different business; excluded from the EBITDA headline. Existing DSCR source precedence is unchanged.")
+        result = {"key": prefix, "label": "Tax-derived earnings estimate", "value": year["ebitda"],
+                  "annualized_value": year["ebitda"] if tax_months == 12 else None, "period": period, "months_covered": tax_months,
+                  "period_start": year.get("period_start"), "period_end": year.get("period_end"),
+                  "annualization_factor": 1 if tax_months == 12 else None, "kind": "tax_estimate", "complete": False, "provisional": True,
+                  "formula": "tax income + known interest + known depreciation", "input_keys": keys,
+                  "missing_inputs": missing, "notes": notes, "source_refs": source_refs, "entity_mismatch": mismatch}
+        result["entity_comparable"] = bool(entity and source_entity and not mismatch)
+        result["currency"], result["basis"] = source_refs[0].get("currency"), source_refs[0].get("basis")
+        if not _currency(result["currency"]):
+            notes.append("The source currency is not established; this amount retains its source denomination without currency conversion.")
+        results.append(result)
+        calculations.append(dict(result))
+
+    if statement:
+        source_refs = refs(statement)
+        raw = (by_file.get(str(statement.get("file_id")), {}).get("key_facts") or {})
+        period = statement.get("period_label") or "Unknown statement period"
+        original_months = statement.get("months_covered")
+        months_value = operand("profit_and_loss.months_covered", "P&L reporting months", original_months, source_refs=source_refs, period=period, unit="months", minimum=1, maximum=12)
+        statement["months_covered"] = int(months_value) if months_value is not None else None
+        fields = ("net_income", "interest", "income_taxes", "depreciation_and_amortization")
+        labels = ("P&L net income", "P&L interest", "P&L income taxes (excluding taxes and licenses)", "P&L depreciation and amortization")
+        for key, label in zip(fields, labels, strict=True):
+            statement[key] = operand(f"profit_and_loss.{key}", label, statement.get(key), source_refs=source_refs, period=period,
+                                     fact_keys=extraction._PL_NET_INCOME_ALIASES if key == "net_income" else (key,))
+        reported = operand("profit_and_loss.reported_ebitda", "Source-reported EBITDA", source_number(raw.get("ebitda")), source_refs=source_refs, period=period)
+        computed = round(sum(statement[key] for key in fields), 2) if all(statement.get(key) is not None for key in fields) else None
+        value = reported if reported is not None else computed
+        statement["ebitda"] = value
+        covered = statement["months_covered"]
+        factor = 12 / covered if covered is not None and 6 <= covered <= 11 else (1 if covered == 12 else None)
+        statement["annualized_ebitda"] = round(value * factor, 2) if value is not None and factor is not None else None
+        # Preserve the separate legacy net-income annualization rule.
+        net_factor = 12 / covered if covered and 0 < covered < 12 else 1
+        statement["annualized_net_income"] = round(statement["net_income"] * net_factor, 2) if statement["net_income"] is not None else None
+        if statement.get("gross_revenue"):
+            statement["net_margin"] = round(statement["net_income"] / statement["gross_revenue"], 4) if statement["net_income"] is not None else None
+        keys = [f"profit_and_loss.{key}" for key in fields]
+        missing = [key for key in keys if next(i for i in inputs if i["key"] == key)["missing"]]
+        notes = []
+        if factor is None:
+            notes.append("Period EBITDA is shown without annualization; DSCR requires a known 6–12 month P&L period.")
+        if months_value != original_months:
+            notes.append("Staff corrected the reporting-month count; original source dates remain unchanged.")
+        if reported is not None and computed is not None and abs(reported - computed) > 0.01:
+            notes.append("Source-reported EBITDA differs from net income + interest + income taxes + D&A. Reported EBITDA remains the existing underwriting basis; reconcile the difference.")
+        if reported is not None and computed is None:
+            notes.append("Source-reported EBITDA cannot yet be reconciled to net income because one or more reconciliation components are unknown.")
+        source_entity = source_refs[0].get("entity")
+        mismatch = bool(entity and source_entity and _entity(entity) != _entity(source_entity))
+        if not source_entity:
+            notes.append("The source business identity is not established.")
+        if mismatch:
+            notes.append("The source names a different business; excluded from the EBITDA headline. Existing DSCR source precedence is unchanged.")
+        currency_known = _currency(source_refs[0].get("currency")) is not None
+        basis_known = str(source_refs[0].get("basis") or "").strip().casefold() in {"cash", "accrual"}
+        if not currency_known:
+            notes.append("The source currency is not established; confirm its denomination before comparing this EBITDA with other figures.")
+        if not basis_known:
+            notes.append("The source accounting basis is unconfirmed; this EBITDA remains provisional.")
+        result = {"key": "profit_and_loss", "label": "Reported EBITDA" if reported is not None else "EBITDA",
+                  "value": value, "annualized_value": statement["annualized_ebitda"], "period": period,
+                  "months_covered": covered, "annualization_factor": factor,
+                  "kind": "reported_ebitda" if reported is not None else "computed_ebitda",
+                  "complete": computed is not None, "provisional": not bool(source_refs[0].get("accepted")) or not source_entity or not entity or computed is None or not currency_known or not basis_known,
+                  "formula": "source-reported EBITDA" if reported is not None else "net income + interest + income taxes + depreciation and amortization",
+                  "input_keys": ["profit_and_loss.reported_ebitda"] if reported is not None else keys,
+                  "missing_inputs": missing, "notes": notes, "source_refs": source_refs,
+                  "computed_value": computed, "reported_value": reported, "entity_mismatch": mismatch}
+        result["entity_comparable"] = bool(entity and source_entity and not mismatch)
+        result["currency"], result["basis"] = source_refs[0].get("currency"), source_refs[0].get("basis")
+        results.append(result)
+        calculations.append(dict(result))
+        calculations.append({"key": "profit_and_loss.reconciliation", "label": "EBITDA reconciliation from net income",
+                             "formula": "net income + interest + income taxes + depreciation and amortization",
+                             "value": computed, "reported_value": reported,
+                             "difference": round(reported - computed, 2) if reported is not None and computed is not None else None,
+                             "input_keys": keys, "period": period, "annualization_factor": 1,
+                             "missing_inputs": missing, "notes": notes, "source_refs": source_refs})
+
+    bank_ids = {str(key) for month in months for key in month.get("file_ids", [])}
+    bank_refs = [refs({"file_id": key, "period_start": bank.get("first_month"), "period_end": bank.get("last_month")})[0] for key in sorted(bank_ids)]
+    bank_period = f"{bank.get('first_month') or '?'} – {bank.get('last_month') or '?'}"
+    bank["avg_net"] = operand("bank.avg_net", "Average monthly bank cash retained", bank.get("avg_net"), source_refs=bank_refs, period=bank_period,
+                              fact_keys=("derived:average(monthly_deposits-minus-withdrawals)",),
+                              details={"months": [{key: month.get(key) for key in ("month", "accounts", "file_ids", "deposits", "withdrawals", "net")} for month in months],
+                                       "included_net_months": sum(month.get("net") is not None for month in months),
+                                       "counted_accounts": context["accounts"]})
+    if bank.get("estimates_available"):
+        bank["annualized_net"] = round(bank["avg_net"] * 12, 2) if bank["avg_net"] is not None else None
+    for key, label in (("avg_deposits", "Average monthly deposits"), ("avg_withdrawals", "Average monthly withdrawals")):
+        operand(f"bank.{key}", label, bank.get(key), source_refs=bank_refs, period=bank_period, editable=False)
+    operand("debt.monthly", "Published / provisional monthly debt service", service.get("monthly"), source_refs=[{"version_id": service.get("version_id"), "basis": service.get("source"), "currency": "USD"}], period="Monthly", editable=False, editor_action="debt_schedule",
+            details={"rows": debt_rows or [], "service": dict(service)})
+    operand("debt.annual", "Annual debt service", service.get("annual"), source_refs=[{"version_id": service.get("version_id"), "basis": service.get("source"), "currency": "USD"}], period="Annual", editable=False)
+    active_inputs = {i["key"]: i for i in inputs}
+    stale = [event for key, event in latest.items() if event.get("action") == "correct" and (key not in active_inputs or active_inputs[key]["source_stamp"] != event.get("source_stamp"))]
+    eligible = [result for result in results if result["value"] is not None and not result["entity_mismatch"]]
+    headline = next((r for r in eligible if r["kind"] != "tax_estimate"), None) or next((r for r in reversed(eligible) if r["kind"] == "tax_estimate"), None)
+    return {"revision": state.get("revision", 0), "source_stamp": stamp([i["source_stamp"] for i in inputs]),
+            "inputs": inputs, "calculations": calculations, "history": state.get("events", []),
+            "stale_corrections": [{**event, "stale": True} for event in stale],
+            "_bank": bank,
+            "scope": "Effective cockpit facts and downstream cockpit consumers. Original documents, financial form versions and hypothetical plan overrides are unchanged.",
+            "ebitda": {"headline": headline, "candidates": results, "reason": None if headline else "No source-supported EBITDA or tax-derived estimate is available. Bank cash flow is not EBITDA."}}
+
+
+def finish(review, dscr, service, bank):
+    """Trace the actual selected DSCR, including its bank debt-payment addback."""
+    for candidate in dscr.get("candidates", []):
+        if candidate["key"] == "tax_return":
+            earnings = next((r for r in reversed(review["calculations"]) if r.get("kind") == "tax_estimate" and r.get("value") is not None), None)
+            keys = earnings["input_keys"] if earnings else []
+            formula = "(tax income + known interest + known depreciation) / annual debt service"
+        elif candidate["key"] == "profit_and_loss":
+            earnings = next((r for r in review["calculations"] if r.get("key") == "profit_and_loss"), None)
+            keys = (earnings["input_keys"] + ["profit_and_loss.months_covered"]) if earnings else []
+            formula = "(period EBITDA × eligible annualization factor) / annual debt service"
+        else:
+            earnings = None
+            keys = ["bank.avg_net", "debt.monthly"]
+            formula = "((average monthly bank cash retained + monthly debt service) × 12) / annual debt service"
+        candidate["input_keys"] = keys + ["debt.annual"]
+        candidate["source_refs"] = earnings["source_refs"] if earnings else next(i["source_refs"] for i in review["inputs"] if i["key"] == "bank.avg_net")
+        comparison = _currency_comparison(candidate["source_refs"])
+        candidate.update(comparison)
+        if comparison["currency_note"]:
+            candidate["note"] = " ".join(part for part in (candidate.get("note"), comparison["currency_note"]) if part)
+        review["calculations"].append({"key": f"dscr.{candidate['key']}", "label": candidate["label"] + " DSCR", "formula": formula,
+                                       "value": candidate.get("value"), "numerator": candidate.get("numerator"), "denominator": service.get("annual"),
+                                       "input_keys": candidate["input_keys"], "period": candidate.get("period"),
+                                       "annualization_factor": 1 if candidate["key"] == "tax_return" else earnings.get("annualization_factor") if earnings else 12,
+                                       "missing_inputs": [i["key"] for i in review["inputs"] if i["key"] in candidate["input_keys"] and i["missing"]],
+                                       "notes": ([candidate["note"]] if candidate.get("note") else []) + (earnings.get("notes", []) if earnings else []),
+                                       "source_refs": candidate["source_refs"], "selected": candidate is dscr.get("headline"),
+                                       "basis_status": service.get("basis_status"), "debt_version_id": service.get("version_id"),
+                                       "entity_comparable": earnings.get("entity_comparable", False) if earnings else False,
+                                       **comparison,
+                                       "observed_bank_months": bank.get("months")})
+    for item in review["inputs"]:
+        item["used_by"] = [calculation["key"] for calculation in review["calculations"] if item["key"] in calculation.get("input_keys", [])]
+        item["used_by_headline"] = [calculation["key"] for calculation in review["calculations"] if calculation.get("selected") and item["key"] in calculation.get("input_keys", [])]
+
+
+def redact_for_external(cockpit, actor):
+    """Retain existing numeric visibility without exposing internal staff audit."""
+    if actor.role not in {Role.CLIENT, Role.DEALER, Role.LENDER, Role.VENDOR, Role.CAPITAL_PARTNER}:
+        return cockpit
+    from copy import deepcopy
+
+    result = deepcopy(cockpit)
+    review = result.get("metric_review") or {}
+    review["history"] = []
+    review["stale_correction_count"] = len(review.get("stale_corrections", []))
+    review["stale_corrections"] = []
+    for item in review.get("inputs", []):
+        item["editable"] = False
+        if item.get("correction"):
+            item["correction"] = {key: item["correction"].get(key) for key in ("value", "at")}
+    return result
+
+
+def change(state, review, *, input_key, action, value, reason, expected_revision, source_stamp, idempotency_key, actor, mark_unknown=False, now=None):
+    """Pure audited transition, allowing receipt replay before stale-source checks."""
+    if actor.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(403, "Underwriting role required")
+    state = state or {}
+    request = {"input_key": input_key, "action": action, "value": value, "mark_unknown": mark_unknown, "reason": reason.strip(), "source_stamp": source_stamp, "expected_revision": expected_revision}
+    request_stamp = stamp(request)
+    for event in state.get("events", []):
+        if event.get("idempotency_key") == idempotency_key:
+            if event.get("request_stamp") != request_stamp:
+                raise HTTPException(409, "Idempotency key already used for a different correction")
+            return state, False
+    if state.get("revision", 0) != expected_revision:
+        raise HTTPException(409, "Financial corrections changed; reload before saving")
+    target = next((i for i in review["inputs"] if i["key"] == input_key), None)
+    if target is None or not target["editable"]:
+        raise HTTPException(422, "This calculation input must be corrected in its source workspace")
+    if target["source_stamp"] != source_stamp:
+        raise HTTPException(409, "Source evidence changed; review the current input before saving")
+    if not reason.strip() or len(reason) > 2000:
+        raise HTTPException(422, "A correction reason is required")
+    if action not in {"correct", "restore"}:
+        raise HTTPException(422, "Unknown correction action")
+    numeric = number(value)
+    if mark_unknown and (action != "correct" or value is not None):
+        raise HTTPException(422, "Marking an input unknown requires a correction with an explicitly empty value")
+    if action == "correct" and numeric is None and not mark_unknown:
+        raise HTTPException(422, "A finite numeric value is required; unknown values cannot be invented")
+    if numeric is not None and abs(numeric) > 1e15:
+        raise HTTPException(422, "The correction exceeds the supported amount range")
+    if target["unit"] == "months" and action == "correct" and numeric is not None and (numeric != int(numeric) or not 1 <= numeric <= 12):
+        raise HTTPException(422, "Reporting months must be a whole number from 1 to 12")
+    if numeric is not None and target["unit"] == "currency":
+        numeric = float(Decimal(str(numeric)).quantize(Decimal("0.01")))
+    revision = expected_revision + 1
+    event = {"id": str(uuid.uuid4()), **request, "value": numeric if action == "correct" else None,
+             "previous_value": target["value"], "original_value": target["original_value"],
+             "effective_value": numeric if action == "correct" else target["original_value"],
+             "source_refs": target["source_refs"], "period": target["period"],
+             "actor_id": str(actor.id), "actor_name": getattr(actor, "full_name", None) or getattr(actor, "name", None),
+             "at": (now or datetime.now(UTC)).isoformat(), "revision": revision,
+             "idempotency_key": idempotency_key, "request_stamp": request_stamp}
+    return {"revision": revision, "events": [*state.get("events", []), event]}, True
+
+
+async def correct(db, profile, actor, **payload):
+    from app.services import application_profiles as profiles
+    from app.services import financial_cockpit
+    from app.services.financial_workspace import lock_financial_profile
+
+    await lock_financial_profile(db, profile)
+    # A loaded ORM profile can predate waiting for the lock. Refresh its state
+    # under the lock before reading revision or idempotency receipts.
+    profile = (await db.execute(select(ApplicationProfile).where(ApplicationProfile.id == profile.id).execution_options(populate_existing=True))).scalar_one()
+    cockpit = await financial_cockpit.load_cockpit(db, profile)
+    state, changed = change(getattr(profile, "financial_metric_review", None), cockpit["metric_review"], actor=actor, **payload)
+    if changed:
+        profile.financial_metric_review = state
+        await profiles.log_profile_action(db, profile, actor, "financial_metrics.corrected" if payload["action"] == "correct" else "financial_metrics.restored", "Reviewed a source-bound financial calculation input", metadata=state["events"][-1])
+        await db.flush()
+        cockpit = await financial_cockpit.load_cockpit(db, profile)
+    return cockpit

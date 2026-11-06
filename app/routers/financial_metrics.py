@@ -1,0 +1,55 @@
+"""Advanced staff corrections of source-bound financial calculation inputs."""
+
+from typing import Annotated, Literal
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db import get_db
+from app.deps import CurrentUser
+from app.enums import Role
+from app.schemas.financial_cockpit import FinancialCockpitRead
+from app.services import application_profiles as profiles
+from app.services import financial_cockpit, financial_metric_review
+
+router = APIRouter(prefix="/application-profiles/{profile_id}/financial-metrics", tags=["financial-metrics"])
+Db = Annotated[AsyncSession, Depends(get_db)]
+
+
+class FinancialMetricCorrection(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    input_key: str = Field(min_length=1, max_length=200)
+    action: Literal["correct", "restore"]
+    value: float | None = None
+    mark_unknown: bool = False
+    reason: str = Field(min_length=1, max_length=2000)
+    expected_revision: int = Field(ge=0)
+    source_stamp: str = Field(min_length=64, max_length=64)
+    idempotency_key: str = Field(min_length=8, max_length=128)
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def numeric_not_boolean(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("A financial correction must be numeric")
+        return value
+
+
+@router.get("", response_model=FinancialCockpitRead)
+async def read_metrics(profile_id: UUID, user: CurrentUser, db: Db):
+    if user.role in {Role.CLIENT, Role.DEALER, Role.LENDER, Role.VENDOR, Role.CAPITAL_PARTNER}:
+        raise HTTPException(403, "Financial metric review requires a staff account")
+    profile = await profiles.load_profile(db, profile_id, user)
+    return await financial_cockpit.load_cockpit(db, profile)
+
+
+@router.post("/corrections", response_model=FinancialCockpitRead)
+async def correct_metrics(profile_id: UUID, payload: FinancialMetricCorrection, user: CurrentUser, db: Db):
+    if user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(403, "Underwriting role required")
+    profile = await profiles.load_profile(db, profile_id, user)
+    cockpit = await financial_metric_review.correct(db, profile, user, **payload.model_dump())
+    await db.commit()
+    return cockpit

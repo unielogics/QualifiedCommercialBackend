@@ -1237,6 +1237,8 @@ class ApplicationIntelligenceRead(BaseModel):
     profile_id: UUID
     metrics: list[IntelligenceMetric] = Field(default_factory=list)
     dscr_inputs: dict = Field(default_factory=dict)
+    metric_review: dict | None = None
+    effective_calculation: dict | None = None
 
 
 class ClassificationPreview(BaseModel):

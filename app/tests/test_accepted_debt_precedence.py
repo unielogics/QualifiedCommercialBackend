@@ -227,7 +227,8 @@ async def test_intelligence_ignores_stale_ai_debt_and_ratio_once_schedule_is_com
         result = await application_profiles.intelligence_state(SimpleNamespace(get=AsyncMock(return_value=intake)), profile)
     assert result.dscr_inputs["annual_debt_service"] == annual
     metric = next(row for row in result.metrics if row.key == "dscr")
-    assert metric.value == dscr and metric.source == "completed saved debt schedule"
+    assert metric.value == dscr
+    assert metric.source == ("completed saved debt schedule" if annual == 0 else "Cached AI earnings with completed saved debt schedule")
     if annual == 0:
         assert metric.status == "not_applicable" and metric.action is None
 

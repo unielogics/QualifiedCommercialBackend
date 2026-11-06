@@ -195,6 +195,10 @@ class ApplicationProfile(TimestampMixin, Base):
     financial_plan: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
+    # Source-bound factual corrections, separate from hypothetical plan inputs.
+    financial_metric_review: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
     #: Requirements the desk added to this file from the library (app/services/
     #: requirement_library.py): [{key, source_requirement_id, required_level, note,
     #: added_by, added_at, custom}]. Materialized like evidence-policy requirements.

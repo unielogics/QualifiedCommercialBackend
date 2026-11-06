@@ -295,6 +295,9 @@ def _extractor_rows(analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "file_id": item.get("file_id"),
                     "classification": classification,
                     "key_facts": item.get("key_facts") or {},
+                    "analysis_id": item.get("analysis_id"),
+                    "content_hash": item.get("content_hash"),
+                    "financial_fact_citations": item.get("financial_fact_citations"),
                 }
             )
     return rows
@@ -2052,6 +2055,8 @@ def build_cockpit(
     now: datetime | None = None,
     accepted_schedule: dict[str, Any] | None = None,
     working_schedule: dict[str, Any] | None = None,
+    metric_review_state: dict[str, Any] | None = None,
+    business_entity: str | None = None,
 ) -> dict[str, Any]:
     """The cockpit read model from plain dicts.
 
@@ -2127,7 +2132,13 @@ def build_cockpit(
         schedule["version_id"] = accepted_schedule.get("version_id")
     reconciliation = reconcile_advances(rows, documented, recurring)
     proposed = proposed_payment(proposed_terms)
-    dscr = dscr_block(years, statement, bank, service, proposed)
+    from app.services import financial_metric_review as metric_reviews
+
+    metric_review = metric_reviews.prepare(analyses, years, statement, bank, months, accounts, service,
+                                          state=metric_review_state, entity=business_entity, debt_rows=rows)
+    effective_bank = metric_review.pop("_bank")
+    dscr = dscr_block(years, statement, effective_bank, service, proposed)
+    metric_reviews.finish(metric_review, dscr, service, effective_bank)
     from app.services import financial_plan as plans
 
     plan_record = plans.normalize_plan(plan)
@@ -2227,6 +2238,8 @@ def build_cockpit(
             "review": review,
         },
         "dscr": dscr,
+        "ebitda": metric_review.pop("ebitda"),
+        "metric_review": metric_review,
         "plan": {
             "unresolved_previous_selections": unresolved_selections,
             "record": plan_record,
@@ -2468,6 +2481,8 @@ def listing_summary(cockpit: dict[str, Any]) -> dict[str, Any]:
         "tax_year": latest_tax.get("year"),
         "tax_gross_receipts": latest_tax.get("gross_receipts"),
         "tax_income": latest_tax.get("income"),
+        "ebitda": (cockpit.get("ebitda", {}).get("headline") or {}).get("value"),
+        "ebitda_basis": (cockpit.get("ebitda", {}).get("headline") or {}).get("kind"),
     }
 
 
@@ -2496,6 +2511,8 @@ def _analysis_rows(
                 "file_id": str(file.id),
                 "file_name": file.file_name,
                 "content_hash": getattr(analysis, "content_hash", None) or getattr(file, "content_hash", None),
+                "analysis_id": str(analysis.id) if getattr(analysis, "id", None) else None,
+                "financial_fact_citations": payload.get("financial_fact_citations"),
                 "classification": classification,
                 "classifications": sorted(classifications),
                 "key_facts": facts,
@@ -2714,6 +2731,8 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
                            "version_id": str(accepted_version.id), "saved_at": accepted_version.created_at.isoformat(),
                            "actor_name": accepted_version.actor_name} if accepted_version is not None else None,
         working_schedule=working_schedule,
+        metric_review_state=getattr(profile, "financial_metric_review", None) or {},
+        business_entity=getattr(intake, "business_name", None) or getattr(_dealer, "legal_name", None) or getattr(_dealer, "name", None),
     )
     cockpit["profile_id"] = str(profile.id)
     return cockpit
