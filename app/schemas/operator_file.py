@@ -452,10 +452,13 @@ class IntakePromotionResult(BaseModel):
     audit_id: UUID
 
 
+AttentionKind = Literal["intake_no_files", "no_client_entry", "request_overdue", "action_items_stale"]
+
+
 class AttentionItem(BaseModel):
     """One thing on the desk that is stalling, with the one link that fixes it."""
 
-    kind: Literal["intake_no_files", "no_client_entry", "request_overdue", "action_items_stale"]
+    kind: AttentionKind
     severity: Literal["warn", "bad"]
     title: str
     detail: str
@@ -473,3 +476,7 @@ class AttentionQueue(BaseModel):
     generated_at: datetime
     items: list[AttentionItem]
     counts: dict[str, int]
+    total: int = Field(ge=0)
+    filtered_total: int = Field(ge=0)
+    limit: int = Field(default=60, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
