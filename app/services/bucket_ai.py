@@ -1647,6 +1647,11 @@ def _mentions_debt_schedule(*texts) -> bool:
 
 
 def _whole_debt_schedule_gap(*texts) -> bool:
+    original = " ".join(str(value or "") for value in texts)
+    # A current accepted schedule does not prove an independently requested
+    # reporting year/date, even when that happens to be the current year.
+    if re.search(r"\b\d{4}\b|\b\d{1,2}[-/]\d{1,2}(?:[-/]\d{2,4})?\b", original):
+        return False
     words = _debt_schedule_gap_words(*texts)
     normalized = " ".join(words)
     additional_documents = re.search(

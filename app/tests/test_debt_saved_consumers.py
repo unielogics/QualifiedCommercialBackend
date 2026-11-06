@@ -177,3 +177,20 @@ def test_schedule_plus_independent_documents_is_not_a_whole_schedule_gap(title):
     assert result["missing_or_incomplete_items"][0]["title"] == title
     assert result["recommended_next_document_requests"][0]["title"] == title
     assert result["lending_ready"] is False
+
+
+@pytest.mark.parametrize("title", ["2025 Business debt schedule", "Business debt schedule as of 2025-12-31",
+                                  "Business debt schedule as of 12/31/25"])
+def test_current_schedule_does_not_retire_an_unverified_period_specific_request(title):
+    result = reconcile(review(title), accepted())
+    assert result["missing_or_incomplete_items"][0]["title"] == title
+    assert result["recommended_next_document_requests"][0]["title"] == title
+    assert result["lending_ready"] is False
+
+
+@pytest.mark.parametrize("count", [0, 5])
+def test_ordinary_row_counts_are_not_mistaken_for_a_reporting_period(count):
+    result = reconcile(review(f"Business debt schedule with {count} active obligations"), accepted())
+    assert result["missing_or_incomplete_items"] == []
+    assert result["recommended_next_document_requests"] == []
+    assert result["lending_ready"] is True
