@@ -41,6 +41,8 @@ from app.schemas.communication import (
     ComposeRecipient,
     FileCommunicationSeen,
     FileCommunicationUnread,
+    FileCommunicationUnreadBatchRequest,
+    FileCommunicationUnreadBatchResponse,
     UnifiedCommunicationCompose,
     UnifiedCommunicationMessage,
     UnifiedCommunicationSeen,
@@ -192,6 +194,15 @@ async def communication_sync_state(
         "stream_connected": communication_event_broker.connected,
         "server_time": datetime.now(UTC).isoformat(),
     }
+
+
+@router.post("/intakes/unread-batch", response_model=FileCommunicationUnreadBatchResponse)
+async def intake_communication_unread_batch(
+    payload: FileCommunicationUnreadBatchRequest, user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> FileCommunicationUnreadBatchResponse:
+    from app.services.file_communication_unread import unread_batch
+
+    return FileCommunicationUnreadBatchResponse(items=await unread_batch(db, user=user, intake_ids=payload.intake_ids))
 
 
 @router.get("/intakes/{intake_id}/unread", response_model=FileCommunicationUnread)

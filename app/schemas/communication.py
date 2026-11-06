@@ -108,6 +108,14 @@ class FileCommunicationUnread(BaseModel):
     as_of: datetime
 
 
+class FileCommunicationUnreadBatchRequest(BaseModel):
+    intake_ids: list[UUID] = Field(max_length=100)
+
+
+class FileCommunicationUnreadBatchResponse(BaseModel):
+    items: list[FileCommunicationUnread] = Field(default_factory=list)
+
+
 class UnifiedContactGroup(BaseModel):
     """One person, every channel. The inbox row the operator actually wants:
     who spoke last, through what, with the full history one click away."""
