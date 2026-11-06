@@ -38,10 +38,13 @@ import logging
 import secrets
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Annotated, Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -153,6 +156,14 @@ class RowsBody(LiveBody):
     visible: int | None = Field(default=None, ge=0, le=10_000)
 
 
+class WorksheetVersionBody(BaseModel):
+    sheet: str = Field(min_length=1, max_length=24)
+    expected_revision: int = Field(ge=0)
+    base_version_id: uuid.UUID | None = None
+    idempotency_key: str = Field(min_length=8, max_length=128)
+    name: str | None = Field(default=None, max_length=120)
+
+
 class CursorBody(BaseModel):
     """Where somebody is, and nothing about what they are typing.
 
@@ -192,8 +203,10 @@ async def _snapshot(db: AsyncSession, access, kinds) -> dict[str, dict[str, Any]
     """
     from app.services import sheets
 
+    family_ids = await worksheet_links.bound_families(db, access, kinds)
     payload = await sheets.read_sheets(
-        db, access.profile, kinds=list(kinds), origin=access.origin, worksheet=access.worksheet
+        db, access.profile, kinds=list(kinds), origin=access.origin, worksheet=access.worksheet,
+        can_edit=access.can_edit, family_ids=family_ids,
     )
     return {
         str(sheet.get("kind")): sheet
@@ -219,6 +232,43 @@ def _row_ids(rows: Any, block: str | None = None) -> list[str]:
         if key:
             out.append(str(key))
     return out
+
+
+def _pdf_metadata(metadata: dict, token: str, kind: str) -> dict:
+    result = dict(metadata)
+    base = f"/api/v1/public/worksheets/{quote(token, safe='')}/versions/{kind}"
+    def safe_version(row):
+        value = {key: row.get(key) for key in ("id", "version_number", "created_at", "source", "status")}
+        if row.get("pdf_available") or row.get("pdf_file_id") or row.get("pdf_url"):
+            value["pdf_url"] = f"{base}/{row['id']}/pdf"
+        return value
+
+    versions = [safe_version(row) for row in result.get("versions") or []]
+    result["versions"] = versions
+    if result.get("current_version"):
+        result["current_version"] = safe_version(result["current_version"])
+    return result
+
+
+def _public_sheet_payload(payload: dict, access, token: str) -> dict:
+    result = dict(payload)
+    result["sheets"] = [dict(row) for row in result.get("sheets") or []
+        if isinstance(row, dict) and str(row.get("kind") or "") in access.sheets]
+    for row in result["sheets"]:
+        if row.get("workspace"):
+            row["workspace"] = _pdf_metadata(row["workspace"], token, row["kind"])
+    result["scope"] = {**(result.get("scope") or {}), "sheets": list(access.sheets),
+        "can_edit": access.can_edit, "open_at": access.sheets[0] if access.sheets else None}
+    result["can_edit"] = access.can_edit
+    result["completed"] = access.link.completed_at is not None
+    return result
+
+
+def _public_write_metadata(result: dict, token: str) -> dict:
+    if result.get("workspaces"):
+        result["workspaces"] = {kind: _pdf_metadata(metadata, token, kind)
+            for kind, metadata in result["workspaces"].items()}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +305,7 @@ async def read_worksheet(
     )
     from app.services import sheets
 
+    family_ids = await worksheet_links.bound_families(db, access)
     payload = dict(
         await sheets.read_sheets(
             db,
@@ -262,22 +313,11 @@ async def read_worksheet(
             kinds=list(access.sheets),
             origin=access.origin,
             worksheet=access.worksheet,
+            can_edit=access.can_edit,
+            family_ids=family_ids,
         )
     )
-    payload["sheets"] = [
-        sheet
-        for sheet in (payload.get("sheets") or [])
-        if isinstance(sheet, dict) and str(sheet.get("kind") or "") in access.sheets
-    ]
-    scope = dict(payload.get("scope") or {})
-    scope["sheets"] = list(access.sheets)
-    scope["can_edit"] = access.can_edit
-    scope["open_at"] = access.sheets[0] if access.sheets else None
-    payload["scope"] = scope
-    # Alongside the scope rather than only inside it: the toolbar reads one
-    # boolean, and a nested one is easy to forget to look at.
-    payload["can_edit"] = access.can_edit
-    payload["completed"] = access.link.completed_at is not None
+    payload = _public_sheet_payload(payload, access, token)
     await db.commit()
     return payload
 
@@ -303,6 +343,7 @@ async def write_worksheet_cells(
     worksheet_links.guard_write_rate(access)
 
     before = await _snapshot(db, access, kinds)
+    family_ids = await worksheet_links.bound_families(db, access, kinds)
     result = await sheets.apply_cell_edits(
         db,
         access.profile,
@@ -313,6 +354,7 @@ async def write_worksheet_cells(
         worksheet=access.worksheet,
         participant_id=payload.participant_id,
         client_id=payload.client_id,
+        family_ids=family_ids,
     )
     after = await _snapshot(db, access, kinds)
     revs = dict(result.get("rev") or {})
@@ -334,7 +376,7 @@ async def write_worksheet_cells(
     # same way the desk does, so the same 120-second settle applies: the PDF is
     # filed once the typing stops, on the finished figure.
     await sheets.refresh_touched_pdfs(db, access.profile, kinds, actor_name=payload.name)
-    return result
+    return _public_write_metadata(result, token)
 
 
 @router.post("/{token}/rows")
@@ -358,6 +400,7 @@ async def write_worksheet_rows(
     worksheet_links.guard_write_rate(access)
 
     before = await _snapshot(db, access, [kind])
+    family_ids = await worksheet_links.bound_families(db, access, [kind])
     before_rows = _row_ids((before.get(kind) or {}).get("rows"), payload.block)
     result = await sheets.apply_row_op(
         db,
@@ -373,6 +416,7 @@ async def write_worksheet_rows(
         participant_id=payload.participant_id,
         client_id=payload.client_id,
         visible=payload.visible,
+        family_ids=family_ids,
     )
     after_rows = _row_ids(result.get("rows"), payload.block)
     revs = dict(result.get("rev") or {})
@@ -396,7 +440,66 @@ async def write_worksheet_rows(
     await db.commit()
     # Queued, not rendered: see `write_worksheet_cells` above.
     await sheets.refresh_touched_pdfs(db, access.profile, [kind], actor_name=payload.name)
-    return result
+    return _public_write_metadata(result, token)
+
+
+@router.post("/{token}/versions")
+async def save_worksheet_version(
+    token: str, payload: WorksheetVersionBody, request: Request, db: DbSession, session: LinkSession = None
+) -> dict[str, Any]:
+    from app.services import client_financial_forms, sheets
+
+    access, _s, _e = await worksheet_links.resolve(db, token, session=session, client_ip=_ip(request))
+    worksheet_links.require_edit(access)
+    (kind,) = worksheet_links.require_sheets(access, [payload.sheet])
+    worksheet_links.guard_write_rate(access)
+    families = await worksheet_links.bound_families(db, access, [kind])
+    family_id = families.get(kind)
+    if family_id is None:
+        raise worksheet_links.gone()
+    snapshot = await client_financial_forms.ensure_snapshot(db, access.profile, kind, family_id=family_id)
+    result = await client_financial_forms.save_submission(db, access.profile, snapshot, body=snapshot["body"],
+        expected_revision=payload.expected_revision, base_version_id=payload.base_version_id,
+        idempotency_key=client_financial_forms.submission_key(access.link.id, payload.idempotency_key),
+        actor=SimpleNamespace(id=None, name=payload.name or access.link.invitee_email or "Client", email=access.link.invitee_email or ""))
+    access.link.completed_at = datetime.now(UTC)
+    await worksheet_links.complete_bound_sheet(db, access, kind, family_id)
+    await worksheet_links.record_edit(db, access, sheet_kind=kind, revision=access.worksheet.revision,
+        changes={"version": {"id": result["saved_version"]["id"], "version_number": result["saved_version"]["version_number"]}},
+        request=request, claimed_name=payload.name)
+    all_families = await worksheet_links.bound_families(db, access)
+    response = _public_sheet_payload(await sheets.read_sheets(db, access.profile, kinds=access.sheets,
+        origin=access.origin, can_edit=access.can_edit, worksheet=access.worksheet, family_ids=all_families), access, token)
+    response["saved_version"] = _pdf_metadata({"versions": [result["saved_version"]]}, token, kind)["versions"][0]
+    await db.commit()
+    return response
+
+
+@router.get("/{token}/versions/{kind}/{version_id}/pdf")
+async def read_worksheet_version_pdf(
+    token: str, kind: str, version_id: uuid.UUID, request: Request, db: DbSession, session: LinkSession = None
+) -> Response:
+    from app.services import financial_workspace
+
+    access, _s, _e = await worksheet_links.resolve(db, token, session=session, client_ip=_ip(request))
+    (kind,) = worksheet_links.require_sheets(access, [kind])
+    families = await worksheet_links.bound_families(db, access, [kind])
+    try:
+        family, _version = await financial_workspace.version_for_profile(db, access.profile, version_id)
+    except HTTPException as error:
+        if error.status_code == 404:
+            raise worksheet_links.gone() from None
+        raise
+    if families.get(kind) != family.id or family.kind != kind:
+        raise worksheet_links.gone()
+    content, filename = await financial_workspace.version_pdf(db, access.profile, version_id)
+    ascii_name = "".join(char if char.isascii() and (char.isalnum() or char in "._-") else "-" for char in filename) or "financial-version.pdf"
+    filename = filename.replace("\r", "").replace("\n", "")
+    await db.commit()
+    return Response(content, media_type="application/pdf", headers={
+        "Content-Disposition": f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}",
+        "Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -412,10 +515,28 @@ def _frame(event: dict[str, Any]) -> str:
     return f"id: {event_id}\nevent: {event_type}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n"
 
 
+def _scoped_family_event(event: dict, family_ids: dict[str, uuid.UUID] | None) -> dict | None:
+    """A live cell must prove the same owner/period as the scoped REST read."""
+    if not family_ids or str(event.get("type") or "").startswith("presence."):
+        return event
+    data = event.get("data") or {}
+    kind = data.get("sheet_kind")
+    if kind not in family_ids:
+        return None
+    if data.get("family_id"):
+        return event if str(data["family_id"]) == str(family_ids[kind]) else None
+    # Old publishers do not identify the family. They may ask the client to
+    # re-read its bound sheet, but never push another person's values.
+    return {**event, "type": "sync.required", "data": {
+        "worksheet_id": data.get("worksheet_id"), "sheet_kind": kind, "reason": "family_refresh",
+    }}
+
+
 def _live_stream(
     request: Request,
     worksheet_id: Any,
     participant: worksheet_presence.Participant,
+    family_ids: dict[str, uuid.UUID] | None = None,
 ) -> AsyncIterator[str]:
     """The stream both doors return, once the caller has been resolved.
 
@@ -451,7 +572,9 @@ def _live_stream(
                         # is how a client learns the connection is still real.
                         yield ": heartbeat\n\n"
                         continue
-                    yield _frame(event)
+                    visible = _scoped_family_event(event, family_ids)
+                    if visible is not None:
+                        yield _frame(visible)
         finally:
             # The connection *is* the presence, so this is the only place a
             # participant leaves — no endpoint to forget to call, nothing to
@@ -516,6 +639,7 @@ async def stream_worksheet_events(
             access, _s, _e = await worksheet_links.resolve(
                 auth_db, token, session=session, client_ip=_ip(request)
             )
+            family_ids = await worksheet_links.bound_families(auth_db, access)
             claimed = worksheet_presence.clean_name(name)
             person = worksheet_presence.register(
                 access.worksheet.id,
@@ -538,7 +662,7 @@ async def stream_worksheet_events(
             await auth_db.rollback()
             log.exception("worksheet guest stream failed to open")
             raise
-    return _sse(_live_stream(request, worksheet_id, person))
+    return _sse(_live_stream(request, worksheet_id, person, family_ids=family_ids or None))
 
 
 @router.post("/{token}/cursor")

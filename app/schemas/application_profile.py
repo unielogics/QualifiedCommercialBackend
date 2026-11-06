@@ -1390,6 +1390,9 @@ class FinancialStatementRead(BaseModel):
 
 class FinancialStatementWrite(BaseModel):
     body: dict
+    expected_revision: int | None = Field(default=None, ge=0)
+    base_version_id: UUID | None = None
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
     statement_date: str | None = None
     #: Owners this statement covers. A joint statement — one sheet for a married
     #: couple — is simply two entries.

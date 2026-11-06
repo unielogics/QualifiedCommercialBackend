@@ -293,7 +293,7 @@ async def existing_draft(db: AsyncSession, profile: ApplicationProfile, kind: st
     return (await db.execute(select(FinancialFormDraft).where(FinancialFormDraft.family_id == family.id).execution_options(populate_existing=True))).scalar_one_or_none()
 
 
-async def _legacy_body(db: AsyncSession, profile: ApplicationProfile, kind: str) -> tuple[dict, Any]:
+async def _legacy_body(db: AsyncSession, profile: ApplicationProfile, kind: str, *, statement_id: UUID | None = None) -> tuple[dict, Any]:
     if kind == "real_estate_schedule":
         # The dated family/version is its source of truth. Never seed a second
         # schedule from a PFS or turn a property mortgage into business debt.
@@ -302,7 +302,9 @@ async def _legacy_body(db: AsyncSession, profile: ApplicationProfile, kind: str)
     if kind in bss.KINDS:
         return await business_statements.body_for_profile(db, profile, kind, prefill)
     if kind == "pfs":
-        statement = await financial_statements.latest_for_profile(db, profile.id)
+        statement = await db.get(FinancialStatement, statement_id) if statement_id else await financial_statements.latest_for_profile(db, profile.id)
+        if statement_id and (statement is None or statement.profile_id != profile.id):
+            raise HTTPException(404, "Financial statement not found")
         body = copy.deepcopy(statement.body if statement else pfs_schema.empty_body())
         body = financial_statements.seed_pfs_applicant(body, prefill)
         if statement and statement.statement_date and not body.get("as_of"):
@@ -363,15 +365,27 @@ async def _baseline_files(db: AsyncSession, profile: ApplicationProfile, kind: s
     return selected
 
 
-async def resolve_family(db: AsyncSession, profile: ApplicationProfile, *, kind: str, family_id: UUID | None = None, actor: Any = None) -> tuple[FinancialFormFamily, FinancialFormDraft]:
+async def resolve_family(db: AsyncSession, profile: ApplicationProfile, *, kind: str, family_id: UUID | None = None, statement_id: UUID | None = None, actor: Any = None) -> tuple[FinancialFormFamily, FinancialFormDraft]:
     _kind(kind)
     # The profile lock serializes first-open and publication across all kinds.
     await lock_financial_profile(db, profile)
-    family = await db.get(FinancialFormFamily, family_id) if family_id else await existing_family(db, profile.id, kind)
+    if statement_id and kind != "pfs":
+        raise HTTPException(404, "Financial statement not found")
+    if statement_id:
+        selected_statement = await db.get(FinancialStatement, statement_id)
+        if selected_statement is None or selected_statement.profile_id != profile.id:
+            raise HTTPException(404, "Financial statement not found")
+    if family_id:
+        family = await db.get(FinancialFormFamily, family_id)
+    elif statement_id:
+        family = (await db.execute(select(FinancialFormFamily).where(FinancialFormFamily.profile_id == profile.id,
+            FinancialFormFamily.kind == kind, FinancialFormFamily.identity["statement_id"].astext == str(statement_id)))).scalar_one_or_none()
+    else:
+        family = await existing_family(db, profile.id, kind)
     if family_id and (family is None or family.profile_id != profile.id or family.kind != kind):
         raise HTTPException(404, "Financial form family not found")
     if family is None:
-        body, statement = await _legacy_body(db, profile, kind)
+        body, statement = await _legacy_body(db, profile, kind, statement_id=statement_id) if statement_id else await _legacy_body(db, profile, kind)
         identity = _identity(kind, body, statement)
         family = FinancialFormFamily(id=uuid4(), profile_id=profile.id, kind=kind, identity_key=body_hash(identity), identity=identity, label=LABELS[kind], created_at=now())
         db.add(family)

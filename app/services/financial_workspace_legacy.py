@@ -11,8 +11,13 @@ from fastapi import HTTPException
 EDITABLE_DEBT_FIELDS = frozenset({"lender", "debt_type", "original_amount", "balance", "rate", "monthly_payment", "factor_rate", "payment_amount", "payment_frequency", "originated_on", "maturity_on", "secured", "payment_status", "collateral", "mca_modified", "mca_modification_note", "notes"})
 
 
-def merge_source_debts(current: dict, incoming: dict, *, origin: str = "client_form") -> dict:
-    """A public whole-body save cannot edit another source's obligations."""
+def merge_source_debts(current: dict, incoming: dict, *, origin: str = "client_form", allow_source_edits: bool = False) -> dict:
+    """Merge scoped financial answers without accepting provenance/desk controls.
+
+    An authorized client form can correct imported figures. Source origin is
+    retained as evidence, rather than used as an access-control boundary.
+    Other legacy callers keep their existing source-owned behavior.
+    """
     body = deepcopy(current)
     if "no_debt" in incoming:
         # Validation rejects non-boolean or contradictory declarations. All
@@ -26,25 +31,36 @@ def merge_source_debts(current: dict, incoming: dict, *, origin: str = "client_f
         row_id = str(raw.get("id") or "")
         row = known.get(row_id)
         if row is not None:
-            if row.get("origin", row.get("owner")) != origin or row.get("status", "active") != "active":
+            if (not allow_source_edits and row.get("origin", row.get("owner")) != origin) or row.get("status", "active") != "active":
                 continue
         else:
             # Old borrowers may send no ids. Match a unique own row before
             # minting identity; never treat a lender name as a global loan id.
-            matches = [r for key, r in known.items() if key not in seen and r.get("origin", r.get("owner")) == origin
+            matches = [r for key, r in known.items() if not row_id and key not in seen and (allow_source_edits or r.get("origin", r.get("owner")) == origin)
                        and r.get("status", "active") == "active" and str(r.get("lender", "")).strip().casefold() == str(raw.get("lender", "")).strip().casefold()]
             if len(matches) == 1:
                 row = matches[0]
             else:
-                row = {"id": str(uuid4()), "origin": origin, "status": "active", "count_in_dscr": True, "evidence_links": []}
+                try:
+                    fresh_id = str(UUID(row_id)) if row_id else str(uuid4())
+                except (ValueError, TypeError):
+                    raise HTTPException(422, "Schedule rows require UUIDs") from None
+                row = {"id": fresh_id, "origin": origin, "status": "active", "count_in_dscr": True, "evidence_links": []}
                 body.setdefault("debts", []).append(row)
-        row.update({key: value for key, value in raw.items() if key in EDITABLE_DEBT_FIELDS})
+        if str(row["id"]) in seen:
+            raise HTTPException(422, "Schedule rows require distinct UUIDs")
+        patch = {key: value for key, value in raw.items() if key in EDITABLE_DEBT_FIELDS}
+        changed = [key for key, value in patch.items() if row.get(key) != value]
+        row.update(patch)
+        if allow_source_edits and changed:
+            row["client_reviewed"] = True
+            row["client_edited_fields"] = sorted(set(row.get("client_edited_fields") or []) | set(changed))
         seen.add(str(row["id"]))
     for row in body.get("debts", []):
-        if row.get("origin", row.get("owner")) == origin and str(row.get("id")) not in seen and row.get("status", "active") == "active":
+        if (allow_source_edits or row.get("origin", row.get("owner")) == origin) and str(row.get("id")) not in seen and row.get("status", "active") == "active":
             row["status"] = "dismissed"
     if "no_debt" not in incoming and any(
-        row.get("status", "active") == "active" and row.get("origin", row.get("owner")) == origin
+        row.get("status", "active") == "active" and (allow_source_edits or row.get("origin", row.get("owner")) == origin)
         for row in body.get("debts", [])
     ):
         body["no_debt"] = False
