@@ -1732,6 +1732,8 @@ class MyFileRow(BaseModel):
     city: str | None
     loan_type: str | None
     amount: float | None
+    requested_amount: float | None = None
+    requested_amount_source: str | None = None
     ai_status: str | None  # living_profile.current_status one-liner
     updated_at: datetime
     # The modal loads loan-backed tabs when loan_uuid is set, else
@@ -1753,8 +1755,11 @@ async def my_files(
         )
 
     from app.models.client_property import ClientProperty
+    from app.models.application_profile import ApplicationProfile
     from app.models.deal import Deal
     from app.models.loan import Loan
+    from app.services import funding_requests
+    from sqlalchemy import or_
 
     client_id = user.client.id
 
@@ -1765,6 +1770,26 @@ async def my_files(
             .order_by(Loan.updated_at.desc())
         )
     ).scalars().all()
+    # Read only the profiles linked to this borrower's already-scoped loans.
+    # The request projection never creates a new application or changes terms.
+    profiles_by_loan = {}
+    if loans:
+        loan_ids = [loan.id for loan in loans]
+        intake_ids = [loan.source_intake_id for loan in loans if loan.source_intake_id]
+        deal_ids = [loan.source_deal_id for loan in loans if loan.source_deal_id]
+        predicates = [ApplicationProfile.loan_id.in_(loan_ids)]
+        if intake_ids:
+            predicates.append(ApplicationProfile.intake_id.in_(intake_ids))
+        if deal_ids:
+            predicates.append(ApplicationProfile.deal_id.in_(deal_ids))
+        profiles = (await db.execute(select(ApplicationProfile).where(or_(*predicates)))).scalars().all()
+        direct = {profile.loan_id: profile for profile in profiles if profile.loan_id}
+        by_intake = {profile.intake_id: profile for profile in profiles if profile.intake_id}
+        by_deal = {profile.deal_id: profile for profile in profiles if profile.deal_id}
+        profiles_by_loan = {
+            loan.id: direct.get(loan.id) or by_intake.get(loan.source_intake_id) or by_deal.get(loan.source_deal_id)
+            for loan in loans
+        }
 
     # Only un-promoted deals — a promoted deal is covered by its Loan row.
     deals = (
@@ -1793,6 +1818,7 @@ async def my_files(
     for ln in loans:
         stage = _enum_str(ln.stage)
         funded = stage == "funded"
+        current_request = funding_requests.current_for_profile(profiles_by_loan.get(ln.id))
         rows.append(
             MyFileRow(
                 id=str(ln.id),
@@ -1804,6 +1830,8 @@ async def my_files(
                 city=ln.city,
                 loan_type=_enum_str(ln.type) or None,
                 amount=float(ln.amount) if ln.amount is not None else None,
+                requested_amount=float(current_request) if current_request is not None else None,
+                requested_amount_source="profile.current_funding_request" if current_request is not None else None,
                 ai_status=_ai_oneliner(ln.living_profile, ln.status_summary),
                 updated_at=ln.updated_at,
                 deal_uuid=str(ln.source_deal_id) if ln.source_deal_id else None,

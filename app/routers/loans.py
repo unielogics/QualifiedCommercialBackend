@@ -53,7 +53,7 @@ from app.schemas.loan import (
     TodoItemRead,
 )
 from app.scoping import scope_loan_query
-from app.services import calendar_emitter, file_events, upload_validation
+from app.services import calendar_emitter, file_events, funding_requests, upload_validation
 from app.services.activity_log import mark_loan_dirty
 from app.services.ai.vector_store import log_event as vector_log
 from app.services.email.parser import inject_deal_id
@@ -94,6 +94,15 @@ def _scope_query(user, stmt):
     return scope_loan_query(user, stmt)
 
 
+def _profile_read_projection(profile: ApplicationProfile | None) -> dict:
+    requested = funding_requests.current_for_profile(profile)
+    return {
+        "application_profile_id": profile.id if profile is not None else None,
+        "requested_amount": float(requested) if requested is not None else None,
+        "requested_amount_source": "profile.current_funding_request" if requested is not None else None,
+    }
+
+
 @router.get("", response_model=list[LoanRead])
 async def list_loans(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> list[LoanRead]:
     """List loans visible to the calling user. Returns broker_name +
@@ -111,7 +120,7 @@ async def list_loans(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> l
         .order_by(Loan.created_at.desc()),
     )
     rows = (await db.execute(stmt)).scalars().all()
-    profiles_by_loan: dict[UUID, UUID | None] = {}
+    profiles_by_loan: dict[UUID, ApplicationProfile | None] = {}
     if rows:
         loan_ids = [row.id for row in rows]
         intake_ids = [row.source_intake_id for row in rows if row.source_intake_id]
@@ -124,9 +133,9 @@ async def list_loans(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> l
         existing_profiles = (
             await db.execute(select(ApplicationProfile).where(or_(*profile_clauses)))
         ).scalars().all()
-        direct = {profile.loan_id: profile.id for profile in existing_profiles if profile.loan_id}
-        by_intake = {profile.intake_id: profile.id for profile in existing_profiles if profile.intake_id}
-        by_deal = {profile.deal_id: profile.id for profile in existing_profiles if profile.deal_id}
+        direct = {profile.loan_id: profile for profile in existing_profiles if profile.loan_id}
+        by_intake = {profile.intake_id: profile for profile in existing_profiles if profile.intake_id}
+        by_deal = {profile.deal_id: profile for profile in existing_profiles if profile.deal_id}
         profiles_by_loan = {
             row.id: direct.get(row.id)
             or (by_intake.get(row.source_intake_id) if row.source_intake_id else None)
@@ -142,7 +151,7 @@ async def list_loans(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> l
         d["broker_name"] = getattr(broker_obj, "display_name", None) if broker_obj else None
         d["client_name"] = getattr(client_obj, "name", None) if client_obj else None
         d["client_fico"] = getattr(client_obj, "fico", None) if client_obj else None
-        d["application_profile_id"] = profiles_by_loan.get(r.id)
+        d.update(_profile_read_projection(profiles_by_loan.get(r.id)))
         out.append(LoanRead.model_validate(d))
     return out
 
@@ -158,9 +167,9 @@ async def get_loan(loan_id: UUID, user: CurrentUser, db: AsyncSession = Depends(
         profile_clauses.append(ApplicationProfile.intake_id == row.source_intake_id)
     if row.source_deal_id:
         profile_clauses.append(ApplicationProfile.deal_id == row.source_deal_id)
-    profile_id = (
+    profile = (
         await db.execute(
-            select(ApplicationProfile.id)
+            select(ApplicationProfile)
             .where(or_(*profile_clauses))
             .order_by(
                 (ApplicationProfile.loan_id == row.id).desc(),
@@ -171,7 +180,7 @@ async def get_loan(loan_id: UUID, user: CurrentUser, db: AsyncSession = Depends(
         )
     ).scalar_one_or_none()
     payload = LoanRead.model_validate(row).model_dump()
-    payload["application_profile_id"] = profile_id
+    payload.update(_profile_read_projection(profile))
     return LoanRead.model_validate(payload)
 
 
