@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import exists, func, select
+from sqlalchemy import case, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.application_profile import ApplicationProfile
@@ -26,7 +26,7 @@ from app.models.bucket import (
     BucketUploadLink,
 )
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
-from app.schemas.operator_file import AttentionItem, AttentionKind, AttentionQueue
+from app.schemas.operator_file import AttentionItem, AttentionKind, AttentionQueue, AttentionView
 
 INTAKE_NO_FILES_DAYS = 7
 REQUEST_OVERDUE_DAYS = 30
@@ -91,13 +91,26 @@ def sort_items(items: list[AttentionItem]) -> list[AttentionItem]:
 async def _intakes_without_files(db: AsyncSession, now: datetime) -> list[AttentionItem]:
     cutoff = now - timedelta(days=INTAKE_NO_FILES_DAYS)
     has_file = exists(select(BucketFile.id).where(BucketFile.bucket_id == PublicUnderwritingIntake.bucket_id))
+    # intake_id is unique; primary_bucket_id is only indexed. A bucket join
+    # multiplies queue items and can attach another intake's resend action.
+    has_anchor = exists(select(ApplicationProfile.id).where(
+        ApplicationProfile.intake_id == PublicUnderwritingIntake.id,
+    ).correlate(PublicUnderwritingIntake))
+    anchored_id = select(ApplicationProfile.id).where(
+        ApplicationProfile.intake_id == PublicUnderwritingIntake.id,
+        ApplicationProfile.primary_bucket_id == PublicUnderwritingIntake.bucket_id,
+    ).correlate(PublicUnderwritingIntake).scalar_subquery()
+    bucket_profile_count = select(func.count(ApplicationProfile.id)).where(
+        ApplicationProfile.primary_bucket_id == PublicUnderwritingIntake.bucket_id,
+    ).correlate(PublicUnderwritingIntake).scalar_subquery()
+    unanchored_bucket_id = select(ApplicationProfile.id).where(
+        ApplicationProfile.primary_bucket_id == PublicUnderwritingIntake.bucket_id,
+        ApplicationProfile.intake_id.is_(None),
+    ).correlate(PublicUnderwritingIntake).scalar_subquery()
+    safe_profile_id = case((has_anchor, anchored_id), (bucket_profile_count == 1, unanchored_bucket_id), else_=None)
     rows = (
         await db.execute(
-            select(PublicUnderwritingIntake, ApplicationProfile.id)
-            .outerjoin(
-                ApplicationProfile,
-                ApplicationProfile.primary_bucket_id == PublicUnderwritingIntake.bucket_id,
-            )
+            select(PublicUnderwritingIntake, safe_profile_id)
             .where(
                 PublicUnderwritingIntake.status == "collecting",
                 PublicUnderwritingIntake.created_at < cutoff,
@@ -139,7 +152,10 @@ async def _intake_by_bucket(db: AsyncSession, bucket_ids: set[UUID]) -> dict[UUI
             )
         )
     ).all()
-    return {bucket_id: intake_id for bucket_id, intake_id in rows}
+    identities: dict[UUID, set[UUID]] = {}
+    for bucket_id, intake_id in rows:
+        identities.setdefault(bucket_id, set()).add(intake_id)
+    return {bucket_id: next(iter(intake_ids)) for bucket_id, intake_ids in identities.items() if len(intake_ids) == 1}
 
 
 def _file_href(bucket_id: UUID, intake_id: UUID | None) -> str:
@@ -259,10 +275,10 @@ async def _buckets_without_client_entry(db: AsyncSession, now: datetime) -> list
     return items
 
 
-async def load_attention_queue(
-    db: AsyncSession, *, now: datetime | None = None, limit: int = 60,
-    offset: int = 0, kind: AttentionKind | None = None, q: str | None = None,
-) -> AttentionQueue:
+async def load_source_items(db: AsyncSession, *, now: datetime | None = None) -> list[AttentionItem]:
+    """Canonical source conditions, independent of queue-only dispositions."""
+    from app.services.attention_controls import item_key
+
     now = now or datetime.now(UTC)
     items: list[AttentionItem] = []
     for loader in (
@@ -272,13 +288,35 @@ async def load_attention_queue(
         _stale_action_items,
     ):
         items.extend(await loader(db, now))
-    items = sort_items(items)
+    canonical = {}
+    for item in sort_items(items):
+        item = item.model_copy(update={"item_key": item_key(item)})
+        canonical.setdefault(item.item_key, item)
+    return list(canonical.values())
+
+
+async def load_attention_queue(
+    db: AsyncSession, *, now: datetime | None = None, limit: int = 60,
+    offset: int = 0, kind: AttentionKind | None = None, q: str | None = None,
+    view: AttentionView = "active",
+) -> AttentionQueue:
+    from app.services.attention_controls import load_controls, visible_items
+
+    now = now or datetime.now(UTC)
+    source_items = await load_source_items(db, now=now)
+    controls = await load_controls(db)
+    combined = visible_items(source_items, controls)
+    active = [item for item in combined if item.queue_status == "active"]
+    hidden = [item for item in combined if item.queue_status != "active"]
+    items = sort_items(active if view == "active" else hidden if view == "hidden" else combined)
     counts: dict[str, int] = {}
-    for item in items:
+    for item in active:
         counts[item.kind] = counts.get(item.kind, 0) + 1
-    total = len(items)
+    total = len(active)
+    status_counts = {status: sum(item.queue_status == status for item in combined) for status in ("active", "archived", "dismissed", "duplicate")}
     query = " ".join((q or "").split()).casefold()
     filtered = [item for item in items if (kind is None or item.kind == kind)
                 and (not query or query in " ".join(f"{item.title} {item.detail}".split()).casefold())]
     return AttentionQueue(generated_at=now, items=filtered[offset:offset + limit], counts=counts,
-        total=total, filtered_total=len(filtered), limit=limit, offset=offset)
+        total=total, filtered_total=len(filtered), limit=limit, offset=offset,
+        hidden_total=len(hidden), status_counts=status_counts)

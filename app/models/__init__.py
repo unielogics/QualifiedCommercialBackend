@@ -8,6 +8,7 @@ from app.dealer_os import (
     models as dealer_os_models,  # noqa: F401  (Dealer OS — isolated dos_* tables)
 )
 from app.models.activity import Activity  # noqa: F401
+from app.models.operator_attention import OperatorAttentionControl, OperatorAttentionEvent  # noqa: F401
 from app.models.admin_activity import AdminActivitySeen, AdminDigestState  # noqa: F401
 from app.models.agent_reassignment_audit import AgentReassignmentAudit  # noqa: F401
 from app.models.agent_task import AgentTask  # noqa: F401

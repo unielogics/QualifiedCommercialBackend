@@ -11,7 +11,7 @@ from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 UnifiedVertical = Literal["real_estate", "main_street", "dealer", "mca"]
 UnifiedOrigin = Literal["console", "agent", "rep", "dealer", "ai_intake"]
@@ -453,6 +453,16 @@ class IntakePromotionResult(BaseModel):
 
 
 AttentionKind = Literal["intake_no_files", "no_client_entry", "request_overdue", "action_items_stale"]
+AttentionStatus = Literal["active", "archived", "dismissed", "duplicate"]
+AttentionView = Literal["active", "hidden", "all"]
+
+
+class AttentionDuplicateTarget(BaseModel):
+    item_key: str
+    kind: AttentionKind
+    title: str
+    href: str
+    current_source_active: bool = True
 
 
 class AttentionItem(BaseModel):
@@ -470,6 +480,14 @@ class AttentionItem(BaseModel):
     profile_id: UUID | None = None
     link_last_sent_at: datetime | None = None
     actions: list[Literal["resend_link"]] = Field(default_factory=list)
+    item_key: str = ""
+    queue_status: AttentionStatus = "active"
+    queue_revision: int = 0
+    queue_updated_at: datetime | None = None
+    queue_actor_name: str | None = None
+    queue_reason: str | None = None
+    duplicate_of: AttentionDuplicateTarget | None = None
+    current_source_active: bool = True
 
 
 class AttentionQueue(BaseModel):
@@ -480,3 +498,45 @@ class AttentionQueue(BaseModel):
     filtered_total: int = Field(ge=0)
     limit: int = Field(default=60, ge=1, le=200)
     offset: int = Field(default=0, ge=0)
+    hidden_total: int = Field(default=0, ge=0)
+    status_counts: dict[AttentionStatus, int] = Field(default_factory=dict)
+
+
+class AttentionAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    item_key: str = Field(min_length=1, max_length=120)
+    action: Literal["archive", "dismiss", "duplicate", "restore"]
+    expected_revision: int = Field(ge=0)
+    idempotency_key: UUID
+    reason: str = Field(default="", max_length=1000)
+    duplicate_of_key: str | None = Field(default=None, min_length=1, max_length=120)
+
+
+class AttentionEventRead(BaseModel):
+    id: UUID
+    item_key: str
+    action: Literal["archive", "dismiss", "duplicate", "restore"]
+    previous_status: AttentionStatus
+    status: AttentionStatus
+    revision: int
+    reason: str | None
+    actor_user_id: UUID | None
+    actor_name: str
+    occurred_at: datetime
+    duplicate_of: AttentionDuplicateTarget | None = None
+
+
+class AttentionActionResult(BaseModel):
+    item: AttentionItem
+    event: AttentionEventRead
+    replayed: bool
+    current_source_active: bool
+    message: str
+
+
+class AttentionHistory(BaseModel):
+    item_key: str
+    items: list[AttentionEventRead]
+    total: int
+    limit: int
+    offset: int
