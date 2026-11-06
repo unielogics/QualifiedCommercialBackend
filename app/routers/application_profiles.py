@@ -189,6 +189,7 @@ from app.schemas.financial_cockpit import (
     StatementRereadResult,
 )
 from app.schemas.form_answers import FormAnswerFile, FormAnswersRead
+from app.schemas.funding_request import FundingRequestPatch, FundingRequestRead
 from app.schemas.requirement_library import RequirementAddWrite, RequirementLibraryRead
 from app.schemas.retention import LegalHoldChange, RetentionStatusRead
 from app.schemas.use_of_funds import (
@@ -882,6 +883,32 @@ async def get_application_use_of_funds(
 
     profile = await profiles.load_profile(db, profile_id, user)
     return (await read_budget(db, profile)).model_copy(update={"can_edit": user.role in EDIT_ROLES})
+
+
+@router.get("/{profile_id}/funding-request", response_model=FundingRequestRead)
+async def get_application_funding_request(
+    profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> FundingRequestRead:
+    from app.services.funding_requests import read_request
+
+    return await read_request(db, await profiles.load_profile(db, profile_id, user), user=user)
+
+
+@router.patch("/{profile_id}/funding-request", response_model=FundingRequestRead)
+async def patch_application_funding_request(
+    profile_id: UUID, payload: FundingRequestPatch, user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FundingRequestRead:
+    from app.services.funding_requests import require_editor, update_request
+
+    require_editor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    result = await update_request(db, profile, payload, user)
+    await capital_readiness.advisory_recompute_profiles(
+        db, [profile], event_key=f"funding-request:{profile.id}:{result.revision}",
+    )
+    await db.commit()
+    return result
 
 
 @router.patch("/{profile_id}/use-of-funds", response_model=UseOfFundsRead)

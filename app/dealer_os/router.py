@@ -96,6 +96,7 @@ from app.services import (
     booking_notify,
     booking_operations,
     booking_reminders,
+    funding_requests,
     provenance,
     prospect_outreach as prospect_outreach_service,
 )
@@ -9040,7 +9041,7 @@ async def _appointment_booking_data_review(
                 "company": intake.business_name,
                 "email": intake.email,
                 "phone": intake.phone,
-                "requested_amount": intake.requested_loan_amount,
+                "requested_amount": funding_requests.intake_requested_amount(intake),
                 "program": intake.loan_purpose,
                 "address": address,
             }
@@ -10541,13 +10542,17 @@ async def _apply_calendar_booking_data(
         )
     if appointment.converted_intake_id:
         intake = await _load_calendar_intake_file(db, appointment.converted_intake_id, user)
+        parsed_amount = _appointment_amount(appointment.requested_amount)
+        if parsed_amount is not None:
+            funding_requests.require_initial_or_unchanged_amount(intake, parsed_amount)
+            if funding_requests.intake_requested_amount(intake) is None:
+                intake.requested_loan_amount = parsed_amount
         intake.full_name = appointment.invitee_name
         intake.email = (appointment.invitee_email or intake.email).strip().lower()
         intake.phone = appointment.invitee_phone
         intake.business_name = appointment.company
         _, funding_intent = _appointment_classification(appointment)
         intake.loan_purpose = funding_intent or appointment.program_name
-        intake.requested_loan_amount = _appointment_amount(appointment.requested_amount)
         await _persist_appointment_intake_classification(db, appointment, intake)
         bucket = await db.get(Bucket, intake.bucket_id)
         if bucket is not None and bucket.name_sync_mode == "linked":
@@ -10570,9 +10575,6 @@ async def _apply_calendar_booking_data(
             client.address = appointment.full_address
         loan.entity_name = appointment.company
         loan.address = appointment.full_address or loan.address
-        parsed_amount = _appointment_amount(appointment.requested_amount)
-        if parsed_amount is not None:
-            loan.amount = parsed_amount
         return RepAppointmentActionResult(
             action="apply_booking_data",
             status="completed",

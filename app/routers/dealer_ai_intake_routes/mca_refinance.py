@@ -406,12 +406,14 @@ async def update_mca_refinance_qualification(
     """Save declarations for new and legacy/upload-only files, without underwriting."""
     intake = await core._load_public_intake(db, token)
     core._require_mca_intake(intake)
+    if payload.requested_amount is not None:
+        core.funding_requests.require_initial_or_unchanged_amount(intake, payload.requested_amount)
     state = core._intake_state(intake)
     declaration = dict(state.get("mca_qualification") or {})
     declaration.update(payload.model_dump(exclude_unset=True, exclude_none=True, exclude={"manual_review_requested"}))
     state["mca_qualification"] = declaration
     intake.intake_state = state
-    if payload.requested_amount is not None:
+    if payload.requested_amount is not None and core.funding_requests.intake_requested_amount(intake) is None:
         intake.requested_loan_amount = payload.requested_amount
     policy = core.mca_refinance_policy.persist(intake, request_manual=payload.manual_review_requested)
     await core._log(db, intake.bucket_id, "mca_refinance_manual_review_requested" if payload.manual_review_requested else "mca_refinance_qualification_saved", request=request,

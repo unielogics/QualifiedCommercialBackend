@@ -144,7 +144,7 @@ async def test_client_save_uses_staff_lock_revision_and_safe_audit_then_source_c
         with pytest.raises(HTTPException) as error:
             await use_of_funds.update_client_budget(db, profile, payload, room_link=link)
         assert error.value.status_code == 409
-    query = db.execute.await_args.args[0]
+    query = db.execute.await_args_list[0].args[0]
     assert query._for_update_arg is not None
     assert query.get_execution_options()["populate_existing"] is True
     assert profile.use_of_funds_updated_by_user_id is None
@@ -159,8 +159,8 @@ async def test_client_save_uses_staff_lock_revision_and_safe_audit_then_source_c
 
 
 @pytest.mark.asyncio
-async def test_client_partial_budget_is_saved_but_overallocation_is_rejected():
-    profile = saved_profile()
+async def test_unsubmitted_draft_partial_budget_is_saved_but_overallocation_is_rejected():
+    profile = saved_profile(is_draft=True)
     db = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one=lambda: profile)), flush=AsyncMock())
     with (
         patch.object(use_of_funds, "source_funding_data", AsyncMock(return_value=(Decimal(1000), "loan.amount", None, None))),

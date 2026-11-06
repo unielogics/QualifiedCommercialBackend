@@ -45,6 +45,7 @@ from app.models.bucket import (
 from app.models.user import User
 from app.services import (
     bank_transactions_export,
+    funding_requests,
     mca_refinance_policy,
     merchant_processing,
     provenance,
@@ -3401,7 +3402,7 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
     from app.models.public_underwriting_intake import PublicUnderwritingIntake
     from app.services.operator_file_links import selected_files_for_intake
 
-    intake = (await db.execute(select(PublicUnderwritingIntake).where(PublicUnderwritingIntake.bucket_id == bucket.id))).scalar_one_or_none()
+    intake = (await db.execute(select(PublicUnderwritingIntake).where(PublicUnderwritingIntake.bucket_id == bucket.id).execution_options(populate_existing=True))).scalar_one_or_none()
     policy = await mca_refinance_policy.for_bucket(db, bucket, intake=intake, context=review.context_snapshot)
     if policy is not None and not policy["auto_underwriting_allowed"]:
         return await _stop_mca_review(db, review, policy, intake)
@@ -3489,6 +3490,18 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         log.exception("bucket_ai: program screen profile lookup failed review=%s", review.id)
         screen_profile = None
     if screen_profile is not None:
+        from app.services import use_of_funds
+        current_request = dict(getattr(screen_profile, "current_funding_request", None) or {})
+        review_context["ai_context"] = funding_requests.project_request_context(review_context["ai_context"], current_request)
+        review.context_snapshot = funding_requests.project_request_context(dict(review.context_snapshot or {}), current_request)
+        current_budget = await use_of_funds.read_budget(db, screen_profile)
+        current_budget_revision = current_budget.revision
+        budget_context = use_of_funds.ai_context(current_budget)
+        review_context["ai_context"]["use_of_funds"] = budget_context
+        review.context_snapshot = {**review.context_snapshot, "funding_request_stale": False, "use_of_funds": budget_context}
+        current_policy = mca_refinance_policy.evaluate(intake, bucket=bucket, context=review.context_snapshot) if mca_refinance_policy.is_mca_refinance(intake, bucket) else None
+        if current_policy is not None and not current_policy["auto_underwriting_allowed"]:
+            return await _stop_mca_review(db, review, current_policy, intake)
         review_context["published_program_screen"] = await _published_program_screen(db, screen_profile)
         await _attach_current_financial_context(db, screen_profile, review_context)
     review_context.update(
@@ -3668,6 +3681,17 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         _merge_per_file_analyses(
             result, per_file_analyses, requested_documents=requested, slot_files=slot_files
         )
+        # A request can be corrected while the model is reading documents.
+        # Preserve the finished analysis as history, but never publish its old
+        # request decision, checklist actions or recommendation as current.
+        if screen_profile is not None and not await funding_requests.lock_review_revision(db, screen_profile, int(current_request.get("revision", 0)), current_budget_revision):
+            review.result = result
+            review.status = "completed"
+            review.completed_at = _now()
+            review.context_snapshot = {**(review.context_snapshot or {}), "funding_request_stale": True}
+            review.progress = {"stage": "complete", "label": "Historical review: funding request changed; run a new review", "percent": 100}
+            await db.flush()
+            return review
         # Reconcile the requested-document checklist: mark an open ask as
         # uploaded when an analyzed file satisfies its category, so satisfied
         # baseline items stop showing as "missing" in the UI.
@@ -3981,7 +4005,7 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
 async def latest_review(db: AsyncSession, bucket_id: UUID) -> BucketAIReview | None:
     from app.services.financial_publication import review_is_financially_stale
 
-    current_financials = BucketAIReview.context_snapshot["financial_versions_stale"].as_boolean().is_not(True)
+    current_financials = and_(BucketAIReview.context_snapshot["financial_versions_stale"].as_boolean().is_not(True), BucketAIReview.context_snapshot["funding_request_stale"].as_boolean().is_not(True))
     completed = (
         await db.execute(
             select(BucketAIReview)

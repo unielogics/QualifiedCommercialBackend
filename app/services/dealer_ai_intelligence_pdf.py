@@ -407,7 +407,10 @@ def render_dealer_intelligence_pdf(
     evidence = _record(result.get("document_evidence_map"))
     basics = _record(state.get("funding_review_basics"))
 
-    requested = _num(getattr(intake, "requested_loan_amount", None)) or _num(basics.get("requested_amount")) or _num(key_metrics.get("requested_amount"))
+    from app.services.funding_requests import intake_requested_amount
+
+    current_request = intake_requested_amount(intake)
+    requested = float(current_request) if current_request is not None else _num(basics.get("requested_amount")) or _num(key_metrics.get("requested_amount"))
     status = str(result.get("probability_status") or bankability.get("status") or "Awaiting AI review")
     confidence = str(result.get("confidence") or "")
     next_step = str(result.get("one_next_step") or bankability.get("reason") or "Upload Stage 1 evidence to advance the file.")

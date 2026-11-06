@@ -21,7 +21,15 @@ from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -132,6 +140,7 @@ from app.services import (
     business_profile,
     equipment_financing,
     file_events,  # noqa: F401  (handlers reach this through core)
+    funding_requests,
     inline_images,  # noqa: F401  (handlers reach this through core)
     intake_lifecycle,
     intake_retention,  # noqa: F401  (handlers reach this through core)
@@ -1623,7 +1632,7 @@ class DealerIntakeRead(ORMModel):
     phone: str | None
     business_name: str | None
     loan_purpose: str | None
-    requested_loan_amount: float | None
+    requested_loan_amount: float | None = Field(validation_alias=AliasChoices("current_requested_loan_amount", "requested_loan_amount"))
     estimated_credit_score: int | None
     referral_source: str | None
     years_in_business: float | None = None
@@ -2961,7 +2970,14 @@ def _key_metrics(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     if not isinstance(result, dict):
         return {}
     km = result.get("key_metrics")
-    return km if isinstance(km, dict) else {}
+    metrics = dict(km) if isinstance(km, dict) else {}
+    current = funding_requests.current_for_intake_snapshot(intake)
+    if current is not None:
+        metrics.pop("requested_amount_reasonableness", None)
+        metrics["requested_amount"] = float(current)
+        if "requested_loan_amount" in metrics:
+            metrics["requested_loan_amount"] = float(current)
+    return metrics
 
 
 def _merchant_processing_offer(intake: PublicUnderwritingIntake) -> dict[str, Any]:
@@ -2980,7 +2996,11 @@ def _loan_program_fit(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     credit_pull. Admin/AI-only, like credit_pull: never surfaced to the
     dealer directly (no widget, no chat announcement of program names or
     pricing) — the AI only uses it to avoid re-asking a resolved question."""
-    raw = _intake_state(intake).get("loan_program_fit")
+    state = _intake_state(intake)
+    revision = int((state.get("current_funding_request") or {}).get("revision", 0))
+    if revision and state.get("loan_program_fit_request_revision") != revision:
+        return {}
+    raw = state.get("loan_program_fit")
     return raw if isinstance(raw, dict) else {}
 
 
@@ -3113,7 +3133,7 @@ def _compute_loan_program_fit(intake: PublicUnderwritingIntake) -> dict[str, Any
     annualized_deposits = km.get("annualized_adjusted_deposits")
     liquid_assets = km.get("pfs_total_liquid_assets")
     details = _dealer_details(intake)
-    requested_amount = float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else None
+    requested_amount = float(funding_requests.intake_requested_amount(intake)) if funding_requests.intake_requested_amount(intake) is not None else None
 
     def _meets(value: Any, threshold: float) -> bool:
         return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= threshold
@@ -3267,8 +3287,8 @@ def _compute_main_street_fit(intake: PublicUnderwritingIntake) -> dict[str, Any]
     km = dict(_key_metrics(intake))
     # The Main Street screen reads the requested amount from key metrics; on this
     # path it lives on the intake row instead.
-    if km.get("requested_amount") is None and intake.requested_loan_amount is not None:
-        km["requested_amount"] = float(intake.requested_loan_amount)
+    if funding_requests.intake_requested_amount(intake) is not None:
+        km["requested_amount"] = float(funding_requests.intake_requested_amount(intake))
 
     return compute_main_street_program_fit(
         intent=details.get("intent"),
@@ -3301,6 +3321,7 @@ def _apply_loan_program_fit(intake: PublicUnderwritingIntake) -> None:
         state["loan_program_fit"] = _compute_main_street_fit(intake)
     else:
         state["loan_program_fit"] = _compute_loan_program_fit(intake)
+    state["loan_program_fit_request_revision"] = int((state.get("current_funding_request") or {}).get("revision", 0))
     intake.intake_state = state
 
 
@@ -3476,7 +3497,7 @@ def _compute_dscr_potential(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     property_value = extracted_value or _stated("estimated_value_or_purchase_price")
     value_source = "documents" if extracted_value else ("stated" if property_value else None)
 
-    requested = float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else _stated("requested_amount")
+    requested = float(funding_requests.intake_requested_amount(intake)) if funding_requests.intake_requested_amount(intake) is not None else _stated("requested_amount")
 
     extracted_carry = _km_number(km, "monthly_tax_insurance_hoa", "monthly_taxes_insurance", "monthly_pitia_taxes_insurance")
     extracted_pitia = _km_number(km, "monthly_pitia", "estimated_pitia", "pitia")
@@ -3610,6 +3631,8 @@ def _merge_funding_review_details(intake: PublicUnderwritingIntake, proposed: An
             if text:
                 accepted[key] = text[:64]
             continue
+    if "requested_amount" in accepted and not funding_requests.accept_initial_amount_fact(intake, accepted["requested_amount"], source="funding_review_chat"):
+        accepted.pop("requested_amount")
     if not accepted:
         return
     state = _intake_state(intake)
@@ -3760,6 +3783,8 @@ def _merge_dealer_details(intake: PublicUnderwritingIntake, proposed: Any) -> di
             if text:
                 accepted[key] = text[:500]
             continue
+    if "requested_loan_amount" in accepted and not funding_requests.accept_initial_amount_fact(intake, accepted["requested_loan_amount"], source="dealer_chat"):
+        accepted.pop("requested_loan_amount")
     if not accepted:
         return {}
     state = _intake_state(intake)
@@ -4071,7 +4096,7 @@ def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "documentation_level": "full doc",
         "collateral_type": "real estate collateral and business assets",
         "loan_purpose": intake.loan_purpose,
-        "requested_loan_amount": float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else None,
+        "requested_loan_amount": float(funding_requests.intake_requested_amount(intake)) if funding_requests.intake_requested_amount(intake) is not None else None,
         "estimated_credit_score": intake.estimated_credit_score,
         "credit_pull": _credit_pull_state(intake) or None,
         "business_profile": _business_profile(intake) or None,
@@ -4160,7 +4185,7 @@ def _merge_main_street_details(
     if isinstance(years, (int, float)) and not isinstance(years, bool) and 0 <= years <= 250:
         accepted["years_in_business"] = float(years)
     requested = proposed.get("requested_amount")
-    if isinstance(requested, (int, float)) and not isinstance(requested, bool) and 0 < requested <= 500_000_000:
+    if isinstance(requested, (int, float)) and not isinstance(requested, bool) and 0 < requested <= 500_000_000 and funding_requests.accept_initial_amount_fact(intake, requested, source="main_street_chat"):
         accepted["requested_amount"] = float(requested)
         intake.requested_loan_amount = float(requested)
     credit = proposed.get("estimated_credit_score")
@@ -4214,8 +4239,8 @@ def _main_street_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "industry": industry,
         "industry_label": MAIN_STREET_INDUSTRIES[industry]["en"],
         "loan_purpose": intake.loan_purpose,
-        "requested_loan_amount": float(intake.requested_loan_amount)
-        if intake.requested_loan_amount is not None
+        "requested_loan_amount": float(funding_requests.intake_requested_amount(intake))
+        if funding_requests.intake_requested_amount(intake) is not None
         else None,
         "estimated_credit_score": intake.estimated_credit_score,
         "credit_pull": _credit_pull_state(intake) or None,
@@ -4334,13 +4359,13 @@ def _context_fn_for(intake: PublicUnderwritingIntake):
     file would have been screened with floorplan and MCA framing. Route through
     here so a new vertical cannot inherit dealer's context by omission.
     """
-    if intake.variant == FUNDING_VARIANT:
-        return _funding_review_context
-    if intake.variant == MAIN_STREET_VARIANT:
-        return _main_street_context
-    if intake.variant == MCA_VARIANT:
-        return _mca_context
-    return _dealer_context
+    builder = {
+        FUNDING_VARIANT: _funding_review_context, MAIN_STREET_VARIANT: _main_street_context,
+        MCA_VARIANT: _mca_context,
+    }.get(intake.variant, _dealer_context)
+    def current_context(row):
+        return funding_requests.project_request_context(builder(row), _intake_state(row).get("current_funding_request"))
+    return current_context
 
 
 def _funding_review_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
@@ -4352,7 +4377,7 @@ def _funding_review_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "documentation_level": "preliminary DSCR / investor review",
         "collateral_type": "income-producing real estate",
         "loan_purpose": intake.loan_purpose or basics.get("transaction_type"),
-        "requested_loan_amount": float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else basics.get("requested_amount"),
+        "requested_loan_amount": float(funding_requests.intake_requested_amount(intake)) if funding_requests.intake_requested_amount(intake) is not None else basics.get("requested_amount"),
         "estimated_credit_tier": basics.get("estimated_credit_tier"),
         "credit_pull": _credit_pull_state(intake) or None,
         "business_profile": _business_profile(intake) or None,
@@ -4950,6 +4975,10 @@ def _apply_updates(intake: PublicUnderwritingIntake, updates: DealerIntakePatch 
     if updates is None:
         return
     data = updates.model_dump(exclude_unset=True)
+    if "requested_loan_amount" in data:
+        funding_requests.require_initial_or_unchanged_amount(intake, data["requested_loan_amount"])
+        if funding_requests.intake_requested_amount(intake) is not None:
+            data.pop("requested_loan_amount")
     for key in ("business_name", "phone", "loan_purpose", "requested_loan_amount", "estimated_credit_score", "referral_source"):
         if key in data:
             setattr(intake, key, data[key])
@@ -5143,7 +5172,7 @@ async def _register_intake_booking(
         # booking time. Email reminders remain active; SMS stays safely gated.
         sms_consent=False,
         program_name=intake.loan_purpose,
-        requested_amount=str(intake.requested_loan_amount) if intake.requested_loan_amount else None,
+        requested_amount=str(funding_requests.intake_requested_amount(intake)) if funding_requests.intake_requested_amount(intake) else None,
         full_address=str(_intake_state(intake).get("property_address") or "").strip() or None,
     )
     if booking.precall_enabled:
@@ -5496,7 +5525,7 @@ def _latest_result_for_intake(intake: PublicUnderwritingIntake) -> dict[str, Any
     review = intake.latest_review if intake.latest_review else None
     if review and not review_is_financially_stale(review) and isinstance(review.result, dict):
         return review.result
-    if isinstance(intake.result_snapshot, dict):
+    if isinstance(intake.result_snapshot, dict) and not intake.result_snapshot.get("_funding_request_stale"):
         return intake.result_snapshot
     return {}
 
@@ -5550,7 +5579,7 @@ async def _lead_management_context(
             "phone": intake.phone,
             "business_name": intake.business_name,
             "loan_purpose": intake.loan_purpose,
-            "requested_loan_amount": float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else None,
+            "requested_loan_amount": float(funding_requests.intake_requested_amount(intake)) if funding_requests.intake_requested_amount(intake) is not None else None,
             "estimated_credit_score": intake.estimated_credit_score,
             "referral_source": intake.referral_source,
             "asset_rows": intake.asset_rows,
@@ -7145,9 +7174,12 @@ async def _response(
     )
     mca_policy = mca_refinance_policy.evaluate(intake, bucket=intake.bucket) if mca_refinance_policy.is_mca_refinance(intake, intake.bucket) else None
     review = intake.latest_review if intake.latest_review else None
+    from app.services.financial_publication import review_is_financially_stale
+    if review is not None and review_is_financially_stale(review):
+        review = None
     if mca_policy is not None and not mca_policy["auto_underwriting_allowed"]:
         review = None  # Historical AI screening is not a current eligibility decision.
-    latest_result = _lead_result(intake) if mca_policy is not None else review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
+    latest_result = _lead_result(intake) or None
     widget = prequalification_widget
     if widget is None and latest_result and latest_result.get("booking_recommended") is True and not _call_booked(intake):
         widget = await _decorate_widget(
@@ -7244,7 +7276,7 @@ async def _response(
     # Redact internal-only data from the public/uploader payload. The dealer
     # sees only whitelisted intake_state keys and a sanitized review result.
     intake_read.intake_state = _client_safe_intake_state(intake.intake_state)
-    intake_read.result_snapshot = _client_safe_result(intake.result_snapshot)
+    intake_read.result_snapshot = _client_safe_result(_latest_result_for_intake(intake))
     review_read = None
     if review:
         review_read = BucketAIReviewRead.model_validate(review)
@@ -8497,10 +8529,7 @@ def _lead_result(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         policy = mca_refinance_policy.evaluate(intake, bucket=getattr(intake, "bucket", None))
         if not policy["auto_underwriting_allowed"]:
             return mca_refinance_policy.blocked_result(policy)
-    review = intake.latest_review if intake.latest_review else None
-    if review and isinstance(review.result, dict):
-        return review.result
-    return intake.result_snapshot if isinstance(intake.result_snapshot, dict) else {}
+    return _latest_result_for_intake(intake)
 
 
 def _lead_row(
@@ -8551,7 +8580,7 @@ def _lead_row(
         call_booked=_call_booked(intake),
         file_count=len(active_files),
         missing_required_count=len(missing_docs),
-        requested_loan_amount=float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else None,
+        requested_loan_amount=float(funding_requests.intake_requested_amount(intake)) if funding_requests.intake_requested_amount(intake) is not None else None,
         estimated_credit_score=int(intake.estimated_credit_score) if intake.estimated_credit_score is not None else None,
         created_at=intake.created_at,
         updated_at=intake.updated_at,
@@ -8845,6 +8874,7 @@ async def _execute_intake_review(
     review_context = {
         **(intake.bucket.ai_context or {}),
         **context_fn(intake),
+        "funding_request_stale": False,
         recent_key: recent_chat,
         # Deterministically resolved borrower-stated facts (e.g. latest credit
         # score) so the review synthesis reports the corrected value, not a stale
@@ -8881,7 +8911,7 @@ async def _execute_intake_review(
     )
     await run_bucket_ai_review(db, review.id)
     fresh_review = await latest_review(db, intake.bucket_id)
-    intake.latest_review_id = fresh_review.id if fresh_review else review.id
+    intake.latest_review_id = fresh_review.id if fresh_review else None
     if fresh_review and isinstance(fresh_review.result, dict):
         intake.result_snapshot = fresh_review.result
         intake.status = "reviewed"
@@ -8916,6 +8946,7 @@ async def _create_queued_review(
     review_context = {
         **(intake.bucket.ai_context or {}),
         **context_fn(intake),
+        "funding_request_stale": False,
         recent_key: recent_chat,
         # Deterministically resolved borrower-stated facts (e.g. latest credit
         # score) so the review synthesis reports the corrected value, not a stale
@@ -8971,7 +9002,8 @@ async def _run_review_background(review_id: UUID, intake_id: UUID) -> None:
         try:
             intake = await db.get(PublicUnderwritingIntake, intake_id)
             review = await db.get(BucketAIReview, review_id)
-            if intake is not None and review is not None:
+            from app.services.financial_publication import review_is_financially_stale
+            if intake is not None and review is not None and not review_is_financially_stale(review):
                 intake.latest_review_id = review_id
                 if isinstance(review.result, dict):
                     intake.result_snapshot = review.result
@@ -10212,6 +10244,8 @@ def _merge_mca_details(intake: PublicUnderwritingIntake, proposed: Any) -> None:
         # remaining_payback / payment_amount / requested_amount — dollars.
         if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 500_000_000:
             accepted[key] = float(value)
+    if "requested_amount" in accepted and not funding_requests.accept_initial_amount_fact(intake, accepted["requested_amount"], source="mca_chat"):
+        accepted.pop("requested_amount")
     if not accepted:
         return
     state = _intake_state(intake)
@@ -10233,7 +10267,7 @@ def _mca_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "documentation_level": "three-item MCA refinance file",
         "collateral_type": "business cash flow",
         "business_name": intake.business_name,
-        "requested_loan_amount": float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else None,
+        "requested_loan_amount": float(funding_requests.intake_requested_amount(intake)) if funding_requests.intake_requested_amount(intake) is not None else None,
         "mca_details": _mca_details(intake) or None,
         "mca_qualification": state.get("mca_qualification"),
         "mca_terms_summary": state.get("mca_terms_summary"),

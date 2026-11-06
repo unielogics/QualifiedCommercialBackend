@@ -971,6 +971,11 @@ async def update_lead_contact(
     core._require_governance_admin(user)
     intake = await core._load_admin_dealer_lead(db, intake_id)
     values = payload.model_dump(exclude_unset=True)
+    if "requested_loan_amount" in values:
+        current = core.funding_requests.intake_requested_amount(intake)
+        value = values.pop("requested_loan_amount")
+        if (current is None and value is not None) or (current is not None and (value is None or core.Decimal(str(value)) != current)):
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Use the funding-request controls to change the amount and complete allocation together")
     if "years_in_business" in values:
         # Not a column: the fit engine reads it from the intake state, beside
         # what the client declared or the chat established.

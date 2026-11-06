@@ -31,6 +31,7 @@ from app.models.user import User
 from app.services import application_profiles as profiles
 from app.services import production_arrangement as pa
 from app.services.extracted_facts import canonical_field_key
+from app.services.funding_requests import current_for_profile, intake_requested_amount
 
 SOURCE_LABELS: dict[str, str] = {
     "dealer": "Dealer file",
@@ -47,6 +48,7 @@ SOURCE_LABELS: dict[str, str] = {
     "sponsor_default": "Linked profile",
     "document_extraction": "Read from an uploaded document",
     "financial_plan": "Financial plan on the file",
+    "current_funding_request": "Current reviewed funding request",
 }
 
 _ENTITY_ALIASES: dict[str, str] = {
@@ -233,6 +235,9 @@ def _primary_owner(owners: list[Any]) -> Any | None:
 
 async def build_prefill(db: AsyncSession, profile: ApplicationProfile, actor: User | None) -> PrefillResult:
     out = PrefillResult()
+    current_request = current_for_profile(profile)
+    if current_request is not None:
+        out.put("requested", float(current_request), "current_funding_request")
 
     dealer: DealerBusiness | None = await db.get(DealerBusiness, profile.dealer_id) if profile.dealer_id else None
     dap: DealerApplicationProfile | None = None
@@ -272,7 +277,7 @@ async def build_prefill(db: AsyncSession, profile: ApplicationProfile, actor: Us
         # would have written a company name into both fields had they run.
         out.put("dealer_name", _text(intake.business_name) or _text(primary_entity), "intake")
         out.put("dealer_entity", normalize_entity_type(main_street.get("entity_type")), "intake")
-        out.put("requested", _number(intake.requested_loan_amount) or _number(dealer_details.get("requested_loan_amount")), "intake")
+        out.put("requested", _number(intake_requested_amount(intake)) or _number(dealer_details.get("requested_loan_amount")), "intake")
         out.put("debt_service", _number(dealer_details.get("stated_monthly_debt_payments")), "intake")
     out.put("dealer_entity", normalize_entity_type(profile.entity_type), "profile")
     out.put("dealer_dba", _text(ident.get("dba")), "dealer")

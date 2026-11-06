@@ -93,6 +93,13 @@ class PublicUnderwritingIntake(TimestampMixin, Base):
     business_name: Mapped[str | None] = mapped_column(String(180), nullable=True)
     loan_purpose: Mapped[str | None] = mapped_column(String(255), nullable=True)
     requested_loan_amount: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+
+    @property
+    def current_requested_loan_amount(self):
+        """Display projection; the submitted amount column remains historical."""
+        from app.services.funding_requests import intake_requested_amount
+        return intake_requested_amount(self)
+
     estimated_credit_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     referral_source: Mapped[str | None] = mapped_column(String(180), nullable=True)
 

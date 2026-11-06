@@ -59,13 +59,18 @@ def _money(value: object) -> Decimal | None:
 async def source_funding_data(
     db: AsyncSession, profile: ApplicationProfile, *, intake: Any = None,
 ) -> tuple[Decimal | None, str | None, str | None, Any]:
-    """Resolve source request/purpose without inventing a purchase-price request."""
+    """Resolve the file's current request, retaining original source fallbacks."""
+    from app.services.funding_requests import current_for_profile
     if intake is None and getattr(profile, "intake_id", None):
         intake = await db.get(PublicUnderwritingIntake, profile.intake_id)
     dealer = (
         await db.get(DealerBusiness, profile.dealer_id)
         if getattr(profile, "dealer_id", None) else None
     )
+    corrected = current_for_profile(profile)
+    if corrected is not None:
+        purpose = getattr(intake, "loan_purpose", None) or getattr(dealer, "funding_purpose", None)
+        return corrected, "profile.current_funding_request", purpose, dealer
     if intake is not None and _money(getattr(intake, "requested_loan_amount", None)) is not None:
         return (
             _money(intake.requested_loan_amount), "intake.requested_loan_amount",
@@ -132,6 +137,8 @@ def summarize(
     dealer: Any = None,
     items: list[UseOfFundsItem] | None = None,
 ) -> UseOfFundsRead:
+    from app.services.funding_requests import requires_exact_allocation
+
     warnings: list[str] = []
     source = "profile"
     if items is None:
@@ -175,6 +182,9 @@ def summarize(
         updated_at=getattr(profile, "use_of_funds_updated_at", None),
         updated_by_user_id=getattr(profile, "use_of_funds_updated_by_user_id", None),
         source=source, warnings=warnings,
+        requires_exact_allocation=requires_exact_allocation(profile),
+        funding_request_revision=int((getattr(profile, "current_funding_request", None) or {}).get("revision", 0)),
+        payoff_only_alternative=bool((getattr(profile, "current_funding_request", None) or {}).get("payoff_only_alternative", False)),
     )
 
 
@@ -248,14 +258,15 @@ async def _persist_budget(
         raise HTTPException(409, "Use of funds changed; reload the current budget before saving")
     amount, source, _purpose, dealer = await source_funding_data(db, locked)
     result = summarize(locked, amount, source, items=payload.items)
-    exact_total = sum((item.amount for item in payload.items), Decimal(0))
-    if amount is not None and exact_total > amount:
-        raise HTTPException(422, "Use-of-funds total cannot exceed the requested amount")
+    from app.services.funding_requests import requires_exact_allocation, validate_allocation
+    exact_total = validate_allocation(amount, payload.items, exact=requires_exact_allocation(locked))
     before = list(locked.use_of_funds or [])
     locked.use_of_funds = [item.model_dump(mode="json") for item in payload.items]
     locked.use_of_funds_revision = (locked.use_of_funds_revision or 0) + 1
     locked.use_of_funds_updated_at = datetime.now(UTC)
     locked.use_of_funds_updated_by_user_id = user.id if user else None
+    from app.services.funding_requests import invalidate_request_reviews
+    await invalidate_request_reviews(db, locked)
     from app.services.application_profiles import log_profile_action
 
     await log_profile_action(

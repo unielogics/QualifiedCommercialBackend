@@ -24,6 +24,7 @@ from app.schemas.application_terms import (
 )
 from app.services import application_profiles as profiles
 from app.services import file_contacts, funding_programs
+from app.services.funding_requests import current_for_profile, intake_requested_amount
 
 CADENCE_PERIODS_PER_YEAR: dict[str, float] = {
     # Existing refinance math treats "daily" as business-day repayment:
@@ -472,8 +473,10 @@ async def read_terms(
         initial_amount = (
             profile.underwriting_term_sheet_amount or profile.underwriting_approved_amount
         )
+        if initial_amount is None:
+            initial_amount = current_for_profile(profile)
         if initial_amount is None and intake is not None:
-            initial_amount = intake.requested_loan_amount
+            initial_amount = intake_requested_amount(intake)
         calc = _calculation(
             context=context,
             payment=None,
