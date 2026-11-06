@@ -35,6 +35,10 @@ CATEGORY_CLASSIFICATIONS: dict[str, set[str]] = {
     "mca": {"floorplan_mca_inventory"},
     "inventory": {"floorplan_mca_inventory"},
     "debt schedule": {"debt_schedule"},
+    "real estate schedule": {"real_estate_schedule"},
+    "schedule of real estate": {"real_estate_schedule"},
+    "real estate owned": {"real_estate_schedule"},
+    "reo schedule": {"real_estate_schedule"},
     "personal financial statement": {"personal_financial_statement"},
     "pfs": {"personal_financial_statement"},
     "merchant processing": {"merchant_processing_statement"},
@@ -73,6 +77,8 @@ def filename_evidence_classification(file_name: str) -> str | None:
         return "current_p_and_l"
     if "debt schedule" in value or "debtschedule" in compact:
         return "debt_schedule"
+    if any(phrase in value for phrase in ("real estate schedule", "schedule of real estate", "real estate owned", "reo schedule")):
+        return "real_estate_schedule"
     if "personal financial statement" in value or compact.startswith("pfs"):
         return "personal_financial_statement"
     if "statement" in value or "estmt" in compact:
