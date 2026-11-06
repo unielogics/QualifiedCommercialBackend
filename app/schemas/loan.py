@@ -165,6 +165,10 @@ class LoanRead(ORMModel):
     # clients must never call the mutating profile resolver just to render a
     # readiness widget.
     application_profile_id: UUID | None = None
+    # Current requested funding is a read-only profile projection. ``amount``
+    # below retains the loan's issued/approved amount and repayment basis.
+    requested_amount: float | None = None
+    requested_amount_source: str | None = None
     deal_id: str
     # Back-reference to the Deal this loan was promoted from (alembic
     # 0048). Lets mobile / desktop route from a loan row to its (A)
