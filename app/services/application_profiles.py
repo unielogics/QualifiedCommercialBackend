@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -1798,6 +1799,21 @@ async def intelligence_state(db: AsyncSession, profile: ApplicationProfile) -> A
         annual_debt = float(financial_version_selection.debt_schedule_monthly(accepted_debt.body)) * 12
     deterministic_dscr = calculate_dscr(ebitda, annual_debt)
     dscr = deterministic_dscr if deterministic_dscr is not None or accepted_debt is not None else _metric_number(key_metrics, "estimated_dscr", "dscr")
+    calculation_review = None
+    validated_annual = None
+    if hasattr(db, "execute"):
+        try:
+            from app.services import financial_cockpit
+            from app.services.financial_metric_reporting import metric_brief
+
+            calculation_review = metric_brief(await financial_cockpit.load_cockpit(db, profile))
+            validated_annual = (calculation_review or {}).get("validated_annual")
+        except Exception:  # noqa: BLE001 - a diagnostic view never rewrites or blocks cached evidence
+            logging.getLogger(__name__).exception("Current financial calculation review unavailable profile=%s", profile.id)
+    if validated_annual is not None:
+        ebitda = validated_annual["ebitda_annual"]
+        dscr = validated_annual.get("dscr")
+        annual_debt = validated_annual.get("annual_debt_service")
     has_assets = bool(intake and intake.asset_rows)
     is_real_estate = profile.vertical == "real_estate" or has_assets
     revenue = _metric_number(key_metrics, "annualized_revenue", "annual_revenue", "gross_revenue")
@@ -1805,13 +1821,31 @@ async def intelligence_state(db: AsyncSession, profile: ApplicationProfile) -> A
     metrics = [
         IntelligenceMetric(key="requested", label="Requested", value=requested, unit="USD", status="ready" if requested is not None else "needs_evidence", source="intake", action=None if requested is not None else "edit_profile"),
         IntelligenceMetric(key="revenue", label="Annualized revenue", value=revenue, unit="USD", status="ready" if revenue is not None else "needs_evidence", source="latest_review", action=None if revenue is not None else "request_bank_or_tax_evidence"),
-        IntelligenceMetric(key="dscr", label="DSCR", value=dscr, unit="x", status="not_applicable" if accepted_debt is not None and annual_debt == 0 else "ready" if dscr is not None else "needs_evidence", source="completed saved debt schedule" if accepted_debt is not None else "deterministic: bankable EBITDA / annual debt service" if deterministic_dscr is not None else "latest AI review", action=None if dscr is not None or accepted_debt is not None and annual_debt == 0 else "request_bank_or_tax_evidence" if accepted_debt is not None else "request_debt_schedule", confidence=1.0 if deterministic_dscr is not None or accepted_debt is not None else 0.65 if dscr is not None else None),
+        IntelligenceMetric(key="dscr", label="DSCR", value=dscr, unit="x", status="not_applicable" if accepted_debt is not None and annual_debt == 0 else "ready" if dscr is not None else "needs_evidence", source="completed saved debt schedule" if accepted_debt is not None and annual_debt == 0 else "Cached AI earnings with completed saved debt schedule" if accepted_debt is not None else "Cached AI earnings / annual debt service" if deterministic_dscr is not None else "Cached AI review", action=None if dscr is not None or accepted_debt is not None and annual_debt == 0 else "request_bank_or_tax_evidence" if accepted_debt is not None else "request_debt_schedule", confidence=1.0 if deterministic_dscr is not None or accepted_debt is not None else 0.65 if dscr is not None else None),
         IntelligenceMetric(key="ltv", label="LTV", applicable=is_real_estate, value=ltv, unit="%", status=("ready" if ltv is not None else "needs_evidence") if is_real_estate else "not_applicable", source="collateral evidence" if is_real_estate else None, action="request_property_evidence" if is_real_estate and ltv is None else None),
     ]
+    if calculation_review is not None:
+        dscr_metric = next(item for item in metrics if item.key == "dscr")
+        if validated_annual is not None:
+            dscr_metric.source = "P&L EBITDA-based DSCR: current validated annual P&L inputs; primary cockpit DSCR is shown separately"
+            dscr_metric.period = validated_annual.get("period")
+            dscr_metric.status = "not_applicable" if accepted_debt is not None and annual_debt == 0 else "ready" if dscr is not None else "needs_evidence"
+            dscr_metric.confidence = 1.0
+        else:
+            dscr_metric.source = "Cached AI earnings with completed saved debt schedule" if accepted_debt is not None else "Cached AI review; no validated annual P&L basis available"
+        metrics.append(IntelligenceMetric(key="ebitda", label="Annual EBITDA",
+            value=validated_annual["ebitda_annual"] if validated_annual else None,
+            unit=validated_annual["currency"] if validated_annual else None,
+            status="ready" if validated_annual else "needs_evidence",
+            period=validated_annual.get("period") if validated_annual else None,
+            source="Current validated annual P&L: reviewed effective inputs" if validated_annual else "Current calculation review contains period figures, estimates or incomplete evidence; strict annual EBITDA is unavailable"))
     return ApplicationIntelligenceRead(
         profile_id=profile.id,
         metrics=metrics,
-        dscr_inputs={"bankable_ebitda": ebitda, "annual_debt_service": annual_debt, "target": 1.25, "floor": 1.1},
+        dscr_inputs={"bankable_ebitda": ebitda, "annual_debt_service": annual_debt, "target": 1.25, "floor": 1.1,
+                     **({"basis": "validated_profit_and_loss_annual_ebitda", "primary_cockpit_dscr": calculation_review.get("primary_dscr")} if validated_annual else {})},
+        metric_review=calculation_review,
+        effective_calculation=validated_annual,
     )
 
 
