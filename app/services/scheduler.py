@@ -368,6 +368,12 @@ def start_scheduler() -> None:
     )
 
     scheduler.add_job(
+        _wrap(job_financial_debt_batch_imports),
+        "interval", seconds=30, id="financial_debt_batch_imports",
+        replace_existing=True, coalesce=True, max_instances=1,
+    )
+
+    scheduler.add_job(
         _wrap(job_bucket_ai_review_drain),
         "interval",
         minutes=1,
@@ -1199,3 +1205,9 @@ async def job_plaid_cleanup() -> None:
     sources = await plaid_payment_lifecycle.cleanup_payment_items()
     if reports or items or sources:
         log.info("plaid_cleanup: reports=%s items=%s payment_sources=%s", reports, items, sources)
+
+
+async def job_financial_debt_batch_imports() -> None:
+    from app.services.financial_debt_batch_imports import drain_pending
+
+    await drain_pending(limit=2)

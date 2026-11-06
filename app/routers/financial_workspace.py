@@ -5,7 +5,7 @@ from typing import Annotated, Literal
 from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +13,10 @@ from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import Role
 from app.schemas.financial_workspace import (
+    DebtBatchApply,
+    DebtBatchCreate,
+    DebtBatchRefresh,
+    DebtBatchRetry,
     FinancialDraftWrite,
     FinancialFamilyCreate,
     FinancialImportApply,
@@ -26,6 +30,76 @@ from app.services import financial_workspace as workspace
 
 router = APIRouter(prefix="/application-profiles/{profile_id}/financial-workspace", tags=["financial-workspace"])
 Db = Annotated[AsyncSession, Depends(get_db)]
+
+
+async def _batch_profile(db, profile_id, user):
+    from app.services.financial_debt_batch_imports import _staff
+
+    _staff(user)
+    return await profiles.load_profile(db, profile_id, user)
+
+
+@router.post("/debt-batch-imports")
+async def create_debt_batch(profile_id: UUID, payload: DebtBatchCreate, background: BackgroundTasks, user: CurrentUser, db: Db) -> dict:
+    from app.services import financial_debt_batch_imports as batches
+
+    profile = await _batch_profile(db, profile_id, user)
+    result = await batches.create(db, profile, **payload.model_dump(), actor=user)
+    await db.commit()
+    if result["status"] in {"queued", "processing"}:
+        background.add_task(batches.run_batch, UUID(result["id"]))
+    return result
+
+
+@router.get("/debt-batch-imports")
+async def list_debt_batches(profile_id: UUID, user: CurrentUser, db: Db, family_id: UUID | None = None) -> dict:
+    from app.services import financial_debt_batch_imports as batches
+
+    profile = await _batch_profile(db, profile_id, user)
+    return await batches.list_reviews(db, profile, family_id=family_id)
+
+
+@router.get("/debt-batch-imports/{batch_id}")
+async def read_debt_batch(profile_id: UUID, batch_id: UUID, user: CurrentUser, db: Db) -> dict:
+    from app.services import financial_debt_batch_imports as batches
+
+    profile = await _batch_profile(db, profile_id, user)
+    return await batches.get(db, profile, batch_id)
+
+
+@router.post("/debt-batch-imports/{batch_id}/retry")
+async def retry_debt_batch(profile_id: UUID, batch_id: UUID, payload: DebtBatchRetry, background: BackgroundTasks, user: CurrentUser, db: Db) -> dict:
+    from app.services import financial_debt_batch_imports as batches
+
+    profile = await _batch_profile(db, profile_id, user)
+    result = await batches.retry(db, profile, batch_id, **payload.model_dump(), actor=user)
+    await db.commit()
+    if result["status"] == "queued":
+        background.add_task(batches.run_batch, batch_id)
+    return result
+
+
+@router.post("/debt-batch-imports/{batch_id}/refresh")
+async def refresh_debt_batch(profile_id: UUID, batch_id: UUID, payload: DebtBatchRefresh, background: BackgroundTasks, user: CurrentUser, db: Db) -> dict:
+    from app.services import financial_debt_batch_imports as batches
+
+    profile = await _batch_profile(db, profile_id, user)
+    result = await batches.refresh(db, profile, batch_id, **payload.model_dump(), actor=user)
+    await db.commit()
+    if result["status"] in {"queued", "processing"}:
+        background.add_task(batches.run_batch, UUID(result["id"]))
+    return result
+
+
+@router.post("/debt-batch-imports/{batch_id}/apply")
+async def apply_debt_batch(profile_id: UUID, batch_id: UUID, payload: DebtBatchApply, user: CurrentUser, db: Db) -> dict:
+    from app.services import financial_debt_batch_imports as batches
+
+    profile = await _batch_profile(db, profile_id, user)
+    result = await batches.apply(db, profile, batch_id, **payload.model_dump(), actor=user)
+    await profiles.log_profile_action(db, profile, user, "financial_debt.batch_applied", "Applied reviewed batch debt sources to the working draft", target_type="financial_import", target_id=batch_id)
+    await db.commit()
+    return result
 
 
 class DebtCandidateAction(BaseModel):
