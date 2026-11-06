@@ -41,7 +41,7 @@ async def list_notifications(
             select(group_expression().label("notification_group"), func.count(Notification.id)).where(
                 Notification.recipient_user_id == user.id,
                 Notification.read_at.is_(None),
-            ).group_by(group_expression())
+            ).group_by("notification_group")
         )).all()
     unread_counts = {"sms": 0, "email": 0, "general": 0}
     for key, count in unread_groups:
