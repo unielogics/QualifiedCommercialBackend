@@ -94,6 +94,42 @@ def test_borrower_cannot_clear_manual_hold_by_lowering_declaration():
     assert intake.intake_state["mca_manual_review_hold"]["observed_at"]
 
 
+def test_reviewed_request_supersedes_stale_request_copies_without_changing_original():
+    intake = make_intake(amount=400_000, details={"requested_amount": 450_000})
+    policy.persist(intake)
+    intake.intake_state["current_funding_request"] = {"requested_amount": "200000.00", "revision": 1}
+    result = policy.evaluate(intake)
+    assert result["requested_amount"] == 200_000
+    assert result["screening_amount"] == 200_000
+    assert result["review_mode"] == "automated_review"
+    assert intake.requested_loan_amount == 400_000
+    assert intake.intake_state["mca_qualification"]["requested_amount"] == 400_000
+
+
+def test_reviewed_request_preserves_documented_debt_and_count_term_safeguards():
+    intake = make_intake(count=3, amount=70_000, term=121, typed={"remaining_payback": 400_000})
+    intake.intake_state["current_funding_request"] = {"requested_amount": "200000.00", "revision": 1}
+    result = policy.evaluate(intake)
+    assert result["requested_amount"] == 200_000
+    assert result["documented_remaining_payback"] == 400_000
+    assert result["screening_amount"] == 400_000
+    assert set(result["reason_codes"]) == {
+        "more_than_two_active_mcas", "amount_above_program_maximum", "term_above_program_maximum",
+    }
+
+
+def test_context_only_policy_uses_latest_reviewed_request_revision():
+    bucket = SimpleNamespace(ai_context={
+        "mca_qualification": {"active_mca_count": 2, "requested_amount": 70_000},
+        "current_funding_request": {"requested_amount": "200000.00", "revision": 2},
+    })
+    result = policy.evaluate(bucket=bucket, context={
+        "current_funding_request": {"requested_amount": "400000.00", "revision": 1},
+    })
+    assert result["requested_amount"] == 200_000
+    assert result["review_mode"] == "automated_review"
+
+
 def evidence(funder, *, identity=None, balance=50_000):
     row = {"lender": funder, "current_balance": balance}
     if identity:

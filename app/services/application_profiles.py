@@ -1787,7 +1787,9 @@ async def intelligence_state(db: AsyncSession, profile: ApplicationProfile) -> A
     intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
     snapshot = dict(intake.result_snapshot or {}) if intake else {}
     key_metrics = snapshot.get("key_metrics") if isinstance(snapshot.get("key_metrics"), dict) else {}
-    requested = float(intake.requested_loan_amount) if intake and intake.requested_loan_amount is not None else None
+    from app.services.use_of_funds import source_funding_data
+    requested_amount, requested_source, _purpose, _dealer = await source_funding_data(db, profile, intake=intake)
+    requested = float(requested_amount) if requested_amount is not None else None
     ebitda = _metric_number(key_metrics, "bankable_ebitda", "annual_ebitda", "tax_net_income")
     annual_debt = _metric_number(key_metrics, "annual_debt_service")
     if annual_debt is None:
@@ -1819,7 +1821,7 @@ async def intelligence_state(db: AsyncSession, profile: ApplicationProfile) -> A
     revenue = _metric_number(key_metrics, "annualized_revenue", "annual_revenue", "gross_revenue")
     ltv = _metric_number(key_metrics, "ltv", "estimated_ltv") if is_real_estate else None
     metrics = [
-        IntelligenceMetric(key="requested", label="Requested", value=requested, unit="USD", status="ready" if requested is not None else "needs_evidence", source="intake", action=None if requested is not None else "edit_profile"),
+        IntelligenceMetric(key="requested", label="Requested", value=requested, unit="USD", status="ready" if requested is not None else "needs_evidence", source=requested_source, action=None if requested is not None else "edit_profile"),
         IntelligenceMetric(key="revenue", label="Annualized revenue", value=revenue, unit="USD", status="ready" if revenue is not None else "needs_evidence", source="latest_review", action=None if revenue is not None else "request_bank_or_tax_evidence"),
         IntelligenceMetric(key="dscr", label="DSCR", value=dscr, unit="x", status="not_applicable" if accepted_debt is not None and annual_debt == 0 else "ready" if dscr is not None else "needs_evidence", source="completed saved debt schedule" if accepted_debt is not None and annual_debt == 0 else "Cached AI earnings with completed saved debt schedule" if accepted_debt is not None else "Cached AI earnings / annual debt service" if deterministic_dscr is not None else "Cached AI review", action=None if dscr is not None or accepted_debt is not None and annual_debt == 0 else "request_bank_or_tax_evidence" if accepted_debt is not None else "request_debt_schedule", confidence=1.0 if deterministic_dscr is not None or accepted_debt is not None else 0.65 if dscr is not None else None),
         IntelligenceMetric(key="ltv", label="LTV", applicable=is_real_estate, value=ltv, unit="%", status=("ready" if ltv is not None else "needs_evidence") if is_real_estate else "not_applicable", source="collateral evidence" if is_real_estate else None, action="request_property_evidence" if is_real_estate and ltv is None else None),

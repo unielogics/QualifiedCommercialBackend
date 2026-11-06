@@ -63,7 +63,7 @@ from app.schemas.event import (
     CalendarWorkspaceRead,
 )
 from app.scoping import regional_manager_broker_ids_subquery, scope_loan_query
-from app.services import calendar_v2
+from app.services import calendar_v2, funding_requests
 from app.services.activity_log import filter_payload_for_audience, is_visible_to
 from app.services.deal_economics import calculate_deal_earnings, optional_float
 from app.services.team_calendar import effective_booking_settings, team_calendar_host
@@ -192,6 +192,8 @@ def _forecast_amount(
 
     def first(*values: Decimal | float | int | None) -> Decimal | float | int | None:
         return next((value for value in values if value is not None), None)
+
+    requested_amount = first(funding_requests.current_for_profile(profile), requested_amount)
 
     if profile.underwriting_status == "closed_won":
         raw_amount = first(
@@ -338,6 +340,7 @@ async def _estimated_closing_events(
             or "Funding file"
         )
         requested_candidates = [
+            funding_requests.current_for_profile(profile),
             dealer.client_requested_amount if dealer is not None else None,
             dealer.funding_goal if dealer is not None else None,
             intake.requested_loan_amount if intake is not None else None,

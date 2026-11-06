@@ -184,6 +184,11 @@ class ApplicationProfile(TimestampMixin, Base):
     use_of_funds_revision: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
+    # Current staff-reviewed request belongs to this file, not the business's
+    # company-wide funding goal or the approved/issued loan terms.
+    current_funding_request: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
     #: Account keys (bank + last four, as financial_cockpit names them) the desk
     #: chose to count toward the statement-months requirement and to read by
     #: default in the cockpit. Empty means every account counts.

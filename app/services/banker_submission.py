@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
+from app.services.funding_requests import intake_requested_amount
 
 
 def build_banker_payload(
@@ -37,6 +38,7 @@ def build_banker_payload(
     SSN/Tax ID is accepted transiently and forwarded in-memory only, never
     written to a DB column or JSONB field, never logged.
     """
+    requested_amount = intake_requested_amount(intake)
     return {
         "borrower": {
             "full_name": intake.full_name,
@@ -46,7 +48,7 @@ def build_banker_payload(
         },
         "financing_request": {
             "loan_purpose": intake.loan_purpose,
-            "requested_loan_amount": intake.requested_loan_amount,
+            "requested_loan_amount": float(requested_amount) if requested_amount is not None else None,
         },
         "entity_structure": entity_structure,
         "owners": owners,

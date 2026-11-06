@@ -455,6 +455,31 @@ def _prefill_db(get, dap, *, facts):
 
 
 @pytest.mark.asyncio
+async def test_current_request_prefills_before_stale_intake_and_dealer_values():
+    dealer_id = uuid.uuid4()
+    profile = SimpleNamespace(
+        id=uuid.uuid4(), dealer_id=dealer_id, intake_id=uuid.uuid4(), entity_type="llc",
+        vertical="dealer", naics_code=None,
+        current_funding_request={"requested_amount": "200000.00", "revision": 1},
+    )
+    dealer = _dealer_row(dealer_id)
+    intake = SimpleNamespace(
+        business_name="Test Company", full_name="Test Owner", email="owner@example.com", phone=None,
+        requested_loan_amount=70_000, intake_state={}, result_snapshot={},
+    )
+
+    async def get(model, key):
+        return {dealer_id: dealer, profile.intake_id: intake}.get(key)
+
+    with patch.object(prefill.profiles, "owner_rows", AsyncMock(return_value=[])):
+        result = await prefill.build_prefill(_prefill_db(get, _dap_row(), facts=[]), profile, None)
+    assert result.values["requested"] == 200_000
+    assert result.provenance["requested"]["source"] == "current_funding_request"
+    assert intake.requested_loan_amount == 70_000
+    assert dealer.funding_goal == 900_000
+
+
+@pytest.mark.asyncio
 async def test_a_document_reading_fills_what_no_column_holds():
     """The AI reads entity type off an upload into application_extracted_facts.
 

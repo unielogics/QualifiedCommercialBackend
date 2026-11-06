@@ -84,6 +84,7 @@ from app.services import (
     capital_readiness,
     file_events,
     funding_programs,
+    funding_requests,
     intake_lifecycle,
     intake_retention,
 )
@@ -802,8 +803,8 @@ async def _intake_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
                 origin=origin,  # type: ignore[arg-type]
                 origin_label=ORIGIN_LABELS[origin],
                 source_label=partner.name if partner else "Public AI intake",
-                amount=_money(intake.requested_loan_amount),
-                amount_label=_money_label(intake.requested_loan_amount),
+                amount=_money(funding_requests.intake_requested_amount(intake)),
+                amount_label=_money_label(funding_requests.intake_requested_amount(intake)),
                 working_stage=working,
                 funding_stage=funding,
                 normalized_stage=normalized,
@@ -1275,6 +1276,12 @@ async def _decorate_pipeline_state(
             requested_amount = (
                 dealer_requested if dealer_requested is not None else dealer_goal
             )
+        corrected_request = funding_requests.current_for_profile(profile)
+        if corrected_request is not None:
+            requested_amount = corrected_request
+            if PIPELINE_ECONOMICS_GROUPS.get(status_value) in {"requested", "underwriting"}:
+                row.amount = _money(corrected_request)
+                row.amount_label = _money_label(corrected_request)
         row.requested_amount = _money(requested_amount) if can_view_economics else None
         row.approved_amount = _money(profile.underwriting_approved_amount) if profile else None
         row.accepted_amount = (
@@ -2559,7 +2566,7 @@ async def promote_intake_to_funding(
         type=LoanType.DSCR if vertical == "real_estate" else LoanType.BRIDGE,
         purpose=LoanPurpose.PURCHASE if vertical == "real_estate" else LoanPurpose.CASH_OUT_REFI,
         stage=LoanStage.COLLECTING_DOCS,
-        amount=float(intake.requested_loan_amount or 0),
+        amount=float(funding_requests.intake_requested_amount(intake) or 0),
         source_intake_id=intake.id,
         funding_file_kind=funding_kind,
         entity_name=intake.business_name,

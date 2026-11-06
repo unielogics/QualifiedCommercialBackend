@@ -459,8 +459,10 @@ def _review_fixture(*, with_intake: bool):
     return db, review, bucket, intake
 
 
-async def _run_review(*, with_intake: bool, profile):
+async def _run_review(*, with_intake: bool, profile, queued_budget=None):
     db, review, bucket, intake = _review_fixture(with_intake=with_intake)
+    if queued_budget is not None:
+        review.context_snapshot = {**review.context_snapshot, "use_of_funds": queued_budget}
     with patch.object(bucket_ai, "log_bucket_ai_activity", AsyncMock()), patch(
         "app.services.operator_file_links.selected_files_for_intake", AsyncMock(return_value=[])
     ), patch(
@@ -502,9 +504,30 @@ async def test_the_review_context_carries_the_screen_when_a_profile_resolves() -
         "uploaded_files",
         "instruction",
     ]
-    assert payload["ai_context"] == {"review_type": "main_street_v1"}
+    assert payload["ai_context"]["review_type"] == "main_street_v1"
+    assert payload["ai_context"]["use_of_funds"]["basis"] == "declared_budget_not_verified_evidence"
+    assert payload["ai_context"]["use_of_funds"]["complete"] is False
     assert payload["bucket"]["name"] == "Operating file"
     assert bucket_ai.REVIEW_PROGRAM_SCREEN_RULES in call["system"]
+
+
+@pytest.mark.asyncio
+async def test_queued_review_uses_current_request_and_budget_instead_of_old_snapshot():
+    profile = SimpleNamespace(
+        id=uuid4(), current_funding_request={"requested_amount": "200000", "revision": 1, "payoff_only_alternative": True},
+        use_of_funds=[
+            {"id": "payoff", "category": "debt_refinance", "label": "Private reviewed payoff budget", "amount": "150000"},
+            {"id": "capital", "category": "working_capital", "label": "Private remainder label", "amount": "50000"},
+        ], use_of_funds_revision=3, is_draft=False,
+    )
+    payload, _, _, _, _, _, _ = await _run_review(with_intake=True, profile=profile, queued_budget={"requested_amount": 70000, "total": 70000, "revision": 1})
+    current = payload["ai_context"]
+    assert current["requested_loan_amount"] == 200000
+    assert current["use_of_funds"]["requested_amount"] == 200000
+    assert current["use_of_funds"]["total"] == 200000
+    assert current["use_of_funds"]["category_totals"]["working_capital"] == 50000
+    assert current["use_of_funds"]["revision"] == 3
+    assert "Private reviewed payoff budget" not in str(payload)
 
 
 @pytest.mark.asyncio

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
+import pytest
+
+from app.enums import Role
 from app.models.application_profile import ApplicationProfile
 from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile
+from app.routers import operator_files
 from app.routers.operator_files import (
     INTAKE_STATUS_TO_UNDERWRITING,
     PIPELINE_TO_INTAKE_STATUS,
@@ -50,6 +56,44 @@ def test_variant_verticals_match_unified_operator_taxonomy():
     assert _variant_vertical("dealer_gatekeeper_v1") == "dealer"
     assert _variant_vertical("mca_refi_v1") == "mca"
     assert _variant_vertical("unknown") == "real_estate"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,displayed,forecast", [
+    ("collecting_docs", 200_000, 200_000),
+    ("in_underwriting", 200_000, 200_000),
+    ("approved", 150_000, 180_000),
+    ("closed_won", 150_000, 170_000),
+])
+async def test_pipeline_current_request_wins_stale_dealer_amount_without_changing_approved_funded_values(status, displayed, forecast):
+    row = _row(vertical="dealer", origin="ai_intake", stage="Applicant intake")
+    row.dealer_id, row.loan_id = uuid4(), uuid4()
+    row.amount, row.amount_label = 150_000, "$150k"
+    profile = SimpleNamespace(
+        id=uuid4(), underwriting_status=status, underwriting_approved_amount=180_000,
+        underwriting_accepted_amount=160_000, underwriting_funded_amount=170_000,
+        underwriting_approved_dscr=None, forecast_fee_points=None,
+        forecast_consulting_fee=None, estimated_close_date=None,
+        current_funding_request={"requested_amount": "200000.00", "revision": 1},
+    )
+    results = [
+        SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])),
+        SimpleNamespace(all=lambda: [(row.loan_id, 150_000)]),
+        SimpleNamespace(all=lambda: [(row.dealer_id, 70_000, 70_000, 170_000)]),
+    ]
+    with (
+        patch.object(operator_files, "_profile_map_for_rows", AsyncMock(return_value={("dealer", row.dealer_id): profile})),
+        patch.object(operator_files, "_team_names_for_profiles", AsyncMock(return_value={})),
+    ):
+        await operator_files._decorate_pipeline_state(
+            [row], SimpleNamespace(role=Role.LOAN_EXEC), SimpleNamespace(execute=AsyncMock(side_effect=results)),
+        )
+    assert row.requested_amount == 200_000
+    assert row.amount == displayed
+    assert row.forecast_amount == forecast
+    assert row.approved_amount == 180_000
+    assert row.accepted_amount == 160_000
+    assert row.funded_amount == 170_000
 
 
 def test_terminal_pipeline_statuses_keep_their_business_meaning():

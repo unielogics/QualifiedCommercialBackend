@@ -126,6 +126,55 @@ def test_lender_brief_never_labels_bank_inflows_as_annual_revenue():
     assert "1,200,000" not in html
 
 
+def test_current_request_replaces_original_amount_in_brief_metrics():
+    intake = SimpleNamespace(
+        requested_loan_amount=70_000,
+        intake_state={"current_funding_request": {"requested_amount": "200000.00", "revision": 1}},
+    )
+    html = pdf._executive_metric_tiles(
+        intake=intake, result={"key_metrics": {"requested_amount": 70_000}}, financials={},
+    )
+    assert "$200,000" in html and "Current file request" in html
+    assert "$70,000" not in html
+    assert intake.requested_loan_amount == 70_000
+
+
+def test_current_request_drives_new_packet_and_brief_without_stale_request_metrics():
+    intake = SimpleNamespace(
+        variant="main_street_v1", business_name="Example", full_name="Example Owner",
+        requested_loan_amount=70_000, loan_purpose="Refinance and working capital",
+        intake_state={"current_funding_request": {"requested_amount": "200000.00", "revision": 1}},
+    )
+    captured: list[str] = []
+
+    def capture(html_doc: str) -> bytes:
+        captured.append(html_doc)
+        return b"%PDF-stub"
+
+    with (
+        patch.dict(sys.modules, {"weasyprint": None}),
+        patch.object(pdf, "_render_html_pymupdf", side_effect=capture),
+        patch.object(pdf, "_apply_watermark", side_effect=lambda b: b),
+    ):
+        for summary in (
+            {"key_metrics": [{"label": "Requested loan amount", "value": "$70,000"}]},
+            {},
+        ):
+            pdf.render_underwriting_packet_pdf(
+                intake=intake, files=[], missing_docs=[],
+                result={"key_metrics": {"requested_amount": 70_000}},
+                executive_summary=summary, financials={},
+            )
+        pdf.render_executive_summary_pdf(
+            intake=intake, result={"key_metrics": {"requested_amount": 70_000}},
+            executive_summary={}, financials={},
+        )
+    assert len(captured) == 3
+    for html in captured:
+        assert "$200,000" in html and "$70,000" not in html
+    assert intake.requested_loan_amount == 70_000
+
+
 def test_financial_parser_preserves_losses_and_rejects_nonfinite_or_malformed_numbers():
     assert pdf._num("($5,000.25)") == -5000.25
     assert pdf._num(" $1,000.50 ") == 1000.5

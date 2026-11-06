@@ -1279,7 +1279,7 @@ async def profile_for_chat_scope(
                 select(ApplicationProfile).where(
                     ApplicationProfile.intake_id == intake_id,
                     ApplicationProfile.primary_bucket_id == bucket_id,
-                )
+                  ).execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
     if upload_link_id is not None:

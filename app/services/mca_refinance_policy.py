@@ -17,6 +17,8 @@ from typing import Any
 from fastapi import HTTPException
 from sqlalchemy import select
 
+from app.services.funding_requests import current_for_intake_snapshot
+
 MAX_AMOUNT = 350_000
 MAX_TERM_MONTHS = 120
 MAX_ACTIVE_MCAS = 2
@@ -103,6 +105,14 @@ def evaluate(intake: Any = None, *, bucket: Any = None, context: Any = None) -> 
     counts = [*confirmed_counts, _count(hold.get("active_mca_count")), *[_count(item.get("advance_count")) for item in details]]
     counts = [value for value in counts if value is not None]
     active_count = max(counts) if counts else None
+    corrections = []
+    for priority, source in enumerate((snapshot, current, state)):
+        correction = _mapping(source.get("current_funding_request"))
+        corrected = _number(current_for_intake_snapshot(SimpleNamespace(intake_state=source)))
+        revision = correction.get("revision")
+        if corrected is not None and isinstance(revision, int) and not isinstance(revision, bool) and revision > 0:
+            corrections.append((revision, priority, corrected))
+    corrected_amount = max(corrections)[2] if corrections else None
     confirmed_amounts = [
         _number(declaration.get("requested_amount")),
         _number(typed_terms.get("remaining_payback")),
@@ -113,6 +123,19 @@ def evaluate(intake: Any = None, *, bucket: Any = None, context: Any = None) -> 
     ]]
     amounts = [value for value in amounts if value is not None]
     amount = max(amounts) if amounts else None
+    documented_amounts = [_number(typed_terms.get("remaining_payback")), *[
+        _number(item.get("remaining_payback")) for item in details
+    ]]
+    documented_amounts = [value for value in documented_amounts if value is not None]
+    documented_payback = max(documented_amounts) if documented_amounts else None
+    if corrected_amount is not None:
+        # A reviewed desk correction supersedes old request copies and amount
+        # holds. It cannot erase documented debt or relax count/term safeguards.
+        confirmed_amounts = [corrected_amount]
+        amount = corrected_amount
+    screening_amount = max(value for value in (amount, documented_payback) if value is not None) if any(
+        value is not None for value in (amount, documented_payback)
+    ) else None
     terms = [_number(declaration.get("requested_term_months")), _number(hold.get("requested_term_months")), _number(current.get("requested_term_months")), _number(snapshot.get("requested_term_months"))]
     terms = [value for value in terms if value is not None]
     term = max(terms) if terms else None
@@ -121,7 +144,7 @@ def evaluate(intake: Any = None, *, bucket: Any = None, context: Any = None) -> 
         manual.append("manual_review_requested")
     if active_count is not None and active_count > MAX_ACTIVE_MCAS:
         manual.append("more_than_two_active_mcas")
-    if amount is not None and amount > MAX_AMOUNT:
+    if screening_amount is not None and screening_amount > MAX_AMOUNT:
         manual.append("amount_above_program_maximum")
     if term is not None and term > MAX_TERM_MONTHS:
         manual.append("term_above_program_maximum")
@@ -149,6 +172,8 @@ def evaluate(intake: Any = None, *, bucket: Any = None, context: Any = None) -> 
             declared_count is not None and documented_count is not None and declared_count != documented_count
         ),
         "requested_amount": amount,
+        "screening_amount": screening_amount,
+        "documented_remaining_payback": documented_payback,
         "requested_term_months": term,
         "max_amount": MAX_AMOUNT,
         "max_term_months": MAX_TERM_MONTHS,

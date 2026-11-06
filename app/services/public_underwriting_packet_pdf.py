@@ -10,6 +10,8 @@ from html import escape
 from types import SimpleNamespace
 from typing import Any
 
+from app.services.funding_requests import current_for_intake_snapshot, intake_requested_amount
+
 log = logging.getLogger(__name__)
 
 # Brand palette (white-background bank-underwriter document).
@@ -31,6 +33,20 @@ HEADFILL = "#0B1D3A"
 # ─────────────────────────────────────────────────────────────────────────────
 def _record(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _request_source(intake: Any) -> str:
+    return "Current file request" if current_for_intake_snapshot(intake) is not None else "Intake"
+
+
+def _is_request_metric(label: str) -> bool:
+    # The canonical row already represents the current request. Old analysis
+    # snapshots may still carry the original submitted amount in these fields.
+    normalized = " ".join(label.lower().replace("_", " ").split())
+    return normalized in {
+        "requested", "requested amount", "requested loan amount", "amount requested",
+        "loan amount requested", "funding request", "requested funding amount",
+    }
 
 
 def _records(value: Any) -> list[dict[str, Any]]:
@@ -1228,11 +1244,11 @@ def _executive_metric_tiles(
         or _num(key_metrics.get("estimated_ebitda_or_cash_flow"))
     )
     dscr = _num(key_metrics.get("estimated_dscr")) or _num(key_metrics.get("dscr"))
-    requested = _num(getattr(intake, "requested_loan_amount", None)) or _num(key_metrics.get("requested_amount"))
+    requested = _num(intake_requested_amount(intake)) or _num(key_metrics.get("requested_amount"))
     current_ratio = _num(balance_sheet.get("current_ratio"))
 
     candidates: list[tuple[str, str, str]] = [
-        ("Requested", _fmt_full(requested), "Intake"),
+        ("Requested", _fmt_full(requested), _request_source(intake)),
         ("Avg monthly deposits", _fmt_full(avg_deposits), f"{len(deposits)} bank month{'s' if len(deposits) != 1 else ''}" if deposits else "Awaiting statements"),
         ("Avg monthly net", _fmt_full(avg_net), "Deposits less withdrawals"),
         ("Latest ending balance", _fmt_full(latest_balance), "Most recent bank month"),
@@ -1816,7 +1832,7 @@ def render_executive_summary_pdf(
 
     borrower = getattr(intake, "full_name", None)
     business = getattr(intake, "business_name", None)
-    requested = _money(getattr(intake, "requested_loan_amount", None))
+    requested = _money(intake_requested_amount(intake))
     purpose = getattr(intake, "loan_purpose", None)
     status = _text(
         result.get("probability_status")
@@ -2064,7 +2080,7 @@ def render_underwriting_packet_pdf(
         subtitle = "Dealer capital funding review"
     borrower_name = getattr(intake, "full_name", None)
     business_name = getattr(intake, "business_name", None)
-    requested_amount = _money(getattr(intake, "requested_loan_amount", None))
+    requested_amount = _money(intake_requested_amount(intake))
     purpose = getattr(intake, "loan_purpose", None)
     status = result.get("probability_status") or result.get("fundability_status") or bankability.get("status")
     application_types = (
@@ -2140,13 +2156,15 @@ def render_underwriting_packet_pdf(
     metric_rows = [
         {"metric": "Probability status", "value": status or "Awaiting review", "source": "AI review"},
         {"metric": "Suggested path", "value": program_fit or "Awaiting evidence", "source": "AI review"},
-        {"metric": "Requested amount", "value": requested_amount, "source": "Intake"},
+        {"metric": "Requested amount", "value": requested_amount, "source": _request_source(intake)},
     ]
     exec_metrics = executive_summary.get("key_metrics")
     if isinstance(exec_metrics, list) and exec_metrics:
         for m in exec_metrics:
             if isinstance(m, dict):
                 label = _text(m.get("label"), fallback="")
+                if _is_request_metric(label):
+                    continue
                 value = _text(m.get("value"), fallback="")
                 note = _text(m.get("note"), fallback="")
                 if label or value:
@@ -2156,7 +2174,7 @@ def render_underwriting_packet_pdf(
             key_text = str(key)
             # Provenance stamps (*_source / *_basis) label other rows; the
             # statement figures (pl_* / balance_sheet_*) have their own section.
-            if key_text.endswith(("_source", "_basis")) or key_text.startswith(("pl_", "balance_sheet_")):
+            if _is_request_metric(key_text) or key_text.endswith(("_source", "_basis")) or key_text.startswith(("pl_", "balance_sheet_")):
                 continue
             metric_rows.append({"metric": key_text.replace("_", " ").title(), "value": _text(value), "source": "AI extraction"})
 

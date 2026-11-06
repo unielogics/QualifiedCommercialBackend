@@ -76,3 +76,6 @@ class UseOfFundsRead(BaseModel):
     updated_by_user_id: UUID | None = None
     source: Literal["profile", "legacy_dealer", "none"] = "none"
     warnings: list[str] = Field(default_factory=list)
+    requires_exact_allocation: bool = False
+    funding_request_revision: int = 0
+    payoff_only_alternative: bool = False

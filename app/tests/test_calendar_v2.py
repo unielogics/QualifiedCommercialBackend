@@ -116,6 +116,19 @@ def test_estimated_closing_amount_uses_stage_specific_basis() -> None:
     )
 
 
+def test_current_request_drives_forecast_without_replacing_approved_or_funded_amounts() -> None:
+    profile = SimpleNamespace(
+        underwriting_status="collecting_docs", underwriting_approved_amount=180_000,
+        underwriting_term_sheet_amount=None,
+        current_funding_request={"requested_amount": "200000.00", "revision": 1},
+    )
+    assert _forecast_amount(profile, requested_amount=70_000, funded_amount=None) == (200_000, "requested")
+    profile.underwriting_status = "approved"
+    assert _forecast_amount(profile, requested_amount=70_000, funded_amount=None) == (180_000, "approved")
+    profile.underwriting_status = "closed_won"
+    assert _forecast_amount(profile, requested_amount=70_000, funded_amount=175_000) == (175_000, "funded")
+
+
 def test_estimated_closing_range_end_is_exclusive_without_dropping_partial_final_day() -> None:
     eastern = ZoneInfo("America/New_York")
     assert _exclusive_local_calendar_date(
