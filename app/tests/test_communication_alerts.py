@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import JSON, MetaData, create_engine
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -21,7 +22,7 @@ from app.models.message_send import (
 )
 from app.models.notification import Notification
 from app.routers import communications
-from app.routers.notifications import router
+from app.routers.notifications import list_notifications, router
 from app.schemas.communication import FileCommunicationSeen
 from app.services import communication_read_state as read_state
 from app.services import communication_scope
@@ -33,8 +34,10 @@ from app.services.notification_navigation import communication_link
 class DB:
     def __init__(self, session):
         self.session = session
+        self.statements = []
 
     async def execute(self, statement):
+        self.statements.append(statement)
         return self.session.execute(statement)
 
     async def get(self, model, key):
@@ -114,6 +117,19 @@ async def test_global_group_counts_exceed_page_and_scoped_read_all_preserves_oth
         data = (await client.get("/notifications", params={"status": "unread"})).json()
         assert data["unread_counts"] == {"sms": 0, "email": 1, "general": 1} and data["total"] == 2
     assert all(row.read_at is None for row in db.session.query(Notification).filter_by(recipient_user_id=other))
+
+
+async def test_postgres_unread_grouping_uses_selected_alias_without_duplicate_case_bind_parameters(db):
+    # PostgreSQL compares parameter identities during GROUP BY analysis. Two
+    # identical-looking CASE constructions have different $n parameters and
+    # raise 42803, even when SQLite accepts them and their values are equal.
+    await list_notifications(user=SimpleNamespace(id=uuid4(), role=Role.LOAN_EXEC), db=db,
+        status_filter="all", limit=1, offset=0, group=None)
+    grouped = next(statement for statement in db.statements
+        if any(column.get("name") == "notification_group" for column in statement.column_descriptions))
+    compiled = str(grouped.compile(dialect=PGDialect_asyncpg()))
+    assert "GROUP BY notification_group" in compiled
+    assert compiled.count("CASE WHEN") == 1
 
 
 async def test_notification_get_repairs_legacy_links_without_marking_read_or_mutating_history(db):
