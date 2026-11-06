@@ -5,7 +5,7 @@ from typing import Annotated, Literal
 from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -96,6 +96,20 @@ async def _profile(db, profile_id, user):
     if user.role in {Role.CLIENT, Role.DEALER, Role.VENDOR, Role.LENDER}:
         raise HTTPException(403, "Financial workspace requires a staff account")
     return await profiles.load_profile(db, profile_id, user)
+
+
+@router.get("/evidence/{file_id}/image-preview")
+async def preview_source_image(profile_id: UUID, file_id: UUID, user: CurrentUser, db: Db,
+                               expected_content_hash: Annotated[str | None, Query(pattern=r"^[a-fA-F0-9]{64}$")] = None) -> Response:
+    from app.routers.application_profiles import _can_review_manual_bank_evidence
+    from app.services.financial_source_images import scoped_image_preview
+
+    if not _can_review_manual_bank_evidence(user):
+        raise HTTPException(403, "Evidence review role required")
+    profile = await profiles.load_profile(db, profile_id, user)
+    raw, content_hash = await scoped_image_preview(db, profile, file_id, expected_content_hash=expected_content_hash)
+    return Response(raw, media_type="image/jpeg", headers={"Cache-Control": "no-store",
+        "Content-Disposition": 'inline; filename="loan-image-preview.jpg"', "X-Source-Content-Hash": content_hash})
 
 
 @router.get("")

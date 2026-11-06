@@ -1,4 +1,4 @@
-"""Reviewed PDF terms and evidence association for one explicitly chosen loan.
+"""Reviewed document/image terms and evidence association for one explicitly chosen loan.
 
 Preview creates an import, never a debt row or evidence link. Applying selected
 fields reuses the workspace draft boundary and attaches the source only to the
@@ -31,11 +31,11 @@ from app.services.debt_terms import (
 CONTRACT_CLASSES = {
     "collateral_debt_evidence", "payoff_or_mortgage_statement", "debt_schedule", "loan_agreement",
     "mca_agreement", "merchant_cash_advance", "financing_contract", "contract", "other",
-    "floorplan_mca_inventory", "advance_agreement", "payoff_letter",
+    "floorplan_mca_inventory", "advance_agreement", "payoff_letter", "loan_statement",
 }
 DOCUMENT_ROLES = {"agreement", "payoff", "supporting"}
 CONTRACT_INSTRUCTIONS = (
-    "This source is an explicitly selected financing agreement, MCA contract, or payoff letter. "
+    "This source is explicitly selected loan evidence: a financing agreement, loan/SBA account statement, MCA contract, payoff letter, or still screenshot. "
     "Return every distinct obligation it actually describes, in source order; never choose or merge loans. "
     "factor_rate is the separately printed MCA payback multiplier (for example 1.38), never an APR. "
     "rate is only a printed interest percentage. Never convert one into the other. "
@@ -43,7 +43,11 @@ CONTRACT_INSTRUCTIONS = (
     "daily, weekly, biweekly (every two weeks), or monthly cadence. Semimonthly/twice-monthly is NOT "
     "biweekly: leave unsupported or unstated frequency null and explain it in warnings. "
     "monthly_payment is populated only if the source explicitly states a monthly payment; the server "
-    "calculates any monthly equivalent. Missing contract terms stay null."
+    "calculates any monthly equivalent. Missing contract terms stay null. "
+    "A bank deposit/account balance is never a loan principal balance. Bank debits alone are observations, "
+    "not proof of contractual frequency, interest rate, original amount, or remaining debt. "
+    "Extract all printed debt-schema fields including type, original amount, balance, APR, originated/maturity "
+    "dates, secured status, payment status and collateral; SBA is a loan type, never an MCA factor."
 )
 
 
@@ -172,8 +176,6 @@ async def propose_document_import(db, profile, *, row_id: UUID, file_id: UUID, e
 
     if file.id not in await document_file_ids(db, [file.id], usable=False):
         raise HTTPException(409, "A newer document version exists. Read the latest loan terms instead.")
-    if file.content_type != "application/pdf" and not file.file_name.lower().endswith(".pdf"):
-        raise HTTPException(422, "Choose an uploaded PDF agreement or payoff letter")
     query = select(BucketFileAnalysis).where(BucketFileAnalysis.bucket_file_id == file.id,
                                              BucketFileAnalysis.status == "completed")
     if file.content_hash:
@@ -182,15 +184,25 @@ async def propose_document_import(db, profile, *, row_id: UUID, file_id: UUID, e
     if ((analysis and (getattr(analysis, "provider", None) == "drafted_form" or (analysis.analysis or {}).get("financial_version")))
             or getattr(file, "source_entity_type", None) in {"financial_form_version", "financial_version"}):
         raise HTTPException(409, "Choose an uploaded agreement or payoff letter rather than a generated financial version")
-    if analysis and analysis.classification and analysis.classification not in CONTRACT_CLASSES:
-        raise HTTPException(409, "This PDF was classified as a different document. Choose this loan’s agreement or payoff letter")
+    image_named = str(file.content_type or "").lower() in {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp", "image/heic", "image/heif"} or file.file_name.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".heif"))
+    if analysis and analysis.classification and analysis.classification not in CONTRACT_CLASSES and not (
+        analysis.classification == "bank_statement" and image_named
+    ):
+        raise HTTPException(409, "This source was classified as a different document. Choose this loan’s agreement, statement, payoff letter, or screenshot")
     try:
         raw = await asyncio.to_thread(workspace._read_file, file)
     except Exception as error:
-        raise HTTPException(502, "The uploaded loan PDF could not be read") from error
+        raise HTTPException(502, "The uploaded loan source could not be read") from error
+    from app.services.financial_source_images import validated_image_media
+
+    image_media = await asyncio.to_thread(validated_image_media, raw)
+    if analysis and analysis.classification == "bank_statement" and image_media is None:
+        raise HTTPException(409, "Use a loan-specific statement or screenshot to map terms; general bank statements remain supporting evidence.")
+    if image_media is None and b"%PDF" not in raw[:1024]:
+        raise HTTPException(422, "Choose an uploaded PDF or a readable PNG, JPEG, GIF, WebP, or HEIC still image")
     content_hash = hashlib.sha256(raw).hexdigest()
     if file.content_hash and file.content_hash != content_hash:
-        raise HTTPException(409, "The source PDF changed. Reanalyze its current contents before mapping terms")
+        raise HTTPException(409, "The source document changed. Reanalyze its current contents before mapping terms")
     cached = (await db.execute(select(FinancialFormImport).where(
         FinancialFormImport.family_id == family.id, FinancialFormImport.source_file_id == file.id,
         FinancialFormImport.proposed_body["target_debt_id"].astext == str(row_id),
@@ -214,12 +226,17 @@ async def propose_document_import(db, profile, *, row_id: UUID, file_id: UUID, e
         printed_monthly = candidate.get("monthly_payment") if candidate.get("monthly_payment_source") == "stated" else None
         if equivalent is not None:
             if printed_monthly is not None and monthly_equivalent(printed_monthly, "monthly") != equivalent:
-                warnings.append(f"The PDF also states a monthly payment of {printed_monthly}. The monthly equivalent from its native payment terms is {equivalent}; review this difference before accepting the calculated equivalent.")
+                warnings.append(f"The source also states a monthly payment of {printed_monthly}. The monthly equivalent from its native payment terms is {equivalent}; review this difference before accepting the calculated equivalent.")
             candidate["monthly_payment"], candidate["monthly_payment_source"] = str(equivalent), "native_terms"
         source_id = str(candidate["id"])
         body["debts"] = [candidate if str(row.get("id")) == source_id else row for row in body.get("debts") or []]
         mappings = workspace._mapping_records("debt_schedule", body, file, analysis, content_hash, references, pages)
         mappings = [mapping for mapping in mappings if mapping["key"].startswith(f"{source_id}.")]
+        if image_media:
+            for mapping in mappings:
+                mapping["source"].pop("page", None)
+                mapping["source"].update(kind="image", content_type=image_media)
+                mapping["confidence"] = "needs_review"
         # Native terms drive the deterministic equivalent when accepted. A
         # calculated monthly value must never masquerade as a printed field.
         if candidate.get("monthly_payment_source") == "native_terms":
@@ -242,7 +259,7 @@ async def propose_document_import(db, profile, *, row_id: UUID, file_id: UUID, e
             proposed["debts"][0]["monthly_payment_source"] = "native_terms"
             warnings.append("The monthly equivalent is calculated from the printed payment and frequency when those fields are accepted; it is not a separately printed monthly payment.")
         if not mappings:
-            raise HTTPException(422, "No supported printed loan terms were found in this PDF")
+            raise HTTPException(422, "No supported printed loan terms were found in this source")
     imported = FinancialFormImport(id=uuid4(), family_id=family.id, source_file_id=file.id, content_hash=content_hash,
         base_revision=draft.revision, proposed_body=proposed, mappings=mappings, warnings=warnings,
         status="proposed", created_at=workspace.now(), created_by_user_id=getattr(actor, "id", None))
