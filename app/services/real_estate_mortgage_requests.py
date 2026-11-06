@@ -58,6 +58,9 @@ def statement_requests(body: dict, family_id: UUID) -> list[tuple[dict, FileRequ
         loans.sort(key=lambda row: str(row["id"]) if row else "")
         for ordinal, loan in enumerate(loans, 1):
             context = _scope(family_id, property_id, str(loan["id"]) if loan else None)
+            from app.services.real_estate_evidence import identity_fingerprint
+
+            context["identity_hash"] = identity_fingerprint(property_row, loan)
             address = ", ".join(str(property_row.get(key) or "").strip()
                                 for key in ("address", "city", "state", "postal_code")
                                 if str(property_row.get(key) or "").strip()) or "Property address not provided"
@@ -186,11 +189,18 @@ async def sync_published_mortgage_requests(
         identity = _identity(context)
         state = by_identity.get(identity)
         placeholder = by_identity.get((identity[0], None))
+        adopted = False
         if (state is None and identity[1] is not None and placeholder is not None
                 and len(active_by_property[identity[0]]) == 1):
             state = placeholder
             await _adopt_placeholder(db, state, context)
+            adopted = True
         if state is not None:
+            old_hash = ((state.provenance or {}).get("source_context") or {}).get("identity_hash")
+            if old_hash and old_hash != context["identity_hash"] and not adopted:
+                from app.services.real_estate_evidence import invalidate_changed_identity
+
+                await invalidate_changed_identity(db, profile=profile, state=state, identity_hash=context["identity_hash"])
             await _restore(db, state)
             await _refresh_definition(db, state, item, context, version)
             active_ids.add(state.id)
@@ -210,6 +220,9 @@ async def sync_published_mortgage_requests(
             state.provenance = {**(state.provenance or {}), "publication_actor_name": getattr(version, "actor_name", None),
                                 "publication_source": version.source, "last_schedule_version_id": str(version.id)}
         result.extend(states)
+    from app.services.real_estate_evidence import sync_published_evidence
+
+    await sync_published_evidence(db, profile=profile, family=family, version=version, states=result)
     all_states = list((await db.execute(select(ApplicationRequirementState).where(
         ApplicationRequirementState.profile_id == profile.id))).scalars().all())
     await collection_tasks.sync_collection_tasks(db, profile, all_states)

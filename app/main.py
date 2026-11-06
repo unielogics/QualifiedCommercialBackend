@@ -98,6 +98,7 @@ from app.routers import (
     public_links,
     public_payments,
     rates,
+    real_estate_evidence,
     regional_managers,
     reports,
     search,
@@ -324,6 +325,7 @@ for r in [
     financial_workspace.router,
     financial_metrics.router,
     financial_workspace_debts.router,
+    real_estate_evidence.router,
     file_requests.router,
     merchant_offers.router,
     production_packages.link_router,  # before the package router: /link/{token} is not a package id

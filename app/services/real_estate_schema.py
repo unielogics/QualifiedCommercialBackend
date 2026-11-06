@@ -237,6 +237,8 @@ def align_import(proposed, current, warnings):
             return (str(row["property_row_id"]), text(row["lender"]), text(row.get("loan_reference")))
 
         source_groups, stored_groups = {}, {}
+        known_ids = {str(row.get("id")): row for row in stored if row.get("id")}
+        incoming_ids = [str(row.get("id")) for row in incoming]
         for row in incoming:
             source_groups.setdefault(identity(row), []).append(row)
         for row in stored:
@@ -244,11 +246,20 @@ def align_import(proposed, current, warnings):
         for row in incoming:
             key = identity(row)
             matches = stored_groups.get(key, []) if key else []
-            if key and len(matches) == len(source_groups[key]) == 1:
+            # Fresh extraction IDs are minted by the server. A cached proposal
+            # may already carry an established ID even after a staff correction
+            # changes its address or lender. Preserve that proven lineage.
+            existing = known_ids.get(str(row.get("id"))) if incoming_ids.count(str(row.get("id"))) == 1 else None
+            if existing is not None or key and len(matches) == len(source_groups[key]) == 1:
                 original = row["id"]
-                preserved = copy.deepcopy(matches[0])
-                preserved.update(row)
-                preserved["id"] = matches[0]["id"]
+                existing = existing or matches[0]
+                # Only controls/evidence survive alignment. An old editable
+                # answer omitted by this source must not become a new mapping
+                # with this source's citation; apply merges selected fields.
+                columns = {spec["key"] for spec in COLLECTIONS[block]}
+                preserved = {key: copy.deepcopy(value) for key, value in existing.items() if key not in columns}
+                preserved.update({key: copy.deepcopy(value) for key, value in row.items() if key in columns})
+                preserved["id"] = existing["id"]
                 row.clear()
                 row.update(preserved)
                 changed[str(original)] = str(row["id"])
