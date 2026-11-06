@@ -242,7 +242,10 @@ class ReadinessMetric(BaseModel):
     numerator: float | None = None
     denominator: float | None = None
     unit: str
-    status: MetricStatus
+    # Informational evidence states do not rate a borrower's financial health.
+    # Snapshot writers already persist these for observed banking figures and
+    # an accepted debt schedule; retain them when reading immutable snapshots.
+    status: MetricStatus | Literal["observed", "accepted"]
     source_period_id: UUID | None = None
     confidence_pct: float | None = None
     source: dict = Field(default_factory=dict)
