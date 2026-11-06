@@ -13,6 +13,7 @@ import re
 import zipfile
 from contextlib import nullcontext
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from typing import Any
 from uuid import UUID, uuid4
@@ -1613,6 +1614,96 @@ def _baseline_key(category_or_name: str) -> str | None:
     return None
 
 
+
+# Only generic collection language can be retired by a completed schedule.
+# A payoff, agreement, bank statement or compound request still needs its own
+# evidence even when the schedule's lender/balance/payment fields are complete.
+_DEBT_SCHEDULE_GAP_WORDS = frozenset("""
+a an the all and or of to for from in on with without as is are was were be been
+has have had not no yet please provide provided upload uploaded submit submitted
+complete completed completing fill filled out missing needed need needs required
+require requires request requested current updated update latest dated date dates
+business businesses company debt debts schedule schedules form forms document
+documents lender lenders name names loan loans obligation obligations outstanding
+active existing list listing listed include includes including each every their
+balance balances amount amounts original monthly payment payments frequency
+frequencies type types rate rates interest maturity terms details full
+fully reviewed confirmed confirmation known stated information this that your
+our borrower ask clarify clarification still remains remain so can calculate
+calculating calculation dscr service burden assess assessment underwriting
+underwrite before ready month per at it you we us must should currency file files
+client matching analyzed analysis evidence received available present record
+""".split())
+
+
+def _debt_schedule_gap_words(*texts) -> list[str]:
+    text = " ".join(str(value or "") for value in texts).casefold().replace("&", " and ")
+    return re.findall(r"[a-z0-9]+", text)
+
+
+def _mentions_debt_schedule(*texts) -> bool:
+    normalized = " ".join(_debt_schedule_gap_words(*texts))
+    return bool(re.search(r"\bdebt schedules?\b|\bschedule of (?:all )?(?:business )?debts?\b", normalized))
+
+
+def _whole_debt_schedule_gap(*texts) -> bool:
+    words = _debt_schedule_gap_words(*texts)
+    normalized = " ".join(words)
+    additional_documents = re.search(
+        r"\b(?:loan|lender|debt|supporting|source|advance|mortgage|financing) "
+        r"(?:documents?|documentation|files?|statements?|agreements?|contracts?|notes?|evidence)\b",
+        normalized,
+    )
+    return bool(_mentions_debt_schedule(*texts) and not additional_documents and all(
+        word in _DEBT_SCHEDULE_GAP_WORDS or word.isdigit() for word in words
+    ))
+
+
+def _compound_debt_schedule_gap(item: dict) -> bool:
+    texts = (item.get("title"), item.get("detail"), item.get("instructions"), item.get("reason"), item.get("rationale"))
+    return _mentions_debt_schedule(*texts) and not _whole_debt_schedule_gap(*texts)
+
+
+def _reconcile_accepted_debt_schedule_gaps(result: dict[str, Any], accepted_schedule: dict | None) -> None:
+    """Retire only whole-schedule asks using trusted current-version context.
+
+    Callers pass the server-selected immutable version. Never authorize this
+    from result['accepted_debt_schedule'], which the synthesis could invent.
+    Run before readiness so an answered ask cannot leave its old false flag.
+    """
+    if not isinstance(accepted_schedule, dict) or accepted_schedule.get("authoritative") is not True:
+        return
+    completion = accepted_schedule.get("completion")
+    if not isinstance(completion, dict) or completion.get("complete") is not True:
+        return
+    try:
+        UUID(str(accepted_schedule.get("version_id")))
+        UUID(str(accepted_schedule.get("source_file_id")))
+        monthly = Decimal(str(accepted_schedule.get("debt_service_for_dscr")))
+        if not monthly.is_finite() or monthly < 0:
+            return
+    except (ValueError, TypeError, InvalidOperation):
+        return
+    for field, detail in (("missing_or_incomplete_items", "detail"), ("recommended_next_document_requests", "instructions")):
+        rows = result.get(field)
+        if isinstance(rows, list):
+            result[field] = [row for row in rows if not (
+                isinstance(row, dict) and _whole_debt_schedule_gap(
+                    row.get("title"), row.get(detail), row.get("reason"), row.get("rationale"),
+                )
+            )]
+    evidence_map = result.get("document_evidence_map")
+    if isinstance(evidence_map, dict):
+        for row in evidence_map.get("baseline_coverage") or []:
+            if isinstance(row, dict) and _whole_debt_schedule_gap(row.get("category"), row.get("gap")):
+                row.update(status="satisfied", gap="", evidence=[accepted_schedule["source_file_id"]])
+    action = result.get("next_best_action")
+    if isinstance(action, dict) and _whole_debt_schedule_gap(action.get("title"), action.get("detail"), action.get("reason")):
+        result["next_best_action"] = {"type": "none", "title": "", "detail": "", "reason": ""}
+    if _whole_debt_schedule_gap(result.get("one_next_step")):
+        result["one_next_step"] = ""
+
+
 def _apply_lending_readiness(result: dict[str, Any], per_file_analyses: list[dict[str, Any]] | None = None) -> None:
     """Set result['lending_ready'] and, when the file is NOT ready, derive a
     concrete clarifying next step from the HIGHEST-PRIORITY open gap instead of a
@@ -1687,7 +1778,7 @@ def _apply_lending_readiness(result: dict[str, Any], per_file_analyses: list[dic
         if not isinstance(m, dict):
             continue
         key = _baseline_key(m.get("title") or m.get("detail"))
-        if key and key in satisfied_keys:
+        if key and key in satisfied_keys and not _compound_debt_schedule_gap(m):
             continue
         open_items.append(m)
     # The reconciled list is the one every consumer shows (cockpit chips, the
@@ -1791,7 +1882,8 @@ def _reconcile_checklist_consistency(bucket: Bucket, result: dict[str, Any]) -> 
     existing = [
         item
         for item in (existing if isinstance(existing, list) else [])
-        if not (isinstance(item, dict) and str(item.get("title") or "").strip().lower() in answered)
+        if not (isinstance(item, dict) and str(item.get("title") or "").strip().lower() in answered
+                and not _compound_debt_schedule_gap(item))
     ]
     result["missing_or_incomplete_items"] = existing
     if not outstanding_docs:
@@ -3745,6 +3837,7 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         # (the synthesis pass frequently leaves them null) and compute lending
         # readiness + a concrete clarifying next step from the open gaps.
         _compute_key_metrics_from_cache(result, per_file_analyses, accepted_debt_schedule=accepted_schedule)
+        _reconcile_accepted_debt_schedule_gaps(result, accepted_schedule)
         _apply_lending_readiness(result, per_file_analyses)
         # Deterministic consistency pass + single targeted repair — see the
         # helpers for why each exists.
