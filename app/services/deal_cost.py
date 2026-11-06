@@ -109,14 +109,15 @@ def internal_economics(
         "words": "",
     }
     if rows and loan_amount:
-        payments = [float(r.get("payment") or 0.0) for r in rows]
-        balloon = float(schedule.get("balloon") or 0.0)
+        from app.services.loan_schedule import schedule_cash_flows
+
+        payments = schedule_cash_flows({**schedule, "rows": rows})
         ppy = float(schedule.get("periods_per_year") or 12.0)
         out["structure_rate_pct"] = effective_rate_pct(
-            loan_amount, payments, balloon=balloon, periods_per_year=ppy
+            loan_amount, payments, periods_per_year=ppy
         )
         out["effective_rate_pct"] = effective_rate_pct(
-            loan_amount - total_fees, payments, balloon=balloon, periods_per_year=ppy
+            loan_amount - total_fees, payments, periods_per_year=ppy
         )
     words: list[str] = []
     if total_fees and loan_amount:

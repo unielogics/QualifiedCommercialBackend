@@ -12,7 +12,9 @@ from datetime import date, datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from app.schemas.loan_repayment import LoanRepaymentConfig, validate_repayment_config
 
 
 class FinancialCockpitRead(BaseModel):
@@ -143,6 +145,7 @@ class FinancialPlanWrite(BaseModel):
     are not operating spend, add-backs and overrides to the coverage inputs,
     and the new payment or the loan it comes from (level or interest-only)."""
 
+    expected_updated_at: datetime | None = None
     retire: list[str] = Field(default_factory=list, max_length=60)
     exclude: list[str] = Field(default_factory=list, max_length=60)
     new_payment_monthly: float | None = Field(default=None, ge=0)
@@ -156,12 +159,32 @@ class FinancialPlanWrite(BaseModel):
     new_loan_structure: Literal["amortizing", "simple_interest", "interest_only"] | None = None
     #: Months of the term that are interest-only before principal starts.
     new_loan_interest_only_months: int | None = Field(default=None, ge=0, le=600)
+    new_loan_repayment_config: LoanRepaymentConfig | None = None
+    new_loan_payments_per_year: float | None = Field(default=None, ge=1, le=366, allow_inf_nan=False)
     add_backs: list[AddBackIn] = Field(default_factory=list, max_length=20)
     overrides: PlanOverridesIn | None = None
     #: Which recorded terms the loan fields were adopted from; kept across saves
     #: so the cockpit can say whether the plan still mirrors them.
     terms_ref: dict[str, Any] | None = None
     note: str | None = Field(default=None, max_length=600)
+
+    @model_validator(mode="after")
+    def _repayment_schedule(self):
+        if self.new_loan_repayment_config is not None and (not self.new_loan_amount or self.new_loan_rate_pct is None):
+            raise ValueError("Flexible repayment requires the new loan amount, rate and maturity")
+        if self.new_loan_repayment_config is not None:
+            self.new_loan_repayment_config = validate_repayment_config(self.new_loan_repayment_config, self.new_loan_term_months,
+                structure="interest_only" if self.new_loan_interest_only else self.new_loan_structure,
+                interest_only_months=self.new_loan_interest_only_months, periods_per_year=self.new_loan_payments_per_year or 12,
+                amount=self.new_loan_amount, rate_pct=self.new_loan_rate_pct)
+        return self
+
+    @field_validator("expected_updated_at")
+    @classmethod
+    def _aware_plan_timestamp(cls, value):
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("Expected plan timestamp must include a timezone")
+        return value
 
 
 class DebtRowPatch(BaseModel):

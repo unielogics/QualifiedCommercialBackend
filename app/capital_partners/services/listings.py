@@ -205,6 +205,8 @@ PARTNER_TERMS_KEYS = (
     "structure_label",
     "interest_only",
     "interest_only_months",
+    "repayment_config",
+    "payments_per_year",
     "monthly_payment",
     "payment_io_monthly",
     "payment_after_monthly",

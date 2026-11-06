@@ -12,8 +12,9 @@ from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.schemas.loan_repayment import LoanRepaymentConfig, validate_repayment_config
 from app.schemas.phone import RequiredPhone
 
 InvestingAsT = Literal["individual", "family_office", "entity"]
@@ -485,11 +486,39 @@ class ListingProductIn(BaseModel):
     #: months of the term that are interest-only before principal starts.
     structure: Literal["amortizing", "simple_interest", "interest_only"] | None = None
     interest_only_months: int | None = Field(default=None, ge=0, le=600)
-    payment_frequency: Literal["monthly", "weekly", "daily"] | None = "monthly"
+    repayment_config: LoanRepaymentConfig | None = None
+    payment_frequency: Literal["monthly", "weekly", "daily", "biweekly", "custom"] | None = "monthly"
+    payments_per_year: float | None = Field(default=None, ge=1, le=366, allow_inf_nan=False)
     monthly_payment: Decimal | None = Field(default=None, ge=0)
     dscr: Decimal | None = None
     notes: str | None = Field(default=None, max_length=600)
     primary: bool = False
+
+    @model_validator(mode="after")
+    def _repayment_schedule(self):
+        if self.payment_frequency == "custom" and self.payments_per_year is None:
+            raise ValueError("Custom repayment cadence requires payments per year")
+        if self.repayment_config is None:
+            return self
+        if self.factor_rate is not None:
+            raise ValueError("Advanced amortization and principal balloons require interest-rate pricing, not a factor rate")
+        if not self.amount or self.rate_pct is None or not self.term_months:
+            raise ValueError("Enter the amount, interest rate and maturity before configuring advanced repayment")
+        from app.services.loan_schedule import build_schedule
+        from app.services.production_term_structure import periods_per_year
+
+        ppy = periods_per_year(self.payment_frequency or "monthly", self.payments_per_year)
+        kind = "interest_only" if self.interest_only else self.structure
+        self.repayment_config = validate_repayment_config(
+            self.repayment_config, self.term_months, structure=kind,
+            interest_only_months=self.interest_only_months, periods_per_year=ppy,
+            amount=float(self.amount), rate_pct=float(self.rate_pct),
+        )
+        schedule = build_schedule(float(self.amount), float(self.rate_pct), self.term_months,
+            structure=kind, interest_only_months=self.interest_only_months or 0,
+            periods_per_year=ppy, repayment_config=self.repayment_config.model_dump(exclude_none=True))
+        self.monthly_payment = Decimal(str(schedule["coverage_payment_monthly"]))
+        return self
 
 
 class OfferSuggestions(BaseModel):

@@ -931,6 +931,16 @@ def _dual_axis_chart_svg(
     return "".join(parts), width
 
 
+def _schedule_cash(row: dict[str, Any]) -> float:
+    value = _num(row.get("cash_payment"))
+    return value if value is not None else float(row.get("payment") or 0) + float(row.get("balloon") or 0)
+
+
+def _schedule_principal(row: dict[str, Any]) -> float:
+    value = _num(row.get("total_principal"))
+    return value if value is not None else float(row.get("principal") or 0) + float(row.get("balloon") or 0)
+
+
 def _schedule_chart_svg(
     rows: list[dict[str, Any]], *, title: str, width: int = 660, height: int = 230
 ) -> tuple[str, int]:
@@ -943,7 +953,7 @@ def _schedule_chart_svg(
     plot_h = height - pad_t - pad_b
     x0, x1, y0, y1 = pad_l, width - pad_r, pad_t, height - pad_b
     n = max(1, len(rows))
-    payments = [float(r.get("payment") or 0.0) for r in rows]
+    payments = [_schedule_cash(r) for r in rows]
     vmax = (max(payments) if payments else 1.0) * 1.15 or 1.0
     STEPS = 4
     slot = plot_w / n
@@ -982,7 +992,7 @@ def _schedule_chart_svg(
             parts.append(
                 f'<text x="{px(i):.1f}" y="{y1 + 15:.1f}" font-family="Arial" font-size="8.5" fill="{MUTE}" text-anchor="middle">{period}</text>'
             )
-        principal = float(r.get("principal") or 0.0)
+        principal = _schedule_principal(r)
         interest = float(r.get("interest") or 0.0)
         io = r.get("phase") == "interest_only"
         left = px(i) - bar_w / 2
@@ -1053,6 +1063,9 @@ def _schedule_block(terms: dict[str, Any], *, compact: bool) -> str:
     balloon = _num(summary.get("balloon"))
     if balloon:
         facts.append(f"<li><strong>Due at maturity</strong> {_fmt_full(balloon)} ({_num(summary.get('balloon_pct')) or 0:g}% of the loan)</li>")
+    from app.services.loan_repayment_display import repayment_lines
+
+    facts.extend(f"<li>{escape(line)}</li>" for line in repayment_lines(summary))
     lowest = _num(risk.get("lowest_coverage"))
     if lowest is not None:
         io_cov = _num(risk.get("coverage_during_interest_only"))
@@ -1075,10 +1088,10 @@ def _schedule_block(terms: dict[str, Any], *, compact: bool) -> str:
             last = chunk[-1]
             years.append(
                 f"<tr><td class=\"rowhead\">Year {start // ppy + 1}</td>"
-                f'<td class="num">{_fmt_full(sum(float(r.get("payment") or 0) for r in chunk))}</td>'
+                f'<td class="num">{_fmt_full(sum(_schedule_cash(r) for r in chunk))}</td>'
                 f'<td class="num">{_fmt_full(sum(float(r.get("interest") or 0) for r in chunk))}</td>'
-                f'<td class="num">{_fmt_full(sum(float(r.get("principal") or 0) for r in chunk))}</td>'
-                f'<td class="num">{_fmt_full(_num(last.get("balance")))}</td>'
+                f'<td class="num">{_fmt_full(sum(_schedule_principal(r) for r in chunk))}</td>'
+                f'<td class="num">{_fmt_full(_num(last.get("balance_after_cash", last.get("balance"))))}</td>'
                 f'<td class="num">{_num(last.get("exposure_pct")) or 0:g}%</td></tr>'
             )
         by_year = (

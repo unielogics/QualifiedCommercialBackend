@@ -1261,6 +1261,16 @@ def proposed_payment(terms: dict[str, Any] | None) -> dict[str, Any] | None:
         _num(terms.get("rate_pct")),
         _int(terms.get("term_months")),
     )
+    repayment_config = terms.get("repayment_config")
+    schedule = None
+    if repayment_config is not None and amount and months:
+        from app.services.loan_schedule import build_schedule
+
+        schedule = build_schedule(amount, rate or 0, months, structure=terms.get("structure"),
+            interest_only_months=terms.get("interest_only_months") or 0,
+            periods_per_year=terms.get("payments_per_year") or 12, repayment_config=repayment_config)
+        if schedule:
+            monthly = max(float(monthly or 0), schedule["coverage_payment_monthly"])
     if monthly is None and amount and months:
         monthly = amortized_payment(amount, rate or 0.0, months)
     if monthly is None:
@@ -1272,12 +1282,14 @@ def proposed_payment(terms: dict[str, Any] | None) -> dict[str, Any] | None:
         "rate_pct": rate,
         "term_months": months,
         "monthly_payment": _round(monthly),
-        "annual_payment": _round(monthly * 12),
+        "annual_payment": schedule["coverage_annual_debt_service"] if schedule else _round(monthly * 12),
         # The structure travels with the terms: the schedule, the package and
         # the offering price on it (proposed_terms_block), and the plan link
         # reads the treatment.
         "structure": terms.get("structure"),
         "interest_only_months": int(terms.get("interest_only_months") or 0),
+        "repayment_config": repayment_config,
+        "payments_per_year": terms.get("payments_per_year") or 12,
         "interest_only": bool(terms.get("interest_only")),
         "payment_stated": bool(terms.get("payment_stated")),
         "treatment": terms.get("treatment"),
@@ -2335,6 +2347,8 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
             "structure": proposed.get("structure")
             or ("interest_only" if proposed.get("interest_only") else None),
             "interest_only_months": int(proposed.get("interest_only_months") or 0),
+            "repayment_config": proposed.get("repayment_config"),
+            "payments_per_year": proposed.get("payments_per_year") or 12,
             "treatment": proposed.get("treatment"),
             "retained_annual_debt_service": proposed.get("retained_annual_debt_service"),
             "payment_stated": bool(proposed.get("payment_stated")),
@@ -2352,6 +2366,8 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
                 "structure": loan.get("structure")
                 or ("interest_only" if loan.get("interest_only") else None),
                 "interest_only_months": int(loan.get("interest_only_months") or 0),
+                "repayment_config": loan.get("repayment_config"),
+                "payments_per_year": loan.get("payments_per_year") or 12,
                 "treatment": None,
                 "retained_annual_debt_service": None,
                 "payment_stated": False,
@@ -2365,6 +2381,8 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
             base["term_months"],
             structure=base["structure"],
             interest_only_months=base["interest_only_months"],
+            repayment_config=base["repayment_config"],
+            periods_per_year=base["payments_per_year"],
         )
         if base["amount"]
         and base["rate_pct"] is not None
@@ -2382,7 +2400,7 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
         base["payment_io_monthly"] = schedule["payment_io_monthly"]
         base["payment_after_monthly"] = schedule["payment_after_monthly"]
         base["describe"] = describe(schedule)
-        base["schedule"] = {k: v for k, v in schedule.items() if k != "rows"}
+        base["schedule"] = {k: v for k, v in schedule.items() if k not in {"rows", "cash_flows"}}
         keys = (
             "period",
             "month",
@@ -2396,6 +2414,12 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
             "recovered_pct",
             "cumulative_paid",
             "cash_at_risk_pct",
+            "cash_payment",
+            "regular_payment",
+            "scheduled_balloon",
+            "maturity_balloon",
+            "total_principal",
+            "balance_after_cash",
         )
         base["schedule_rows"] = [{k: r.get(k) for k in keys} for r in schedule["rows"]]
         stated = _num(base.get("monthly_payment"))
@@ -2605,6 +2629,8 @@ async def recorded_terms_for_profile(
         "retained_annual_debt_service": recorded["retained_annual_debt_service"],
         "structure": recorded.get("structure"),
         "interest_only_months": int(recorded.get("interest_only_months") or 0),
+        "repayment_config": recorded.get("repayment_config"),
+        "payments_per_year": recorded.get("payments_per_year") or 12,
         "payment_stated": False,
     }
     return recorded, proposed
@@ -2614,13 +2640,20 @@ def term_sheet_terms(sheet: ProductionTermSheet | None) -> dict[str, Any] | None
     if sheet is None:
         return None
     extra = sheet.extra if isinstance(sheet.extra, dict) else {}
+    advanced = None
+    if extra.get("repayment_config") is not None:
+        from app.services.production_term_sheets import sheet_structure
+
+        advanced = sheet_structure(sheet)
     return {
         "source": "term_sheet",
         "label": f"Term sheet v{sheet.version}: {sheet.funding_party_name}",
-        "amount": sheet.approved_amount,
+        "amount": advanced["payment_basis_amount"] if advanced else sheet.approved_amount,
         "rate_pct": sheet.rate_pct,
         "term_months": sheet.term_months,
-        "monthly_payment": sheet.monthly_debt_service,
+        "monthly_payment": advanced["monthly_program_coverage_amount"] if advanced else sheet.monthly_debt_service,
+        "repayment_config": extra.get("repayment_config"),
+        "payments_per_year": advanced["payments_per_year"] if advanced else 12,
         # How the sheet itself treats the existing debt: on top of it
         # (additive) or in place of it (refinance, keeping what is retained).
         "treatment": str(extra.get("debt_service_treatment") or "additive"),
@@ -2630,7 +2663,7 @@ def term_sheet_terms(sheet: ProductionTermSheet | None) -> dict[str, Any] | None
         # payment has no structure the schedule can draw exactly).
         "structure": _sheet_structure(sheet, extra),
         "interest_only_months": int(_num(extra.get("interest_only_months")) or 0)
-        if _sheet_repayment(sheet, extra) == "interest_only_then_amortizing"
+        if _sheet_repayment(sheet, extra) == "interest_only_then_amortizing" or _sheet_repayment(sheet, extra) == "simple_interest" and extra.get("repayment_config") is not None
         else 0,
         "payment_stated": bool(extra.get("lender_payment_override"))
         or _sheet_repayment(sheet, extra) in {"fixed_payment", "custom"},
@@ -2649,6 +2682,10 @@ def _sheet_repayment(sheet: Any, extra: dict[str, Any]) -> str:
 def _sheet_structure(sheet: Any, extra: dict[str, Any]) -> str | None:
     repayment = _sheet_repayment(sheet, extra)
     if repayment in {"fully_amortizing", "interest_only_then_amortizing"}:
+        return "amortizing"
+    if repayment == "simple_interest":
+        return "simple_interest"
+    if repayment == "balloon" and extra.get("repayment_config") is not None:
         return "amortizing"
     if repayment in {"interest_only", "revolving_interest_only"}:
         return "interest_only"

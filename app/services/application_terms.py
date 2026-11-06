@@ -71,9 +71,10 @@ def repayment_math(
     apr_pct: float,
     term_months: int,
     frequency: str,
-    custom_payments_per_year: int | None = None,
+    custom_payments_per_year: float | None = None,
     loan_structure: str | None = None,
     interest_only_months: int | None = None,
+    repayment_config: dict | None = None,
 ) -> tuple[float, int, float, float, float, float]:
     """Return periodic payment, count, periods/year, annual service, total, cost.
 
@@ -101,6 +102,7 @@ def repayment_math(
         structure=loan_structure,
         interest_only_months=interest_only_months or 0,
         periods_per_year=periods,
+        repayment_config=repayment_config,
     )
     if summary is None:
         raise ValueError("A positive amount and term are required")
@@ -124,9 +126,10 @@ def structure_block(
     apr_pct: float | None,
     term_months: int | None,
     frequency: str | None,
-    custom_payments_per_year: int | None,
+    custom_payments_per_year: float | None,
     loan_structure: str | None,
     interest_only_months: int | None,
+    repayment_config: dict | None = None,
 ) -> dict[str, Any]:
     """What the read model says about the structure: which, the interest-only
     months, and the payment during them."""
@@ -146,6 +149,7 @@ def structure_block(
             structure=kind,
             interest_only_months=interest_only_months or 0,
             periods_per_year=periods or 12.0,
+            repayment_config=repayment_config,
         )
         if amount and (term_months or kind == "interest_only")
         else None
@@ -157,6 +161,12 @@ def structure_block(
         else int(interest_only_months or 0),
         "interest_only_payment": summary["payment_io"] if summary else None,
         "structure_label": STRUCTURE_LABELS.get(summary["structure"] if summary else kind),
+        "repayment_config": summary.get("repayment_config") if summary else repayment_config,
+        "schedule": {key: value for key, value in summary.items() if key not in {"rows", "cash_flows"}} if summary and repayment_config is not None else None,
+        "balloon_events": summary.get("scheduled_balloons", []) if summary else [],
+        "maturity_balance": summary.get("balloon") if summary else None,
+        "first_year_debt_service": summary.get("annual_debt_service") if summary else None,
+        "max_annual_debt_service": summary.get("coverage_annual_debt_service") if summary else None,
     }
 
 
@@ -486,6 +496,14 @@ async def read_terms(
         )
 
     total = float(row.periodic_payment) * int(row.payment_count)
+    repayment_config = getattr(row, "repayment_config", None)
+    if repayment_config is not None:
+        _payment, _count, _ppy, _annual, total, _cost = repayment_math(
+            amount=float(row.amount), apr_pct=float(row.apr_pct), term_months=row.term_months,
+            frequency=row.repayment_frequency, custom_payments_per_year=float(row.payments_per_year) if row.repayment_frequency == "custom" else None,
+            loan_structure=getattr(row, "loan_structure", None) or "amortizing",
+            interest_only_months=getattr(row, "interest_only_months", None), repayment_config=repayment_config,
+        )
     calc = ClientTermsCalculation(
         periodic_payment=float(row.periodic_payment),
         payment_count=row.payment_count,
@@ -517,12 +535,13 @@ async def read_terms(
             apr_pct=float(row.apr_pct),
             term_months=row.term_months,
             frequency=row.repayment_frequency,
-            custom_payments_per_year=round(float(row.payments_per_year))
+            custom_payments_per_year=float(row.payments_per_year)
             if row.repayment_frequency == "custom"
             else None,
             # Rows saved before the structure existed were amortizing.
             loan_structure=getattr(row, "loan_structure", None) or "amortizing",
             interest_only_months=getattr(row, "interest_only_months", None),
+            repayment_config=repayment_config,
         ),
     )
     return ClientTermsRead(
@@ -538,7 +557,7 @@ async def read_terms(
         funder_type=row.funder_type,  # type: ignore[arg-type]
         funder_name=row.funder_name,
         repayment_frequency=row.repayment_frequency,  # type: ignore[arg-type]
-        custom_payments_per_year=round(float(row.payments_per_year))
+        custom_payments_per_year=float(row.payments_per_year)
         if row.repayment_frequency == "custom"
         else None,
         custom_repayment_label=row.custom_repayment_label,
@@ -548,6 +567,7 @@ async def read_terms(
         else None,
         loan_structure=(getattr(row, "loan_structure", None) or "amortizing"),  # type: ignore[arg-type]
         interest_only_months=getattr(row, "interest_only_months", None) or 0,
+        repayment_config=repayment_config,
         expiration_days=row.expiration_days,
         closing_estimate_days=row.closing_estimate_days,
         co_brand_enabled=row.co_brand_enabled,
@@ -609,6 +629,8 @@ async def save_terms(
             status.HTTP_409_CONFLICT,
             "These terms changed in another session. Reload the file before saving a new version.",
         )
+    if getattr(current, "repayment_config", None) is not None and "repayment_config" not in payload.model_fields_set:
+        raise HTTPException(status.HTTP_409_CONFLICT, "These terms contain a flexible repayment schedule. Reload and include repayment_config, or explicitly send null to clear it, before saving a new version.")
     if current is not None and not any(item.value == current.program_key for item in options):
         options.insert(
             0,
@@ -624,7 +646,8 @@ async def save_terms(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "Choose a loan type from the active funding catalog",
         )
-    payment, count, periods, annual, _, _ = repayment_math(
+    repayment_config = payload.repayment_config.model_dump(exclude_none=True) if payload.repayment_config is not None else None
+    payment, count, periods, annual, total, _ = repayment_math(
         amount=payload.amount,
         apr_pct=payload.apr_pct,
         term_months=payload.term_months,
@@ -632,6 +655,7 @@ async def save_terms(
         custom_payments_per_year=payload.custom_payments_per_year,
         loan_structure=payload.loan_structure,
         interest_only_months=payload.interest_only_months,
+        repayment_config=repayment_config,
     )
     structure = structure_block(
         amount=payload.amount,
@@ -641,6 +665,7 @@ async def save_terms(
         custom_payments_per_year=payload.custom_payments_per_year,
         loan_structure=payload.loan_structure,
         interest_only_months=payload.interest_only_months,
+        repayment_config=repayment_config,
     )
     context = await _dscr_context(db, profile)
     calc = _calculation(
@@ -650,7 +675,7 @@ async def save_terms(
         payments_per_year=periods,
         new_annual_debt_service=annual,
         amount=payload.amount,
-        total_repayment=payment * count,
+        total_repayment=total if repayment_config is not None else payment * count,
         treatment=payload.debt_service_treatment,
         retained_annual_debt_service=payload.retained_annual_debt_service,
     )
@@ -677,6 +702,7 @@ async def save_terms(
         retained_annual_debt_service=payload.retained_annual_debt_service,
         loan_structure=structure["loan_structure"],
         interest_only_months=structure["interest_only_months"],
+        repayment_config=structure["repayment_config"],
         periodic_payment=payment,
         payment_count=count,
         annual_new_debt_service=annual,
@@ -730,6 +756,7 @@ async def save_terms(
             "apr_pct": float(row.apr_pct),
             "term_months": row.term_months,
             "repayment_frequency": row.repayment_frequency,
+            "repayment_config": row.repayment_config,
             "dscr_before": calc.dscr_before,
             "dscr_after": calc.dscr_after,
         },

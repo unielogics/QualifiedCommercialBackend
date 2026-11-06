@@ -194,7 +194,7 @@ async def record_term_sheet(
     profile_id: UUID, payload: ProductionTermSheetBody, request: Request, user: CurrentUser, db: AsyncSession = Depends(get_db),
 ) -> ProductionTermSheetResult:
     access = await _profile_access(db, profile_id, user)
-    _sheet, reapplied = await sheets_svc.record_sheet(db, profile=access.profile, user=user, body=payload.model_dump(), request=request)
+    _sheet, reapplied = await sheets_svc.record_sheet(db, profile=access.profile, user=user, body=payload.model_dump(exclude_unset=True), request=request)
     await db.commit()
     await svc._load_family(db, access)
     state = ProductionTermSheetState(**await svc.term_sheet_state(db, access))

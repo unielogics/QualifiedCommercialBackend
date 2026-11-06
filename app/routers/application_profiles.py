@@ -2484,7 +2484,13 @@ async def put_financial_plan(
     offer and the debt service all re-read it."""
     _require_underwriting_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
-    record = payload.model_dump()
+    from app.services.application_terms import lock_profile_terms
+    from app.services.financial_plan import validate_plan_write
+
+    await lock_profile_terms(db, profile.id)
+    await db.refresh(profile, attribute_names=["financial_plan"])
+    validate_plan_write(profile.financial_plan, payload)
+    record = payload.model_dump(exclude={"expected_updated_at"})
     record["updated_at"] = datetime.now(UTC).isoformat()
     record["updated_by"] = str(user.id)
     profile.financial_plan = record

@@ -145,6 +145,8 @@ def test_the_proposed_terms_carry_the_schedule_and_the_risk_but_never_a_fee() ->
         "structure_label",
         "interest_only",
         "interest_only_months",
+        "repayment_config",
+        "payments_per_year",
         "monthly_payment",
         "payment_io_monthly",
         "payment_after_monthly",

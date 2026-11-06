@@ -97,7 +97,9 @@ async def defaults(db: AsyncSession, profile: ApplicationProfile, parent: Produc
     out: dict[str, Any] = {}
 
     def put(key: str, value: Any, source: str) -> None:
-        if value in (None, "", 0, 0.0):
+        if value in (None, "") or value in (0, 0.0) and key not in {"rate_pct", "periodic_payment", "monthly_equivalent_payment", "monthly_program_coverage_amount"}:
+            return
+        if src.get(key) == "financial_plan" and source != "financial_plan":
             return
         out[key] = value
         src[key] = source
@@ -113,8 +115,16 @@ async def defaults(db: AsyncSession, profile: ApplicationProfile, parent: Produc
         structure = str(plan.get("new_loan_structure") or "")
         io_months = int(pa._num(plan.get("new_loan_interest_only_months")) or 0)
         term = int(pa._num(plan.get("new_loan_term_months")) or 0)
+        put("repayment_config", plan.get("new_loan_repayment_config"), "financial_plan")
+        if plan.get("new_loan_repayment_config") is not None and plan.get("new_loan_payments_per_year"):
+            cadence = float(plan["new_loan_payments_per_year"])
+            put("payments_per_year", cadence, "financial_plan")
+            put("payment_frequency", next((key for key, value in term_structure.CADENCE_PERIODS_PER_YEAR.items() if value == cadence), "custom"), "financial_plan")
         if plan.get("new_loan_interest_only") or structure == "interest_only" or (term and io_months >= term):
             put("repayment_structure", "interest_only", "financial_plan")
+        elif structure == "simple_interest" and plan.get("new_loan_repayment_config") is not None:
+            put("repayment_structure", "simple_interest", "financial_plan")
+            put("interest_only_months", io_months, "financial_plan")
         elif io_months:
             put("repayment_structure", "interest_only_then_amortizing", "financial_plan")
             put("interest_only_months", io_months, "financial_plan")
@@ -158,6 +168,11 @@ async def defaults(db: AsyncSession, profile: ApplicationProfile, parent: Produc
     put("commencement_date", first_next.isoformat(), "funding")
     if out.get("term_months"):
         put("maturity_date", add_months(funding, int(out["term_months"])).isoformat(), "funding")
+    if out.get("repayment_config") is not None:
+        calculated = term_structure.calculate(out)
+        for key in ("repayment_config", "periodic_payment", "post_io_payment", "monthly_equivalent_payment", "monthly_program_coverage_amount", "monthly_program_coverage_basis", "balloon_amount", "schedule"):
+            out[key] = calculated.get(key)
+        out["monthly_debt_service"] = calculated["monthly_program_coverage_amount"]
     lenders = (await db.execute(select(Lender).where(Lender.is_active.is_(True)).order_by(Lender.name))).scalars().all()
     return {"values": out, "sources": src, "lenders": [{"id": str(lender.id), "name": lender.name} for lender in lenders]}
 
@@ -221,6 +236,16 @@ async def record_sheet(
     """Create or supersede the profile's current term sheet. Returns (sheet, re-applied draft final or None)."""
     require_term_role(user)
     body = dict(body)
+    from app.services.application_terms import lock_profile_terms
+
+    await lock_profile_terms(db, profile.id)
+    previous = await current_sheet(db, profile.id)
+    expected_version = body.get("expected_version")
+    if expected_version is not None and expected_version != (previous.version if previous is not None else 0):
+        raise HTTPException(status.HTTP_409_CONFLICT, "These production terms changed in another session. Reload before saving a new version.")
+    previous_extra = getattr(previous, "extra", None) or {}
+    if previous_extra.get("repayment_config") is not None and "repayment_config" not in body and "repayment_config" not in (body.get("extra") or {}):
+        raise HTTPException(status.HTTP_409_CONFLICT, "These production terms contain a flexible repayment schedule. Reload and include repayment_config, or explicitly send null to clear it, before saving a new version.")
     if body.get("lender_id"):
         lender = await db.get(Lender, UUID(str(body["lender_id"])))
         if lender is None:
@@ -229,10 +254,13 @@ async def record_sheet(
         if not body.get("funding_party_name"):
             body["funding_party_name"] = lender.name
     now = _now()
-    structure = term_structure.calculate(body, entered_on=now.date())
+    try:
+        structure = term_structure.calculate(body, entered_on=now.date())
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "term_sheet_invalid", "errors": [str(exc)]}) from exc
     await _add_dscr_snapshot(db, profile, structure)
     body["rate_pct"] = structure["effective_rate_pct"]
-    body["monthly_debt_service"] = structure["monthly_equivalent_payment"]
+    body["monthly_debt_service"] = structure["monthly_program_coverage_amount"] if structure.get("repayment_config") is not None else structure["monthly_equivalent_payment"]
     body["debt_service_is_level_payment"] = term_structure.is_level_payment(
         structure,
         term_months=int(body.get("term_months") or 0),
@@ -244,7 +272,6 @@ async def record_sheet(
     validation_view["rate_pct"] = body["rate_pct"]
     validation_view["monthly_debt_service"] = body["monthly_debt_service"]
     _validate_body(validation_view)
-    previous = await current_sheet(db, profile.id)
     if previous is not None:
         previous = await db.get(ProductionTermSheet, previous.id, with_for_update=True)
     # A final that is out for signature or executed pins its terms.

@@ -105,6 +105,7 @@ def loan_payment(
     *,
     structure: str | None = None,
     interest_only_months: int | None = None,
+    repayment_config: dict | None = None,
 ) -> float | None:
     """The payment coverage stands on: interest alone for an interest-only
     loan, else the payment after any interest-only months, from the one loan
@@ -123,6 +124,7 @@ def loan_payment(
         int(term_months or 0),
         structure=kind,
         interest_only_months=interest_only_months or 0,
+        repayment_config=repayment_config,
     )
     return summary["coverage_payment_monthly"] if summary else None
 
@@ -150,6 +152,10 @@ def _io_months_of(raw: dict[str, Any]) -> int:
 
 def normalize_plan(raw: Any) -> dict[str, Any]:
     raw = raw if isinstance(raw, dict) else {}
+    from app.services.loan_schedule import normalize_repayment_config
+
+    repayment_config = normalize_repayment_config(raw.get("new_loan_repayment_config"), raw.get("new_loan_term_months"),
+        structure=_structure_of(raw), interest_only_months=_io_months_of(raw), periods_per_year=_num(raw.get("new_loan_payments_per_year")) or 12)
     retire = [str(v) for v in raw.get("retire") or [] if v]
     exclude = [str(v) for v in raw.get("exclude") or [] if v]
     payment = _num(raw.get("new_payment_monthly"))
@@ -169,6 +175,8 @@ def normalize_plan(raw: Any) -> dict[str, Any]:
         # interest-only before principal starts.
         "new_loan_structure": _structure_of(raw),
         "new_loan_interest_only_months": _io_months_of(raw),
+        "new_loan_repayment_config": repayment_config,
+        "new_loan_payments_per_year": _num(raw.get("new_loan_payments_per_year")),
         "add_backs": normalize_add_backs(raw.get("add_backs")),
         "overrides": normalize_overrides(raw.get("overrides")),
         "note": str(raw.get("note") or "")[:600] or None,
@@ -179,6 +187,26 @@ def normalize_plan(raw: Any) -> dict[str, Any]:
         "updated_at": raw.get("updated_at"),
         "updated_by": raw.get("updated_by"),
     }
+
+
+def validate_plan_write(current: dict | None, payload) -> None:
+    """Protect a configured full-write from old clients and stale editors."""
+    from datetime import datetime
+
+    from fastapi import HTTPException
+
+    current = current or {}
+    advanced = current.get("new_loan_repayment_config") is not None
+    if advanced and "new_loan_repayment_config" not in payload.model_fields_set:
+        raise HTTPException(409, "This plan contains a flexible repayment schedule. Reload and include the schedule, or explicitly send null to clear it.")
+    if advanced or "expected_updated_at" in payload.model_fields_set:
+        actual = current.get("updated_at")
+        try:
+            actual = datetime.fromisoformat(actual.replace("Z", "+00:00")) if isinstance(actual, str) else actual
+        except ValueError:
+            raise HTTPException(409, "The current plan timestamp requires review before replacing its flexible terms.") from None
+        if payload.expected_updated_at != actual or advanced and payload.expected_updated_at is None:
+            raise HTTPException(409, "This financial plan changed in another session. Reload before saving or clearing its repayment schedule.")
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +408,8 @@ def evaluate_plan(
             int(plan["new_loan_term_months"]) if plan.get("new_loan_term_months") else 0,
             structure="interest_only" if interest_only else plan.get("new_loan_structure"),
             interest_only_months=int(plan.get("new_loan_interest_only_months") or 0),
+            repayment_config=plan.get("new_loan_repayment_config"),
+            periods_per_year=plan.get("new_loan_payments_per_year") or 12,
         )
         loan_terms = {
             "amount": float(plan["new_loan_amount"]),
@@ -394,18 +424,30 @@ def evaluate_plan(
             "interest_only_months": schedule["interest_only_months"]
             if schedule
             else int(plan.get("new_loan_interest_only_months") or 0),
+            "repayment_config": schedule.get("repayment_config") if schedule else plan.get("new_loan_repayment_config"),
+            "payments_per_year": schedule.get("periods_per_year") if schedule else plan.get("new_loan_payments_per_year") or 12,
             "payment_io": schedule["payment_io_monthly"] if schedule else None,
             "payment_after": schedule["payment_after_monthly"] if schedule else None,
-            "annual_debt_service": schedule["annual_debt_service"] if schedule else None,
+            "annual_debt_service": (schedule["coverage_annual_debt_service"] if plan.get("new_loan_repayment_config") is not None else schedule["annual_debt_service"]) if schedule else None,
             "total_interest": schedule["total_interest"] if schedule else None,
             "total_paid": schedule["total_paid"] if schedule else None,
             "balloon": schedule["balloon"] if schedule else None,
             "weighted_average_life_months": schedule["weighted_average_life_months"] if schedule else None,
             "describe": describe(schedule),
         }
+        if schedule and schedule.get("repayment_config") is not None:
+            loan_terms.update({key: schedule.get(key) for key in (
+                "scheduled_balloons", "first_year_actual_debt_service", "peak_rolling_12_month_debt_service",
+                "coverage_basis", "actual_payoff_month", "maturity_balloon",
+            )})
+            loan_terms["actual_regular_payment_monthly"] = schedule.get("regular_coverage_payment_monthly")
     if new_payment is None and loan_terms and schedule:
         new_payment = schedule["coverage_payment_monthly"]
         source = source or "manual_terms"
+    elif schedule and plan.get("new_loan_repayment_config") is not None:
+        # A manually entered regular payment cannot erase contractual balloon
+        # cash flows from a configured schedule's coverage denominator.
+        new_payment = max(float(new_payment or 0), schedule["coverage_payment_monthly"])
     # The recorded loan terms join the plan only when the desk adopts them:
     # a term sheet on file is not a decision, and adding its payment on its
     # own made "with the plan" worse than today with nothing planned.
@@ -423,9 +465,29 @@ def evaluate_plan(
             if _num(proposed.get("term_months"))
             else None,
             "interest_only": False,
+            "structure": proposed.get("structure"),
+            "interest_only_months": proposed.get("interest_only_months"),
+            "repayment_config": proposed.get("repayment_config"),
+            "payments_per_year": proposed.get("payments_per_year") or 12,
             "source": "term_sheet",
             "label": proposed.get("label"),
         }
+        if loan_terms.get("repayment_config") is not None:
+            from app.services.loan_schedule import build_schedule, describe
+
+            schedule = build_schedule(loan_terms["amount"], loan_terms["rate_pct"], loan_terms["term_months"],
+                structure=loan_terms["structure"], interest_only_months=loan_terms["interest_only_months"] or 0,
+                periods_per_year=loan_terms["payments_per_year"], repayment_config=loan_terms["repayment_config"])
+            if schedule:
+                new_payment = max(float(new_payment or 0), schedule["coverage_payment_monthly"])
+                loan_terms.update({key: schedule.get(key) for key in (
+                    "scheduled_balloons", "first_year_actual_debt_service", "peak_rolling_12_month_debt_service",
+                    "coverage_basis", "actual_payoff_month", "maturity_balloon", "total_paid", "total_interest", "balloon",
+                )})
+                loan_terms.update(interest_only=schedule["structure"] == "interest_only", structure=schedule["structure"],
+                    payment_io=schedule["payment_io_monthly"], payment_after=schedule["payment_after_monthly"],
+                    actual_regular_payment_monthly=schedule["regular_coverage_payment_monthly"],
+                    annual_debt_service=schedule["coverage_annual_debt_service"], describe=describe(schedule))
     # The existing debt service: what the file shows, unless the desk set it.
     service_monthly = (
         float(service_override)
@@ -434,6 +496,15 @@ def evaluate_plan(
     )
     before_new = round(max(0.0, service_monthly - retired_monthly), 2)
     after_monthly = round(max(0.0, before_new + float(new_payment or 0.0)), 2)
+    after_annual = after_monthly * 12
+    if schedule and schedule.get("repayment_config") is not None:
+        exact_new_annual = schedule["coverage_annual_debt_service"] if abs(float(new_payment or 0) - schedule["coverage_payment_monthly"]) < .005 else float(new_payment or 0) * 12
+        exact_existing_annual = before_new * 12
+        ref = plan.get("terms_ref") or {}
+        retained = _num(ref.get("retained_annual_debt_service"))
+        if source == "recorded_terms" and ref.get("treatment") == "refinance" and retained is not None and (overrides.get("debt_service_note") or "").startswith("Refinance per ") and service_override is not None and abs(float(service_override) - round(retained / 12, 2)) < .005:
+            exact_existing_annual = max(0, retained - retired_monthly * 12)
+        after_annual = round(exact_existing_annual + exact_new_annual, 2)
 
     candidates_after = []
     for candidate in dscr.get("candidates") or []:
@@ -448,7 +519,7 @@ def evaluate_plan(
             + (excluded_monthly * 12 if candidate.get("key") == "bank_cash_flow" else 0.0)
         )
         numerator_after = float(income_override) if income_override is not None else adjusted
-        value = round(numerator_after / (after_monthly * 12), 2) if after_monthly > 0 else None
+        value = round(numerator_after / after_annual, 2) if after_annual > 0 else None
         candidates_after.append(
             {
                 "key": candidate.get("key"),
@@ -466,7 +537,7 @@ def evaluate_plan(
         # No document gives an income figure, but the desk set one: coverage
         # stands on the override alone and says so.
         value = (
-            round(float(income_override) / (after_monthly * 12), 2) if after_monthly > 0 else None
+            round(float(income_override) / after_annual, 2) if after_annual > 0 else None
         )
         candidates_after.append(
             {
@@ -528,7 +599,7 @@ def evaluate_plan(
         "debt_service_override_monthly": service_override,
         "interest_only": interest_only,
         "loan_terms": loan_terms,
-        "schedule": {k: v for k, v in schedule.items() if k != "rows"} if schedule else None,
+        "schedule": {k: v for k, v in schedule.items() if k not in {"rows", "cash_flows"}} if schedule else None,
         "schedule_rows": schedule["rows"] if schedule else [],
         "new_payment_monthly": _round(float(new_payment)) if new_payment is not None else None,
         "new_payment_source": source if new_payment is not None else None,
@@ -536,7 +607,7 @@ def evaluate_plan(
         "debt_service_before_monthly": _round(service_monthly),
         "debt_service_before_new_payment_monthly": before_new,
         "debt_service_after_monthly": after_monthly,
-        "debt_service_after_annual": _round(after_monthly * 12),
+        "debt_service_after_annual": _round(after_annual),
         "candidates": candidates_after,
         "income_before_annual": headline.get("numerator"),
         "income_after_annual": headline_after["numerator_after"] if headline_after else None,
@@ -549,6 +620,9 @@ def evaluate_plan(
         "headline_key": headline_key or (headline_after["key"] if headline_after else None),
         "no_debt_left": bool(headline_after and headline_after["no_debt_left"]),
         "replay": rows,
+        "replay_basis": "coverage_payment_proxy" if schedule and schedule.get("repayment_config") is not None else "constant_monthly_payment",
+        "replay_note": "Projected bank balances use a coverage-normalized payment proxy, not the actual monthly cash due. No loan commencement date is aligned to the historical statements; use the loan-month schedule for scheduled balloons and maturity cash flows." if schedule and schedule.get("repayment_config") is not None else None,
+        "actual_regular_payment_monthly": schedule.get("regular_coverage_payment_monthly") if schedule else None,
         "net_before_avg": _round(sum(net_before) / len(net_before)) if net_before else None,
         "net_after_avg": _round(sum(net_after) / len(net_after)) if net_after else None,
         "ending_before_last": rows[-1]["ending"] if rows else None,
@@ -964,6 +1038,8 @@ def coverage_levers(
             "new_loan_rate_pct": None,
             "new_loan_term_months": None,
             "new_loan_interest_only": False,
+            "new_loan_repayment_config": None,
+            "new_loan_payments_per_year": None,
         }
         after_add = round(
             max(0.0, evaluation["debt_service_before_new_payment_monthly"] + sheet_payment), 2
@@ -1043,6 +1119,7 @@ def coverage_levers(
     loan = evaluation.get("loan_terms")
     if (
         loan
+        and loan.get("repayment_config") is None
         and not loan.get("interest_only")
         and loan.get("rate_pct")
         and numerator is not None
@@ -1129,6 +1206,11 @@ def coverage_levers(
                 "apply": None,
             }
         )
+    if plan.get("new_loan_repayment_config") is not None:
+        # Scalar quote shortcuts cannot reprice a granular schedule. Staff can
+        # edit its maturity, rate and events in the schedule editor instead.
+        levers = [lever for lever in levers if not isinstance(lever.get("apply"), dict)
+                  or not any(key.startswith("new_loan_") for key in lever["apply"])]
     ranked = sorted(
         levers, key=lambda lever: -(lever["dscr_after"] if lever["dscr_after"] is not None else -1)
     )

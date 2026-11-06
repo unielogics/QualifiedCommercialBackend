@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from app.models.application_terms import ApplicationTermSheet
+from app.services.loan_repayment_display import repayment_lines
 
 _APP = Path(__file__).resolve().parents[1]
 _QC_MARK = _APP / "templates" / "_qcmark.svg.html"
@@ -92,7 +93,15 @@ def render_terms_html(
     """Build the exact stored version as print-ready, self-contained HTML."""
     payment = float(row.periodic_payment)
     amount = float(row.amount)
-    total = payment * row.payment_count
+    summary = _stored_schedule(row)
+    total = float(summary["total_paid"]) if summary else payment * row.payment_count
+    advanced = bool(getattr(row, "repayment_config", None))
+    repayment_html = ""
+    if advanced:
+        lines = "".join(f"<li>{escape(line)}</li>" for line in repayment_lines(summary))
+        repayment_html = f'<section class="repayment"><h2>Advanced repayment schedule</h2><ul>{lines}</ul></section>'
+    payment_label = "Starting regular" if advanced else "Estimated"
+    annual_label = "Peak rolling 12-month cash due" if advanced else "Annual debt service"
     conditions = list(row.conditions or [])
     conditions_html = "".join(f"<li>{escape(str(item))}</li>" for item in conditions)
     if not conditions_html:
@@ -114,7 +123,8 @@ def render_terms_html(
     html = f"""
 <!doctype html>
 <html><head><meta charset="utf-8"><style>
-  @page {{ size: Letter; margin: 0; @bottom-right {{ content: "Page " counter(page) " of " counter(pages); color: #718096; font: 8px Arial; margin: 0 32px 18px 0; }} }}
+  @page {{ size: Letter; margin: 28px 0 44px; @bottom-right {{ content: "Page " counter(page) " of " counter(pages); color: #718096; font: 8px Arial; margin: 0 32px 8px 0; }} }}
+  @page:first {{ margin-top: 0; }}
   * {{ box-sizing: border-box; }}
   body {{ margin: 0; color: #13233d; font-family: Arial, Helvetica, sans-serif; font-size: 10px; line-height: 1.45; background: white; }}
   .hero {{ background: #0b1d3a; color: white; padding: 25px 34px 23px; min-height: 158px; }}
@@ -154,6 +164,8 @@ def render_terms_html(
   .two {{ display: grid; grid-template-columns: 1fr 1fr; gap: 13px; }}
   .card {{ border-top: 2px solid #0b1d3a; padding-top: 9px; page-break-inside: avoid; }}
   ul {{ margin: 5px 0 0; padding-left: 16px; }} li {{ margin: 0 0 4px; }}
+  .repayment {{ border: 1px solid #dce3ec; border-radius: 9px; padding: 10px 12px; margin-bottom: 15px; }}
+  .repayment li {{ break-inside: avoid; overflow-wrap: anywhere; }}
   .client-note {{ border-left: 3px solid #0f7a73; background: #f6f9fc; padding: 9px 11px; margin: 12px 0; color: #31445e; }}
   .fine {{ border-top: 1px solid #dce3ec; margin-top: 16px; padding-top: 10px; color: #718096; font-size: 7.6px; line-height: 1.55; }}
   .fine b {{ color: #41546e; }}
@@ -181,10 +193,11 @@ def render_terms_html(
       <div class="term"><span class="label">Structure</span><strong style="font-size:11px">{escape(_structure_line(row))}</strong><small>{escape(_structure_note(row))}</small></div>
     </div>
     <div class="payment">
-      <div class="primary"><span class="label">Estimated {escape(cadence.lower())} payment</span><strong>{_money(payment)}</strong></div>
-      <div><span class="label">Annual debt service</span><strong>{_money(float(row.annual_new_debt_service))}</strong></div>
+      <div class="primary"><span class="label">{payment_label} {escape(cadence.lower())} payment</span><strong>{_money(payment)}</strong></div>
+      <div><span class="label">{annual_label}</span><strong>{_money(float(row.annual_new_debt_service))}</strong></div>
       <div><span class="label">Estimated total repayment</span><strong>{_money(total)}</strong></div>
     </div>
+    {repayment_html}
     <h2>Debt-service coverage</h2>
     <div class="dscr">
       <div class="dscr-card"><span class="label">Before acceptance</span><strong>{_ratio(float(row.dscr_before) if row.dscr_before is not None else None)}</strong><p>Current file evidence and existing obligations.</p></div>
@@ -211,22 +224,36 @@ def _structure_line(row: Any) -> str:
     io = int(getattr(row, "interest_only_months", None) or 0)
     label = STRUCTURE_LABELS.get(kind, kind.replace("_", " ").title())
     if kind == "interest_only":
+        if (getattr(row, "repayment_config", None) or {}).get("balloons"):
+            return "Interest-only with principal balloons"
         return "Interest-only, principal at maturity"
     return f"{io} months interest-only, then {label.lower()}" if io else label
 
 
 def _structure_note(row: Any) -> str:
-    from app.services.loan_schedule import build_schedule
-
     kind = getattr(row, "loan_structure", None) or "amortizing"
     io = int(getattr(row, "interest_only_months", None) or 0)
     if not io or kind == "interest_only":
         return ""
-    periods = float(row.payments_per_year or 12)
-    summary = build_schedule(float(row.amount), float(row.apr_pct), int(row.term_months), structure=kind, interest_only_months=io, periods_per_year=periods)
+    summary = _stored_schedule(row)
     if not summary or summary.get("payment_io") is None:
         return ""
     return f"{_money(summary['payment_io'])} per payment during the interest-only months"
+
+
+def _stored_schedule(row: Any) -> dict[str, Any] | None:
+    """Reconstruct only explicit structured terms; historical estimates stay intact."""
+    from app.services.loan_schedule import build_schedule
+
+    if not getattr(row, "loan_structure", None) and not getattr(row, "repayment_config", None):
+        return None
+    return build_schedule(
+        float(row.amount), float(row.apr_pct), int(row.term_months),
+        structure=getattr(row, "loan_structure", None) or "amortizing",
+        interest_only_months=int(getattr(row, "interest_only_months", None) or 0),
+        periods_per_year=float(getattr(row, "payments_per_year", None) or 12),
+        repayment_config=getattr(row, "repayment_config", None),
+    )
 
 
 def render_terms_pdf(

@@ -47,7 +47,7 @@ class ApplicationTermSheet(TimestampMixin, Base):
         CheckConstraint("repayment_frequency IN ('daily', 'weekly', 'biweekly', 'monthly', 'custom')", name="ck_application_term_sheet_frequency"),
         CheckConstraint("debt_service_treatment IN ('additive', 'refinance')", name="ck_application_term_sheet_debt_treatment"),
         CheckConstraint("payments_per_year > 0", name="ck_application_term_sheet_payments_year"),
-        CheckConstraint("periodic_payment > 0", name="ck_application_term_sheet_payment"),
+        CheckConstraint("periodic_payment > 0 OR (repayment_config IS NOT NULL AND jsonb_typeof(repayment_config) = 'object' AND periodic_payment >= 0)", name="ck_application_term_sheet_payment"),
         CheckConstraint("payment_count > 0", name="ck_application_term_sheet_payment_count"),
         CheckConstraint("annual_new_debt_service > 0", name="ck_application_term_sheet_annual_debt"),
     )
@@ -80,6 +80,7 @@ class ApplicationTermSheet(TimestampMixin, Base):
     #: term that are interest-only before principal starts.
     loan_structure: Mapped[str | None] = mapped_column(String(20))
     interest_only_months: Mapped[int | None] = mapped_column(Integer)
+    repayment_config: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
     retained_annual_debt_service: Mapped[float | None] = mapped_column(Numeric(14, 2))
     periodic_payment: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
     payment_count: Mapped[int] = mapped_column(Integer, nullable=False)

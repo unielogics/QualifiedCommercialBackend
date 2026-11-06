@@ -261,10 +261,13 @@ def _production_expiry(row: ProductionTermSheet) -> datetime | None:
 def production_term_lines(row: ProductionTermSheet) -> list[str]:
     """Canonical client-visible summary for every production loan structure."""
     structure = production_term_sheets.sheet_structure(row)
+    from app.services.loan_repayment_display import configured_structure_label, repayment_lines
+
+    advanced = bool(structure.get("repayment_config"))
     facility_kind = str(structure.get("facility_kind") or "term_loan")
     amount_label = "Credit limit" if facility_kind in {"revolving_loc", "heloc", "hybrid"} else "Approved amount"
     cadence = production_term_structure.cadence_label(structure)
-    repayment = production_term_structure.structure_label(str(structure["repayment_structure"]))
+    repayment = configured_structure_label(structure, production_term_structure.structure_label(str(structure["repayment_structure"])))
     lines = [
         f"Facility: {_text(row.facility_type)} ({_human_key(facility_kind)})",
         f"{amount_label}: {_money(row.approved_amount)}",
@@ -298,11 +301,12 @@ def production_term_lines(row: ProductionTermSheet) -> list[str]:
     lines.extend(
         [
             f"Monthly payment equivalent: {_money(structure.get('monthly_equivalent_payment'))}",
-            f"Annual scheduled debt service: {_money(structure.get('annual_debt_service'))}",
+            f"{'Peak rolling 12-month cash due' if advanced else 'Annual scheduled debt service'}: {_money(structure.get('annual_debt_service'))}",
         ]
     )
     if float(structure.get("balloon_amount") or 0) > 0:
         lines.append(f"Balloon due at maturity: {_money(structure['balloon_amount'])}")
+    lines.extend(repayment_lines(structure.get("schedule")))
     coverage = structure.get("monthly_program_coverage_amount")
     if coverage is not None:
         lines.append(f"Monthly program coverage amount: {_money(coverage)}")
@@ -453,6 +457,11 @@ async def resolve_offers(
                 f"DSCR before acceptance: {_ratio(row.dscr_before)}",
                 f"DSCR after acceptance: {_ratio(row.dscr_after)}",
             ]
+            if getattr(row, "repayment_config", None) is not None:
+                from app.services.application_terms_pdf import _stored_schedule
+                from app.services.loan_repayment_display import repayment_lines
+
+                lines.extend(repayment_lines(_stored_schedule(row)))
             if row.conditions:
                 lines.append("Conditions: " + "; ".join(str(value) for value in row.conditions))
             resolved.append(

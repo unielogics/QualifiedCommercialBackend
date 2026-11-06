@@ -11,6 +11,7 @@ from typing import Any
 from app.models.production_package import ProductionTermSheet
 from app.services import production_term_sheets as sheet_service
 from app.services import production_term_structure as term_structure
+from app.services.loan_repayment_display import configured_structure_label, repayment_lines
 from app.services.production_arrangement import USE_OF_FUNDS_KEYS
 
 _APP = Path(__file__).resolve().parents[1]
@@ -119,7 +120,19 @@ def render_term_sheet_html(
     internal underwriting commentary. Only the client-facing conditions print.
     """
     structure = sheet_service.sheet_structure(sheet)
-    repayment_label = term_structure.structure_label(str(structure["repayment_structure"]))
+    advanced = bool(structure.get("repayment_config"))
+    advanced_lines = repayment_lines(structure.get("schedule"))
+    repayment_html = (
+        '<section class="repayment"><h2>Advanced repayment schedule</h2><ul>'
+        + "".join(f"<li>{escape(line)}</li>" for line in advanced_lines)
+        + "</ul></section>"
+    ) if advanced_lines else ""
+    annual_label = "Peak rolling 12-month cash due" if advanced else "Annual scheduled debt service"
+    coverage_note = (
+        "advanced repayment coverage includes scheduled principal balloons and residual maturity principal once in the highest rolling 12 months of scheduled cash due."
+        if advanced else "any balloon is shown separately and is not included in annual scheduled debt service."
+    )
+    repayment_label = configured_structure_label(structure, term_structure.structure_label(str(structure["repayment_structure"])))
     cadence = term_structure.cadence_label(structure)
     rate = term_structure.rate_label(structure)
     facility_kind = str(structure.get("facility_kind") or "term_loan")
@@ -171,7 +184,7 @@ def render_term_sheet_html(
     )
     term_cards = "".join(terms)
 
-    periodic_label = f"Estimated {cadence.lower()} payment"
+    periodic_label = f"{'Starting regular' if advanced else 'Estimated'} {cadence.lower()} payment"
     if structure.get("post_io_payment") is not None:
         periodic_label = f"Initial IO payment ({cadence.lower()})"
     payment_middle_label = (
@@ -182,7 +195,7 @@ def render_term_sheet_html(
     payment_middle_value = (
         float(structure["post_io_payment"])
         if structure.get("post_io_payment") is not None
-        else float(structure.get("monthly_equivalent_payment") or sheet.monthly_debt_service)
+        else float(structure["monthly_equivalent_payment"] if structure.get("monthly_equivalent_payment") is not None else sheet.monthly_debt_service)
     )
     payment_summary = term_structure.payment_summary_text(structure)
     prepared_for = client_name or business_name
@@ -214,7 +227,8 @@ def render_term_sheet_html(
     html = f"""
 <!doctype html>
 <html><head><meta charset="utf-8"><style>
-  @page {{ size: Letter; margin: 0; @bottom-right {{ content: "Page " counter(page) " of " counter(pages); color: #6d7e91; font: 8px Arial; margin: 0 32px 17px 0; }} }}
+  @page {{ size: Letter; margin: 28px 0 44px; @bottom-right {{ content: "Page " counter(page) " of " counter(pages); color: #6d7e91; font: 8px Arial; margin: 0 32px 8px 0; }} }}
+  @page:first {{ margin-top: 0; }}
   * {{ box-sizing: border-box; }}
   body {{ margin: 0; color: #14243c; font-family: Arial, Helvetica, sans-serif; font-size: 10px; line-height: 1.42; background: white; }}
   .hero {{ background: #0b1d3a; color: white; padding: 24px 34px 22px; min-height: 164px; }}
@@ -255,6 +269,8 @@ def render_term_sheet_html(
   td:last-child {{ text-align: right; color: #0b1d3a; font-weight: 700; }}
   .empty {{ color: #718096; font-size: 8.5px; }}
   ul {{ margin: 5px 0 0; padding-left: 16px; }} li {{ margin: 0 0 4px; }}
+  .repayment {{ border: 1px solid #dce3ec; border-radius: 9px; padding: 10px 12px; margin: 12px 0; }}
+  .repayment li {{ break-inside: avoid; overflow-wrap: anywhere; }}
   .fine {{ border-top: 1px solid #dce3ec; margin-top: 10px; padding-top: 7px; color: #718096; font-size: 7.2px; line-height: 1.38; }}
   .fine b {{ color: #41546e; }}
 </style></head><body>
@@ -275,16 +291,17 @@ def render_term_sheet_html(
     <div class="payment">
       <div class="primary"><span class="label">{escape(periodic_label)}</span><strong>{_money(float(structure.get("periodic_payment") or 0))}</strong></div>
       <div><span class="label">{escape(payment_middle_label)}</span><strong>{_money(payment_middle_value)}</strong></div>
-      <div><span class="label">Annual scheduled debt service</span><strong>{_money(float(structure.get("annual_debt_service") or 0))}</strong></div>
+      <div><span class="label">{annual_label}</span><strong>{_money(float(structure.get("annual_debt_service") or 0))}</strong></div>
     </div>
     {f'<div class="fine"><b>Payment structure:</b> {escape(str(payment_summary))}</div>' if payment_summary else ''}
+    {repayment_html}
     <h2>Estimated timing</h2>
     <div class="schedule">{schedule}</div>
     <div class="two">
       <section class="card"><h2>Approved use of funds</h2>{_use_of_funds_rows(sheet.use_of_funds)}</section>
       <section class="card"><h2>Conditions</h2><ul>{_condition_items(sheet.conditions)}</ul></section>
     </div>
-    <div class="fine"><b>Important:</b> This client-facing summary reflects Production Term Sheet v{sheet.version}. It is not a commitment to lend, a final credit approval, or a replacement for executed funding documents. Terms remain subject to verification, final underwriting, funding-source approval, satisfactory documentation, and closing conditions. Payment and annual scheduled debt-service figures are estimates; any balloon is shown separately and is not included in annual scheduled debt service. Interest on revolving facilities is based on the outstanding balance, so actual payments change with draws, repayments, and rate changes. Variable-rate figures use the current index snapshot shown above. Fees, reserves, third-party charges, legal expenses, default charges, taxes, insurance, and closing costs are separate unless expressly stated in final documents. Qualified Commercial is not the lender unless identified as the funding party in the final loan documents.</div>
+    <div class="fine"><b>Important:</b> This client-facing summary reflects Production Term Sheet v{sheet.version}. It is not a commitment to lend, a final credit approval, or a replacement for executed funding documents. Terms remain subject to verification, final underwriting, funding-source approval, satisfactory documentation, and closing conditions. Payment and debt-service figures are estimates; {coverage_note} Interest on revolving facilities is based on the outstanding balance, so actual payments change with draws, repayments, and rate changes. Variable-rate figures use the current index snapshot shown above. Fees, reserves, third-party charges, legal expenses, default charges, taxes, insurance, and closing costs are separate unless expressly stated in final documents. Qualified Commercial is not the lender unless identified as the funding party in the final loan documents.</div>
   </main>
 </body></html>
 """
