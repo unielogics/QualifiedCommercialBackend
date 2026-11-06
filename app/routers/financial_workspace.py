@@ -1,7 +1,7 @@
 """Scoped staff workspace: drafts do not change filed financial versions."""
 
 import re
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import quote
 from uuid import UUID
 
@@ -26,6 +26,37 @@ from app.services import financial_workspace as workspace
 
 router = APIRouter(prefix="/application-profiles/{profile_id}/financial-workspace", tags=["financial-workspace"])
 Db = Annotated[AsyncSession, Depends(get_db)]
+
+
+class DebtCandidateAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    family_id: UUID | None = None
+    expected_revision: int = Field(ge=0)
+    candidate_key: str = Field(min_length=1, max_length=100)
+    action: Literal["include", "disable", "restore", "link_existing"]
+    target_row_id: UUID | None = None
+    idempotency_key: str = Field(min_length=8, max_length=128)
+
+
+@router.get("/debt-review")
+async def read_debt_review(profile_id: UUID, user: CurrentUser, db: Db, family_id: UUID | None = None) -> dict:
+    from app.services import financial_debt_review
+
+    profile = await _profile(db, profile_id, user)
+    result = await financial_debt_review.read_review(db, profile, family_id=family_id, actor=user)
+    await db.commit()
+    return result
+
+
+@router.post("/debt-review/actions")
+async def act_on_debt_candidate(profile_id: UUID, payload: DebtCandidateAction, user: CurrentUser, db: Db) -> dict:
+    from app.services import financial_debt_review
+
+    profile = await _profile(db, profile_id, user)
+    result = await financial_debt_review.act(db, profile, **payload.model_dump(), actor=user)
+    await profiles.log_profile_action(db, profile, user, "financial_debt.observed_candidate_reviewed", "Reviewed an observed payment against the working debt schedule", target_type="financial_form", target_id=UUID(result["workspace"]["family_id"]), metadata={"candidate_key": payload.candidate_key, "action": payload.action})
+    await db.commit()
+    return result
 
 
 async def _profile(db, profile_id, user):

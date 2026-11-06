@@ -197,11 +197,17 @@ def _number(value: Any) -> float | None:
 
 
 def obligations(debt: dict[str, Any], recurring: dict[str, Any]) -> list[dict[str, Any]]:
-    """One list of what the business pays lenders, whichever source the debt
-    service came from, each entry carrying the monthly amount it puts in the
-    denominator and the statement payee it is linked to."""
-    rows = debt.get("rows") or []
+    """Explicit schedule membership, with statement observations beside each row.
+
+    A recurring debit, an uploaded contract, or an extracted schedule line is
+    evidence to review, not another confirmed obligation. The cockpit exposes
+    those candidates separately; its provisional debt-service calculation can
+    still use bank observations when there is no curated schedule.
+    """
     service = debt.get("service") or {}
+    authoritative = bool(service.get("schedule_authoritative"))
+    rows = [row for row in debt.get("rows") or []
+            if authoritative or row.get("origin") != "ai_draft"]
     payees = [p for p in recurring.get("payees") or [] if p.get("is_debt") or p.get("is_card")]
     by_key = {p["key"]: p for p in payees}
     used: set[str] = set()
@@ -209,151 +215,31 @@ def obligations(debt: dict[str, Any], recurring: dict[str, Any]) -> list[dict[st
     source = service.get("source") or "none"
     rows_in_service = source in {"debt_schedule_rows", "debt_schedule_rows+bank_observed", "accepted_debt_schedule"}
     for row in rows:
-        linked = None
         vendor_key = row.get("vendor_key")
-        if vendor_key and vendor_key in by_key and vendor_key not in used:
-            linked = by_key[vendor_key]
-        else:
-            linked = next(
-                (
-                    p
-                    for p in payees
-                    if p["key"] not in used and match_names(row["lender"], p["payee"])
-                ),
-                None,
-            )
+        linked = by_key.get(vendor_key) if vendor_key not in used else None
+        if linked is None:
+            linked = next((p for p in payees if p["key"] not in used
+                           and match_names(row["lender"], p["payee"])), None)
         if linked is not None:
             used.add(linked["key"])
-        counted = bool(row.get("count_in_dscr")) and rows_in_service
-        out.append(
-            {
-                "id": f"row:{row.get('id')}",
-                "kind": "row",
-                "lender": row["lender"],
-                "category": "merchant_cash_advance"
-                if row.get("is_mca")
-                else row.get("category") or "loan",
-                "is_mca": bool(row.get("is_mca")),
-                "monthly": row.get("monthly_payment"),
-                "balance": row.get("balance"),
-                "payoff": row.get("payoff_amount")
-                if row.get("payoff_amount") is not None
-                else row.get("balance"),
-                "in_debt_service": counted,
-                "count_in_dscr": bool(row.get("count_in_dscr")),
-                "linked_payee_key": linked["key"] if linked else None,
-                "linked_payee": linked["payee"] if linked else None,
-                "observed_monthly": linked["monthly_average"] if linked else None,
-                "cadence": row.get("payment_frequency") or (linked["cadence"] if linked else None),
-                "source": "debt_schedule_row",
-                "origin": row.get("origin"),
-            }
-        )
-    if service.get("schedule_authoritative"):
-        return out
-    if source == "debt_schedule_document":
-        # The schedule the client uploaded, read by the AI: its lines are the
-        # obligations until the desk adopts them as rows or enters its own.
-        document = debt.get("document") or {}
-        for index, line in enumerate(document.get("debts") or []):
-            if not isinstance(line, dict):
-                continue
-            lender = str(line.get("lender") or line.get("creditor") or line.get("name") or "").strip()
-            if not lender:
-                continue
-            monthly = _number(line.get("monthly_payment"))
-            balance = _number(line.get("current_balance") or line.get("balance"))
-            linked = next(
-                (p for p in payees if p["key"] not in used and match_names(lender, p["payee"])),
-                None,
-            )
-            if linked is not None:
-                used.add(linked["key"])
-            kind_text = str(line.get("debt_type") or line.get("type") or "").lower()
-            is_mca = "advance" in kind_text or "mca" in kind_text
-            out.append(
-                {
-                    "id": f"sched:{index}",
-                    "kind": "schedule_document",
-                    "lender": lender,
-                    "category": "merchant_cash_advance" if is_mca else (kind_text.replace(" ", "_") or "loan"),
-                    "is_mca": is_mca,
-                    "monthly": monthly,
-                    "balance": balance,
-                    "payoff": _number(line.get("payoff_amount")) if line.get("payoff_amount") is not None else balance,
-                    "in_debt_service": True,
-                    "count_in_dscr": True,
-                    "linked_payee_key": linked["key"] if linked else None,
-                    "linked_payee": linked["payee"] if linked else None,
-                    "observed_monthly": linked["monthly_average"] if linked else None,
-                    "cadence": line.get("payment_frequency") or (linked["cadence"] if linked else None),
-                    "source": "debt_schedule_document",
-                    "origin": "uploaded_schedule",
-                    "rate_pct": _number(line.get("rate_pct") or line.get("rate")),
-                    "maturity_on": line.get("maturity_date") or line.get("maturity_on"),
-                    "secured_by": line.get("secured_by"),
-                }
-            )
-    if source == "advance_terms":
-        for index, doc in enumerate(debt.get("documented") or []):
-            linked = next(
-                (
-                    p
-                    for p in payees
-                    if p["key"] not in used and match_names(doc["lender"], p["payee"])
-                ),
-                None,
-            )
-            if linked is not None:
-                used.add(linked["key"])
-            out.append(
-                {
-                    "id": f"doc:{index}",
-                    "kind": "document",
-                    "lender": doc["lender"],
-                    "category": "merchant_cash_advance" if doc.get("is_mca") else "loan",
-                    "is_mca": bool(doc.get("is_mca")),
-                    "monthly": doc.get("monthly_payment"),
-                    "balance": doc.get("balance"),
-                    "payoff": doc.get("balance"),
-                    "in_debt_service": True,
-                    "count_in_dscr": True,
-                    "linked_payee_key": linked["key"] if linked else None,
-                    "linked_payee": linked["payee"] if linked else None,
-                    "observed_monthly": linked["monthly_average"] if linked else None,
-                    "cadence": doc.get("payment_frequency")
-                    or (linked["cadence"] if linked else None),
-                    "source": "advance_terms",
-                    "origin": "document",
-                }
-            )
-    for payee in payees:
-        if payee["key"] in used:
-            continue
-        in_service = payee.get("is_debt") and source in {
-            "bank_observed",
-            "debt_schedule_rows+bank_observed",
-        }
-        out.append(
-            {
-                "id": f"payee:{payee['key']}",
-                "kind": "payee",
-                "lender": payee["payee"],
-                "category": payee["kind"],
-                "is_mca": payee["kind"] == "merchant_cash_advance",
-                "monthly": payee.get("monthly_average"),
-                "balance": None,
-                "payoff": None,
-                "in_debt_service": bool(in_service),
-                "count_in_dscr": bool(payee.get("is_debt")),
-                "linked_payee_key": payee["key"],
-                "linked_payee": payee["payee"],
-                "observed_monthly": payee.get("monthly_average"),
-                "cadence": payee.get("cadence"),
-                "source": "bank_observed",
-                "origin": "statements",
-            }
-        )
+        out.append({
+            "id": f"row:{row.get('id')}",
+            "kind": "row",
+            "lender": row["lender"],
+            "category": "merchant_cash_advance" if row.get("is_mca") else row.get("category") or "loan",
+            "is_mca": bool(row.get("is_mca")),
+            "monthly": row.get("monthly_payment"),
+            "balance": row.get("balance"),
+            "payoff": row.get("payoff_amount") if row.get("payoff_amount") is not None else row.get("balance"),
+            "in_debt_service": bool(row.get("count_in_dscr")) and rows_in_service,
+            "count_in_dscr": bool(row.get("count_in_dscr")),
+            "linked_payee_key": linked["key"] if linked else None,
+            "linked_payee": linked["payee"] if linked else None,
+            "observed_monthly": linked["monthly_average"] if linked else None,
+            "cadence": row.get("payment_frequency") or (linked["cadence"] if linked else None),
+            "source": "debt_schedule_row",
+            "origin": row.get("origin"),
+        })
     return out
 
 

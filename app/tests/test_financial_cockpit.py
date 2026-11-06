@@ -969,7 +969,7 @@ def test_the_cockpit_carries_the_plan_in_words_and_the_listing_summary_repeats_i
     assert quiet["plan"]["impact"]["active"] is False and listing_summary(quiet)["plan"]["active"] is False
 
 
-def test_the_uploaded_schedule_lines_become_the_desk_form_and_the_plan_obligations() -> None:
+def test_uploaded_schedule_lines_map_to_the_desk_form_but_need_review_for_plan_membership() -> None:
     from app.services.financial_plan import obligations
     from app.services.financial_statements import debt_rows_from_body, document_debts_as_body
 
@@ -990,9 +990,7 @@ def test_the_uploaded_schedule_lines_become_the_desk_form_and_the_plan_obligatio
     assert rows[0]["maturity_on"] is not None and rows[0]["rate"] is not None
     assert rows[1]["payment_status"] == "current"
     listed = obligations({"rows": [], "service": {"source": "debt_schedule_document"}, "document": document, "documented": []}, {"payees": []})
-    assert [o["id"] for o in listed] == ["sched:0", "sched:2"]
-    assert listed[0]["lender"] == "Ally" and listed[0]["monthly"] == 1090.38 and listed[0]["payoff"] == 49139.2 and listed[0]["in_debt_service"] is True
-    assert listed[0]["kind"] == "schedule_document" and listed[0]["origin"] == "uploaded_schedule"
+    assert listed == []  # extracted lines are evidence until adopted into the staff schedule
     assert obligations({"rows": [], "service": {"source": "none"}, "document": document, "documented": []}, {"payees": []}) == []
 
 
