@@ -168,6 +168,10 @@ async def propose_document_import(db, profile, *, row_id: UUID, file_id: UUID, e
     workspace._check_revision(draft, expected_revision)
     target = _target(draft.body, row_id)
     file = await workspace.source_file_for_profile(db, profile, file_id)
+    from app.services.document_version_selection import document_file_ids
+
+    if file.id not in await document_file_ids(db, [file.id], usable=False):
+        raise HTTPException(409, "A newer document version exists. Read the latest loan terms instead.")
     if file.content_type != "application/pdf" and not file.file_name.lower().endswith(".pdf"):
         raise HTTPException(422, "Choose an uploaded PDF agreement or payoff letter")
     query = select(BucketFileAnalysis).where(BucketFileAnalysis.bucket_file_id == file.id,

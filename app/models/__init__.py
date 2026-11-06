@@ -9,6 +9,7 @@ from app.dealer_os import (
 )
 from app.models.activity import Activity  # noqa: F401
 from app.models.operator_attention import OperatorAttentionControl, OperatorAttentionEvent  # noqa: F401
+from app.models.document_file_version import DocumentFileVersion  # noqa: F401
 from app.models.admin_activity import AdminActivitySeen, AdminDigestState  # noqa: F401
 from app.models.agent_reassignment_audit import AgentReassignmentAudit  # noqa: F401
 from app.models.agent_task import AgentTask  # noqa: F401

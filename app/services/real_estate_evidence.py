@@ -151,7 +151,11 @@ def _contradictions(candidate, prop, loan):
 
 
 async def _source(db, profile, file_id, *, expected_hash=None, read=True):
+    from app.services.document_version_selection import document_file_ids
+
     file = await workspace.source_file_for_profile(db, profile, file_id)
+    if file_id not in await document_file_ids(db, [file_id], usable=False):
+        raise HTTPException(409, "A newer document version exists. Review its latest mortgage statement instead.")
     if not (file.content_type == "application/pdf" or file.file_name.lower().endswith(".pdf")):
         raise HTTPException(422, "Choose a readable uploaded mortgage statement PDF")
     if getattr(file, "source_kind", None) == "drafted_form":

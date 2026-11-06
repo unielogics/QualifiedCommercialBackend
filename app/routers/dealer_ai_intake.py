@@ -1315,6 +1315,9 @@ class DealerLogoutResponse(BaseModel):
 
 
 class DealerFileUploadInit(BaseModel):
+    replaces_file_id: UUID | None = None
+    expected_document_version: int | None = Field(default=None, ge=1)
+    idempotency_key: UUID | None = None
     requested_document_id: UUID | None = None
     file_name: str = Field(min_length=1, max_length=255)
     content_type: str = "application/octet-stream"
@@ -5525,7 +5528,7 @@ def _latest_result_for_intake(intake: PublicUnderwritingIntake) -> dict[str, Any
     review = intake.latest_review if intake.latest_review else None
     if review and not review_is_financially_stale(review) and isinstance(review.result, dict):
         return review.result
-    if isinstance(intake.result_snapshot, dict) and not intake.result_snapshot.get("_funding_request_stale"):
+    if isinstance(intake.result_snapshot, dict) and not intake.result_snapshot.get("_funding_request_stale") and not intake.result_snapshot.get("_document_versions_stale"):
         return intake.result_snapshot
     return {}
 
@@ -5741,6 +5744,7 @@ async def _collect_packet_financials(
             "credit": credit,
             "program_fit": program_fit,
         }
+    from app.services.document_version_selection import current_document_file_clause
     from app.services.financial_version_selection import current_financial_file_clause
     rows = (
         await db.execute(
@@ -5751,6 +5755,7 @@ async def _collect_packet_financials(
                 BucketFileAnalysis.bucket_id == BucketFile.bucket_id,
                 BucketFileAnalysis.bucket_file_id.in_(active_ids),
                 current_financial_file_clause(BucketFile.id),
+                current_document_file_clause(BucketFile.id),
                 BucketFile.deleted_at.is_(None),
                 BucketFile.status == "uploaded",
                 BucketFileAnalysis.content_hash == BucketFile.content_hash,
@@ -7410,6 +7415,8 @@ async def _start_upload(
         BucketFile.file_name == payload.file_name,
         BucketFile.size_bytes == payload.size_bytes,
         BucketFile.status == "uploading",
+        BucketFile.supersedes_file_id == payload.replaces_file_id if payload.replaces_file_id else BucketFile.supersedes_file_id.is_(None),
+        BucketFile.upload_idempotency_key == payload.idempotency_key if payload.idempotency_key else BucketFile.upload_idempotency_key.is_(None),
         BucketFile.deleted_at.is_(None),
     ]
     if payload.requested_document_id:
@@ -7420,7 +7427,7 @@ async def _start_upload(
     if existing:
         upload_url, headers = _upload_url(existing.s3_key, payload.content_type)
         return BucketFileUploadInitResponse(file_id=existing.id, upload_url=upload_url, s3_key=existing.s3_key, required_headers=headers)
-    if req is not None and not req.allow_multiple_files:
+    if req is not None and not req.allow_multiple_files and not payload.replaces_file_id:
         existing_for_doc = (
             await db.execute(
                 select(BucketFile).where(
@@ -7453,6 +7460,16 @@ async def _start_upload(
         source_detail=source_detail or None,
         status="uploading",
     )
+    from app.services import document_versions
+    retried = await document_versions.prepare_upload(
+        db, file, replaces_file_id=payload.replaces_file_id,
+        expected_document_version=payload.expected_document_version, idempotency_key=payload.idempotency_key,
+    )
+    if retried is not None:
+        if retried.status == "uploaded":
+            return BucketFileUploadInitResponse(file_id=retried.id, upload_url="", s3_key=retried.s3_key, required_headers={}, already_uploaded=True)
+        upload_url, headers = _upload_url(retried.s3_key, retried.content_type)
+        return BucketFileUploadInitResponse(file_id=retried.id, upload_url=upload_url, s3_key=retried.s3_key, required_headers=headers)
     db.add(file)
     await _log(
         db,
@@ -7846,6 +7863,8 @@ async def _complete_upload(
             actor_role=provenance.actor_role_for(file.source_kind or "client_room"),
         )
         file.status = "uploaded"
+        from app.services.document_versions import mark_received
+        await mark_received(db, file)
         if req is not None:
             req.status = "uploaded"
         if intake.bucket_upload_link is not None:

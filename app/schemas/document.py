@@ -4,7 +4,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.enums import DocStatus
 from app.schemas.common import ORMModel
@@ -31,6 +31,10 @@ class DocumentRead(ORMModel):
     # default `requested_on + due_offset_days` math; the cron uses
     # whatever non-null value lives here. NULL = computed default.
     due_date: date | None = None
+    document_version_number: int = 0
+    document_latest_version_number: int = 0
+    document_version_status: str = "current"
+    document_has_pending_version: bool = False
 
 
 class VaultTotals(BaseModel):
@@ -184,12 +188,16 @@ class DocumentUploadInit(BaseModel):
     fulfill_document_id: UUID | None = None
     checklist_key: str | None = None
     is_other: bool = False
+    replace_document_id: UUID | None = None
+    expected_document_version: int | None = Field(default=None, ge=0)
+    idempotency_key: UUID | None = None
 
 
 class DocumentUploadInitResponse(BaseModel):
     document_id: UUID
     upload_url: str | None  # presigned S3 PUT URL; None when S3 not configured
     s3_key: str
+    version_id: UUID | None = None
 
 
 class DocumentUploadComplete(BaseModel):
@@ -197,6 +205,7 @@ class DocumentUploadComplete(BaseModel):
     doc to RECEIVED + queues a vision scan."""
 
     document_id: UUID
+    version_id: UUID | None = None
 
 
 # ── Required documents (drives upload modal's checklist picker) ──

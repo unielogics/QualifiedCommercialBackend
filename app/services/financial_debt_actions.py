@@ -128,3 +128,65 @@ async def debt_evidence_by_row(db: AsyncSession, profile_id: UUID) -> dict[str, 
         })
     return result
 
+
+async def superseded_payoff_debt_ids(db: AsyncSession, profile_id: UUID) -> set[str]:
+    """Published payoff reviews stop being today's quote after replacement.
+
+    Keep the saved version and ledger untouched. A replacement's proposed
+    amount becomes financial truth only through a reviewed new form version.
+    """
+    if not isinstance(getattr(db, "info", None), dict):
+        return set()
+    links = list((await db.execute(select(FinancialDebtEvidence).where(
+        FinancialDebtEvidence.profile_id == profile_id,
+        FinancialDebtEvidence.role == "payoff", FinancialDebtEvidence.is_current.is_(True),
+    ))).scalars().all())
+    current = await reviewed_payoff_source_ids(db, {link.file_id for link in links})
+    return {str(link.debt_id) for link in links if link.file_id not in current}
+
+
+async def reviewed_payoff_source_ids(db: AsyncSession, file_ids: set[UUID]) -> set[UUID]:
+    """A saved staff payoff review can accept a readable pending source.
+
+    Financial publication is its own review. It does not require a second
+    general-document signoff, but cannot revive old, rejected, failed, or
+    confidently mismatched evidence.
+    """
+    if not file_ids or not isinstance(getattr(db, "info", None), dict):
+        return set(file_ids)
+    from app.models.bucket import BucketFile, BucketFileAnalysis
+    from app.services.document_version_selection import latest_document_file_clause
+
+    files = list((await db.execute(select(BucketFile).where(
+        BucketFile.id.in_(file_ids), latest_document_file_clause(BucketFile.id),
+        BucketFile.status == "uploaded", BucketFile.document_version_status.in_(["pending", "current"]),
+    ))).scalars().all())
+    by_id = {file.id: file for file in files}
+    if not by_id:
+        return set()
+    analyses = list((await db.execute(select(BucketFileAnalysis).where(
+        BucketFileAnalysis.bucket_file_id.in_(by_id),
+        BucketFileAnalysis.status == "completed",
+    ).order_by(BucketFileAnalysis.analysis_version.desc(), BucketFileAnalysis.created_at.desc(), BucketFileAnalysis.id.desc()))).scalars().all())
+    seen = set()
+    for analysis in analyses:
+        source = by_id.get(analysis.bucket_file_id)
+        if source is None or analysis.bucket_file_id in seen or source.content_hash and analysis.content_hash != source.content_hash:
+            continue
+        seen.add(analysis.bucket_file_id)
+        review = (analysis.analysis or {}).get("document_version_review") or {}
+        if review.get("status") == "identity_mismatch":
+            by_id.pop(analysis.bucket_file_id, None)
+    return set(by_id)
+
+
+def payoff_review_projection(rows: list[dict], superseded_ids: set[str]) -> list[dict]:
+    result = deepcopy(rows)
+    for row in result:
+        if str(row.get("id")) in superseded_ids:
+            row["published_payoff_amount"] = row.get("payoff_amount")
+            row["payoff_amount"] = None
+            row["payoff_requires_review"] = True
+            row["payoff_review_reason"] = "A newer or unavailable payoff document must be reviewed and saved before this amount can be used."
+    return result
+

@@ -202,6 +202,7 @@ async def build_context(
                 .where(
                     DealerDocument.dealer_id == dealer.id,
                     DealerDocument.status != "deleted",
+                    DealerDocument.is_current_document_version.is_(True),
                 )
                 .order_by(DealerDocument.created_at.asc())
             )

@@ -5,7 +5,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Numeric, String, Text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -83,5 +83,34 @@ class Document(TimestampMixin, Base):
     # Flipped True on upload-complete; the scheduler's
     # job_document_scan_drain picks up scan_dirty=True rows.
     scan_dirty: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
+    file_version_number: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    latest_file_version_number: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    latest_file_version_status: Mapped[str] = mapped_column(String(24), nullable=False, default="current", server_default="current")
+    current_file_version_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+
+    @property
+    def document_version_number(self) -> int:
+        return self.file_version_number or (1 if self.s3_key else 0)
+
+    @property
+    def document_latest_version_number(self) -> int:
+        return self.latest_file_version_number or self.document_version_number
+
+    @property
+    def document_has_pending_version(self) -> bool:
+        return self.latest_file_version_status in {"uploading", "pending"} or self.ai_scan_status in {"queued", "scanning"}
+
+    @property
+    def document_version_status(self) -> str:
+        if self.latest_file_version_status in {"rejected", "failed"}:
+            return self.latest_file_version_status
+        if self.document_has_pending_version:
+            return "pending"
+        if self.status == DocStatus.VERIFIED and self.latest_file_version_status == "current":
+            return "current"
+        if self.ai_scan_status in {"queued", "scanning", "unscanned"}:
+            return "pending"
+        return "failed" if self.ai_scan_status == "failed" else "current"
 
     loan: Mapped[Loan] = relationship(back_populates="documents")

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import date
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import financial_version_selection
@@ -604,6 +604,8 @@ async def load_metric_inputs(
     # row with count_in_dscr contributes. For vendor-linked rows the OBSERVED
     # monthly debits win over the stated figure (primary source = what the
     # statements actually show); stated monthly_payment is the fallback.
+    from .document_version_projection import current_dealer_document_source
+
     dscr_debt_rows = [] if accepted_rows is not None else (
         (
             await db.execute(
@@ -611,6 +613,7 @@ async def load_metric_inputs(
                     DealerDebt.dealer_id == dealer_id,
                     DealerDebt.status == "active",
                     DealerDebt.count_in_dscr.is_(True),
+                    or_(DealerDebt.origin != "ai_draft", current_dealer_document_source(DealerDebt.document_id)),
                 )
             )
         )
@@ -689,6 +692,7 @@ async def load_metric_inputs(
                     .where(
                         DealerCashEvent.dealer_id == dealer_id,
                         DealerCashEvent.period >= earliest,
+                        current_dealer_document_source(DealerCashEvent.document_id),
                     )
                     .order_by(DealerCashEvent.occurred_on.desc())
                     .limit(8000)
@@ -855,6 +859,7 @@ async def load_metric_inputs(
             .where(
                 DealerTaxFiling.dealer_id == dealer_id,
                 DealerTaxFiling.revenue_reported.is_not(None),
+                current_dealer_document_source(DealerTaxFiling.document_id),
             )
             .order_by(DealerTaxFiling.year.desc())
             .limit(1)

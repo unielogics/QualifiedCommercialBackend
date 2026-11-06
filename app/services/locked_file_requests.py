@@ -202,6 +202,12 @@ def public_analysis_state(
     analysis_classification = (
         raw_classification if raw_classification in _PUBLIC_ANALYSIS_CLASSIFICATIONS else None
     )
+    version_review = (getattr(analysis, "analysis", None) or {}).get("document_version_review") or {}
+    if version_review.get("status") == "identity_mismatch":
+        return PublicFileAnalysisState(
+            analysis_status=analysis_status, analysis_reason_code="document_identity_mismatch",
+            analysis_classification=analysis_classification, analysis_review_state="checking",
+        )
 
     if password_protected:
         # A ZIP parent can prove that a member is encrypted even when there is

@@ -27,6 +27,7 @@ import logging
 import re
 from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
@@ -134,9 +135,20 @@ async def push_document(
     if not doc.s3_key:
         return None
     bucket = await ensure_bucket(db, dealer)
+    from app.services import document_versions
+
+    def update_version_metadata(linked: BucketFile) -> None:
+        linked.document_version_status = getattr(doc, "document_version_status", None) or "current"
+        linked.is_current_document_version = bool(getattr(doc, "is_current_document_version", True))
+        linked.status = doc.status if doc.status in {"pending_review", "rejected", "failed"} else "uploaded"
+        if getattr(doc, "content_hash", None):
+            linked.content_hash = doc.content_hash
     if doc.bucket_file_id is not None:
         linked = await db.get(BucketFile, doc.bucket_file_id)
         if linked is not None and linked.deleted_at is None and linked.bucket_id == bucket.id:
+            if getattr(doc, "supersedes_document_id", None):
+                await document_versions.mark_received(db, linked)
+                update_version_metadata(linked)
             return linked
         doc.bucket_file_id = None
     # The mirror used to stamp every document "Capital OS", which erased the
@@ -144,6 +156,7 @@ async def push_document(
     # nowhere to keep them either. Carry whatever the source row now knows, and
     # fall back to naming the system rather than pretending it was a person.
     bucket_file = BucketFile(
+        id=uuid4(),
         bucket_id=bucket.id,
         file_name=doc.filename[:255],
         s3_key=doc.s3_key,
@@ -154,8 +167,24 @@ async def push_document(
         source_kind=doc.source_kind or "capital_os",
         source_detail=(doc.source_detail or _UPLOADED_BY)[:200],
     )
+    previous_file = None
+    if getattr(doc, "supersedes_document_id", None):
+        previous_doc = await db.get(DealerDocument, doc.supersedes_document_id)
+        if previous_doc is not None and previous_doc.bucket_file_id is not None:
+            previous_file = await db.get(BucketFile, previous_doc.bucket_file_id)
+            if previous_file is not None and previous_file.bucket_id != bucket.id:
+                raise HTTPException(409, "The document's linked evidence source changed; reload before uploading")
+    await document_versions.prepare_upload(db, bucket_file,
+        replaces_file_id=previous_file.id if previous_file else None,
+        expected_document_version=document_versions.version_number(previous_file) if previous_file else None,
+        idempotency_key=None)
     db.add(bucket_file)
     await db.flush()
+    if getattr(doc, "supersedes_document_id", None):
+        await document_versions.mark_received(db, bucket_file)
+        if getattr(doc, "document_version_status", None) == "duplicate":
+            await document_versions.complete_analysis(db, bucket_file, usable=True, content_hash=doc.content_hash)
+    update_version_metadata(bucket_file)
     doc.bucket_file_id = bucket_file.id
     await db.flush()
     return bucket_file

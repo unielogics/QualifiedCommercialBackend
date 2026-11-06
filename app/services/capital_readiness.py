@@ -415,6 +415,7 @@ async def _current_evidence_sources(
     from contributing to the current score without rewriting the old row.
     """
 
+    from app.services.document_version_selection import current_document_file_clause
     from app.services.financial_version_selection import current_financial_file_clause
     files: dict[UUID, BucketFile] = {}
     if profile.primary_bucket_id is not None:
@@ -426,6 +427,7 @@ async def _current_evidence_sources(
                         BucketFile.deleted_at.is_(None),
                         BucketFile.status == "uploaded",
                         current_financial_file_clause(BucketFile.id),
+                        current_document_file_clause(BucketFile.id),
                     )
                 )
             )

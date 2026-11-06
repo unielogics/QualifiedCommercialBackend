@@ -71,6 +71,7 @@ __all__ = [
     "retry_dealer_ai_client_thread_sms",
     "resume_dealer_ai_client_thread",
     "dealer_ai_lead_upload_init",
+    "dealer_document_versions",
     "dealer_ai_lead_upload_complete",
     "admin_submit_lead_pfs",
     "admin_submit_lead_debt_schedule",
@@ -1974,6 +1975,18 @@ async def dealer_ai_lead_upload_init(
     intake = await core._load_admin_dealer_lead(db, intake_id)
     return await core._start_upload(db, intake, payload, request, actor_name=user.name or "Super admin", actor_email=user.email,
                                source_kind="internal_upload", actor=user)
+
+
+@core.admin_router.get("/{intake_id}/files/{file_id}/versions")
+async def dealer_document_versions(
+    intake_id: UUID, file_id: UUID, user: core.CurrentUser,
+    db: AsyncSession = Depends(core.get_db),
+):
+    from app.services.document_versions import history
+
+    core._require_super_admin(user)
+    intake = await core._load_admin_dealer_lead(db, intake_id)
+    return await history(db, intake.bucket_id, file_id, can_upload=True, can_preview=True)
 
 @core.admin_router.post("/{intake_id}/files/complete", response_model=core.BucketFileRead)
 async def dealer_ai_lead_upload_complete(

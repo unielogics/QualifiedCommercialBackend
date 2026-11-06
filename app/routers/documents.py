@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, date, datetime
 from typing import Literal
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
@@ -18,6 +19,7 @@ from app.models.activity import Activity
 from app.models.client import Client
 from app.models.document import Document
 from app.models.document_analysis_result import DocumentAnalysisResult
+from app.models.document_file_version import DocumentFileVersion
 from app.models.loan import Loan
 from app.models.payments import ActualFundingConfirmation, BankDirectFeeReceipt
 from app.schemas.document import (
@@ -34,6 +36,7 @@ from app.schemas.document import (
 )
 from app.scoping import scope_loan_query
 from app.services import calendar_emitter, file_events, upload_validation
+from app.services import document_file_versions as file_versions
 from app.services.activity_log import mark_loan_dirty
 from app.services.ai.vector_store import log_event as vector_log
 
@@ -347,7 +350,7 @@ async def documents_analysis(
         ares = (
             await db.execute(
                 select(DocumentAnalysisResult)
-                .where(DocumentAnalysisResult.document_id.in_(doc_ids))
+                .where(DocumentAnalysisResult.document_id.in_(doc_ids), DocumentAnalysisResult.is_current.is_(True))
                 .order_by(DocumentAnalysisResult.analyzed_at.asc())
             )
         ).scalars().all()
@@ -494,17 +497,30 @@ async def upload_init(
     if loan is None or not await _can_access_loan(user, loan.id, db):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
 
-    s3_key = f"loans/{loan.deal_id}/{uuid4()}-{payload.name}"
-
     doc: Document
-    if payload.fulfill_document_id is not None:
-        doc = await db.get(Document, payload.fulfill_document_id)
+    if payload.fulfill_document_id is not None and payload.replace_document_id is not None:
+        raise HTTPException(422, "Choose a requested document or an existing version to replace")
+    from app.services import document_upload_receipts
+    receipt = await document_upload_receipts.find(db, payload, user)
+    if receipt is not None:
+        return document_upload_receipts.response(*receipt, settings)
+    target_id = payload.replace_document_id or payload.fulfill_document_id
+    initial = target_id is None
+    if target_id is not None:
+        doc = (await db.execute(select(Document).where(Document.id == target_id)
+            .with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
         if doc is None or doc.loan_id != loan.id:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
                 "fulfill_document_id doesn't belong to this loan",
             )
-        if doc.status not in (DocStatus.REQUESTED, DocStatus.PENDING):
+        if doc.status == DocStatus.SKIPPED:
+            raise HTTPException(409, "This document was set aside. Restore the requirement before uploading a replacement.")
+        if payload.replace_document_id and payload.expected_document_version is None:
+            raise HTTPException(422, "Reload the version history before uploading a replacement")
+        if payload.replace_document_id and await _is_recorded_payment_evidence(db, doc.id):
+            raise HTTPException(409, "Recorded payment evidence is immutable. Upload a separate supporting document; its history remains available here.")
+        if not payload.replace_document_id and doc.status not in (DocStatus.REQUESTED, DocStatus.PENDING):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
                 f"Document is already in status={doc.status} — cannot replace via upload-init.",
@@ -512,8 +528,7 @@ async def upload_init(
         # Repoint to the new file. Status stays REQUESTED until the
         # client posts /upload-complete (we treat partial uploads as
         # not-yet-fulfilled).
-        doc.s3_key = s3_key
-        if payload.name and payload.name != doc.name:
+        if not doc.s3_key and payload.name and payload.name != doc.name:
             # Borrower's chosen filename — keep the checklist label
             # but stash the user-visible filename under the row.
             doc.name = payload.name
@@ -526,7 +541,6 @@ async def upload_init(
             category=payload.category,
             checklist_key=payload.checklist_key,
             is_other=False,
-            s3_key=s3_key,
             status=DocStatus.PENDING,
         )
         db.add(doc)
@@ -537,7 +551,6 @@ async def upload_init(
             category=payload.category,
             checklist_key=None,
             is_other=True,
-            s3_key=s3_key,
             status=DocStatus.PENDING,
         )
         db.add(doc)
@@ -549,36 +562,15 @@ async def upload_init(
             loan_id=loan.id,
             name=payload.name,
             category=payload.category,
-            s3_key=s3_key,
             status=DocStatus.PENDING,
         )
         db.add(doc)
 
     await db.flush()
     await db.refresh(doc)
-
-    upload_url: str | None = None
-    if settings.aws_access_key_id and settings.aws_secret_access_key:
-        import boto3
-
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=settings.aws_access_key_id,
-            aws_secret_access_key=settings.aws_secret_access_key,
-            region_name=settings.aws_region,
-        )
-        upload_url = s3.generate_presigned_url(
-            "put_object",
-            Params={
-                "Bucket": settings.s3_bucket,
-                "Key": s3_key,
-                "ContentType": payload.content_type,
-                "ServerSideEncryption": "AES256",
-            },
-            ExpiresIn=900,
-        )
-
-    return DocumentUploadInitResponse(document_id=doc.id, upload_url=upload_url, s3_key=s3_key)
+    version = await file_versions.reserve(db, doc, payload, user, initial=initial)
+    document_upload_receipts.remember(version, payload)
+    return document_upload_receipts.response(doc, version, settings)
 
 
 async def _document_upload_notice_reached(db: AsyncSession, loan: Loan) -> set[UUID]:
@@ -619,6 +611,30 @@ async def upload_complete(
     loan = await db.get(Loan, doc.loan_id)
     if loan is None or not await _can_access_loan(user, loan.id, db):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
+
+    if payload.version_id is not None or (getattr(doc, "latest_file_version_number", 0) or 0) > 0:
+        doc = (await db.execute(select(Document).where(Document.id == doc.id)
+            .with_for_update().execution_options(populate_existing=True))).scalar_one()
+        rows = await file_versions.versions(db, doc)
+        version = next((row for row in rows if row.id == payload.version_id), None) if payload.version_id else next(
+            (row for row in rows if row.status == "uploading" and (row.uploaded_by_user_id == user.id
+             or row.source == "legacy_baseline" and row.uploaded_by_user_id is None)), None)
+        if version is None:
+            if payload.version_id is None and doc.s3_key and doc.status in {DocStatus.RECEIVED, DocStatus.VERIFIED}:
+                return DocumentRead.model_validate(doc)
+            raise HTTPException(404, "Document upload not found")
+        if version.status == "uploading" and doc.current_file_version_id and await _is_recorded_payment_evidence(db, doc.id):
+            raise HTTPException(409, "This document became recorded payment evidence. Preserve it and upload a separate supporting document.")
+        first_upload = not (doc.file_version_number or 0) or (doc.received_on is None and doc.status in {DocStatus.REQUESTED, DocStatus.PENDING})
+        changed = await file_versions.complete(db, doc, version, user)
+        if changed:
+            db.add(Activity(loan_id=loan.id, actor_id=user.id, actor_label=user.role,
+                kind="document.version_received", summary=f"Received {doc.name} v{version.version_number}",
+                payload={"document_id": str(doc.id), "version_id": str(version.id), "version_number": version.version_number}))
+            await mark_loan_dirty(db, loan.id)
+            await _version_received(db, loan, doc, version, user, first_upload=first_upload)
+        await db.flush()
+        return DocumentRead.model_validate(doc)
 
     already_received = doc.status in (DocStatus.RECEIVED, DocStatus.VERIFIED)
     if not already_received and (
@@ -765,6 +781,60 @@ async def upload_complete(
     await db.flush()
     await db.refresh(doc)
     return DocumentRead.model_validate(doc)
+
+
+async def _is_recorded_payment_evidence(db: AsyncSession, document_id: UUID) -> bool:
+    return bool((await db.execute(select(ActualFundingConfirmation.id).where(
+        ActualFundingConfirmation.evidence_document_id == document_id,
+    ).limit(1))).scalar_one_or_none() or (await db.execute(select(BankDirectFeeReceipt.id).where(
+        BankDirectFeeReceipt.evidence_document_id == document_id,
+    ).limit(1))).scalar_one_or_none())
+
+
+async def _version_received(db, loan, doc, version, user, *, first_upload):
+    if first_upload and doc.checklist_key:
+        from app.services.checklist_scheduler import fire_anchor_dependents
+        try:
+            await fire_anchor_dependents(db, loan=loan, anchor_event=f"doc_received:{doc.checklist_key}")
+        except Exception:
+            log.exception("Document version checklist follow-up failed document=%s", doc.id)
+    if first_upload:
+        from app.services.notifications import notify_document_uploaded
+        try:
+            await notify_document_uploaded(db, loan=loan, document_name=doc.name, actor=user)
+        except Exception:
+            log.exception("Document version upload notice failed document=%s", doc.id)
+    await file_events.emit(db, loan_id=loan.id, kind="document.received",
+        visibility=file_events.VISIBILITY_CLIENT, title=f"{doc.name} v{version.version_number} was received",
+        actor=user, target_type="document", target_id=doc.id,
+        already_notified=await _document_upload_notice_reached(db, loan) if first_upload else set())
+
+
+@router.get("/{document_id}/versions")
+async def document_version_history(document_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> dict:
+    doc = await db.get(Document, document_id)
+    if user.role not in _VAULT_ROLES or doc is None or not await _can_access_loan(user, doc.loan_id, db):
+        raise HTTPException(404, "Document not found")
+    can_upload = user.role != Role.REGIONAL_MANAGER and doc.status != DocStatus.SKIPPED and not await _is_recorded_payment_evidence(db, doc.id)
+    return file_versions.history(doc, await file_versions.versions(db, doc), can_upload=can_upload)
+
+
+@router.get("/{document_id}/versions/{version_id}/download")
+async def document_version_download(document_id: UUID, version_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> dict:
+    doc = await db.get(Document, document_id)
+    if user.role not in _VAULT_ROLES or doc is None or not await _can_access_loan(user, doc.loan_id, db):
+        raise HTTPException(404, "Document not found")
+    version = await db.get(DocumentFileVersion, version_id)
+    if version is None or version.document_id != doc.id or version.status not in {"uploaded", "duplicate"}:
+        raise HTTPException(404, "Document version not found")
+    from urllib.parse import quote
+    settings = get_settings()
+    parameters = {"Bucket": settings.s3_bucket, "Key": version.s3_key,
+                  "ResponseContentDisposition": "attachment; filename*=UTF-8''" + quote(version.file_name, safe="")}
+    if version.s3_version_id:
+        parameters["VersionId"] = version.s3_version_id
+    url = await asyncio.to_thread(upload_validation._s3_client().generate_presigned_url, "get_object", Params=parameters, ExpiresIn=900)
+    return {"url": url, "expires_in": 900}
 
 
 # ── Conversational doc-collector: re-route an orphan upload ──────────
@@ -924,6 +994,17 @@ async def route_document(
     ).scalars().first()
 
     if target is not None:
+        if (getattr(doc, "latest_file_version_number", 0) or 0) > 0:
+            # Keep versioned binaries and payment citations on their stable
+            # identity; the empty request is merely satisfied by this upload.
+            target.status = DocStatus.SKIPPED
+            doc.checklist_key = target_key
+            doc.is_other = False
+            if doc.status == DocStatus.PENDING:
+                doc.status = DocStatus.RECEIVED
+            await mark_loan_dirty(db, loan.id)
+            await db.flush()
+            return DocumentRead.model_validate(doc)
         # Merge: move the orphan's blob + scan onto the REQUESTED row,
         # then delete the orphan. Anchor scheduler fires from the
         # surviving (target) row to keep dedup correct.
@@ -1051,12 +1132,20 @@ async def mark_document_verified(
         # Idempotent — no-op return so the UI can fire this freely.
         return DocumentRead.model_validate(doc)
 
+    if getattr(doc, "latest_file_version_status", None) == "rejected":
+        raise HTTPException(422, "Upload a readable replacement before verifying this version")
     doc.status = DocStatus.VERIFIED
     if doc.received_on is None:
         doc.received_on = date.today()
     if doc.verified_at is None:
         doc.verified_at = datetime.now(UTC)
     doc.verified_by = user.id
+    if getattr(doc, "current_file_version_id", None):
+        version = await db.get(DocumentFileVersion, doc.current_file_version_id)
+        if version is not None and version.status == "uploaded":
+            version.analysis_status = "reviewed"
+            version.analysis_snapshot = {**(version.analysis_snapshot or {}), **file_versions.scan_snapshot(doc), "review_source": "staff"}
+            doc.latest_file_version_status = "current"
     db.add(
         Activity(
             loan_id=loan.id,

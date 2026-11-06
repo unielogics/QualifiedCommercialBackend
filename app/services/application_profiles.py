@@ -1265,6 +1265,7 @@ async def plaid_statement_months(db: AsyncSession, profile: ApplicationProfile) 
     connections count — a sandbox pull never completes a production file."""
     if not profile.primary_bucket_id:
         return set()
+    from app.services.document_version_selection import current_document_file_clause
     months: set[str] = set()
     rows = (
         await db.execute(
@@ -1275,6 +1276,7 @@ async def plaid_statement_months(db: AsyncSession, profile: ApplicationProfile) 
                 BucketFile.statement_period.is_not(None),
                 BucketFile.status == "uploaded",
                 BucketFile.deleted_at.is_(None),
+                current_document_file_clause(BucketFile.id),
                 ApplicationPlaidItem.environment == plaid_client.environment(),
             )
         )
@@ -1291,6 +1293,7 @@ async def plaid_statement_months(db: AsyncSession, profile: ApplicationProfile) 
                 BucketFile.status == "uploaded",
                 BucketFile.deleted_at.is_(None),
                 BucketFileAnalysis.status == "completed",
+                current_document_file_clause(BucketFile.id),
             )
         )
     ).scalars().all()
@@ -1377,6 +1380,8 @@ async def verification_state(
 async def _profile_evidence_file_ids(
     db: AsyncSession, profile: ApplicationProfile
 ) -> set[UUID]:
+    from app.services.document_version_selection import latest_document_file_clause
+
     file_ids: set[UUID] = set()
     if profile.primary_bucket_id:
         primary_files = list(
@@ -1386,6 +1391,7 @@ async def _profile_evidence_file_ids(
                         BucketFile.bucket_id == profile.primary_bucket_id,
                         BucketFile.status == "uploaded",
                         BucketFile.deleted_at.is_(None),
+                        latest_document_file_clause(BucketFile.id),
                     )
                 )
             ).scalars().all()
@@ -1406,6 +1412,7 @@ async def _profile_evidence_file_ids(
                         BucketIntakeLink.intake_id == profile.intake_id,
                         BucketIntakeLink.unlinked_at.is_(None),
                         BucketIntakeLinkFile.removed_at.is_(None),
+                        latest_document_file_clause(BucketFile.id),
                         BucketFile.status == "uploaded",
                         BucketFile.deleted_at.is_(None),
                     )
@@ -1692,6 +1699,7 @@ async def draft_analysis_status(
     if profile.primary_bucket_id is None:
         return ApplicationDraftAnalysisStatus(profile_id=profile.id, can_finalize=True)
     from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
+    from app.services.document_version_selection import latest_document_file_clause
 
     file_rows = list(
         (
@@ -1700,6 +1708,7 @@ async def draft_analysis_status(
                     BucketFile.bucket_id == profile.primary_bucket_id,
                     BucketFile.status == "uploaded",
                     BucketFile.deleted_at.is_(None),
+                    latest_document_file_clause(BucketFile.id),
                 )
             )
         ).scalars().all()
@@ -2011,6 +2020,7 @@ async def evidence_state(
     sources: list[EvidenceSourceRead] = []
     files: list[EvidenceFileRead] = []
     raw_files: dict[UUID, BucketFile] = {}
+    from app.services.document_version_selection import filter_document_files
     primary_id = profile.primary_bucket_id
     if primary_id:
         bucket = await db.get(Bucket, primary_id)
@@ -2031,6 +2041,7 @@ async def evidence_state(
             if not provenance.is_internal_package_output(file)
         ]
         source_id = f"bucket:{primary_id}"
+        primary_active = await filter_document_files(db, primary_files, usable=False)
         raw_files.update((file.id, file) for file in primary_files)
         sources.append(
             EvidenceSourceRead(
@@ -2039,7 +2050,7 @@ async def evidence_state(
                 relationship="primary",
                 label=bucket.name if bucket else "Primary evidence bucket",
                 bucket_id=primary_id,
-                active_file_count=len(primary_files),
+                active_file_count=len(primary_active),
                 selected_file_count=len(primary_files),
                 accessible_file_count=len(primary_files),
             )
@@ -2100,9 +2111,10 @@ async def evidence_state(
                     )
                 ).scalars().all()
             )
+            latest_active_rows = await filter_document_files(db, active_rows, usable=False)
             active_count = sum(
                 not provenance.is_internal_package_output(file)
-                for file in active_rows
+                for file in latest_active_rows
             )
             source_id = f"link:{link.id}"
             raw_files.update((file.id, file) for file in rows)

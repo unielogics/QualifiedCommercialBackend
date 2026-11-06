@@ -1229,6 +1229,15 @@ async def extract_document(
 
         doc.detected_kind = detected
         doc.doc_meta = _build_doc_meta(detected, tax_years, pl_months, debts)
+        # Stable printed identity is retained separately from normalized money
+        # fields. Replacement checks never guess a loan/account from a name.
+        doc.doc_meta = {**doc.doc_meta, "_document_identity_source": {
+            key: extraction[key] for key in (
+                "business_identity", "business_name", "borrower_name", "borrower_entity",
+                "account", "account_number", "account_last4", "statement_period", "period_start", "period_end",
+                "months", "tax_year", "tax_years", "loan_reference", "loan_number", "loan_account_number", "debts",
+            ) if key in extraction
+        }}
 
         managed_financial_source = False
         managed_kind = {"profit_and_loss": "p_and_l", "balance_sheet": "balance_sheet", "personal_financial_statement": "pfs"}.get(detected)

@@ -1071,6 +1071,9 @@ def debt_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "term_months": _int(row.get("term_months")),
                 "maturity_on": _iso_date(row.get("maturity_on")),
                 "payoff_amount": _num(row.get("payoff_amount")),
+                "published_payoff_amount": _num(row.get("published_payoff_amount")),
+                "payoff_requires_review": bool(row.get("payoff_requires_review")),
+                "payoff_review_reason": row.get("payoff_review_reason"),
                 "origin": row.get("origin"),
                 "count_in_dscr": bool(row.get("count_in_dscr", True)),
                 "vendor_key": (str(row.get("vendor_key") or "").strip() or None),
@@ -2750,9 +2753,18 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
     from app.services.financial_debt_review import working_snapshot
 
     working_schedule = await working_snapshot(db, profile)
+    from app.services.financial_debt_actions import (
+        payoff_review_projection,
+        superseded_payoff_debt_ids,
+    )
+
+    superseded_payoffs = await superseded_payoff_debt_ids(db, profile.id)
+    projected_debts = payoff_review_projection(_debt_dicts(debts), superseded_payoffs)
+    accepted_body = ({**accepted_version.body, "debts": payoff_review_projection(accepted_version.body.get("debts") or [], superseded_payoffs)}
+                     if accepted_version is not None else None)
     cockpit = build_cockpit(
         analyses,
-        _debt_dicts(debts),
+        projected_debts,
         requested_amount=float(requested_amount) if requested_amount is not None else None,
         proposed_terms=proposed_terms,
         counted_accounts=list(getattr(profile, "counted_bank_accounts", None) or []),
@@ -2766,7 +2778,7 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
             "consulting_fee": getattr(profile, "forecast_consulting_fee", None),
         },
         schedule_set_aside=set_aside,
-        accepted_schedule={"body": accepted_version.body, "key_facts": accepted_version.key_facts,
+        accepted_schedule={"body": accepted_body, "key_facts": accepted_version.key_facts,
                            "version_id": str(accepted_version.id), "saved_at": accepted_version.created_at.isoformat(),
                            "actor_name": accepted_version.actor_name} if accepted_version is not None else None,
         working_schedule=working_schedule,
@@ -2774,6 +2786,8 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
         business_entity=getattr(intake, "business_name", None) or getattr(_dealer, "legal_name", None) or getattr(_dealer, "name", None),
     )
     cockpit["profile_id"] = str(profile.id)
+    if superseded_payoffs:
+        cockpit["notes"].append("A linked payoff letter has a newer or unavailable document version. Review its latest amount and date, then save the schedule before using that payoff in a refinance plan.")
     return cockpit
 
 

@@ -16,10 +16,10 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Numeric, String, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, String, func
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
-
 
 from app.db import Base
 
@@ -36,6 +36,8 @@ class DocumentAnalysisResult(Base):
         nullable=False,
         index=True,
     )
+    document_version_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True, index=True)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
 
     detected_document_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     confidence: Mapped[Decimal | None] = mapped_column(Numeric(4, 3), nullable=True)

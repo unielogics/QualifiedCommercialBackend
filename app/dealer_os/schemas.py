@@ -1994,6 +1994,11 @@ class LenderPackageRead(BaseModel):
 class DocumentRead(ORM):
     id: UUID
     dealer_id: UUID
+    document_family_id: UUID | None = None
+    document_version_number: int = 1
+    is_current_document_version: bool = True
+    document_version_status: str = "current"
+    supersedes_document_id: UUID | None = None
     filename: str
     content_type: str
     size_bytes: int

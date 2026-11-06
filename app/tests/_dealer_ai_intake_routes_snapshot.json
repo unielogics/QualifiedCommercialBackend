@@ -62,6 +62,12 @@
   [
     "admin_router",
     "GET",
+    "/admin/ai-underwriter-leads/{intake_id}/files/{file_id}/versions",
+    "dealer_document_versions"
+  ],
+  [
+    "admin_router",
+    "GET",
     "/admin/ai-underwriter-leads/{intake_id}/intelligence.pdf",
     "download_admin_dealer_intelligence_pdf"
   ],

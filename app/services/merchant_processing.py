@@ -396,6 +396,10 @@ async def ensure_extracted(
     the offer prompt, inline. With no read yet, the minute-drain does it.
     """
     from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION, analyze_bucket_file
+    from app.services.document_version_selection import document_file_ids
+
+    if file.id not in await document_file_ids(db, [file.id], usable=False):
+        return
 
     existing = (
         await db.execute(
@@ -412,7 +416,8 @@ async def ensure_extracted(
     if existing is None:
         return
     if existing.status == "completed" and existing.classification == OFFER_CLASSIFICATION:
-        await absorb_analysis(db, file, existing)
+        if file.id in await document_file_ids(db, [file.id], usable=True):
+            await absorb_analysis(db, file, existing)
         return
     await analyze_bucket_file(db, file, review_type=review_type, force=True)
 
