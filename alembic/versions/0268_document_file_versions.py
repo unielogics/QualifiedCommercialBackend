@@ -38,12 +38,12 @@ def upgrade() -> None:
     # known record timestamp; source labels it as a truthful legacy baseline.
     op.execute("""INSERT INTO document_file_versions
         (id,document_id,version_number,file_name,s3_key,content_type,status,analysis_status,analysis_snapshot,source,created_at)
-        SELECT md5(id::text || ':file-version:1')::uuid,id,1,name,s3_key,'application/octet-stream',
+        SELECT md5(id::text || chr(58) || 'file-version' || chr(58) || '1')::uuid,id,1,name,s3_key,'application/octet-stream',
           CASE WHEN status IN ('received','verified','flagged') THEN 'uploaded' ELSE 'uploading' END,
           CASE WHEN status='verified' AND verified_by IS DISTINCT FROM 'ai' THEN 'reviewed' ELSE ai_scan_status END,
           jsonb_build_object('ai_notes',ai_notes,'status',status,'ai_scan_status',ai_scan_status),
           'legacy_baseline',coalesce(updated_at,created_at) FROM documents WHERE s3_key IS NOT NULL""")
-    op.execute("""UPDATE documents SET current_file_version_id=md5(id::text || ':file-version:1')::uuid,
+    op.execute("""UPDATE documents SET current_file_version_id=md5(id::text || chr(58) || 'file-version' || chr(58) || '1')::uuid,
         file_version_number=1,latest_file_version_number=1 WHERE s3_key IS NOT NULL""")
     op.execute("UPDATE document_analysis_results SET is_current=false")
     op.execute("""UPDATE document_analysis_results a SET document_version_id=d.current_file_version_id,is_current=true
