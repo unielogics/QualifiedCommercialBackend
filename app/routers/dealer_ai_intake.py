@@ -9762,18 +9762,9 @@ async def _client_thread_response(
     if paused_until is None and link and engagement.is_paused(link):
         paused_until = link.ai_paused_until
     phone = consent_delivery.normalize_phone(intake.phone)
-    rows: list[SmsMessage] = []
-    if phone:
-        rows = list(
-            (
-                await db.execute(
-                    select(SmsMessage)
-                    .where(SmsMessage.phone_e164 == phone)
-                    .order_by(SmsMessage.created_at.asc())
-                    .limit(200)
-                )
-            ).scalars().all()
-        )
+    from app.services.communication_scope import intake_sms_rows
+
+    rows = await intake_sms_rows(db, intake)
     opted_out = bool(phone and await is_opted_out(db, phone))
     consent = await sms_consent_svc.consent_for(db, phone_e164=phone, kind="transactional") if phone else None
     ready = sms_available()

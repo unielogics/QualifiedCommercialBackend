@@ -13,7 +13,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import false as sql_false
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import SessionLocal, get_db
@@ -36,8 +36,11 @@ from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.sms_message import SmsMessage
 from app.models.user import User
 from app.schemas.communication import (
+    CommunicationMessagesSeen,
     ComposeChannelResult,
     ComposeRecipient,
+    FileCommunicationSeen,
+    FileCommunicationUnread,
     UnifiedCommunicationCompose,
     UnifiedCommunicationMessage,
     UnifiedCommunicationSeen,
@@ -191,6 +194,25 @@ async def communication_sync_state(
     }
 
 
+@router.get("/intakes/{intake_id}/unread", response_model=FileCommunicationUnread)
+async def intake_communication_unread(intake_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> FileCommunicationUnread:
+    from app.services.communication_read_state import file_unread, load_file_scope
+
+    intake, profile = await load_file_scope(db, user, intake_id)
+    return await file_unread(db, user=user, intake=intake, profile=profile)
+
+
+@router.post("/intakes/{intake_id}/seen", response_model=FileCommunicationUnread)
+async def intake_communication_seen(intake_id: UUID, payload: FileCommunicationSeen, user: CurrentUser,
+    db: AsyncSession = Depends(get_db)) -> FileCommunicationUnread:
+    from app.services.communication_read_state import file_seen, load_file_scope
+
+    intake, profile = await load_file_scope(db, user, intake_id)
+    result = await file_seen(db, user=user, intake=intake, profile=profile, payload=payload)
+    await db.commit()
+    return result
+
+
 def _at(value: datetime | None) -> datetime:
     return value or datetime.min.replace(tzinfo=UTC)
 
@@ -215,29 +237,32 @@ def _phone_key(value: str | None) -> str | None:
 
 
 async def _client_for_phone_scoped(db: AsyncSession, user: User, phone: str):
-    """A client on this number, within what the viewer may see."""
-    key = _phone_key(phone)
-    if not key:
+    """A unique global identity, then the viewer's book; never newest wins."""
+    from app.services.communication_scope import canonical_phone, phone_identity_sql
+
+    number = canonical_phone(phone)
+    if not number:
         return None
-    stmt = scope_client_query(user, select(Client)).where(
-        func.regexp_replace(func.coalesce(Client.phone, ""), r"\D", "", "g").like(f"%{key}")
-    ).order_by(Client.created_at.desc()).limit(1)
-    return (await db.execute(stmt)).scalar_one_or_none()
+    matches = (await db.execute(select(Client).where(phone_identity_sql(Client.phone) == number))).scalars().all()
+    if len({row.id for row in matches}) != 1:
+        return None
+    client = matches[0]
+    visible = (await db.execute(scope_client_query(user, select(Client.id)).where(Client.id == client.id))).scalar_one_or_none()
+    return client if visible is not None else None
 
 
 async def _rep_contact_for_phone(db: AsyncSession, user: User, phone: str):
     """A rep contact on this number, scoped to the rep who owns it."""
-    key = _phone_key(phone)
-    if not key:
+    from app.services.communication_scope import canonical_phone, phone_identity_sql
+
+    number = canonical_phone(phone)
+    if not number or user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.FIELD_REP):
         return None
-    stmt = select(DealerRepContact).where(
-        func.regexp_replace(func.coalesce(DealerRepContact.phone_e164, ""), r"\D", "", "g").like(f"%{key}")
-    )
-    if user.role == Role.FIELD_REP:
-        stmt = stmt.where(DealerRepContact.owner_user_id == user.id)
-    elif user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+    matches = (await db.execute(select(DealerRepContact).where(phone_identity_sql(DealerRepContact.phone_e164) == number))).scalars().all()
+    if len({row.id for row in matches}) != 1:
         return None
-    return (await db.execute(stmt.limit(1))).scalar_one_or_none()
+    contact = matches[0]
+    return contact if user.role in (Role.SUPER_ADMIN, Role.LOAN_EXEC) or contact.owner_user_id == user.id else None
 
 
 def _same_number(phone: str):
@@ -247,9 +272,10 @@ def _same_number(phone: str):
     spelling the newest message used, and an exact string match would drop
     every message stored in another format.
     """
-    key = _phone_key(phone) or ""
-    digits = func.regexp_replace(SmsMessage.phone_e164, r"\D", "", "g")
-    return digits.like(f"%{key}") if key else SmsMessage.phone_e164 == phone
+    from app.services.communication_scope import canonical_phone, phone_identity_sql
+
+    number = canonical_phone(phone)
+    return phone_identity_sql(SmsMessage.phone_e164) == number if number else sql_false()
 
 
 def _snippet(value: str | None) -> str | None:
@@ -584,36 +610,31 @@ async def _sms_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicatio
     rep has, since rep leads are not clients. Unattributed numbers stay
     admin-only either way.
     """
-    if user.role in (Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER):
+    from app.services.communication_read_state import sms_unread_by_phone
+    from app.services.communication_scope import (
+        SMS_ROLES,
+        canonical_phone,
+        phone_identity_sql,
+        scoped_sms_query,
+    )
+
+    if user.role not in SMS_ROLES:
         return []
+    unread_by_phone = await sms_unread_by_phone(db, user.id)
     stmt = (
-        select(SmsMessage, Client)
+        (await scoped_sms_query(db, user)).add_columns(Client)
         .outerjoin(Client, Client.id == SmsMessage.client_id)
-        .order_by(SmsMessage.created_at.asc())
+        .order_by(SmsMessage.created_at.desc(), SmsMessage.id.desc())
         .limit(SCAN_LIMIT)
     )
-    if user.role == Role.FIELD_REP:
-        # A rep's book is their contacts' phone numbers. Compared on normalized
-        # digits so a contact stored "(862) 384-1951" still matches ledger rows
-        # written as "+18623841951".
-        owned = list(
-            (
-                await db.execute(
-                    select(DealerRepContact.phone_e164).where(
-                        DealerRepContact.owner_user_id == user.id,
-                        DealerRepContact.phone_e164.is_not(None),
-                    )
-                )
-            ).scalars().all()
-        )
-        keys = {k for k in (_phone_key(p) for p in owned) if k}
-        if not keys:
-            return []
-        digits = func.regexp_replace(SmsMessage.phone_e164, r"\D", "", "g")
-        stmt = stmt.where(or_(*[digits.like(f"%{k}") for k in keys]))
-    elif user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
-        stmt = stmt.where(SmsMessage.client_id.in_(scope_client_query(user, select(Client.id))))
     rows = list((await db.execute(stmt)).all())
+    rows.sort(key=lambda pair: (_at(pair[0].created_at), str(pair[0].id)))
+    numbers = {number for message, _ in rows if (number := canonical_phone(message.phone_e164))}
+    global_clients = (await db.execute(select(Client).where(phone_identity_sql(Client.phone).in_(numbers)))).scalars().all() if numbers else []
+    clients_by_number: dict[str, set[UUID]] = {}
+    for candidate in global_clients:
+        if number := canonical_phone(candidate.phone):
+            clients_by_number.setdefault(number, set()).add(candidate.id)
 
     # Rep leads are not clients, so a number that belongs to one would render as
     # a bare phone number. Resolve those names too, scoped to what the viewer
@@ -623,28 +644,30 @@ async def _sms_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicatio
         contact_stmt = contact_stmt.where(DealerRepContact.owner_user_id == user.id)
     elif user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
         contact_stmt = contact_stmt.where(sql_false())
-    rep_by_key: dict[str, DealerRepContact] = {}
+    rep_candidates: dict[str, list[DealerRepContact]] = {}
     for contact in (await db.execute(contact_stmt.limit(SCAN_LIMIT))).scalars():
-        key = _phone_key(contact.phone_e164)
+        key = canonical_phone(contact.phone_e164)
         if key:
-            rep_by_key.setdefault(key, contact)
+            rep_candidates.setdefault(key, []).append(contact)
+    rep_by_key = {key: values[0] for key, values in rep_candidates.items() if len({row.id for row in values}) == 1}
 
     # Keyed on the NUMBER, not the client. Texting is a conversation with a
     # phone: an outbound send with no client link and the inbound reply that
     # matched a client are the same thread to everyone except the database.
     grouped: dict[str, list[tuple[SmsMessage, Client | None]]] = {}
     for message, client in rows:
-        grouped.setdefault(_phone_key(message.phone_e164) or message.phone_e164, []).append(
+        grouped.setdefault(canonical_phone(message.phone_e164) or message.phone_e164, []).append(
             (message, client)
         )
     result = []
     for _key, members in grouped.items():
         latest, _ = members[-1]
         # Address the thread by a real number, not the identity key.
-        key = latest.phone_e164
+        key = canonical_phone(latest.phone_e164) or latest.phone_e164
         # Any message on this number that resolved to a client names the thread;
         # failing that, a rep contact on the same number does.
-        client = next((c for _, c in reversed(members) if c is not None), None)
+        known_clients = {client.id: client for _, client in members if client is not None}
+        client = next(iter(known_clients.values())) if len(known_clients) == 1 and set(known_clients) == clients_by_number.get(key, set()) else None
         rep_contact = None if client is not None else rep_by_key.get(_key)
         # A blocked or failed send is worth surfacing in the preview — "why
         # didn't the text go out" should be visible from the inbox row.
@@ -673,7 +696,7 @@ async def _sms_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicatio
                     if rep_contact is not None
                     else None
                 ),
-                participant_phone=latest.phone_e164,
+                participant_phone=key,
                 participant_type="client" if client is not None else "rep_lead" if rep_contact is not None else "client",
                 source_kind="sms",
                 source_id=(
@@ -689,7 +712,7 @@ async def _sms_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicatio
                 ),
                 channel="sms",
                 transport="sms",
-                unread_count=0,
+                unread_count=unread_by_phone.get(key, 0),
                 message_count=len(members),
                 latest_snippet=_snippet(snippet),
                 latest_at=latest.created_at,
@@ -796,22 +819,61 @@ async def _thread_summary(db: AsyncSession, user: User, thread_id: str) -> Unifi
                 latest_at=intake.created_at,
                 href=f"/admin/ai-underwriter-leads?lead={intake.id}&channel={channel}",
             )
+    if row is None and len(parts) == 2 and parts[0] == "loan":
+        try:
+            loan_id = UUID(parts[1])
+        except ValueError:
+            loan_id = None
+        loan = (await db.execute(scope_loan_query(user, select(Loan).where(Loan.id == loan_id)))).scalar_one_or_none() if loan_id else None
+        if loan is not None:
+            row = UnifiedCommunicationThread(id=thread_id, title=loan.deal_id or "Loan conversation", participant_type="client",
+                source_kind="loan", source_id=str(loan.id), channel="client", transport="portal",
+                latest_at=loan.updated_at or loan.created_at, href=f"/messages?thread={thread_id}")
+    if row is None and len(parts) == 2 and parts[0] == "rep":
+        try:
+            thread = await db.get(DealerRepInboxThread, UUID(parts[1]))
+        except ValueError:
+            thread = None
+        if thread is not None and (user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC} or user.role == Role.FIELD_REP and thread.owner_user_id == user.id):
+            row = UnifiedCommunicationThread(id=thread_id, title=thread.subject, participant_type="rep_lead",
+                source_kind="rep", source_id=str(thread.dealer_id or thread.contact_id or thread.id),
+                channel=thread.channel, transport=thread.channel, latest_at=thread.last_message_at or thread.created_at,
+                href=f"/messages?thread={thread_id}", can_reply=thread.owner_user_id == user.id)
+    if row is None and len(parts) == 2 and parts[0] == "email":
+        from app.routers.inbox import _load_thread_rows
+
+        owned = await _load_thread_rows(db, owner_id=user.id, thread_id=parts[1])
+        if owned:
+            latest = owned[-1]
+            row = UnifiedCommunicationThread(id=thread_id, title=latest.subject or "Email conversation",
+                participant_type=latest.matched_party_role or "email_contact", participant_email=latest.from_email,
+                source_kind="email", source_id=parts[1], channel="email", transport="email",
+                latest_at=latest.received_at or latest.created_at, href=f"/messages?thread={thread_id}")
     if row is None and len(parts) == 3 and parts[0] == "sms" and parts[1] == "phone":
         # A conversation with a person exists whether or not it has history —
         # the first text to an appointment's client has to start somewhere, and
         # _all_threads only lists numbers the ledger has already seen.
-        from app.dealer_os.services.consent_delivery import normalize_phone
+        from app.services.communication_scope import (
+            GLOBAL_SMS_ROLES,
+            SMS_ROLES,
+            canonical_phone,
+            scoped_sms_query,
+        )
 
-        phone = normalize_phone(parts[2])
-        if phone and user.role not in (Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER):
+        phone = canonical_phone(parts[2])
+        if phone and user.role in SMS_ROLES:
             name = email = None
             client = await _client_for_phone_scoped(db, user, phone)
+            contact = None
             if client is not None:
                 name, email = client.name, client.email
             else:
                 contact = await _rep_contact_for_phone(db, user, phone)
                 if contact is not None:
                     name, email = contact.full_name, contact.email
+            existing = (await db.execute((await scoped_sms_query(db, user, phone)).limit(1))).scalars().first()
+            if user.role not in GLOBAL_SMS_ROLES and client is None and contact is None and existing is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Conversation not found")
             row = UnifiedCommunicationThread(
                 id=f"sms:phone:{phone}",
                 title=name or phone,
@@ -1156,7 +1218,9 @@ async def get_unified_communication_thread(
     elif parts[0] == "sms":
         # Every message on this number, client-linked or not, in whatever
         # format it was stored — see _sms_threads.
-        stmt = select(SmsMessage).where(_same_number(parts[2]))
+        from app.services.communication_scope import scoped_sms_query
+
+        stmt = await scoped_sms_query(db, user, thread.participant_phone or parts[2])
         rows = list((await db.execute(stmt.order_by(SmsMessage.created_at.asc()))).scalars().all())
         # A picture the client texted us, filed against the ledger row. The
         # thread was already authorised above, so these ride the same decision.
@@ -1334,18 +1398,16 @@ async def reply_unified_communication_thread(
         )
     elif parts[0] == "sms":
         from app.services import sms as sms_service
+        from app.services.communication_scope import GLOBAL_SMS_ROLES
 
         phone = parts[2]
         # Keep the reply attached to whoever this number already resolved to,
         # so the thread does not fork the moment we answer it.
-        linked = (
-            await db.execute(
-                select(SmsMessage.client_id)
-                .where(_same_number(phone), SmsMessage.client_id.is_not(None))
-                .order_by(SmsMessage.created_at.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
+        client = await _client_for_phone_scoped(db, user, phone)
+        contact = await _rep_contact_for_phone(db, user, phone) if client is None else None
+        if user.role not in GLOBAL_SMS_ROLES and client is None and contact is None:
+            raise HTTPException(409, "This phone has no unambiguous contact in your book. Reply from the explicitly linked client file instead")
+        linked = client.id if client else None
         result = await sms_service.send_sms_checked(
             db, to_phone=phone, body=body, client_id=linked, context="manual"
         )
@@ -1371,34 +1433,59 @@ async def reply_unified_communication_thread(
 
 @router.post("/threads/{thread_id:path}/seen", response_model=UnifiedCommunicationSeen)
 async def mark_unified_communication_seen(
-    thread_id: str, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    thread_id: str, user: CurrentUser, db: AsyncSession = Depends(get_db), payload: CommunicationMessagesSeen | None = None,
 ) -> UnifiedCommunicationSeen:
     await _thread_summary(db, user, thread_id)
     parts = thread_id.split(":")
     seen_at = datetime.now(UTC)
+    requested = set(payload.message_ids) if payload is not None else None
+    from app.services.communication_read_state import (
+        mark_rep_messages_seen,
+        read_received_notifications,
+        sms_source_ids,
+    )
+
     if parts[0] == "rep":
         thread = await db.get(DealerRepInboxThread, UUID(parts[1]))
-        if thread and thread.owner_user_id == user.id:
-            rows = list((await db.execute(select(DealerRepInboxMessage).where(DealerRepInboxMessage.thread_id == thread.id, DealerRepInboxMessage.direction == "inbound", DealerRepInboxMessage.read_at.is_(None)))).scalars().all())
-            for row in rows:
-                row.read_at = seen_at
-            thread.unread_count = 0
+        statement = select(DealerRepInboxMessage).where(DealerRepInboxMessage.thread_id == thread.id)
+        if requested is not None:
+            statement = statement.where(DealerRepInboxMessage.id.in_(requested))
+        rows = list((await db.execute(statement)).scalars().all())
+        if requested is not None and {row.id for row in rows} != requested:
+            raise HTTPException(404, "A rendered message does not belong to this thread")
+        await mark_rep_messages_seen(db, thread=thread, user_id=user.id, rows=[row for row in rows if row.direction == "inbound"], at=seen_at)
     elif parts[0] == "email":
         key = ":".join(parts[1:])
         from app.routers.inbox import _load_thread_rows
 
         rows = await _load_thread_rows(db, owner_id=user.id, thread_id=key)
-        for row in rows:
-            row.is_read = True
-    await db.execute(
-        update(Notification)
-        .where(
-            Notification.recipient_user_id == user.id,
-            Notification.target_type == "communication_thread",
-            Notification.target_id == thread_id,
-            Notification.read_at.is_(None),
-        )
-        .values(read_at=seen_at)
-    )
+        if requested is not None and not requested.issubset({row.id for row in rows}):
+            raise HTTPException(404, "A rendered message does not belong to this mailbox thread")
+        selected = [row for row in rows if row.direction == "inbound" and (requested is None or row.id in requested)]
+        from app.services.communication_read_state import mark_mailbox_messages_seen
+
+        await mark_mailbox_messages_seen(db, user_id=user.id, rows=selected, at=seen_at)
+    elif parts[0] == "sms":
+        from app.services.communication_scope import scoped_sms_query
+
+        statement = await scoped_sms_query(db, user, parts[2])
+        if requested is not None:
+            statement = statement.where(SmsMessage.id.in_(requested))
+        rows = list((await db.execute(statement)).scalars().all())
+        if requested is not None and {row.id for row in rows} != requested:
+            raise HTTPException(404, "A rendered text message does not belong to this authorized conversation")
+        await read_received_notifications(db, user_id=user.id,
+            message_ids=await sms_source_ids(db, [row for row in rows if row.direction == "inbound"]), at=seen_at)
+    else:
+        # Legacy portal callers do not supply provider message IDs. Scope the
+        # notification update to this already-authorized exact thread.
+        statement = update(Notification).where(Notification.recipient_user_id == user.id,
+            Notification.target_type == "communication_thread", Notification.target_id == thread_id, Notification.read_at.is_(None))
+        if requested is not None:
+            statement = statement.where(Notification.meta["message_id"].astext.in_([str(value) for value in requested]))
+        await db.execute(statement.values(read_at=seen_at))
+    from app.services.communication_events import publish_communication_event
+
+    await publish_communication_event(db, recipient_user_ids={user.id}, event_type="message.seen", thread_id=thread_id)
     await db.commit()
     return UnifiedCommunicationSeen(thread_id=thread_id, seen_at=seen_at)

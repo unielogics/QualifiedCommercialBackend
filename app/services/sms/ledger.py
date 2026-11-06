@@ -108,30 +108,22 @@ async def mark_delivery(
     return True
 
 
-async def client_for_phone(db: AsyncSession, phone_e164: str):
-    """Best-effort match of a number to a client, newest first.
-
-    Client phones are stored as entered, so match on the digits. A miss is
-    fine — the ledger keeps unknown-sender rows too.
-    """
-    from sqlalchemy import func
-
+async def client_candidates_for_phone(db: AsyncSession, phone_e164: str):
+    """At most two exact identities: two means the sender is ambiguous."""
     from app.models.client import Client
+    from app.services.communication_scope import canonical_phone, phone_identity_sql
 
-    digits = "".join(ch for ch in phone_e164 if ch.isdigit())
-    if len(digits) == 11 and digits.startswith("1"):
-        digits = digits[1:]
-    if not digits:
-        return None
+    phone = canonical_phone(phone_e164)
+    if not phone:
+        return []
     try:
-        return (
-            await db.execute(
-                select(Client)
-                .where(func.regexp_replace(Client.phone, r"\D", "", "g").like(f"%{digits}"))
-                .order_by(Client.created_at.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
+        return list((await db.execute(select(Client).where(phone_identity_sql(Client.phone) == phone).limit(2))).scalars().all())
     except Exception:  # noqa: BLE001
         log.exception("sms ledger: client lookup failed for %s", phone_e164)
-        return None
+        return []
+
+
+async def client_for_phone(db: AsyncSession, phone_e164: str):
+    """Bind a text only when exactly one client has this canonical number."""
+    candidates = await client_candidates_for_phone(db, phone_e164)
+    return candidates[0] if len(candidates) == 1 else None

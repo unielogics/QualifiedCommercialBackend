@@ -857,7 +857,7 @@ async def _thread_read(
         cc_emails=emails[1:],
         participant_names=[names_by_email.get(value, value) for value in emails],
         last_message_at=thread.last_message_at,
-        unread_count=int(thread.unread_count or 0),
+        unread_count=int(thread.unread_count or 0) if thread.owner_user_id == user.id else 0,
         can_reply=thread.owner_user_id == user.id,
         created_at=thread.created_at,
     )

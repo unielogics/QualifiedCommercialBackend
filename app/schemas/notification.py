@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, computed_field
 
 from app.schemas.common import ORMModel
+from app.services.notification_groups import NotificationGroup, group_for
 
 
 class NotificationRead(ORMModel):
@@ -28,7 +29,16 @@ class NotificationRead(ORMModel):
     created_at: datetime
     updated_at: datetime
 
+    @computed_field
+    @property
+    def group(self) -> NotificationGroup:
+        return group_for(self.event_type, self.category, self.meta)
+
 
 class NotificationListRead(BaseModel):
     unread_count: int
     items: list[NotificationRead]
+    unread_counts: dict[NotificationGroup, int] = Field(default_factory=lambda: {"sms": 0, "email": 0, "general": 0})
+    total: int = 0
+    limit: int = 30
+    offset: int = 0

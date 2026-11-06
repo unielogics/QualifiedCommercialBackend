@@ -4,7 +4,6 @@ import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from urllib.parse import quote
 from uuid import UUID
 
 from sqlalchemy import select
@@ -209,6 +208,9 @@ async def notify_inbound_communication(
     thread_id: str,
     message_id: str | None = None,
     subject: str | None = None,
+    profile_id: UUID | None = None,
+    intake_id: UUID | None = None,
+    client_id: UUID | None = None,
 ) -> list[Notification]:
     """Create one durable in-app notification for one inbound communication.
 
@@ -219,7 +221,21 @@ async def notify_inbound_communication(
     normalized_channel = "email" if channel == "email" else "SMS"
     sender = (sender_label or "Unknown sender").strip() or "Unknown sender"
     clean_subject = " ".join((subject or "").split())[:180]
-    body = clean_subject if clean_subject else "Open Inbox to review this message."
+    body = clean_subject if clean_subject else "Open the conversation to review this message."
+    from app.services.notification_navigation import communication_link
+
+    context = {"channel": channel, "thread_id": thread_id, "message_id": message_id}
+    if profile_id:
+        from app.models.application_profile import ApplicationProfile
+
+        profile = await db.get(ApplicationProfile, profile_id)
+        if profile:
+            intake_id, client_id = profile.intake_id, profile.client_id
+        context["profile_id"] = str(profile_id)
+    if intake_id:
+        context["intake_id"] = str(intake_id)
+    if client_id:
+        context["client_id"] = str(client_id)
     return await notify_users(
         db,
         recipient_ids=recipient_ids,
@@ -230,12 +246,8 @@ async def notify_inbound_communication(
         body=body,
         target_type="communication_thread",
         target_id=thread_id,
-        deep_link=f"/inbox?thread={quote(thread_id, safe='')}",
-        meta={
-            "channel": channel,
-            "thread_id": thread_id,
-            "message_id": message_id,
-        },
+        deep_link=communication_link(thread_id),
+        meta=context,
         email=False,
         push=True,
     )

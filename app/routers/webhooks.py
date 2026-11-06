@@ -231,15 +231,12 @@ async def _store_inbound_sms(
             if duplicate is not None:
                 return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-        contacts = list(
-            (
-                await db.execute(
-                    select(DealerRepContact)
-                    .where(DealerRepContact.phone_e164 == from_phone)
-                    .order_by(DealerRepContact.last_activity_at.desc().nullslast(), DealerRepContact.updated_at.desc())
-                )
-            ).scalars().all()
-        )
+        from app.services.communication_scope import canonical_phone, phone_identity_sql
+
+        phone = canonical_phone(from_phone)
+        contacts = list((await db.execute(select(DealerRepContact).where(
+            phone_identity_sql(DealerRepContact.phone_e164) == phone
+        ))).scalars().all()) if phone else []
 
         # Every inbound text becomes a ledger row FIRST, before any early
         # return below can skip it — the compliance record must not depend on
@@ -248,7 +245,10 @@ async def _store_inbound_sms(
         from app.services.sms import optout as sms_optout
 
         is_stop = rep_workflows.is_stop_message(body)
-        ledger_client = await sms_ledger.client_for_phone(db, from_phone)
+        clients = await sms_ledger.client_candidates_for_phone(db, from_phone)
+        ambiguous_sender = len(contacts) > 1 or len(clients) > 1
+        contact = contacts[0] if len(contacts) == 1 and not ambiguous_sender else None
+        ledger_client = clients[0] if len(clients) == 1 and not ambiguous_sender else None
         ledger_row = await sms_ledger.record(
             db,
             direction="inbound",
@@ -275,7 +275,7 @@ async def _store_inbound_sms(
                 db, ledger_row_id=ledger_row.id, attachments=attachments or []
             )
 
-        recipient_ids = {contact.owner_user_id for contact in contacts if contact.owner_user_id}
+        recipient_ids = {contact.owner_user_id} if contact is not None and contact.owner_user_id else set()
         if ledger_client is not None:
             recipient_ids.update(await client_agent_user_ids(db, ledger_client))
         if not recipient_ids:
@@ -283,8 +283,8 @@ async def _store_inbound_sms(
                 user.id for user in await users_with_roles(db, Role.LOAN_EXEC, Role.SUPER_ADMIN)
             )
         sender_label = (
-            contacts[0].full_name
-            if contacts
+            contact.full_name
+            if contact is not None
             else ledger_client.name
             if ledger_client is not None
             else from_phone
@@ -315,7 +315,6 @@ async def _store_inbound_sms(
             await db.commit()
             return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-        contact = contacts[0] if contacts else None
         if contact is None or contact.owner_user_id is None:
             log.warning("%s sms webhook: no rep contact for sender=%s", provider, from_phone)
             # No rep thread to file it under, but the ledger row above stands.

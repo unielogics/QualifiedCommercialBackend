@@ -90,6 +90,24 @@ class UnifiedCommunicationSeen(BaseModel):
     seen_at: datetime
 
 
+class CommunicationMessagesSeen(BaseModel):
+    message_ids: list[UUID] = Field(default_factory=list, max_length=500)
+
+
+class FileCommunicationSeen(CommunicationMessagesSeen):
+    channel: Literal["sms", "email"]
+    thread_id: UUID | None = None
+
+
+class FileCommunicationUnread(BaseModel):
+    intake_id: UUID
+    profile_id: UUID | None = None
+    sms: int = 0
+    email: int = 0
+    total: int = 0
+    as_of: datetime
+
+
 class UnifiedContactGroup(BaseModel):
     """One person, every channel. The inbox row the operator actually wants:
     who spoke last, through what, with the full history one click away."""
