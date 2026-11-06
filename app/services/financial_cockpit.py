@@ -1168,7 +1168,7 @@ def debt_service(
                 unexplained_observed += payee.get("monthly_average") or 0
     unexplained_observed = round(unexplained_observed, 2)
     counted = [r for r in rows if r["count_in_dscr"] and r["monthly_payment"] is not None]
-    schedule_monthly = round(sum(r["monthly_payment"] for r in counted), 2) if counted or schedule_authoritative else None
+    schedule_monthly = round(sum(r["monthly_payment"] for r in counted), 2) if counted or schedule_authoritative or suppress_observed_additions and rows else None
     document_monthly = _num(document.get("total_monthly_debt_service")) if document else None
     documented_monthly = (
         round(sum(r["monthly_payment"] for r in documented if r["monthly_payment"]), 2)
@@ -1177,7 +1177,7 @@ def debt_service(
     )
     if schedule_authoritative:
         monthly, source = schedule_monthly, "accepted_debt_schedule"
-    elif schedule_monthly and unexplained_observed:
+    elif schedule_monthly is not None and unexplained_observed:
         monthly, source = (
             round(schedule_monthly + unexplained_observed, 2),
             "debt_schedule_rows+bank_observed",

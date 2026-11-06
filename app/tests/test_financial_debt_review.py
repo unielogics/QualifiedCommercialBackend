@@ -164,6 +164,22 @@ def test_working_edits_do_not_change_complete_explicit_legacy_baseline():
     assert not incomplete["debt"]["service"]["working_schedule_complete"]
 
 
+def test_complete_explicit_legacy_exclusions_are_known_zero_not_observed_fallback():
+    row = {"id": str(uuid4()), "lender": "Disclosed", "origin": "admin", "balance": 100,
+           "monthly_payment": 10, "count_in_dscr": False}
+    result = cockpit.build_cockpit(sources(), [row], working_schedule={"body": {"debts": [row]}})
+    assert result["debt"]["service"]["monthly"] == 0
+    assert result["debt"]["service"]["source"] == "debt_schedule_rows"
+
+
+def test_incomplete_zero_payment_legacy_baseline_retains_unmatched_observed_provisional_estimate():
+    row = {"id": str(uuid4()), "lender": "Disclosed", "origin": "admin", "balance": None, "monthly_payment": 0}
+    result = cockpit.build_cockpit(sources(), [row], working_schedule={"body": {"debts": [row]}})
+    assert not result["debt"]["service"]["observed_additions_suppressed"]
+    assert result["debt"]["service"]["monthly"] == 400
+    assert result["debt"]["service"]["basis_status"] == "provisional"
+
+
 def test_complete_human_preview_cannot_replace_an_incomplete_or_automated_baseline():
     legacy = {"id": str(uuid4()), "lender": "Unreviewed", "origin": "ai_draft", "balance": 100, "monthly_payment": 10}
     baseline = cockpit.build_cockpit(sources(), [legacy])
