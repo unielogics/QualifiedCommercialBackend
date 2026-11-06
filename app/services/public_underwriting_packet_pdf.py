@@ -2040,6 +2040,33 @@ def render_executive_summary_pdf(
 # ─────────────────────────────────────────────────────────────────────────────
 # Main entry point
 # ─────────────────────────────────────────────────────────────────────────────
+def _debt_evidence_section(financials: dict[str, Any]) -> str:
+    """The accepted row/document association, without a public storage URL."""
+    manifest = _record(financials.get("debt_evidence"))
+    schedule = _record(manifest.get("schedule"))
+    if manifest.get("status") != "accepted":
+        return ""
+    from app.services.debt_package_evidence import saved_at_label
+
+    header = f"Accepted debt schedule v{schedule.get('version_number', '-')} - saved {saved_at_label(schedule.get('saved_at'))}"
+    sections = [f'<section class="card"><h2>Debt supporting documents</h2><p>{escape(header)}</p><p>Sources are linked to the saved obligation below. Images alone do not establish a current payoff. The ZIP debt-evidence index opens the included originals.</p></section>']
+    for number, debt in enumerate(_records(manifest.get("debts")), 1):
+        rows = []
+        for document in _records(debt.get("documents")):
+            label = "Current reviewed payoff" if document.get("current_payoff") else "Previously selected payoff - review latest" if document.get("selected_current_payoff") else str(document.get("role") or "Supporting")
+            amount = _money(document.get("reviewed_payoff_amount")) if document.get("reviewed_payoff_amount") is not None else "Unknown"
+            date = str(document.get("reviewed_payoff_date") or "Unknown")
+            detail = f"Reviewed amount {amount}; date {date}" if document.get("role") == "payoff" else ""
+            rows.append("<tr>" + "".join(f"<td>{escape(str(value))}</td>" for value in (
+                label, document.get("file_name") or "Unavailable linked source",
+                document.get("status") or "unknown", detail,
+            )) + "</tr>")
+        if not rows:
+            rows = ['<tr><td colspan="4">No supporting documents linked to this saved obligation.</td></tr>']
+        sections.append(f'<section class="card debt-evidence"><h2>{number}. {escape(str(debt.get("lender") or "Unnamed obligation"))}</h2><p>Balance {_money(debt.get("balance"))}; monthly payment {_money(debt.get("monthly_payment"))}.</p><table class="grid-table"><thead><tr><th>Role / payoff review</th><th>Source document</th><th>Source status</th><th>Reviewed payoff</th></tr></thead><tbody>{"".join(rows)}</tbody></table></section>')
+    return "".join(sections)
+
+
 def render_underwriting_packet_pdf(
     *,
     intake: Any,
@@ -2211,6 +2238,10 @@ def render_underwriting_packet_pdf(
     for row in missing_rows[:12]:
         fallback_lines.extend(_wrap(f"- {row.get('title') or 'Missing item'}: {row.get('detail') or ''}"))
     fallback_lines.extend(["", "CONFIDENTIAL — This packet is not a 1003, lender-specific application, commitment to lend, or final credit decision."])
+    if financials.get("debt_evidence"):
+        from app.services.debt_package_evidence import index_text
+
+        fallback_lines.extend(["", *index_text(financials["debt_evidence"]).splitlines()])
 
     html_doc = f"""
 <!doctype html>
@@ -2235,6 +2266,9 @@ def render_underwriting_packet_pdf(
     .field strong {{ display:block; margin-top:3px; color:{INK}; font-size:10.5px; }}
     .card {{ border:1px solid {LINE}; border-radius:9px; padding:10px 12px; background:#ffffff; margin-bottom:9px; page-break-inside:avoid; }}
     .card.wide {{ page-break-inside:avoid; }}
+    .card.debt-evidence {{ page-break-inside:auto; }}
+    .debt-evidence tr {{ page-break-inside:avoid; }}
+    .debt-evidence td {{ overflow-wrap:anywhere; word-break:break-word; }}
     .cols {{ width:100%; }} .cols td {{ vertical-align:top; width:50%; }}
     .cols td:first-child {{ padding-right:6px; }} .cols td:last-child {{ padding-left:6px; }}
     ul {{ margin:0; padding-left:16px; }} li {{ margin:3px 0; line-height:1.35; color:{SLATE}; }}
@@ -2294,6 +2328,7 @@ def render_underwriting_packet_pdf(
   </tr></table>
   {_program_readiness_section(financials) if selected_programs else _program_fit_section(loan_program_fit)}
   {_plan_section(financials)}
+  {_debt_evidence_section(financials)}
 
   <table class="cols"><tr>
     <td>{_bullet_card("Strengths", strengths, "green")}</td>

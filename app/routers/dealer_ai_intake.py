@@ -17,6 +17,7 @@ import zipfile
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
+from pathlib import PurePosixPath
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
@@ -5722,6 +5723,9 @@ async def _collect_packet_financials(
     Returns raw facts; the PDF renderer handles charting and redaction so this stays a
     thin data-loader."""
     credit = await _credit_financials_section(db, intake)
+    from app.services.debt_package_evidence import manifest_for_intake
+
+    debt_evidence = await manifest_for_intake(db, intake)
     # New underwriting artifacts must not fall back to the legacy dealer-only
     # heuristic. Approved catalog candidates are carried in package_readiness
     # and rendered deterministically by the summary instead.
@@ -5743,6 +5747,7 @@ async def _collect_packet_financials(
             "balance_sheet": None,
             "credit": credit,
             "program_fit": program_fit,
+            "debt_evidence": debt_evidence,
         }
     from app.services.document_version_selection import current_document_file_clause
     from app.services.financial_version_selection import current_financial_file_clause
@@ -5795,6 +5800,7 @@ async def _collect_packet_financials(
         "balance_sheet": extract_balance_sheet(analyses),
         "credit": credit,
         "program_fit": program_fit,
+        "debt_evidence": debt_evidence,
     }
 
 
@@ -6170,6 +6176,7 @@ async def _create_executive_summary_artifact(
         cleanup_s3_keys.append(s3_key)
     summary = {
         **summary,
+        "debt_evidence": financials.get("debt_evidence"),
         "_pdf": {
             "size_bytes": len(pdf_bytes),
             "sha256": hashlib.sha256(pdf_bytes).hexdigest(),
@@ -6390,6 +6397,7 @@ async def _create_lender_packet_artifact(
         body_text="Qualified Commercial underwriting packet PDF generated for lender/vendor review.",
         body_json={
             "source_summary_artifact_id": str(summary_artifact.id),
+            "debt_evidence": financials.get("debt_evidence"),
             "_pdf": {
                 "size_bytes": len(pdf_bytes),
                 "sha256": hashlib.sha256(pdf_bytes).hexdigest(),
@@ -9861,6 +9869,11 @@ async def build_package_zip_bytes(
     )
 
     label = _safe_filename(intake.business_name or intake.full_name or "lead")
+    from app.services import debt_package_evidence
+
+    debt_manifest = (packet_artifact.body_json or {}).get("debt_evidence") or {
+        "status": "no_accepted_schedule", "schedule": None, "debts": [],
+    }
     # The processing partner's proposal (residual lines and all) is not a
     # borrower document and never ships to a lender.
     files = sorted(
@@ -9872,6 +9885,13 @@ async def build_package_zip_bytes(
         ),
         key=lambda f: f.file_name.lower(),
     )
+    # Explicit row links may name a selected source from another room. Reapply
+    # this application's evidence scope before adding it to the delivery.
+    linked_files = await debt_package_evidence.delivery_files(db, intake, debt_manifest)
+    files = sorted({file.id: file for file in [*files, *linked_files]
+                    if not merchant_processing.is_offer_document(file)
+                    and not _is_package_readiness_output(file)}.values(),
+                   key=lambda file: (file.file_name.casefold(), str(file.id)))
     manifest_lines = [
         "Qualified Commercial — Underwriting Package",
         f"Borrower/entity: {intake.business_name or intake.full_name or '-'}",
@@ -9882,6 +9902,7 @@ async def build_package_zip_bytes(
         "  executive-summary.pdf  — concise underwriter executive summary",
         "  lender-packet.pdf       — formatted lender/vendor packet",
         "  email-template.txt      — ready-to-edit vendor outreach email",
+        "  debt-evidence.html/json/txt — documents linked to each accepted obligation",
         f"  documents/              — {len(files)} uploaded file(s)",
         "",
         "Uploaded documents:",
@@ -9917,19 +9938,48 @@ async def build_package_zip_bytes(
         zf.writestr("email-template.txt", f"Subject: {subject}\n\n{body}\n")
         # All uploaded documents under documents/.
         used_names: set[str] = set()
+        archived = {}
+        failed_ids = set()
+        linked_hashes = {document["file_id"]: document.get("content_hash")
+                         for debt in debt_manifest.get("debts") or [] for document in debt["documents"]}
         for f in files:
             entry_name = _safe_filename(f.file_name) or f"file-{str(f.id)[:8]}"
             candidate = entry_name
             n = 2
-            while candidate in used_names:
-                candidate = f"{entry_name}-{n}"
+            parts = PurePosixPath(entry_name)
+            while candidate.casefold() in used_names:
+                candidate = f"{parts.stem}-{n}{parts.suffix}"
                 n += 1
-            used_names.add(candidate)
+            used_names.add(candidate.casefold())
             manifest_lines.append(f"  - {f.file_name} ({round((f.size_bytes or 0) / 1024)} KB)")
             try:
-                zf.writestr(f"documents/{candidate}", await _s3_bytes(f.s3_key))
+                raw = await _s3_bytes(f.s3_key)
+                digest = hashlib.sha256(raw).hexdigest()
+                if linked_hashes.get(str(f.id)) and digest != linked_hashes[str(f.id)]:
+                    raise ValueError("Linked debt source does not match the accepted package content hash")
+                path = f"documents/{candidate}"
+                zf.writestr(path, raw)
+                archived[str(f.id)] = {"path": path, "sha256": digest}
+                if str(f.id) in linked_hashes:
+                    from app.services.bucket_ai import detect_document_content_type
+
+                    if detect_document_content_type(raw) == "image/heic":
+                        from app.services.financial_source_images import jpeg_preview
+
+                        try:
+                            preview = await asyncio.to_thread(jpeg_preview, raw)
+                            preview_path = f"previews/{candidate}.jpg"
+                            zf.writestr(preview_path, preview)
+                            archived[str(f.id)].update(preview_path=preview_path,
+                                preview_sha256=hashlib.sha256(preview).hexdigest(), preview_status="available")
+                        except Exception:  # noqa: BLE001 - original remains included
+                            archived[str(f.id)]["preview_status"] = "unavailable"
+                            log.exception("package.zip: image preview unavailable file=%s", f.id)
             except Exception:  # noqa: BLE001
                 log.exception("package.zip: doc fetch failed file=%s", f.id)
+                failed_ids.add(str(f.id))
+                manifest_lines.append("    NOT INCLUDED: source unavailable or content hash changed")
+        debt_package_evidence.write_indexes(zf, debt_manifest, archived, failed_ids)
         zf.writestr("README.txt", "\n".join(manifest_lines) + "\n")
 
     return f"{label}-package.zip", buf.getvalue()
