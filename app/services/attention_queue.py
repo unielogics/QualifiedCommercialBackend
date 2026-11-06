@@ -26,7 +26,7 @@ from app.models.bucket import (
     BucketUploadLink,
 )
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
-from app.schemas.operator_file import AttentionItem, AttentionQueue
+from app.schemas.operator_file import AttentionItem, AttentionKind, AttentionQueue
 
 INTAKE_NO_FILES_DAYS = 7
 REQUEST_OVERDUE_DAYS = 30
@@ -84,7 +84,8 @@ def _who(full_name: str | None, business_name: str | None, fallback: str) -> str
 
 
 def sort_items(items: list[AttentionItem]) -> list[AttentionItem]:
-    return sorted(items, key=lambda item: (KIND_ORDER.get(item.kind, 9), -item.age_days, item.title))
+    return sorted(items, key=lambda item: (KIND_ORDER.get(item.kind, 9), -item.age_days, item.title,
+        item.kind, str(item.intake_id or ""), str(item.bucket_id or ""), str(item.profile_id or ""), item.href))
 
 
 async def _intakes_without_files(db: AsyncSession, now: datetime) -> list[AttentionItem]:
@@ -259,7 +260,8 @@ async def _buckets_without_client_entry(db: AsyncSession, now: datetime) -> list
 
 
 async def load_attention_queue(
-    db: AsyncSession, *, now: datetime | None = None, limit: int = 60
+    db: AsyncSession, *, now: datetime | None = None, limit: int = 60,
+    offset: int = 0, kind: AttentionKind | None = None, q: str | None = None,
 ) -> AttentionQueue:
     now = now or datetime.now(UTC)
     items: list[AttentionItem] = []
@@ -274,4 +276,9 @@ async def load_attention_queue(
     counts: dict[str, int] = {}
     for item in items:
         counts[item.kind] = counts.get(item.kind, 0) + 1
-    return AttentionQueue(generated_at=now, items=items[:limit], counts=counts)
+    total = len(items)
+    query = " ".join((q or "").split()).casefold()
+    filtered = [item for item in items if (kind is None or item.kind == kind)
+                and (not query or query in " ".join(f"{item.title} {item.detail}".split()).casefold())]
+    return AttentionQueue(generated_at=now, items=filtered[offset:offset + limit], counts=counts,
+        total=total, filtered_total=len(filtered), limit=limit, offset=offset)
