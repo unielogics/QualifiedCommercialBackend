@@ -89,6 +89,15 @@ CURRENT_FILE_ANALYSIS_VERSION = 4
 # deterministic same-statement diagnostics without a new AI request.
 FINANCIAL_EXTRACTION_POLICY_VERSION = "numbers_first_citations_v2"
 
+# Bank statements can contain bounded recurring-payee lists plus up to 100
+# individually cited transfer lines. They need more JSON output than a short
+# document summary. Keep the higher limit scoped to those reads; both limits
+# remain below the configured Bedrock Sonnet 4.6 model's 64K output ceiling.
+FILE_ANALYSIS_OUTPUT_TOKENS = 3000
+FILE_ANALYSIS_RETRY_OUTPUT_TOKENS = 6000
+BANK_ANALYSIS_OUTPUT_TOKENS = 12000
+BANK_ANALYSIS_RETRY_OUTPUT_TOKENS = 24000
+
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_REVIEW_ATTACHMENTS = 8
 MAX_PDF_PAGES = 100
@@ -2916,6 +2925,33 @@ def _content_evidence_claims(parsed: dict[str, Any], candidates: list[dict[str, 
     return result
 
 
+def _bank_analysis_needs_long_output(analysis: Any, response: Any = None) -> bool:
+    """Budget for bank JSON without changing classification or trusting partial facts.
+
+    A forced read retains its previous classification/facts, including after a
+    failed attempt. An unknown first read can identify itself in the truncated
+    response and receive the larger retry; that text is never accepted as data.
+    """
+    if getattr(analysis, "classification", None) == "bank_statement":
+        return True
+    payload = getattr(analysis, "analysis", None)
+    facts = payload.get("key_facts") if isinstance(payload, dict) else None
+    if isinstance(facts, dict):
+        if facts.get("source") == "transactions_export":
+            return True
+        months = facts.get("months")
+        records = [facts, *[row for row in months[:60] if isinstance(row, dict)]] if isinstance(months, list) else [facts]
+        bank_arrays = ("transfer_lines", "transaction_lines", "recurring_debits", "recurring_credits")
+        if any(any(isinstance(row.get(key), list) for key in bank_arrays) for row in records):
+            return True
+    if response is not None:
+        return bool(re.search(
+            r'"classification"\s*:\s*"bank_statement"|"(?:transfer_lines|recurring_debits|recurring_credits)"\s*:\s*\[',
+            _text_from_response(response),
+        ))
+    return False
+
+
 async def analyze_bucket_file(
     db: AsyncSession,
     file: BucketFile,
@@ -3103,6 +3139,7 @@ async def analyze_bucket_file(
 
     try:
         model = model_heavy()
+        bank_output = not offer_document and _bank_analysis_needs_long_output(row)
         analysis_system = (
             merchant_processing.MERCHANT_OFFER_ANALYSIS_SYSTEM
             if offer_document
@@ -3118,13 +3155,14 @@ async def analyze_bucket_file(
                 "bucket_file_id": str(file.id),
                 "financial_extraction_policy": FINANCIAL_EXTRACTION_POLICY_VERSION,
             },
-            max_tokens=3000,
+            max_tokens=BANK_ANALYSIS_OUTPUT_TOKENS if bank_output else FILE_ANALYSIS_OUTPUT_TOKENS,
             # The partner's terms sheet is read with its own prompt, chosen by
             # the file's marker before any product persona is consulted.
             system=analysis_system,
             messages=[{"role": "user", "content": content}],
         )
         if is_truncated_response(resp):
+            bank_output = bank_output or (not offer_document and _bank_analysis_needs_long_output(row, resp))
             resp = await tracked_messages_create(
                 db,
                 feature="file_analysis",
@@ -3136,7 +3174,7 @@ async def analyze_bucket_file(
                     "retry_reason": "truncated_output",
                     "financial_extraction_policy": FINANCIAL_EXTRACTION_POLICY_VERSION,
                 },
-                max_tokens=6000,
+                max_tokens=BANK_ANALYSIS_RETRY_OUTPUT_TOKENS if bank_output else FILE_ANALYSIS_RETRY_OUTPUT_TOKENS,
                 system=(
                     analysis_system
                     + "\nA prior response hit its token limit. Respect the list limits, stay concise, and complete the JSON object."
