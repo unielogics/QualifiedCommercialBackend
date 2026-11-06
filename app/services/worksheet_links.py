@@ -354,6 +354,65 @@ def guard_write_rate(access: WorksheetAccess) -> None:
     link_throttle.note_write(key)
 
 
+async def bound_families(db: AsyncSession, access: WorksheetAccess, kinds=None) -> dict[str, uuid.UUID]:
+    """Persist each authorized sheet's family once, never follow another owner.
+
+    Older links acquire this binding on their next authorized visit. Financial
+    answers and publication are unchanged; no requested kind can widen scope.
+    """
+    wanted = require_sheets(access, kinds if kinds is not None else access.sheets)
+    if not isinstance(getattr(db, "info", None), dict):
+        return {}
+    from app.models.financial_worksheet import FinancialFormLinkSheet
+    from app.services.client_financial_forms import ensure_snapshot
+    from app.services.financial_workspace import lock_financial_profile
+
+    # Workspace writers lock bucket/profile before any worksheet/link rows.
+    await lock_financial_profile(db, access.profile)
+    rows = list((await db.execute(select(FinancialFormLinkSheet).where(
+        FinancialFormLinkSheet.link_id == access.link.id,
+        FinancialFormLinkSheet.sheet_kind.in_(wanted),
+    ).with_for_update().execution_options(populate_existing=True))).scalars().all())
+    if {row.sheet_kind for row in rows} != set(wanted):
+        raise gone()
+    result = {}
+    for row in rows:
+        selected_family = row.financial_family_id
+        statement_id = getattr(access.link, "statement_id", None) if row.sheet_kind == "pfs" else None
+        if selected_family is None and getattr(access.link, "packet_id", None):
+            child = (await db.execute(select(FinancialFormLink).where(
+                FinancialFormLink.packet_id == access.link.packet_id,
+                FinancialFormLink.profile_id == access.profile.id,
+                FinancialFormLink.kind == row.sheet_kind,
+            ))).scalar_one_or_none()
+            if child is not None:
+                selected_family = child.financial_family_id
+                statement_id = child.statement_id if row.sheet_kind == "pfs" else None
+        snapshot = await ensure_snapshot(db, access.profile, row.sheet_kind,
+            family_id=selected_family, statement_id=statement_id if selected_family is None else None)
+        family_id = uuid.UUID(snapshot["family_id"])
+        if row.financial_family_id is None:
+            row.financial_family_id = family_id
+        result[row.sheet_kind] = family_id
+    await db.flush()
+    return result
+
+
+async def complete_bound_sheet(db: AsyncSession, access: WorksheetAccess, kind: str, family_id: uuid.UUID) -> None:
+    """A packet's stacked form and its grid file the same versioned answer."""
+    require_sheets(access, [kind])
+    packet_id = getattr(access.link, "packet_id", None)
+    if packet_id is None or not isinstance(getattr(db, "info", None), dict):
+        return
+    child = (await db.execute(select(FinancialFormLink).where(
+        FinancialFormLink.packet_id == packet_id, FinancialFormLink.profile_id == access.profile.id,
+        FinancialFormLink.kind == kind,
+    ).with_for_update())).scalar_one_or_none()
+    if child is not None and child.financial_family_id in (None, family_id):
+        child.financial_family_id = family_id
+        child.completed_at = _now()
+
+
 # ---------------------------------------------------------------------------
 # minting side: what the sharing dialog has to do about the PIN
 # ---------------------------------------------------------------------------

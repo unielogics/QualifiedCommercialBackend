@@ -54,16 +54,19 @@ async def test_view_only_form_link_cannot_change_or_publish_portfolio(operation)
 @pytest.mark.asyncio
 async def test_borrower_submission_uses_the_bound_draft_and_publication_pipeline():
     held, profile = link(), SimpleNamespace(id=uuid4())
-    snapshot = {"kind": KIND, "family_id": str(held.financial_family_id), "body": {}}
-    payload = FinancialStatementWrite(body={"owner_name": "Investor", "no_real_estate": True})
+    snapshot = {"kind": KIND, "family_id": str(held.financial_family_id), "body": {},
+        "draft": {"revision": 4, "base_version_id": None}, "versions": []}
+    payload = FinancialStatementWrite(body={"owner_name": "Investor", "no_real_estate": True}, expected_revision=4, idempotency_key="save-portfolio-1")
     db = SimpleNamespace(get=AsyncMock(return_value=profile), commit=AsyncMock())
     with (patch.object(application_profiles, "_open_link_or_404", AsyncMock(return_value=held)),
           patch.object(application_profiles, "managed_snapshot", AsyncMock(return_value=snapshot)) as read,
-          patch.object(application_profiles, "stage_legacy_body", AsyncMock()) as publish):
-        assert await application_profiles.submit_public_financial_form("credential", payload, db) == {"completed": True}
+          patch("app.services.client_financial_forms.save_submission", AsyncMock(return_value=snapshot)) as publish):
+        result = await application_profiles.submit_public_financial_form("credential", payload, db)
+        assert result["completed"] and result["workspace"]["family_id"] == snapshot["family_id"]
     assert read.await_args.kwargs["family_id"] == held.financial_family_id
-    assert publish.await_args.args[2:4] == (snapshot, payload.body)
-    assert publish.await_args.kwargs["submit"] and publish.await_args.kwargs["public"]
+    assert publish.await_args.args[2] == snapshot
+    assert publish.await_args.kwargs["body"] == payload.body
+    assert publish.await_args.kwargs["expected_revision"] == 4
     assert publish.await_args.kwargs["actor"].id is None
     assert held.completed_at is not None
     db.commit.assert_awaited_once()

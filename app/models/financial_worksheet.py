@@ -99,6 +99,11 @@ class FinancialFormLinkSheet(Base):
         index=True,
     )
     sheet_kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    # A shared sheet stays on the selected owner/reporting period even when
+    # staff later imports a newer family of the same kind on this file.
+    financial_family_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("financial_form_families.id", ondelete="CASCADE"), index=True
+    )
 
     __table_args__ = (
         UniqueConstraint("link_id", "sheet_kind", name="uq_financial_form_link_sheets_link_kind"),

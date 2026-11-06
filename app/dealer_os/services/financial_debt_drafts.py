@@ -174,7 +174,7 @@ async def stage_proposals(db: Any, context: ManagedDebtDraft, proposals: list[di
             skipped += 1
             continue
         row = matches[0] if matches else None
-        if row is not None and row.get("origin", row.get("owner")) == "admin":
+        if row is not None and (row.get("origin", row.get("owner")) == "admin" or row.get("client_reviewed") is True):
             skipped += 1
             continue
         fresh = row is None

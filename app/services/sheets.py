@@ -117,7 +117,7 @@ class _Loaded:
     """One sheet as it currently stands: the body a save would patch, the row
     that holds it, and how it is reported."""
 
-    __slots__ = ("body", "statement", "status", "completed", "rev", "draft")
+    __slots__ = ("body", "statement", "status", "completed", "rev", "draft", "workspace")
 
     def __init__(
         self,
@@ -134,6 +134,7 @@ class _Loaded:
         self.completed = completed
         self.rev = rev
         self.draft = None
+        self.workspace = None
 
 
 
@@ -391,9 +392,22 @@ async def _load(
     origin: str,
     prefill: Mapping[str, Any],
     worksheet: FinancialWorksheet,
+    family_id: uuid.UUID | None = None,
 ) -> _Loaded:
     """One sheet's current body, through the reader that already owns it."""
     from app.services import financial_workspace
+
+    if isinstance(getattr(db, "info", None), dict):
+        from app.services import client_financial_forms
+
+        snapshot = await client_financial_forms.ensure_snapshot(db, profile, kind, family_id=family_id)
+        _family, draft = await financial_workspace.resolve_family(db, profile, kind=kind, family_id=uuid.UUID(snapshot["family_id"]))
+        body = client_financial_forms.client_body(kind, snapshot["body"])
+        current = next((row for row in snapshot.get("versions") or [] if row["id"] == snapshot.get("current_version_id")), None)
+        completed = bool(current and current["status"] == "filed" and not snapshot["draft"]["dirty"])
+        loaded = _Loaded(body, None, status="submitted" if completed else "draft", completed=completed, rev=worksheet.revision)
+        loaded.draft, loaded.workspace = draft, snapshot
+        return loaded
 
     draft = await financial_workspace.existing_draft(db, profile, kind)
     if draft is not None:
@@ -471,6 +485,7 @@ async def read_sheets(
     origin: str = "admin",
     can_edit: bool = True,
     worksheet: FinancialWorksheet | None = None,
+    family_ids: Mapping[str, uuid.UUID] | None = None,
 ) -> dict[str, Any]:
     """The whole workbook in one answer: shape, values and computed figures.
 
@@ -487,8 +502,11 @@ async def read_sheets(
     sheets: list[dict[str, Any]] = []
     for kind in scope:
         loaded = await _load(
-            db, profile, kind, origin=origin, prefill=prefill, worksheet=worksheet
+            db, profile, kind, origin=origin, prefill=prefill, worksheet=worksheet, family_id=(family_ids or {}).get(kind)
         )
+        if not can_edit:
+            for row in loaded.body.get("debts") or []:
+                row["editable"] = False
         shape = _layout_for(kind, loaded.body)
         sheets.append(
             {
@@ -503,6 +521,7 @@ async def read_sheets(
                 "values": sheet_layout.flatten(kind, loaded.body),
                 "row_meta": _row_meta(kind, loaded.body),
                 "computed": _computed(kind, loaded.body),
+                **({"workspace": _workspace_metadata(loaded)} if loaded.workspace else {}),
             }
         )
 
@@ -521,6 +540,27 @@ async def read_sheets(
         "prefill": prefill,
         "sheets": sheets,
     }
+
+
+def _workspace_metadata(loaded: _Loaded) -> dict | None:
+    if loaded.workspace is None:
+        return None
+    from app.services.client_financial_forms import workspace_metadata
+
+    result = workspace_metadata(loaded.workspace)
+    pdf_ids = {row["id"] for row in loaded.workspace.get("versions") or [] if row.get("pdf_file_id")}
+    for row in result["versions"]:
+        row["pdf_available"] = row["id"] in pdf_ids
+    if result.get("current_version"):
+        result["current_version"]["pdf_available"] = result["current_version"]["id"] in pdf_ids
+    return result
+
+
+async def _lock_profile_before_worksheet(db, profile) -> None:
+    if isinstance(getattr(db, "info", None), dict):
+        from app.services.financial_workspace import lock_financial_profile
+
+        await lock_financial_profile(db, profile)
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +683,21 @@ async def _save_kind(
         draft = loaded.draft
         family = await db.get(FinancialFormFamily, draft.family_id)
         if kind == "debt_schedule":
+            from app.services.financial_workspace_legacy import EDITABLE_DEBT_FIELDS
+
+            # A working row can be temporarily incomplete while a client
+            # clears and retypes a required field. Only genuinely blank NEW
+            # padding is omitted; completeness belongs to explicit submission.
+            known_active = {str(row.get("id")) for row in draft.body.get("debts") or []
+                if row.get("status", "active") == "active"}
+            body = {**body, "debts": [row for row in body.get("debts") or []
+                if str(row.get("id")) in known_active or any(
+                    row.get(key) is not None and str(row[key]).strip() for key in EDITABLE_DEBT_FIELDS)]}
+        if origin == "client_form":
+            from app.services.client_financial_forms import merge_client_body
+
+            body = merge_client_body(kind, draft.body, body)
+        elif kind == "debt_schedule":
             for row in body.get("debts") or []:
                 if not row.get("id"):
                     row["id"] = str(uuid.uuid4())
@@ -661,6 +716,7 @@ async def _save_kind(
             rows.extend({**row, "origin": origin, "status": "active"} for row in wanted.values())
             body = {**draft.body, **body, "debts": rows}
         saved = await financial_workspace.stage_draft(db, profile, family, draft, body, actor=SimpleNamespace(id=actor_user_id))
+        loaded.workspace = await financial_workspace.load_workspace(db, profile, kind=kind, family_id=draft.family_id)
         return saved
     if kind in bss.KINDS:
         return await business_statements.save(
@@ -766,6 +822,7 @@ async def apply_cell_edits(
     worksheet: FinancialWorksheet | None = None,
     participant_id: str | None = None,
     client_id: str | None = None,
+    family_ids: Mapping[str, uuid.UUID] | None = None,
 ) -> dict[str, Any]:
     """Write a handful of cells and say where the workbook now stands.
 
@@ -775,6 +832,7 @@ async def apply_cell_edits(
     rather than leaving the typed text on screen as though it had been kept.
     """
     grouped = _group(edits)
+    await _lock_profile_before_worksheet(db, profile)
     worksheet = worksheet or await ensure_worksheet(db, profile, created_by=actor_user_id)
     worksheet = await _lock(db, worksheet)
     _check_stale(worksheet, grouped, base_rev)
@@ -786,6 +844,7 @@ async def apply_cell_edits(
     new_rev = int(worksheet.revision) + 1
     revs: dict[str, int] = {}
     computed: dict[str, dict[str, Any]] = {}
+    workspaces: dict[str, dict[str, Any]] = {}
     resync: list[str] = []
     by = _by(worksheet, participant_id=participant_id, actor_user_id=actor_user_id)
     events: list[dict[str, Any]] = []
@@ -793,7 +852,7 @@ async def apply_cell_edits(
 
     for kind, values in grouped.items():
         loaded = await _load(
-            db, profile, kind, origin=origin, prefill=prefill, worksheet=worksheet
+            db, profile, kind, origin=origin, prefill=prefill, worksheet=worksheet, family_id=(family_ids or {}).get(kind)
         )
         try:
             body = sheet_layout.unflatten(kind, values, loaded.body)
@@ -807,6 +866,8 @@ async def apply_cell_edits(
             db, profile, kind, loaded, body, origin=origin, actor_user_id=actor_user_id
         )
         stored = await _stored_body(db, profile, kind, saved, body, origin=origin)
+        if loaded.workspace is not None:
+            workspaces[kind] = _workspace_metadata(loaded)
         computed[kind] = _computed(kind, stored)
         flat = sheet_layout.flatten(kind, stored)
         if any(flat.get(key, "") != sheet_layout._as_text(value) for key, value in values.items()):
@@ -820,8 +881,7 @@ async def apply_cell_edits(
             # or refused would otherwise be broadcast as though it had been
             # kept. An appended row is addressed by its ordinal key until it
             # exists, so the typed text is the fallback for exactly that case.
-            events.append(
-                worksheet_presence.cell_event(
+            event = worksheet_presence.cell_event(
                     worksheet.id,
                     sheet_kind=kind,
                     key=key,
@@ -830,7 +890,9 @@ async def apply_cell_edits(
                     by=by,
                     origin_client_id=client_id,
                 )
-            )
+            if loaded.workspace is not None:
+                event["data"]["family_id"] = loaded.workspace["family_id"]
+            events.append(event)
 
     worksheet.revision = new_rev
     await db.flush()
@@ -839,7 +901,7 @@ async def apply_cell_edits(
     # always reported: otherwise a client that only ever edits the P&L would
     # drift behind on it until it tripped the stale limit for no reason.
     revs["debt_schedule"] = new_rev
-    return {"rev": revs, "computed": computed, "resync": resync}
+    return {"rev": revs, "computed": computed, "resync": resync, **({"workspaces": workspaces} if workspaces else {})}
 
 
 async def apply_row_op(
@@ -857,6 +919,7 @@ async def apply_row_op(
     participant_id: str | None = None,
     client_id: str | None = None,
     visible: int | None = None,
+    family_ids: Mapping[str, uuid.UUID] | None = None,
 ) -> dict[str, Any]:
     """Add or remove a line on one of the two list-shaped sheets.
 
@@ -888,16 +951,17 @@ async def apply_row_op(
     if op not in ("insert", "delete"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown row operation")
 
+    await _lock_profile_before_worksheet(db, profile)
     worksheet = worksheet or await ensure_worksheet(db, profile, created_by=actor_user_id)
     worksheet = await _lock(db, worksheet)
     prefill = await financial_statements.form_prefill(db, profile)
-    loaded = await _load(db, profile, kind, origin=origin, prefill=prefill, worksheet=worksheet)
+    loaded = await _load(db, profile, kind, origin=origin, prefill=prefill, worksheet=worksheet, family_id=(family_ids or {}).get(kind))
     from app.services import worksheet_presence
 
     by = _by(worksheet, participant_id=participant_id, actor_user_id=actor_user_id)
 
     def _row_announcement(row_id: str | None, revision: int) -> dict[str, Any]:
-        return worksheet_presence.row_event(
+        event = worksheet_presence.row_event(
             worksheet.id,
             event_type="row.inserted" if op == "insert" else "row.deleted",
             sheet_kind=kind,
@@ -908,6 +972,9 @@ async def apply_row_op(
             by=by,
             origin_client_id=client_id,
         )
+        if loaded.workspace is not None:
+            event["data"]["family_id"] = loaded.workspace["family_id"]
+        return event
 
     if kind == "real_estate_schedule":
         if block not in real_estate_schema.COLLECTIONS:
@@ -924,7 +991,7 @@ async def apply_row_op(
         worksheet.revision = int(worksheet.revision) + 1
         await db.flush()
         await _announce(db, worksheet, [_row_announcement(fresh["id"] if fresh else row_id, worksheet.revision)])
-        return {"rows": _row_payloads(kind, dict(saved.body), exact=block), "row_meta": {}, "rev": {kind: worksheet.revision}}
+        return {"rows": _row_payloads(kind, dict(saved.body), exact=block), "row_meta": {}, "rev": {kind: worksheet.revision}, **({"workspaces": {kind: _workspace_metadata(loaded)}} if loaded.workspace else {})}
 
     if kind == "pfs":
         spec = pfs_schema.SCHEDULES_BY_KEY.get(str(block or ""))
@@ -955,6 +1022,7 @@ async def apply_row_op(
             "rows": _row_payloads(kind, stored, exact=spec.key),
             "row_meta": _row_meta(kind, stored),
             "rev": {kind: worksheet.revision, "debt_schedule": worksheet.revision},
+            **({"workspaces": {kind: _workspace_metadata(loaded)}} if loaded.workspace else {}),
         }
 
     rows = _as_seen(
@@ -978,6 +1046,7 @@ async def apply_row_op(
             "rows": _row_payloads(kind, body, exact="debts"),
             "row_meta": _row_meta(kind, body),
             "rev": {kind: worksheet.revision},
+            **({"workspaces": {kind: _workspace_metadata(loaded)}} if loaded.workspace else {}),
         }
 
     rows = _apply_rows(rows, op=op, row_id=row_id, after=after)
@@ -993,6 +1062,7 @@ async def apply_row_op(
         "rows": _row_payloads(kind, body, exact="debts"),
         "row_meta": _row_meta(kind, body),
         "rev": {kind: worksheet.revision},
+        **({"workspaces": {kind: _workspace_metadata(loaded)}} if loaded.workspace else {}),
     }
 
 

@@ -6253,6 +6253,58 @@ async def _open_link_or_404(db: AsyncSession, token: str):
     return link
 
 
+async def _client_link_snapshot(db: AsyncSession, profile, link):
+    """Adopt existing links into their exact versioned form, never another owner."""
+    from app.services import client_financial_forms
+
+    if isinstance(getattr(db, "info", None), dict):
+        snapshot = await client_financial_forms.ensure_snapshot(db, profile, link.kind,
+            statement_id=link.statement_id if link.kind == "pfs" else None,
+            family_id=getattr(link, "financial_family_id", None))
+    else:
+        # Lightweight historical adapters have no workspace transaction state.
+        snapshot = await managed_snapshot(db, profile, link.kind,
+            statement_id=link.statement_id if link.kind == "pfs" else None,
+            family_id=getattr(link, "financial_family_id", None))
+    if snapshot is not None:
+        link.financial_family_id = UUID(snapshot["family_id"])
+    return snapshot
+
+
+def _client_form_response(snapshot: dict, link, token: str) -> dict:
+    from app.services import client_financial_forms
+
+    can_edit = getattr(link, "permission", "edit") == "edit"
+    result = {"body": client_financial_forms.client_body(link.kind, snapshot["body"], can_edit=can_edit),
+        "workspace": client_financial_forms.workspace_metadata(snapshot,
+            pdf_base=f"/api/v1/application-profiles/public/financial-forms/{token}/versions"),
+        "permission": getattr(link, "permission", "edit"), "can_edit": can_edit}
+    if link.kind == "debt_schedule":
+        result["completion"] = snapshot.get("completion")
+    if snapshot.get("saved_version"):
+        result["saved_version"] = next((row for row in result["workspace"]["versions"]
+            if row["id"] == snapshot["saved_version"]["id"]), snapshot["saved_version"])
+    return result
+
+
+@router.get("/public/financial-forms/{token}/versions/{version_id}/pdf")
+async def public_financial_version_pdf(token: str, version_id: UUID, db: AsyncSession = Depends(get_db)) -> Response:
+    """An immutable PDF belonging to exactly the form this link opens."""
+    from app.services import financial_workspace
+
+    link = await _open_link_or_404(db, token)
+    profile = await db.get(ApplicationProfile, link.profile_id)
+    snapshot = await _client_link_snapshot(db, profile, link)
+    family, _version = await financial_workspace.version_for_profile(db, profile, version_id)
+    if snapshot is None or str(family.id) != snapshot["family_id"] or family.kind != link.kind:
+        raise HTTPException(404, "Financial version not found")
+    content, filename = await financial_workspace.version_pdf(db, profile, version_id)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "-", filename) or "financial-version.pdf"
+    await db.commit()
+    return Response(content, media_type="application/pdf", headers={
+        "Content-Disposition": f'inline; filename="{safe_name}"', "Cache-Control": "no-store"})
+
+
 @router.get("/public/financial-forms/{token}")
 async def public_financial_form(token: str, db: AsyncSession = Depends(get_db)) -> dict:
     link = await _open_link_or_404(db, token)
@@ -6289,12 +6341,10 @@ async def public_financial_form(token: str, db: AsyncSession = Depends(get_db)) 
         body = financial_statements.seed_pfs_applicant(body, prefill)
         schema = pfs_schema.describe()
 
-    managed = await managed_snapshot(db, profile, link.kind, statement_id=link.statement_id if link.kind == "pfs" else None, family_id=getattr(link, "financial_family_id", None))
+    managed = await _client_link_snapshot(db, profile, link)
     if managed:
-        body = managed["body"]
-        if link.kind == "debt_schedule":
-            body = {**body, "debts": [{**row, "editable": row.get("origin", row.get("owner")) == "client_form", "owner": row.get("origin", row.get("owner"))}
-                                       for row in body.get("debts", []) if row.get("status", "active") == "active"]}
+        response = _client_form_response(managed, link, token)
+        body = response["body"]
     await db.commit()
     return {
         "kind": link.kind,
@@ -6310,6 +6360,7 @@ async def public_financial_form(token: str, db: AsyncSession = Depends(get_db)) 
         # Returned whole so the page can say which fields it filled in and
         # invite the borrower to correct them.
         "prefill": prefill,
+        **(response if managed else {"permission": getattr(link, "permission", "edit"), "can_edit": getattr(link, "permission", "edit") == "edit"}),
     }
 
 
@@ -6326,11 +6377,15 @@ async def save_public_financial_form_draft(
     if getattr(link, "permission", "edit") != "edit":
         raise HTTPException(403, "This form link is read-only")
     profile = await db.get(ApplicationProfile, link.profile_id)
-    managed = await managed_snapshot(db, profile, link.kind, statement_id=link.statement_id if link.kind == "pfs" else None, family_id=getattr(link, "financial_family_id", None))
+    managed = await _client_link_snapshot(db, profile, link)
     if managed:
-        await stage_legacy_body(db, profile, managed, payload.body or {}, public=True)
+        from app.services import client_financial_forms
+
+        result = await client_financial_forms.stage_client_draft(db, profile, managed,
+            body=payload.body or {}, expected_revision=payload.expected_revision,
+            actor=SimpleNamespace(id=None, name=link.invitee_email or "Borrower", email=link.invitee_email or ""))
         await db.commit()
-        return {"saved": True}
+        return {"saved": True, **_client_form_response(result, link, token)}
 
     if link.kind == "real_estate_schedule":
         raise HTTPException(404, "This link is no longer available")
@@ -6398,15 +6453,19 @@ async def submit_public_financial_form(
     if getattr(link, "permission", "edit") != "edit":
         raise HTTPException(403, "This form link is read-only")
     profile = await db.get(ApplicationProfile, link.profile_id)
-    managed = await managed_snapshot(db, profile, link.kind, statement_id=link.statement_id if link.kind == "pfs" else None, family_id=getattr(link, "financial_family_id", None))
+    managed = await _client_link_snapshot(db, profile, link)
     if managed:
+        from app.services import client_financial_forms
+
         if link.kind == "debt_schedule" and "debts" not in (payload.body or {}):
             raise HTTPException(422, "No debt schedule was sent")
-        await stage_legacy_body(db, profile, managed, payload.body or {}, public=True, submit=True,
-                                actor=SimpleNamespace(id=None, name=link.invitee_email or "Borrower", email=link.invitee_email or ""))
+        result = await client_financial_forms.save_submission(db, profile, managed, body=payload.body or {},
+            expected_revision=payload.expected_revision, base_version_id=payload.base_version_id,
+            idempotency_key=client_financial_forms.submission_key(link.id, payload.idempotency_key),
+            actor=SimpleNamespace(id=None, name=link.invitee_email or "Borrower", email=link.invitee_email or ""))
         link.completed_at = datetime.now(UTC)
         await db.commit()
-        return {"completed": True}
+        return {"completed": True, **_client_form_response(result, link, token)}
 
     if link.kind == "real_estate_schedule":
         raise HTTPException(404, "This link is no longer available")

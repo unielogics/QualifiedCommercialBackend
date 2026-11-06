@@ -325,7 +325,7 @@ def test_public_get_dispatches_a_business_statement_link_to_its_schema_and_seede
     assert out["body"]["header"]["business_name"] == "Acme"
     assert out["completed"] is False
     assert out["business_name"] == "Acme"
-    assert set(out) == {"kind", "schema", "body", "completed", "business_name", "prefill"}
+    assert set(out) == {"kind", "schema", "body", "completed", "business_name", "prefill", "permission", "can_edit"}
     assert link.last_used_at is not None
 
 
