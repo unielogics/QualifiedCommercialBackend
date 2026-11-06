@@ -31,6 +31,7 @@ from app.services.debt_terms import (
 CONTRACT_CLASSES = {
     "collateral_debt_evidence", "payoff_or_mortgage_statement", "debt_schedule", "loan_agreement",
     "mca_agreement", "merchant_cash_advance", "financing_contract", "contract", "other",
+    "floorplan_mca_inventory", "advance_agreement", "payoff_letter",
 }
 DOCUMENT_ROLES = {"agreement", "payoff", "supporting"}
 CONTRACT_INSTRUCTIONS = (

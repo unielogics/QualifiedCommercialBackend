@@ -10,7 +10,7 @@ import secrets
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
@@ -24,6 +24,7 @@ from fastapi import (
     Response,
     status,
 )
+from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
@@ -8225,6 +8226,9 @@ async def get_requirement_library(
         for state in states
         if not (state.provenance or {}).get("inactive_definition")
     }
+    from app.services.requirement_lifecycle import DEBT_KEYS
+    if "business_debt_schedule" in on_file:
+        on_file.update(DEBT_KEYS)
     added = {entry["key"] for entry in library.clean_entries(profile.extra_requirements)}
     items = [
         LibraryItemRead(
@@ -8270,6 +8274,17 @@ async def add_application_requirement(
     _require_underwriting_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
     before = await application_programs.get_program_readiness(db, profile)
+    from app.services import requirement_lifecycle
+    removed_key = requirement_lifecycle.resolve_requirement_key(before.inactive_requirements, payload.requirement_key) if payload.requirement_key else None
+    removed = next((item for item in before.inactive_requirements if item.requirement_key == removed_key), None)
+    if removed is not None:
+        await requirement_lifecycle.change(db, profile, removed.requirement_key, action="restore", reason="", actor=user)
+        await profiles.log_profile_action(db, profile, user, "requirement.restored", f"Restored {removed.label} to the checklist",
+                                         target_type="application_requirement", target_id=profile.id,
+                                         metadata={"requirement_key": removed.requirement_key})
+        readiness = await application_programs.get_program_readiness(db, profile)
+        await db.commit()
+        return readiness
     on_file = {
         item.requirement_key: {
             "program_keys": list(item.source_program_keys or []),
@@ -8327,6 +8342,32 @@ async def add_application_requirement(
     return readiness
 
 
+class RequirementLifecycleWrite(BaseModel):
+    action: Literal["remove", "restore"]
+    reason: str = Field(default="", max_length=2000)
+    confirmed: Literal[True]
+
+
+@router.post("/{profile_id}/requirements/{requirement_key}/lifecycle", response_model=ApplicationProgramReadiness)
+async def change_application_requirement_lifecycle(
+    profile_id: UUID, requirement_key: str, payload: RequirementLifecycleWrite,
+    user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> ApplicationProgramReadiness:
+    from app.services import requirement_lifecycle
+
+    _require_underwriting_actor(user)
+    if payload.action == "remove" and len(payload.reason.strip()) < 8:
+        raise HTTPException(422, "A reason of at least eight characters is required")
+    profile = await profiles.load_profile(db, profile_id, user)
+    await requirement_lifecycle.change(db, profile, requirement_key, action=payload.action, reason=payload.reason.strip(), actor=user)
+    await profiles.log_profile_action(db, profile, user, f"requirement.{payload.action}",
+        f"{payload.action.title()} checklist item {requirement_key}", target_type="application_requirement", target_id=profile.id,
+        metadata={"requirement_key": requirement_key, "reason": payload.reason})
+    readiness = await application_programs.get_program_readiness(db, profile)
+    await db.commit()
+    return readiness
+
+
 @router.delete("/{profile_id}/requirements/{requirement_key}/added", response_model=ApplicationProgramReadiness)
 async def remove_added_application_requirement(
     profile_id: UUID,
@@ -8344,7 +8385,8 @@ async def remove_added_application_requirement(
     entry = library.find_entry(profile, requirement_key)
     if entry is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "That requirement was not added to this file")
-    profile.extra_requirements = library.without_entry(profile, requirement_key)
+    from app.services import requirement_lifecycle
+    await requirement_lifecycle.change(db, profile, requirement_key, action="remove", reason="Removed from the staff-added checklist", actor=user)
     await db.flush()
     readiness = await application_programs.get_program_readiness(db, profile)
     await profiles.log_profile_action(

@@ -89,7 +89,8 @@ async def request_states(db: AsyncSession, profile_id: UUID, request_id: UUID | 
     states = list((await db.execute(select(ApplicationRequirementState).where(
         ApplicationRequirementState.profile_id == profile_id,
     ).order_by(ApplicationRequirementState.created_at, ApplicationRequirementState.requirement_key))).scalars().all())
-    return [state for state in states if (state.provenance or {}).get("source_kind") in REQUEST_SOURCE_KINDS
+    return [state for state in states if ((state.provenance or {}).get("source_kind") in REQUEST_SOURCE_KINDS or (state.provenance or {}).get("request_batches"))
+            and not (state.provenance or {}).get("redirect_requirement_key")
             and (request_id is None or str(request_id) in batch_memberships(state))]
 
 
@@ -116,6 +117,11 @@ async def apply_memberships(db, state, memberships: dict) -> None:
     active = [FileRequestItem(**member["item"]) for member in memberships.values() if not member.get("cancelled_at")]
     effective = active[-1].model_copy(update={"quantity": max(item.quantity for item in active)})
     config = item_config(effective, UUID(metadata["file_request_id"]))
+    if effective.document_type == "debt_schedule":
+        from app.services.requirement_lifecycle import normalize_subject, profile_subjects
+        profile = await db.get(ApplicationProfile, state.profile_id)
+        if profile:
+            config = normalize_subject(config, await profile_subjects(db, profile))
     if metadata.get("source_context"):
         config["source_context"] = deepcopy(metadata["source_context"])
     label = request_label(effective)
@@ -170,22 +176,48 @@ async def create_batch(
         await require_hosted_permission(db, requested_documents=[item.document_type for item in items])
     states = []
     candidates = await request_states(db, profile.id)
+    debt_states = list((await db.execute(select(ApplicationRequirementState).where(ApplicationRequirementState.profile_id == profile.id))).scalars().all()) if any(item.document_type == "debt_schedule" for item in items) else []
     namespace = uuid5(profile.id, str(request_id))
     for index, item in enumerate(items):
         context = source_contexts[index] if source_contexts is not None else source_context
         key = f"staff_request_{request_id.hex}_{index}"
         semantic_key = canonical_keys[index] if canonical_keys is not None else f"staff_file_{request_identity(item)[:40]}"
+        if item.document_type == "debt_schedule":
+            from app.services.requirement_lifecycle import (
+                debt_identity,
+                normalize_subject,
+                profile_subjects,
+                state_key,
+            )
+            semantic_key = debt_identity("debt_schedule", normalize_subject(item_config(item, request_id), await profile_subjects(db, profile)))
+            candidates = list({state.id: state for state in [*candidates, *debt_states]}.values())
         previous = next((state for state in candidates
                          if not (state.provenance or {}).get("cancelled_at")
-                         and (state.provenance or {}).get("canonical_key") == semantic_key), None)
+                         and not (state.provenance or {}).get("redirect_requirement_key")
+                         and ((state.provenance or {}).get("canonical_key") == semantic_key
+                              or item.document_type == "debt_schedule" and state_key(state) == semantic_key)), None)
         membership = {"fingerprint": fingerprint, "item": item.model_dump(), "created_at": datetime.now(UTC).isoformat(), "cancelled_at": None}
         if previous is not None:
+            if item.document_type == "debt_schedule":
+                metadata = deepcopy(previous.provenance or {})
+                metadata.setdefault("file_request_id", str(request_id))
+                metadata.setdefault("source_kind", source_kind)
+                metadata.setdefault("source_key", str(request_id))
+                metadata.setdefault("catalog_approved", True)
+                metadata.setdefault("external_definition", {"requirement_key": previous.requirement_key,
+                    "label": previous.label, "category": previous.category, "required_level": previous.required_level,
+                    "requirement_kind": "document", "visibility": ["borrower", "underwriter"],
+                    "completion_mode": "requires_human_verify" if previous.verification_required else "ai_can_complete",
+                    "can_underwriter_waive": True})
+                previous.provenance = metadata
             memberships = batch_memberships(previous)
             memberships[str(request_id)] = membership
             await apply_memberships(db, previous, memberships)
             states.append(previous)
             continue
         config = item_config(item, request_id)
+        if item.document_type == "debt_schedule":
+            config = normalize_subject(config, await profile_subjects(db, profile))
         if context:
             config["source_context"] = deepcopy(context)
         label = request_label(item)
@@ -255,7 +287,9 @@ async def deliver_batch(db: AsyncSession, *, profile: ApplicationProfile, reques
     states = await request_states(db, profile.id, request_id)
     if not states:
         raise HTTPException(404, "File request not found")
-    if all(batch_memberships(state).get(str(request_id), {}).get("cancelled_at") for state in states):
+    states = [state for state in states if not (state.provenance or {}).get("cancelled_at")
+              and not batch_memberships(state).get(str(request_id), {}).get("cancelled_at")]
+    if not states:
         raise HTTPException(409, "This file request was cancelled")
     delivery_key = f"files:{profile.id}:{request_id}:" + (f"retry:{retry_id}" if retry_id else "initial")
     existing = (await db.execute(select(ApplicationRoomDelivery).where(
@@ -313,6 +347,10 @@ async def cancel_batch(db: AsyncSession, *, profile: ApplicationProfile, request
         if any(not member.get("cancelled_at") for member in memberships.values()):
             await apply_memberships(db, state, memberships)
             continue
+        from app.services.requirement_lifecycle import derived_required
+        if derived_required(state):
+            state.provenance = {**(state.provenance or {}), "request_batches": memberships}
+            continue  # Cancelling this staff ask never cancels the policy's shared collection.
         state.status = "not_applicable"
         state.state_reason = "Staff cancelled this file request"
         state.provenance = {**(state.provenance or {}), "request_batches": memberships, "cancelled_at": datetime.now(UTC).isoformat(), "cancelled_by_user_id": str(user.id), "inactive_definition": True}
@@ -350,7 +388,7 @@ async def list_batches(db: AsyncSession, profile: ApplicationProfile, *, refresh
             batch = grouped.setdefault(request_id, {"request_id": request_id, "created_at": member.get("created_at") or state.created_at, "items": [], "deliveries": []})
             batch["items"].append({**metadata.get("request_item", {}), "label": state.label,
                 "requirement_key": state.requirement_key, "requested_document_id": str(state.requested_document_id),
-                "status": "cancelled" if member.get("cancelled_at") else state.status,
+                "status": "cancelled" if member.get("cancelled_at") or metadata.get("cancelled_at") else state.status,
                 "coverage": metadata.get("coverage") or {}, "verified_coverage": metadata.get("verified_coverage") or {},
                 "next_reminder_at": task.next_attempt_at if task else None,
                 "task_id": str(task.id) if task else None, "task_status": task.status if task else None})
@@ -373,7 +411,7 @@ async def loan_todo_items(db: AsyncSession, profile: ApplicationProfile, *, want
          "deeplink": (f"/buckets/request/{link.token}?tab=todo&request={row.requested_document_id}"
                       if link else None)}
         for row in readiness.requirements
-        if row.client_visible and row.provenance.get("source_kind") in REQUEST_SOURCE_KINDS
+        if row.client_visible and (row.provenance.get("source_kind") in REQUEST_SOURCE_KINDS or row.provenance.get("request_batches"))
         and not row.provenance.get("cancelled_at")
         and ((row.status in {"verified", "waived", "not_applicable"}) and want_completed
              or row.status not in {"verified", "waived", "not_applicable"} and want_pending)

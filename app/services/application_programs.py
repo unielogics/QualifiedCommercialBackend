@@ -70,6 +70,7 @@ from app.services import (
     mca_refinance_policy,
     provenance,
     requirement_library,
+    requirement_lifecycle,
 )
 from app.services import funding_programs as program_catalog
 from app.services.activity_log import log_activity
@@ -2915,6 +2916,8 @@ async def _materialize_requirements(
         .scalars()
         .all()
     }
+    await requirement_lifecycle.reconcile(db, profile, list(existing.values()))
+    existing = {state.requirement_key: state for state in existing.values()}
     responses = await collection_tasks.latest_responses(db, profile.id)
     merged: dict[str, dict[str, Any]] = {}
     per_selection: dict[uuid.UUID, list[str]] = defaultdict(list)
@@ -2958,7 +2961,8 @@ async def _materialize_requirements(
     # Requirements the desk added behave like the initial checklist, but a key a
     # program or the policy already requires keeps that definition.
     for extra in extra_requirements or []:
-        if extra.requirement.requirement_key not in merged:
+        if (extra.requirement.requirement_key not in merged
+                or requirement_lifecycle.debt_identity(extra.requirement.requirement_key, getattr(extra.requirement, "collection_config", None), getattr(extra.requirement, "canonical_key", None))):
             merge_requirement(extra.requirement, policy_key=requirement_library.STAFF_POLICY_KEY)
 
     # Lender checklist definitions use the same evidence engine as program
@@ -2966,6 +2970,8 @@ async def _materialize_requirements(
     from types import SimpleNamespace
     for state in existing.values():
         metadata = state.provenance or {}
+        if metadata.get("redirect_requirement_key") or requirement_lifecycle.is_removed(state):
+            continue
         external = metadata.get("external_definition")
         if (metadata.get("source_kind") in {"lender", "staff_request", "financial_form_request"} and external
                 and not metadata.get("cancelled_at") and state.requirement_key not in merged):
@@ -3039,12 +3045,15 @@ async def _materialize_requirements(
         state.verification_required = requires_human
         state.source_program_keys = sorted(source_programs)
         state.source_policy_keys = sorted(source_policies)
+        requirement_lifecycle.reactivate_for_derived(state)
         if requested:
             state.requested_document_id = requested.id
 
         definition_metadata = collection_tasks.definition_metadata(
             requirement, version=criteria_versions.get(requirement.playbook_id, 1)
         )
+        original_keys = {getattr(item, "original_requirement_key", key) for item in merged_item["definitions"]}
+        definition_metadata["requirement_aliases"] = sorted({*(state.provenance or {}).get("requirement_aliases", []), *original_keys} - {key})
         if (getattr(requirement, "canonical_key", None) or key) == "real_estate_schedule":
             definition_metadata = {**definition_metadata, "requirement_kind": "form",
                 "collection_config": {**definition_metadata["collection_config"], "form_kind": "real_estate_schedule", "document_type": "real_estate_schedule"}}
@@ -3082,7 +3091,7 @@ async def _materialize_requirements(
             .all()
         )
         prior_link_ids = {row.file_id for row in prior_links}
-        manual_ids = {row.file_id for row in prior_links if row.source == "operator"}
+        manual_ids = {row.file_id for row in prior_links if row.source == "operator" or (row.provenance or {}).get("merged_from_requirement_state_id")}
         matched_files, _matched_complete, matched_provenance = _matching_evidence_files(
             requirement,
             requested,
@@ -3141,6 +3150,7 @@ async def _materialize_requirements(
             requested.status = "uploaded" if accepted_complete else "requested"
         state.evidence_file_id = linked_files[0].id if linked_files else None
         state.provenance = {
+            **(state.provenance or {}),
             **definition_metadata,
             "inactive_definition": False,
             **matched_provenance,
@@ -3515,6 +3525,10 @@ async def get_program_readiness(
     extra_requirements = (
         await requirement_library.extra_definitions(db, profile) if lending_applicable else []
     )
+    subjects = await requirement_lifecycle.profile_subjects(db, profile)
+    grouped = {key: [requirement_lifecycle.normalize_definition(row, subjects) for row in rows] for key, rows in grouped.items()}
+    grouped_policies = {key: [requirement_lifecycle.normalize_definition(row, subjects) for row in rows] for key, rows in grouped_policies.items()}
+    extra_requirements = [requirement_library.ExtraDefinition(requirement_lifecycle.normalize_definition(extra.requirement, subjects), extra.version, extra.entry) for extra in extra_requirements]
     states, per_selection = await _materialize_requirements(
         db,
         profile,
@@ -3525,6 +3539,12 @@ async def get_program_readiness(
         extra_requirements=extra_requirements,
     )
     overrides = await _active_overrides(db, selections)
+    for state in states:
+        for alias in (state.provenance or {}).get("requirement_aliases", []):
+            for selection in selections:
+                old = overrides.get((selection.id, alias))
+                if old is not None and (selection.id, state.requirement_key) not in overrides:
+                    overrides[(selection.id, state.requirement_key)] = old
     requirement_map = {item.requirement_key: item for item in states}
     visibility: dict[str, bool] = {}
     can_waive: dict[str, bool] = {}
@@ -3850,6 +3870,7 @@ async def get_program_readiness(
                 },
                 client_visible=visibility.get(item.requirement_key, False),
                 can_waive=can_waive.get(item.requirement_key, False),
+                **requirement_lifecycle.lifecycle_fields(item),
                 state_reason=item.state_reason,
                 last_requested_at=item.last_requested_at,
                 received_at=item.received_at,
@@ -3858,6 +3879,13 @@ async def get_program_readiness(
             )
             for item in states
         ],
+        inactive_requirements=[ApplicationRequirementRead(
+            requirement_key=item.requirement_key, label=item.label, category=item.category,
+            required_level=item.required_level, status=item.status, requested_document_id=item.requested_document_id,
+            evidence_file_id=item.evidence_file_id, state_reason=item.state_reason,
+            provenance=dict(item.provenance or {}), **requirement_lifecycle.lifecycle_fields(item),
+        ) for item in (await db.execute(select(ApplicationRequirementState).where(ApplicationRequirementState.profile_id == profile.id))).scalars().all()
+          if requirement_lifecycle.is_removed(item) and not (item.provenance or {}).get("redirect_requirement_key")],
         available_evidence_files=[
             ApplicationEvidenceOptionRead(
                 file_id=file.id,
@@ -3893,6 +3921,9 @@ async def patch_requirement(
     user: User,
 ) -> None:
     readiness = await get_program_readiness(db, profile)
+    resolved = requirement_lifecycle.resolve_requirement_key(readiness.requirements, requirement_key)
+    if resolved is not None:
+        requirement_key = resolved
     state = (
         await db.execute(
             select(ApplicationRequirementState).where(

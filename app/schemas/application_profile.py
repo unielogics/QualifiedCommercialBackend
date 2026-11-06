@@ -257,6 +257,9 @@ class ApplicationRequirementRead(BaseModel):
     program_overrides: dict[str, str] = Field(default_factory=dict)
     client_visible: bool = False
     can_waive: bool = False
+    can_remove: bool = False
+    derived_required: bool = False
+    removal_reason: str | None = None
     state_reason: str | None = None
     last_requested_at: datetime | None = None
     received_at: datetime | None = None
@@ -310,6 +313,7 @@ class ApplicationProgramReadiness(BaseModel):
     candidates: list[ProgramFitCandidate] = Field(default_factory=list)
     programs: list[ProgramReadinessItem] = Field(default_factory=list)
     requirements: list[ApplicationRequirementRead] = Field(default_factory=list)
+    inactive_requirements: list[ApplicationRequirementRead] = Field(default_factory=list)
     available_evidence_files: list[ApplicationEvidenceOptionRead] = Field(default_factory=list)
     evidence_summary: ApplicationEvidenceSummary = Field(default_factory=ApplicationEvidenceSummary)
     can_advance: bool = False
