@@ -129,10 +129,10 @@ def is_removed(state):
 
 
 def resolve_requirement_key(rows, key):
-    candidates = [row for row in rows if not (row.provenance or {}).get("redirect_requirement_key")]
+    candidates = [row for row in rows if not (getattr(row, "provenance", None) or {}).get("redirect_requirement_key")]
     if any(row.requirement_key == key for row in candidates):
         return key
-    matches = {row.requirement_key for row in candidates if key in (row.provenance or {}).get("requirement_aliases", [])}
+    matches = {row.requirement_key for row in candidates if key in (getattr(row, "provenance", None) or {}).get("requirement_aliases", [])}
     if len(matches) > 1:
         raise HTTPException(409, {"code": "requirement_context_ambiguous", "message": "Choose the specific business, person, account or reporting period before changing this requirement."})
     return next(iter(matches), None)
@@ -240,7 +240,7 @@ async def reconcile(db, profile, states):
                 requested.closed_reason = "requirement_merged"
                 requested.requirement_source = {**(requested.requirement_source or {}), "redirect_requirement_key": key,
                                                 "redirect_requested_document_id": str(canonical.requested_document_id)}
-        if profile.missing_item_email_requirement_key in aliases:
+        if getattr(profile, "missing_item_email_requirement_key", None) in aliases:
             profile.missing_item_email_requirement_key = key
     await db.flush()
     return states
