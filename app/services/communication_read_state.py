@@ -214,21 +214,12 @@ async def load_file_scope(db, user, intake_id):
 
 async def file_unread(db, *, user, intake, profile):
     from app.services.communication_scope import intake_sms_rows
+    from app.services.file_communication_unread import email_counts, sms_counts
 
     sms_rows = [row for row in await intake_sms_rows(db, intake, limit=None) if row.direction == "inbound"]
-    sms_ids = await sms_alias_map(db, sms_rows)
-    sms = 0
-    if sms_ids:
-        notices = (await db.execute(select(Notification.meta["message_id"].astext).where(
-            Notification.recipient_user_id == user.id, Notification.read_at.is_(None), Notification.event_type == "sms_received",
-            Notification.meta["message_id"].astext.in_(list(sms_ids))))).scalars().all()
-        sms = len({sms_ids[value] for value in notices if value in sms_ids})
-    email = 0
-    if profile is not None:
-        email = int((await db.execute(select(func.count()).select_from(DealerRepInboxMessage).join(DealerRepInboxThread,
-            DealerRepInboxThread.id == DealerRepInboxMessage.thread_id).where(DealerRepInboxThread.profile_id == profile.id,
-            DealerRepInboxThread.owner_user_id == user.id, DealerRepInboxThread.channel == "email",
-            DealerRepInboxMessage.direction == "inbound", DealerRepInboxMessage.read_at.is_(None)))).scalar_one() or 0)
+    sms = (await sms_counts(db, user_id=user.id, rows_by_intake={intake.id: sms_rows}))[intake.id]
+    emails = await email_counts(db, user_id=user.id, profile_ids=[profile.id] if profile else [])
+    email = int(emails.get(profile.id, 0)) if profile else 0
     return FileCommunicationUnread(intake_id=intake.id, profile_id=profile.id if profile else None,
         sms=sms, email=email, total=sms + email, as_of=datetime.now(UTC))
 

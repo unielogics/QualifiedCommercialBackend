@@ -77,13 +77,8 @@ async def scoped_sms_query(db, user, phone=None):
     return query
 
 
-async def intake_sms_rows(db, intake, *, ids=None, limit=200):
-    """Explicit binding wins; unbound legacy rows require a unique intake phone.
-
-    A contrary intake/profile/client binding never flows through phone fallback.
-    Keep newest 200 for display, then return them chronologically. An explicit
-    IDs read is unbounded by that window for safe seen/reconciliation checks.
-    """
+def intake_sms_clause(intake):
+    """The exact file binding shared by message reads and batch unread counts."""
     profiles = select(ApplicationProfile.id).where(ApplicationProfile.intake_id == intake.id,
         ApplicationProfile.primary_bucket_id == intake.bucket_id)
     client_id = getattr(intake, "client_id", None)
@@ -97,7 +92,17 @@ async def intake_sms_rows(db, intake, *, ids=None, limit=200):
         unique_intake = select(func.count(PublicUnderwritingIntake.id)).where(
             phone_identity_sql(PublicUnderwritingIntake.phone) == number).scalar_subquery() == 1
         fallback = (phone_identity_sql(SmsMessage.phone_e164) == number) & unique_intake & client_ok & SmsMessage.profile_id.is_(None) & SmsMessage.intake_id.is_(None)
-    query = select(SmsMessage).where(or_(bound, fallback))
+    return or_(bound, fallback)
+
+
+async def intake_sms_rows(db, intake, *, ids=None, limit=200):
+    """Explicit binding wins; unbound legacy rows require a unique intake phone.
+
+    A contrary intake/profile/client binding never flows through phone fallback.
+    Keep newest 200 for display, then return them chronologically. An explicit
+    IDs read is unbounded by that window for safe seen/reconciliation checks.
+    """
+    query = select(SmsMessage).where(intake_sms_clause(intake))
     if ids is not None:
         if not ids:
             return []
