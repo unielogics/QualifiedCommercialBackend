@@ -230,7 +230,7 @@ def _records(analyses: list[dict], accounts: dict[str, dict], members: dict[str,
                 reasons.append("statement_period_unknown")
             elif group["start"] > group["end"]:
                 reasons.append("contradictory_statement_period")
-            elif group["start"] and group["end"] and not group["start"] <= on <= group["end"]:
+            elif on is not None and group["start"] and group["end"] and not group["start"] <= on <= group["end"]:
                 reasons.append("outside_statement_period")
             if currency is None:
                 reasons.append("currency_unknown")
@@ -301,6 +301,7 @@ def build_account_movements(analyses: list[dict], accounts: list[dict], *, limit
     members = {str(member): key for key, account in index.items() for member in [key, *(account.get("members") or [])]}
     records, coverage, summaries = _records(analyses, index, members)
     candidates = defaultdict(list)
+    reference_candidates = defaultdict(list)
     counterpart_issues = defaultdict(set)
     inbound = defaultdict(list)
     invalid = {"contradictory_direction", "contradictory_amount", "contradictory_statement_period", "outside_statement_period", "contradictory_currency", "account_identity_conflict", "account_identity_ambiguous", "conflicting_transaction_identity"}
@@ -320,16 +321,30 @@ def build_account_movements(analyses: list[dict], accounts: list[dict], *, limit
                     counterpart_issues[out["id"]].add("counterpart_currency_mismatch")
                     counterpart_issues[incoming["id"]].add("counterpart_currency_mismatch")
                     continue
-                # Only uniqueness matters: two candidates are already ambiguous.
+                if out["reference"] and incoming["reference"] and out["reference"] != incoming["reference"]:
+                    counterpart_issues[out["id"]].add("reference_conflict")
+                    counterpart_issues[incoming["id"]].add("reference_conflict")
+                    continue
+                # Collect exact references before the general candidate cap:
+                # frequent equal payments must not hide a later exact match.
+                # Existing account, amount, date and currency gates still apply;
+                # source acceptance/location and ownership are checked below.
+                if out["reference"] and out["reference"] == incoming["reference"]:
+                    if len(reference_candidates[out["id"]]) < 6:
+                        reference_candidates[out["id"]].append(incoming)
+                    if len(reference_candidates[incoming["id"]]) < 6:
+                        reference_candidates[incoming["id"]].append(out)
                 if len(candidates[out["id"]]) < 6:
                     candidates[out["id"]].append(incoming)
                 if len(candidates[incoming["id"]]) < 6:
                     candidates[incoming["id"]].append(out)
+    candidates = defaultdict(list, {key: reference_candidates[key] or peers for key, peers in candidates.items()})
     movements, used = [], set()
     internal = defaultdict(lambda: {"in": Decimal(0), "out": Decimal(0)})
     for out in records:
         peers = candidates[out["id"]]
-        if out["direction"] != "out" or len(peers) != 1 or len(candidates[peers[0]["id"]]) != 1:
+        if (out["direction"] != "out" or len(peers) != 1 or len(candidates[peers[0]["id"]]) != 1
+                or candidates[peers[0]["id"]][0]["id"] != out["id"]):
             continue
         incoming = peers[0]
         reasons = [*out["reasons"], *incoming["reasons"]]
