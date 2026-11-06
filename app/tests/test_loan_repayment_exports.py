@@ -83,3 +83,13 @@ def test_internal_cost_and_public_packet_count_balloons_once():
     legacy = {"payment": 1000, "principal": 0, "balloon": 10000}
     assert _schedule_cash(legacy) == 11000
     assert _schedule_principal(legacy) == 10000
+
+
+def test_internal_cost_can_price_the_entire_long_daily_schedule():
+    schedule = build_schedule(100000, 12, 120, structure="amortizing", periods_per_year=252,
+        repayment_config={"amortization_months": 180, "balloons": []})
+    assert len(schedule["rows"]) == 2520
+    economics = internal_economics({}, {"amount": 100000, "rate_pct": 12,
+        "schedule": {key: value for key, value in schedule.items() if key != "rows"},
+        "schedule_rows": schedule["rows"]})
+    assert economics["structure_rate_pct"] == pytest.approx(12, abs=.01)
