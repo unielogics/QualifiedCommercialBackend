@@ -554,10 +554,14 @@ async def plan_add(
         )
 
     key = str(requirement_key).strip()
+    from app.services.requirement_lifecycle import debt_identity
+    shared_key = debt_identity(key)
     existing = find_entry(profile, key)
+    if existing is None and shared_key:
+        existing = next((entry for entry in clean_entries(profile.extra_requirements) if debt_identity(entry["key"]) == shared_key), None)
     if existing is not None:
         return AddPlan(entry=existing, label=key, already=True)
-    sources = on_file.get(key)
+    sources = on_file.get(shared_key or key)
     if sources and (sources.get("program_keys") or [item for item in sources.get("policy_keys", []) if item != STAFF_POLICY_KEY]):
         raise HTTPException(status.HTTP_409_CONFLICT, "This file already requires that item")
 

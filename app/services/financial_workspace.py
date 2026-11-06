@@ -488,6 +488,10 @@ async def source_file_for_profile(db: AsyncSession, profile: ApplicationProfile,
 
 async def load_workspace(db: AsyncSession, profile: ApplicationProfile, *, kind: str, family_id: UUID | None = None, actor: Any = None) -> dict:
     family, draft = await resolve_family(db, profile, kind=kind, family_id=family_id, actor=actor)
+    if kind == "debt_schedule":
+        from app.services.financial_debt_intake import initial_seed
+
+        await initial_seed(db, profile, family, draft)
     from app.services import sheets
 
     versions = list((await db.execute(select(FinancialFormVersion).where(FinancialFormVersion.family_id == family.id).order_by(FinancialFormVersion.version_number.desc()))).scalars().all())

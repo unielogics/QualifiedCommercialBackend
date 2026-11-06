@@ -73,6 +73,11 @@ def collects_file(requirement: object) -> bool:
 
 def canonical_identity(key: str, kind: str, config: dict) -> str:
     """Entity and period are part of identity; labels and filenames never are."""
+    from app.services.requirement_lifecycle import debt_identity
+
+    debt_key = debt_identity(key, config)
+    if debt_key:
+        return f"debt_schedule:{debt_key}"
     material = [
         kind,
         key,
@@ -281,6 +286,26 @@ async def sync_collection_tasks(
         .all()
     )
     by_identity = {row.canonical_identity: row for row in existing}
+    from app.services.requirement_lifecycle import normalize_subject, profile_subjects
+    subjects = await profile_subjects(db, profile)
+    # Old aliases used different task keys. Preserve the existing task and its
+    # outreach limits rather than restarting the reminder clock on migration.
+    for row in existing:
+        for key in row.requirement_keys or []:
+            identity = canonical_identity(key, (row.config or {}).get("requirement_kind", "document"), normalize_subject(row.config, subjects))
+            if identity.startswith("debt_schedule:"):
+                current = by_identity.get(identity)
+                if current is None:
+                    by_identity[identity] = row
+                elif current is not row:
+                    current.attempts = max(current.attempts or 0, row.attempts or 0)
+                    current.cadence_hours = max(current.cadence_hours or 24, row.cadence_hours or 24)
+                    current.max_attempts = min(current.max_attempts or 3, row.max_attempts or 3)
+                    dates = [value for value in (current.next_attempt_at, row.next_attempt_at) if value is not None]
+                    current.next_attempt_at = max(dates) if dates else None
+                    current.config = {**(current.config or {}), "merged_task_ids": sorted({str(row.id), *((current.config or {}).get("merged_task_ids") or [])})}
+                    if row.status in {"paused", "unavailable", "escalated"}:
+                        current.status = row.status
     fact_rows = list(
         (
             await db.execute(
@@ -308,7 +333,7 @@ async def sync_collection_tasks(
     grouped: dict[str, list[ApplicationRequirementState]] = {}
     for state in states:
         metadata = state.provenance or {}
-        if metadata.get("cancelled_at") or (state.status == "stale" and metadata.get("inactive_definition")):
+        if metadata.get("cancelled_at") or metadata.get("redirect_requirement_key") or (state.status == "stale" and metadata.get("inactive_definition")):
             continue
         kind = metadata.get("requirement_kind", "document")
         identity = canonical_identity(
@@ -369,10 +394,12 @@ async def sync_collection_tasks(
                 channel="portal",
             )
             db.add(task)
+        task.canonical_identity = identity
         task.requirement_state_ids = [str(row.id) for row in members]
         task.requirement_keys = [row.requirement_key for row in members]
         task.label = first.label
         message_override = (task.config or {}).get("request_message_override")
+        merged_task_ids = (task.config or {}).get("merged_task_ids")
         task.description = _render_request_message(
             message_override
             or metadata.get("request_message")
@@ -396,6 +423,8 @@ async def sync_collection_tasks(
         }
         if message_override:
             task.config = {**task.config, "request_message_override": message_override}
+        if merged_task_ids:
+            task.config = {**task.config, "merged_task_ids": merged_task_ids}
         field_key = task.config.get("field_key") or metadata.get("canonical_key")
         if kind == "field" and field_key in prefills:
             task.config = {**task.config, "prefill": prefills[field_key]}

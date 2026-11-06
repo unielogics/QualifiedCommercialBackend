@@ -435,7 +435,9 @@ async def test_removing_an_added_requirement_takes_it_off_the_checklist_and_only
     assert set(_by_key(readiness)) == {"business_debt_schedule", "business_tax_returns_2_years"}
     assert [entry["key"] for entry in seed.profile.extra_requirements] == ["business_tax_returns_2_years"]
     state = (await db.execute(sa.select(ApplicationRequirementState).where(ApplicationRequirementState.requirement_key == "business_license"))).scalars().one()
-    assert state.status == "stale" and state.provenance["inactive_definition"] is True
+    assert state.status == "not_applicable" and state.provenance["inactive_definition"] is True
+    assert state.provenance["staff_removal"]["removed_at"]
+    assert [item.requirement_key for item in readiness.inactive_requirements] == ["business_license"]
     # and it can be added again
     again = await route.add_application_requirement(seed.profile.id, _add("business_license"), seed.desk, db)
     assert "business_license" in _by_key(again) and _by_key(again)["business_license"].status != "stale"
@@ -451,6 +453,81 @@ async def test_only_what_the_desk_added_can_be_removed(db):
             await route.remove_added_application_requirement(seed.profile.id, key, seed.desk, db)
         assert caught.value.status_code == 404
     assert "business_debt_schedule" in _by_key(await application_programs.get_program_readiness(db, seed.profile))
+
+
+@pytest.mark.asyncio
+async def test_legacy_staff_refinance_alias_and_policy_schedule_materialize_once_after_each_refresh(db):
+    from app.services import requirement_lifecycle
+
+    seed = await _seed(db)
+    await application_programs.get_program_readiness(db, seed.profile)
+    staff = await lib.ensure_staff_playbook(db)
+    definition = _requirement(staff, "refinance_debt_schedule", "Debt schedule if refinancing", level="recommended")
+    db.add(definition)
+    await db.flush()
+    entry = lib.build_entry(key=definition.requirement_key, requirement_id=definition.id, required_level="recommended",
+                            note="Needed for refinance", user_id=seed.desk.id, custom=False)
+    seed.profile.extra_requirements = [entry]
+    duplicate = ApplicationRequirementState(profile_id=seed.profile.id, requirement_key=definition.requirement_key,
+        label=definition.label, category="financials", required_level="recommended", status="requested",
+        source_program_keys=[], source_policy_keys=[lib.STAFF_POLICY_KEY],
+        provenance={"staff_added": lib.provenance_note(entry), "collection_config": {}})
+    db.add(duplicate)
+    await db.flush()
+    old_id = duplicate.id
+    for _ in range(2):
+        readiness = await application_programs.get_program_readiness(db, seed.profile)
+        assert list(_by_key(readiness)) == ["business_debt_schedule"]
+        canonical = readiness.requirements[0]
+        assert canonical.required_level == "required" and canonical.derived_required and not canonical.can_remove
+        assert lib.STAFF_POLICY_KEY in canonical.source_policy_keys
+        assert "refinance_debt_schedule" in canonical.provenance["requirement_aliases"]
+    assert duplicate.id == old_id and duplicate.provenance["redirect_requirement_key"] == "business_debt_schedule"
+    with pytest.raises(HTTPException) as result:
+        await requirement_lifecycle.change(db, seed.profile, "refinance_debt_schedule", action="remove", reason="Remove duplicate request", actor=seed.desk)
+    assert result.value.status_code == 409
+    assert list(_by_key(await application_programs.get_program_readiness(db, seed.profile))) == ["business_debt_schedule"]
+
+
+@pytest.mark.asyncio
+async def test_same_form_for_another_business_period_remains_a_separate_requirement(db):
+    seed = await _seed(db)
+    staff = await lib.ensure_staff_playbook(db)
+    definition = _requirement(staff, "refinance_debt_schedule", "Other LLC prior-year debt schedule")
+    definition.collection_config = {"subject": "Other LLC", "period": "2025", "quantity": 2, "unit": "files"}
+    db.add(definition)
+    await db.flush()
+    seed.profile.extra_requirements = [lib.build_entry(key=definition.requirement_key, requirement_id=definition.id,
+        required_level="required", note=None, user_id=seed.desk.id, custom=False)]
+    readiness = await application_programs.get_program_readiness(db, seed.profile)
+    assert len(readiness.requirements) == 2
+    context = next(item for item in readiness.requirements if item.requirement_key != "business_debt_schedule")
+    assert context.collection_config == definition.collection_config
+    assert context.can_remove and not context.derived_required
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_waiver", [False, True])
+async def test_new_policy_requirement_reactivates_prior_staff_removal_without_inventing_a_waiver(db, explicit_waiver):
+    from app.routers import application_profiles as route
+    from app.schemas.application_profile import ApplicationRequirementPatch
+
+    seed = await _seed(db)
+    await route.add_application_requirement(seed.profile.id, _add("business_license"), seed.desk, db)
+    if explicit_waiver:
+        await application_programs.patch_requirement(db, seed.profile, "business_license",
+            ApplicationRequirementPatch(action="waive", reason="Existing authorized underwriting waiver", confirmed=True), seed.desk)
+    await route.remove_added_application_requirement(seed.profile.id, "business_license", seed.desk, db)
+    db.add(_requirement(seed.policy, "business_license", "Required business license"))
+    await db.flush()
+    for _ in range(2):
+        readiness = await application_programs.get_program_readiness(db, seed.profile)
+        current = _by_key(readiness)["business_license"]
+        assert current.status == ("waived" if explicit_waiver else "missing")
+        assert current.derived_required and not current.can_remove
+        assert "staff_removal" not in current.provenance
+        assert len(current.provenance["staff_removal_history"]) == 1
+        assert current.provenance["staff_removal_history"][0]["reactivated_by_derived_requirement"]
 
 
 @pytest.mark.asyncio

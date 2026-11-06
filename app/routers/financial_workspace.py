@@ -38,6 +38,39 @@ class DebtCandidateAction(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=128)
 
 
+class DebtIntakePreview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    family_id: UUID | None = None
+    expected_revision: int = Field(ge=0)
+    mode: Literal["documents", "banking"]
+
+
+class DebtIntakeApply(DebtIntakePreview):
+    selected_ids: list[str] = Field(min_length=1, max_length=500)
+    idempotency_key: str = Field(min_length=8, max_length=128)
+
+
+@router.post("/debt-intake/proposals")
+async def preview_debt_intake(profile_id: UUID, payload: DebtIntakePreview, user: CurrentUser, db: Db) -> dict:
+    from app.services import financial_debt_intake
+
+    profile = await _profile(db, profile_id, user)
+    result = await financial_debt_intake.proposals(db, profile, **payload.model_dump(), actor=user)
+    await db.commit()
+    return result
+
+
+@router.post("/debt-intake/apply")
+async def apply_debt_intake(profile_id: UUID, payload: DebtIntakeApply, user: CurrentUser, db: Db) -> dict:
+    from app.services import financial_debt_intake
+
+    profile = await _profile(db, profile_id, user)
+    result = await financial_debt_intake.apply(db, profile, **payload.model_dump(), actor=user)
+    await profiles.log_profile_action(db, profile, user, "financial_debt.intake_applied", "Applied reviewed source proposals to the working debt schedule", target_type="financial_form", target_id=UUID(result["family_id"]), metadata={"mode": payload.mode, "selected_count": len(payload.selected_ids)})
+    await db.commit()
+    return result
+
+
 @router.get("/debt-review")
 async def read_debt_review(profile_id: UUID, user: CurrentUser, db: Db, family_id: UUID | None = None) -> dict:
     from app.services import financial_debt_review
