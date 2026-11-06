@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import HTTPException, status
+from pydantic import ValidationError
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +24,7 @@ from app.schemas.funding_program import (
     FundingProgramCommercialTermsCreate,
     FundingProgramCommercialTermsRead,
     FundingProgramCreate,
+    FundingProgramFinancialLimits,
     FundingProgramRetireRequest,
     FundingProgramScopePatch,
     FundingProgramScopeRead,
@@ -31,7 +33,7 @@ from app.schemas.funding_program import (
     PublicFundingProgramCatalogItem,
 )
 from app.services.mca_refinance_policy import MAX_AMOUNT, MAX_TERM_MONTHS
-from app.services.program_rules import ProgramRuleError, validate_rules
+from app.services.program_rules import ProgramRuleError, uses_annual_ebitda, validate_rules
 
 
 def _now() -> datetime:
@@ -91,15 +93,32 @@ def _validate_program_rules_or_422(rules: dict[str, Any] | None) -> None:
         ) from exc
 
 
+def _validate_specialist_financial_rules(program_key: str, rules: dict | None) -> None:
+    if program_key.startswith("arf_") and uses_annual_ebitda(rules):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_field_validation_detail(
+                "rules", "fit", message="ARF uses its separately reviewed specialist policy. Annual EBITDA rules and financial_limits are not supported on this route and cannot be published or silently ignored.",
+            ),
+        )
+
+
 def _version_read(
     playbook: AIPlaybookTemplate,
     requirements: list[AICollectionRequirement],
 ) -> FundingProgramVersionRead:
+    # A malformed manual/legacy metadata record must remain editable. Keep
+    # its raw rules visible; create/publish still reject invalid policy data.
+    try:
+        financial_limits = FundingProgramFinancialLimits.model_validate((playbook.rules or {}).get("financial_limits"))
+    except ValidationError:
+        financial_limits = None
     return FundingProgramVersionRead(
         playbook_id=playbook.id,
         version=playbook.version,
         status=playbook.status,
         rules=dict(playbook.rules or {}),
+        financial_limits=financial_limits,
         requirements=[
             {
                 "requirement_key": row.requirement_key,
@@ -815,6 +834,7 @@ async def create_version(
     user: User,
 ) -> AIPlaybookTemplate:
     _validate_program_rules_or_422(payload.rules)
+    _validate_specialist_financial_rules(program.program_key, payload.rules)
     latest_version = (
         await db.execute(
             select(AIPlaybookTemplate.version)
@@ -898,6 +918,7 @@ async def publish_version(
     if playbook.status != "draft":
         raise HTTPException(status.HTTP_409_CONFLICT, "Only a draft version can be published")
     _validate_program_rules_or_422(playbook.rules)
+    _validate_specialist_financial_rules(program.program_key, playbook.rules)
     if not (playbook.rules or {}).get("fit"):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,

@@ -113,6 +113,9 @@ async def screen(db: AsyncSession, rules: dict, verticals: Sequence[str]) -> dic
     for profile in profiles:
         try:
             context = await application_programs.profile_fit_context(db, profile)
+            # Keep this diagnostic screen aligned with the new verified-only
+            # EBITDA field without changing legacy estimate screening rules.
+            context["annual_ebitda"] = application_programs.evaluation_values(context, context.get("fact_sources") or {}).get("annual_ebitda")
             result = evaluate_rules(rules, context)
         except Exception as exc:  # noqa: BLE001 - one bad file must not hide the screen
             states["error"] += 1

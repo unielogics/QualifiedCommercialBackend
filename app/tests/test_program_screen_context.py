@@ -156,13 +156,15 @@ async def test_helper_maps_candidate_fields_and_clips_the_published_description(
     loader.assert_awaited_once_with(db, [eligible.catalog_id, pending.catalog_id, unpublished.catalog_id])
     assert [entry["program_key"] for entry in screen] == ["ez_term", "sba_7a", "bridge"]
     for entry in screen:
-        # Only the screen vocabulary travels: no scores, ranks, or rule internals.
+        # Only the screen vocabulary and bounded financial checks travel.
         assert set(entry) == {
             "program_key",
             "program_name",
             "recommendation_status",
             "eligible",
             "criteria_status",
+            "criteria_version",
+            "financial_checks",
             "reasons",
             "evidence_gaps",
             "description",
@@ -181,6 +183,8 @@ async def test_helper_maps_candidate_fields_and_clips_the_published_description(
         "recommendation_status": "needs_information",
         "eligible": False,
         "criteria_status": "published",
+        "criteria_version": 2,
+        "financial_checks": [],
         "reasons": ["Credit score is not yet known"],
         "evidence_gaps": ["credit_score"],
         "description": None,
@@ -436,7 +440,9 @@ def _review_fixture(*, with_intake: bool):
         bucket=bucket,
         bucket_id=bucket.id,
         status="queued",
-        context_snapshot={"review_type": "main_street_v1"},
+        context_snapshot={"review_type": "main_street_v1",
+                          "financial_calculation_review": {"stale_cached_earnings": True},
+                          "desk_financial_plan": {"stale_cached_refinance": True}},
         result=None,
     )
     db = Mock(
@@ -563,10 +569,12 @@ def test_review_screen_rules_match_the_contract_and_leave_the_result_shape_alone
     assert "say in executive_summary that the file fits the published criteria for that program by name" in rules
     assert "keep one_next_step on the lender's remaining items" in rules
     assert "name in recommended_next_document_requests the single missing item that would unlock it" in rules
-    assert rules.endswith(
+    assert (
         "Never call a fit an approval, never quote a rate, and never treat a missing credit score as a "
         "failure: the soft credit pull is the last step."
-    )
+    ) in rules
+    assert "published criteria_version and financial_checks" in rules
+    assert "hypothetical Adjusted EBITDA cannot satisfy" in rules
     # The rules steer existing fields only; the JSON shape in the preamble gains nothing.
     assert "published_program_screen" not in bucket_ai.REVIEW_PREAMBLE
     assert "published_program_screen" not in bucket_ai._ensure_review_result_shape({})

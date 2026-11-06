@@ -185,7 +185,7 @@ def reviewed_profitability_facts(snapshot: ApplicationCapitalReadinessSnapshot |
 
 
 FINANCIAL_FIT_FIELDS = frozenset({
-    "revenue", "annual_revenue", "gross_margin_pct", "net_margin_pct", "annualized_deposits",
+    "revenue", "annual_revenue", "annual_ebitda", "gross_margin_pct", "net_margin_pct", "annualized_deposits",
     "deposits", "credit_score", "estimated_credit_score", "dscr", "cash_flow", "debt_burden",
     "liquid_assets", "business_age_years", "nsf_or_overdraft_count",
 })
@@ -206,6 +206,10 @@ def _fit_fact_sources(context: dict, facts: list, files: list, analyses: dict) -
     grouped: dict[str, list] = defaultdict(list)
     for fact in facts:
         key = aliases.get(fact.field_key, fact.field_key)
+        if key == "annual_ebitda":
+            # Only the current source-bound reconciliation below can establish
+            # this fact. A standalone accepted scalar lacks its period/basis.
+            continue
         if key not in FINANCIAL_FIT_FIELDS or fact.status != "accepted" or not fact.reviewed_by_user_id:
             continue
         source_file_id = getattr(fact, "source_file_id", None)
@@ -680,6 +684,14 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
             )
             if current_sources:
                 context["fact_sources"][field] = {"verification_status": "verified", "source_refs": source_rows[:24]}
+    from app.services.financial_cockpit import _analysis_rows
+    from app.services.program_earnings_facts import annual_ebitda_fact
+
+    context["annual_ebitda"], context["fact_sources"]["annual_ebitda"] = annual_ebitda_fact(
+        _analysis_rows(files, latest_analyses, accepted_file_ids),
+        entity=getattr(intake, "business_name", None) or getattr(dealer, "legal_name", None) or getattr(dealer, "name", None),
+        state=getattr(profile, "financial_metric_review", None),
+    )
     return context
 
 
@@ -703,7 +715,7 @@ def evaluation_values(context: dict[str, Any], fact_sources: dict[str, Any]) -> 
     values = dict(context)
     for field in FINANCIAL_FIT_FIELDS:
         status = (fact_sources.get(field) or {}).get("verification_status")
-        if status not in EVALUABLE_FACT_STATUSES:
+        if status not in ({"verified"} if field == "annual_ebitda" else EVALUABLE_FACT_STATUSES):
             values[field] = None
     return values
 
@@ -985,8 +997,23 @@ async def published_candidates(
         rules_valid = True
         if item.program_key.startswith("arf_"):
             from app.services.arf_channel import program_candidate
+            from app.services.program_rules import uses_annual_ebitda
 
-            candidates.append(await program_candidate(db, profile, item, playbook))
+            # Specialist assessment does not evaluate ordinary fit trees. A
+            # malformed legacy version must not ignore a configured earnings
+            # limit and report the file as eligible.
+            if uses_annual_ebitda(playbook.rules):
+                candidates.append(ProgramFitCandidate(
+                    program_key=item.program_key, program_name=item.name,
+                    catalog_id=item.id, public_slug=item.public_slug,
+                    playbook_id=playbook.id, playbook_version=playbook.version,
+                    eligible=False, recommendation_status="criteria_unavailable", criteria_status="invalid",
+                    reasons=["Annual EBITDA rules are not supported by the separately reviewed ARF specialist policy; review the published configuration."],
+                    scope_status="matched" if scope_state is True else "unknown" if scope_state is None else "outside_scope",
+                    fact_sources={"annual_ebitda": fact_sources.get("annual_ebitda", {})},
+                ))
+            else:
+                candidates.append(await program_candidate(db, profile, item, playbook))
             continue
         try:
             validate_rules(playbook.rules or {})

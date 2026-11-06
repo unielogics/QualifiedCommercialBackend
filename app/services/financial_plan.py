@@ -339,6 +339,7 @@ def evaluate_plan(
     service: dict[str, Any],
     proposed: dict[str, Any] | None,
     requested_amount: float | None,
+    ebitda: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     retire = set(plan.get("retire") or [])
     exclude = set(plan.get("exclude") or [])
@@ -511,7 +512,7 @@ def evaluate_plan(
             income_monthly=(float(income_after) / 12.0) if income_after else None,
             existing_service_monthly=before_new or 0.0,
         )
-    return {
+    result = {
         "active": active,
         "risk": risk,
         "retired_ids": sorted(retire),
@@ -560,6 +561,10 @@ def evaluate_plan(
         ),
         "cash_kept": rows[-1]["cumulative"] if rows else 0.0,
     }
+    from app.services.financial_plan_earnings import scenario_ebitda
+
+    result["ebitda"] = scenario_ebitda(ebitda, plan, result, dscr, service)
+    return result
 
 
 def describe_modifications(
@@ -774,6 +779,7 @@ def plan_impact(
         "income_annual": pair(
             evaluation.get("income_before_annual"), evaluation.get("income_after_annual")
         ),
+        "ebitda": evaluation.get("ebitda"),
         "debt_service_monthly": pair(
             evaluation.get("debt_service_before_monthly"),
             evaluation.get("debt_service_after_monthly"),

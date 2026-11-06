@@ -47,11 +47,27 @@ class FundingProgramRequirementRead(BaseModel):
     review_checks: DocumentReviewChecks = Field(default_factory=list)
 
 
+class FundingProgramFinancialLimits(BaseModel):
+    minimum_annual_ebitda: float = Field(strict=True, allow_inf_nan=False)
+    currency: Literal["USD"] = "USD"
+    source_reference: str = Field(min_length=1, max_length=1000)
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("source_reference")
+    @classmethod
+    def _source_reference(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("An explicit annual EBITDA limit requires its policy source")
+        return value.strip()
+
+
 class FundingProgramVersionRead(BaseModel):
     playbook_id: UUID
     version: int
     status: Literal["draft", "published", "archived"]
     rules: dict = Field(default_factory=dict)
+    financial_limits: FundingProgramFinancialLimits | None = None
     requirements: list[FundingProgramRequirementRead] = Field(default_factory=list)
     published_at: datetime | None = None
 
@@ -338,8 +354,24 @@ class FundingProgramVersionCreate(_OptionalReviewReason):
     name: str | None = Field(default=None, max_length=160)
     description: str | None = Field(default=None, max_length=4000)
     rules: dict = Field(default_factory=dict)
+    financial_limits: FundingProgramFinancialLimits | None = None
     requirements: list[FundingProgramRequirementWrite] = Field(default_factory=list, max_length=100)
     confirmed: Literal[True]
+
+    @model_validator(mode="after")
+    def _compile_financial_limits(self):
+        from app.services.program_rules import compile_financial_limits
+
+        stored = self.rules.get("financial_limits")
+        if self.financial_limits is not None:
+            supplied = self.financial_limits.model_dump()
+            if stored is not None and FundingProgramFinancialLimits.model_validate(stored).model_dump() != supplied:
+                raise ValueError("financial_limits conflicts with rules.financial_limits")
+        elif stored is not None:
+            self.financial_limits = FundingProgramFinancialLimits.model_validate(stored)
+        if self.financial_limits is not None:
+            self.rules = compile_financial_limits(self.rules, self.financial_limits.model_dump())
+        return self
 
     @field_validator("requirements")
     @classmethod
