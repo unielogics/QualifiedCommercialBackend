@@ -87,6 +87,7 @@ SLUGS: dict[str, str] = {
     "balance-sheet": "balance_sheet",
     "business-debt-schedule": "debt_schedule",
     "personal-financial-statement": "pfs",
+    "real-estate-schedule": "real_estate_schedule",
 }
 
 #: The fifth download: all four forms as four tabs of one workbook, in this
@@ -113,6 +114,7 @@ ATTACHMENT_FILENAMES: dict[str, str] = {
     "balance_sheet": "Qualified Commercial - Balance Sheet.xlsx",
     "debt_schedule": "Qualified Commercial - Business Debt Schedule.xlsx",
     "pfs": "Qualified Commercial - Personal Financial Statement.xlsx",
+    "real_estate_schedule": "Qualified Commercial - Real Estate Schedule.xlsx",
 }
 
 MONEY_FORMAT = '#,##0.00;(#,##0.00);"-"'
@@ -173,7 +175,7 @@ class _Form:
         self.prefix = sheet.name_prefix
         self.row = 0
         self.cells: dict[str, int] = {}
-        self.keys_beside_inputs = sheet.kind != "debt_schedule"
+        self.keys_beside_inputs = sheet.kind not in {"debt_schedule", "real_estate_schedule"}
         self.monthly_equivalent_column = len(sheet.columns) + 1 if sheet.kind == "debt_schedule" else None
         self.key_column = 3 if self.keys_beside_inputs else len(sheet.columns) + 2
         self.last_column = self.monthly_equivalent_column or max(column.c for column in sheet.columns)
@@ -278,7 +280,7 @@ class _Form:
         cell.alignment = _RIGHT
         if hint:
             cell.comment = Comment(hint, _AUTHOR)
-        self.ws.cell(row=self.row, column=3, value=key)
+        self.ws.cell(row=self.row, column=3 if self.keys_beside_inputs else self.key_column, value=key)
         self._name(key, self.row)
         return self.row
 
@@ -291,7 +293,7 @@ class _Form:
         if emphasis:
             label_cell.font = _BOLD
             cell.font = _BOLD
-        self.ws.cell(row=self.row, column=3, value=key)
+        self.ws.cell(row=self.row, column=3 if self.keys_beside_inputs else self.key_column, value=key)
         self._name(key, self.row)
         return self.row
 
@@ -317,7 +319,7 @@ class _Form:
             target.font = _HEADING_FONT
             target.fill = _HEADING_FILL
             target.alignment = _WRAP
-        if not self.keys_beside_inputs:
+        if self.sheet.kind == "debt_schedule":
             # The schema key under its label, on a hidden row.
             for index, key in enumerate(DEBT_COLUMNS, start=1):
                 self.ws.cell(row=self.row + 1, column=index, value=key)
@@ -330,7 +332,7 @@ class _Form:
     def data(self, row: Row) -> None:
         self.row += 1
         if not self.keys_beside_inputs:
-            self.ws.cell(row=self.row, column=self.key_column, value=f"r{row.ordinal}")
+            self.ws.cell(row=self.row, column=self.key_column, value=f"{row.block}.{row.row_key}" if self.sheet.kind == "real_estate_schedule" else f"r{row.ordinal}")
         for cell in row.cells:
             target = self.ws.cell(row=self.row, column=cell.c)
             target.protection = _UNLOCKED
@@ -486,9 +488,84 @@ def build_workbook(kind: str) -> bytes:
     """The workbook for one kind, as bytes. Built once per process."""
     if kind not in sheet_layout.KINDS:
         raise KeyError(kind)
+    if kind == "real_estate_schedule":
+        return build_real_estate_workbook()
     wb = _blank_workbook(SHEET_TITLES[kind])
     _build(wb, kind)
     return _finished_bytes(wb)
+
+
+def build_real_estate_workbook(body: dict | None = None) -> bytes:
+    """A dated snapshot with editable fields and explicitly labelled totals."""
+    from app.services import real_estate_schema as res
+
+    given = body is not None
+    body = res.validate(body or res.empty_body())
+    shape = sheet_layout.layout_for_body(res.KIND, body) if given else sheet_layout.layout(res.KIND)
+    wb = _blank_workbook(SHEET_TITLES[res.KIND])
+    _render(wb, shape)
+    ws = wb.active
+    for row, cell in sheet_layout.input_cells(shape) if given else []:
+        value = sheet_layout._get(body, cell.path) if cell.path else None
+        if isinstance(value, bool):
+            value = str(value).lower()
+        elif value not in (None, "") and cell.type in {"money", "number", "rate", "percent"}:
+            value = float(value)
+        ws.cell(row=row.r, column=cell.c, value=value)
+    computed = res.totals(body)
+    for row in shape.rows:
+        for cell in row.cells:
+            if cell.compute:
+                value = computed[cell.compute]
+                ws.cell(row=row.r, column=cell.c).value = float(value) if value is not None else '=""'
+    return _finished_bytes(wb)
+
+
+def read_real_estate_workbook(raw: bytes) -> dict:
+    """Read only named inputs and stable row IDs, never exported snapshot totals."""
+    from uuid import UUID, uuid4
+
+    from openpyxl import load_workbook
+
+    from app.services import real_estate_schema as res
+
+    wb = load_workbook(BytesIO(raw), data_only=False)
+    body, lists = res.empty_body(), {block: {} for block in res.COLLECTIONS}
+    key_column = len(res.PROPERTY_FIELDS) + 2
+    for name, defined in wb.defined_names.items():
+        if not name.startswith("res."):
+            continue
+        key = name[4:]
+        parts = key.split(".")
+        destinations = list(defined.destinations)
+        if len(destinations) != 1:
+            continue
+        sheet_name, address = destinations[0]
+        cell = wb[sheet_name][address]
+        value = cell.value
+        if isinstance(value, str) and value.startswith("="):
+            continue
+        if isinstance(value, datetime):
+            value = value.date().isoformat()
+        if len(parts) == 1 and key in {spec["key"] for spec in res.HEADER}:
+            if value is not None:
+                body[key] = value
+        elif len(parts) == 3 and parts[0] in res.COLLECTIONS and parts[2] in {spec["key"] for spec in res.COLLECTIONS[parts[0]]}:
+            row = lists[parts[0]].setdefault(parts[1], {})
+            marker = str(wb[sheet_name].cell(row=cell.row, column=key_column).value or "").split(".", 1)[-1]
+            try:
+                UUID(marker)
+            except ValueError:
+                marker = row.get("id") or str(uuid4())
+            row.update(id=marker, **{parts[2]: value})
+    for block, rows in lists.items():
+        body[block] = [row for row in rows.values() if res.meaningful(row, res.COLLECTIONS[block])]
+    aliases = {f"r{index}": row["id"] for index, row in enumerate(body["properties"], 1)}
+    for row in body["mortgages"]:
+        parent = row.get("property_row_id")
+        if parent in aliases:
+            row["property_row_id"] = aliases[parent]
+    return res.validate(body)
 
 
 @functools.cache
@@ -520,6 +597,8 @@ def workbook_for_slug(slug: str) -> tuple[str, bytes] | None:
 
 def schema_keys(kind: str) -> list[str]:
     """Every key the workbook of this kind must carry a defined name for."""
+    if kind == "real_estate_schedule":
+        return list(sheet_layout.layout(kind).by_xlsx_name)
     if kind in bss.KINDS:
         schema = bss.SCHEMA_FOR[kind]
         keys = [field.key for field in schema.header]

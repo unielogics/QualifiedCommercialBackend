@@ -49,7 +49,7 @@ from app.models._mixins import TimestampMixin
 #: The four sheets a worksheet spans, and the only values a link scope may
 #: name. Kept here rather than imported from `sheet_layout` so the model layer
 #: does not depend on the service layer; `test_sheets.py` pins them equal.
-SHEET_KINDS: tuple[str, ...] = ("p_and_l", "balance_sheet", "debt_schedule", "pfs")
+SHEET_KINDS: tuple[str, ...] = ("p_and_l", "balance_sheet", "debt_schedule", "pfs", "real_estate_schedule")
 
 #: What a link may allow. Stored, not computed: "what did this link permit on
 #: 3 March?" is a question a recomputed capability cannot answer.
@@ -103,7 +103,7 @@ class FinancialFormLinkSheet(Base):
     __table_args__ = (
         UniqueConstraint("link_id", "sheet_kind", name="uq_financial_form_link_sheets_link_kind"),
         CheckConstraint(
-            "sheet_kind in ('pfs','debt_schedule','p_and_l','balance_sheet')",
+            "sheet_kind in ('pfs','debt_schedule','p_and_l','balance_sheet','real_estate_schedule')",
             name="ck_financial_form_link_sheets_kind",
         ),
     )

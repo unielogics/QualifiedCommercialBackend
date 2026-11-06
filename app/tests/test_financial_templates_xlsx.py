@@ -54,7 +54,7 @@ def test_every_schema_key_has_a_defined_name_and_a_hidden_key_beside_it(kind):
     ws = wb.active
     hidden = [letter for letter, dim in ws.column_dimensions.items() if dim.hidden]
     assert hidden, "no hidden key column"
-    if kind != "debt_schedule":
+    if kind not in {"debt_schedule", "real_estate_schedule"}:
         keys = {cell.value for cell in ws["C"] if cell.value}
         assert set(templates.schema_keys(kind)) <= keys
 
@@ -245,7 +245,7 @@ def test_the_packet_stays_inside_the_analyzers_sheet_and_row_budget():
         assert ws.max_row <= MAX_SPREADSHEET_ROWS, (ws.title, ws.max_row)
 
 
-@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("kind", templates.PACKET_KINDS)
 def test_every_defined_name_of_every_single_workbook_is_in_the_packet_on_its_own_tab(kind):
     """The pl. / bs. / ds. / pfs. prefixes keep the four sets apart in one
     workbook, and each name still carries its own sheet title, so a reader
@@ -260,7 +260,7 @@ def test_every_defined_name_of_every_single_workbook_is_in_the_packet_on_its_own
         assert _named_cell(packet, name).parent.title == templates.SHEET_TITLES[kind], name
 
 
-@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("kind", templates.PACKET_KINDS)
 def test_each_packet_tab_is_cell_for_cell_the_single_workbook(kind):
     single = _open(kind).active
     tab = _packet()[templates.SHEET_TITLES[kind]]

@@ -79,7 +79,7 @@ async def test_scoped_chat_context_uses_the_exact_current_version_and_file_scope
     query = db.execute.await_args.args[0]
     assert "current_version_id" in str(query)
     params = query.compile().params
-    assert profile_id in params.values() and "pfs" in params.values()
+    assert profile_id in params.values() and ["pfs", "real_estate_schedule"] in params.values()
     assert [file_id] in params.values()
 
 

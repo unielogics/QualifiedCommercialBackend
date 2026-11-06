@@ -296,6 +296,7 @@ _FORM_KIND_BY_CLASSIFICATION = {
     "debt_schedule": "debt_schedule",
     "current_p_and_l": "p_and_l",
     "balance_sheet": "balance_sheet",
+    "real_estate_schedule": "real_estate_schedule",
 }
 
 
@@ -1537,7 +1538,7 @@ async def _requested_document(
             return None
     collection_config = getattr(requirement, "collection_config", None) or {}
     form_kind = collection_config.get("form_kind") if getattr(requirement, "requirement_kind", None) == "form" else None
-    request_category = {"pfs": "Personal Financials", "debt_schedule": "Debts", "p_and_l": "Financials", "balance_sheet": "Financials"}.get(form_kind, requirement.category)
+    request_category = {"pfs": "Personal Financials", "debt_schedule": "Debts", "p_and_l": "Financials", "balance_sheet": "Financials", "real_estate_schedule": "Real estate"}.get(form_kind, requirement.category)
     requested = (
         await db.execute(
             select(BucketRequestedDocument)
@@ -1554,7 +1555,7 @@ async def _requested_document(
             .limit(1)
         )
     ).scalar_one_or_none()
-    if requested is None and form_kind in {"pfs", "debt_schedule", "p_and_l", "balance_sheet"}:
+    if requested is None and form_kind in {"pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule"}:
         from app.routers.application_profiles import _requested_slot
         requested = await _requested_slot(db, profile, form_kind)
     if requested is None and not collection_config.get("file_request_id"):
@@ -2966,7 +2967,7 @@ async def _materialize_requirements(
     for state in existing.values():
         metadata = state.provenance or {}
         external = metadata.get("external_definition")
-        if (metadata.get("source_kind") in {"lender", "staff_request"} and external
+        if (metadata.get("source_kind") in {"lender", "staff_request", "financial_form_request"} and external
                 and not metadata.get("cancelled_at") and state.requirement_key not in merged):
             definition = {
                 "id": state.id, "playbook_id": state.id, "requirement_key": state.requirement_key,
@@ -3044,6 +3045,9 @@ async def _materialize_requirements(
         definition_metadata = collection_tasks.definition_metadata(
             requirement, version=criteria_versions.get(requirement.playbook_id, 1)
         )
+        if (getattr(requirement, "canonical_key", None) or key) == "real_estate_schedule":
+            definition_metadata = {**definition_metadata, "requirement_kind": "form",
+                "collection_config": {**definition_metadata["collection_config"], "form_kind": "real_estate_schedule", "document_type": "real_estate_schedule"}}
         staff_added = extra_by_key.get(key)
         if staff_added is not None and requirement_library.STAFF_POLICY_KEY in source_policies:
             definition_metadata = {
@@ -3053,11 +3057,11 @@ async def _materialize_requirements(
                     requirement_library.form_kinds_for(key, getattr(requirement, "canonical_key", None)),
                 ),
             }
-        if (state.provenance or {}).get("source_kind") in {"lender", "staff_request"}:
+        if (state.provenance or {}).get("source_kind") in {"lender", "staff_request", "financial_form_request"}:
             definition_metadata = {**definition_metadata, **{
                 name: (state.provenance or {}).get(name)
                 for name in ("source_kind", "source_key", "catalog_approved", "external_definition", "definition_version", "definition_id",
-                             "file_request_id", "request_fingerprint", "request_item", "request_instructions", "requested_by_user_id", "request_batches")
+                             "file_request_id", "request_fingerprint", "request_item", "request_instructions", "requested_by_user_id", "request_batches", "source_context")
             }}
         state.provenance = {**(state.provenance or {}), **definition_metadata, "inactive_definition": False}
         if not collection_tasks.collects_file(requirement):

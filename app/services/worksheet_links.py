@@ -63,7 +63,7 @@ LINK_KIND = "worksheet"
 #: The workbook's four sheets in tab order. Duplicated from `sheet_layout.KINDS`
 #: rather than imported at module scope so this module stays importable without
 #: the grid service; `_ordered` checks against it.
-SHEET_KINDS: tuple[str, ...] = ("p_and_l", "balance_sheet", "debt_schedule", "pfs")
+SHEET_KINDS: tuple[str, ...] = ("p_and_l", "balance_sheet", "debt_schedule", "pfs", "real_estate_schedule")
 
 _PIN_MAX_ATTEMPTS = 5
 _PIN_LOCKOUT = timedelta(minutes=15)
@@ -379,7 +379,7 @@ def pin_required_for(permission: str, sheets: Any) -> bool:
     the actual status quo this replaces. So: not mandatory, and the dialog
     should still default it on.
     """
-    return (permission or "edit") == "edit" or "pfs" in {str(k) for k in (sheets or [])}
+    return (permission or "edit") == "edit" or bool({"pfs", "real_estate_schedule"}.intersection(str(k) for k in (sheets or [])))
 
 
 async def set_pin(link: FinancialFormLink, pin: str | None = None) -> str:

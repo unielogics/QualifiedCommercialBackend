@@ -227,7 +227,7 @@ def _read(*, kinds=None, can_edit=True, worksheet=None, origin="admin", **readin
 
 def test_the_read_returns_the_four_sheets_with_flat_values_and_computed_figures():
     payload = _read()
-    assert [sheet["kind"] for sheet in payload["sheets"]] == list(sheet_layout.KINDS)
+    assert [sheet["kind"] for sheet in payload["sheets"]] == list(sheets.DEFAULT_KINDS)
     assert payload["layout_version"] == sheet_layout.LAYOUT_VERSION
     assert payload["business_name"] == "Acme LLC"
 
@@ -249,7 +249,7 @@ def test_the_read_returns_the_four_sheets_with_flat_values_and_computed_figures(
 def test_every_sheet_carries_its_own_shape_schema_version_and_revision():
     payload = _read(worksheet=_worksheet(revision=7))
     by_kind = {sheet["kind"]: sheet for sheet in payload["sheets"]}
-    assert set(by_kind) == set(SHEET_KINDS)
+    assert set(by_kind) == set(sheets.DEFAULT_KINDS)
     for kind, sheet in by_kind.items():
         assert sheet["schema_version"] == sheet_layout.SCHEMA_VERSIONS[kind]
         assert sheet["title"] == sheet_layout.SHEET_TITLES[kind]

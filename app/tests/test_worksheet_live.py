@@ -477,7 +477,7 @@ def _staff_patches(user, worksheet):
 
 
 @pytest.mark.asyncio
-async def test_the_desk_streams_all_four_sheets_and_is_named_from_its_account():
+async def test_the_desk_streams_all_staff_sheets_and_is_named_from_its_account():
     user = SimpleNamespace(id=uuid.uuid4(), role=Role.LOAN_EXEC, name="Jane Desk", email="j@x.com")
     worksheet = SimpleNamespace(id=uuid.uuid4(), profile_id=uuid.uuid4(), revision=3)
     a, b, c = _staff_patches(user, worksheet)
@@ -492,7 +492,7 @@ async def test_the_desk_streams_all_four_sheets_and_is_named_from_its_account():
     state = _frames(raw)[0]
     assert state["type"] == "presence.state"
     assert state["data"]["you"]["name"] == "Jane Desk"
-    assert set(state["data"]["you"]["sheets"]) == set(ALL_SHEETS)
+    assert set(state["data"]["you"]["sheets"]) == set(ALL_SHEETS) | {"real_estate_schedule"}
     # A signed-in user is already named; no display name is taken from the
     # request, so nothing self-declared sits beside a proved one.
     import inspect

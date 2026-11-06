@@ -30,8 +30,8 @@ class LibraryItemRead(BaseModel):
     required_level: RequiredLevel
     description: str = ""
     #: The first online form this item is filled in through, when it is one of the four.
-    form_kind: Literal["pfs", "debt_schedule", "p_and_l", "balance_sheet"] | None = None
-    form_kinds: list[Literal["pfs", "debt_schedule", "p_and_l", "balance_sheet"]] = Field(default_factory=list)
+    form_kind: Literal["pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule"] | None = None
+    form_kinds: list[Literal["pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule"]] = Field(default_factory=list)
     #: False for an internal review the client is never asked for.
     client_visible: bool = True
     verification_required: bool = True

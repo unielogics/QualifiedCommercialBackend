@@ -64,9 +64,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.application_profile import ApplicationProfile
 from app.models.financial_worksheet import FinancialWorksheet
 from app.services import business_statement_schema as bss
-from app.services import business_statements, financial_statements, pfs_schema, sheet_layout
+from app.services import (
+    business_statements,
+    financial_statements,
+    pfs_schema,
+    real_estate_schema,
+    sheet_layout,
+)
 
 KINDS: tuple[str, ...] = sheet_layout.KINDS
+DEFAULT_KINDS = ("p_and_l", "balance_sheet", "debt_schedule", "pfs")
 
 #: How far behind a client may be before it is told to reload rather than
 #: patched. Two people typing produce a few revisions a second; two hundred is
@@ -187,6 +194,8 @@ def _layout_for(
     delete as one fewer instead of being rounded back up to the floor.
     """
     body = body or {}
+    if kind == "real_estate_schedule":
+        return sheet_layout.layout(kind, schedule_rows={block: _row_keys(body.get(block) or [], 0 if exact == block else BLANK_SCHEDULE_ROWS) for block in real_estate_schema.COLLECTIONS})
     if kind == "debt_schedule":
         minimum = 0 if exact == "debts" else BLANK_DEBT_ROWS
         return sheet_layout.layout(kind, debt_rows=_row_keys(body.get("debts") or [], minimum))
@@ -295,6 +304,8 @@ def _schema_for(kind: str) -> dict[str, Any]:
         return bss.describe(kind)
     if kind == "pfs":
         return pfs_schema.describe()
+    if kind == "real_estate_schedule":
+        return real_estate_schema.describe()
     return {"kind": "debt_schedule", "columns": list(financial_statements.DEBT_COLUMNS)}
 
 
@@ -394,6 +405,11 @@ async def _load(
         loaded = _Loaded(body, None, status="draft", completed=False, rev=worksheet.revision)
         loaded.draft = draft
         return loaded
+    if kind == "real_estate_schedule":
+        _family, draft = await financial_workspace.resolve_family(db, profile, kind=kind)
+        loaded = _Loaded(dict(draft.body), None, status="draft", completed=False, rev=worksheet.revision)
+        loaded.draft = draft
+        return loaded
     if kind in bss.KINDS:
         body, statement = await business_statements.body_for_profile(
             db, profile, kind, dict(prefill)
@@ -443,7 +459,7 @@ def _scoped(kinds: Iterable[str] | None) -> list[str]:
     scope rows had been deleted into a link that opens everything, which is
     the failure this whole mechanism exists to prevent.
     """
-    wanted = set(KINDS if kinds is None else kinds)
+    wanted = set(DEFAULT_KINDS if kinds is None else kinds)
     return [kind for kind in KINDS if kind in wanted]
 
 
@@ -728,7 +744,7 @@ async def refresh_touched_pdfs(
     from app.services import drafted_forms
 
     for kind in dict.fromkeys(kinds):
-        if kind not in KINDS:
+        if kind not in KINDS or kind == "real_estate_schedule":
             continue
         try:
             await drafted_forms.enqueue_form_refresh(
@@ -867,7 +883,7 @@ async def apply_row_op(
     picture of the sheet came from a read.
     """
     _kind_or_400(kind)
-    if kind not in ("debt_schedule", "pfs"):
+    if kind not in ("debt_schedule", "pfs", "real_estate_schedule"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "This sheet has a fixed row list")
     if op not in ("insert", "delete"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown row operation")
@@ -892,6 +908,23 @@ async def apply_row_op(
             by=by,
             origin_client_id=client_id,
         )
+
+    if kind == "real_estate_schedule":
+        if block not in real_estate_schema.COLLECTIONS:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Choose properties or mortgages")
+        body = dict(loaded.body)
+        rows = _as_seen(list(body.get(block) or []), minimum=BLANK_SCHEDULE_ROWS, origin=origin, visible=visible)
+        fresh = _blank_line(origin) if op == "insert" else None
+        rows = _apply_rows(rows, op=op, row_id=row_id, after=after, blank=fresh)
+        body[block] = rows
+        if block == "properties" and op == "delete":
+            remaining = {str(row.get("id")) for row in rows}
+            body["mortgages"] = [row for row in body.get("mortgages") or [] if not row.get("property_row_id") or str(row["property_row_id"]) in remaining]
+        saved = await _save_kind(db, profile, kind, loaded, body, origin=origin, actor_user_id=actor_user_id)
+        worksheet.revision = int(worksheet.revision) + 1
+        await db.flush()
+        await _announce(db, worksheet, [_row_announcement(fresh["id"] if fresh else row_id, worksheet.revision)])
+        return {"rows": _row_payloads(kind, dict(saved.body), exact=block), "row_meta": {}, "rev": {kind: worksheet.revision}}
 
     if kind == "pfs":
         spec = pfs_schema.SCHEDULES_BY_KEY.get(str(block or ""))
