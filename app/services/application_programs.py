@@ -2642,6 +2642,32 @@ def _evidence_shadow_comparison(
     }
 
 
+def _evidence_analysis_details(file: Any, analysis: Any, decision: Any = None) -> dict[str, str | None]:
+    """Expose recognition confidence without borrowing another reading's facts.
+
+    A high-confidence contract classification can still be a low-confidence
+    match for a complete debt schedule. Do not conflate the two confidences or
+    combine a stale requirement decision with a replacement file's analysis.
+    """
+    unknown = {"detected_classification": None, "analysis_confidence": None}
+    if (analysis is None or getattr(analysis, "status", None) != "completed"
+            or getattr(analysis, "bucket_file_id", None) != file.id
+            or not getattr(file, "content_hash", None)
+            or getattr(analysis, "content_hash", None) != file.content_hash):
+        return unknown
+    if decision is not None:
+        analysis_id = getattr(decision, "analysis_id", None)
+        content_hash = getattr(decision, "content_hash", None)
+        analysis_version = getattr(decision, "analysis_version", None)
+        if ((analysis_id is not None and analysis_id != analysis.id)
+                or (content_hash is not None and content_hash != analysis.content_hash)
+                or (analysis_version is not None and analysis_version != analysis.analysis_version)
+                or (analysis_id is None and not (content_hash and analysis_version is not None))):
+            return unknown
+    return {"detected_classification": getattr(analysis, "classification", None),
+            "analysis_confidence": getattr(analysis, "confidence", None)}
+
+
 async def _latest_evidence_decisions(
     db: AsyncSession,
     links: list[ApplicationRequirementEvidence],
@@ -3669,6 +3695,7 @@ async def get_program_readiness(
             ai_reason_code=decision.reason_code if decision else None,
             ai_explanation=decision.explanation if decision else None,
             ai_confidence=decision.confidence if decision else None,
+            **_evidence_analysis_details(file, available_analyses.get(file.id), decision),
             decision_actor=(
                 decision.actor_kind if decision else "staff" if link.verified_by_user_id else None
             ),
