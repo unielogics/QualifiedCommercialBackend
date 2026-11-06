@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from datetime import UTC, datetime
 from html import escape
 from urllib.parse import quote
@@ -21,6 +22,24 @@ from app.services.financial_version_selection import (
     accepted_debt_schedule_snapshot,
     active_debt_schedule_rows,
 )
+
+
+def reviewed_loan_reference(row):
+    """Display only a bounded reference explicitly retained on the saved row."""
+    evidence = row.get("evidence") if isinstance(row.get("evidence"), dict) else {}
+    raw = row.get("loan_reference") or evidence.get("loan_reference")
+    if not isinstance(raw, str) or len(raw) > 80:
+        return None
+    value = " ".join(raw.split())
+    if not value or not re.fullmatch(r"[A-Za-z0-9#*/ ._-]+", value) or re.search(r"\bssn\b|\b\d{3}-\d{2}-\d{4}\b", value, re.I):
+        return None
+    return value
+
+
+def debt_heading(debt, ordinal):
+    label = f"{ordinal}. {debt.get('lender') or 'Unnamed obligation'}"
+    reference = reviewed_loan_reference(debt)
+    return f"{label} - loan {reference}" if reference else label
 
 
 def _links(body):
@@ -75,7 +94,9 @@ def build_manifest(version, files, *, scoped_ids, latest_ids, reviewed_payoff_id
                 "reviewed_payoff_date": str(link["payoff_date"]) if link.get("payoff_date") else None,
                 "duplicate_row_ids": [duplicate_id] if duplicate_id else [],
             }
+        reference = reviewed_loan_reference(row)
         debts.append({"row_id": row_id, "lender": row.get("lender") or "Unnamed obligation",
+                      **({"loan_reference": reference} if reference else {}),
                       "balance": str(row["balance"]) if row.get("balance") is not None else None,
                       "monthly_payment": str(row["monthly_payment"]) if row.get("monthly_payment") is not None else None,
                       "documents": list(documents.values())})
@@ -176,7 +197,7 @@ def index_text(manifest):
     lines = ["Debt supporting documents", f"Accepted schedule v{schedule.get('version_number', '-')} - {saved_at_label(schedule.get('saved_at'))}",
              "Only the accepted schedule supplies debt figures. Linked images do not establish a current payoff."]
     for number, debt in enumerate(manifest.get("debts") or [], 1):
-        lines += ["", f"{number}. {debt['lender']}", f"Balance: {debt.get('balance') or 'unknown'}; monthly payment: {debt.get('monthly_payment') or 'unknown'}"]
+        lines += ["", debt_heading(debt, number), f"Balance: {debt.get('balance') or 'unknown'}; monthly payment: {debt.get('monthly_payment') or 'unknown'}"]
         for document in debt["documents"]:
             label = "Current reviewed payoff" if document["current_payoff"] else "Previously selected payoff; review latest" if document["selected_current_payoff"] else document["role"]
             lines.append(f"  {label}: {document.get('file_name') or 'Unavailable linked source'} - {document['status']}; {document.get('archive_path') or 'NOT INCLUDED'}")
@@ -207,7 +228,7 @@ def index_html(manifest):
             label = "Current reviewed payoff" if document["current_payoff"] else "Previously selected payoff; review latest" if document["selected_current_payoff"] else document["role"]
             payoff = f"; reviewed amount {escape(str(document.get('reviewed_payoff_amount') or 'unknown'))}; date {escape(str(document.get('reviewed_payoff_date') or 'unknown'))}" if document["role"] == "payoff" else ""
             items.append(f"<li>{escape(label)}: {name} - {escape(document['status'])}{payoff}</li>")
-        sections.append(f"<section><h2>{number}. {escape(str(debt['lender']))}</h2><ul>{''.join(items) or '<li>No linked supporting documents.</li>'}</ul></section>")
+        sections.append(f"<section><h2>{escape(debt_heading(debt, number))}</h2><ul>{''.join(items) or '<li>No linked supporting documents.</li>'}</ul></section>")
     return '<!doctype html><html><head><meta charset="utf-8"><title>Debt supporting documents</title></head><body><h1>Debt supporting documents</h1><p>Sources belong to the accepted saved schedule. Images and older payoff letters are supporting evidence, not an automatic current payoff.</p>' + "".join(sections) + "</body></html>"
 
 

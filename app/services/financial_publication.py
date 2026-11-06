@@ -43,6 +43,38 @@ def snapshot_matches_publication(snapshot: Any, published_at: datetime | None) -
     return stamp.replace(tzinfo=stamp.tzinfo or UTC) >= published_at.replace(tzinfo=published_at.tzinfo or UTC)
 
 
+def debt_row_identity_context(body: dict, *, visible_file_ids: set[UUID] | None = None) -> list[dict]:
+    """Stable row associations only; amounts stay in the existing fact contract."""
+    from app.services.debt_package_evidence import reviewed_loan_reference
+    from app.services.financial_version_selection import active_debt_schedule_rows
+
+    visible = {str(value) for value in visible_file_ids} if visible_file_ids is not None else None
+    result = []
+    has_metadata = False
+    for ordinal, row in enumerate(active_debt_schedule_rows(body), 1):
+        documents = []
+        seen = set()
+        links = row.get("evidence_links") if "evidence_links" in row else row.get("documents")
+        for link in links or []:
+            if not isinstance(link, dict) or link.get("role") not in {"agreement", "payoff", "supporting"}:
+                continue
+            try:
+                file_id = str(UUID(str(link.get("file_id"))))
+            except (ValueError, TypeError):
+                continue
+            key = (file_id, link["role"])
+            if (visible is not None and file_id not in visible) or key in seen:
+                continue
+            seen.add(key)
+            documents.append({"file_id": file_id, "role": link["role"]})
+        reference = reviewed_loan_reference(row)
+        has_metadata |= bool(reference or documents)
+        result.append({"ordinal": ordinal, "row_id": str(row["id"]) if row.get("id") else None,
+                       "lender": row.get("lender"), "loan_reference": reference, "documents": documents})
+    # Avoid changing older contexts which contain only aggregate debt facts.
+    return result if has_metadata else []
+
+
 async def current_version_context(db: AsyncSession, *, profile_id: UUID | None = None, bucket_id: UUID | None = None, visible_file_ids: set[UUID] | None = None, client_safe: bool = False) -> list[dict]:
     """Only pointer-selected versions inside the caller's demonstrated scope."""
     if not isinstance(getattr(db, "info", None), dict):
@@ -91,6 +123,9 @@ async def current_version_context(db: AsyncSession, *, profile_id: UUID | None =
                 item["business_name"] = version.body.get("business_name") or (version.key_facts or {}).get("business_name")
                 item["currency"] = version.body.get("currency") or (version.key_facts or {}).get("currency")
                 item["source"] = {"kind": "accepted_financial_version", "file_id": item["source_file_id"], "version_id": item["version_id"], "version_number": version.version_number}
+                identities = debt_row_identity_context(version.body, visible_file_ids=visible_file_ids)
+                if identities:
+                    item["debt_rows"] = identities
         context.append(item)
     return context
 

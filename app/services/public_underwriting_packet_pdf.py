@@ -2046,7 +2046,7 @@ def _debt_evidence_section(financials: dict[str, Any]) -> str:
     schedule = _record(manifest.get("schedule"))
     if manifest.get("status") != "accepted":
         return ""
-    from app.services.debt_package_evidence import saved_at_label
+    from app.services.debt_package_evidence import debt_heading, saved_at_label
 
     header = f"Accepted debt schedule v{schedule.get('version_number', '-')} - saved {saved_at_label(schedule.get('saved_at'))}"
     sections = [f'<section class="card"><h2>Debt supporting documents</h2><p>{escape(header)}</p><p>Sources are linked to the saved obligation below. Images alone do not establish a current payoff. The ZIP debt-evidence index opens the included originals.</p></section>']
@@ -2063,7 +2063,7 @@ def _debt_evidence_section(financials: dict[str, Any]) -> str:
             )) + "</tr>")
         if not rows:
             rows = ['<tr><td colspan="4">No supporting documents linked to this saved obligation.</td></tr>']
-        sections.append(f'<section class="card debt-evidence"><h2>{number}. {escape(str(debt.get("lender") or "Unnamed obligation"))}</h2><p>Balance {_money(debt.get("balance"))}; monthly payment {_money(debt.get("monthly_payment"))}.</p><table class="grid-table"><thead><tr><th>Role / payoff review</th><th>Source document</th><th>Source status</th><th>Reviewed payoff</th></tr></thead><tbody>{"".join(rows)}</tbody></table></section>')
+        sections.append(f'<section class="card debt-evidence"><h2>{escape(debt_heading(debt, number))}</h2><p>Balance {_money(debt.get("balance"))}; monthly payment {_money(debt.get("monthly_payment"))}.</p><table class="grid-table"><thead><tr><th>Role / payoff review</th><th>Source document</th><th>Source status</th><th>Reviewed payoff</th></tr></thead><tbody>{"".join(rows)}</tbody></table></section>')
     return "".join(sections)
 
 

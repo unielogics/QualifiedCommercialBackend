@@ -1575,7 +1575,7 @@ async def propose_import(db: AsyncSession, profile: ApplicationProfile, *, kind:
             family, draft = await resolve_family(db, profile, kind=kind, family_id=family.id, actor=actor)
     cached = (await db.execute(select(FinancialFormImport).where(FinancialFormImport.family_id == family.id, FinancialFormImport.source_file_id == file.id,
         FinancialFormImport.proposed_body["target_debt_id"].astext.is_(None),
-        or_(FinancialFormImport.proposed_body["import_scope"].astext.is_(None), FinancialFormImport.proposed_body["import_scope"].astext != "mortgage_statement")).order_by(FinancialFormImport.created_at.desc()).limit(1))).scalar_one_or_none()
+        or_(FinancialFormImport.proposed_body["import_scope"].astext.is_(None), FinancialFormImport.proposed_body["import_scope"].astext.notin_(["mortgage_statement", "debt_batch"]))).order_by(FinancialFormImport.created_at.desc()).limit(1))).scalar_one_or_none()
     content_hash = getattr(analysis, "content_hash", None) or file.content_hash
     summary_cached = cached and any("Summary-only extraction" in warning for warning in cached.warnings)
     if cached and cached.content_hash == content_hash:
@@ -1663,8 +1663,8 @@ async def apply_import(db: AsyncSession, profile: ApplicationProfile, import_id:
     family = await db.get(FinancialFormFamily, imported.family_id) if imported else None
     if family is None or family.profile_id != profile.id:
         raise HTTPException(404, "Financial import not found")
-    if (imported.proposed_body or {}).get("import_scope") == "mortgage_statement":
-        raise HTTPException(422, "Use mortgage statement review to apply this mapping")
+    if (imported.proposed_body or {}).get("import_scope") in {"mortgage_statement", "debt_batch"}:
+        raise HTTPException(422, "Use the dedicated source review to apply this mapping")
     family, draft = await resolve_family(db, profile, kind=family.kind, family_id=family.id, actor=actor)
     _check_revision(draft, expected_revision)
     if imported.status != "proposed":
