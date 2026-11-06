@@ -2952,6 +2952,57 @@ def _bank_analysis_needs_long_output(analysis: Any, response: Any = None) -> boo
     return False
 
 
+def _apply_verified_bank_movements(
+    analysis: Any, *, file: Any, raw: bytes, content_type: str,
+) -> None:
+    """Add exact printed transfer details without changing cached bank figures.
+
+    Supplied bytes have already been fetched by the normal analyzer. This is a
+    deterministic enrichment, not another provider call or financial save.
+    """
+    if getattr(analysis, "status", None) != "completed" or getattr(analysis, "classification", None) != "bank_statement":
+        return
+    if _media_type(content_type, "") != "application/pdf":
+        return
+    from app.services.wells_fargo_bank_movements import PARSER_VERSION, parse_wells_fargo_pdf
+
+    payload = getattr(analysis, "analysis", None)
+    payload = payload if isinstance(payload, dict) else {}
+    facts = payload.get("key_facts")
+    facts = facts if isinstance(facts, dict) else {}
+    actual_hash = _sha256_bytes(raw)
+    warning = "Individual bank transfer details need source review; existing extracted figures remain available."
+    try:
+        result = parse_wells_fargo_pdf(raw)
+        metadata = {key: value for key, value in result.items() if key != "transfer_lines"}
+        reasons = []
+        if result.get("source_hash") != actual_hash or getattr(analysis, "content_hash", None) != actual_hash or getattr(file, "content_hash", None) != actual_hash:
+            reasons.append("source_hash_mismatch")
+        existing_account = facts.get("account_last4")
+        if existing_account not in (None, ""):
+            digits = re.sub(r"\D", "", str(existing_account))
+            if len(digits) < 4 or digits[-4:] != result.get("account_last4"):
+                reasons.append("existing_account_identity_conflict")
+        currency = str(facts.get("currency") or "").strip().upper()
+        if currency and result.get("currency") and currency != result["currency"]:
+            reasons.append("existing_currency_conflict")
+        applicable = result.get("recognized") and result.get("coverage", {}).get("complete") and not reasons
+        metadata["status"] = "applied" if applicable else "unrecognized" if not result.get("recognized") else "needs_review"
+        metadata["warning_codes"] = reasons
+        if applicable:
+            facts = {**facts, "transfer_lines": result["transfer_lines"]}
+            if not currency and result.get("currency") == "USD":
+                facts = {**facts, "currency": "USD", "currency_basis": result["currency_basis"]}
+    except Exception:  # noqa: BLE001 - advisory extraction cannot reject a readable bank statement
+        metadata = {"parser_version": PARSER_VERSION, "source_hash": actual_hash, "status": "error",
+                    "coverage": {"complete": False}, "warning_codes": ["bank_movement_parser_failed"]}
+    warnings = payload.get("read_warnings")
+    warnings = [value for value in warnings if value != warning] if isinstance(warnings, list) else []
+    if metadata["status"] in {"needs_review", "error"}:
+        warnings.append(warning)
+    analysis.analysis = {**payload, "key_facts": facts, "bank_movement_extraction": metadata, "read_warnings": warnings}
+
+
 async def analyze_bucket_file(
     db: AsyncSession,
     file: BucketFile,
@@ -3016,6 +3067,7 @@ async def analyze_bucket_file(
             file_name=file.file_name,
         ):
             _refresh_profitability_diagnostics(cached)
+            _apply_verified_bank_movements(cached, file=file, raw=raw, content_type=content_type)
             cached.usability_status = analysis_usability(cached)
             if not getattr(cached, "document_type_candidates", None):
                 cached.document_type_candidates = _content_type_candidates({
@@ -3232,6 +3284,7 @@ async def analyze_bucket_file(
                 # A citation projection cannot reject a readable document.
                 log.exception("financial citation validation unavailable analysis=%s", getattr(row, "id", None))
         _refresh_profitability_diagnostics(row)
+        _apply_verified_bank_movements(row, file=file, raw=raw, content_type=content_type)
         row.usability_status = analysis_usability(row)
         row.input_tokens = input_tokens
         row.output_tokens = output_tokens
