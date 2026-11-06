@@ -494,16 +494,23 @@ def evaluate_plan(
         if service_override is not None
         else float(service.get("monthly") or 0.0)
     )
-    before_new = round(max(0.0, service_monthly - retired_monthly), 2)
+    ref = plan.get("terms_ref") or {}
+    retained = _num(ref.get("retained_annual_debt_service"))
+    configured_refinance = bool(schedule and schedule.get("repayment_config") is not None
+        and source == "recorded_terms" and ref.get("treatment") == "refinance" and retained is not None
+        and (overrides.get("debt_service_note") or "").startswith("Refinance per ")
+        and service_override is not None and abs(float(service_override) - round(retained / 12, 2)) < .005)
+    # Canonical recorded refinance terms already state the debt remaining
+    # AFTER these payoffs. Preserve the payoff selections and their evidence,
+    # without subtracting their payments from retained debt a second time.
+    before_new = round(max(0.0, service_monthly if configured_refinance else service_monthly - retired_monthly), 2)
     after_monthly = round(max(0.0, before_new + float(new_payment or 0.0)), 2)
     after_annual = after_monthly * 12
     if schedule and schedule.get("repayment_config") is not None:
         exact_new_annual = schedule["coverage_annual_debt_service"] if abs(float(new_payment or 0) - schedule["coverage_payment_monthly"]) < .005 else float(new_payment or 0) * 12
         exact_existing_annual = before_new * 12
-        ref = plan.get("terms_ref") or {}
-        retained = _num(ref.get("retained_annual_debt_service"))
-        if source == "recorded_terms" and ref.get("treatment") == "refinance" and retained is not None and (overrides.get("debt_service_note") or "").startswith("Refinance per ") and service_override is not None and abs(float(service_override) - round(retained / 12, 2)) < .005:
-            exact_existing_annual = max(0, retained - retired_monthly * 12)
+        if configured_refinance:
+            exact_existing_annual = retained
         after_annual = round(exact_existing_annual + exact_new_annual, 2)
 
     candidates_after = []

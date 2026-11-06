@@ -338,6 +338,38 @@ def test_exact_retained_annual_refinance_value_survives_advanced_adoption():
     assert evaluate(plan)["debt_service_after_annual"] == 112345.67
 
 
+@pytest.mark.parametrize("mode", ["canonical", "staff_note", "staff_amount", "legacy"])
+def test_configured_refinance_retains_after_payoff_service_without_losing_payoff_evidence(mode):
+    recorded = {"kind": "client_terms", "id": "terms", "version": 1, "label": "Terms", "amount": 100000,
+        "rate_pct": 0, "term_months": 12, "structure": "amortizing", "interest_only": False,
+        "payment_monthly": 8333.33, "payments_per_year": 12,
+        "repayment_config": {"amortization_months": 24, "after_balloon": "keep_payment", "balloons": []},
+        "treatment": "refinance", "retained_annual_debt_service": 12345.67}
+    if mode == "legacy":
+        recorded["repayment_config"] = None
+    plan = financial_plan.normalize_plan(plan_terms_link.adopt({"retire": ["row:paid"]}, recorded))
+    if mode == "staff_note":
+        plan["overrides"]["debt_service_note"] = "Staff explicitly changed the service basis"
+    if mode == "staff_amount":
+        plan["overrides"]["debt_service_monthly"] = 2000
+    before = deepcopy(plan)
+    paid = {"id": "row:paid", "monthly": 1000, "payoff": 50000, "in_debt_service": True}
+    result = financial_plan.evaluate_plan(plan, obligations_list=[paid], recurring={}, months=[],
+        dscr={"headline": {"key": "profit_and_loss", "value": 5, "numerator": 120000},
+              "candidates": [{"key": "profit_and_loss", "numerator": 120000, "value": 5}]},
+        service={"monthly": 3000}, proposed=None, requested_amount=None)
+    assert plan == before and result["retired_ids"] == ["row:paid"]
+    assert result["retired_count"] == 1 and result["payoff_total"] == 50000
+    if mode == "canonical":
+        assert result["debt_service_before_new_payment_monthly"] == 1028.81
+        assert result["debt_service_after_annual"] == 112345.67
+        assert result["risk"]["existing_service_monthly"] == 1028.81
+    elif mode == "staff_amount":
+        assert result["debt_service_before_new_payment_monthly"] == 1000
+    else:
+        assert result["debt_service_before_new_payment_monthly"] == 28.81
+
+
 @pytest.mark.asyncio
 async def test_production_prefill_keeps_zero_apr_and_simple_interest_io():
     config = deepcopy(CONFIG)
