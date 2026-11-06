@@ -56,7 +56,7 @@ async def test_inbound_communication_notification_is_individual_and_deep_linked(
     assert captured["event_type"] == "sms_received"
     assert captured["target_type"] == "communication_thread"
     assert captured["target_id"] == "sms:phone:+12015550100"
-    assert captured["deep_link"] == "/inbox?thread=sms%3Aphone%3A%2B12015550100"
+    assert captured["deep_link"] == "/messages?thread=sms%3Aphone%3A%2B12015550100"
     assert captured.get("batch_key") is None
     assert captured["email"] is False
 

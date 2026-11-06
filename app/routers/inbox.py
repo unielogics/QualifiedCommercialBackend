@@ -18,12 +18,14 @@ Endpoints (all under /api/v1/inbox, all owner-scoped):
   GET  /inbox/search?q=                    subject/sender search (owner-scoped)
 """
 
+# FastAPI dependencies intentionally use callable defaults.
+# ruff: noqa: B008
 from __future__ import annotations
 
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import Text, or_, select, update
@@ -69,8 +71,8 @@ def _sort_dt(row: EmailMessage) -> datetime:
     tolerates NULL received_at (nullable on the model)."""
     dt = row.received_at or row.created_at
     if dt is None:
-        return datetime.min.replace(tzinfo=timezone.utc)
-    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+        return datetime.min.replace(tzinfo=UTC)
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
 def _preview(body: str | None) -> str | None:
@@ -178,7 +180,7 @@ async def list_threads(
     if starred_only:
         summaries = [s for s in summaries if s.is_starred]
 
-    summaries.sort(key=lambda s: (s.last_received_at or datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
+    summaries.sort(key=lambda s: (s.last_received_at or datetime.min.replace(tzinfo=UTC)), reverse=True)
     total = len(summaries)
     page = summaries[offset : offset + limit]
     return InboxThreadListResponse(threads=page, total=total, truncated=truncated)
@@ -213,7 +215,6 @@ async def get_thread(thread_id: str, user: CurrentUser, db: AsyncSession = Depen
         )
         for r in rows
     ]
-    latest = rows[-1]
     return InboxThreadDetail(
         thread_id=thread_id,
         subject=next((r.subject for r in reversed(rows) if r.subject), None),
@@ -279,7 +280,7 @@ async def reply_to_thread(
     # than forming a disconnected new thread.
     real_thread = latest_inbound.gmail_thread_id or str(latest_inbound.id)
     out_gmail_id = result.message_id or f"local-{uuid.uuid4().hex}"
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     # from_email is the mailbox owner's identity for THEIR OWN thread view (the row is
     # owner-scoped). On the SES fallback the wire From is the firm address; we
     # intentionally attribute the reply to the owner here rather than the transport.
@@ -338,6 +339,7 @@ async def mark_thread_read(
 ):
     """Mark every message in the owner's thread read/unread."""
     is_read = payload.is_read if payload is not None else True
+    rows = await _load_thread_rows(db, owner_id=user.id, thread_id=thread_id)
     result = await db.execute(
         update(EmailMessage)
         .where(EmailMessage.owner_user_id == user.id)  # ISOLATION: owner-only
@@ -346,6 +348,10 @@ async def mark_thread_read(
     )
     if result.rowcount == 0:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found")
+    if is_read:
+        from app.services.communication_read_state import mark_mailbox_messages_seen
+
+        await mark_mailbox_messages_seen(db, user_id=user.id, rows=[row for row in rows if row.direction == "inbound"])
     return None
 
 
@@ -367,6 +373,10 @@ async def mark_message_read(
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
     row.is_read = is_read
+    if is_read and row.direction == "inbound":
+        from app.services.communication_read_state import mark_mailbox_messages_seen
+
+        await mark_mailbox_messages_seen(db, user_id=user.id, rows=[row])
     return None
 
 
@@ -446,7 +456,7 @@ async def search_inbox(
             )
         )
 
-    summaries.sort(key=lambda s: (s.last_received_at or datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
+    summaries.sort(key=lambda s: (s.last_received_at or datetime.min.replace(tzinfo=UTC)), reverse=True)
     total = len(summaries)
     return InboxThreadListResponse(threads=summaries[offset : offset + limit], total=total, truncated=truncated)
 

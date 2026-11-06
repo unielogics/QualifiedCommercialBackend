@@ -149,14 +149,14 @@ async def _mirror_file_email_reply(
     gmail_id: str,
     gmail_thread_id: str | None = None,
     owner_user_id: uuid.UUID | None = None,
-) -> None:
+) -> bool:
     """Attach an inbound Gmail reply to its provider-backed file thread.
 
     Exact sender and normalized-subject matching keeps unrelated mailbox mail
     out of a funding file while allowing the file and Inbox to share history.
     """
     if not from_email or not subject:
-        return
+        return False
     from app.dealer_os.models import DealerRepContact, DealerRepInboxThread
     from app.dealer_os.router import _append_rep_inbox_message
 
@@ -165,7 +165,7 @@ async def _mirror_file_email_reply(
     # stable thread id and fall back to exact participant + normalized subject.
     app_thread = None
     if owner_user_id is not None and gmail_thread_id:
-        app_thread = (
+        exact = list((
             await db.execute(
                 select(DealerRepInboxThread).where(
                     DealerRepInboxThread.owner_user_id == owner_user_id,
@@ -175,7 +175,10 @@ async def _mirror_file_email_reply(
                     DealerRepInboxThread.provider_thread_id == gmail_thread_id,
                 )
             )
-        ).scalars().first()
+        ).scalars().all())
+        if len(exact) > 1:
+            return False
+        app_thread = exact[0] if exact else None
     if app_thread is None and owner_user_id is not None:
         candidates = list(
             (
@@ -187,20 +190,21 @@ async def _mirror_file_email_reply(
                         DealerRepInboxThread.channel == "email",
                         DealerRepInboxThread.status == "open",
                         DealerRepInboxThread.subject_key == subject_key,
+                        DealerRepInboxThread.provider_thread_id.is_(None),
                     )
                     .order_by(DealerRepInboxThread.last_message_at.desc().nullslast())
                 )
             ).scalars().all()
         )
-        app_thread = next(
-            (
+        matches = [
                 thread
                 for thread in candidates
                 if from_email.lower()
                 in {str(value).strip().lower() for value in (thread.participant_emails or [])}
-            ),
-            None,
-        )
+            ]
+        if len(matches) > 1:
+            return False
+        app_thread = matches[0] if matches else None
     if app_thread is not None:
         if gmail_thread_id and not app_thread.provider_thread_id:
             app_thread.provider_thread_id = gmail_thread_id
@@ -218,7 +222,7 @@ async def _mirror_file_email_reply(
             sender=from_email,
             recipient=mailbox,
         )
-        return
+        return True
 
     row = (
         await db.execute(
@@ -230,13 +234,15 @@ async def _mirror_file_email_reply(
                 DealerRepInboxThread.status == "open",
                 DealerRepInboxThread.subject_key == subject_key,
                 DealerRepInboxThread.dealer_id.is_not(None),
+                DealerRepInboxThread.owner_user_id == owner_user_id,
+                DealerRepInboxThread.provider_thread_id.is_(None),
             )
             .order_by(DealerRepInboxThread.last_message_at.desc().nullslast())
-            .limit(1)
         )
-    ).first()
-    if row is None:
-        return
+    ).all()
+    if len(row) != 1:
+        return False
+    row = row[0]
     thread, contact = row
     await _append_rep_inbox_message(
         db,
@@ -252,6 +258,7 @@ async def _mirror_file_email_reply(
         sender=from_email,
         recipient=mailbox,
     )
+    return True
 
 
 async def run_user_inbox_sync() -> dict[str, int]:
@@ -380,16 +387,7 @@ async def _ingest_message(db: AsyncSession, *, owner_user_id, mailbox: str, gmai
     db.add(row)
     await db.flush()
     thread_key = row.gmail_thread_id or str(row.id)
-    await notify_inbound_communication(
-        db,
-        recipient_ids={owner_user_id},
-        channel="email",
-        sender_label=from_email,
-        thread_id=f"email:{thread_key}",
-        message_id=str(row.id),
-        subject=subject,
-    )
-    await _mirror_file_email_reply(
+    mirrored = await _mirror_file_email_reply(
         db,
         from_email=from_email,
         mailbox=mailbox,
@@ -399,6 +397,11 @@ async def _ingest_message(db: AsyncSession, *, owner_user_id, mailbox: str, gmai
         gmail_thread_id=thread_id,
         owner_user_id=owner_user_id,
     )
+    if not mirrored:
+        await notify_inbound_communication(
+            db, recipient_ids={owner_user_id}, channel="email", sender_label=from_email,
+            thread_id=f"email:{thread_key}", message_id=str(row.id), subject=subject,
+        )
     # Dealer Desk outreach uses a tokenized plus-address Reply-To.  Correlate
     # that narrow namespace here while the parsed headers/body are already in
     # memory; unrelated inbox mail remains a cheap no-op.

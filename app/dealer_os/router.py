@@ -8579,6 +8579,7 @@ async def _append_rep_inbox_message(
             thread_id=f"rep:{thread.id}",
             message_id=str(msg.id),
             subject=subject,
+            profile_id=getattr(thread, "profile_id", None),
         )
     # Timeline: a client writing in from outside lands on the file. The file
     # thread's own mirror (provider="file_message") is already on the timeline

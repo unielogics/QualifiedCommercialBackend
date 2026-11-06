@@ -719,7 +719,7 @@ async def test_inbound_gmail_reply_prefers_profile_provider_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     thread = SimpleNamespace(provider_thread_id=None, participant_emails=["client@example.com"])
-    scalar_result = SimpleNamespace(first=lambda: thread)
+    scalar_result = SimpleNamespace(all=lambda: [thread])
     db = AsyncMock()
     db.execute = AsyncMock(return_value=SimpleNamespace(scalars=lambda: scalar_result))
     append = AsyncMock()
