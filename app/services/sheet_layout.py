@@ -38,13 +38,13 @@ from __future__ import annotations
 import copy
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import field as _dc_field
 from decimal import Decimal
 from typing import Any
 
 from app.services import business_statement_schema as bss
-from app.services import pfs_schema
+from app.services import pfs_schema, real_estate_schema
 from app.services.debt_terms import PAYMENT_FREQUENCIES, normalize_terms
 from app.services.debt_types import DEBT_TYPE_SLUGS, DEBT_TYPES
 from app.services.financial_statements import DEBT_COLUMN_LABELS, DEBT_COLUMNS
@@ -54,13 +54,14 @@ LAYOUT_VERSION = "qc_sheets.v1"
 #: The debt schedule has no schema module of its own; the version travels here.
 DEBT_SCHEMA_VERSION = "qc_ds.v2"
 
-KINDS: tuple[str, ...] = ("p_and_l", "balance_sheet", "debt_schedule", "pfs")
+KINDS: tuple[str, ...] = ("p_and_l", "balance_sheet", "debt_schedule", "pfs", "real_estate_schedule")
 
 SHEET_TITLES: dict[str, str] = {
     "p_and_l": "Profit and Loss",
     "balance_sheet": "Balance Sheet",
     "debt_schedule": "Business Debt Schedule",
     "pfs": "Personal Financial Statement",
+    "real_estate_schedule": "Real Estate Schedule",
 }
 
 NAME_PREFIX: dict[str, str] = {
@@ -68,6 +69,7 @@ NAME_PREFIX: dict[str, str] = {
     "balance_sheet": "bs",
     "debt_schedule": "ds",
     "pfs": "pfs",
+    "real_estate_schedule": "res",
 }
 
 SCHEMA_VERSIONS: dict[str, str] = {
@@ -75,6 +77,7 @@ SCHEMA_VERSIONS: dict[str, str] = {
     "balance_sheet": bss.BS_SCHEMA_VERSION,
     "debt_schedule": DEBT_SCHEMA_VERSION,
     "pfs": pfs_schema.SCHEMA_VERSION,
+    "real_estate_schedule": real_estate_schema.SCHEMA_VERSION,
 }
 
 #: Rows in the debt-schedule grid. The owner's template had fifteen.
@@ -360,13 +363,14 @@ class _Rows:
         compute: str | None = None,
         source: str | None = None,
         emphasis: bool = True,
+        format: str = "money",
     ) -> None:
         self.r += 1
         cell = Cell(
             c=2,
             type="formula",
             xlsx_name=key,
-            format="money",
+            format=format,
             compute=compute,
             source=source,
             formula=formula,
@@ -797,6 +801,31 @@ def _row_keys(spec: int | Sequence[str]) -> list[str]:
     return [str(key) for key in spec]
 
 
+def _real_estate_schedule(per: Mapping[str, Sequence[str]]) -> Sheet:
+    rows = _Rows()
+    rows.heading("Real Estate Schedule")
+    for spec in real_estate_schema.HEADER:
+        boolean = spec["input"] == "boolean"
+        rows.field(spec["key"], spec["label"], (spec["key"],), input="select" if boolean else spec["input"], options=("true", "false") if boolean else None)
+    for block, specs in real_estate_schema.COLLECTIONS.items():
+        rows.heading("Properties" if block == "properties" else "Mortgages / liens")
+        rows.r += 1
+        rows._add(Row(rows.r, "colhead", block=block, cells=tuple(_label(index, spec["label"]) for index, spec in enumerate(specs, 1))))
+        for ordinal, row_key in enumerate(per[block], 1):
+            rows.r += 1
+            cells = tuple(Cell(c=index, type="rate" if spec["input"] == "percent" else "text" if spec["input"] == "number" else spec["input"], key=f"{block}.{row_key}.{spec['key']}", xlsx_name=f"{block}.r{ordinal}.{spec['key']}",
+                               editable=True, format="money" if spec["input"] == "money" else "date" if spec["input"] == "date" else "count" if spec["input"] == "number" else "text",
+                               hint="Choose a property on screen. In a blank workbook, r1 or r2 refers to that property row; saved exports retain the linked property ID." if spec["key"] == "property_row_id" else None,
+                               options=tuple(spec["options"]) if spec.get("options") else None, path=(block, row_key, spec["key"])) for index, spec in enumerate(specs, 1))
+            rows._add(Row(rows.r, "data", cells=cells, block=block, row_key=row_key, ordinal=ordinal))
+    rows.note("Unknown values remain blank. Mortgage payments are separate from operating expenses; cash flow uses principal and interest only.")
+    rows.note("Current export totals; edits are recalculated when imported/saved online.")
+    for key, label in real_estate_schema.TOTAL_LABELS.items():
+        rows.formula(key, label, '=""', compute=key, format="count" if key.endswith("_count") else "money")
+    columns = tuple(Column(index, "", 24 if index == 1 else 18) for index in range(1, len(real_estate_schema.PROPERTY_FIELDS) + 1))
+    return _sheet("real_estate_schedule", columns, rows.rows, freeze=(0, 1))
+
+
 def layout(
     kind: str,
     *,
@@ -814,6 +843,9 @@ def layout(
         return _p_and_l() if kind == "p_and_l" else _balance_sheet()
     if kind == "debt_schedule":
         return _debt_schedule(_row_keys(debt_rows))
+    if kind == "real_estate_schedule":
+        per = {block: _row_keys(schedule_rows.get(block, 2) if isinstance(schedule_rows, Mapping) else 2 if schedule_rows is None else schedule_rows) for block in real_estate_schema.COLLECTIONS}
+        return _real_estate_schedule(per)
     if kind == "pfs":
         if schedule_rows is None or isinstance(schedule_rows, int):
             count = PFS_SCHEDULE_ROWS if schedule_rows is None else schedule_rows
@@ -839,6 +871,14 @@ def _list_row_key(row: Any, ordinal: int) -> str:
 def layout_for_body(kind: str, body: Mapping[str, Any] | None) -> Sheet:
     """The layout whose list rows are the body's rows, keyed by identity."""
     body = body or {}
+    if kind == "real_estate_schedule":
+        sheet = layout(kind, schedule_rows={block: [_list_row_key(row, n) for n, row in enumerate(body.get(block) or [], 1)] for block in real_estate_schema.COLLECTIONS})
+        addresses = {_list_row_key(row, n): str(row.get("address") or "").strip()[:160] for n, row in enumerate(body.get("properties") or [], 1)}
+        choices = tuple((row.row_key, f"Property {row.ordinal}" + (f" - {addresses[row.row_key]}" if addresses.get(row.row_key) else ""))
+                        for row in sheet.rows if row.kind == "data" and row.block == "properties")
+        rows = tuple(replace(row, cells=tuple(replace(cell, type="select", options=tuple(key for key, _ in choices), option_labels=choices)
+                    if cell.path and cell.path[-1] == "property_row_id" else cell for cell in row.cells)) for row in sheet.rows)
+        return _sheet(kind, sheet.columns, rows, freeze=sheet.freeze)
     if kind == "debt_schedule":
         debts = body.get("debts") or []
         return layout(kind, debt_rows=[_list_row_key(row, n) for n, row in enumerate(debts, start=1)])
@@ -892,6 +932,8 @@ def totals(kind: str, body: Mapping[str, Any] | None) -> dict[str, Any]:
         return pfs_schema.totals(body)
     if kind == "debt_schedule":
         return debt_totals(body)
+    if kind == "real_estate_schedule":
+        return real_estate_schema.totals(body)
     raise KeyError(kind)
 
 
@@ -937,7 +979,7 @@ def _get(body: Mapping[str, Any], path: tuple[str, ...]) -> Any:
 def _is_row_step(path: tuple[str, ...], index: int) -> bool:
     """Whether path[index] is a row key inside a list — `debts.<row>.<col>`
     and `schedules.<schedule>.<row>.<col>` are the two list-shaped paths."""
-    if path[0] == "debts":
+    if path[0] in {"debts", "properties", "mortgages"}:
         return index == 1
     return path[0] == "schedules" and index == 2
 
@@ -993,6 +1035,10 @@ def _path_for_key(kind: str, key: str) -> tuple[str, ...]:
     static = layout(kind).by_key.get(key)
     if static is not None and static[1].path is not None:
         return static[1].path
+    if kind == "real_estate_schedule":
+        parts = key.split(".")
+        if len(parts) == 3 and parts[0] in real_estate_schema.COLLECTIONS and parts[2] in {spec["key"] for spec in real_estate_schema.COLLECTIONS[parts[0]]}:
+            return tuple(parts)
     if kind == "debt_schedule":
         row_key, _, column = key.rpartition(".")
         if row_key and column in DEBT_COLUMNS:

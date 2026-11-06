@@ -532,6 +532,77 @@ def render_balance_sheet_pdf(*, body: dict, financial_totals: dict | None = None
     return pdf
 
 
+def build_real_estate_schedule_html(*, body: dict, financial_totals: dict | None = None) -> str:
+    """Property and lien identities stay separate; unknown values stay visible."""
+    from app.services import real_estate_schema as res
+
+    totals = res.totals(body)
+    if financial_totals is not None:
+        totals.update({key: financial_totals[key] for key in totals if key in financial_totals})
+
+    def value(spec, raw):
+        if raw in (None, "", "unknown"):
+            return "<span class='unknown'>Not stated</span>"
+        if spec.get("input") == "money":
+            return html.escape(f"${float(raw):,.2f}")
+        if spec.get("input") in {"rate", "percent"}:
+            return html.escape(f"{float(raw):g}%")
+        return html.escape(str(raw).replace("_", " ") if spec.get("input") == "select" else str(raw))
+
+    def fields(specs, row):
+        pairs = list(specs)
+        rendered = []
+        for index in range(0, len(pairs), 2):
+            cells = "".join(f"<th>{html.escape(spec['label'])}</th><td>{value(spec, row.get(spec['key']))}</td>" for spec in pairs[index:index + 2])
+            if len(pairs[index:index + 2]) == 1:
+                cells += "<th></th><td></td>"
+            rendered.append("<tr>" + cells + "</tr>")
+        return "<table class='fields'><tbody>" + "".join(rendered) + "</tbody></table>"
+
+    properties, mortgages = res.properties(body), res.mortgages(body)
+    sections = []
+    for ordinal, property_row in enumerate(properties, 1):
+        own = [row for row in mortgages if row.get("property_row_id") == property_row["id"]]
+        heading = html.escape(str(property_row.get("address") or "Address not stated"))
+        content = f"<section class='property'><h2>Property {ordinal}: {heading}</h2>" + fields(res.PROPERTY_FIELDS, property_row)
+        content += "<h3>Mortgages / liens</h3>"
+        if not own:
+            content += "<p>Reported free and clear.</p>" if property_row.get("mortgage_status") == "free_clear" else "<p class='unknown'>Mortgage details not stated.</p>"
+        for number, mortgage in enumerate(own, 1):
+            content += f"<h4>Lien {number}: {html.escape(str(mortgage.get('lender') or 'Lender not stated'))}</h4>"
+            content += fields([spec for spec in res.MORTGAGE_FIELDS if spec["key"] != "property_row_id"], mortgage)
+        sections.append(content + "</section>")
+    unlinked = [row for row in mortgages if not row.get("property_row_id")]
+    if unlinked:
+        sections.append("<section class='property'><h2>Mortgages awaiting a property association</h2>" + "".join(fields([spec for spec in res.MORTGAGE_FIELDS if spec["key"] != "property_row_id"], row) for row in unlinked) + "</section>")
+    summary = "".join(f"<tr><th>{html.escape(label)}</th><td>{value({'input': 'number' if key.endswith('_count') else 'money'}, totals.get(key))}</td></tr>" for key, label in res.TOTAL_LABELS.items())
+    declaration = "<p class='declaration'>The owner declares that no real estate is owned.</p>" if body.get("no_real_estate") is True else "<p class='unknown'>Property details have not been provided.</p>" if not properties else ""
+    notes = f"<h3>Notes</h3><p class='notes'>{html.escape(str(body['notes']))}</p>" if body.get("notes") else ""
+    return f"""<!doctype html><html><head><meta charset='utf-8'><style>
+      @page {{ size: Letter; margin: 32pt; @bottom-center {{ content: 'Page ' counter(page) ' of ' counter(pages); font-size: 8pt; color: #64748b; }} }}
+      body {{ font-family: Arial, sans-serif; font-size: 10pt; color: #172033; }}
+      h1 {{ font-size: 20pt; margin: 0 0 8pt; }} h2 {{ font-size: 14pt; margin: 0 0 10pt; overflow-wrap: anywhere; }}
+      h3 {{ font-size: 11pt; margin: 16pt 0 6pt; }} h4 {{ font-size: 10pt; margin: 10pt 0 4pt; }}
+      table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }} th, td {{ padding: 5pt; border-bottom: .5pt solid #dce2e9; text-align: left; vertical-align: top; overflow-wrap: anywhere; }}
+      .fields th {{ width: 23%; background: #f3f5f8; font-size: 8pt; font-weight: normal; }} .fields td {{ width: 27%; font-size: 9pt; }}
+      tr {{ break-inside: avoid; }} .property {{ break-before: page; }} .unknown, .context {{ color: #64748b; }}
+      .context {{ font-size: 9pt; line-height: 1.45; }} .notes {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
+    </style></head><body><h1>Real Estate Schedule</h1>
+    <p><strong>Owner / entity:</strong> {html.escape(str(body.get('owner_name') or 'Not stated'))}<br><strong>As of:</strong> {html.escape(str(body.get('as_of') or 'Not stated'))}</p>
+    {declaration}<table>{summary}</table>
+    <p class='context'>Values and equity describe the whole properties; ownership percentages are shown separately. Cash flow uses principal and interest, excluding escrow only when its amount is established. Missing values remain unknown.</p>
+    {notes}{''.join(sections)}<p class='context'>{html.escape(FORM_DISCLAIMER)}</p></body></html>"""
+
+
+def render_real_estate_schedule_pdf(*, body: dict, financial_totals: dict | None = None) -> bytes:
+    from weasyprint import HTML
+
+    pdf = HTML(string=build_real_estate_schedule_html(body=body, financial_totals=financial_totals)).write_pdf()
+    if pdf is None:
+        raise RuntimeError("weasyprint returned no PDF bytes")
+    return pdf
+
+
 # The full schedule includes native contract terms and does not fit a portrait page at
 # a readable size. Landscape, and the notes hang under their own obligation as a
 # spanning row so a long one wraps instead of squeezing every other column.

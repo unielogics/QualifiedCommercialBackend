@@ -80,6 +80,7 @@ FORM_KINDS_BY_KEY: dict[str, tuple[str, ...]] = {
     "refinance_debt_schedule": ("debt_schedule",),
     "ytd_p_and_l_balance_sheet": ("p_and_l", "balance_sheet"),
     "ytd_profit_and_loss": ("p_and_l",),
+    "real_estate_schedule": ("real_estate_schedule",),
 }
 
 

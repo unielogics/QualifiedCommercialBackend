@@ -6015,6 +6015,10 @@ async def business_statement_form_schema(kind: str, user: CurrentUser) -> dict:
     """The profit-and-loss or balance-sheet field set, served so the browser
     renders from it rather than duplicating it. Same reasoning as the 413."""
     _require_statement_staff(user)
+    if kind == "real_estate_schedule":
+        from app.services.real_estate_schema import describe
+
+        return describe()
     if kind not in business_statement_schema.KINDS:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
     return business_statement_schema.describe(kind)
@@ -6231,9 +6235,11 @@ async def mint_financial_statement_link(
 
 async def _open_link_or_404(db: AsyncSession, token: str):
     link = await financial_statements.link_for_token(db, token)
-    if link is None:
+    if link is None or link.kind not in {"pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule"}:
         # One message for "never existed", "expired" and "revoked". Telling them
         # apart would confirm which tokens are real to anyone probing.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "This link is no longer available")
+    if link.kind == "real_estate_schedule" and not getattr(link, "financial_family_id", None):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "This link is no longer available")
     return link
 
@@ -6255,6 +6261,10 @@ async def public_financial_form(token: str, db: AsyncSession = Depends(get_db)) 
         if not str(body.get("business_name") or "").strip() and prefill.get("business_name"):
             body = {**body, "business_name": prefill["business_name"]}
         schema = {"columns": list(financial_statements.DEBT_COLUMNS)}
+    elif link.kind == "real_estate_schedule":
+        from app.services import real_estate_schema
+
+        body, schema = real_estate_schema.empty_body(), real_estate_schema.describe()
     elif link.kind in business_statement_schema.KINDS:
         # No statement id on these links: the latest row of the kind is the
         # form, seeded with the business name when it is blank.
@@ -6304,12 +6314,17 @@ async def save_public_financial_form_draft(
     tab loses everything, which is most of why the old form went unused.
     """
     link = await _open_link_or_404(db, token)
+    if getattr(link, "permission", "edit") != "edit":
+        raise HTTPException(403, "This form link is read-only")
     profile = await db.get(ApplicationProfile, link.profile_id)
     managed = await managed_snapshot(db, profile, link.kind, statement_id=link.statement_id if link.kind == "pfs" else None, family_id=getattr(link, "financial_family_id", None))
     if managed:
         await stage_legacy_body(db, profile, managed, payload.body or {}, public=True)
         await db.commit()
         return {"saved": True}
+
+    if link.kind == "real_estate_schedule":
+        raise HTTPException(404, "This link is no longer available")
 
     if link.kind == "debt_schedule":
         await financial_statements.save_debt_rows(
@@ -6371,6 +6386,8 @@ async def submit_public_financial_form(
     it and correct it, which is the whole reason for keeping the rows.
     """
     link = await _open_link_or_404(db, token)
+    if getattr(link, "permission", "edit") != "edit":
+        raise HTTPException(403, "This form link is read-only")
     profile = await db.get(ApplicationProfile, link.profile_id)
     managed = await managed_snapshot(db, profile, link.kind, statement_id=link.statement_id if link.kind == "pfs" else None, family_id=getattr(link, "financial_family_id", None))
     if managed:
@@ -6381,6 +6398,9 @@ async def submit_public_financial_form(
         link.completed_at = datetime.now(UTC)
         await db.commit()
         return {"completed": True}
+
+    if link.kind == "real_estate_schedule":
+        raise HTTPException(404, "This link is no longer available")
 
     if link.kind == "debt_schedule":
         rows = financial_statements.debt_rows_from_body(payload.body)
@@ -6521,12 +6541,14 @@ _FORM_SLOT_CATEGORY = {
     "debt_schedule": "Debts",
     "p_and_l": business_statements.SLOT_CATEGORY,
     "balance_sheet": business_statements.SLOT_CATEGORY,
+    "real_estate_schedule": "Real estate",
 }
 _FORM_LABEL = {
     "pfs": "Personal financial statement",
     "debt_schedule": "Business debt schedule",
     "p_and_l": business_statement_schema.SCHEMA_FOR["p_and_l"].label,
     "balance_sheet": business_statement_schema.SCHEMA_FOR["balance_sheet"].label,
+    "real_estate_schedule": "Real estate schedule",
 }
 
 #: The four forms one packet link opens, in the order the page shows them.
@@ -6536,6 +6558,10 @@ PACKET_KINDS = ("p_and_l", "balance_sheet", "debt_schedule", "pfs")
 async def _requested_slot(
     db: AsyncSession, profile: ApplicationProfile, kind: str
 ) -> BucketRequestedDocument | None:
+    if kind == "real_estate_schedule":
+        from app.services.real_estate_forms import requested_slot
+
+        return await requested_slot(db, profile)
     if kind in business_statement_schema.KINDS:
         # Both business statements share the "Financials" category with the
         # tax returns, so a category match would find the wrong row.
@@ -6823,6 +6849,10 @@ async def financial_forms_status(
     for kind in business_statement_schema.KINDS:
         forms.append(await _business_statement_status(db, profile, kind))
 
+    from app.services.real_estate_forms import status as real_estate_status
+
+    forms.append(await real_estate_status(db, profile))
+
     return FinancialFormsRead(forms=forms, packets=await _packets_for_profile(db, profile))
 
 
@@ -7028,6 +7058,10 @@ async def mint_financial_form_link(
     _require_statement_staff(user)
 
     statement_id = None
+    if kind == "real_estate_schedule":
+        from app.services.real_estate_forms import ensure_workspace
+
+        await ensure_workspace(db, profile, actor=user)
     if kind == "pfs":
         statement = await financial_statements.latest_for_profile(db, profile.id)
         managed = await managed_snapshot(db, profile, "pfs")
@@ -7290,13 +7324,17 @@ async def read_business_statement_body(
 ) -> dict:
     """The file's profit and loss or balance sheet, shaped for the form —
     the latest row, or a blank one seeded with the business name."""
-    if kind not in business_statement_schema.KINDS:
+    if kind not in (*business_statement_schema.KINDS, "real_estate_schedule"):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
     profile = await profiles.load_profile(db, profile_id, user)
     _require_statement_staff(user)
     managed = await managed_snapshot(db, profile, kind)
     if managed:
         return {**managed["body"], "status": "draft" if managed["draft"]["dirty"] else "submitted", "statement_id": None}
+    if kind == "real_estate_schedule":
+        from app.services.real_estate_schema import empty_body
+
+        return empty_body()
     prefill = await financial_statements.form_prefill(db, profile)
     body, statement = await business_statements.body_for_profile(db, profile, kind, prefill)
     return {
@@ -7381,7 +7419,11 @@ async def financial_form_answers(
     uploaded = slot is not None and slot.status == "uploaded"
     stored_file_id: UUID | None = None
 
-    if kind == "pfs":
+    if kind == "real_estate_schedule":
+        from app.services.real_estate_forms import answers as real_estate_answers
+
+        answers, stored_file_id = await real_estate_answers(db, profile)
+    elif kind == "pfs":
         statement = await financial_statements.latest_for_profile(db, profile.id)
         stored_file_id = statement.bucket_file_id if statement else None
         if statement is not None and statement.status == "submitted":
@@ -7983,6 +8025,9 @@ async def financial_form_pdf(
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "financial-version.pdf"
         return Response(content, media_type="application/pdf", headers={"Content-Disposition": f'inline; filename="{safe_name}"', "Cache-Control": "no-store"})
 
+    if kind == "real_estate_schedule":
+        raise HTTPException(404, "Save a real estate version before downloading its PDF")
+
     prefill = await financial_statements.form_prefill(db, profile)
     business = prefill.get("business_name") or "the business"
     stamp = datetime.now(UTC).strftime("%Y-%m-%d")
@@ -8066,6 +8111,18 @@ async def request_financial_form(
         raise HTTPException(
             status.HTTP_409_CONFLICT, "This file has no document room to request into"
         )
+
+    if kind == "real_estate_schedule":
+        from app.services.real_estate_forms import ensure_request
+
+        _slot, already = await ensure_request(db, profile, actor=user)
+        await profiles.log_profile_action(db, profile, user, "financial_form.requested", "Requested the real estate schedule",
+            target_type="financial_form", target_id=profile.id)
+        if not already:
+            await file_events.emit(db, profile=profile, kind="document.requested", visibility=file_events.VISIBILITY_CLIENT,
+                title="We asked for the real estate schedule", actor=user, target_type="financial_form", target_id=profile.id, meta={"kind": kind})
+        await db.commit()
+        return {"requested": True, "already": already}
 
     existing = await _requested_slot(db, profile, kind)
     if existing is not None:

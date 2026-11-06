@@ -47,7 +47,7 @@ class FormAnswerFile(BaseModel):
 
 
 class FormAnswersRead(BaseModel):
-    kind: Literal["pfs", "debt_schedule", "p_and_l", "balance_sheet"]
+    kind: Literal["pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule"]
     label: str
     source: Literal["filled", "uploaded", "none"]
     #: Whether the figures are what somebody typed or what the AI read off a

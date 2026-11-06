@@ -113,6 +113,7 @@ def test_financial_overview_uses_accepted_schedule_even_when_legacy_slot_still_s
         patch.object(financial_statements, "latest_for_profile", AsyncMock(return_value=None)),
         patch.object(router, "_requested_slot", AsyncMock(return_value=_slot(status="requested"))),
         patch.object(router, "_business_statement_status", AsyncMock(side_effect=lambda _db, _profile, kind: FinancialFormStatus(kind=kind, label=kind))),
+        patch("app.services.real_estate_forms.status", AsyncMock(return_value=FinancialFormStatus(kind="real_estate_schedule", label="Real estate schedule"))),
         patch.object(router, "_packets_for_profile", AsyncMock(return_value=[])),
         patch.object(financial_version_selection, "accepted_debt_schedule_snapshot", AsyncMock(return_value=accepted)),
         patch.object(router, "_slot_analyses", AsyncMock()) as uploaded,
@@ -199,7 +200,7 @@ def test_the_extractors_are_imported_lazily_and_their_absence_means_none():
         assert router._recognised_business_statement("p_and_l", []) is None
 
 
-def test_the_status_read_lists_four_forms_and_the_packets():
+def test_the_status_read_lists_five_forms_and_the_four_form_packets():
     profile = _profile()
     user = _user()
     entry = lambda kind: router.FinancialFormStatus(kind=kind, label=kind)  # noqa: E731
@@ -208,11 +209,12 @@ def test_the_status_read_lists_four_forms_and_the_packets():
         patch.object(router, "_requested_slot", AsyncMock(return_value=None)),
         patch.object(financial_statements, "latest_for_profile", AsyncMock(return_value=None)),
         patch.object(router, "_business_statement_status", AsyncMock(side_effect=lambda db, p, k: entry(k))),
+        patch("app.services.real_estate_forms.status", AsyncMock(return_value=entry("real_estate_schedule"))),
         patch.object(router, "_packets_for_profile", AsyncMock(return_value=[router.FinancialFormPacket(packet_id=uuid.uuid4())])),
     ):
         read = _run(router.financial_forms_status(profile.id, user, _db(rows=[])))
     assert isinstance(read, FinancialFormsRead)
-    assert [f.kind for f in read.forms] == ["pfs", "debt_schedule", "p_and_l", "balance_sheet"]
+    assert [f.kind for f in read.forms] == ["pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule"]
     assert len(read.packets) == 1
 
 

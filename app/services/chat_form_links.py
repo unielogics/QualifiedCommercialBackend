@@ -72,13 +72,14 @@ WORKSHEET_PERMISSION = "edit"
 
 #: The single-form kinds the chat can mint on their own. The P&L and balance
 #: sheet are asked for as one requirement and opened as one worksheet link.
-FORM_KINDS: tuple[str, ...] = ("pfs", "debt_schedule", "p_and_l", "balance_sheet")
+FORM_KINDS: tuple[str, ...] = ("pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule")
 
 _FORM_LABEL = {
     "pfs": "personal financial statement",
     "debt_schedule": "business debt schedule",
     "p_and_l": "profit and loss statement",
     "balance_sheet": "balance sheet",
+    "real_estate_schedule": "real estate schedule",
 }
 
 #: Which sheets each actionable requirement opens when the borrower chooses to
@@ -88,6 +89,7 @@ COMPLETE_NOW_TARGETS: dict[str, tuple[str, tuple[str, ...]]] = {
     "owner_personal_financial_statement": ("pfs", ()),
     "business_debt_schedule": ("debt_schedule", ()),
     "ytd_p_and_l_balance_sheet": ("worksheet", ("p_and_l", "balance_sheet")),
+    "real_estate_schedule": ("real_estate_schedule", ()),
 }
 
 def _base_url() -> str:
@@ -114,7 +116,7 @@ def target_for(action_type: str, requirement_key: str | None) -> tuple[str, tupl
     chat's earlier link for the other.
     """
     if action_type == "open_worksheet":
-        return ("worksheet", tuple(sheets_service.KINDS))
+        return ("worksheet", tuple(kind for kind in sheets_service.KINDS if kind != "real_estate_schedule"))
     if action_type == "complete_now":
         return COMPLETE_NOW_TARGETS.get(requirement_key or "")
     return None
@@ -145,6 +147,11 @@ async def mint_form_link(
         raise ValueError(f"Unknown form kind: {kind}")
 
     statement_id: uuid.UUID | None = None
+    real_estate_workspace = None
+    if kind == "real_estate_schedule":
+        from app.services.real_estate_forms import ensure_workspace
+
+        real_estate_workspace = await ensure_workspace(db, profile)
     if kind == "pfs":
         # Create the statement the link will fill, as the router does, so the
         # borrower lands on a draft they can resume rather than a blank that
@@ -165,6 +172,8 @@ async def mint_form_link(
         invitee_email=recipient,
         created_by=None,
     )
+    if real_estate_workspace:
+        link.financial_family_id = uuid.UUID(real_estate_workspace["family_id"])
     await profiles.log_profile_action(
         db,
         profile,

@@ -34,7 +34,13 @@ from app.models.financial_form_version import (
 )
 from app.models.financial_statement import FinancialStatement
 from app.services import business_statement_schema as bss
-from app.services import business_statements, financial_statements, pfs_schema, sheet_layout
+from app.services import (
+    business_statements,
+    financial_statements,
+    pfs_schema,
+    real_estate_schema,
+    sheet_layout,
+)
 from app.services.debt_terms import (
     DebtTermsError,
     monthly_equivalent,
@@ -48,8 +54,8 @@ from app.services.financial_version_selection import (
 )
 
 KINDS = sheet_layout.KINDS
-CLASSIFICATIONS = {"pfs": "personal_financial_statement", "debt_schedule": "debt_schedule", "p_and_l": "current_p_and_l", "balance_sheet": "balance_sheet"}
-LABELS = {"pfs": "Personal financial statement", "debt_schedule": "Business debt schedule", "p_and_l": "Profit and loss statement", "balance_sheet": "Balance sheet"}
+CLASSIFICATIONS = {"pfs": "personal_financial_statement", "debt_schedule": "debt_schedule", "p_and_l": "current_p_and_l", "balance_sheet": "balance_sheet", "real_estate_schedule": "real_estate_schedule"}
+LABELS = {"pfs": "Personal financial statement", "debt_schedule": "Business debt schedule", "p_and_l": "Profit and loss statement", "balance_sheet": "Balance sheet", "real_estate_schedule": "Real estate schedule"}
 MAX_ROWS = 500
 
 
@@ -83,6 +89,8 @@ def empty_body(kind: str) -> dict:
         return bss.empty_body(kind)
     if kind == "pfs":
         return pfs_schema.empty_body()
+    if kind == "real_estate_schedule":
+        return real_estate_schema.empty_body()
     return {"schema_version": sheet_layout.SCHEMA_VERSIONS[kind], "business_name": "", "debts": []}
 
 
@@ -102,6 +110,8 @@ def validate_body(kind: str, raw: dict) -> dict:
     _kind(kind)
     if not isinstance(raw, dict) or len(json.dumps(raw, default=str)) > 2_000_000:
         raise HTTPException(422, "Financial form is too large")
+    if kind == "real_estate_schedule":
+        return _json(real_estate_schema.validate(raw))
     body = copy.deepcopy(raw)
     body["schema_version"] = sheet_layout.SCHEMA_VERSIONS[kind]
     groups = [body.get("debts", [])] if kind == "debt_schedule" else list((body.get("schedules") or {}).values()) if kind == "pfs" else []
@@ -179,6 +189,8 @@ def _present(values: Iterable[Any]) -> bool:
 def facts_for_body(kind: str, body: dict) -> dict:
     """Never turn an unfilled financial answer into an asserted zero."""
     body = active_body(kind, body)
+    if kind == "real_estate_schedule":
+        return _json(real_estate_schema.key_facts(body))
     if kind == "debt_schedule":
         rows = financial_statements.debt_rows_from_body(body) or []
         facts = financial_statements.debt_key_facts(rows)
@@ -282,6 +294,10 @@ async def existing_draft(db: AsyncSession, profile: ApplicationProfile, kind: st
 
 
 async def _legacy_body(db: AsyncSession, profile: ApplicationProfile, kind: str) -> tuple[dict, Any]:
+    if kind == "real_estate_schedule":
+        # The dated family/version is its source of truth. Never seed a second
+        # schedule from a PFS or turn a property mortgage into business debt.
+        return real_estate_schema.empty_body(), None
     prefill = await financial_statements.form_prefill(db, profile)
     if kind in bss.KINDS:
         return await business_statements.body_for_profile(db, profile, kind, prefill)
@@ -420,6 +436,9 @@ async def create_family(db: AsyncSession, profile: ApplicationProfile, *, kind: 
     body = empty_body(kind)
     if kind == "pfs":
         body["applicant"]["name"] = identity["subject"] if identity["subject"] != "applicant" else ""
+        body["as_of"] = identity.get("as_of") or ""
+    elif kind == "real_estate_schedule":
+        body["owner_name"] = identity["subject"] if identity["subject"] != "business" else ""
         body["as_of"] = identity.get("as_of") or ""
     elif kind in bss.KINDS:
         body["header"].update({key: value for key, value in identity.items() if key in body["header"]})
@@ -627,6 +646,10 @@ async def save_draft(db: AsyncSession, profile: ApplicationProfile, *, kind: str
 
 
 async def _project(db: AsyncSession, profile: ApplicationProfile, family: FinancialFormFamily, body: dict, facts: dict, *, actor: Any, submit: bool, pdf_file_id: UUID) -> None:
+    if family.kind == "real_estate_schedule":
+        # Accepted facts live on this immutable version and generated analysis;
+        # mortgage rows deliberately never project into dos_debts or DSCR.
+        return
     actor_id = getattr(actor, "id", None)
     if family.kind in bss.KINDS:
         from app.models.business_financial_statement import BusinessFinancialStatement
@@ -715,6 +738,8 @@ def _render(kind: str, body: dict, facts: dict) -> bytes:
     from app.services import dealer_forms_pdf
 
     visible = active_body(kind, body)
+    if kind == "real_estate_schedule":
+        return dealer_forms_pdf.render_real_estate_schedule_pdf(body=visible, financial_totals=facts)
     if kind == "pfs":
         return dealer_forms_pdf.render_pfs_413_pdf(body=visible, statement_date=visible.get("as_of") or "not stated", financial_totals=facts)
     if kind == "p_and_l":
@@ -743,6 +768,12 @@ async def publish_version(db: AsyncSession, profile: ApplicationProfile, *, kind
     if profile.primary_bucket_id is None:
         raise HTTPException(409, "This file needs a document room before saving a PDF version")
     body = validate_body(kind, draft.body)
+    if kind == "real_estate_schedule":
+        described_properties = {row["id"] for row in real_estate_schema.properties(body)}
+        missing = [f"mortgages.{row['id']}.property_row_id" for row in real_estate_schema.mortgages(body)
+                   if row.get("status") != "paid_off" and row.get("property_row_id") not in described_properties]
+        if missing:
+            raise HTTPException(422, {"code": "real_estate_property_required", "message": "Choose a described property for each active or unresolved mortgage before saving a version. Your working draft is retained.", "missing_fields": missing})
     if kind == "debt_schedule":
         await validate_debt_scope(db, profile, body)
     facts = facts_for_body(kind, body)
@@ -877,6 +908,8 @@ async def filter_current_files(db: AsyncSession, files: list[BucketFile]) -> lis
 
 
 def _source_identity(kind: str, facts: dict) -> dict:
+    if kind == "real_estate_schedule":
+        return {"subject": facts.get("owner_name") or "business", "as_of": facts.get("as_of") or facts.get("statement_date") or None}
     if kind == "debt_schedule":
         return {"subject": "business"}
     if kind == "pfs":
@@ -899,6 +932,8 @@ def _compatible_identity(family: FinancialFormFamily, identity: dict) -> bool:
 def _body_from_facts(kind: str, facts: dict) -> dict:
     """Only map facts with an exact editable destination, never total → detail."""
     body = empty_body(kind)
+    if kind == "real_estate_schedule":
+        return _sanitize_extracted_body(kind, facts)
     if kind == "debt_schedule":
         body["business_name"] = facts.get("business_name") or ""
         for item in (facts.get("debts") or [])[:MAX_ROWS]:
@@ -943,7 +978,16 @@ def _extract_acroform(kind: str, raw: bytes) -> tuple[dict, dict[int, str]]:
         if field.get("/V") in (None, ""):
             continue
         if key in known:
-            values[key] = str(field["/V"])
+            value = str(field["/V"])
+            if kind == "real_estate_schedule" and key == "no_real_estate" and value in {"/Yes", "/On", "/Off"}:
+                value = "false" if value == "/Off" else "true"
+            values[key] = value
+        elif kind == "real_estate_schedule":
+            parts = key.split(".")
+            if len(parts) == 3 and parts[0] in real_estate_schema.COLLECTIONS and parts[2] in {spec["key"] for spec in real_estate_schema.COLLECTIONS[parts[0]]}:
+                ordinal = re.fullmatch(r"r(\d+)", parts[1])
+                if ordinal and 1 <= int(ordinal.group(1)) <= MAX_ROWS:
+                    values[key] = str(field["/V"])
         elif kind == "debt_schedule":
             # Canonical fillable templates use ds.r1.<field>. A one-loan
             # contract can also declare the bare canonical field name.
@@ -977,7 +1021,22 @@ def _sanitize_extracted_body(kind: str, raw: dict) -> dict:
             raise HTTPException(422, "The PDF reader returned invalid schedule rows")
         return [{"id": str(uuid4()), **{key: copy.deepcopy(row[key]) for key in columns if key in row}} for row in value]
 
-    if kind == "debt_schedule":
+    if kind == "real_estate_schedule":
+        for spec in real_estate_schema.HEADER:
+            if spec["key"] in raw and not (spec["key"] == "no_real_estate" and raw[spec["key"]] is None):
+                body[spec["key"]] = copy.deepcopy(raw[spec["key"]])
+        incoming = raw.get("properties", [])
+        body["properties"] = rows(incoming, [spec["key"] for spec in real_estate_schema.PROPERTY_FIELDS])
+        aliases = {}
+        for index, (source, stored) in enumerate(zip(incoming, body["properties"], strict=True), 1):
+            for key in (source.get("id"), f"r{index}", str(index - 1)):
+                if key is not None:
+                    aliases[str(key)] = stored["id"]
+        body["mortgages"] = rows(raw.get("mortgages", []), [spec["key"] for spec in real_estate_schema.MORTGAGE_FIELDS])
+        for mortgage in body["mortgages"]:
+            parent = mortgage.get("property_row_id")
+            mortgage["property_row_id"] = aliases.get(str(parent)) if parent is not None else None
+    elif kind == "debt_schedule":
         body["business_name"] = copy.deepcopy(raw.get("business_name", ""))
         body["debts"] = [{**row, "origin": "ai_draft", "status": "active"}
                          for row in rows(raw.get("debts", []), financial_statements.DEBT_COLUMNS)]
@@ -1014,12 +1073,15 @@ async def _extract_full_form(db: AsyncSession, kind: str, file: BucketFile, raw:
     from app.services.ai.usage import tracked_messages_create
 
     acro, pages = await asyncio.to_thread(_extract_acroform, kind, raw)
-    schema = pfs_schema.describe() if kind == "pfs" else bss.describe(kind) if kind in bss.KINDS else {"columns": list(financial_statements.DEBT_COLUMNS)}
+    schema = real_estate_schema.describe() if kind == "real_estate_schedule" else pfs_schema.describe() if kind == "pfs" else bss.describe(kind) if kind in bss.KINDS else {"columns": list(financial_statements.DEBT_COLUMNS)}
     template = empty_body(kind)
     if kind == "debt_schedule":
         template["debts"] = [{key: None for key in financial_statements.DEBT_COLUMNS}]
     if kind == "pfs":
         template["schedules"] = {spec.key: [{key: None for key in spec.column_keys}] for spec in pfs_schema.SCHEDULES}
+    if kind == "real_estate_schedule":
+        template.update(properties=[{"id": "r1", **{spec["key"]: None for spec in real_estate_schema.PROPERTY_FIELDS}}],
+                        mortgages=[{"property_row_id": "r1", **{spec["key"]: None for spec in real_estate_schema.MORTGAGE_FIELDS if spec["key"] != "property_row_id"}}])
     content = [{"type": "text", "text": "Map this one uploaded document into this financial form schema. Return JSON {body, references, warnings}. Each reference is keyed by the exact editable cell key and has page (1-based) and quote. Body template: " + json.dumps(template) + "\nField definitions: " + json.dumps(schema)}]
     if extra_instructions:
         content[0]["text"] += "\n" + extra_instructions
@@ -1040,6 +1102,11 @@ async def _extract_full_form(db: AsyncSession, kind: str, file: BucketFile, raw:
     # become a stated amount when exact native payment terms replace OCR.
     exact = {key: value for key, value in sheet_layout.flatten(kind, acro).items() if value not in (None, "")}
     candidate = sheet_layout.unflatten(kind, exact, candidate)
+    if kind == "real_estate_schedule":
+        for mortgage in candidate.get("mortgages") or []:
+            ordinal = re.fullmatch(r"r(\d+)", str(mortgage.get("property_row_id") or ""))
+            if ordinal and 1 <= int(ordinal.group(1)) <= len(candidate.get("properties") or []):
+                mortgage["property_row_id"] = candidate["properties"][int(ordinal.group(1)) - 1].get("id")
     stated_monthly = [row.get("monthly_payment") not in (None, "") for row in candidate.get("debts", [])] if kind == "debt_schedule" else []
     candidate = validate_body(kind, candidate)
     warnings = [str(value)[:500] for value in (parsed.get("warnings") or [])[:100]]
@@ -1256,7 +1323,7 @@ def _mapping_records(kind: str, body: dict, file: BucketFile, analysis: BucketFi
         candidates = [cell.key, cell.xlsx_name, ".".join(cell.path or ())]
         if row.ordinal and cell.path:
             path = list(cell.path)
-            at = 1 if path[0] == "debts" else 2 if path[0] == "schedules" else None
+            at = 1 if path[0] in {"debts", "properties", "mortgages"} else 2 if path[0] == "schedules" else None
             if at is not None:
                 for ordinal in (f"r{row.ordinal}", str(row.ordinal - 1)):
                     variant = path.copy()
@@ -1300,7 +1367,9 @@ async def propose_import(db: AsyncSession, profile: ApplicationProfile, *, kind:
     if analysis and analysis.classification not in {CLASSIFICATIONS[kind], "collateral_debt_evidence", "payoff_or_mortgage_statement"}:
         raise HTTPException(409, "This document was classified as a different form. Review its type before importing.")
     identity = _source_identity(kind, facts)
-    if kind == "pfs" and identity.get("subject") == "applicant":
+    if kind == "real_estate_schedule" and (identity.get("subject") == "business" or not identity.get("as_of")):
+        identity["source_file_id"] = str(file.id)
+    elif kind == "pfs" and identity.get("subject") == "applicant":
         identity["source_file_id"] = str(file.id)
     elif kind in bss.KINDS and not any(identity.get(key) for key in ("period_start", "period_end", "as_of_date")):
         identity["source_file_id"] = str(file.id)
@@ -1332,6 +1401,13 @@ async def propose_import(db: AsyncSession, profile: ApplicationProfile, *, kind:
             return _import_read(cached, kind)
         if not summary_cached:
             proposed, mappings, warnings = copy.deepcopy(cached.proposed_body), copy.deepcopy(cached.mappings), list(cached.warnings)
+            if kind == "real_estate_schedule":
+                proposed, ids = real_estate_schema.align_import(proposed, draft.body, warnings)
+                for mapping in mappings:
+                    parts = mapping["key"].split(".")
+                    if len(parts) == 3 and parts[1] in ids:
+                        parts[1] = ids[parts[1]]
+                        mapping["key"] = ".".join(parts)
             if kind in {"debt_schedule", "pfs"}:
                 align = _align_debt_import_rows if kind == "debt_schedule" else _align_pfs_import_rows
                 proposed, ids = align(proposed, draft.body, warnings)
@@ -1365,6 +1441,8 @@ async def propose_import(db: AsyncSession, profile: ApplicationProfile, *, kind:
             evidence["last_import_file_id"] = str(file.id)
             row["evidence"] = evidence
             row["evidence_links"] = _merge_import_links(row.get("evidence_links") or [], [{"file_id": str(file.id), "role": "supporting", "is_current": False}])
+    elif kind == "real_estate_schedule":
+        proposed, _ids = real_estate_schema.align_import(proposed, draft.body, warnings)
     elif kind == "pfs":
         proposed, _ids = _align_pfs_import_rows(proposed, draft.body, warnings)
     mappings = _mapping_records(kind, proposed, file, analysis, content_hash, references, pages)

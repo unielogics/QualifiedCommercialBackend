@@ -33,14 +33,17 @@ DOCUMENT_CLASSES = {
     "bank_statement": ["bank_statement"],
     "tax_return": ["tax_return"],
     "debt_schedule": ["debt_schedule"],
+    "real_estate_schedule": ["real_estate_schedule"],
     "pfs": ["personal_financial_statement"],
     "personal_financial_statement": ["personal_financial_statement"],
     "profit_and_loss": ["current_p_and_l"],
     "p_and_l": ["current_p_and_l"],
     "balance_sheet": ["balance_sheet"],
     "payoff_letter": ["payoff_or_mortgage_statement", "collateral_debt_evidence"],
+    "mortgage_statement": ["payoff_or_mortgage_statement"],
     "loan_agreement": ["collateral_debt_evidence"],
 }
+REQUEST_SOURCE_KINDS = {"staff_request", "financial_form_request"}
 
 
 def item_config(item: FileRequestItem, request_id: UUID) -> dict:
@@ -58,7 +61,12 @@ def item_config(item: FileRequestItem, request_id: UUID) -> dict:
         # Explicit upload/association selects which obligation a file satisfies.
         "explicit_assignment_only": True,
         "automation_approved": True,
+        **({"form_kind": "real_estate_schedule"} if _online_real_estate_form(item) else {}),
     }
+
+
+def _online_real_estate_form(item: FileRequestItem) -> bool:
+    return item.document_type == "real_estate_schedule" and item.quantity == 1 and item.unit == "files"
 
 
 def request_label(item: FileRequestItem) -> str:
@@ -81,7 +89,7 @@ async def request_states(db: AsyncSession, profile_id: UUID, request_id: UUID | 
     states = list((await db.execute(select(ApplicationRequirementState).where(
         ApplicationRequirementState.profile_id == profile_id,
     ).order_by(ApplicationRequirementState.created_at, ApplicationRequirementState.requirement_key))).scalars().all())
-    return [state for state in states if (state.provenance or {}).get("source_kind") == "staff_request"
+    return [state for state in states if (state.provenance or {}).get("source_kind") in REQUEST_SOURCE_KINDS
             and (request_id is None or str(request_id) in batch_memberships(state))]
 
 
@@ -108,14 +116,18 @@ async def apply_memberships(db, state, memberships: dict) -> None:
     active = [FileRequestItem(**member["item"]) for member in memberships.values() if not member.get("cancelled_at")]
     effective = active[-1].model_copy(update={"quantity": max(item.quantity for item in active)})
     config = item_config(effective, UUID(metadata["file_request_id"]))
+    if metadata.get("source_context"):
+        config["source_context"] = deepcopy(metadata["source_context"])
     label = request_label(effective)
     request_message = effective.instructions or f"Please provide {label}."
     definition = deepcopy(metadata["external_definition"])
     definition.update(collection_config=config, label=label, objective_text=effective.instructions,
-                      ai_request_message_template=request_message)
+                      ai_request_message_template=request_message,
+                      requirement_kind="form" if _online_real_estate_form(effective) else "document")
     metadata.update(request_batches=memberships, request_item=effective.model_dump(), collection_config=config,
                     external_definition=definition, request_instructions=effective.instructions,
-                    objective_text=effective.instructions, request_message=request_message)
+                    objective_text=effective.instructions, request_message=request_message,
+                    requirement_kind=definition["requirement_kind"])
     state.provenance = metadata
     state.label = label
     requested = await db.get(BucketRequestedDocument, state.requested_document_id)
@@ -126,8 +138,20 @@ async def apply_memberships(db, state, memberships: dict) -> None:
 
 async def create_batch(
     db: AsyncSession, *, profile: ApplicationProfile, request_id: UUID,
-    items: list[FileRequestItem], user,
+    items: list[FileRequestItem], user=None, canonical_keys: list[str] | None = None,
+    source_kind: str = "staff_request", source_context: dict | None = None,
+    source_contexts: list[dict] | None = None,
 ) -> list[ApplicationRequirementState]:
+    # These options belong to trusted server workflows, not the public schema.
+    if source_kind not in REQUEST_SOURCE_KINDS:
+        raise ValueError("Unsupported file request source")
+    if canonical_keys is not None and (
+        len(canonical_keys) != len(items)
+        or any(not key or len(key) > 200 for key in canonical_keys)
+    ):
+        raise ValueError("A valid canonical identity is required for each file request")
+    if source_contexts is not None and len(source_contexts) != len(items):
+        raise ValueError("A source context is required for each file request")
     if profile.primary_bucket_id is None:
         raise HTTPException(409, "This file has no document room")
     await lock_profile(db, profile)
@@ -137,7 +161,7 @@ async def create_batch(
         if any(batch_memberships(state).get(str(request_id), {}).get("fingerprint") != fingerprint for state in existing):
             raise HTTPException(409, "This request ID was already used for different items")
         return existing
-    identities = [request_identity(item) for item in items]
+    identities = canonical_keys or [request_identity(item) for item in items]
     if len(set(identities)) != len(identities):
         raise HTTPException(422, "Combine repeated document requests into one quantity")
     # Respect the same authorized hosted-collection boundary as program tasks.
@@ -148,8 +172,9 @@ async def create_batch(
     candidates = await request_states(db, profile.id)
     namespace = uuid5(profile.id, str(request_id))
     for index, item in enumerate(items):
+        context = source_contexts[index] if source_contexts is not None else source_context
         key = f"staff_request_{request_id.hex}_{index}"
-        semantic_key = f"staff_file_{request_identity(item)[:40]}"
+        semantic_key = canonical_keys[index] if canonical_keys is not None else f"staff_file_{request_identity(item)[:40]}"
         previous = next((state for state in candidates
                          if not (state.provenance or {}).get("cancelled_at")
                          and (state.provenance or {}).get("canonical_key") == semantic_key), None)
@@ -161,15 +186,18 @@ async def create_batch(
             states.append(previous)
             continue
         config = item_config(item, request_id)
+        if context:
+            config["source_context"] = deepcopy(context)
         label = request_label(item)
         custom = item.document_type not in DOCUMENT_CLASSES
         # Free-text reporting windows are preserved as client instructions.
         # Their exact meaning needs staff review before claiming fulfillment.
         requires_review = custom or item.period.strip().casefold() not in {"current", "any", "any period"}
+        requirement_kind = "form" if _online_real_estate_form(item) else "document"
         definition = {
             "requirement_key": key, "canonical_key": semantic_key,
             "label": label, "category": "Other", "required_level": "required",
-            "requirement_kind": "document", "collection_config": config,
+            "requirement_kind": requirement_kind, "collection_config": config,
             "visibility": ["borrower", "underwriter"],
             "verification_required": requires_review,
             "completion_mode": "requires_human_verify" if requires_review else "ai_can_complete",
@@ -183,7 +211,7 @@ async def create_batch(
             name=label, category="Other", description=item.instructions or None,
             required=True, allow_multiple_files=True, status="requested", is_custom=True,
             requirement_key=key,
-            requirement_source={"kind": "staff_request", "file_request_id": str(request_id), "collection_config": config},
+            requirement_source={"kind": source_kind, "file_request_id": str(request_id), "collection_config": config},
         )
         db.add(requested)
         state = ApplicationRequirementState(
@@ -193,12 +221,13 @@ async def create_batch(
             verification_required=requires_review, source_program_keys=[], source_policy_keys=[],
             first_requested_at=datetime.now(UTC),
             provenance={
-                "source_kind": "staff_request", "source_key": str(request_id),
+                "source_kind": source_kind, "source_key": str(request_id),
                 "file_request_id": str(request_id), "request_fingerprint": fingerprint,
                 "request_batches": {str(request_id): membership},
                 "request_item": item.model_dump(), "request_instructions": item.instructions,
-                "requested_by_user_id": str(user.id),
-                "requirement_kind": "document", "canonical_key": semantic_key,
+                "requested_by_user_id": str(user.id) if user is not None else None,
+                **({"source_context": deepcopy(context)} if context else {}),
+                "requirement_kind": requirement_kind, "canonical_key": semantic_key,
                 "collection_config": config, "catalog_approved": True, "client_visible": True,
                 "definition_id": key, "definition_version": "1", "external_definition": definition,
                 "objective_text": item.instructions, "request_message": definition["ai_request_message_template"],
@@ -344,7 +373,7 @@ async def loan_todo_items(db: AsyncSession, profile: ApplicationProfile, *, want
          "deeplink": (f"/buckets/request/{link.token}?tab=todo&request={row.requested_document_id}"
                       if link else None)}
         for row in readiness.requirements
-        if row.client_visible and row.provenance.get("source_kind") == "staff_request"
+        if row.client_visible and row.provenance.get("source_kind") in REQUEST_SOURCE_KINDS
         and not row.provenance.get("cancelled_at")
         and ((row.status in {"verified", "waived", "not_applicable"}) and want_completed
              or row.status not in {"verified", "waived", "not_applicable"} and want_pending)

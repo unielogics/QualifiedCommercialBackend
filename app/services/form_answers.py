@@ -30,6 +30,7 @@ FORM_LABELS: dict[str, str] = {
     "debt_schedule": "Business debt schedule",
     "p_and_l": "Profit and loss statement",
     "balance_sheet": "Balance sheet",
+    "real_estate_schedule": "Real estate schedule",
 }
 
 #: Whose answers a debt row carries, by the source that wrote it.

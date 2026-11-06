@@ -327,11 +327,16 @@ async def open_public_collection_form(
     if task.assignee != "borrower" and task.status != "escalated":
         raise HTTPException(404, "Form collection action not found")
     kind = (task.config or {}).get("form_kind")
-    if kind not in {"pfs", "debt_schedule", "p_and_l", "balance_sheet"}:
+    if kind not in {"pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule"}:
         raise HTTPException(409, "Use the approved lender form and upload its completed copy")
     if await profile_uses_arf(db, profile):
-        await require_hosted_permission(db, requested_documents=task.requirement_keys)
+        document_type = (task.config or {}).get("document_type")
+        await require_hosted_permission(db, requested_documents=[document_type] if document_type else task.requirement_keys)
     statement_id = None
+    if kind == "real_estate_schedule":
+        from app.services.real_estate_forms import ensure_workspace
+
+        await ensure_workspace(db, profile)
     if kind == "pfs":
         statement = await financial_statements.latest_for_profile(db, profile.id)
         from app.services.financial_workspace_legacy import managed_snapshot

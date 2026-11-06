@@ -340,6 +340,7 @@ async def sync_collection_tasks(
             arf_config = await get_configuration(db)
             requested_key = (
                 (metadata.get("collection_config") or {}).get("field_key")
+                or (metadata.get("collection_config") or {}).get("document_type")
                 or metadata.get("canonical_key")
                 or first.requirement_key
             )

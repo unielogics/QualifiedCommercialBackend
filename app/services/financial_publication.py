@@ -61,7 +61,7 @@ async def current_version_context(db: AsyncSession, *, profile_id: UUID | None =
     if client_safe:
         # The shared business room does not prove personal-statement ownership.
         # Explicitly scoped staff/share views may include their selected PFS.
-        query = query.where(FinancialFormFamily.kind != "pfs")
+        query = query.where(FinancialFormFamily.kind.notin_(["pfs", "real_estate_schedule"]))
     rows = (await db.execute(query.order_by(FinancialFormVersion.created_at.desc()))).all()
     from app.services.financial_version_selection import (
         debt_schedule_completion,
@@ -71,7 +71,7 @@ async def current_version_context(db: AsyncSession, *, profile_id: UUID | None =
 
     rows = [(family, version) for family, version in rows
             if (visible_file_ids is None or (version.pdf_file_id or version.source_file_id) in visible_file_ids)
-            and not (client_safe and family.kind == "pfs")]
+            and not (client_safe and family.kind in {"pfs", "real_estate_schedule"})]
     accepted = {}
     for family, version in rows:
         if family.kind == "debt_schedule" and is_accepted_debt_schedule_version(version):
@@ -183,6 +183,10 @@ async def record_staff_debt_publication_review(db: AsyncSession, profile: Applic
 
 
 async def after_publication(db: AsyncSession, profile: ApplicationProfile, *, family: FinancialFormFamily, version: FinancialFormVersion, file: BucketFile, actor: Any = None, submit: bool = False) -> None:
+    if family.kind == "real_estate_schedule":
+        from app.services.real_estate_mortgage_requests import sync_published_mortgage_requests
+
+        await sync_published_mortgage_requests(db, profile=profile, family=family, version=version, actor=actor)
     await invalidate_financial_review_caches(db, profile, version)
     await record_staff_debt_publication_review(db, profile, family=family, version=version, file=file, actor=actor)
     loan_id = getattr(profile, "loan_id", None)

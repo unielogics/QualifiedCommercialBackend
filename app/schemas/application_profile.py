@@ -1416,7 +1416,7 @@ class FinancialFormStatus(BaseModel):
     reopened, corrected, or handed back to the borrower to finish.
     """
 
-    kind: Literal["pfs", "debt_schedule", "p_and_l", "balance_sheet"]
+    kind: Literal["pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule"]
     label: str
     #: Whether the checklist actually asks for it on this file. A form nobody
     #: has requested is not outstanding — it is simply not part of this deal.
@@ -1454,6 +1454,13 @@ class FinancialFormStatus(BaseModel):
     total_liabilities: float | None = None
     total_equity: float | None = None
     balances: bool | None = None
+    #: Real estate portfolio figures; estimated values are supplied by the owner.
+    property_count: int | None = None
+    estimated_value_total: float | None = None
+    mortgage_balance_total: float | None = None
+    estimated_equity: float | None = None
+    monthly_rent_total: float | None = None
+    active_mortgage_count: int | None = None
     #: The debt schedule only: the desk's declaration that the business carries
     #: no debt ({reason, by, by_user_id, at}), which sets the request aside.
     voided: dict | None = None
@@ -1525,7 +1532,7 @@ class ApplicationEvidenceWorkspace(BaseModel):
 # The worksheet: the four forms as one grid
 # ---------------------------------------------------------------------------
 
-SheetKind = Literal["p_and_l", "balance_sheet", "debt_schedule", "pfs"]
+SheetKind = Literal["p_and_l", "balance_sheet", "debt_schedule", "pfs", "real_estate_schedule"]
 
 
 class WorksheetCellEdit(BaseModel):
