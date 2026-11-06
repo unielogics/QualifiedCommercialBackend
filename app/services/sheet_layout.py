@@ -38,7 +38,7 @@ from __future__ import annotations
 import copy
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import field as _dc_field
 from decimal import Decimal
 from typing import Any
@@ -872,7 +872,13 @@ def layout_for_body(kind: str, body: Mapping[str, Any] | None) -> Sheet:
     """The layout whose list rows are the body's rows, keyed by identity."""
     body = body or {}
     if kind == "real_estate_schedule":
-        return layout(kind, schedule_rows={block: [_list_row_key(row, n) for n, row in enumerate(body.get(block) or [], 1)] for block in real_estate_schema.COLLECTIONS})
+        sheet = layout(kind, schedule_rows={block: [_list_row_key(row, n) for n, row in enumerate(body.get(block) or [], 1)] for block in real_estate_schema.COLLECTIONS})
+        addresses = {_list_row_key(row, n): str(row.get("address") or "").strip()[:160] for n, row in enumerate(body.get("properties") or [], 1)}
+        choices = tuple((row.row_key, f"Property {row.ordinal}" + (f" - {addresses[row.row_key]}" if addresses.get(row.row_key) else ""))
+                        for row in sheet.rows if row.kind == "data" and row.block == "properties")
+        rows = tuple(replace(row, cells=tuple(replace(cell, type="select", options=tuple(key for key, _ in choices), option_labels=choices)
+                    if cell.path and cell.path[-1] == "property_row_id" else cell for cell in row.cells)) for row in sheet.rows)
+        return _sheet(kind, sheet.columns, rows, freeze=sheet.freeze)
     if kind == "debt_schedule":
         debts = body.get("debts") or []
         return layout(kind, debt_rows=[_list_row_key(row, n) for n, row in enumerate(debts, start=1)])

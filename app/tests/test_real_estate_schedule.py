@@ -122,6 +122,9 @@ def test_worksheet_ids_paths_new_rows_and_explicit_opt_in_scope():
     assert sheets._scoped([res.KIND]) == [res.KIND]
     assert {row.block for row in sheets._layout_for(res.KIND, body).rows if row.kind == "data"} == {"properties", "mortgages"}
     shape = sheet_layout.layout_for_body(res.KIND, body)
+    association = shape.by_key[f"mortgages.{loan_id}.property_row_id"][1]
+    assert association.type == "select" and prop_id in association.options
+    assert body["properties"][0]["address"] in dict(association.option_labels)[prop_id]
     assert {cell.type for row in shape.rows for cell in row.cells} <= {"label", "text", "money", "date", "select", "rate", "formula"}
     assert all(cell.format == "count" for row in shape.rows for cell in row.cells if cell.compute in {"property_count", "active_mortgage_count"})
 
