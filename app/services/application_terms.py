@@ -206,7 +206,7 @@ async def _cockpit_context(db: AsyncSession, profile: ApplicationProfile) -> Dsc
         return None
     existing_monthly = evaluation.get("debt_service_before_new_payment_monthly")
     if existing_monthly is None:
-        existing_monthly = (cockpit.get("debt") or {}).get("service", {}).get("monthly") or 0.0
+        existing_monthly = (cockpit.get("debt") or {}).get("service", {}).get("monthly")
     label = str(basis.get("label") or "Income available for debt service")
     changes = [
         m.get("label")
@@ -222,7 +222,7 @@ async def _cockpit_context(db: AsyncSession, profile: ApplicationProfile) -> Dsc
         cash_flow=float(income),
         cash_flow_label=f"{label} income available for debt service"
         + (" with the desk's plan" if active and changes else ""),
-        current_annual_debt_service=round(float(existing_monthly) * 12, 2),
+        current_annual_debt_service=round(float(existing_monthly) * 12, 2) if existing_monthly is not None else None,
         real_estate_carrying_costs=None,
         source=source,
     )

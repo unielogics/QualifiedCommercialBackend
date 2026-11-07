@@ -49,9 +49,9 @@ def capacity_monthly(
     target: float = TARGET_DSCR,
 ) -> float | None:
     """The largest new monthly payment the income covers at the target DSCR."""
-    if income_annual is None:
+    if income_annual is None or existing_monthly_debt_service is None:
         return None
-    room = income_annual / 12 / target - (existing_monthly_debt_service or 0.0)
+    room = income_annual / 12 / target - existing_monthly_debt_service
     return round(max(0.0, room), 2)
 
 
@@ -172,12 +172,14 @@ def suggest_product(
     candidates = [
         v for v in (affordable, requested_amount, shape.get("max_amount")) if v is not None
     ]
-    amount = min(candidates) if candidates and income_annual is not None else None
+    amount = min(candidates) if candidates and room is not None else None
     if amount is not None:
         amount = float(int(amount / _ROUND_TO) * _ROUND_TO)
     reason = None
     if income_annual is None:
         reason = "No income figure yet: a tax return, a profit-and-loss statement or three months of statements gives one."
+    elif existing_monthly_debt_service is None:
+        reason = "Existing debt service is unknown; complete the debt schedule or set an explicit debt-service assumption before sizing a new loan."
     elif room is not None and room <= 0:
         reason = f"At {target:.2f}x the income on file leaves no room for a new payment after today's debt service."
         amount = None
@@ -195,10 +197,10 @@ def suggest_product(
         if amount
         else None
     )
-    existing_annual = (existing_monthly_debt_service or 0.0) * 12
+    existing_annual = existing_monthly_debt_service * 12 if existing_monthly_debt_service is not None else None
     dscr_at = (
         round(income_annual / (existing_annual + payment * 12), 2)
-        if income_annual is not None and payment
+        if income_annual is not None and existing_annual is not None and payment
         else None
     )
     requested_payment = (
@@ -214,7 +216,7 @@ def suggest_product(
     )
     dscr_requested = (
         round(income_annual / (existing_annual + requested_payment * 12), 2)
-        if income_annual is not None and requested_payment
+        if income_annual is not None and existing_annual is not None and requested_payment
         else None
     )
     return {
@@ -327,7 +329,7 @@ async def suggest_offers(
     # loan has to cover their payoffs on top of what the client asked for.
     existing_monthly = evaluation.get("debt_service_before_new_payment_monthly")
     if existing_monthly is None:
-        existing_monthly = cockpit["debt"]["service"].get("monthly") or 0.0
+        existing_monthly = cockpit["debt"]["service"].get("monthly")
     requested = evaluation.get("loan_amount_needed") or cockpit.get("requested_amount")
     selections = await programs.active_selections(db, profile.id)
     candidates = {c.program_key: c for c in await programs.published_candidates(db, profile)}

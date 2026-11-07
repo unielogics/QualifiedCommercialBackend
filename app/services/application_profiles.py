@@ -1812,19 +1812,25 @@ async def intelligence_state(db: AsyncSession, profile: ApplicationProfile) -> A
     dscr = deterministic_dscr if deterministic_dscr is not None or accepted_debt is not None else _metric_number(key_metrics, "estimated_dscr", "dscr")
     calculation_review = None
     validated_annual = None
+    current_cockpit = None
     if hasattr(db, "execute"):
         try:
             from app.services import financial_cockpit
             from app.services.financial_metric_reporting import metric_brief
 
-            calculation_review = metric_brief(await financial_cockpit.load_cockpit(db, profile))
+            current_cockpit = await financial_cockpit.load_cockpit(db, profile)
+            calculation_review = metric_brief(current_cockpit)
             validated_annual = (calculation_review or {}).get("validated_annual")
         except Exception:  # noqa: BLE001 - a diagnostic view never rewrites or blocks cached evidence
             logging.getLogger(__name__).exception("Current financial calculation review unavailable profile=%s", profile.id)
-    if validated_annual is not None:
-        ebitda = validated_annual["ebitda_annual"]
-        dscr = validated_annual.get("dscr")
-        annual_debt = validated_annual.get("annual_debt_service")
+            ebitda = dscr = None
+    primary = (calculation_review or {}).get("primary_dscr")
+    if calculation_review is not None:
+        # A current unavailable figure must not resurrect cached AI earnings
+        # from a personal return or a superseded debt basis.
+        ebitda = validated_annual["ebitda_annual"] if validated_annual and validated_annual.get("currency") == "USD" else None
+        dscr = (primary or {}).get("value")
+        annual_debt = ((current_cockpit or {}).get("debt") or {}).get("service", {}).get("annual")
     has_assets = bool(intake and intake.asset_rows)
     is_real_estate = profile.vertical == "real_estate" or has_assets
     revenue = _metric_number(key_metrics, "annualized_revenue", "annual_revenue", "gross_revenue")
@@ -1837,13 +1843,10 @@ async def intelligence_state(db: AsyncSession, profile: ApplicationProfile) -> A
     ]
     if calculation_review is not None:
         dscr_metric = next(item for item in metrics if item.key == "dscr")
-        if validated_annual is not None:
-            dscr_metric.source = "P&L EBITDA-based DSCR: current validated annual P&L inputs; primary cockpit DSCR is shown separately"
-            dscr_metric.period = validated_annual.get("period")
-            dscr_metric.status = "not_applicable" if accepted_debt is not None and annual_debt == 0 else "ready" if dscr is not None else "needs_evidence"
-            dscr_metric.confidence = 1.0
-        else:
-            dscr_metric.source = "Cached AI earnings with completed saved debt schedule" if accepted_debt is not None else "Cached AI review; no validated annual P&L basis available"
+        dscr_metric.source = f"Current financial cockpit: {primary.get('label')}" if primary else "Current financial cockpit: coverage unavailable from eligible business evidence"
+        dscr_metric.period = primary.get("period") if primary else None
+        dscr_metric.status = "not_applicable" if accepted_debt is not None and annual_debt == 0 else "ready" if dscr is not None else "needs_evidence"
+        dscr_metric.confidence = (0.65 if primary.get("confidence") == "proxy" else 1.0) if primary else None
         metrics.append(IntelligenceMetric(key="ebitda", label="Annual EBITDA",
             value=validated_annual["ebitda_annual"] if validated_annual else None,
             unit=validated_annual["currency"] if validated_annual else None,
@@ -1854,7 +1857,9 @@ async def intelligence_state(db: AsyncSession, profile: ApplicationProfile) -> A
         profile_id=profile.id,
         metrics=metrics,
         dscr_inputs={"bankable_ebitda": ebitda, "annual_debt_service": annual_debt, "target": 1.25, "floor": 1.1,
-                     **({"basis": "validated_profit_and_loss_annual_ebitda", "primary_cockpit_dscr": calculation_review.get("primary_dscr")} if validated_annual else {})},
+                     **({"basis": "current_cockpit", "cash_flow_value": (primary or {}).get("numerator"),
+                         "cash_flow_label": (primary or {}).get("numerator_label"),
+                         "primary_cockpit_dscr": primary} if calculation_review is not None else {})},
         metric_review=calculation_review,
         effective_calculation=validated_annual,
     )
