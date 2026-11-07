@@ -324,7 +324,7 @@ def test_tax_short_period_is_not_presented_as_annualized_new_ebitda():
     result = c["ebitda"]["headline"]
     assert result["months_covered"] == 6 and result["value"] == 115000
     assert result["annualized_value"] is None and result["annualization_factor"] is None
-    assert c["dscr"]["headline"]["numerator"] == 115000
+    assert c["dscr"]["headline"] is None
 
 
 def test_operand_names_the_actual_tax_alias_and_no_invented_page():
