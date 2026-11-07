@@ -50,6 +50,9 @@ DOUBLE_COUNTED_ADD_BACK_REASON = (
 UNKNOWN_DEBT_SERVICE_REASON = (
     "Existing debt service is unknown; complete the debt schedule or set an explicit debt-service assumption."
 )
+UNKNOWN_NEW_LOAN_PAYMENT_REASON = (
+    "The new loan payment is unknown; enter its rate and terms or a reviewed monthly payment."
+)
 
 
 def _num(value: Any) -> float | None:
@@ -122,7 +125,7 @@ def loan_payment(
     three years)."""
     from app.services.loan_schedule import build_schedule
 
-    if not amount or amount <= 0:
+    if not amount or amount <= 0 or rate_pct is None:
         return None
     kind = "interest_only" if interest_only else structure
     if kind != "interest_only" and not term_months:
@@ -415,12 +418,12 @@ def evaluate_plan(
     source = plan.get("new_payment_source")
     loan_terms: dict[str, Any] | None = None
     schedule: dict[str, Any] | None = None
-    if plan.get("new_loan_amount") and (plan.get("new_loan_term_months") or interest_only):
+    if plan.get("new_loan_amount") and plan.get("new_loan_rate_pct") is not None and (plan.get("new_loan_term_months") or interest_only):
         from app.services.loan_schedule import build_schedule, describe
 
         schedule = build_schedule(
             float(plan["new_loan_amount"]),
-            float(plan.get("new_loan_rate_pct") or 0.0),
+            float(plan["new_loan_rate_pct"]),
             int(plan["new_loan_term_months"]) if plan.get("new_loan_term_months") else 0,
             structure="interest_only" if interest_only else plan.get("new_loan_structure"),
             interest_only_months=int(plan.get("new_loan_interest_only_months") or 0),
@@ -429,7 +432,7 @@ def evaluate_plan(
         )
         loan_terms = {
             "amount": float(plan["new_loan_amount"]),
-            "rate_pct": float(plan.get("new_loan_rate_pct") or 0.0),
+            "rate_pct": float(plan["new_loan_rate_pct"]),
             "term_months": int(plan["new_loan_term_months"])
             if plan.get("new_loan_term_months")
             else None,
@@ -470,13 +473,14 @@ def evaluate_plan(
     if (
         new_payment is None
         and source == "term_sheet"
+        and not plan.get("new_loan_amount")
         and proposed
         and proposed.get("monthly_payment") is not None
     ):
         new_payment = proposed.get("monthly_payment")
         loan_terms = {
             "amount": _num(proposed.get("amount")),
-            "rate_pct": _num(proposed.get("rate_pct")) or 0.0,
+            "rate_pct": _num(proposed.get("rate_pct")),
             "term_months": int(proposed["term_months"])
             if _num(proposed.get("term_months"))
             else None,
@@ -488,7 +492,7 @@ def evaluate_plan(
             "source": "term_sheet",
             "label": proposed.get("label"),
         }
-        if loan_terms.get("repayment_config") is not None:
+        if loan_terms.get("repayment_config") is not None and loan_terms["rate_pct"] is not None:
             from app.services.loan_schedule import build_schedule, describe
 
             schedule = build_schedule(loan_terms["amount"], loan_terms["rate_pct"], loan_terms["term_months"],
@@ -504,6 +508,9 @@ def evaluate_plan(
                     payment_io=schedule["payment_io_monthly"], payment_after=schedule["payment_after_monthly"],
                     actual_regular_payment_monthly=schedule["regular_coverage_payment_monthly"],
                     annual_debt_service=schedule["coverage_annual_debt_service"], describe=describe(schedule))
+    configured_schedule_unpriced = bool(((plan.get("new_loan_amount") and plan.get("new_loan_repayment_config") is not None)
+        or ((loan_terms or {}).get("amount") and (loan_terms or {}).get("repayment_config") is not None)) and schedule is None)
+    new_loan_payment_unknown = bool(plan.get("new_loan_amount") and new_payment is None) or configured_schedule_unpriced
     # The existing debt service: what the file shows, unless the desk set it.
     service_monthly = (
         float(service_override)
@@ -523,7 +530,7 @@ def evaluate_plan(
     # fully priced new loan cannot establish the missing retained payments.
     before_new = (round(max(0.0, service_monthly if recorded_refinance_basis else service_monthly - retired_monthly), 2)
                   if service_monthly is not None and (recorded_refinance_basis or not retirement_payment_unknown) else None)
-    after_monthly = round(max(0.0, before_new + float(new_payment or 0.0)), 2) if before_new is not None else None
+    after_monthly = round(max(0.0, before_new + float(new_payment or 0.0)), 2) if before_new is not None and not new_loan_payment_unknown else None
     after_annual = after_monthly * 12 if after_monthly is not None else None
     if before_new is not None and schedule and schedule.get("repayment_config") is not None:
         exact_new_annual = schedule["coverage_annual_debt_service"] if abs(float(new_payment or 0) - schedule["coverage_payment_monthly"]) < .005 else float(new_payment or 0) * 12
@@ -623,7 +630,7 @@ def evaluate_plan(
         "add_backs_monthly": add_backs_monthly,
         "add_backs_annual": add_backs_annual,
         "excluded_add_backs": excluded_add_backs,
-        "coverage_unavailable_reason": UNKNOWN_DEBT_SERVICE_REASON if before_new is None else None,
+        "coverage_unavailable_reason": UNKNOWN_DEBT_SERVICE_REASON if before_new is None else UNKNOWN_NEW_LOAN_PAYMENT_REASON if new_loan_payment_unknown else None,
         "income_override_annual": income_override,
         "debt_service_override_monthly": service_override,
         "interest_only": interest_only,
@@ -960,7 +967,8 @@ def coverage_levers(
     key = headline.get("key") or ((dscr.get("candidates") or [{}])[0].get("key"))
     base_service = evaluation["debt_service_after_monthly"]
     base_value = evaluation["headline_after"]
-    rate = float((terms or {}).get("rate_pct") or DEFAULT_RATE_PCT)
+    recorded_rate = _num((terms or {}).get("rate_pct"))
+    rate = recorded_rate if recorded_rate is not None else DEFAULT_RATE_PCT
     term = int((terms or {}).get("term_months") or DEFAULT_TERM_MONTHS)
     retire = set(plan.get("retire") or [])
     exclude = set(plan.get("exclude") or [])
@@ -1049,9 +1057,10 @@ def coverage_levers(
         and terms
         and _num(terms.get("amount"))
         and _num(terms.get("term_months"))
+        and _num(terms.get("rate_pct")) is not None
     ):
         sheet_payment = amortized_payment(
-            float(terms["amount"]), float(terms.get("rate_pct") or 0.0), int(terms["term_months"])
+            float(terms["amount"]), float(terms["rate_pct"]), int(terms["term_months"])
         )
     adopted = (
         plan.get("new_payment_source") == "term_sheet"
@@ -1062,7 +1071,7 @@ def coverage_levers(
         sheet_label = (terms or {}).get("label") or "the recorded loan terms"
         sheet_terms = (
             f"{float(terms['amount']):,.0f} at {float(terms.get('rate_pct') or 0):g}% over {int(terms['term_months'])} months"
-            if terms and _num(terms.get("amount")) and _num(terms.get("term_months"))
+            if terms and _num(terms.get("amount")) and _num(terms.get("term_months")) and _num(terms.get("rate_pct")) is not None
             else f"{sheet_payment:,.0f} a month"
         )
         adopt = {

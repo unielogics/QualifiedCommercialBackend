@@ -78,9 +78,11 @@ async def _dealer_profile(
 
 
 async def _current_or_404(
-    db: AsyncSession, profile_id: UUID, user: CurrentUser
+    db: AsyncSession, profile: ApplicationProfile, user: CurrentUser
 ) -> CapitalReadinessRead:
-    row = await capital_readiness.latest_snapshot(db, profile_id)
+    # Access is established by load_profile/_dealer_profile before this read.
+    # Refresh only the derived current projection; immutable history survives.
+    row = await capital_readiness.current_snapshot(db, profile)
     if row is None:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
@@ -106,7 +108,7 @@ async def get_capital_readiness(
     db: AsyncSession = Depends(get_db),
 ) -> CapitalReadinessRead:
     profile = await profiles.load_profile(db, profile_id, user)
-    return await _current_or_404(db, profile.id, user)
+    return await _current_or_404(db, profile, user)
 
 
 @router.get(
@@ -184,7 +186,7 @@ async def get_dealer_capital_readiness(
     db: AsyncSession = Depends(get_db),
 ) -> CapitalReadinessRead:
     profile = await _dealer_profile(db, dealer_id, user)
-    return await _current_or_404(db, profile.id, user)
+    return await _current_or_404(db, profile, user)
 
 
 @router.post(

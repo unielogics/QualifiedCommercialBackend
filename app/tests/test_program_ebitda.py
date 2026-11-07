@@ -145,16 +145,20 @@ async def test_profile_context_materializes_current_source_instead_of_cached_ai_
     db = SimpleNamespace(execute=AsyncMock(return_value=query), get=AsyncMock(return_value=intake))
     budget = SimpleNamespace(items=[], total=None, real_estate_equipment_amount=None, real_estate_equipment_pct=None,
                              complete=False, category_totals={"equipment": 0})
+    current_source = {**pnl(), "accepted": accepted, "file_id": str(file_id)}
+    current_cockpit = financial_cockpit.build_cockpit([current_source], [], business_entity=ENTITY)
     with (patch.object(programs, "source_funding_data", AsyncMock(return_value=(None, None, "working_capital", None))),
           patch.object(programs, "summarize_use_of_funds", return_value=budget),
           patch.object(programs, "_evidence_inventory", AsyncMock(return_value=([source_file], {file_id: analysis}, {"current_p_and_l"}))),
-          patch.object(programs, "accepted_evidence_file_ids", AsyncMock(return_value={file_id} if accepted else set()))):
+          patch.object(programs, "accepted_evidence_file_ids", AsyncMock(return_value={file_id} if accepted else set())),
+          patch.object(financial_cockpit, "load_cockpit", AsyncMock(return_value=current_cockpit))):
         context = await programs.profile_fit_context(db, profile)
     assert context["annual_ebitda"] == (52000 if accepted else None)
     source = context["fact_sources"]["annual_ebitda"]
     assert source["verification_status"] == ("verified" if accepted else "unknown")
     assert source["source_refs"][0]["file_id"] == str(file_id)
-    assert context["cash_flow"] == 900000  # Existing cached cash-flow semantics unchanged.
+    assert context["cash_flow"] == 52000
+    assert context["fact_sources"]["cash_flow"]["verification_status"] == ("verified" if accepted else "provisional")
 
 
 @pytest.mark.parametrize("status,expected", [("verified", True), ("provisional", False), ("unknown", False)])

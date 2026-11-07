@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import html
 import logging
+import math
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -471,26 +472,52 @@ def review_context(offer: MerchantProcessingOffer | None) -> dict[str, Any] | No
 
 
 def pro_forma_dscr(key_metrics: dict[str, Any], annual_saving: float | None) -> dict[str, Any] | None:
-    """DSCR with the saving added to the numerator, computed on read.
+    """Apply annual processing savings to the current annual coverage operands.
 
-    estimated_dscr is tax net income over annual debt service, so
-    dscr × (1 + saving / net income) is the same ratio with the saving in the
-    numerator, using two figures that are both annual by construction.
-    estimated_debt_burden is not used: when the model authors it, its unit is
-    not stated, and a monthly figure would make the answer twelve times off.
+    A rounded cached ratio and an unrelated cached income figure cannot
+    establish a debt-service denominator. Unknown, stale or incompatible
+    current operands remain unavailable rather than reviving that shortcut.
     """
-    if not annual_saving or annual_saving <= 0:
+    saving = _num(annual_saving)
+    if saving is None or not math.isfinite(saving) or saving <= 0:
         return None
-    dscr_now = _num(key_metrics.get("estimated_dscr"))
-    net_income = _num(key_metrics.get("estimated_ebitda_or_cash_flow"))
-    if dscr_now is None or not net_income or net_income <= 0:
+    if key_metrics.get("financial_metrics_source") != "current_financial_cockpit":
+        return None
+    earnings = _num(key_metrics.get("dscr_earnings"))
+    service = _num(key_metrics.get("annual_debt_service"))
+    if earnings is None or service is None or not math.isfinite(earnings) or not math.isfinite(service) or service <= 0:
         return None
     return {
-        "dscr_now": round(dscr_now, 2),
-        "dscr_with_saving": round(dscr_now * (1.0 + annual_saving / net_income), 2),
-        "annual_saving": round(annual_saving, 2),
-        "basis": "estimated_dscr × (1 + annual saving ÷ annual net income); pro-forma, not a decision of record",
+        "dscr_now": round(earnings / service, 2),
+        "dscr_with_saving": round((earnings + saving) / service, 2),
+        "annual_saving": round(saving, 2),
+        "earnings_annual": earnings,
+        "annual_debt_service": service,
+        "income_basis": key_metrics.get("dscr_basis"),
+        "source_refs": key_metrics.get("dscr_source_refs") or [],
+        "basis": "(current annual earnings + annual processing savings) / current annual debt service; pro-forma, not a decision of record",
     }
+
+
+async def current_pro_forma_dscr(
+    db: AsyncSession, profile_id: UUID, annual_saving: float | None, *, intake_id: UUID | None = None
+) -> dict[str, Any] | None:
+    """Read the scoped current basis, without changing saved reviews or offers."""
+    saving = _num(annual_saving)
+    if saving is None or not math.isfinite(saving) or saving <= 0:
+        return None
+    try:
+        from app.services.financial_cockpit import load_cockpit
+        from app.services.financial_metric_reporting import current_review_projection
+
+        profile = await db.get(ApplicationProfile, profile_id)
+        if profile is None or intake_id is not None and profile.intake_id != intake_id:
+            return None
+        cockpit = await load_cockpit(db, profile)
+        return pro_forma_dscr(current_review_projection(None, cockpit)["key_metrics"], saving)
+    except Exception:  # noqa: BLE001 - unavailable current evidence must not revive a cached ratio
+        log.exception("Current processing-savings coverage unavailable profile=%s", profile_id)
+        return None
 
 
 # ── the intake's copy ───────────────────────────────────────────────────────

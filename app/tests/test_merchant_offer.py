@@ -89,7 +89,10 @@ def test_the_terms_schema_shares_no_key_with_a_tax_return_or_bank_statement():
 
 
 def test_pro_forma_dscr_is_computed_from_two_annual_figures_or_not_at_all():
-    assert mp.pro_forma_dscr({"estimated_dscr": 1.05, "estimated_ebitda_or_cash_flow": 80000}, 8000)["dscr_with_saving"] == 1.16
+    metrics = {"financial_metrics_source": "current_financial_cockpit", "dscr_earnings": 80000,
+               "annual_debt_service": 80000 / 1.05}
+    assert mp.pro_forma_dscr(metrics, 8000)["dscr_with_saving"] == 1.16
+    assert mp.pro_forma_dscr({"estimated_dscr": 1.05, "estimated_ebitda_or_cash_flow": 80000}, 8000) is None
     assert mp.pro_forma_dscr({"estimated_dscr": 1.05, "estimated_debt_burden": 50000}, 8000) is None
     assert mp.pro_forma_dscr({"estimated_dscr": 1.05, "estimated_ebitda_or_cash_flow": 80000}, 0) is None
 

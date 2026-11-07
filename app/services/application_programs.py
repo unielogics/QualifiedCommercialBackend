@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 import uuid
@@ -628,7 +629,7 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         ),
         "credit_score": credit_score,
         "estimated_credit_score": credit_score,
-        "dscr": _float(metrics.get("estimated_dscr") or metrics.get("dscr")),
+        "dscr": _first_numeric_metric(metrics, "estimated_dscr", "dscr"),
         "cash_flow": _first_numeric_metric(
             metrics, "estimated_ebitda_or_cash_flow", "cash_flow"
         ),
@@ -701,7 +702,74 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         entity=getattr(intake, "business_name", None) or getattr(dealer, "legal_name", None) or getattr(dealer, "name", None),
         state=getattr(profile, "financial_metric_review", None),
     )
+    if profile.vertical != "real_estate":
+        from app.services.financial_cockpit import load_cockpit
+
+        try:
+            current_cockpit = await load_cockpit(db, profile)
+        except Exception:  # noqa: BLE001 - absent current operands cannot revive a cached AI estimate
+            logging.getLogger(__name__).exception("Current program financial basis unavailable profile=%s", profile.id)
+            current_cockpit = None
+        _apply_current_business_coverage(context, current_cockpit, accepted_bank_months=len(accepted_bank_months))
     return context
+
+
+def _apply_current_business_coverage(context: dict[str, Any], cockpit: dict[str, Any] | None, *, accepted_bank_months: int) -> None:
+    """Use one current annual basis for program coverage and cash-flow rules.
+
+    Source-bound factual earnings stay separate from hypothetical plan
+    adjustments and reviewed scalar assumptions. The latter remain visible in
+    provenance, but cannot replace current financial operands.
+    """
+    from app.services.financial_calculation_policy import financial_authority
+
+    sources = context.setdefault("fact_sources", {})
+    assumptions = {field: {"value": context.get(field), "source_refs": source.get("source_refs", [])}
+                   for field in ("dscr", "cash_flow")
+                   if (source := sources.get(field) or {}).get("verification_status") == "verified"
+                   and _float(context.get(field)) is not None}
+    current = cockpit or {}
+    dscr = current.get("dscr") or {}
+    primary = dscr.get("headline") or {}
+    annual_basis = primary or next((row for row in dscr.get("candidates") or []
+                                    if _float(row.get("numerator")) is not None and not row.get("ineligible_reason")), {})
+    authority = financial_authority(current) if cockpit is not None else None
+    annual_pair = (authority or {}).get("validated_annual") or {}
+    service = (current.get("debt") or {}).get("service") or {}
+    proxy = annual_basis.get("key") == "bank_cash_flow"
+    # Preserve the program engine's existing three-accepted-month minimum for
+    # bank-derived estimates. The cockpit may show a shorter labelled proxy.
+    source_refs = annual_basis.get("source_refs") or []
+    proxy_sources_accepted = bool(source_refs) and all(ref.get("accepted") for ref in source_refs)
+    proxy_eligible = not proxy or accepted_bank_months >= 3 and proxy_sources_accepted
+    cash_flow = _float(annual_basis.get("numerator")) if proxy_eligible else None
+    ratio = _float(primary.get("value")) if proxy_eligible else None
+    verified_earnings = bool(cash_flow is not None and annual_basis.get("key") == "profit_and_loss"
+                             and annual_pair.get("currency") == "USD"
+                             and _float(annual_pair.get("ebitda_annual")) == cash_flow)
+    verified_ratio = bool(ratio is not None and verified_earnings and annual_pair.get("debt_service_validated")
+                          and _float(annual_pair.get("dscr")) == ratio)
+    common = {"kind": "current_financial_cockpit", "basis": annual_basis.get("key"),
+              "label": annual_basis.get("numerator_label"), "period": annual_basis.get("period"),
+              "currency": annual_basis.get("numerator_currency"), "currency_status": annual_basis.get("currency_status"),
+              "source_refs": annual_basis.get("source_refs") or [], "debt_version_id": service.get("version_id"),
+              "annual_debt_service": service.get("annual"),
+              "calculation_policy_version": (authority or {}).get("policy_version"),
+              "calculation_signature": (authority or {}).get("signature")}
+    for field, value, verified in (("dscr", ratio, verified_ratio), ("cash_flow", cash_flow, verified_earnings)):
+        status = "unknown" if value is None else "verified" if verified else "estimated_from_statements" if proxy else "provisional"
+        context[field] = value
+        sources[field] = {**common, "verification_status": status,
+                          "reason": "Current financial evidence is unavailable." if cockpit is None else
+                                    "Three accepted statement months and a fully accepted bank source basis are required for program cash-flow estimates." if not proxy_eligible else
+                                    dscr.get("reason") if value is None else None}
+        if field in assumptions:
+            sources[field]["reviewed_assumption"] = assumptions[field]
+    estimated = [field for field in context.get("estimated_fit_facts") or [] if field not in {"dscr", "cash_flow"}]
+    estimated.extend(field for field in ("dscr", "cash_flow")
+                     if sources[field]["verification_status"] == "estimated_from_statements")
+    context["estimated_fit_facts"] = estimated
+    context["financial_calculation_authority"] = authority
 
 
 #: Facts the rules may evaluate. A staff-reviewed fact is verified; a value the

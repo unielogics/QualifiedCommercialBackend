@@ -3809,7 +3809,7 @@ async def _application_room_state(
         pass
     else:
         payment_agreements_visible = True
-    readiness_snapshot = await capital_readiness.latest_snapshot(db, profile.id)
+    readiness_snapshot = await capital_readiness.advisory_current_snapshot(db, profile)
     return ApplicationRoomState(
         profile_id=profile.id,
         business_name=_business_label(profile, intake, client),

@@ -678,7 +678,7 @@ async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
         await db.execute(
             select(DealerMetricSnapshot)
             .where(DealerMetricSnapshot.dealer_id.in_(ids))
-            .order_by(DealerMetricSnapshot.dealer_id, DealerMetricSnapshot.as_of.desc())
+            .order_by(DealerMetricSnapshot.dealer_id, DealerMetricSnapshot.as_of.desc(), DealerMetricSnapshot.created_at.desc())
         )
     ).scalars().all()
     latest: dict[UUID, DealerMetricSnapshot] = {}
@@ -771,11 +771,13 @@ async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
         ).all()
     )
     out: list[DealerListItem] = []
+    from .services.engines import metric_snapshot_policy_current
+
     for d in dealers:
         item = DealerListItem.model_validate(d)
         item.group_name = group_names.get(d.id)
         snap = latest.get(d.id)
-        if snap is not None:
+        if snap is not None and metric_snapshot_policy_current(snap):
             item.score = float(snap.score) if snap.score is not None else None
             item.tier = snap.tier
         item.open_alerts = int(alerts.get(d.id, 0))
@@ -6977,14 +6979,7 @@ async def dealer_health(
     """Cockpit read: latest snapshot + targets + unresolved alerts + lineage size."""
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
-    snapshot = (
-        await db.execute(
-            select(DealerMetricSnapshot)
-            .where(DealerMetricSnapshot.dealer_id == dealer.id)
-            .order_by(DealerMetricSnapshot.as_of.desc(), DealerMetricSnapshot.created_at.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
+    snapshot = await _latest_snapshot_row(db, dealer.id)
     targets = (
         await db.execute(
             select(DealerMetricTarget)
@@ -7068,7 +7063,9 @@ async def _latest_snapshot_metrics(db: AsyncSession, dealer_id: UUID) -> dict:
             "No metric snapshot exists for this client yet — import financials or "
             "POST /dealers/{id}/recompute first",
         )
-    return snapshot.metrics or {}
+    from .services.engines import current_snapshot_metrics
+
+    return await current_snapshot_metrics(db, dealer_id, snapshot)
 
 
 @router.get("/dealers/{dealer_id}/plan", response_model=list[PlanActionRead])
@@ -15565,14 +15562,7 @@ async def lender_package(
 async def _build_lender_package(db: AsyncSession, dealer: DealerBusiness) -> LenderPackageRead:
     """Assemble the full lender bundle for one dealer — shared by the
     lender-package endpoint and the AI analyst (same facts, one code path)."""
-    snapshot = (
-        await db.execute(
-            select(DealerMetricSnapshot)
-            .where(DealerMetricSnapshot.dealer_id == dealer.id)
-            .order_by(DealerMetricSnapshot.as_of.desc(), DealerMetricSnapshot.created_at.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
+    snapshot = await _latest_snapshot_row(db, dealer.id)
     target_rows = (
         (
             await db.execute(
@@ -15630,7 +15620,7 @@ async def _build_lender_package(db: AsyncSession, dealer: DealerBusiness) -> Len
         )
     ).scalar_one_or_none()
     readiness_snapshot = (
-        await capital_readiness_service.latest_snapshot(db, application_profile.id)
+        await capital_readiness_service.advisory_current_snapshot(db, application_profile)
         if application_profile is not None
         else None
     )
@@ -15965,7 +15955,7 @@ async def list_audit_log(
 
 
 async def _latest_snapshot_row(db: AsyncSession, dealer_id: UUID) -> DealerMetricSnapshot | None:
-    return (
+    snapshot = (
         await db.execute(
             select(DealerMetricSnapshot)
             .where(DealerMetricSnapshot.dealer_id == dealer_id)
@@ -15973,6 +15963,9 @@ async def _latest_snapshot_row(db: AsyncSession, dealer_id: UUID) -> DealerMetri
             .limit(1)
         )
     ).scalar_one_or_none()
+    from .services.engines import current_snapshot_row
+
+    return await current_snapshot_row(db, dealer_id, snapshot)
 
 
 @router.get("/dealers/{dealer_id}/lineage", response_model=LineageRead)
@@ -16395,6 +16388,8 @@ async def dealer_progress(
     between the two snapshots."""
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    # Refresh only the current projection before comparing immutable history.
+    await _latest_snapshot_row(db, dealer.id)
     snaps = (
         (
             await db.execute(

@@ -91,6 +91,11 @@ def _entity_words(value: Any) -> tuple[str, ...]:
     return tuple(words)
 
 
+def normalize_business_identity(value: Any) -> str:
+    """Preserve word boundaries while normalizing punctuation/legal suffixes."""
+    return " ".join(_entity_words(value))
+
+
 def entities_match(expected: Any, observed: Any) -> bool:
     """Exact words after punctuation, conjunction and legal-suffix normalization."""
     expected_words = _entity_words(expected)
