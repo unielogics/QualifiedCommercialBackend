@@ -76,50 +76,62 @@ def _gap(target: float | None, current: float | None) -> float | None:
 
 # EBITDA components as they appear on a business return. Names vary by form and
 # preparer, so each maps to a list of accepted keys.
-_TAX_EBITDA_FIELDS: dict[str, tuple[str, ...]] = {
-    "base": ("ordinary_business_income", "net_income", "taxable_income", "book_income"),
-    "interest": ("interest_expense", "floor_plan_interest_expense", "mortgage_interest"),
-    "depreciation": ("depreciation", "depreciation_expense", "depreciation_amortization"),
-    "amortization": ("amortization", "amortization_expense"),
-    "taxes": ("taxes_paid", "income_tax_expense"),
-}
+_TAX_EARNINGS_BASE_FIELDS = (
+    "ordinary_business_income", "ordinary_business_income_loss_current", "ordinary_business_income_loss",
+    "net_income", "net_profit", "net_income_per_books_current", "net_income_per_books", "book_income", "taxable_income",
+)
 
 
-def _tax_ebitda(filing) -> float | None:
-    """Rebuild annual EBITDA from a business tax return's stored figures.
+def _tax_ebitda(filing, *, business_entity: str | None = None) -> float | None:
+    """The legacy tax-derived earnings estimate, scoped to the business.
 
-    EBITDA = ordinary business income + interest + taxes + depreciation +
-    amortization. Officer compensation is deliberately NOT added back here:
-    it is an add-back only when the owner's pay is above market, which is a
-    human judgement that belongs in the add-back editor with evidence — not a
-    silent boost to the headline number a lender sees.
-
-    Returns None when the filing carries no usable base figure, so the metric
-    stays honestly null rather than showing a fabricated zero."""
+    Personal returns never supply business earnings. Only known current-year
+    interest and D&A augment the return's income; unknown deductions stay
+    unknown rather than becoming asserted zeroes or full reconciled EBITDA.
+    """
     if filing is None or not isinstance(getattr(filing, "detail", None), dict):
         return None
-    detail = filing.detail
+    from app.services.financial_tax_earnings import entities_match, normalize_tax_earnings
+    from app.services.public_underwriting_packet_pdf import _num
 
-    def pick(keys: tuple[str, ...]) -> float | None:
-        for k in keys:
-            v = detail.get(k)
-            if v is None:
-                continue
-            try:
-                return float(str(v).replace(",", "").replace("$", ""))
-            except (TypeError, ValueError):
-                continue
+    detail = {**filing.detail}
+    if not any(detail.get(key) for key in ("entity_name", "business_name", "taxpayer")) and getattr(filing, "entity_name", None):
+        detail["entity_name"] = filing.entity_name
+    if not detail.get("form_type") and getattr(filing, "form_type", None):
+        detail["form_type"] = filing.form_type
+    normalized = normalize_tax_earnings(detail)
+    source_entity = detail.get("entity_name") or detail.get("business_name") or detail.get("taxpayer")
+    if not normalized["business_tax_source"] or not entities_match(business_entity, source_entity):
         return None
-
-    base = pick(_TAX_EBITDA_FIELDS["base"])
+    if normalized["currency"] is not None and normalized["currency"] != "USD":
+        return None
+    first, last = normalized["period_start"], normalized["period_end"]
+    if first or last:
+        # Explicit short or malformed periods are not annual income. A
+        # legacy filing's bare year retains its existing annual semantics.
+        if not first or not last or last < first:
+            return None
+        start, end = date.fromisoformat(first), date.fromisoformat(last)
+        if (end.year - start.year) * 12 + end.month - start.month + 1 != 12:
+            return None
+    base = None
+    for key in _TAX_EARNINGS_BASE_FIELDS:
+        raw = detail.get(key)
+        value = _num(raw.get("value") if isinstance(raw, dict) else raw)
+        if value is not None:
+            base = value
+            break
     if base is None:
         return None
-    total = base
-    for part in ("interest", "depreciation", "amortization", "taxes"):
-        v = pick(_TAX_EBITDA_FIELDS[part])
-        if v is not None:
-            total += abs(v)
-    return round(total, 2)
+    return round(base + (normalized["interest"] or 0) + (normalized["depreciation"] or 0), 2)
+
+
+def _latest_business_tax_earnings(filings, *, business_entity: str | None) -> float | None:
+    for filing in filings:
+        value = _tax_ebitda(filing, business_entity=business_entity)
+        if value is not None:
+            return value
+    return None
 
 
 def compute_metrics(
@@ -222,8 +234,8 @@ def compute_metrics(
     # payment) — defined even at zero current debt.
     goal_payment = (fallbacks or {}).get("goal_monthly_payment")
     dscr_at_goal = None
-    if goal_payment and ebitda_bankable is not None:
-        goal_ds_annual = ((monthly_ds or 0.0) + float(goal_payment)) * 12.0
+    if goal_payment and ebitda_bankable is not None and monthly_ds is not None:
+        goal_ds_annual = (monthly_ds + float(goal_payment)) * 12.0
         if goal_ds_annual > 0:
             dscr_at_goal = round(ebitda_bankable / goal_ds_annual, 3)
 
@@ -318,6 +330,9 @@ def compute_metrics(
         "tier": tier,
         "ebitda": {
             "source": ebitda_source,
+            "basis": "tax_earnings_estimate" if ebitda_source == "tax_return" else ebitda_source,
+            "label": "Tax-derived earnings estimate" if ebitda_source == "tax_return" else "Reported EBITDA",
+            "provisional": ebitda_source == "tax_return",
             "reported_ttm": ebitda_reported_ttm,
             "adjusted": ebitda_adjusted,
             "bankable": ebitda_bankable,
@@ -840,9 +855,10 @@ async def load_metric_inputs(
     # conventional terms — gives the tile a meaningful ratio even at zero
     # current debt ("there is always a DSCR ratio").
     goal_payment = None
-    goal_row = (
-        await db.execute(select(DealerBusiness.funding_goal).where(DealerBusiness.id == dealer_id))
+    business = (
+        await db.execute(select(DealerBusiness).where(DealerBusiness.id == dealer_id))
     ).scalar_one_or_none()
+    goal_row = getattr(business, "funding_goal", None)
     if goal_row:
         from .paths import merged_settings, monthly_payment_for_goal
 
@@ -853,18 +869,16 @@ async def load_metric_inputs(
             float(goal_row), settings=merged_settings(setting_rows)
         )
 
-    latest_filing = (
+    tax_filings = (
         await db.execute(
             select(DealerTaxFiling)
             .where(
                 DealerTaxFiling.dealer_id == dealer_id,
-                DealerTaxFiling.revenue_reported.is_not(None),
                 current_dealer_document_source(DealerTaxFiling.document_id),
             )
             .order_by(DealerTaxFiling.year.desc())
-            .limit(1)
         )
-    ).scalar_one_or_none()
+    ).scalars().all()
 
     return MetricInputs(
         period_rows=period_rows,
@@ -879,7 +893,8 @@ async def load_metric_inputs(
             "debt_service_draft_monthly": draft_ds_monthly or None,
             "debt_schedule_monthly": drafted_monthly if accepted_rows is not None else drafted_monthly or None,
             "goal_monthly_payment": goal_payment,
-            "tax_ebitda_annual": _tax_ebitda(latest_filing),
+            "tax_ebitda_annual": _latest_business_tax_earnings(tax_filings,
+                business_entity=getattr(business, "legal_name", None) or getattr(business, "name", None)),
         },
     )
 

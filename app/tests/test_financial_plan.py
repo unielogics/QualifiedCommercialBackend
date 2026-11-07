@@ -5,6 +5,8 @@ all derive from it, so an action in one place changes everywhere."""
 
 from __future__ import annotations
 
+import pytest
+
 from app.services import financial_plan as fp
 from app.services.financial_cockpit import build_cockpit
 
@@ -177,7 +179,75 @@ def test_add_backs_overrides_and_an_interest_only_loan_change_every_figure_toget
     assert all(c["numerator_after"] == 200000.0 and c["overridden"] for c in out["candidates"])
     assert out["headline_after"] == round(200000 / 36000, 2)
     alone = fp.evaluate_plan(fp.normalize_plan({"overrides": {"income_annual": 90000}, "new_payment_monthly": 2000}), obligations_list=[], recurring={"payees": [], "months_read": []}, months=[], dscr={"candidates": [], "headline": None}, service={"monthly": None}, proposed=None, requested_amount=None)
-    assert alone["candidates"][0]["key"] == "desk_override" and alone["headline_after"] == round(90000 / 24000, 2)
+    assert alone["candidates"][0]["key"] == "desk_override" and alone["headline_after"] is None
+    assert alone["debt_service_after_monthly"] is None and not alone["no_debt_left"]
+
+
+@pytest.mark.parametrize("basis", ["tax_return", "profit_and_loss", "bank_cash_flow"])
+def test_interest_and_depreciation_do_not_inflate_any_coverage_basis(basis) -> None:
+    dscr = {"headline": {"key": basis, "numerator": 120000, "value": 10},
+            "candidates": [{"key": basis, "label": basis, "numerator": 120000, "value": 10}]}
+    plan = fp.normalize_plan({"add_backs": [
+        {"id": "interest", "kind": "interest_refinanced", "amount_monthly": 1000},
+        {"id": "depreciation", "kind": "depreciation", "amount_monthly": 500},
+        {"id": "operating", "kind": "one_time_expense", "amount_monthly": 250, "note": "One-time repair"},
+    ]})
+    result = fp.evaluate_plan(plan, obligations_list=[], recurring={}, months=[], dscr=dscr,
+                              service={"monthly": 1000}, proposed=None, requested_amount=None)
+    assert result["add_backs_monthly"] == 250 and result["add_backs_annual"] == 3000
+    assert result["income_after_annual"] == 123000 and result["headline_after"] == 10.25
+    assert [item["id"] for item in result["excluded_add_backs"]] == ["interest", "depreciation"]
+    # Original records remain recoverable, with zero financial effect shown.
+    assert len(plan["add_backs"]) == 3
+    modifications = fp.describe_modifications(plan, result, [], {})
+    assert [item["annual_effect"] for item in modifications] == [0, 0, 3000]
+    assert all(item["label"].startswith("Not applied:") for item in modifications[:2])
+
+
+@pytest.mark.parametrize("new_loan", [
+    {"new_payment_monthly": 1000},
+    {"new_loan_amount": 100000, "new_loan_rate_pct": 12, "new_loan_term_months": 120},
+    {"new_loan_amount": 100000, "new_loan_rate_pct": 12, "new_loan_term_months": 12,
+     "new_loan_structure": "amortizing",
+     "new_loan_repayment_config": {"amortization_months": 120, "after_balloon": "keep_payment", "balloons": []}},
+])
+def test_pricing_a_new_loan_does_not_turn_unknown_existing_debt_into_zero(new_loan) -> None:
+    plan = fp.normalize_plan(new_loan)
+    result = fp.evaluate_plan(plan, obligations_list=[], recurring={}, months=[], dscr=DSCR,
+                              service={"monthly": None}, proposed=None, requested_amount=100000)
+    assert result["new_payment_monthly"] is not None
+    for field in ("debt_service_before_monthly", "debt_service_before_new_payment_monthly",
+                  "debt_service_after_monthly", "debt_service_after_annual", "headline_after"):
+        assert result[field] is None
+    assert not result["no_debt_left"] and result["risk"] is None
+    assert result["coverage_unavailable_reason"] == fp.UNKNOWN_DEBT_SERVICE_REASON
+    assert all(candidate["value_after"] is None and not candidate["no_debt_left"] for candidate in result["candidates"])
+    levers = fp.coverage_levers(plan, result, obligations_list=[], recurring={}, dscr=DSCR,
+                                requested_amount=100000, terms=None)
+    assert len(levers) == 1 and levers[0]["key"] == "debt_schedule"
+    assert levers[0]["dscr_after"] is None and not levers[0]["improves"]
+
+
+@pytest.mark.parametrize("service,overrides", [
+    ({"monthly": 0, "source": "declared_none"}, {}),
+    ({"monthly": None}, {"debt_service_monthly": 0}),
+    ({"monthly": None}, {"debt_service_monthly": 1000}),
+])
+def test_explicit_existing_debt_assumptions_still_enable_scenario_coverage(service, overrides) -> None:
+    plan = fp.normalize_plan({"new_payment_monthly": 2000,
+                              "overrides": {"income_annual": 90000, **overrides}})
+    result = fp.evaluate_plan(plan, obligations_list=[], recurring={}, months=[],
+                              dscr={"candidates": []}, service=service, proposed=None, requested_amount=None)
+    existing = overrides.get("debt_service_monthly", service.get("monthly"))
+    assert result["headline_after"] == round(90000 / ((existing + 2000) * 12), 2)
+    assert result["coverage_unavailable_reason"] is None
+
+
+def test_unknown_debt_without_new_financing_is_not_a_no_debt_declaration() -> None:
+    result = fp.evaluate_plan(fp.normalize_plan({}), obligations_list=[], recurring={}, months=[],
+                              dscr=DSCR, service={}, proposed=None, requested_amount=None)
+    assert result["headline_after"] is None and not result["no_debt_left"]
+    assert result["debt_service_after_monthly"] is None
 
 
 def test_modifications_and_impact_read_as_original_change_and_result() -> None:

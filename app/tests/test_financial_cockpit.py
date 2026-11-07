@@ -385,12 +385,14 @@ def test_dscr_candidates_follow_the_review_precedence_and_name_their_basis() -> 
     assert dscr["thresholds"] == {"acceptable": 1.0, "healthy": 1.25, "very_strong": 1.5}
 
 
-def test_dscr_without_debt_service_explains_itself_and_still_shows_the_pro_forma() -> None:
+def test_unknown_existing_debt_service_blocks_current_and_pro_forma_coverage() -> None:
     cockpit = build_cockpit([TAX_2025], [], proposed_terms=TERM_SHEET)
     dscr = cockpit["dscr"]
     assert dscr["headline"] is None
     assert "debt schedule" in dscr["reason"]
-    assert dscr["pro_forma_headline"]["pro_forma_value"] == 5.83
+    assert dscr["pro_forma_headline"] is None
+    assert dscr["proposed"]["annual_payment"] == 12000
+    assert all(row["value"] is None and row["pro_forma_value"] is None for row in dscr["candidates"])
     assert any("No debt service" in note for note in cockpit["notes"])
 
     nothing = build_cockpit([], [])

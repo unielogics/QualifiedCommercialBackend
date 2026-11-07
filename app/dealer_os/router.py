@@ -16490,6 +16490,15 @@ async def _store_tax_detail(
     facts = analysis.get("key_facts") if isinstance(analysis, dict) else None
     if not isinstance(facts, dict):
         return
+    from app.services.financial_tax_earnings import entities_match, tax_source_is_business
+
+    if not tax_source_is_business(facts):
+        return
+    dealer = await db.get(DealerBusiness, dealer_id)
+    expected_entity = (getattr(dealer, "legal_name", None) or getattr(dealer, "name", None))
+    source_entity = facts.get("entity_name") or facts.get("business_name") or facts.get("taxpayer")
+    if not entities_match(expected_entity, source_entity):
+        return
     for item in tax_years:
         row = (
             await db.execute(

@@ -62,12 +62,19 @@ def test_complete_pl_reconciles_once_and_dscr_keeps_tax_precedence():
 
 
 @pytest.mark.parametrize("currency,status,numerator_currency", [("USD", "comparable", "USD"), ("EUR", "mismatch", "EUR"), (None, "unknown", None), ("XXX", "unknown", None)])
-def test_dscr_currency_provenance_does_not_change_existing_ratio(currency, status, numerator_currency):
+def test_dscr_blocks_known_currency_mismatch_and_retains_currency_provenance(currency, status, numerator_currency):
     c = build([pnl(currency=currency)])
-    headline = c["dscr"]["headline"]
+    candidate = c["dscr"]["candidates"][0]
     calculation = next(row for row in c["metric_review"]["calculations"] if row["key"] == "dscr.profit_and_loss")
-    assert headline["value"] == 4.33 and headline["numerator"] == 52000
-    for result in (headline, calculation):
+    if status == "mismatch":
+        assert c["dscr"]["headline"] is None and c["dscr"]["pro_forma_headline"] is None
+        assert candidate["source_numerator"] == 52000
+        assert candidate["value"] is None and candidate["numerator"] is None
+        assert candidate["pro_forma_value"] is None and candidate["status"] == "unavailable"
+    else:
+        assert c["dscr"]["headline"] is candidate
+        assert candidate["value"] == 4.33 and candidate["numerator"] == 52000
+    for result in (candidate, calculation):
         assert result["currency_status"] == status and result["numerator_currency"] == numerator_currency
         assert result["denominator_currency"] == "USD"
         assert result["currency_comparable"] == (status == "comparable")
@@ -77,14 +84,19 @@ def test_dscr_currency_provenance_does_not_change_existing_ratio(currency, statu
     assert target(c, "debt.annual")["source_refs"][0]["currency"] == "USD"
 
 
-def test_tax_currency_warning_follows_actual_tax_first_dscr_source_not_pl_headline():
+def test_comparable_pl_fallback_leads_when_tax_currency_is_ineligible():
     c = build([tax(currency="EUR"), pnl(currency="USD")])
     assert c["ebitda"]["headline"]["currency"] == "USD"
-    assert c["dscr"]["headline"]["key"] == "tax_return"
-    assert c["dscr"]["headline"]["numerator"] == 115000
-    assert c["dscr"]["headline"]["currency_status"] == "mismatch"
-    assert c["dscr"]["headline"]["source_currencies"] == ["EUR"]
-    assert "EUR" in c["dscr"]["headline"]["note"]
+    assert c["dscr"]["headline"]["key"] == "profit_and_loss"
+    assert c["dscr"]["headline"]["value"] == 4.33
+    tax_candidate = next(row for row in c["dscr"]["candidates"] if row["key"] == "tax_return")
+    assert tax_candidate["source_numerator"] == 115000
+    assert tax_candidate["value"] is None and tax_candidate["numerator"] is None
+    assert tax_candidate["currency_status"] == "mismatch"
+    assert tax_candidate["source_currencies"] == ["EUR"]
+    assert "EUR" in tax_candidate["note"]
+    selected = [row["key"] for row in c["metric_review"]["calculations"] if row.get("selected")]
+    assert selected == ["dscr.profit_and_loss"]
 
 
 def test_unknown_accounting_basis_keeps_complete_operand_ebitda_provisional():
@@ -101,10 +113,12 @@ def test_mixed_bank_source_currencies_are_explicit_without_fx_or_ebitda():
                                        "total_withdrawals_and_debits": 8000}, key=f"bank-{month}") for month, currency in ((1, "EUR"), (2, "USD"), (3, "USD"))]
     c = build(analyses)
     assert c["ebitda"]["headline"] is None
-    headline = c["dscr"]["headline"]
-    assert headline["numerator"] == 36000 and headline["value"] == 3
-    assert headline["source_currencies"] == ["EUR", "USD"]
-    assert headline["numerator_currency"] is None and headline["currency_status"] == "mismatch"
+    assert c["dscr"]["headline"] is None
+    candidate = c["dscr"]["candidates"][0]
+    assert candidate["source_numerator"] == 36000
+    assert candidate["numerator"] is None and candidate["value"] is None
+    assert candidate["source_currencies"] == ["EUR", "USD"]
+    assert candidate["numerator_currency"] is None and candidate["currency_status"] == "mismatch"
 
 
 def test_effective_operand_changes_dscr_plan_and_net_profit_but_not_raw_analysis():
@@ -229,15 +243,14 @@ def test_earnings_correction_survives_debt_version_and_supporting_evidence_chang
     assert updated["metric_review"]["source_stamp"] != c["metric_review"]["source_stamp"]
 
 
-def test_known_wrong_entity_excluded_from_new_ebitda_but_legacy_dscr_basis_explained():
+def test_known_wrong_business_tax_is_excluded_before_earnings_and_correction_inputs():
     c = build([tax(entity_name="Other Inc"), pnl()])
     assert c["ebitda"]["headline"]["key"] == "profit_and_loss"
-    assert c["dscr"]["headline"]["key"] == "tax_return"
-    calculation = next(row for row in c["metric_review"]["calculations"] if row["key"] == "dscr.tax_return")
-    assert not calculation["entity_comparable"]
-    assert any("different business" in note for note in calculation["notes"])
+    assert c["dscr"]["headline"]["key"] == "profit_and_loss"
+    assert not any(row["key"] == "dscr.tax_return" for row in c["metric_review"]["calculations"])
     wrong_inputs = [i for i in c["metric_review"]["inputs"] if i["key"].startswith("tax_return:")]
-    assert all(not i["editable"] and i["unavailable_reason"] for i in wrong_inputs)
+    assert wrong_inputs == []
+    assert c["metric_review"]["excluded_income_sources"] == [{"file_id": "tax", "file_name": "tax.pdf", "reason": "Business identity does not match this file; review the association in Evidence."}]
 
 
 def test_idempotent_replay_before_revision_and_source_checks_and_restore():
@@ -311,7 +324,7 @@ def test_tax_short_period_is_not_presented_as_annualized_new_ebitda():
     result = c["ebitda"]["headline"]
     assert result["months_covered"] == 6 and result["value"] == 115000
     assert result["annualized_value"] is None and result["annualization_factor"] is None
-    assert c["dscr"]["headline"]["numerator"] == 115000
+    assert c["dscr"]["headline"] is None
 
 
 def test_operand_names_the_actual_tax_alias_and_no_invented_page():

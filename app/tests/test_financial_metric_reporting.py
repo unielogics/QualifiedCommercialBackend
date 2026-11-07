@@ -97,25 +97,33 @@ def test_unvalidated_or_other_currency_debt_never_promotes_a_pl_dscr_pair():
 
 
 @pytest.mark.parametrize("currency,status", [("EUR", "mismatch"), (None, "unknown")])
-def test_primary_and_calculation_briefs_preserve_currency_warnings_without_changing_ratio(currency, status):
+def test_brief_blocks_known_currency_mismatch_and_preserves_calculation_evidence(currency, status):
     cockpit = build([pnl(currency=currency)])
     brief = metric_brief(cockpit)
     primary = brief["primary_dscr"]
     calculation = next(row for row in brief["calculations"] if row["key"] == "dscr.profit_and_loss")
-    for result in (primary, calculation):
+    if status == "mismatch":
+        assert primary is None
+        assert cockpit["dscr"]["headline"] is None
+        assert calculation["value"] is None and calculation["numerator"] is None
+        assert cockpit["dscr"]["candidates"][0]["source_numerator"] == 52000
+    else:
+        assert primary["value"] == cockpit["dscr"]["headline"]["value"] == 4.33
+        assert primary["source_currencies"] == []
+        assert primary["currency_note"] in primary["note"]
+    for result in ((calculation,) if primary is None else (primary, calculation)):
         assert result["currency_status"] == status and not result["currency_comparable"]
         assert result["denominator_currency"] == "USD" and result["currency_note"]
         assert "without currency conversion" in result["currency_note"]
-        assert result["value"] == cockpit["dscr"]["headline"]["value"] == 4.33
-    assert primary["source_currencies"] == ([currency] if currency else [])
-    assert primary["currency_note"] in primary["note"]
+        assert result["source_currencies"] == ([currency] if currency else [])
 
 
 @pytest.mark.asyncio
 async def test_internal_loan_ai_context_uses_current_correction_even_without_a_plan():
     cockpit = build(state=correction(build()))
     with patch.object(application_profiles, "find_profile", AsyncMock(return_value=SimpleNamespace(id=uuid4()))), \
-         patch.object(financial_cockpit, "load_cockpit", AsyncMock(return_value=cockpit)):
+         patch.object(financial_cockpit, "load_cockpit", AsyncMock(return_value=cockpit)), \
+         patch("app.services.bucket_ai._published_program_screen", AsyncMock(return_value={})):
         result = await ai_context._financial_calculation_block(None, SimpleNamespace(id=uuid4()), audience="super_admin")
     assert "current_applied" in result and "72000" in result and "primary_dscr" in result
 
@@ -136,7 +144,7 @@ def profile_fixture():
 
 
 @pytest.mark.asyncio
-async def test_intelligence_prefers_comparable_live_annual_pair_and_retains_primary_provenance():
+async def test_intelligence_uses_current_primary_dscr_and_keeps_strict_annual_pl_ebitda_separate():
     db, profile, intake = profile_fixture()
     before = deepcopy(intake.result_snapshot)
     cockpit = build([tax(interest=None, depreciation=None), pnl()])
@@ -145,21 +153,27 @@ async def test_intelligence_prefers_comparable_live_annual_pair_and_retains_prim
         result = await application_profiles.intelligence_state(db, profile)
     assert next(row for row in result.metrics if row.key == "ebitda").value == 52000
     dscr = next(row for row in result.metrics if row.key == "dscr")
-    assert dscr.value == 4.33 and "P&L EBITDA-based" in dscr.source
+    assert dscr.value == cockpit["dscr"]["headline"]["value"] == 8.33
+    assert "Current financial cockpit" in dscr.source and "Tax return 2025" in dscr.source
     assert result.dscr_inputs["bankable_ebitda"] == 52000 and result.dscr_inputs["annual_debt_service"] == 12000
     assert result.metric_review["primary_dscr"]["key"] == "tax_return"
+    assert result.dscr_inputs["basis"] == "current_cockpit" and result.dscr_inputs["cash_flow_value"] == 100000
+    assert result.effective_calculation["dscr"] == 4.33
     assert result.effective_calculation["basis"] == "validated_profit_and_loss_annual_ebitda"
     assert intake.result_snapshot == before
 
 
 @pytest.mark.asyncio
-async def test_intelligence_period_ebitda_is_unavailable_annually_and_cached_fallback_is_labelled():
+async def test_live_unavailable_coverage_and_short_period_ebitda_do_not_resurrect_cached_ai():
     db, profile, _ = profile_fixture()
     cockpit = build([pnl(period_end="2026-04-30")])
     with patch("app.services.financial_version_selection.accepted_debt_schedule_snapshot", AsyncMock(return_value=None)), \
          patch.object(financial_cockpit, "load_cockpit", AsyncMock(return_value=cockpit)):
         result = await application_profiles.intelligence_state(db, profile)
     assert next(row for row in result.metrics if row.key == "ebitda").value is None
-    assert "Cached AI" in next(row for row in result.metrics if row.key == "dscr").source
+    dscr = next(row for row in result.metrics if row.key == "dscr")
+    assert dscr.value is None and dscr.status == "needs_evidence"
+    assert "Current financial cockpit" in dscr.source and "unavailable" in dscr.source
+    assert result.dscr_inputs["basis"] == "current_cockpit"
     assert result.effective_calculation is None
     assert result.metric_review["ebitda"]["headline"]["value"] == 26000
