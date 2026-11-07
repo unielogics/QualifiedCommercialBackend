@@ -5,6 +5,8 @@ from __future__ import annotations
 import uuid
 from types import SimpleNamespace
 
+import pytest
+
 from app.services import financial_plan as fp
 from app.services import plan_terms_link as link
 
@@ -41,6 +43,63 @@ def test_recording_terms_adopts_them_into_the_plan_with_the_sheet_s_own_treatmen
     # Re-recorded as additive: the refinance override goes, a desk-typed override would stay.
     back = fp.normalize_plan(link.adopt(refi_plan, link.recorded_from_production_sheet(_sheet())))
     assert back["overrides"]["debt_service_monthly"] is None
+
+
+@pytest.mark.parametrize("retained", [None, 0])
+@pytest.mark.parametrize("prior_basis", [None, "automatic", "staff"])
+def test_legacy_refinance_adoption_preserves_unknown_vs_explicit_zero_and_staff_assumptions(retained, prior_basis):
+    overrides = {"income_annual": 120000, "income_note": "Reviewed earnings"}
+    if prior_basis is not None:
+        overrides.update(debt_service_monthly=1500,
+            debt_service_note="Refinance per old terms" if prior_basis == "automatic" else "Staff-reviewed service")
+    recorded = link.recorded_from_client_terms(_client_row(debt_service_treatment="refinance",
+                                                          retained_annual_debt_service=retained))
+    adopted = fp.normalize_plan(link.adopt({"retire": ["row:old"], "exclude": ["payee:transfer"],
+                                            "overrides": overrides}, recorded))
+    assert adopted["terms_ref"]["retained_annual_debt_service"] == retained
+    assert adopted["new_loan_amount"] == 150000 and adopted["new_payment_source"] == "recorded_terms"
+    assert adopted["retire"] == ["row:old"] and adopted["exclude"] == ["payee:transfer"]
+    assert adopted["overrides"]["income_annual"] == 120000
+    expected_service = 0 if retained == 0 else 1500 if prior_basis == "staff" else None
+    assert adopted["overrides"]["debt_service_monthly"] == expected_service
+    if retained is None:
+        assert not (adopted["overrides"]["debt_service_note"] or "").startswith("Refinance per ")
+    else:
+        assert adopted["overrides"]["debt_service_note"].startswith("Refinance per ")
+    evaluated = fp.evaluate_plan(adopted,
+        obligations_list=[{"id": "row:old", "monthly": 300, "in_debt_service": True}], recurring={}, months=[],
+        dscr={"headline": {"key": "profit_and_loss", "numerator": 120000},
+              "candidates": [{"key": "profit_and_loss", "numerator": 120000}]},
+        service={"monthly": None}, proposed=None, requested_amount=None)
+    expected_remaining = 0 if retained == 0 else 1200 if prior_basis == "staff" else None
+    assert evaluated["debt_service_before_new_payment_monthly"] == expected_remaining
+    assert (evaluated["headline_after"] is None) == (expected_remaining is None)
+
+
+@pytest.mark.parametrize("retained", [None, 0])
+def test_production_refinance_adoption_does_not_invent_missing_retained_service(retained):
+    recorded = link.recorded_from_production_sheet(_sheet(extra={"debt_service_treatment": "refinance",
+                                                                "retained_annual_debt_service": retained}))
+    adopted = fp.normalize_plan(link.adopt({}, recorded))
+    assert adopted["terms_ref"]["retained_annual_debt_service"] == retained
+    assert adopted["overrides"]["debt_service_monthly"] == retained
+
+
+@pytest.mark.parametrize("retained", [None, 0])
+def test_legacy_recorded_refinance_is_not_offered_with_assumed_zero_retained_debt(retained):
+    recorded = link.recorded_from_client_terms(_client_row(debt_service_treatment="refinance",
+                                                          retained_annual_debt_service=retained))
+    plan = fp.normalize_plan({})
+    obligations = [{"id": "row:old", "monthly": 1000, "payoff": 10000, "in_debt_service": True}]
+    dscr = {"headline": {"key": "profit_and_loss", "numerator": 120000},
+            "candidates": [{"key": "profit_and_loss", "numerator": 120000}]}
+    evaluated = fp.evaluate_plan(plan, obligations_list=obligations, recurring={}, months=[], dscr=dscr,
+                                 service={"monthly": 3000}, proposed=None, requested_amount=None)
+    levers = fp.coverage_levers(plan, evaluated, obligations_list=obligations, recurring={}, dscr=dscr,
+                                requested_amount=None, terms={**recorded, "monthly_payment": recorded["payment_monthly"]})
+    keys = {item["key"] for item in levers}
+    assert "term_sheet:add" in keys
+    assert ("term_sheet:refinance" in keys) == (retained is not None)
 
 
 def test_withdrawing_the_adopted_terms_releases_the_plan_and_keeps_the_rest() -> None:

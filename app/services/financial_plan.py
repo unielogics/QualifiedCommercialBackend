@@ -1098,8 +1098,8 @@ def coverage_levers(
         in_service = [
             o for o in obligations_list if o.get("in_debt_service") and o["id"] not in retire
         ]
-        if treatment == "refinance" and in_service:
-            retained = _num((terms or {}).get("retained_annual_debt_service")) or 0.0
+        retained = _num((terms or {}).get("retained_annual_debt_service"))
+        if treatment == "refinance" and in_service and retained is not None:
             after_refi = round(max(0.0, retained / 12 + sheet_payment), 2)
             value_refi = _dscr_for(numerator, after_refi)
             levers.append(
