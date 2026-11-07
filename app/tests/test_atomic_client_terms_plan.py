@@ -70,15 +70,17 @@ def payload(**extra):
         "closing_estimate_days": 5, "conditions": ["Retain reviewed condition"], "client_note": "Retain client note", **extra})
 
 
-def cockpit(profile, *, service=None):
+def cockpit(profile, *, service=None, obligations=None):
     plan = financial_plan.normalize_plan(profile.financial_plan)
-    obligations = [{"id": "row:loan-a", "monthly": 1000, "payoff": 10000, "in_debt_service": True}]
+    obligations = obligations if obligations is not None else [{"id": "row:loan-a", "monthly": 1000, "payoff": 10000, "in_debt_service": True}]
+    debt_service = service if service is not None else {"monthly": 3000}
+    dscr = {"headline": {"key": "profit_and_loss", "numerator": 120000, "value": 3.33},
+            "candidates": [{"key": "profit_and_loss", "numerator": 120000, "value": 3.33}]}
     evaluation = financial_plan.evaluate_plan(plan, obligations_list=obligations,
         recurring={"payees": [{"key": "transfer", "monthly_average": 500}]}, months=[],
-        dscr={"headline": {"key": "profit_and_loss", "numerator": 120000, "value": 3.33},
-              "candidates": [{"key": "profit_and_loss", "numerator": 120000, "value": 3.33}]},
-        service=service if service is not None else {"monthly": 3000}, proposed=None, requested_amount=None)
-    return {"debt": {"obligations": obligations}, "plan": {"record": plan, "evaluation": evaluation, "levers": []}}
+        dscr=dscr, service=debt_service, proposed=None, requested_amount=None)
+    return {"dscr": dscr, "debt": {"obligations": obligations, "service": debt_service},
+            "plan": {"record": plan, "evaluation": evaluation, "levers": []}}
 
 
 @pytest.fixture
@@ -117,6 +119,7 @@ def env(monkeypatch):
     session.commit()
     db = DB(session)
     service = {"monthly": 3000}
+    obligations = [{"id": "row:loan-a", "monthly": 1000, "payoff": 10000, "in_debt_service": True}]
     actor = SimpleNamespace(id=uuid4(), role=Role.LOAN_EXEC)
     log = AsyncMock()
     monkeypatch.setattr(routes.profiles, "load_profile", AsyncMock(return_value=profile))
@@ -126,15 +129,16 @@ def env(monkeypatch):
     monkeypatch.setattr(application_terms, "_plan_block", AsyncMock(return_value=None))
 
     async def context(_db, target):
-        evaluated = cockpit(target, service=service)["plan"]["evaluation"]
+        evaluated = cockpit(target, service=service, obligations=obligations)["plan"]["evaluation"]
         existing = evaluated["debt_service_before_new_payment_monthly"]
         return application_terms.DscrContext("business", 3.33,
             evaluated.get("income_after_annual") or 120000, "Fictional earnings",
             existing * 12 if existing is not None else None, None, "fixture")
 
     monkeypatch.setattr(application_terms, "_dscr_context", context)
-    monkeypatch.setattr(financial_cockpit, "load_cockpit", AsyncMock(side_effect=lambda _db, target: cockpit(target, service=service)))
-    result = SimpleNamespace(db=db, session=session, profile=profile, actor=actor, log=log, Profile=Profile, service=service)
+    monkeypatch.setattr(financial_cockpit, "load_cockpit", AsyncMock(side_effect=lambda _db, target: cockpit(target, service=service, obligations=obligations)))
+    result = SimpleNamespace(db=db, session=session, profile=profile, actor=actor, log=log, Profile=Profile,
+                             service=service, obligations=obligations)
     try:
         yield result
     finally:
@@ -321,6 +325,26 @@ async def test_combined_save_preserves_unknown_debt_until_retained_service_is_ex
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("configured", [False, True])
+async def test_combined_terms_real_context_does_not_restore_raw_debt_after_unknown_retirement(env, monkeypatch, configured):
+    await baseline(env)
+    env.obligations[0]["monthly"] = None
+    monkeypatch.setattr(application_terms, "_dscr_context", application_terms._cockpit_context)
+    request = combined(env)
+    if not configured:
+        request.repayment_config = None
+        request.financial_plan.new_loan_repayment_config = None
+    result = await routes.put_client_terms(env.profile.id, request, env.actor, env.db)
+    assert env.service["monthly"] == 3000
+    assert result.financial_plan.record["overrides"]["debt_service_monthly"] == 2500
+    assert result.calculation.cash_flow_value == 144000
+    assert result.calculation.current_annual_debt_service is None
+    assert result.calculation.projected_annual_debt_service is None and result.calculation.dscr_after is None
+    assert result.financial_plan.evaluation["debt_service_after_annual"] is None
+    assert result.financial_plan.evaluation["headline_after"] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("next_treatment,retained", [("additive", None), ("refinance", 18000)])
 async def test_combined_treatment_transition_snapshots_same_scenario_as_final_plan(env, next_treatment, retained):
     await baseline(env)
@@ -385,6 +409,50 @@ def test_recorded_retained_service_remains_known_when_selected_old_payment_is_un
         assert result["debt_service_before_new_payment_monthly"] is None
         assert result["debt_service_after_annual"] is None and result["headline_after"] is None
         assert result["coverage_unavailable_reason"] == financial_plan.UNKNOWN_DEBT_SERVICE_REASON
+
+
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("change", [
+    {"overrides": {"debt_service_monthly": 0, "debt_service_note": "Staff basis"}},
+    {"overrides": {"debt_service_monthly": 1500, "debt_service_note": "Staff basis"}},
+    {"new_payment_source": "manual_terms"},
+    {"overrides": {"debt_service_monthly": 1000, "debt_service_note": "Staff basis"}},
+    {"overrides": {"debt_service_monthly": 1500, "debt_service_note": "Refinance per terms"}},
+])
+def test_unknown_selected_retirement_cannot_be_subtracted_from_unrelated_known_service(configured, change):
+    plan = financial_plan.normalize_plan({"new_loan_amount": 100000, "new_loan_rate_pct": 12,
+        "new_loan_term_months": 24, "new_loan_structure": "amortizing",
+        "new_loan_repayment_config": {"amortization_months": 60} if configured else None,
+        "new_payment_source": "recorded_terms", "retire": ["row:old"],
+        "terms_ref": {"id": "terms", "treatment": "refinance", "retained_annual_debt_service": 12000},
+        "overrides": {"debt_service_monthly": 1000, "debt_service_note": "Refinance per terms"}, **change})
+    result = financial_plan.evaluate_plan(plan,
+        obligations_list=[{"id": "row:old", "monthly": None, "payoff": 10000, "in_debt_service": True}],
+        recurring={}, months=[], dscr={"headline": {"key": "profit_and_loss", "numerator": 120000},
+            "candidates": [{"key": "profit_and_loss", "numerator": 120000}]},
+        service={"monthly": 3000}, proposed=None, requested_amount=None)
+    assert result["debt_service_before_monthly"] is not None
+    assert result["debt_service_before_new_payment_monthly"] is None
+    assert result["debt_service_after_monthly"] is None and result["debt_service_after_annual"] is None
+    assert result["headline_after"] is None and result["risk"] is None and not result["no_debt_left"]
+    assert result["coverage_unavailable_reason"] == financial_plan.UNKNOWN_DEBT_SERVICE_REASON
+    levers = financial_plan.coverage_levers(plan, result,
+        obligations_list=[{"id": "row:old", "monthly": None, "payoff": 10000, "in_debt_service": True}],
+        recurring={}, dscr={"headline": {"key": "profit_and_loss", "numerator": 120000}}, requested_amount=100000,
+        terms={"monthly_payment": 1000, "amount": 100000, "rate_pct": 12, "term_months": 24, "treatment": "additive"})
+    assert len(levers) == 1 and levers[0]["key"] == "debt_schedule"
+    assert levers[0]["dscr_after"] is None and levers[0]["apply"] is None and not levers[0]["improves"]
+
+
+def test_unknown_selected_payment_outside_debt_service_does_not_block_coverage():
+    result = financial_plan.evaluate_plan(financial_plan.normalize_plan({"retire": ["row:other"], "new_payment_monthly": 500}),
+        obligations_list=[{"id": "row:other", "monthly": None, "in_debt_service": False}], recurring={}, months=[],
+        dscr={"headline": {"key": "profit_and_loss", "numerator": 120000},
+              "candidates": [{"key": "profit_and_loss", "numerator": 120000}]},
+        service={"monthly": 1500}, proposed=None, requested_amount=None)
+    assert result["debt_service_before_new_payment_monthly"] == 1500
+    assert result["debt_service_after_monthly"] == 2000 and result["headline_after"] == 5
+    assert result["coverage_unavailable_reason"] is None
 
 
 @pytest.mark.asyncio

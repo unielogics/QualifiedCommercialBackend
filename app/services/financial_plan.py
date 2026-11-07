@@ -389,6 +389,7 @@ def evaluate_plan(
     retired = [o for o in obligations_list if o["id"] in retire]
     retired_in_service = [o for o in retired if o.get("in_debt_service")]
     retired_monthly = round(sum(o.get("monthly") or 0 for o in retired_in_service), 2)
+    retirement_payment_unknown = any(_num(o.get("monthly")) is None for o in retired_in_service)
     payoff_known = [o.get("payoff") for o in retired if o.get("payoff") is not None]
     payoff_total = round(sum(payoff_known), 2) if payoff_known else None
     payoff_unknown = sum(1 for o in retired if o.get("payoff") is None)
@@ -521,7 +522,7 @@ def evaluate_plan(
     # Missing existing debt service is not a zero-debt declaration. Even a
     # fully priced new loan cannot establish the missing retained payments.
     before_new = (round(max(0.0, service_monthly if recorded_refinance_basis else service_monthly - retired_monthly), 2)
-                  if service_monthly is not None else None)
+                  if service_monthly is not None and (recorded_refinance_basis or not retirement_payment_unknown) else None)
     after_monthly = round(max(0.0, before_new + float(new_payment or 0.0)), 2) if before_new is not None else None
     after_annual = after_monthly * 12 if after_monthly is not None else None
     if before_new is not None and schedule and schedule.get("repayment_config") is not None:
@@ -622,7 +623,7 @@ def evaluate_plan(
         "add_backs_monthly": add_backs_monthly,
         "add_backs_annual": add_backs_annual,
         "excluded_add_backs": excluded_add_backs,
-        "coverage_unavailable_reason": UNKNOWN_DEBT_SERVICE_REASON if service_monthly is None else None,
+        "coverage_unavailable_reason": UNKNOWN_DEBT_SERVICE_REASON if before_new is None else None,
         "income_override_annual": income_override,
         "debt_service_override_monthly": service_override,
         "interest_only": interest_only,

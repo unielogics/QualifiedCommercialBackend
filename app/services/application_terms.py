@@ -206,7 +206,7 @@ async def _cockpit_context(db: AsyncSession, profile: ApplicationProfile) -> Dsc
     if income is None:
         return None
     existing_monthly = evaluation.get("debt_service_before_new_payment_monthly")
-    if existing_monthly is None:
+    if existing_monthly is None and (not active or "debt_service_before_new_payment_monthly" not in evaluation):
         existing_monthly = (cockpit.get("debt") or {}).get("service", {}).get("monthly")
     label = str(basis.get("label") or "Income available for debt service")
     changes = [
