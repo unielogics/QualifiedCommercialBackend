@@ -447,3 +447,29 @@ async def test_embedded_readiness_omits_failed_current_math_in_a_savepoint(monke
     monkeypatch.setattr(readiness, "current_snapshot", AsyncMock(side_effect=RuntimeError("source unavailable")))
     assert await readiness.advisory_current_snapshot(db, SimpleNamespace(id=uuid4())) is None
     assert events == ["entered", "exited"]
+
+
+def test_fingerprint_ignores_evidence_and_candidate_order_but_preserves_exact_numeric_observations(computation):
+    _, profile, period, authority = computation
+    other = manual_period()
+    candidate = SimpleNamespace(program_key="a", playbook_version=1, recommendation_status="needs_information",
+        reasons=["First reason", "Second reason"], rule_state="unknown",
+        rule_results=[{"field": "annual_revenue", "observed": 1263637.63,
+                       "source_refs": [{"file_id": "b"}, {"file_id": "a"}]}],
+        fact_sources={"annual_revenue": {"source_refs": [{"file_id": "b"}, {"file_id": "a"}]}})
+    second = deepcopy(candidate)
+    second.program_key = "b"
+    periods, facts, _, addbacks, actions = readiness._calculation_inputs.return_value
+    policy = readiness.published_policy.return_value
+
+    def calculate(rows, candidates):
+        return readiness._fingerprint(profile, rows, facts, policy, addbacks, actions, candidates, [],
+                                      {"trading dba"}, {}, financial_authority=authority)
+
+    original = calculate([period, other], [candidate, second])
+    candidate.reasons.reverse()
+    candidate.rule_results[0]["source_refs"].reverse()
+    candidate.fact_sources["annual_revenue"]["source_refs"].reverse()
+    assert calculate([other, period], [second, candidate]) == original
+    candidate.rule_results[0]["observed"] = 1706065.35
+    assert calculate([other, period], [second, candidate]) != original
