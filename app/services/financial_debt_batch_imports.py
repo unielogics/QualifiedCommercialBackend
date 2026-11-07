@@ -145,22 +145,32 @@ def _rebuild(body, batch_id):
                 item = copy.deepcopy(mapping)
                 item["key"] = f"{group['id']}:{item['field']}:{file['file_id']}:{row['ordinal']}"
                 group["mappings"].append(item)
+    # A full reference shared by distinct lender groups is only a possible
+    # duplicate. Lender aliases (or coincidental account numbers at different
+    # lenders) still need an explicit staff decision, never an automatic merge.
+    reference_groups = {}
+    for group in groups.values():
+        if _full_reference(group["loan_reference"]):
+            reference_groups.setdefault(_reference_key(group["loan_reference"]), []).append(group["id"])
     candidates = []
     for group in groups.values():
+        reference_peers = len(reference_groups.get(_reference_key(group["loan_reference"]), [])) > 1
         exact = [row for row in existing if _full_reference(group["loan_reference"]) and _full_reference(_row_reference(row)) and _reference_key(_row_reference(row)) == _reference_key(group["loan_reference"])
                  and _text(row.get("lender")) == _text(group["lender"]) and row.get("status", "active") == "active" and not row.get("duplicate_of_id")]
         legacy = [row for row in existing if _legacy_reference_match(row, group["loan_reference"])]
         possible = [row for row in existing if _similar_lender(row.get("lender"), group["lender"]) or row in legacy
                     or group["loan_reference"] and _reference_key(_row_reference(row)) == _reference_key(group["loan_reference"])]
         group["possible_duplicate_row_ids"] = [str(row["id"]) for row in possible]
-        group["requires_separate_loan_confirmation"] = bool(possible)
+        group["requires_separate_loan_confirmation"] = bool(possible) or reference_peers
         suggested = exact[0] if len(exact) == 1 else legacy[0] if len(legacy) == 1 and legacy[0].get("status", "active") == "active" and not legacy[0].get("duplicate_of_id") else None
         group["suggested_target_row_id"] = str(suggested["id"]) if suggested else None
-        group["suggested_action"] = "update" if len(exact) == 1 else "review" if possible or not group["loan_reference"] else "create"
+        group["suggested_action"] = "update" if len(exact) == 1 else "review" if possible or reference_peers or not group["loan_reference"] else "create"
         if not group["loan_reference"]:
             group["warnings"].append("No reliable printed loan reference was read. Confirm a new or existing obligation explicitly; lender and amounts never establish identity.")
         if possible:
             group["warnings"].append("Possible existing or excluded obligation: review its identity. No row will be merged, removed, restored or marked duplicate automatically.")
+        if reference_peers:
+            group["warnings"].append("Possible duplicate within this batch: another candidate has the same full printed loan reference under a different lender name. Compare the source files and explicitly confirm separate loans before creating both. Nothing is merged automatically.")
         target = suggested or {}
         for mapping in group["mappings"]:
             mapping["before"] = target.get(mapping["field"])
