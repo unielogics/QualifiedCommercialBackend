@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -623,7 +624,11 @@ async def save_terms(
 ) -> ApplicationTermSheet:
     # Serialize version creation per profile. Without this row lock, two quick
     # saves can both derive the same version number and collide at commit time.
-    await lock_profile_terms(db, profile.id)
+    with getattr(db, "no_autoflush", nullcontext()):
+        await lock_profile_terms(db, profile.id)
+    # A financial-plan-only save does not advance the terms version. Refresh
+    # after the shared lock so adoption cannot overwrite that newer scenario.
+    await db.refresh(profile, attribute_names=["financial_plan"])
     options = await loan_type_options(db, profile)
     current = await current_term_sheet(db, profile.id)
     actual_version = current.version if current is not None else 0

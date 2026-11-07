@@ -6,6 +6,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
+from app.schemas.financial_cockpit import FinancialPlanRead, FinancialPlanWrite
 from app.schemas.loan_repayment import LoanRepaymentConfig, validate_repayment_config
 
 FunderType = Literal[
@@ -54,6 +55,9 @@ class ClientTermsWrite(BaseModel):
     sponsor_name: str | None = Field(default="UrChoice", max_length=160)
     client_note: str | None = Field(default=None, max_length=1200)
     conditions: list[str] = Field(default_factory=list, max_length=12)
+    # Optional atomic save of the unsaved Financials scenario alongside these
+    # versioned loan terms. Existing terms-only callers retain their behavior.
+    financial_plan: FinancialPlanWrite | None = None
 
     @field_validator("loan_type", "funder_name", "custom_repayment_label", "sponsor_name", "client_note", mode="before")
     @classmethod
@@ -177,6 +181,7 @@ class ClientTermsRead(BaseModel):
     #: What the Financials tab says: the plan in words, coverage today and
     #: with the plan, and whether the plan's loan mirrors these terms.
     plan: dict[str, Any] | None = None
+    financial_plan: FinancialPlanRead | None = None
 
 
 class ClientTermsEmailRequest(BaseModel):
