@@ -134,10 +134,17 @@ async def current_version_context(db: AsyncSession, *, profile_id: UUID | None =
     return context
 
 
-async def invalidate_financial_review_caches(db: AsyncSession, profile: ApplicationProfile, version: FinancialFormVersion) -> None:
+async def invalidate_financial_review_caches(db: AsyncSession, profile: ApplicationProfile, version: FinancialFormVersion | None = None, *, correction_revision: int | None = None) -> None:
     if profile.primary_bucket_id is None:
         return
-    marker = {"financial_versions_stale": True, "financial_version_updated_at": datetime.now(UTC).isoformat(), "financial_version_id": str(version.id)}
+    from app.services.financial_calculation_policy import CALCULATION_POLICY_VERSION
+
+    marker = {"financial_versions_stale": True, "financial_calculation_policy_version": CALCULATION_POLICY_VERSION}
+    if version is not None:
+        marker.update(financial_version_updated_at=datetime.now(UTC).isoformat(), financial_version_id=str(version.id))
+    else:
+        assert correction_revision is not None
+        marker.update(financial_calculation_updated_at=datetime.now(UTC).isoformat(), financial_calculation_revision=correction_revision)
     await db.execute(update(BucketAIReview).where(BucketAIReview.bucket_id == profile.primary_bucket_id).values(context_snapshot=func.coalesce(BucketAIReview.context_snapshot, literal({}, type_=JSONB)).op("||")(literal(marker, type_=JSONB))).execution_options(synchronize_session=False))
     # The intake's copy otherwise bypasses latest_review's stale filter. Clear
     # the relationship too, including a lead already loaded by a legacy route.
@@ -155,18 +162,20 @@ async def invalidate_financial_review_caches(db: AsyncSession, profile: Applicat
     await db.flush()
 
 
-async def refresh_advisory_projections(db: AsyncSession, profile: ApplicationProfile, *, version_id: UUID) -> None:
+async def refresh_advisory_projections(db: AsyncSession, profile: ApplicationProfile, *, version_id: UUID | None = None, event_key: str | None = None) -> None:
     from app.services import application_programs, capital_readiness
 
     profile_id = profile.id
     dealer_id = profile.dealer_id
+    assert version_id is not None or event_key
+    event_key = event_key or f"financial-version:{version_id}"
     try:
         async with db.begin_nested():
             await application_programs.get_program_readiness(db, profile)
     except Exception:  # noqa: BLE001 - accepted version remains authoritative
         log.exception("Financial requirement refresh failed profile=%s version=%s", profile_id, version_id)
         await db.refresh(profile)
-    await capital_readiness.advisory_recompute_profiles(db, [profile], event_key=f"financial-version:{version_id}")
+    await capital_readiness.advisory_recompute_profiles(db, [profile], event_key=event_key)
     if dealer_id:
         from app.dealer_os.services.engines import recompute_snapshot
 

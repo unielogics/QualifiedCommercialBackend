@@ -320,22 +320,22 @@ def test_incompatible_entities_are_never_aggregated() -> None:
     assert prior == []
 
 
-def test_canonical_name_is_not_an_analysis_admission_gate() -> None:
+def test_current_business_window_uses_its_canonical_identity_before_latest_period() -> None:
     borrower = _period(month=1, year=2025, entity="Operating Company, LLC")
     related = _period(month=2, year=2025, entity="Property Holding LLC")
     current, prior = compatible_period_windows(
         [related, borrower],
         canonical_entities={normalize_entity_name("Operating Company")},
     )
-    assert current == [related]
+    assert current == [borrower]
     assert prior == []
 
 
-def test_mismatched_name_keeps_a_coherent_scoring_window() -> None:
+def test_unrelated_name_cannot_supply_the_business_scoring_window() -> None:
     related = _period(month=2, year=2025, entity="Property Holding LLC")
     assert compatible_period_windows(
         [related], canonical_entities={normalize_entity_name("Operating Company LLC")}
-    ) == ([related], [])
+    ) == ([], [])
 
 
 @pytest.mark.parametrize("context", [{"basis": "unknown"}, {"currency": "XXX"}])
@@ -554,7 +554,7 @@ def test_ai_context_is_bounded_and_prevents_ai_recalculation() -> None:
     assert "do not recalculate" in safeguards.lower()
     assert "cannot approve" in safeguards.lower()
     assert "Spanish" in safeguards
-    assert context["policy"]["formula_version"] == "score_v2_cited_funding_v1"
+    assert context["policy"]["formula_version"] == "score_v3_financial_authority"
 
 
 def test_client_safe_snapshot_removes_internal_action_and_review_identifiers() -> None:

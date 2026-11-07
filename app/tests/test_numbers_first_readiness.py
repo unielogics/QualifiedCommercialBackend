@@ -11,6 +11,7 @@ import pytest
 from app.models.capital_readiness import ApplicationFinancialPeriod
 from app.schemas.capital_readiness import CapitalReadinessReviewRequest
 from app.services import application_programs, capital_readiness, funding_programs
+from app.services.financial_calculation_policy import CALCULATION_POLICY_VERSION
 
 
 def _result(*, row=None, rows=()):
@@ -52,7 +53,11 @@ def computation(monkeypatch):
     monkeypatch.setattr(capital_readiness, "published_policy", AsyncMock(return_value=policy))
     monkeypatch.setattr(capital_readiness, "latest_snapshot", AsyncMock(return_value=None))
     monkeypatch.setattr(capital_readiness, "_calculation_inputs", AsyncMock(return_value=([period], facts, [], [], [])))
-    monkeypatch.setattr(capital_readiness, "canonical_entity_aliases", AsyncMock(return_value={"legalborrower"}))
+    monkeypatch.setattr(capital_readiness, "canonical_entity_aliases", AsyncMock(return_value={"trading dba"}))
+    monkeypatch.setattr(capital_readiness, "load_financial_authority", AsyncMock(return_value={
+        "policy_version": CALCULATION_POLICY_VERSION, "signature": "a" * 64,
+        "source_stamp": "b" * 64, "revision": 0, "primary_dscr": None, "validated_annual": None,
+    }))
     monkeypatch.setattr(application_programs, "published_candidates", AsyncMock(return_value=[]))
     monkeypatch.setattr(funding_programs, "commercial_terms_by_program", AsyncMock(return_value={}))
 
@@ -68,15 +73,15 @@ def computation(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_name_mismatch_keeps_metrics_score_and_warning(computation):
+async def test_name_mismatch_keeps_evidence_but_cannot_supply_business_metrics(computation, monkeypatch):
     db, profile, period = computation
+    monkeypatch.setattr(capital_readiness, "canonical_entity_aliases", AsyncMock(return_value={"legalborrower"}))
     snapshot = await capital_readiness.recompute(db, profile, idempotency_key="numbers-first-test", expected_snapshot_version=None)
     metrics = {row["key"]: row for row in snapshot.metrics}
-    assert metrics["gross_margin_pct"]["value"] == 18
-    assert metrics["gross_margin_pct"]["status"] == "very_strong"
-    assert metrics["net_margin_pct"]["value"] == 5
-    assert metrics["net_margin_pct"]["source"]["identity_warning"] is True
-    assert metrics["gross_margin_pct"]["source"]["source_period_ids"] == [str(period.id)]
+    assert metrics["gross_margin_pct"]["value"] is None
+    assert metrics["gross_margin_pct"]["status"] == "unavailable"
+    assert metrics["net_margin_pct"]["value"] is None
+    assert metrics["gross_margin_pct"]["source"]["source_period_ids"] == []
     assert snapshot.score is not None
     assert snapshot.review_status == "awaiting_review"
     warning = next(row for row in snapshot.blockers if row["key"] == "financial_entity_mismatch")
@@ -85,9 +90,10 @@ async def test_name_mismatch_keeps_metrics_score_and_warning(computation):
     assert "metric_key" not in warning  # Do not replace its identity-specific explanation.
     context = capital_readiness.build_ai_context(snapshot)
     metric = next(row for row in context["metrics"] if row["key"] == "gross_margin_pct")
-    assert metric["numerator"] == 180000
-    assert metric["denominator"] == 1000000
-    assert metric["identity_warning"] is True
+    assert metric["numerator"] is None and metric["denominator"] is None
+    mismatch = next(row for row in snapshot.source_manifest if row["kind"] == "financial_entity_mismatch")
+    assert mismatch["observed_entities"] == ["trading dba"]
+    assert period.revenue == Decimal("1000000")  # Original evidence remains intact.
 
 
 @pytest.mark.asyncio

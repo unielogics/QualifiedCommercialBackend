@@ -7167,8 +7167,8 @@ async def _response(
 ) -> DealerIntakeResponse:
     if public_path == "/dealer-ai-underwriter" and _is_main_street_equipment_intake(intake):
         public_path = EQUIPMENT_PUBLIC_PATH
-    # Read-only hydration only: opening/resuming an intake must never create a
-    # profile or a new financial interpretation as a side effect.
+    # Hydrate the existing profile without creating one or running extraction.
+    # Its derived financial summary refreshes when source dependencies change.
     readiness_profile = (
         await db.execute(
             select(ApplicationProfile)
@@ -7181,7 +7181,7 @@ async def _response(
         )
     ).scalar_one_or_none()
     readiness_snapshot = (
-        await capital_readiness_service.latest_snapshot(db, readiness_profile.id)
+        await capital_readiness_service.advisory_current_snapshot(db, readiness_profile)
         if readiness_profile is not None
         else None
     )

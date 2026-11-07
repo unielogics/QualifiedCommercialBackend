@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 import uuid
@@ -26,6 +27,8 @@ from app.models.application_profile import ApplicationProfile
 from app.services import public_underwriting_packet_pdf as extraction
 from app.services.financial_tax_earnings import entities_match
 from app.services.public_underwriting_packet_pdf import _num as source_number
+
+log = logging.getLogger(__name__)
 
 
 def stamp(value: Any) -> str:
@@ -416,5 +419,19 @@ async def correct(db, profile, actor, **payload):
         profile.financial_metric_review = state
         await profiles.log_profile_action(db, profile, actor, "financial_metrics.corrected" if payload["action"] == "correct" else "financial_metrics.restored", "Reviewed a source-bound financial calculation input", metadata=state["events"][-1])
         await db.flush()
+        from app.services.financial_publication import (
+            invalidate_financial_review_caches,
+            refresh_advisory_projections,
+        )
+
+        # The correction itself remains accepted if an advisory projection is
+        # temporarily unavailable. Reads also validate their authority stamp.
+        try:
+            async with db.begin_nested():
+                await invalidate_financial_review_caches(db, profile, correction_revision=state["revision"])
+                await refresh_advisory_projections(db, profile, event_key=f"financial-correction:{state['events'][-1]['id']}")
+        except Exception:  # noqa: BLE001 - keep the reviewed source correction, not a stale cache, as authority
+            log.exception("Financial correction projection refresh failed profile=%s revision=%s", profile.id, state["revision"])
+            await db.refresh(profile)
         cockpit = await financial_cockpit.load_cockpit(db, profile)
     return cockpit

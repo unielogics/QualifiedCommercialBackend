@@ -12,7 +12,7 @@ def annual_ebitda_fact(analyses: list[dict], *, entity: str | None, state: dict 
     from app.services.financial_cockpit import profit_and_loss, tax_years
     from app.services.financial_metric_review import prepare
 
-    review = prepare(analyses, tax_years(analyses), profit_and_loss(analyses), {}, [], [], {},
+    review = prepare(analyses, tax_years(analyses, business_entity=entity), profit_and_loss(analyses, business_entity=entity), {}, [], [], {},
                      state=state, entity=entity)
     pair = validated_annual_pair({"ebitda": review["ebitda"]})
     result = next((row for row in review["ebitda"]["candidates"]

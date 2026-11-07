@@ -108,6 +108,9 @@ def attach_review_context(context, cockpit):
     from app.services.financial_cockpit import plan_brief
 
     brief = metric_brief(cockpit)
+    from app.services.financial_calculation_policy import financial_authority
+
+    context["financial_calculation_authority"] = financial_authority(cockpit)
     if brief is not None:
         context["financial_calculation_review"] = brief
     else:
@@ -130,6 +133,12 @@ def current_review_projection(result, cockpit):
     metrics = projected.get("key_metrics")
     metrics = dict(metrics) if isinstance(metrics, dict) else {}
     brief = metric_brief(cockpit) if cockpit is not None else None
+    from app.services.financial_calculation_policy import (
+        CALCULATION_POLICY_VERSION,
+        financial_authority,
+    )
+
+    authority = financial_authority(cockpit) if cockpit is not None else None
     primary = (brief or {}).get("primary_dscr") or {}
     annual = (brief or {}).get("validated_annual") or {}
     service = ((cockpit or {}).get("debt") or {}).get("service") or {}
@@ -141,10 +150,13 @@ def current_review_projection(result, cockpit):
                     "dscr_basis": primary.get("key"), "dscr_earnings": primary.get("numerator"),
                     "dscr_earnings_label": primary.get("numerator_label"),
                     "dscr_source_refs": primary.get("source_refs") or [],
+                    "financial_calculation_policy_version": CALCULATION_POLICY_VERSION,
+                    "financial_calculation_signature": authority.get("signature") if authority else None,
                     "financial_metrics_source": "current_financial_cockpit" if brief is not None else "current_financial_evidence_unavailable"})
     business_years = ((cockpit or {}).get("tax") or {}).get("years") or []
     metrics["tax_net_income"] = business_years[-1].get("income") if business_years else None
     metrics["tax_earnings_estimate"] = primary.get("numerator") if primary.get("key") == "tax_return" else None
     projected["key_metrics"] = metrics
     projected["financial_calculation_review"] = brief
+    projected["financial_calculation_authority"] = authority
     return projected

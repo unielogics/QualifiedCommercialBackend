@@ -11,6 +11,8 @@ transaction boundary.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import types
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -439,6 +441,7 @@ class MetricInputs:
     targets: dict[str, float | None]
     fallbacks: dict[str, float | None]
     accepted_debt_rows: list[dict] | None = None
+    source_dependencies: dict | None = None
 
     @property
     def addbacks_annual_verified(self) -> float:
@@ -887,6 +890,18 @@ async def load_metric_inputs(
         target_rows=target_rows,
         targets=targets,
         accepted_debt_rows=accepted_rows,
+        source_dependencies={
+            "published_debt_version_id": str(getattr(accepted_version, "id", None)) if accepted_version else None,
+            "primary_account_ids": sorted(str(value) for value in primary_ids),
+            "periods": sorted([{
+                key: str(getattr(row, key, None)) for key in ("id", "account_id", "period", "source", "updated_at")
+            } for row in raw_rows], key=lambda row: (row["period"], row["id"])),
+            "tax_filings": sorted([{
+                "id": str(getattr(row, "id", None)), "document_id": str(getattr(row, "document_id", None)),
+                "year": str(getattr(row, "year", None)),
+                "detail_hash": hashlib.sha256(json.dumps(getattr(row, "detail", None), sort_keys=True, default=str).encode()).hexdigest(),
+            } for row in tax_filings], key=lambda row: (row["year"], row["id"])),
+        },
         fallbacks={
             "debt_schedule_authoritative": accepted_rows is not None,
             "debt_service_observed_monthly": observed_ds_monthly or None,
@@ -899,23 +914,75 @@ async def load_metric_inputs(
     )
 
 
-async def recompute_snapshot(db: AsyncSession, dealer_id: UUID) -> DealerMetricSnapshot:
+def metric_input_authority(inputs: MetricInputs) -> dict[str, str]:
+    """Stable source/policy identity for a saved metric projection, not a plan."""
+    from app.services.financial_calculation_policy import CALCULATION_POLICY_VERSION
+
+    dependency = {"policy_version": CALCULATION_POLICY_VERSION, "periods": inputs.periods,
+                  "verified_addbacks": inputs.addbacks_annual_verified,
+                  "targets": inputs.targets, "fallbacks": inputs.fallbacks,
+                  "accepted_debt_rows": inputs.accepted_debt_rows,
+                  "sources": inputs.source_dependencies,
+                  "period_ids": sorted(str(getattr(row, "id", None)) for row in inputs.period_rows),
+                  "addback_ids": sorted(str(getattr(row, "id", None)) for row in inputs.addback_rows if row.status == "verified"),
+                  "target_ids": sorted(str(getattr(row, "id", None)) for row in inputs.target_rows)}
+    signature = hashlib.sha256(json.dumps(dependency, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+    return {"policy_version": CALCULATION_POLICY_VERSION, "source_signature": signature}
+
+
+def current_input_metrics(inputs: MetricInputs) -> dict:
+    metrics = compute_metrics(inputs.periods, inputs.addbacks_annual_verified, inputs.targets, fallbacks=inputs.fallbacks)
+    return {**metrics, "_financial_calculation": metric_input_authority(inputs)}
+
+
+def metric_snapshot_is_current(snapshot: DealerMetricSnapshot, inputs: MetricInputs) -> bool:
+    return (snapshot.metrics or {}).get("_financial_calculation") == metric_input_authority(inputs)
+
+
+def metric_snapshot_policy_current(snapshot: DealerMetricSnapshot) -> bool:
+    """Batched lists can reject old policy without loading each file's inputs."""
+    from app.services.financial_calculation_policy import CALCULATION_POLICY_VERSION
+
+    stamp = (snapshot.metrics or {}).get("_financial_calculation")
+    return bool(isinstance(stamp, dict) and stamp.get("policy_version") == CALCULATION_POLICY_VERSION
+                and isinstance(stamp.get("source_signature"), str) and len(stamp["source_signature"]) == 64)
+
+
+async def current_snapshot_metrics(db: AsyncSession, dealer_id: UUID, snapshot: DealerMetricSnapshot) -> dict:
+    """Read current operands without changing an older saved interpretation."""
+    inputs = await load_metric_inputs(db, dealer_id)
+    return snapshot.metrics if metric_snapshot_is_current(snapshot, inputs) else current_input_metrics(inputs)
+
+
+async def current_snapshot_row(db: AsyncSession, dealer_id: UUID, snapshot: DealerMetricSnapshot | None) -> DealerMetricSnapshot | None:
+    """Lineage needs a stored current row; append it without alerts or sends."""
+    if snapshot is None:
+        return None
+    inputs = await load_metric_inputs(db, dealer_id)
+    if metric_snapshot_is_current(snapshot, inputs):
+        return snapshot
+    # Serialize cache fills. A second reader rechecks after the first commits.
+    await db.execute(select(DealerBusiness.id).where(DealerBusiness.id == dealer_id).with_for_update())
+    latest = (await db.execute(select(DealerMetricSnapshot).where(DealerMetricSnapshot.dealer_id == dealer_id)
+        .order_by(DealerMetricSnapshot.as_of.desc(), DealerMetricSnapshot.created_at.desc()).limit(1))).scalar_one_or_none()
+    inputs = await load_metric_inputs(db, dealer_id)
+    if latest is not None and metric_snapshot_is_current(latest, inputs):
+        return latest
+    return await recompute_snapshot(db, dealer_id, inputs=inputs, emit_alerts=False)
+
+
+async def recompute_snapshot(db: AsyncSession, dealer_id: UUID, *, inputs: MetricInputs | None = None, emit_alerts: bool = True) -> DealerMetricSnapshot:
     """Recompute and persist a new metric snapshot with full lineage + alerts.
 
     Flushes but does NOT commit — the caller owns the transaction boundary.
     """
-    inputs = await load_metric_inputs(db, dealer_id)
+    inputs = inputs if inputs is not None else await load_metric_inputs(db, dealer_id)
     period_rows = inputs.period_rows
     # Only verified add-backs feed the persisted snapshot (and its lineage).
     addback_rows = [a for a in inputs.addback_rows if a.status == "verified"]
     target_rows = inputs.target_rows
 
-    metrics = compute_metrics(
-        inputs.periods,
-        inputs.addbacks_annual_verified,
-        inputs.targets,
-        fallbacks=inputs.fallbacks,
-    )
+    metrics = current_input_metrics(inputs)
 
     snapshot = DealerMetricSnapshot(
         dealer_id=dealer_id,
@@ -953,6 +1020,10 @@ async def recompute_snapshot(db: AsyncSession, dealer_id: UUID) -> DealerMetricS
                     snapshot_id=snapshot.id, metric_key=metric_key, ref_kind="target", ref_id=t.id
                 )
             )
+
+    if not emit_alerts:
+        await db.flush()
+        return snapshot
 
     # --- Floor alerts (skip when an unresolved alert of the kind exists) ---
     adb_current = metrics["adb"]["current"]

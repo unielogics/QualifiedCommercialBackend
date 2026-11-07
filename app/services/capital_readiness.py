@@ -4,9 +4,7 @@ import calendar
 import hashlib
 import json
 import logging
-import re
-import unicodedata
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
@@ -59,7 +57,7 @@ from app.services.operator_file_links import selected_files_for_intake
 log = logging.getLogger(__name__)
 
 POLICY_KEY = "qc_lending_margin_v1"
-FORMULA_VERSION = "score_v2_cited_funding_v1"
+FORMULA_VERSION = "score_v3_financial_authority"
 MONEY_TOLERANCE = Decimal("1.00")
 STATUS_SCORE = {
     "concerning": Decimal("25"),
@@ -82,6 +80,7 @@ METRIC_LABELS = {
     "property_occupancy_pct": "Property occupancy",
     "internal_adjusted_ebitda": "Internal adjusted EBITDA",
     "current_dscr": "Current DSCR",
+    "underwriting_dscr": "Underwriting DSCR assumption",
     "returned_items_90": "Returned items / NSF",
     "average_daily_balance": "Average daily balance",
     "low_balance": "Lowest observed balance",
@@ -124,6 +123,7 @@ ES_TEXT = {
     "Gross profit margin": "Margen de ganancia bruta",
     "Net income margin": "Margen de ingreso neto",
     "Current DSCR": "DSCR actual",
+    "Underwriting DSCR assumption": "Supuesto de DSCR de evaluación",
     "Returned items / NSF": "Partidas devueltas / NSF",
     "Average daily balance": "Saldo diario promedio",
     "Lowest observed balance": "Saldo observado más bajo",
@@ -765,30 +765,11 @@ def period_compatibility_key(period: ApplicationFinancialPeriod) -> tuple[str, s
     return (entity, basis, currency, str(period.id or period.idempotency_key) if unresolved else "")
 
 
-_ENTITY_SUFFIXES = {
-    "corp",
-    "corporation",
-    "inc",
-    "incorporated",
-    "llc",
-    "llp",
-    "lp",
-    "ltd",
-    "limited",
-    "pllc",
-}
-
-
 def normalize_entity_name(value: Any) -> str:
     """Normalize an exact legal/DBA identity without fuzzy matching."""
+    from app.services.financial_tax_earnings import normalize_business_identity
 
-    folded = unicodedata.normalize("NFKD", str(value or "")).encode(
-        "ascii", "ignore"
-    ).decode("ascii")
-    words = re.findall(r"[a-z0-9]+", folded.casefold().replace("&", " and "))
-    while words and words[-1] in _ENTITY_SUFFIXES:
-        words.pop()
-    return "".join(word for word in words if word != "and")
+    return normalize_business_identity(value)
 
 
 async def canonical_entity_aliases(
@@ -870,9 +851,12 @@ def compatible_period_windows(
     """
 
     active = [row for row in periods if row.review_status in {"submitted", "confirmed"}]
-    # Retain the legacy argument for callers, but a legal/DBA header is a
-    # warning signal, not an admission gate. Use the newest coherent window
-    # and keep different entities/bases/currencies separate below.
+    # Keep every original observation in history. Only an established file
+    # identity can supply its current business window; related entities and
+    # unidentified sources remain available for separate evidence review.
+    if canonical_entities is not None:
+        active = [row for row in active if period_compatibility_key(row)[0] in canonical_entities
+                  and not str(row.entity_name or "").startswith("[Unidentified statement:")]
     if not active:
         return [], []
     active.sort(
@@ -1907,6 +1891,7 @@ def _fingerprint(
     canonical_entities: set[str],
     program_commercial_terms: dict[UUID, list[Any]],
     accepted_debt_version_id: UUID | None = None,
+    financial_authority: dict[str, Any] | None = None,
 ) -> str:
     body = {
         "profile_id": str(profile.id),
@@ -1918,6 +1903,7 @@ def _fingerprint(
             profile, "self_reported_readiness_diagnostic", None
         ),
         "current_dscr": _float(profile.underwriting_current_dscr),
+        "underwriting_assumption_stamp": _underwriting_assumption_stamp(profile),
         "accepted_debt_version_id": str(accepted_debt_version_id) if accepted_debt_version_id else None,
         "use_of_funds_revision": profile.use_of_funds_revision,
         "use_of_funds": profile.use_of_funds or [],
@@ -1946,6 +1932,10 @@ def _fingerprint(
                 str(row.amount),
                 str(row.evidence_file_id or ""),
                 row.lender_program_key or "",
+                str(row.financial_period_id or ""),
+                row.category or "",
+                str(row.expires_at or ""),
+                _addback_expired(row),
             )
             for row in addbacks
         ),
@@ -1998,6 +1988,7 @@ def _fingerprint(
         "policy": [policy.policy_key, policy.version],
         "policy_scope": list(_policy_scope(policy) or ("invalid", None)),
         "formula_version": FORMULA_VERSION,
+        "financial_authority": financial_authority,
     }
     return hashlib.sha256(
         json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -2322,6 +2313,8 @@ def _snapshot_read(
             "content_hashes",
             "addback_ids",
             "lender_accepted_addback_ids",
+            "applied_addbacks",
+            "excluded_addbacks",
             "fact_citations",
             "fact_citation_status",
             "citation_reason",
@@ -2431,6 +2424,12 @@ def build_ai_context(
             ),
             "identity_warning": (item.get("source") or {}).get("identity_warning", False),
             "provisional": (item.get("source") or {}).get("provisional", False),
+            "informational": (item.get("source") or {}).get("informational", False),
+            "assumption": (item.get("source") or {}).get("assumption", False),
+            "source_kind": (item.get("source") or {}).get("kind"),
+            "basis": (item.get("source") or {}).get("basis"),
+            "source_label": (item.get("source") or {}).get("label"),
+            "earnings_label": (item.get("source") or {}).get("earnings_label"),
             "review_statuses": (item.get("source") or {}).get("review_statuses", []),
             "period_start": (item.get("source") or {}).get("period_start"),
             "period_end": (item.get("source") or {}).get("period_end"),
@@ -2535,6 +2534,7 @@ def build_ai_context(
             "Capital Readiness is advisory and cannot approve, deny, or advance a file.",
             "A statement-name mismatch is a warning, not a reason to reject or ignore readable financial numbers. Explain it alongside provisional source-local metrics.",
             "Never combine revenue and profit from different statements, periods, accounting bases or currencies; bank deposits are not revenue and cash movement is not net income.",
+            "Current DSCR is source-bound coverage. Underwriting DSCR is a separate staff assumption used by the readiness score; it must not replace current source math. Informational or provisional figures are not verified annual EBITDA or an approval.",
             "Explain each financial conclusion using its supplied calculation and verified file/page/printed-line citation. If no validated citation exists, say the source reference needs review; never invent a line or treat that as a rejected document.",
             "Distinguish potential program fit, missing evidence, criteria configuration gaps, source review, and financial remediation. Only published, in-scope rules can support a program match; a readiness score cannot establish eligibility.",
             (
@@ -2563,6 +2563,253 @@ async def latest_snapshot(
             .limit(1)
         )
     ).scalar_one_or_none()
+
+
+def _underwriting_assumption_stamp(profile: ApplicationProfile) -> str:
+    return hashlib.sha256(json.dumps({
+        "value": _float(getattr(profile, "underwriting_current_dscr", None)),
+        "reviewed_at": str(getattr(profile, "underwriting_updated_at", None) or ""),
+    }, sort_keys=True).encode()).hexdigest()
+
+
+async def load_financial_authority(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
+    """Read current business operands without promoting a draft or an estimate."""
+    from app.services.financial_calculation_policy import financial_authority
+
+    if not uses_operating_margin_policy(profile.vertical):
+        # Property NOI and its explicit underwriting assumptions retain their
+        # existing policy; the business-earnings selector must not replace it.
+        return financial_authority({})
+    from app.services.financial_cockpit import load_cockpit
+
+    return financial_authority(await load_cockpit(db, profile))
+
+
+def snapshot_authority_matches(
+    row: ApplicationCapitalReadinessSnapshot,
+    authority: dict[str, Any],
+    profile: ApplicationProfile,
+) -> bool:
+    from app.services.financial_calculation_policy import authority_matches
+
+    stored = next((item for item in row.source_manifest or []
+                   if isinstance(item, dict) and item.get("kind") == "financial_calculation_authority"), None)
+    return bool(getattr(row, "formula_version", None) == FORMULA_VERSION
+                and authority_matches(stored, authority)
+                and stored.get("underwriting_assumption_stamp") == _underwriting_assumption_stamp(profile))
+
+
+async def current_snapshot(
+    db: AsyncSession, profile: ApplicationProfile
+) -> ApplicationCapitalReadinessSnapshot | None:
+    """Refresh a stale current projection by appending history, never editing it.
+
+    A failed current-source read raises instead of falling back to a cached
+    ratio. The caller retains its normal access checks and transaction.
+    """
+    current = await latest_snapshot(db, profile.id)
+    if current is None:
+        return None
+    # Recompute compares the full dependency fingerprint before appending.
+    # This includes readiness-only period reviews, actions and addbacks that
+    # do not change the cockpit's business earnings operands.
+    calculated = await recompute(db, profile, idempotency_key="current-financial-authority",
+                                 expected_snapshot_version=None)
+    latest = await latest_snapshot(db, profile.id)
+    # A reviewed successor may share these exact inputs with an older
+    # idempotent receipt. Keep the latest review state on current reads.
+    if (latest is not None and latest.evidence_fingerprint == calculated.evidence_fingerprint
+            and latest.formula_version == calculated.formula_version):
+        return latest
+    return calculated
+
+
+async def advisory_current_snapshot(
+    db: AsyncSession, profile: ApplicationProfile
+) -> ApplicationCapitalReadinessSnapshot | None:
+    """Omit unavailable advisory math without failing a containing file read.
+
+    A savepoint isolates refresh failures. Never substitute an old snapshot for
+    current operands; the direct Readiness API still reports actionable errors.
+    """
+    try:
+        async with db.begin_nested():
+            return await current_snapshot(db, profile)
+    except Exception:  # noqa: BLE001
+        log.exception("capital readiness current projection unavailable profile=%s", profile.id)
+        return None
+
+
+def business_dscr_metrics(
+    profile: ApplicationProfile, authority: dict[str, Any], thresholds: dict[str, Any], locale: str
+) -> tuple[list[dict[str, Any]], str]:
+    """Show canonical coverage while keeping reviewed score assumptions separate."""
+    primary = authority.get("primary_dscr") or {}
+    annual = authority.get("validated_annual") or {}
+    value = _decimal(primary.get("value"))
+    verified_annual = (primary.get("key") == "profit_and_loss" and annual.get("currency") == "USD"
+                       and annual.get("dscr") == primary.get("value") and annual.get("dscr") is not None)
+    rows = [_metric(
+        key="current_dscr", label=_t(locale, "Current DSCR"), value=value, unit="x",
+        numerator=_decimal(primary.get("numerator")), denominator=_decimal(primary.get("annual_debt_service")),
+        metric_status=classify_dscr(value, thresholds.get("dscr")),
+        confidence=(Decimal("1") if verified_annual else Decimal("0.65")) if value is not None else None,
+        source={"kind": "current_financial_cockpit", "basis": primary.get("key"),
+                "period": primary.get("period"), "earnings_label": primary.get("numerator_label"),
+                "policy_version": authority.get("policy_version"), "signature": authority.get("signature"),
+                "provisional": not verified_annual, "informational": True,
+                "reviewed": verified_annual, "addbacks_applied_to_dscr": False},
+    )]
+    assumption = _decimal(getattr(profile, "underwriting_current_dscr", None))
+    reviewed = bool(getattr(profile, "underwriting_updated_at", None))
+    assumption_status = classify_dscr(assumption, thresholds.get("dscr"))
+    if assumption is not None:
+        rows.append(_metric(
+            key="underwriting_dscr", label=_t(locale, "Underwriting DSCR assumption"),
+            value=assumption, unit="x", metric_status=assumption_status,
+            confidence=Decimal("1") if reviewed else None,
+            source={"kind": "underwriting", "reviewed": reviewed, "assumption": True, "provisional": not reviewed,
+                    "reviewed_at": str(getattr(profile, "underwriting_updated_at", None) or ""),
+                    "addbacks_applied_to_dscr": False},
+        ))
+    return rows, assumption_status
+
+
+def reviewed_manual_ebitda(
+    periods: list[ApplicationFinancialPeriod], canonical_entities: set[str]
+) -> dict[str, Any] | None:
+    """Retain reviewed manual period figures without asserting reconciliation.
+
+    The legacy period schema has no interest/tax/D&A components. Its explicit
+    EBITDA can remain an informational stated value, never a verified annual
+    P&L basis or a substitute DSCR numerator.
+    """
+    candidates = [row for row in periods if row.review_status == "confirmed"
+                  and row.source_kind in {"stated", "derived"}
+                  and row.source_file_id is None and row.source_analysis_id is None
+                  and str(row.currency or "").upper() == "USD"
+                  and str(row.accounting_basis or "").casefold() in {"cash", "accrual"}]
+    window, _ = compatible_period_windows(candidates, canonical_entities=canonical_entities)
+    months = sum(row.months_covered for row in window)
+    if not 6 <= months <= 12 or any(row.reconciliation_warnings for row in window):
+        return None
+    values = [_decimal(row.ebitda) for row in window]
+    if any(value is None or not value.is_finite() for value in values):
+        return None
+    return {"value": _sum_complete(values), "months_covered": months,
+            "period_start": min(row.period_start for row in window).isoformat(),
+            "period_end": max(row.period_end for row in window).isoformat(),
+            "source_period_ids": [str(row.id) for row in window],
+            "label": "Reviewed manually stated EBITDA", "provisional": True,
+            "annualized": False, "verification_status": "reviewed_stated_assumption"}
+
+
+def _addback_expired(row: ApplicationAddBackVerification) -> bool:
+    expiry = getattr(row, "expires_at", None)
+    return bool(expiry is not None and expiry.replace(tzinfo=expiry.tzinfo or UTC) <= datetime.now(UTC))
+
+
+def scoped_business_addbacks(
+    addbacks: list[ApplicationAddBackVerification],
+    periods: list[ApplicationFinancialPeriod],
+    *,
+    annual_earnings: dict[str, Any],
+    manual_earnings: dict[str, Any] | None,
+    canonical_entities: set[str],
+) -> dict[str, Any]:
+    """Apply verified operating adjustments only to the EBITDA they describe.
+
+    A six-month P&L and its six-month adjustments annualize together. A
+    reviewed manual window stays on its stated period basis. Binding to a
+    different or unknown period is never an invitation to guess a factor.
+    """
+    from app.services.financial_plan import DOUBLE_COUNTED_ADD_BACK_KINDS
+
+    def day(value: Any) -> date | None:
+        try:
+            return date.fromisoformat(str(value)[:10])
+        except (ValueError, TypeError):
+            return None
+
+    def normalized(value: Any) -> str:
+        return "_".join(str(value or "").casefold().replace("&", " and ").replace("/", " ")
+                        .replace("-", " ").replace("_", " ").split())
+
+    def factor_for(period: ApplicationFinancialPeriod) -> Decimal | None:
+        if (normalize_entity_name(period.entity_name) not in canonical_entities
+                or str(period.currency or "").upper() != "USD"
+                or str(period.accounting_basis or "").casefold() not in {"cash", "accrual"}
+                or period.review_status == "rejected"):
+            return None
+        if manual_earnings is not None:
+            return (Decimal("1") if str(period.id) in manual_earnings["source_period_ids"] else None)
+        ebitda = annual_earnings.get("ebitda") or {}
+        months = _decimal(ebitda.get("months_covered"))
+        if (annual_earnings.get("currency") != "USD" or months is None
+                or not 6 <= months <= 12 or months != months.to_integral_value()
+                or _decimal(annual_earnings.get("ebitda_annual")) is None):
+            return None
+        refs = annual_earnings.get("source_refs") or ebitda.get("source_refs") or []
+        for ref in refs:
+            if (not isinstance(ref, dict) or ref.get("accepted") is not True
+                    or not period.source_file_id or str(period.source_file_id) != str(ref.get("file_id"))
+                    or normalize_entity_name(ref.get("entity")) != normalize_entity_name(period.entity_name)
+                    or str(ref.get("currency") or "").upper() != "USD"
+                    or str(ref.get("basis") or "").casefold() != str(period.accounting_basis).casefold()):
+                continue
+            if (period.source_analysis_id is not None and ref.get("analysis_id") is not None
+                    and str(period.source_analysis_id) != str(ref["analysis_id"])):
+                continue
+            start, end = day(ref.get("period_start")), day(ref.get("period_end"))
+            if start == period.period_start and end == period.period_end and period.months_covered == months:
+                return Decimal("12") / months
+            # A verified contribution from one month inside a selected full-year
+            # source already contributes that month's amount to the annual sum.
+            if (months == 12 and period.months_covered == 1 and start is not None and end is not None
+                    and start <= period.period_start <= period.period_end <= end
+                    and period.period_start.day == 1
+                    and period.period_start.year == period.period_end.year
+                    and period.period_start.month == period.period_end.month
+                    and period.period_end.day == calendar.monthrange(period.period_end.year, period.period_end.month)[1]):
+                return Decimal("1")
+        return None
+
+    by_id = {str(period.id): period for period in periods}
+    applied, excluded = [], []
+    total = Decimal("0")
+    double_counted = set(DOUBLE_COUNTED_ADD_BACK_KINDS) | {
+        "interest", "interest_expense", "amortization", "amortisation", "depreciation_and_amortization",
+        "depreciation_and_amortisation", "d_and_a", "income_tax", "income_taxes", "income_tax_expense",
+    }
+    for row in addbacks:
+        if row.status not in {"qc_verified", "lender_accepted", "lender_rejected"}:
+            continue
+        category = normalized(row.category)
+        amount = _decimal(row.amount)
+        period = by_id.get(str(row.financial_period_id))
+        reason = None
+        if _addback_expired(row):
+            reason = "verification_expired"
+        elif (category in double_counted or any(token in category.split("_")
+                                               for token in {"interest", "depreciation", "amortization", "amortisation"})):
+            reason = "already_excluded_from_ebitda"
+        elif category in {"", "unknown", "other", "misc", "miscellaneous", "uncategorized", "unclassified", "tax", "taxes"}:
+            reason = "operating_category_required"
+        elif amount is None or amount <= 0:
+            reason = "positive_finite_amount_required"
+        factor = factor_for(period) if period is not None and reason is None else None
+        if reason is None and factor is None:
+            reason = "not_bound_to_current_ebitda_period"
+        if reason is not None:
+            excluded.append({"id": str(row.id), "financial_period_id": str(row.financial_period_id or ""),
+                             "reason": reason})
+            continue
+        contribution = amount * factor
+        total += contribution
+        applied.append({"id": str(row.id), "financial_period_id": str(period.id),
+                        "source_amount": _float(amount), "annualization_factor": _float(factor),
+                        "applied_amount": _float(contribution)})
+    return {"applied_total": total, "applied": applied, "excluded": excluded}
 
 
 async def snapshot_history(
@@ -2647,30 +2894,13 @@ async def recompute(
             select(ApplicationProfile)
             .where(ApplicationProfile.id == profile.id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one()
-    existing = (
-        await db.execute(
-            select(ApplicationCapitalReadinessSnapshot).where(
-                ApplicationCapitalReadinessSnapshot.profile_id == profile.id,
-                ApplicationCapitalReadinessSnapshot.idempotency_key == idempotency_key,
-            )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
-        return existing
+    authority = await load_financial_authority(db, profile)
+    from app.services.financial_calculation_policy import authority_idempotency_key
 
     current = await latest_snapshot(db, profile.id)
-    if expected_snapshot_version is not None and (
-        current is None or current.snapshot_version != expected_snapshot_version
-    ):
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            detail={
-                "message": "Capital Readiness changed; refresh and try again",
-                "current_snapshot_version": current.snapshot_version if current else None,
-            },
-        )
 
     await ingest_profile_financial_periods(db, profile)
     policy = await published_policy(db, profile)
@@ -2690,16 +2920,14 @@ async def recompute(
     active_periods = [
         row for row in periods if row.review_status in {"submitted", "confirmed"}
     ]
+    business_profile = uses_operating_margin_policy(profile.vertical)
     current_periods, prior_periods = compatible_period_windows(
-        periods
+        periods, canonical_entities=canonical_entities if business_profile else None,
     )
     entity_mismatch = bool(
         canonical_entities
-        and current_periods
-        and any(
-            period_compatibility_key(row)[0] not in canonical_entities
-            for row in current_periods
-        )
+        and (active_periods and not current_periods if business_profile else
+             any(period_compatibility_key(row)[0] not in canonical_entities for row in current_periods))
     )
     period = current_periods[0] if current_periods else None
     current_window = aggregate_period_window(current_periods)
@@ -2755,7 +2983,7 @@ async def recompute(
         )
         for row in current_periods
     )
-    property_only = not uses_operating_margin_policy(profile.vertical)
+    property_only = not business_profile
     gross_margin, gross_status = gated_margin_display(
         gross_margin_candidate,
         gross_candidate_status,
@@ -2850,8 +3078,32 @@ async def recompute(
         canonical_entities,
         program_commercial_terms,
         accepted_debt.id if accepted_debt is not None else None,
+        financial_authority=authority,
     )
-    if current is not None and current.evidence_fingerprint == fingerprint:
+    effective_idempotency_key = authority_idempotency_key(
+        f"readiness:{FORMULA_VERSION}:{fingerprint}:{idempotency_key}", authority,
+    )
+    existing = (
+        await db.execute(
+            select(ApplicationCapitalReadinessSnapshot).where(
+                ApplicationCapitalReadinessSnapshot.profile_id == profile.id,
+                ApplicationCapitalReadinessSnapshot.idempotency_key == effective_idempotency_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+    if expected_snapshot_version is not None and (
+        current is None or current.snapshot_version != expected_snapshot_version
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "message": "Capital Readiness changed; refresh and try again",
+                "current_snapshot_version": current.snapshot_version if current else None,
+            },
+        )
+    if current is not None and current.evidence_fingerprint == fingerprint and snapshot_authority_matches(current, authority, profile):
         return current
 
     prior_gross_margin = margin_value(
@@ -3040,9 +3292,19 @@ async def recompute(
     verified_addback_total = sum(
         (Decimal(row.amount) for row in qc_verified_addbacks), Decimal("0")
     )
-    base_ebitda = current_window["ebitda"]
+    annual_earnings = authority.get("validated_annual") or {}
+    base_ebitda = (current_window["ebitda"] if property_only else
+                   _decimal(annual_earnings.get("ebitda_annual")) if annual_earnings.get("currency") == "USD" else None)
+    manual_earnings = reviewed_manual_ebitda(periods, canonical_entities) if base_ebitda is None and not property_only else None
+    if manual_earnings is not None:
+        base_ebitda = manual_earnings["value"]
+    scoped_addbacks = (scoped_business_addbacks(
+        addbacks, periods, annual_earnings=annual_earnings, manual_earnings=manual_earnings,
+        canonical_entities=canonical_entities,
+    ) if not property_only else None)
+    applied_addback_total = scoped_addbacks["applied_total"] if scoped_addbacks is not None else verified_addback_total
     internal_adjusted_ebitda = (
-        base_ebitda + verified_addback_total if base_ebitda is not None else None
+        base_ebitda + applied_addback_total if base_ebitda is not None else None
     )
     metrics.append(
         _metric(
@@ -3056,11 +3318,18 @@ async def recompute(
                 "informational": True,
                 "reported_ebitda": _float(base_ebitda),
                 "qc_verified_addback_total": _float(verified_addback_total),
+                "applied_addback_total": _float(applied_addback_total),
+                **({"applied_addbacks": scoped_addbacks["applied"], "excluded_addbacks": scoped_addbacks["excluded"]}
+                   if scoped_addbacks is not None else {}),
                 "addback_ids": [str(row.id) for row in qc_verified_addbacks],
                 "lender_accepted_addback_ids": [
                     str(row.id) for row in lender_accepted_addbacks
                 ],
                 "filed_results_unchanged": True,
+                "source_basis": "current_property_period" if property_only else "reviewed_manual_financial_periods"
+                if manual_earnings is not None else "current_validated_annual_profit_and_loss",
+                **{key: value for key, value in (manual_earnings or {}).items() if key != "value"},
+                "policy_version": authority.get("policy_version"),
             },
         )
     )
@@ -3073,34 +3342,38 @@ async def recompute(
             dscr = property_noi / debt_service
             diagnostic_dscr_used = True
     dscr_status = classify_dscr(dscr, thresholds.get("dscr"))
-    metrics.append(
-        _metric(
-            key="current_dscr",
-            label=_t(locale, "Current DSCR"),
-            value=dscr,
-            unit="x",
-            metric_status=dscr_status,
-            confidence=Decimal("0.35")
-            if diagnostic_dscr_used
-            else Decimal("1")
-            if dscr is not None
-            else None,
-            source={
-                "kind": "self_reported_diagnostic"
+    if not property_only:
+        current_coverage, dscr_status = business_dscr_metrics(profile, authority, thresholds, locale)
+        metrics.extend(current_coverage)
+    else:
+        metrics.append(
+            _metric(
+                key="current_dscr",
+                label=_t(locale, "Current DSCR"),
+                value=dscr,
+                unit="x",
+                metric_status=dscr_status,
+                confidence=Decimal("0.35")
                 if diagnostic_dscr_used
-                else "underwriting",
-                "reviewed": profile.underwriting_updated_at is not None
-                and not diagnostic_dscr_used,
-                "verification_status": "self_reported_unverified"
-                if diagnostic_dscr_used
+                else Decimal("1")
+                if dscr is not None
                 else None,
-            },
+                source={
+                    "kind": "self_reported_diagnostic"
+                    if diagnostic_dscr_used
+                    else "underwriting",
+                    "reviewed": profile.underwriting_updated_at is not None
+                    and not diagnostic_dscr_used,
+                    "verification_status": "self_reported_unverified"
+                    if diagnostic_dscr_used
+                    else None,
+                },
+            )
         )
-    )
-    metrics[-1]["source"]["lender_accepted_addback_ids"] = [
-        str(row.id) for row in lender_accepted_addbacks
-    ]
-    metrics[-1]["source"]["addbacks_applied_to_dscr"] = False
+        metrics[-1]["source"]["lender_accepted_addback_ids"] = [
+            str(row.id) for row in lender_accepted_addbacks
+        ]
+        metrics[-1]["source"]["addbacks_applied_to_dscr"] = False
 
     nsf_fact = fact_map.get("nsf_count") or fact_map.get("returned_items")
     nsf = _decimal(_normalized_fact_value(nsf_fact)) if nsf_fact else None
@@ -3294,7 +3567,7 @@ async def recompute(
             return gross_fit_ready
         if item["key"] == "net_margin_pct":
             return net_fit_ready
-        if item["key"] == "current_dscr":
+        if item["key"] in {"current_dscr", "underwriting_dscr"}:
             return source.get("kind") == "underwriting" and source.get("reviewed") is True
         if source.get("verification_status") == "verified":
             return True
@@ -3362,6 +3635,8 @@ async def recompute(
 
     source_manifest: list[dict[str, Any]] = [
         _policy_lineage(policy),
+        {"kind": "financial_calculation_authority", **authority,
+         "underwriting_assumption_stamp": _underwriting_assumption_stamp(profile)},
         {"kind": "advisory_funding_path", "assessment": assess_funding_paths(
             program_candidates,
             readiness_blockers=blockers,
@@ -3465,7 +3740,7 @@ async def recompute(
         policy_version=policy.version,
         formula_version=FORMULA_VERSION,
         evidence_fingerprint=fingerprint,
-        idempotency_key=idempotency_key,
+        idempotency_key=effective_idempotency_key,
         as_of=datetime.now(UTC),
         communication_locale=locale,
         review_status=(
@@ -3611,11 +3886,18 @@ async def review_snapshot(
             select(ApplicationProfile)
             .where(ApplicationProfile.id == profile.id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one()
     current = await latest_snapshot(db, profile.id)
     if current is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Capital Readiness has not been calculated")
+    authority = await load_financial_authority(db, profile)
+    if not snapshot_authority_matches(current, authority, profile):
+        raise HTTPException(status.HTTP_409_CONFLICT, detail={
+            "message": "Current financial evidence changed; recalculate and review the current version",
+            "action": "recalculate", "current_snapshot_version": current.snapshot_version,
+        })
     if current.snapshot_version != payload.expected_snapshot_version:
         expected = (
             await db.execute(
@@ -3738,6 +4020,7 @@ read_snapshot = _snapshot_read
 
 __all__ = [
     "action_read",
+    "advisory_current_snapshot",
     "addback_read",
     "aggregate_period_window",
     "build_ai_context",
@@ -3748,6 +4031,7 @@ __all__ = [
     "create_addback",
     "create_action",
     "create_financial_period",
+    "current_snapshot",
     "effective_confidence_pct",
     "gated_margin_display",
     "latest_snapshot",

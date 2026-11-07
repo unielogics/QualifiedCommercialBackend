@@ -201,13 +201,12 @@ async def _desk_read(
     db: AsyncSession, offer: MerchantProcessingOffer, intake: PublicUnderwritingIntake | None
 ) -> MerchantOfferRead:
     from app.routers.buckets import _download_url
-    from app.routers.dealer_ai_intake import _key_metrics
 
     file = await db.get(BucketFile, offer.source_file_id) if offer.source_file_id else None
     lender = await db.get(Lender, offer.lender_id) if offer.lender_id else None
     sender = await db.get(User, offer.sent_by_user_id) if offer.sent_by_user_id else None
     annual = float(offer.estimated_annual_savings) if offer.estimated_annual_savings is not None else None
-    pro_forma = mp.pro_forma_dscr(_key_metrics(intake), annual) if intake is not None else None
+    pro_forma = await mp.current_pro_forma_dscr(db, offer.profile_id, annual, intake_id=intake.id) if intake is not None else None
     desk_terms = dict(offer.desk_terms or {})
     return MerchantOfferRead(
         id=offer.id,

@@ -5020,8 +5020,8 @@ async def _chat_context(
     if readiness_profile is not None:
         from app.services import capital_readiness
 
-        readiness_snapshot = await capital_readiness.latest_snapshot(
-            db, readiness_profile.id
+        readiness_snapshot = await capital_readiness.advisory_current_snapshot(
+            db, readiness_profile
         )
         if readiness_snapshot is not None:
             readiness_context = capital_readiness.build_ai_context(
