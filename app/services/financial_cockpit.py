@@ -843,12 +843,24 @@ def bank_summary(months: list[dict[str, Any]]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def tax_years(analyses: list[dict[str, Any]], limit: int = 3) -> list[dict[str, Any]]:
+def tax_years(analyses: list[dict[str, Any]], limit: int = 3, *, business_entity: str | None = None) -> list[dict[str, Any]]:
+    from app.services.financial_tax_earnings import (
+        entities_match,
+        normalize_tax_earnings,
+        tax_source_is_business,
+    )
+
     facts_by_file = {str(item.get("file_id")): item.get("key_facts") or {} for item in analyses}
     accepted = _accepted_files(analyses)
     years: list[dict[str, Any]] = []
-    for year in extract_tax_years(_extractor_rows(analyses), limit=limit):
+    # Select the business before limiting years: personal and unrelated returns
+    # in the evidence room must not displace this company's older return.
+    sources = [item for item in analyses if tax_source_is_business(item.get("key_facts") or {})]
+    for year in extract_tax_years(_extractor_rows(sources), limit=max(limit, len(sources) * 2)):
         facts = facts_by_file.get(str(year.get("file_id"))) or {}
+        if business_entity and not entities_match(business_entity, year.get("entity")):
+            continue
+        earnings = normalize_tax_earnings(facts)
         record = {
             key: year.get(key)
             for key in (
@@ -856,6 +868,7 @@ def tax_years(analyses: list[dict[str, Any]], limit: int = 3) -> list[dict[str, 
                 "year",
                 "entity",
                 "basis",
+                "currency",
                 "period_start",
                 "period_end",
                 "gross_receipts",
@@ -870,6 +883,11 @@ def tax_years(analyses: list[dict[str, Any]], limit: int = 3) -> list[dict[str, 
         record["accepted"] = str(year.get("file_id")) in accepted
         for key, aliases in _TAX_LINE_ALIASES.items():
             record[key] = _first_num(facts, aliases) if isinstance(facts, dict) else None
+        for key in ("interest", "depreciation", "basis", "currency", "period_start", "period_end"):
+            record[key] = earnings.get(key) if earnings.get(key) is not None else record.get(key)
+        record["depreciation_complete"] = earnings["depreciation_complete"]
+        record["component_fact_paths"] = earnings["component_fact_paths"]
+        record["tax_form"] = earnings.get("form")
         income, basis = None, None
         for key, label in _TAX_INCOME_BASES:
             if record.get(key) is not None:
@@ -881,11 +899,10 @@ def tax_years(analyses: list[dict[str, Any]], limit: int = 3) -> list[dict[str, 
         record["ebitda"] = (
             _round(income + (interest or 0) + (depreciation or 0)) if income is not None else None
         )
-        record["ebitda_complete"] = (
-            income is not None and interest is not None and depreciation is not None
-        )
+        record["ebitda_complete"] = income is not None and interest is not None and earnings["depreciation_complete"]
         record["net_margin"] = _ratio(income, record.get("gross_receipts"))
         years.append(record)
+    years = years[-limit:]
     for index in range(1, len(years)):
         prior, current = years[index - 1], years[index]
         current["gross_receipts_change_pct"] = _pct_change(
@@ -898,10 +915,18 @@ def tax_years(analyses: list[dict[str, Any]], limit: int = 3) -> list[dict[str, 
     return years
 
 
-def profit_and_loss(analyses: list[dict[str, Any]]) -> dict[str, Any] | None:
+def profit_and_loss(analyses: list[dict[str, Any]], *, business_entity: str | None = None) -> dict[str, Any] | None:
     statement = extract_profit_and_loss(_extractor_rows(analyses))
     if not statement:
         return None
+    if business_entity:
+        from app.services.financial_tax_earnings import entities_match
+
+        matching = [row for row in statement.get("statements") or [statement]
+                    if entities_match(business_entity, row.get("business_name"))]
+        if matching:
+            statement = {**max(matching, key=lambda row: (row.get("period_end") or "", row.get("period_start") or "")),
+                         "statements": statement.get("statements") or [statement]}
     months = statement.get("months_covered") or 0
     revenue = statement.get("gross_revenue")
     net_income = statement.get("net_income")
@@ -1739,8 +1764,8 @@ def _dscr_candidate(
         else None
     )
     pro_forma = None
-    if numerator is not None and proposed_annual:
-        pro_forma = round(numerator / ((annual_debt_service or 0) + proposed_annual), 2)
+    if numerator is not None and proposed_annual and annual_debt_service is not None:
+        pro_forma = round(numerator / (annual_debt_service + proposed_annual), 2)
     return {
         "key": key,
         "label": label,
@@ -1768,24 +1793,25 @@ def dscr_block(
     no_debt = service.get("source") == "declared_none" or bool(service.get("schedule_authoritative") and service.get("declared_none"))
     proposed_annual = proposed.get("annual_payment") if proposed else None
     candidates: list[dict[str, Any]] = []
-    latest_tax = next((y for y in reversed(years) if y.get("ebitda") is not None), None)
+    latest_tax = next((y for y in reversed(years) if y.get("ebitda") is not None and y.get("annual_coverage_eligible", True)), None)
     if latest_tax:
         candidates.append(
             _dscr_candidate(
                 "tax_return",
                 f"Tax return {latest_tax.get('year')}",
                 numerator=latest_tax["ebitda"],
-                numerator_label=f"EBITDA: {latest_tax.get('income_basis')} + interest + depreciation",
+                numerator_label=f"Tax-derived earnings estimate: {latest_tax.get('income_basis')} + known interest + current-year depreciation and amortization",
                 period=str(latest_tax.get("year") or ""),
                 annual_debt_service=annual,
                 proposed_annual=proposed_annual,
                 confidence="filed",
                 note=None
                 if latest_tax.get("ebitda_complete")
-                else "Interest or depreciation was not read off the return; EBITDA may be understated.",
+                else "Some interest, depreciation or amortization components are unknown; this is a tax-derived earnings estimate, not fully reconciled EBITDA.",
             )
         )
-    if statement and statement.get("annualized_ebitda") is not None:
+        candidates[-1]["source_file_id"] = latest_tax.get("file_id")
+    if statement and not statement.get("dscr_reconciliation_required") and statement.get("annualized_ebitda") is not None:
         candidates.append(
             _dscr_candidate(
                 "profit_and_loss",
@@ -2112,8 +2138,8 @@ def build_cockpit(
     all_summary = bank_summary(all_months) if narrowed else bank
     credits = recurring_payments(analyses, field="recurring_credits", direction=1)
     overdrafts = overdrafts_block(months)
-    years = tax_years(analyses)
-    statement = profit_and_loss(analyses)
+    years = tax_years(analyses, business_entity=business_entity)
+    statement = profit_and_loss(analyses, business_entity=business_entity)
     sheet = balance_sheet(analyses)
     if accepted_schedule is not None:
         current = {str(row.get("id")): row for row in debts}
@@ -2163,8 +2189,46 @@ def build_cockpit(
 
     metric_review = metric_reviews.prepare(analyses, years, statement, bank, months, accounts, service,
                                           state=metric_review_state, entity=business_entity, debt_rows=rows)
+    from app.services.financial_tax_earnings import entities_match, tax_source_is_business
+
+    excluded_earnings = []
+    for item in analyses:
+        if "tax_return" not in _classes(item):
+            continue
+        facts = item.get("key_facts") or {}
+        identity = facts.get("entity_name") or facts.get("business_name") or facts.get("taxpayer")
+        reason = ("Personal or unscoped tax return; excluded from business earnings and DSCR."
+                  if not tax_source_is_business(facts) else
+                  "Business identity does not match this file; review the association in Evidence."
+                  if business_entity and not entities_match(business_entity, identity) else None)
+        if reason:
+            excluded_earnings.append({"file_id": item.get("file_id"), "file_name": item.get("file_name"), "reason": reason})
+    metric_review["excluded_income_sources"] = excluded_earnings
+    comparative_conflicts = []
+    for row in years:
+        facts = next((item.get("key_facts") or {} for item in analyses if str(item.get("file_id")) == str(row.get("file_id"))), {})
+        for key, field in (("three_year_revenue_comparison", "gross_receipts"),
+                           ("prior_year_gross_receipts", "gross_receipts"),
+                           ("three_year_ordinary_income_loss", "income"),
+                           ("prior_year_ordinary_income", "income")):
+            comparisons = facts.get(key)
+            if not isinstance(comparisons, dict):
+                continue
+            for prior in years:
+                if str(prior.get("year")) >= str(row.get("year")):
+                    continue
+                reported = _num(comparisons.get(str(prior.get("year"))))
+                original = _num(prior.get(field))
+                if reported is not None and original is not None and abs(reported - original) > 0.01:
+                    comparative_conflicts.append({"year": prior.get("year"), "field": field,
+                        "file_id": prior.get("file_id"), "value": original,
+                        "comparative_file_id": row.get("file_id"), "comparative_value": reported,
+                        "difference": _round(reported - original),
+                        "reason": "The later return's comparative differs from the uploaded prior-year return. Review an amended or reconciled return; original figures have been preserved."})
+    metric_review["comparative_conflicts"] = comparative_conflicts
     effective_bank = metric_review.pop("_bank")
-    dscr = dscr_block(years, statement, effective_bank, service, proposed)
+    business_statement = statement if not business_entity or statement and entities_match(business_entity, statement.get("business_name")) else None
+    dscr = dscr_block(years, business_statement, effective_bank, service, proposed)
     metric_reviews.finish(metric_review, dscr, service, effective_bank)
     from app.services import financial_plan as plans
 
@@ -2280,7 +2344,7 @@ def build_cockpit(
             "schedule_rows": evaluation.get("schedule_rows") or [],
             "risk": evaluation.get("risk"),
         },
-        "net_profit": net_profit_block(years, statement, bank),
+        "net_profit": net_profit_block(years, business_statement, bank),
         "notes": _notes(coverage, bank, service, proposed, years, statement)
         + schedule_notes(schedule, service),
     }
@@ -2451,7 +2515,7 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
         # Coverage on every payment: the income after the plan when there is
         # one, else today's; beside the existing service after what the plan
         # retires (or what the sheet retains when it refinances).
-        if evaluation.get("active") and evaluation.get("income_after_annual"):
+        if evaluation.get("active") and evaluation.get("income_after_annual") is not None:
             income_annual = evaluation["income_after_annual"]
         else:
             income_annual = (dscr.get("headline") or {}).get("numerator")
@@ -2463,12 +2527,13 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
         ):
             existing = float(evaluation["debt_service_before_new_payment_monthly"])
         else:
-            existing = float(dscr.get("annual_debt_service") or 0.0) / 12.0
+            annual_existing = dscr.get("annual_debt_service")
+            existing = float(annual_existing) / 12.0 if annual_existing is not None else None
         base["risk"] = risk_profile(
             schedule,
-            income_monthly=(float(income_annual) / 12.0) if income_annual else None,
+            income_monthly=(float(income_annual) / 12.0) if income_annual is not None else None,
             existing_service_monthly=existing,
-        )
+        ) if existing is not None else None
     else:
         base["structure_label"] = None
         base["schedule"] = None

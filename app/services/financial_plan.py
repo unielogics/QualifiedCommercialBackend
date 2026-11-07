@@ -42,6 +42,14 @@ EXCLUDABLE_KINDS = frozenset({"transfer", "owner_draw"})
 DEFAULT_RATE_PCT = 16.0
 DEFAULT_TERM_MONTHS = 120
 MAX_LEVERS = 6
+DOUBLE_COUNTED_ADD_BACK_KINDS = frozenset({"interest_refinanced", "depreciation"})
+DOUBLE_COUNTED_ADD_BACK_REASON = (
+    "Interest and depreciation/amortization are already excluded from EBITDA. "
+    "The bank cash-flow basis already adds back scheduled debt paid, while noncash depreciation never reduces bank cash."
+)
+UNKNOWN_DEBT_SERVICE_REASON = (
+    "Existing debt service is unknown; complete the debt schedule or set an explicit debt-service assumption."
+)
 
 
 def _num(value: Any) -> float | None:
@@ -390,7 +398,10 @@ def evaluate_plan(
         if k.startswith("payee:") and k.split(":", 1)[1] in payees_by_key
     ]
     excluded_monthly = round(sum(p.get("monthly_average") or 0 for p in excluded), 2)
-    add_backs_monthly = round(sum(a.get("amount_monthly") or 0 for a in add_backs), 2)
+    excluded_add_backs = [{**item, "reason": DOUBLE_COUNTED_ADD_BACK_REASON}
+                         for item in add_backs if item.get("kind") in DOUBLE_COUNTED_ADD_BACK_KINDS]
+    add_backs_monthly = round(sum(a.get("amount_monthly") or 0 for a in add_backs
+                                 if a.get("kind") not in DOUBLE_COUNTED_ADD_BACK_KINDS), 2)
     add_backs_annual = round(add_backs_monthly * 12, 2)
     income_override = overrides.get("income_annual")
     service_override = overrides.get("debt_service_monthly")
@@ -496,7 +507,7 @@ def evaluate_plan(
     service_monthly = (
         float(service_override)
         if service_override is not None
-        else float(service.get("monthly") or 0.0)
+        else _num(service.get("monthly"))
     )
     ref = plan.get("terms_ref") or {}
     retained = _num(ref.get("retained_annual_debt_service"))
@@ -507,10 +518,13 @@ def evaluate_plan(
     # Canonical recorded refinance terms already state the debt remaining
     # AFTER these payoffs. Preserve the payoff selections and their evidence,
     # without subtracting their payments from retained debt a second time.
-    before_new = round(max(0.0, service_monthly if recorded_refinance_basis else service_monthly - retired_monthly), 2)
-    after_monthly = round(max(0.0, before_new + float(new_payment or 0.0)), 2)
-    after_annual = after_monthly * 12
-    if schedule and schedule.get("repayment_config") is not None:
+    # Missing existing debt service is not a zero-debt declaration. Even a
+    # fully priced new loan cannot establish the missing retained payments.
+    before_new = (round(max(0.0, service_monthly if recorded_refinance_basis else service_monthly - retired_monthly), 2)
+                  if service_monthly is not None else None)
+    after_monthly = round(max(0.0, before_new + float(new_payment or 0.0)), 2) if before_new is not None else None
+    after_annual = after_monthly * 12 if after_monthly is not None else None
+    if before_new is not None and schedule and schedule.get("repayment_config") is not None:
         exact_new_annual = schedule["coverage_annual_debt_service"] if abs(float(new_payment or 0) - schedule["coverage_payment_monthly"]) < .005 else float(new_payment or 0) * 12
         exact_existing_annual = before_new * 12
         if configured_refinance:
@@ -522,15 +536,16 @@ def evaluate_plan(
         numerator = candidate.get("numerator")
         if numerator is None:
             continue
-        # Add-backs raise every basis; a payee that is not spend raises the
-        # bank proxy only; an income override replaces the lot.
+        # Only additional operating adjustments raise earnings. Interest and
+        # D&A have already been reversed in EBITDA (or are absent from bank
+        # cash retained). Reversing them again would inflate coverage.
         adjusted = (
             numerator
             + add_backs_annual
             + (excluded_monthly * 12 if candidate.get("key") == "bank_cash_flow" else 0.0)
         )
         numerator_after = float(income_override) if income_override is not None else adjusted
-        value = round(numerator_after / after_annual, 2) if after_annual > 0 else None
+        value = round(numerator_after / after_annual, 2) if after_annual is not None and after_annual > 0 else None
         candidates_after.append(
             {
                 "key": candidate.get("key"),
@@ -540,7 +555,7 @@ def evaluate_plan(
                 "value_before": candidate.get("value"),
                 "value_after": value,
                 "status_after": dscr_status(value),
-                "no_debt_left": after_monthly <= 0 and numerator_after > 0,
+                "no_debt_left": after_monthly is not None and after_monthly <= 0 and numerator_after > 0,
                 "overridden": income_override is not None,
             }
         )
@@ -548,7 +563,7 @@ def evaluate_plan(
         # No document gives an income figure, but the desk set one: coverage
         # stands on the override alone and says so.
         value = (
-            round(float(income_override) / after_annual, 2) if after_annual > 0 else None
+            round(float(income_override) / after_annual, 2) if after_annual is not None and after_annual > 0 else None
         )
         candidates_after.append(
             {
@@ -559,7 +574,7 @@ def evaluate_plan(
                 "value_before": None,
                 "value_after": value,
                 "status_after": dscr_status(value),
-                "no_debt_left": after_monthly <= 0 and float(income_override) > 0,
+                "no_debt_left": after_monthly is not None and after_monthly <= 0 and float(income_override) > 0,
                 "overridden": True,
             }
         )
@@ -585,7 +600,7 @@ def evaluate_plan(
         or (plan.get("new_payment_source") == "term_sheet" and new_payment is not None)
     )
     risk = None
-    if schedule:
+    if schedule and before_new is not None:
         from app.services.loan_schedule import risk_profile
 
         income_after = headline_after["numerator_after"] if headline_after else None
@@ -606,6 +621,8 @@ def evaluate_plan(
         "excluded_monthly": excluded_monthly,
         "add_backs_monthly": add_backs_monthly,
         "add_backs_annual": add_backs_annual,
+        "excluded_add_backs": excluded_add_backs,
+        "coverage_unavailable_reason": UNKNOWN_DEBT_SERVICE_REASON if service_monthly is None else None,
         "income_override_annual": income_override,
         "debt_service_override_monthly": service_override,
         "interest_only": interest_only,
@@ -702,17 +719,18 @@ def describe_modifications(
         )
     for item in plan.get("add_backs") or []:
         monthly = float(item.get("amount_monthly") or 0)
+        excluded = item.get("kind") in DOUBLE_COUNTED_ADD_BACK_KINDS
         lines.append(
             {
                 "kind": "add_back",
-                "label": f"Add back {item.get('label') or ADD_BACK_KINDS.get(item.get('kind') or 'other')}",
-                "detail": item.get("note")
+                "label": f"{'Not applied: ' if excluded else 'Add back '}{item.get('label') or ADD_BACK_KINDS.get(item.get('kind') or 'other')}",
+                "detail": DOUBLE_COUNTED_ADD_BACK_REASON if excluded else item.get("note")
                 or ADD_BACK_KINDS.get(
                     item.get("kind") or "other",
                     "Added back to the income available for debt service.",
                 ),
-                "monthly_effect": _round(monthly),
-                "annual_effect": _round(monthly * 12),
+                "monthly_effect": 0.0 if excluded else _round(monthly),
+                "annual_effect": 0.0 if excluded else _round(monthly * 12),
             }
         )
     overrides = plan.get("overrides") or {}
@@ -924,6 +942,10 @@ def coverage_levers(
     """Actions, each with the coverage it would leave, ranked best first.
     Every lever is a change to the plan the desk can apply with one click,
     or a document the file is missing."""
+    if evaluation.get("debt_service_after_monthly") is None:
+        return [{"key": "debt_schedule", "label": "Complete the debt schedule",
+                 "detail": UNKNOWN_DEBT_SERVICE_REASON, "dscr_after": None,
+                 "status_after": "unavailable", "uncertain": True, "improves": False, "apply": None}]
     headline = dscr.get("headline") or {}
     numerator = headline.get("numerator")
     if numerator is None:

@@ -7193,6 +7193,18 @@ async def _response(
     if mca_policy is not None and not mca_policy["auto_underwriting_allowed"]:
         review = None  # Historical AI screening is not a current eligibility decision.
     latest_result = _lead_result(intake) or None
+    current_result_projection = None
+    if readiness_profile is not None and (include_management or admin_thread) and not (mca_policy is not None and not mca_policy["auto_underwriting_allowed"]):
+        from app.services import financial_cockpit
+        from app.services.financial_metric_reporting import current_review_projection
+
+        try:
+            current_cockpit = await financial_cockpit.load_cockpit(db, readiness_profile)
+        except Exception:  # noqa: BLE001 - read-only hydration must not expose guessed cached financial figures
+            log.exception("Current financial metrics unavailable intake=%s", intake.id)
+            current_cockpit = None
+        current_result_projection = current_review_projection(latest_result, current_cockpit)
+        latest_result = current_result_projection
     widget = prequalification_widget
     if widget is None and latest_result and latest_result.get("booking_recommended") is True and not _call_booked(intake):
         widget = await _decorate_widget(
@@ -7289,11 +7301,11 @@ async def _response(
     # Redact internal-only data from the public/uploader payload. The dealer
     # sees only whitelisted intake_state keys and a sanitized review result.
     intake_read.intake_state = _client_safe_intake_state(intake.intake_state)
-    intake_read.result_snapshot = _client_safe_result(_latest_result_for_intake(intake))
+    intake_read.result_snapshot = _client_safe_result(current_result_projection if current_result_projection is not None else _latest_result_for_intake(intake))
     review_read = None
     if review:
         review_read = BucketAIReviewRead.model_validate(review)
-        review_read.result = _client_safe_result(review_read.result)
+        review_read.result = _client_safe_result(current_result_projection if current_result_projection is not None else review_read.result)
         review_read.context_snapshot = None
     signing_gate: dict[str, Any] | None = None
     if intake.variant == DEALER_VARIANT and not include_management and not admin_thread:

@@ -3842,6 +3842,16 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         # (the synthesis pass frequently leaves them null) and compute lending
         # readiness + a concrete clarifying next step from the open gaps.
         _compute_key_metrics_from_cache(result, per_file_analyses, accepted_debt_schedule=accepted_schedule)
+        if screen_profile is not None:
+            from app.services import financial_cockpit
+            from app.services.financial_metric_reporting import current_review_projection
+
+            try:
+                current_cockpit = await financial_cockpit.load_cockpit(db, screen_profile)
+            except Exception:  # noqa: BLE001 - unavailable current evidence cannot revive a model's guessed financials
+                log.exception("Current financial operands unavailable for review bucket=%s", bucket.id)
+                current_cockpit = None
+            result = current_review_projection(result, current_cockpit)
         _reconcile_accepted_debt_schedule_gaps(result, accepted_schedule)
         _apply_lending_readiness(result, per_file_analyses)
         # Deterministic consistency pass + single targeted repair — see the

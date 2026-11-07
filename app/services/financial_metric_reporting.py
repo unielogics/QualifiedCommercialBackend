@@ -7,6 +7,7 @@ EBITDA; a tax earnings estimate or bank proxy never fills those fields.
 
 import math
 import re
+from copy import deepcopy
 
 SOURCE_KEYS = ("file_id", "file_name", "analysis_id", "content_hash", "accepted", "entity", "period_start", "period_end", "currency", "basis", "version_id", "fact_key", "fact_present", "citations", "pages")
 CURRENCY_KEYS = ("numerator_currency", "denominator_currency", "source_currencies", "currency_comparable", "currency_status", "currency_note", "denominator_currency_basis")
@@ -95,6 +96,9 @@ def metric_brief(cockpit):
             "ebitda": {"headline": _result(ebitda.get("headline")), "candidates": [_result(row) for row in ebitda.get("candidates", [])], "reason": ebitda.get("reason")},
             "primary_dscr": primary, "validated_annual": validated_annual_pair(cockpit),
             "inputs": inputs, "corrections": corrections,
+            "excluded_income_sources": [{key: row.get(key) for key in ("file_id", "file_name", "reason")}
+                                        for row in review.get("excluded_income_sources", [])],
+            "comparative_conflicts": review.get("comparative_conflicts", []),
             "stale_corrections": [{"input_key": row.get("input_key"), "period": row.get("period"), "status": "stale_not_applied"} for row in review.get("stale_corrections", [])],
             "calculations": [_result(row) for row in review.get("calculations", [])]}
 
@@ -113,3 +117,34 @@ def attach_review_context(context, cockpit):
         context["desk_financial_plan"] = plan
     else:
         context.pop("desk_financial_plan", None)
+
+
+def current_review_projection(result, cockpit):
+    """Overlay current operands on a response copy; preserve historical AI text.
+
+    No ORM result or immutable review is modified. An unavailable current
+    value replaces a cached number instead of letting a personal-return or
+    obsolete debt basis remain the visible financial position.
+    """
+    projected = deepcopy(result) if isinstance(result, dict) else {}
+    metrics = projected.get("key_metrics")
+    metrics = dict(metrics) if isinstance(metrics, dict) else {}
+    brief = metric_brief(cockpit) if cockpit is not None else None
+    primary = (brief or {}).get("primary_dscr") or {}
+    annual = (brief or {}).get("validated_annual") or {}
+    service = ((cockpit or {}).get("debt") or {}).get("service") or {}
+    strict_ebitda = annual.get("ebitda_annual") if annual.get("currency") == "USD" else None
+    metrics.update({"estimated_dscr": primary.get("value"), "dscr": primary.get("value"),
+                    "annual_debt_service": service.get("annual"), "monthly_debt_service": service.get("monthly"),
+                    "debt_service_monthly": service.get("monthly"),
+                    "annual_ebitda": strict_ebitda, "bankable_ebitda": strict_ebitda,
+                    "dscr_basis": primary.get("key"), "dscr_earnings": primary.get("numerator"),
+                    "dscr_earnings_label": primary.get("numerator_label"),
+                    "dscr_source_refs": primary.get("source_refs") or [],
+                    "financial_metrics_source": "current_financial_cockpit" if brief is not None else "current_financial_evidence_unavailable"})
+    business_years = ((cockpit or {}).get("tax") or {}).get("years") or []
+    metrics["tax_net_income"] = business_years[-1].get("income") if business_years else None
+    metrics["tax_earnings_estimate"] = primary.get("numerator") if primary.get("key") == "tax_return" else None
+    projected["key_metrics"] = metrics
+    projected["financial_calculation_review"] = brief
+    return projected
