@@ -71,6 +71,37 @@ def test_client_quote_and_adopted_plan_use_identical_cadence_and_cash_due(freque
     assert plan_terms_link.terms_link(plan, result, recorded)["state"] == "mirrored"
 
 
+
+@pytest.mark.parametrize("frequency,ppy,custom", [("weekly", 51.96, None), ("custom", 51.5, 51.5)])
+def test_legacy_client_quote_retains_cadence_on_adoption_without_changing_monthly_coverage(frequency, ppy, custom):
+    payment, count, periods, annual, total, _cost = client_terms.repayment_math(
+        amount=100000, apr_pct=29.99, term_months=24, frequency=frequency,
+        custom_payments_per_year=custom, loan_structure="amortizing", repayment_config=None)
+    row = SimpleNamespace(id=uuid4(), version=2, program_name="Legacy term", amount=100000, apr_pct=29.99,
+        term_months=24, loan_structure="amortizing", interest_only_months=0, payments_per_year=periods,
+        periodic_payment=payment, annual_new_debt_service=annual, debt_service_treatment="additive", repayment_config=None)
+    recorded = plan_terms_link.recorded_from_client_terms(row)
+    plan = financial_plan.normalize_plan(plan_terms_link.adopt({}, recorded))
+    result = evaluate(plan)
+    expected = build_schedule(100000, 29.99, 24, structure="amortizing", periods_per_year=ppy)
+    assert plan["new_loan_repayment_config"] is None
+    assert plan["new_loan_payments_per_year"] == periods == ppy
+    assert result["schedule"]["periods_per_year"] == ppy
+    assert len(result["schedule_rows"]) == count == expected["periods"]
+    assert result["schedule_rows"] == expected["rows"]
+    # Existing legacy underwriting uses the recorded regular monthly equivalent;
+    # retaining the actual cadence must not reprice that accepted scalar basis.
+    old_scalar = financial_plan.normalize_plan({**plan, "new_loan_payments_per_year": None})
+    old_result = evaluate(old_scalar)
+    assert result["new_payment_monthly"] == old_result["new_payment_monthly"] == recorded["payment_monthly"]
+    assert result["debt_service_after_annual"] == old_result["debt_service_after_annual"]
+    assert result["headline_after"] == old_result["headline_after"]
+    mirrored = plan_terms_link.terms_link(plan, result, recorded)
+    assert mirrored["state"] == "mirrored" and mirrored["plan_loan"]["payments_per_year"] == ppy
+    drifted = plan_terms_link.terms_link(old_scalar, old_result, recorded)
+    assert drifted["state"] == "differs" and drifted["differences"] == ["payment cadence"]
+
+
 def test_plan_manual_regular_payment_cannot_remove_balloon_coverage_and_replay_is_labelled():
     plan = plan_for(new_payment_monthly=1)
     result = evaluate(plan)

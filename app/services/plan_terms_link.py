@@ -123,7 +123,7 @@ def adopt(
             or ("interest_only" if recorded.get("interest_only") else "amortizing"),
             "new_loan_interest_only_months": int(recorded.get("interest_only_months") or 0),
             "new_loan_repayment_config": deepcopy(recorded.get("repayment_config")),
-            "new_loan_payments_per_year": recorded.get("payments_per_year") if recorded.get("repayment_config") is not None else None,
+            "new_loan_payments_per_year": recorded.get("payments_per_year"),
             "terms_ref": {
                 "kind": recorded.get("kind"),
                 "id": recorded.get("id"),
@@ -201,7 +201,7 @@ def terms_link(
             "structure": loan.get("structure"),
             "payment_monthly": _num(payment),
             "repayment_config": deepcopy(loan.get("repayment_config")),
-            "payments_per_year": loan.get("payments_per_year") if loan.get("repayment_config") is not None else None,
+            "payments_per_year": loan.get("payments_per_year"),
         }
         if loan or payment
         else None
@@ -215,8 +215,8 @@ def terms_link(
         state, differences = "recorded_not_in_plan", []
     else:
         differences = []
-        advanced_keys = ("payments_per_year", "structure") if loan.get("repayment_config") is not None or recorded.get("repayment_config") is not None else ()
-        for key in ("amount", "rate_pct", "term_months", "interest_only", "payment_monthly", "repayment_config", *advanced_keys):
+        advanced_keys = ("structure",) if loan.get("repayment_config") is not None or recorded.get("repayment_config") is not None else ()
+        for key in ("amount", "rate_pct", "term_months", "interest_only", "payment_monthly", "repayment_config", "payments_per_year", *advanced_keys):
             a, b = plan_loan.get(key), recorded.get(key)
             if key == "repayment_config":
                 same = a == b
