@@ -1879,6 +1879,19 @@ async def _calculation_inputs(
     return periods, facts, programs, addbacks, actions
 
 
+def _canonical_fingerprint_lineage(value: Any) -> Any:
+    """Canonicalize evidence sets without rounding or changing observations."""
+    if isinstance(value, dict):
+        output = {key: _canonical_fingerprint_lineage(item) for key, item in value.items()}
+        for key in ("source_refs", "reasons", "fact_citations"):
+            if isinstance(output.get(key), list):
+                output[key] = sorted(output[key], key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
+        return output
+    if isinstance(value, (list, tuple)):
+        return [_canonical_fingerprint_lineage(item) for item in value]
+    return value
+
+
 def _fingerprint(
     profile: ApplicationProfile,
     periods: list[ApplicationFinancialPeriod],
@@ -1914,7 +1927,7 @@ def _fingerprint(
             {"period_id": str(row.id),
              "citations": getattr(row, "fact_citations", {}) or {},
              "statuses": getattr(row, "fact_citation_status", {}) or {}}
-            for row in periods
+            for row in sorted(periods, key=lambda item: str(item.id))
         ],
         "facts": sorted(
             (
@@ -1954,12 +1967,12 @@ def _fingerprint(
                 row.program_key,
                 row.playbook_version,
                 row.recommendation_status,
-                tuple(row.reasons),
+                tuple(sorted(row.reasons)),
                 getattr(row, "rule_state", "unavailable"),
                 getattr(row, "rule_results", []),
                 getattr(row, "fact_sources", {}),
             )
-            for row in program_candidates
+            for row in sorted(program_candidates, key=lambda item: item.program_key)
         ],
         "program_requirements": sorted(
             (
@@ -1991,7 +2004,7 @@ def _fingerprint(
         "financial_authority": financial_authority,
     }
     return hashlib.sha256(
-        json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        json.dumps(_canonical_fingerprint_lineage(body), sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
 
 

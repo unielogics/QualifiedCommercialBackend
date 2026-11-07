@@ -234,7 +234,7 @@ def _fit_fact_sources(context: dict, facts: list, files: list, analyses: dict) -
         refs = [{"kind": "accepted_fact", "id": str(fact.id),
                  "source_file_id": str(fact.source_file_id) if fact.source_file_id else None,
                  "source_analysis_id": str(fact.source_analysis_id) if fact.source_analysis_id else None}
-                for _value, fact in rows[:10]]
+                for _value, fact in sorted(rows, key=lambda item: str(item[1].id))[:10]]
         if len({value for value, _fact in rows}) != 1:
             output[key] = {"verification_status": "conflicting", "source_refs": refs}
             continue
@@ -470,25 +470,22 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
     accepted_tax_years: set[str] = set()
     accepted_nsf_counts: list[float] = []
     counted_accounts = _counted_bank_accounts(profile)
+    from app.services.financial_cockpit import _analysis_rows
+
+    analysis_rows = _analysis_rows(files, latest_analyses, accepted_file_ids)
+    statement_rows, statement_refs, statement_warnings = program_bank_estimate_rows(
+        analysis_rows, counted_accounts=counted_accounts,
+        account_aliases=dict(getattr(profile, "bank_account_aliases", None) or {}),
+    )
+    accepted_bank_months.update(row["month"] for row in statement_rows)
+    accepted_nsf_counts.extend(row["nsf"] for row in statement_rows if row.get("nsf") is not None)
     for file in files:
         if file.id not in accepted_file_ids:
             continue
         analysis = latest_analyses.get(file.id)
         classification = effective_file_classification(file.file_name, analysis)
         if classification == "bank_statement":
-            if counted_accounts:
-                from app.services.financial_cockpit import bank_file_counted
-
-                if not bank_file_counted(analysis.analysis if analysis else None, counted_accounts):
-                    continue
-            if file.statement_period:
-                accepted_bank_months.add(file.statement_period)
-            accepted_bank_months.update(
-                statement_months_from_analysis(analysis.analysis if analysis else None)
-            )
-            nsf_count = _analysis_nsf_count(analysis)
-            if nsf_count is not None:
-                accepted_nsf_counts.append(nsf_count)
+            continue  # Counted, accepted account/month contributions were reconciled above.
         elif classification == "tax_return":
             accepted_tax_years.update(_tax_years(file, analysis))
     snapshot = dict(intake.result_snapshot or {}) if intake else {}
@@ -649,7 +646,7 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
             classification: [{"kind": "accepted_document", "source_file_id": str(file.id),
                               "source_analysis_id": str(latest_analyses[file.id].id),
                               "content_hash": file.content_hash}
-                             for file in files if file.id in accepted_file_ids and file.id in latest_analyses
+                             for file in sorted(files, key=lambda source: str(source.id)) if file.id in accepted_file_ids and file.id in latest_analyses
                              and latest_analyses[file.id].classification == classification][:24]
             for classification in accepted_classifications
         },
@@ -662,16 +659,10 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
     # Six accepted statements say more than "needs information". Revenue and
     # cash flow are estimated from them when no P&L or tax return is on file;
     # the estimate is labelled as one, and a person can replace it.
-    from app.services.public_underwriting_packet_pdf import extract_bank_months
-
-    statement_rows = extract_bank_months([
-        {"file_id": str(file.id), "classification": "bank_statement",
-         "key_facts": (latest_analyses[file.id].analysis or {}).get("key_facts") or {}}
-        for file in files
-        if file.id in accepted_file_ids and file.id in latest_analyses
-        and effective_file_classification(file.file_name, latest_analyses[file.id]) == "bank_statement"
-    ], limit=120)
-    apply_statement_estimates(context, context["fact_sources"], accepted_months=len(accepted_bank_months), bank_rows=statement_rows)
+    apply_statement_estimates(context, context["fact_sources"], accepted_months=len(accepted_bank_months),
+                              bank_rows=statement_rows, bank_source_refs=statement_refs)
+    if statement_warnings:
+        context["bank_estimate_warnings"] = statement_warnings
     # Reviewed margins retain the exact snapshot lineage, not an AI estimate.
     for field in ("gross_margin_pct", "net_margin_pct"):
         if reviewed_profitability_facts(readiness_snapshot).get(field) is not None:
@@ -694,11 +685,10 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
             )
             if current_sources:
                 context["fact_sources"][field] = {"verification_status": "verified", "source_refs": source_rows[:24]}
-    from app.services.financial_cockpit import _analysis_rows
     from app.services.program_earnings_facts import annual_ebitda_fact
 
     context["annual_ebitda"], context["fact_sources"]["annual_ebitda"] = annual_ebitda_fact(
-        _analysis_rows(files, latest_analyses, accepted_file_ids),
+        analysis_rows,
         entity=getattr(intake, "business_name", None) or getattr(dealer, "legal_name", None) or getattr(dealer, "name", None),
         state=getattr(profile, "financial_metric_review", None),
     )
@@ -710,11 +700,16 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         except Exception:  # noqa: BLE001 - absent current operands cannot revive a cached AI estimate
             logging.getLogger(__name__).exception("Current program financial basis unavailable profile=%s", profile.id)
             current_cockpit = None
-        _apply_current_business_coverage(context, current_cockpit, accepted_bank_months=len(accepted_bank_months))
+        bank_basis_unresolved = any(row.get("deposits") is None or row.get("withdrawals") is None
+                                    for row in statement_rows) or any(
+            warning["reason"] != "counted_account_source_unaccepted" for warning in statement_warnings)
+        _apply_current_business_coverage(context, current_cockpit, accepted_bank_months=len(accepted_bank_months),
+                                         bank_basis_unresolved=bank_basis_unresolved)
     return context
 
 
-def _apply_current_business_coverage(context: dict[str, Any], cockpit: dict[str, Any] | None, *, accepted_bank_months: int) -> None:
+def _apply_current_business_coverage(context: dict[str, Any], cockpit: dict[str, Any] | None, *, accepted_bank_months: int,
+                                     bank_basis_unresolved: bool = False) -> None:
     """Use one current annual basis for program coverage and cash-flow rules.
 
     Source-bound factual earnings stay separate from hypothetical plan
@@ -741,7 +736,7 @@ def _apply_current_business_coverage(context: dict[str, Any], cockpit: dict[str,
     # bank-derived estimates. The cockpit may show a shorter labelled proxy.
     source_refs = annual_basis.get("source_refs") or []
     proxy_sources_accepted = bool(source_refs) and all(ref.get("accepted") for ref in source_refs)
-    proxy_eligible = not proxy or accepted_bank_months >= 3 and proxy_sources_accepted
+    proxy_eligible = not proxy or accepted_bank_months >= 3 and proxy_sources_accepted and not bank_basis_unresolved
     cash_flow = _float(annual_basis.get("numerator")) if proxy_eligible else None
     ratio = _float(primary.get("value")) if proxy_eligible else None
     verified_earnings = bool(cash_flow is not None and annual_basis.get("key") == "profit_and_loss"
@@ -761,6 +756,8 @@ def _apply_current_business_coverage(context: dict[str, Any], cockpit: dict[str,
         context[field] = value
         sources[field] = {**common, "verification_status": status,
                           "reason": "Current financial evidence is unavailable." if cockpit is None else
+                                    "Resolve conflicting or missing amounts in the counted account statements before relying on bank cash-flow estimates."
+                                    if proxy and bank_basis_unresolved else
                                     "Three accepted statement months and a fully accepted bank source basis are required for program cash-flow estimates." if not proxy_eligible else
                                     dscr.get("reason") if value is None else None}
         if field in assumptions:
@@ -808,6 +805,84 @@ def estimate_notes(fact_sources: dict[str, Any], rule_fields: set[str]) -> list[
     return notes
 
 
+def program_bank_estimate_rows(
+    analyses: list[dict[str, Any]], *, counted_accounts: list[str] | None = None,
+    account_aliases: dict[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Use accepted contributions from the cockpit's full account inventory.
+
+    Never dedupe two different accounts merely because their months match.
+    Resolving scope before acceptance also prevents an unaccepted selected
+    account from disappearing and making the calculator count another account.
+    Tied conflicting statements require review instead of choosing a file by
+    database order or UUID.
+    """
+    from app.services.financial_cockpit import (
+        _classes,
+        _file_month_records,
+        bank_months,
+        resolve_alias,
+    )
+
+    _, accounts = bank_months(analyses, counted=counted_accounts, aliases=account_aliases)
+    account_for_member = {member: account["key"] for account in accounts for member in account["members"]}
+    selected_keys = {account_for_member.get(resolved, resolved) for key in counted_accounts or []
+                     if (resolved := resolve_alias(key, account_aliases))}
+    if counted_accounts and not (selected_keys & {account["key"] for account in accounts}):
+        return [], [], [{"reason": "configured_counted_accounts_unavailable"}]
+    candidates: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for analysis in analyses:
+        if "bank_statement" not in _classes(analysis):
+            continue
+        (key, _, _), records = _file_month_records(analysis)
+        canonical = account_for_member.get(key, key)
+        for record in records:
+            candidates[(canonical, record["month"])].append({**record, "_source": analysis})
+
+    combined: dict[str, dict] = {}
+    refs: dict[tuple[str, str, str], dict] = {}
+    warnings = []
+    conflicted_months = set()
+    for account in sorted(accounts, key=lambda row: row["key"]):
+        if (account["key"] not in selected_keys if counted_accounts else not account["counted"]):
+            continue
+        for record in account["series"]:
+            month = record["month"]
+            alternatives = candidates.get((account["key"], month), [])
+            accepted = [value for value in alternatives if value["_source"].get("accepted")]
+            if len(accepted) != len(alternatives):
+                warnings.append({"reason": "counted_account_source_unaccepted", "month": month,
+                                 "account_key": account["key"]})
+            if not accepted:
+                continue
+            if any(len({number for value in accepted if (number := _float(value.get(field))) is not None}) > 1
+                   for field in ("deposits", "withdrawals", "nsf")):
+                conflicted_months.add(month)
+                warnings.append({"reason": "conflicting_counted_account_month", "month": month, "account_key": account["key"]})
+                continue
+            target = combined.setdefault(month, {"month": month, "deposits": 0, "withdrawals": 0, "nsf": 0})
+            for field in ("deposits", "withdrawals", "nsf"):
+                # Complementary OCR fields can agree without one file being
+                # complete. Retain the unique observed value, never a guessed
+                # zero or an arbitrary first file's missing value.
+                known = {number for row in accepted if (number := _float(row.get(field))) is not None}
+                value = next(iter(known), None)
+                if value is None:
+                    target[field] = None
+                elif target[field] is not None:
+                    target[field] += value
+            for value in accepted:
+                source = value["_source"]
+                file_id = str(source.get("file_id") or "")
+                refs[(month, account["key"], file_id)] = {
+                    "kind": "accepted_bank_statement", "file_id": file_id,
+                    "analysis_id": source.get("analysis_id"), "content_hash": source.get("content_hash"),
+                    "account_key": account["key"], "month": month, "accepted": True,
+                }
+    rows = [combined[month] for month in sorted(combined) if month not in conflicted_months]
+    return rows, [refs[key] for key in sorted(refs) if key[0] not in conflicted_months], warnings
+
+
 def estimate_annualized_deposits(rows: list[dict[str, Any]]) -> float | None:
     """Mean monthly deposits times twelve, from at least three statement months."""
     values = [float(row["deposits"]) for row in rows if row.get("deposits") is not None]
@@ -829,7 +904,8 @@ def estimate_cash_flow_from_statements(rows: list[dict[str, Any]]) -> float | No
     return round(sum(deposits - withdrawals for deposits, withdrawals in pairs) / len(pairs) * 12, 2)
 
 
-def apply_statement_estimates(context: dict[str, Any], fact_sources: dict[str, Any], *, accepted_months: int, bank_rows: list[dict[str, Any]]) -> list[str]:
+def apply_statement_estimates(context: dict[str, Any], fact_sources: dict[str, Any], *, accepted_months: int,
+                             bank_rows: list[dict[str, Any]], bank_source_refs: list[dict[str, Any]] | None = None) -> list[str]:
     """Fill revenue and cash flow from accepted statements when nothing better exists.
 
     Returns the keys that were estimated; ``context["estimated_fit_facts"]``
@@ -841,21 +917,27 @@ def apply_statement_estimates(context: dict[str, Any], fact_sources: dict[str, A
         if deposits is not None:
             context["annualized_deposits"] = deposits
             context["deposits"] = deposits
-            fact_sources["annualized_deposits"] = {"verification_status": "estimated_from_statements", "source_refs": []}
+            fact_sources["annualized_deposits"] = {"verification_status": "estimated_from_statements",
+                                                   "basis": "annualized_counted_account_deposits",
+                                                   "source_refs": list(bank_source_refs or [])}
             fact_sources["deposits"] = fact_sources["annualized_deposits"]
             estimated.append("annualized_deposits")
     deposits = context.get("annualized_deposits")
-    if context.get("annual_revenue") is None and deposits and accepted_months >= 6:
+    numeric_deposit_months = sum(row.get("deposits") is not None for row in bank_rows)
+    if context.get("annual_revenue") is None and deposits is not None and accepted_months >= 6 and numeric_deposit_months >= 6:
         context["annual_revenue"] = deposits
         context["revenue"] = deposits
-        fact_sources["annual_revenue"] = {"verification_status": "estimated_from_deposits", "source_refs": []}
+        fact_sources["annual_revenue"] = {"verification_status": "estimated_from_deposits",
+                                         "basis": "bank_deposits_proxy_not_reported_revenue",
+                                         "source_refs": list((fact_sources.get("annualized_deposits") or {}).get("source_refs") or [])}
         fact_sources["revenue"] = fact_sources["annual_revenue"]
         estimated.extend(["annual_revenue", "revenue"])
     if context.get("cash_flow") is None:
         cash_flow = estimate_cash_flow_from_statements(bank_rows)
         if cash_flow is not None:
             context["cash_flow"] = cash_flow
-            fact_sources["cash_flow"] = {"verification_status": "estimated_from_statements", "source_refs": []}
+            fact_sources["cash_flow"] = {"verification_status": "estimated_from_statements",
+                                        "source_refs": list(bank_source_refs or [])}
             estimated.append("cash_flow")
     context["estimated_fit_facts"] = estimated
     return estimated

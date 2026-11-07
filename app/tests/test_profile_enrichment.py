@@ -33,10 +33,15 @@ def test_statements_estimate_deposits_and_cash_flow_from_three_months_or_more() 
 def test_estimates_fill_revenue_and_cash_flow_only_when_nothing_better_exists() -> None:
     context = {"annualized_deposits": 690395.0, "annual_revenue": None, "revenue": None, "cash_flow": None}
     sources = {}
-    estimated = apply_statement_estimates(context, sources, accepted_months=6, bank_rows=ROWS)
+    six_rows = [
+        {"sort": "2026-03", "deposits": 50000.0, "withdrawals": 40000.0},
+        {"sort": "2026-04", "deposits": 60000.0, "withdrawals": 50000.0},
+        *ROWS,
+    ]
+    estimated = apply_statement_estimates(context, sources, accepted_months=6, bank_rows=six_rows)
     assert context["annual_revenue"] == 690395.0 and context["revenue"] == 690395.0
     assert sources["annual_revenue"]["verification_status"] == "estimated_from_deposits"
-    assert context["cash_flow"] == estimate_cash_flow_from_statements(ROWS)
+    assert context["cash_flow"] == estimate_cash_flow_from_statements(six_rows)
     assert sources["cash_flow"]["verification_status"] == "estimated_from_statements"
     assert set(estimated) == {"annual_revenue", "revenue", "cash_flow"}
 

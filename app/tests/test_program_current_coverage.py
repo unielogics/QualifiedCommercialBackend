@@ -155,3 +155,156 @@ async def test_property_profile_preserves_its_distinct_basis_and_a_known_zero():
     load.assert_not_awaited()
     assert result["dscr"] == 0  # A business earnings projection must not replace property coverage.
     assert "financial_calculation_authority" not in result
+
+
+def account_banks(last4, deposits=10000, withdrawals=8000, *, accepted=True):
+    rows = banks(accepted=accepted)
+    for row in rows:
+        row["file_id"] = f"{last4}-" + row["file_id"]
+        row["analysis_id"] = "analysis-" + row["file_id"]
+        row["key_facts"].update(account_last4=last4, total_deposits_and_credits=deposits,
+                                 total_withdrawals_and_debits=withdrawals)
+    return rows
+
+
+def estimate_rows(rows, **scope):
+    return programs.program_bank_estimate_rows(rows, **scope)
+
+
+def test_program_bank_proxy_sums_distinct_accounts_in_same_month_with_stable_sources():
+    rows = account_banks("1234") + account_banks("5678", 5000, 3000)
+    result = estimate_rows(rows)
+    assert result == estimate_rows(list(reversed(rows)))
+    monthly, refs, warnings = result
+    assert len(monthly) == 6 and len(refs) == 12 and not warnings
+    assert all(row["deposits"] == 15000 and row["withdrawals"] == 11000 for row in monthly)
+    assert programs.estimate_annualized_deposits(monthly) == 180000
+    assert programs.estimate_cash_flow_from_statements(monthly) == 48000
+    target = {"annual_revenue": None, "annualized_deposits": None, "cash_flow": None}
+    sources = {}
+    programs.apply_statement_estimates(target, sources, accepted_months=6, bank_rows=monthly, bank_source_refs=refs)
+    assert target["annual_revenue"] == 180000
+    assert sources["annual_revenue"]["verification_status"] == "estimated_from_deposits"
+    assert sources["annual_revenue"]["source_refs"] == refs
+
+
+def test_same_account_identical_duplicates_do_not_double_count_or_change_refs_on_reorder():
+    rows = account_banks("1234")
+    duplicate = deepcopy(rows[0])
+    duplicate["file_id"], duplicate["analysis_id"] = "identical-duplicate", "duplicate-analysis"
+    rows.append(duplicate)
+    monthly, refs, warnings = estimate_rows(rows)
+    assert (monthly, refs, warnings) == estimate_rows(list(reversed(rows)))
+    assert programs.estimate_annualized_deposits(monthly) == 120000
+    assert len(refs) == 7 and not warnings
+
+
+@pytest.mark.parametrize("richer", [False, True])
+def test_conflicting_accepted_duplicates_require_review_instead_of_order_or_richer_metadata_priority(richer):
+    rows = account_banks("1234")
+    duplicate = deepcopy(rows[0])
+    duplicate["file_id"] = "conflicting-duplicate"
+    duplicate["key_facts"]["total_deposits_and_credits"] = 999999
+    if richer:
+        duplicate["key_facts"]["beginning_balance"] = 200
+    rows.append(duplicate)
+    result = estimate_rows(rows)
+    assert result == estimate_rows(list(reversed(rows)))
+    monthly, refs, warnings = result
+    assert len(monthly) == 5 and len(refs) == 5
+    assert warnings[0]["reason"] == "conflicting_counted_account_month"
+
+
+def test_counted_scope_is_resolved_before_acceptance_and_unaccepted_totals_are_excluded():
+    first, second = account_banks("1234"), account_banks("5678", 999999, 0, accepted=False)
+    monthly, refs, warnings = estimate_rows(first + second)
+    assert programs.estimate_annualized_deposits(monthly) == 120000
+    assert len(refs) == 6 and all(ref["accepted"] for ref in refs)
+    second_key = financial_cockpit.account_key_of(second[0]["key_facts"])
+    scoped, scoped_refs, warnings = estimate_rows(first + second, counted_accounts=[second_key])
+    assert scoped == scoped_refs == []
+    assert all(warning["reason"] == "counted_account_source_unaccepted" for warning in warnings)
+    missing, missing_refs, warnings = estimate_rows(first, counted_accounts=["Missing Bank ••0000"])
+    assert missing == missing_refs == [] and warnings == [{"reason": "configured_counted_accounts_unavailable"}]
+
+
+def test_counted_aliases_use_one_physical_account_without_counting_its_duplicate_twice():
+    first, second = account_banks("1234"), account_banks("5678")
+    first_key = financial_cockpit.account_key_of(first[0]["key_facts"])
+    second_key = financial_cockpit.account_key_of(second[0]["key_facts"])
+    scope = {"counted_accounts": [first_key], "account_aliases": {first_key: second_key}}
+    result = estimate_rows(first + second, **scope)
+    assert result == estimate_rows(list(reversed(first + second)), **scope)
+    monthly, refs, warnings = result
+    assert programs.estimate_annualized_deposits(monthly) == 120000
+    assert len(refs) == 12 and not warnings and {ref["account_key"] for ref in refs} == {second_key}
+
+
+def test_missing_accepted_account_operands_stay_unknown_and_zero_deposits_are_preserved():
+    first, second = account_banks("1234"), account_banks("5678", 5000, 3000)
+    second[0]["key_facts"]["total_deposits_and_credits"] = None
+    monthly, _, _ = estimate_rows(first + second)
+    assert monthly[0]["deposits"] is None and monthly[0]["withdrawals"] == 11000
+    target = {"annual_revenue": None, "annualized_deposits": None}
+    programs.apply_statement_estimates(target, {}, accepted_months=6, bank_rows=monthly)
+    assert target["annual_revenue"] is None  # Six evidence months, only five complete deposit months.
+    zero_rows, _, _ = estimate_rows(account_banks("1234", 0, 0))
+    zero = {"annual_revenue": None, "annualized_deposits": None}
+    programs.apply_statement_estimates(zero, {}, accepted_months=6, bank_rows=zero_rows)
+    assert zero["annual_revenue"] == 0 and zero["annualized_deposits"] == 0
+
+
+def test_complementary_accepted_duplicates_merge_only_observed_agreeing_fields():
+    left = account_banks("1234")[0]
+    right = deepcopy(left)
+    left["key_facts"].pop("total_deposits_and_credits")
+    left["key_facts"].update(beginning_balance=20, nsf_or_overdraft_count=0)
+    right["key_facts"].update(beginning_balance=20)
+    right["file_id"], right["analysis_id"] = "complementary", "complementary-analysis"
+    result = estimate_rows([left, right])
+    assert result == estimate_rows([right, left])
+    monthly, refs, warnings = result
+    assert monthly[0]["deposits"] == 10000 and monthly[0]["withdrawals"] == 8000
+    assert monthly[0]["nsf"] == 0 and len(refs) == 2 and not warnings
+
+
+def test_richer_pending_duplicate_neither_promotes_nor_suppresses_accepted_bank_math():
+    accepted = account_banks("1234")[0]
+    pending = deepcopy(accepted)
+    pending["accepted"] = False
+    pending["file_id"] = "pending"
+    pending["key_facts"].update(total_deposits_and_credits=999999, beginning_balance=200)
+    original_rows, original_refs, _ = estimate_rows([accepted])
+    rows, refs, warnings = estimate_rows([accepted, pending])
+    assert rows == original_rows and refs == original_refs
+    assert warnings[0]["reason"] == "counted_account_source_unaccepted"
+    assert (rows, refs, warnings) == estimate_rows([pending, accepted])
+
+
+def test_counted_bank_only_member_folds_into_its_known_account_without_other_banks():
+    rows = account_banks("1234")
+    bank_only = deepcopy(rows[0])
+    bank_only["key_facts"].pop("account_last4")
+    orphan_key = financial_cockpit.account_key_of(bank_only["key_facts"])
+    other = account_banks("5678", 999999)
+    for row in other:
+        row["key_facts"]["bank"] = "Other Bank"
+    monthly, refs, warnings = estimate_rows(rows + other, counted_accounts=[orphan_key])
+    # The bank-only selected key can be mapped to a known account only when
+    # its source is present in the full inventory's inferred membership.
+    assert monthly == refs == [] and warnings
+    bank_only["file_id"], bank_only["analysis_id"] = "bank-only", "bank-only-analysis"
+    monthly, refs, warnings = estimate_rows(rows + [bank_only] + other, counted_accounts=[orphan_key])
+    assert programs.estimate_annualized_deposits(monthly) == 120000
+    assert len(refs) == 7 and not warnings
+
+
+def test_unresolved_bank_account_basis_cannot_sneak_back_through_a_cockpit_proxy_but_tax_basis_is_unchanged():
+    target = context()
+    programs._apply_current_business_coverage(target, build(banks()), accepted_bank_months=6, bank_basis_unresolved=True)
+    assert target["dscr"] is None and target["cash_flow"] is None
+    assert target["fact_sources"]["dscr"]["verification_status"] == "unknown"
+    assert "Resolve conflicting" in target["fact_sources"]["dscr"]["reason"]
+    tax_target = context()
+    programs._apply_current_business_coverage(tax_target, build([tax()]), accepted_bank_months=6, bank_basis_unresolved=True)
+    assert tax_target["dscr"] == build([tax()])["dscr"]["headline"]["value"]
