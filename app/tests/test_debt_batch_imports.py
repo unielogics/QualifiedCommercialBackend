@@ -547,3 +547,46 @@ async def test_waiting_mutation_refreshes_warm_import_after_another_request_reso
                 assert error.value.status_code == 409
     assert imported.status == "applied" and imported.proposed_body == resolved
     assert state.draft.revision == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lenders", [("SBA", "Small Business Administration"), ("Name", "Name LLC")])
+async def test_same_full_reference_across_lender_aliases_requires_peer_duplicate_review_without_merging(lenders):
+    state = setup()
+    state.draft.body["debts"] = []
+    for file, lender in zip(state.files[:2], lenders, strict=True):
+        state.outputs[file.id][0]["debts"][0]["lender"] = lender
+        state.outputs[file.id][1]["r1.loan_reference"].update(value="0001111111", quote="Loan account 0001111111")
+    with Harness(state):
+        review = await process(state)
+        peers = [candidate for candidate in review["candidates"] if candidate["loan_reference"] == "0001111111"]
+        assert len(peers) == 2 and len({candidate["id"] for candidate in peers}) == 2
+        assert all(candidate["suggested_action"] == "review" and candidate["requires_separate_loan_confirmation"] for candidate in peers)
+        assert all(any("Possible duplicate within this batch" in warning for warning in candidate["warnings"]) for candidate in peers)
+        assert all(candidate["possible_duplicate_row_ids"] == [] for candidate in peers)
+        separate = next(candidate for candidate in review["candidates"] if candidate["loan_reference"] == "0003333333")
+        assert separate["suggested_action"] == "create" and not separate["requires_separate_loan_confirmation"]
+        choices = [decision(candidate, "create", fields={"lender"}, confirm_separate_loan=False) if candidate in peers else decision(candidate, "skip") for candidate in review["candidates"]]
+        with pytest.raises(HTTPException, match="separate loan"):
+            await batches.apply(state.db, state.profile, UUID(review["id"]), expected_revision=4,
+                idempotency_key=uuid4(), decisions=choices, actor=state.actor)
+        assert state.draft.body["debts"] == [] and state.draft.revision == 4
+        for choice in choices:
+            choice["confirm_separate_loan"] = True
+        result = await batches.apply(state.db, state.profile, UUID(review["id"]), expected_revision=4,
+            idempotency_key=uuid4(), decisions=choices, actor=state.actor)
+    assert len(result["body"]["debts"]) == 2
+    assert {row["lender"] for row in result["body"]["debts"]} == set(lenders)
+    assert len({row["id"] for row in result["body"]["debts"]}) == 2
+
+
+@pytest.mark.asyncio
+async def test_same_lender_with_different_full_references_has_no_within_batch_duplicate_gate():
+    state = setup()
+    state.draft.body["debts"] = []
+    with Harness(state):
+        review = await process(state)
+    assert len(review["candidates"]) == 3
+    assert all(candidate["lender"] == "SBA" and candidate["suggested_action"] == "create" for candidate in review["candidates"])
+    assert all(not candidate["requires_separate_loan_confirmation"] for candidate in review["candidates"])
+    assert all(not any("Possible duplicate within this batch" in warning for warning in candidate["warnings"]) for candidate in review["candidates"])
