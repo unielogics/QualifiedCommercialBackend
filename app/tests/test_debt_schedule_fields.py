@@ -518,7 +518,7 @@ def test_the_html_builder_needs_no_weasyprint_and_a_date_object_prints_too():
 def test_the_grid_offers_the_type_list_and_the_yes_no_as_labelled_choices():
     sheet = sheet_layout.layout("debt_schedule", debt_rows=["r1"])
     data = next(row for row in sheet.rows if row.kind == "data")
-    by_key = {cell.key.split(".", 1)[1]: cell for cell in data.cells}
+    by_key = {cell.key.split(".", 1)[1]: cell for cell in data.cells if cell.key}
     assert by_key["debt_type"].type == "select"
     assert by_key["debt_type"].options == debt_types.DEBT_TYPE_SLUGS
     assert dict(by_key["debt_type"].option_labels)["mca"] == "Merchant cash advance (MCA)"

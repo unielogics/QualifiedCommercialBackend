@@ -70,12 +70,21 @@ class AdvanceIn(BaseModel):
 class AdvanceRead(AdvanceIn):
     id: UUID
     monthly_payment: float | None = None
+    originated_on: date | None = None
+    paid_down_pct: float | None = None
     origin: str
     editable: bool
     source: str
     draft_pending: bool = False
     draft_family_id: UUID | None = None
     draft_revision: int | None = None
+
+    @model_validator(mode="after")
+    def _loan_balance_reduction(self):
+        from app.services.loan_progress import paid_down_pct
+
+        self.paid_down_pct = paid_down_pct(self.original_amount, self.balance)
+        return self
 
 
 class AdvancesWrite(BaseModel):

@@ -30,6 +30,7 @@ from app.models.financial_statement import FinancialStatement, FinancialStatemen
 from app.services import debt_types, pfs_schema
 from app.services.debt_terms import DebtTermsError, monthly_source, normalize_terms
 from app.services.extracted_facts import canonical_field_aliases
+from app.services.loan_progress import originated_on, paid_down_pct
 
 log = logging.getLogger(__name__)
 
@@ -347,7 +348,7 @@ DEBT_COLUMN_LABELS = (
     "Current balance",
     "Interest rate (%)",
     "Monthly payment",
-    "Date originated",
+    "Origination date",
     "Maturity date",
     "Secured or unsecured",
     "Payment status",
@@ -661,7 +662,7 @@ def document_debts_as_body(document: dict[str, Any] | None) -> dict[str, Any]:
                 "factor_rate": line.get("factor_rate"),
                 "payment_amount": line.get("payment_amount"),
                 "payment_frequency": line.get("payment_frequency"),
-                "originated_on": _first_present(line, "origination_date", "originated_on", "origin_date"),
+                "originated_on": originated_on(line),
                 "maturity_on": _first_present(line, "maturity_date", "maturity_on"),
                 "collateral": _first_present(line, "collateral", "secured_by"),
                 "secured": _document_secured(line),
@@ -857,6 +858,7 @@ def debt_key_facts(rows: list[dict[str, Any]]) -> dict[str, Any]:
                     float(row["original_amount"]) if row.get("original_amount") is not None else None
                 ),
                 "current_balance": float(row["balance"]) if row.get("balance") is not None else None,
+                "paid_down_pct": paid_down_pct(row.get("original_amount"), row.get("balance")),
                 "monthly_payment": float(row["monthly_payment"]) if row.get("monthly_payment") is not None else None,
                 "rate": float(row["rate"]) if row.get("rate") is not None else None,
                 "factor_rate": float(row["factor_rate"]) if row.get("factor_rate") is not None else None,
@@ -873,6 +875,7 @@ def debt_key_facts(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "debt_type_label": debt_types.debt_type_label(row.get("debt_type")),
                 "interest_rate": float(row["rate"]) if row.get("rate") is not None else None,
                 "originated_date": row["originated_on"].isoformat() if row.get("originated_on") else None,
+                "originated_on": originated_on(row),
                 "secured": row.get("secured"),
                 "payment_status": row.get("payment_status"),
                 "collateral": row.get("collateral"),

@@ -17,6 +17,12 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 from app.services import debt_types
+from app.services.loan_progress import (
+    PAID_DOWN_HINT,
+    finite_amount,
+    format_paid_down_pct,
+    loan_progress_fields,
+)
 
 FORM_DISCLAIMER = (
     "This form is provided for underwriting processing convenience only. It does not "
@@ -612,12 +618,12 @@ _SCHEDULE_STYLE = """
   h1 { font-size: 19px; margin: 0 0 2px; }
   .muted { color: #6b7280; font-size: 12px; }
   table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-  th, td { border: 1px solid #d1d5db; padding: 5px 7px; font-size: 9.5px; text-align: left; }
+  th, td { border: 1px solid #d1d5db; padding: 3px 5px; font-size: 9.5px; text-align: left; }
   th { background: #f3f4f6; font-size: 9px; text-transform: uppercase; letter-spacing: .03em; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
   tr.note td { background: #fafafa; color: #4b5563; font-style: italic; border-top: 0; }
   .totals td { font-weight: 700; background: #f9fafb; }
-  .disclaimer { margin-top: 20px; font-size: 9px; color: #6b7280; border-top: 1px solid #d1d5db; padding-top: 8px; }
+  .disclaimer { margin-top: 8px; font-size: 9px; color: #6b7280; border-top: 1px solid #d1d5db; padding-top: 6px; break-inside: avoid; page-break-inside: avoid; }
 """
 
 _SCHEDULE_COLUMNS = (
@@ -626,9 +632,10 @@ _SCHEDULE_COLUMNS = (
     "Type",
     "Original",
     "Balance",
+    "% paid down",
     "Rate",
     "Monthly",
-    "Originated",
+    "Origination date",
     "Matures",
     "Secured",
     "Status",
@@ -649,10 +656,8 @@ def _cell(value: Any) -> str:
 def _money_cell(value: Any) -> str:
     if value in (None, ""):
         return "&mdash;"
-    try:
-        return f"${float(value):,.2f}"
-    except (TypeError, ValueError):
-        return html.escape(str(value))
+    amount = finite_amount(value)
+    return f"${amount:,.2f}" if amount is not None else html.escape(str(value))
 
 
 def _date_cell(value: Any) -> str:
@@ -699,6 +704,7 @@ def _schedule_row_html(row: dict[str, Any], number: int | None = None) -> str:
     from app.services.debt_terms import normalize_terms
 
     row = normalize_terms(row)
+    progress = loan_progress_fields(row)
     rate = row.get("rate")
     factor = row.get("factor_rate")
     cells = [
@@ -709,9 +715,10 @@ def _schedule_row_html(row: dict[str, Any], number: int | None = None) -> str:
         f"<td>{_cell(debt_types.debt_type_label(row.get('debt_type')))}</td>",
         f"<td class='num'>{_money_cell(row.get('original_amount'))}</td>",
         f"<td class='num'>{_money_cell(row.get('balance'))}</td>",
+        f"<td class='num'>{_cell(format_paid_down_pct(progress['paid_down_pct']))}</td>",
         f"<td class='num'>{(f'{float(rate):g}%' if rate not in (None, '') else '&mdash;')}</td>",
         f"<td class='num'>{_money_cell(row.get('monthly_payment'))}{' <small>calculated</small>' if row.get('monthly_payment_source') == 'native_terms' else ''}</td>",
-        f"<td>{_date_cell(row.get('originated_on'))}</td>",
+        f"<td>{_date_cell(progress['originated_on'])}</td>",
         f"<td>{_date_cell(row.get('maturity_on'))}</td>",
         f"<td>{_cell((row.get('secured') or '').title() or None)}</td>",
         f"<td>{_cell((row.get('payment_status') or '').title() or None)}</td>",
@@ -751,9 +758,9 @@ def build_debt_schedule_html(
             "<tr class='totals'>"
             "<td colspan='4'>Total</td>"
             f"<td class='num'>{_statement_money(total_balance)}</td>"
-            "<td></td>"
+            "<td colspan='2'></td>"
             f"<td class='num'>{_statement_money(total_monthly)}</td>"
-            f"<td colspan='{len(_SCHEDULE_COLUMNS) - 7}'></td>"
+            f"<td colspan='{len(_SCHEDULE_COLUMNS) - 8}'></td>"
             "</tr>"
         )
         count = len(rows)
@@ -786,6 +793,7 @@ def build_debt_schedule_html(
         {'<p>The business declares that it has no outstanding business debt.</p>' if no_debt else ''}
         {table}
         <div class="disclaimer">
+          {f'<span>{html.escape(PAID_DOWN_HINT)}</span><br>' if rows is not None else ''}
           {html.escape(FORM_DISCLAIMER)} Submitted electronically {datetime.now(UTC).isoformat()}.
         </div>
       </body>

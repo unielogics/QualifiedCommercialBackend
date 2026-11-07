@@ -255,12 +255,12 @@ def test_schedule_columns_read_the_schema_keys_and_fall_back_to_label_slugs():
 
 def test_the_debt_schedule_layout_is_the_template_grid():
     sheet = sl.layout("debt_schedule")
-    assert [column.label for column in sheet.columns] == list(DEBT_COLUMN_LABELS)
+    assert [column.label for column in sheet.columns] == [*DEBT_COLUMN_LABELS, "Paid down (%)"]
     colhead = next(row for row in sheet.rows if row.kind == "colhead")
     assert colhead.r == 5
     data = [row for row in sheet.rows if row.kind == "data"]
     assert len(data) == sl.DEBT_ROWS and data[0].r == 7 and data[-1].r == 21
-    assert [cell.key for cell in data[6].cells] == [f"r7.{column}" for column in DEBT_COLUMNS]
+    assert [cell.key for cell in data[6].cells if cell.editable] == [f"r7.{column}" for column in DEBT_COLUMNS]
     secured = next(cell for cell in data[0].cells if cell.key == "r1.secured")
     assert secured.type == "select" and secured.options == ("secured", "unsecured")
     assert sheet.freeze == (5, 1)

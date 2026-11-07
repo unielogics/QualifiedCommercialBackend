@@ -19,6 +19,7 @@ from app.services import (
     financial_workspace_legacy,
 )
 from app.services.debt_terms import normalize_terms
+from app.services.loan_progress import originated_on
 
 from . import refinance
 from .vendors import normalize_vendor
@@ -50,7 +51,8 @@ def read_row(row: dict, snapshot: dict) -> dict:
     return {
         **row, "category": row.get("debt_type") or row.get("category") or "loan",
         **{key: financial_statements._blank_or_amount(row.get(key)) for key in
-           ("monthly_payment", "balance", "rate", "payment_amount", "factor_rate", "payoff_amount")},
+           ("original_amount", "monthly_payment", "balance", "rate", "payment_amount", "factor_rate", "payoff_amount")},
+        "originated_on": originated_on(row),
         "maturity_on": row.get("maturity_on") or None, "term_months": row.get("term_months") or None,
         "origin": row.get("origin") or row.get("owner") or "ai_draft",
         "status": row.get("status", "active"), "count_in_dscr": row.get("count_in_dscr", True),

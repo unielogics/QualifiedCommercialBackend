@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.financial_cockpit import amortized_payment, dscr_status, month_label
+from app.services.loan_progress import loan_progress_fields
 from app.services.payee_classification import match_names
 
 TARGET_DSCR = 1.25
@@ -258,6 +259,7 @@ def obligations(debt: dict[str, Any], recurring: dict[str, Any]) -> list[dict[st
             "is_mca": bool(row.get("is_mca")),
             "monthly": row.get("monthly_payment"),
             "balance": row.get("balance"),
+            **loan_progress_fields(row),
             "payoff": None if row.get("payoff_requires_review") else row.get("payoff_amount") if row.get("payoff_amount") is not None else row.get("balance"),
             "payoff_requires_review": bool(row.get("payoff_requires_review")),
             "payoff_review_reason": row.get("payoff_review_reason"),
