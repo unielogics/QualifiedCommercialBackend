@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.dealer_os.models import DealerDebt
 from app.models.application_profile import ApplicationProfile
 from app.services.financial_cockpit import MCA_CATEGORIES, monthly_equivalent
+from app.services.loan_progress import loan_progress_fields
 
 DESK_ORIGIN = "admin"
 FREQUENCIES = ("daily", "weekly", "biweekly", "monthly")
@@ -72,6 +73,8 @@ def advance_read(row: DealerDebt) -> dict[str, Any]:
         "lender": row.lender,
         "original_amount": _num(row.original_amount),
         "balance": _num(row.balance),
+        **loan_progress_fields({"original_amount": row.original_amount, "balance": row.balance,
+                                "originated_on": getattr(row, "originated_on", None)}),
         "payment_amount": _num(row.payment_amount),
         "payment_frequency": (row.payment_frequency or None),
         "monthly_payment": _num(row.monthly_payment),

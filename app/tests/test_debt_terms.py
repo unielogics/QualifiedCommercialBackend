@@ -135,13 +135,19 @@ def test_xlsx_keeps_old_monthly_input_and_adds_locked_native_equivalent_formula(
     assert _named(workbook, "ds.r1.payment_amount").coordinate == "P7"
     frequency = _named(workbook, "ds.r1.payment_frequency")
     assert frequency.coordinate == "Q7"
-    equivalent = workbook.active["R7"]
+    # The appended percentage is read-only; all 17 stored input columns stay put.
+    percentage = workbook.active["R7"]
+    assert percentage.protection.locked and percentage.number_format == "0.0%"
+    assert all(value in percentage.value for value in ("ISNUMBER(C7)", "C7>0", "ISNUMBER(D7)", "D7>=0", "(C7-D7)/C7"))
+    assert "ROUND(" not in percentage.value
+    assert not any("paid_down" in name for name in workbook.defined_names)
+    equivalent = workbook.active["S7"]
     assert equivalent.protection.locked and not _named(workbook, "ds.r1.monthly_payment").protection.locked
     assert all(value in equivalent.value for value in ("P7", "Q7", "F7", "21.0", "4.33", "2.165", "ROUND("))
     # A stated F value, including zero, wins over conflicting native terms.
     assert equivalent.value.startswith('=IF(ISNUMBER(F7),F7,IF(AND(')
     assert "overrides" in _named(workbook, "ds.r1.monthly_payment").comment.text
-    assert _named(workbook, "ds.total_monthly_payment").value == "=SUM(R7:R21)"
+    assert _named(workbook, "ds.total_monthly_payment").value == "=SUM(S7:S21)"
     assert any(frequency.coordinate in validation.sqref for validation in frequency.parent.data_validations.dataValidation)
 
 

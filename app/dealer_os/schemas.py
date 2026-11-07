@@ -2842,6 +2842,9 @@ class DebtRead(BaseModel):
     category: str
     monthly_payment: float | None = None
     balance: float | None = None
+    original_amount: float | None = None
+    originated_on: date | None = None
+    paid_down_pct: float | None = None
     rate: float | None = None
     term_months: int | None = None
     maturity_on: date | None = None
@@ -2864,6 +2867,13 @@ class DebtRead(BaseModel):
     draft_revision: int | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+    @model_validator(mode="after")
+    def _loan_balance_reduction(self):
+        from app.services.loan_progress import paid_down_pct
+
+        self.paid_down_pct = paid_down_pct(self.original_amount, self.balance)
+        return self
 
 
 _FREQ_PATTERN = r"^(daily|weekly|biweekly|monthly)$"

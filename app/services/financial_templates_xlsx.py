@@ -69,6 +69,7 @@ from app.services import business_statement_schema as bss
 from app.services import pfs_schema, sheet_layout
 from app.services.debt_terms import FREQUENCY_MONTHLY_MULT
 from app.services.financial_statements import DEBT_COLUMNS
+from app.services.loan_progress import PAID_DOWN_HINT
 from app.services.sheet_layout import (  # noqa: F401 — re-exported; callers read them here
     DEBT_ROWS,
     NAME_PREFIX,
@@ -120,6 +121,7 @@ ATTACHMENT_FILENAMES: dict[str, str] = {
 MONEY_FORMAT = '#,##0.00;(#,##0.00);"-"'
 DATE_FORMAT = "yyyy-mm-dd"
 RATE_FORMAT = "0.000"
+PAID_DOWN_FORMAT = "0.0%"
 
 _AUTHOR = "Qualified Commercial"
 #: Pinned so two builds are byte-identical. Not a year that appears in a cell.
@@ -335,6 +337,22 @@ class _Form:
             self.ws.cell(row=self.row, column=self.key_column, value=f"{row.block}.{row.row_key}" if self.sheet.kind == "real_estate_schedule" else f"r{row.ordinal}")
         for cell in row.cells:
             target = self.ws.cell(row=self.row, column=cell.c)
+            if cell.type == "formula":
+                # Read-only derived cells are never declared as editable import keys.
+                if self.sheet.kind == "debt_schedule" and (cell.compute or "").endswith(".paid_down_pct"):
+                    original = self.refs[f"r{row.ordinal}.original_amount"]
+                    balance = self.refs[f"r{row.ordinal}.balance"]
+                    target.value = f'=IFERROR(IF(AND(ISNUMBER({original}),{original}>0,ISNUMBER({balance}),{balance}>=0),({original}-{balance})/{original},""),"")'
+                    target.number_format = PAID_DOWN_FORMAT
+                    target.comment = Comment(PAID_DOWN_HINT + " Unknown inputs stay blank. Excel stores this percentage as a ratio.", _AUTHOR)
+                else:
+                    target.value = self.resolve(cell.formula) if cell.formula else None
+                    target.number_format = MONEY_FORMAT if cell.format == "money" else RATE_FORMAT
+                    if cell.hint:
+                        target.comment = Comment(cell.hint, _AUTHOR)
+                target.protection = Protection(locked=True)
+                target.fill, target.alignment = _HEADING_FILL, _RIGHT
+                continue
             target.protection = _UNLOCKED
             target.fill = _INPUT_FILL
             if cell.hint:

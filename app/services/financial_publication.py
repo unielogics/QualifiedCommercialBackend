@@ -19,6 +19,7 @@ from app.models.application_profile import ApplicationProfile
 from app.models.bucket import BucketAIReview, BucketFile
 from app.models.financial_form_version import FinancialFormFamily, FinancialFormVersion
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
+from app.services.loan_progress import loan_progress_fields
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ def snapshot_matches_publication(snapshot: Any, published_at: datetime | None) -
 
 
 def debt_row_identity_context(body: dict, *, visible_file_ids: set[UUID] | None = None) -> list[dict]:
-    """Stable row associations only; amounts stay in the existing fact contract."""
+    """Stable associations and read-time balance reduction from the accepted row."""
     from app.services.debt_package_evidence import reviewed_loan_reference
     from app.services.financial_version_selection import active_debt_schedule_rows
 
@@ -68,9 +69,12 @@ def debt_row_identity_context(body: dict, *, visible_file_ids: set[UUID] | None 
             seen.add(key)
             documents.append({"file_id": file_id, "role": link["role"]})
         reference = reviewed_loan_reference(row)
-        has_metadata |= bool(reference or documents)
+        progress = loan_progress_fields(row)
+        has_progress = any(value is not None for value in progress.values())
+        has_metadata |= bool(reference or documents or has_progress)
         result.append({"ordinal": ordinal, "row_id": str(row["id"]) if row.get("id") else None,
-                       "lender": row.get("lender"), "loan_reference": reference, "documents": documents})
+                       "lender": row.get("lender"), "loan_reference": reference, "documents": documents,
+                       **(progress if has_progress else {})})
     # Avoid changing older contexts which contain only aggregate debt facts.
     return result if has_metadata else []
 

@@ -64,10 +64,12 @@ def _loan_row(raw):
         "payment_frequency": ("payment_frequency", "frequency", "cadence"),
         "factor_rate": ("factor_rate", "factor"), "rate": ("rate", "rate_pct", "interest_rate", "apr"),
         "payoff_amount": ("payoff_amount",), "payoff_date": ("payoff_date", "good_through_date"),
-        "originated_on": ("originated_on", "origination_date"), "maturity_on": ("maturity_on", "maturity_date"),
+        "originated_on": ("originated_on", "origination_date", "originated_date", "origin_date"), "maturity_on": ("maturity_on", "maturity_date"),
         "collateral": ("collateral", "secured_by"), "notes": ("notes",),
     }
     row = {field: _first(raw, *keys) for field, keys in fields.items()}
+    if "originated_on" in raw:
+        row["originated_on"] = raw["originated_on"]
     row["lender"] = str(row.get("lender") or "").strip()[:180]
     if not row["lender"]:
         return None, ["No lender was identified in this source row."]

@@ -1012,5 +1012,18 @@ def test_a_formula_cell_carries_its_formula_onto_the_wire():
         for cell in formulas:
             wire = sheets._cell_payload(cell)
             assert wire.get("formula") == cell.formula, f"{kind}/{cell.xlsx_name}"
-            # Both halves of what `indexFormulas` keys on.
-            assert wire.get("xlsx_name"), f"{kind}/{cell.c} has a formula and no name"
+            if (cell.compute or "").endswith(".paid_down_pct"):
+                # A row-local derived value is keyed by its stable compute ID,
+                # not an editable or importable workbook name. The percentage
+                # can be unknown while the debt's unrelated totals are known.
+                assert kind == "debt_schedule" and cell.c == 18
+                assert wire["compute"] == cell.compute and wire["format"] == "percent"
+                assert not wire.get("editable") and "key" not in wire and "xlsx_name" not in wire
+                assert cell.path is None
+                row_id = cell.compute.removesuffix(".paid_down_pct")
+                assert "{" + row_id + ".original_amount}" in wire["formula"]
+                assert "{" + row_id + ".balance}" in wire["formula"]
+            else:
+                # Existing aggregate formulas still need both halves of the
+                # name/formula pair used by the blank-input formula index.
+                assert wire.get("xlsx_name"), f"{kind}/{cell.c} has a formula and no name"

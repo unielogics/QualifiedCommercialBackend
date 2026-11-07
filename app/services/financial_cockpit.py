@@ -49,6 +49,7 @@ from app.services.bucket_evidence import (
 )
 from app.services.capital_readiness import classify_dscr
 from app.services.debt_terms import normalize_terms
+from app.services.loan_progress import loan_progress_fields
 from app.services.payee_classification import (
     CARD_KINDS,
     DEBT_KINDS,
@@ -1063,6 +1064,7 @@ def debt_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "category": category,
                 "is_mca": is_mca,
                 "balance": _num(row.get("balance")),
+                **loan_progress_fields(row),
                 "monthly_payment": _round(monthly),
                 "payment_amount": _num(row.get("payment_amount")),
                 "payment_frequency": frequency,
@@ -1115,7 +1117,9 @@ def documented_debts(analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     if row.get("current_balance") is not None
                     else row.get("balance")
                 ),
-                "original_amount": _num(row.get("original_amount") or row.get("funded_amount")),
+                **loan_progress_fields({**row,
+                    "original_amount": row.get("original_amount") if row.get("original_amount") is not None else row.get("funded_amount"),
+                    "balance": row.get("current_balance") if row.get("current_balance") is not None else row.get("balance")}),
                 "monthly_payment": _round(monthly),
                 "payment_amount": _num(row.get("payment_amount") or row.get("payment")),
                 "payment_frequency": frequency,
@@ -1137,6 +1141,10 @@ def documented_debts(analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
             for field in ("balance", "monthly_payment", "original_amount"):
                 values = [v for v in (prior.get(field), record.get(field)) if v is not None]
                 prior[field] = max(values) if values else None
+            # This legacy view combines rows by lender. Do not pair one loan's
+            # original/date with another loan's balance to claim repayment.
+            prior["originated_on"] = None
+            prior["paid_down_pct"] = None
             prior["is_mca"] = prior["is_mca"] or record["is_mca"]
             for field in ("payment_frequency", "factor_rate", "maturity_on"):
                 prior[field] = prior.get(field) or record.get(field)
@@ -1651,11 +1659,15 @@ def reconcile_advances(
                 "is_mca": row.get("is_mca", False),
                 "declared_monthly": row.get("monthly_payment"),
                 "declared_balance": row.get("balance"),
+                **loan_progress_fields(row),
                 "documented": {
                     "lender": doc["lender"],
                     "balance": doc.get("balance"),
                     "monthly_payment": doc.get("monthly_payment"),
                     "payment_frequency": doc.get("payment_frequency"),
+                    "original_amount": doc.get("original_amount"),
+                    "originated_on": doc.get("originated_on"),
+                    "paid_down_pct": doc.get("paid_down_pct"),
                 }
                 if doc
                 else None,

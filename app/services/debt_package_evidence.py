@@ -22,6 +22,7 @@ from app.services.financial_version_selection import (
     accepted_debt_schedule_snapshot,
     active_debt_schedule_rows,
 )
+from app.services.loan_progress import finite_amount, format_paid_down_pct, loan_progress_fields
 
 
 def reviewed_loan_reference(row):
@@ -95,9 +96,11 @@ def build_manifest(version, files, *, scoped_ids, latest_ids, reviewed_payoff_id
                 "duplicate_row_ids": [duplicate_id] if duplicate_id else [],
             }
         reference = reviewed_loan_reference(row)
+        balance = row.get("balance") if row.get("balance") is not None else row.get("current_balance")
         debts.append({"row_id": row_id, "lender": row.get("lender") or "Unnamed obligation",
                       **({"loan_reference": reference} if reference else {}),
-                      "balance": str(row["balance"]) if row.get("balance") is not None else None,
+                      **loan_progress_fields(row),
+                      "balance": str(balance) if balance is not None else None,
                       "monthly_payment": str(row["monthly_payment"]) if row.get("monthly_payment") is not None else None,
                       "documents": list(documents.values())})
     stamp = getattr(version, "created_at", None)
@@ -192,12 +195,27 @@ def saved_at_label(value):
         return "Date unavailable"
 
 
+def loan_summary_text(debt):
+    """Figures from this exact accepted row, never from one of its payoff documents."""
+    progress = loan_progress_fields(debt)
+
+    def money(value):
+        amount = finite_amount(value)
+        return f"${amount:,.2f}" if amount is not None else "Not provided"
+
+    return (f"Origination date: {progress['originated_on'] or 'Not provided'}; "
+            f"original amount: {money(progress['original_amount'])}; "
+            f"current balance: {money(debt.get('balance'))}; "
+            f"paid down: {format_paid_down_pct(progress['paid_down_pct'])}; "
+            f"monthly payment: {money(debt.get('monthly_payment'))}")
+
+
 def index_text(manifest):
     schedule = manifest.get("schedule") or {}
     lines = ["Debt supporting documents", f"Accepted schedule v{schedule.get('version_number', '-')} - {saved_at_label(schedule.get('saved_at'))}",
              "Only the accepted schedule supplies debt figures. Linked images do not establish a current payoff."]
     for number, debt in enumerate(manifest.get("debts") or [], 1):
-        lines += ["", debt_heading(debt, number), f"Balance: {debt.get('balance') or 'unknown'}; monthly payment: {debt.get('monthly_payment') or 'unknown'}"]
+        lines += ["", debt_heading(debt, number), loan_summary_text(debt)]
         for document in debt["documents"]:
             label = "Current reviewed payoff" if document["current_payoff"] else "Previously selected payoff; review latest" if document["selected_current_payoff"] else document["role"]
             lines.append(f"  {label}: {document.get('file_name') or 'Unavailable linked source'} - {document['status']}; {document.get('archive_path') or 'NOT INCLUDED'}")
@@ -228,7 +246,7 @@ def index_html(manifest):
             label = "Current reviewed payoff" if document["current_payoff"] else "Previously selected payoff; review latest" if document["selected_current_payoff"] else document["role"]
             payoff = f"; reviewed amount {escape(str(document.get('reviewed_payoff_amount') or 'unknown'))}; date {escape(str(document.get('reviewed_payoff_date') or 'unknown'))}" if document["role"] == "payoff" else ""
             items.append(f"<li>{escape(label)}: {name} - {escape(document['status'])}{payoff}</li>")
-        sections.append(f"<section><h2>{escape(debt_heading(debt, number))}</h2><ul>{''.join(items) or '<li>No linked supporting documents.</li>'}</ul></section>")
+        sections.append(f"<section><h2>{escape(debt_heading(debt, number))}</h2><p>{escape(loan_summary_text(debt))}</p><ul>{''.join(items) or '<li>No linked supporting documents.</li>'}</ul></section>")
     return '<!doctype html><html><head><meta charset="utf-8"><title>Debt supporting documents</title></head><body><h1>Debt supporting documents</h1><p>Sources belong to the accepted saved schedule. Images and older payoff letters are supporting evidence, not an automatic current payoff.</p>' + "".join(sections) + "</body></html>"
 
 

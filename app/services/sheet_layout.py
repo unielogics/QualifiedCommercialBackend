@@ -48,6 +48,7 @@ from app.services import pfs_schema, real_estate_schema
 from app.services.debt_terms import PAYMENT_FREQUENCIES, normalize_terms
 from app.services.debt_types import DEBT_TYPE_SLUGS, DEBT_TYPES
 from app.services.financial_statements import DEBT_COLUMN_LABELS, DEBT_COLUMNS
+from app.services.loan_progress import PAID_DOWN_HINT, paid_down_pct
 
 LAYOUT_VERSION = "qc_sheets.v1"
 
@@ -178,7 +179,7 @@ class Cell:
     key: str | None = None
     #: The workbook defined-name suffix. None on labels.
     xlsx_name: str | None = None
-    #: money | ratio | count | text | date
+    #: money | ratio | percent (percentage points) | count | text | date
     format: str = "text"
     editable: bool = False
     #: The text of a label cell.
@@ -707,7 +708,7 @@ def _debt_columns() -> tuple[Column, ...]:
             "right" if key in _DEBT_MONEY or key in {"rate", "factor_rate"} else "left",
         )
         for index, (key, label) in enumerate(zip(DEBT_COLUMNS, DEBT_COLUMN_LABELS, strict=True), start=1)
-    )
+    ) + (Column(len(DEBT_COLUMNS) + 1, "Paid down (%)", 18, "right"),)
 
 
 def _debt_cell_type(key: str) -> tuple[str, str]:
@@ -741,7 +742,7 @@ def _debt_schedule(row_keys: Sequence[str]) -> Sheet:
         Row(
             5,
             "colhead",
-            cells=tuple(_label(index, label) for index, label in enumerate(DEBT_COLUMN_LABELS, start=1)),
+            cells=tuple(_label(index, label) for index, label in enumerate((*DEBT_COLUMN_LABELS, "Paid down (%)"), start=1)),
             block="debts",
         )
     )
@@ -765,6 +766,13 @@ def _debt_schedule(row_keys: Sequence[str]) -> Sheet:
                     path=("debts", row_key, key),
                 )
             )
+        original, balance = "{" + row_key + ".original_amount}", "{" + row_key + ".balance}"
+        cells.append(Cell(
+            c=len(DEBT_COLUMNS) + 1, type="formula", format="percent",
+            compute=f"{row_key}.paid_down_pct",
+            formula=f'=IF(AND(ISNUMBER({original}),{original}>0,ISNUMBER({balance}),{balance}>=0),100*({original}-{balance})/{original},"")',
+            hint=PAID_DOWN_HINT,
+        ))
         rows._add(Row(rows.r, "data", cells=tuple(cells), block="debts", row_key=row_key, ordinal=ordinal))
 
     rows.r += 1
@@ -901,12 +909,12 @@ def input_cells(sheet: Sheet) -> list[tuple[Row, Cell]]:
 
 
 def compute_keys(kind: str) -> list[str]:
-    """The `totals` entries the sheet's formula cells show, in row order."""
+    """The aggregate formula keys, independent of a list's current row identities."""
     return [
         cell.compute
         for row in layout(kind).rows
         for cell in row.cells
-        if cell.type == "formula" and cell.compute is not None
+        if row.kind != "data" and cell.type == "formula" and cell.compute is not None
     ]
 
 
@@ -931,7 +939,10 @@ def totals(kind: str, body: Mapping[str, Any] | None) -> dict[str, Any]:
     if kind == "pfs":
         return pfs_schema.totals(body)
     if kind == "debt_schedule":
-        return debt_totals(body)
+        return {**debt_totals(body), **{
+            f"{_list_row_key(row, ordinal)}.paid_down_pct": paid_down_pct(row.get("original_amount"), row.get("balance"))
+            for ordinal, row in enumerate(body.get("debts") or [], 1) if isinstance(row, dict)
+        }}
     if kind == "real_estate_schedule":
         return real_estate_schema.totals(body)
     raise KeyError(kind)

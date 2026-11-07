@@ -52,6 +52,7 @@ from app.services.financial_version_selection import (
     debt_schedule_completion,
     is_accepted_debt_schedule_version,
 )
+from app.services.loan_progress import originated_on
 
 KINDS = sheet_layout.KINDS
 CLASSIFICATIONS = {"pfs": "personal_financial_statement", "debt_schedule": "debt_schedule", "p_and_l": "current_p_and_l", "balance_sheet": "balance_sheet", "real_estate_schedule": "real_estate_schedule"}
@@ -993,7 +994,7 @@ def _body_from_facts(kind: str, facts: dict) -> dict:
             if not isinstance(item, dict):
                 continue
             row = {key: item.get(key) for key in financial_statements.DEBT_COLUMNS}
-            row.update(id=str(uuid4()), status="active", balance=item.get("current_balance", item.get("balance")), maturity_on=item.get("maturity_date", item.get("maturity_on")), evidence_links=[])
+            row.update(id=str(uuid4()), status="active", balance=item.get("current_balance", item.get("balance")), originated_on=originated_on(item), maturity_on=item.get("maturity_date", item.get("maturity_on")), evidence_links=[])
             body["debts"].append(row)
     elif kind == "pfs":
         body["as_of"] = facts.get("statement_date") or ""
