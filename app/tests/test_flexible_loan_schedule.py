@@ -35,6 +35,26 @@ def test_separate_amortization_horizon_creates_one_residual_at_maturity():
     assert_conservation(schedule)
 
 
+def test_24_month_maturity_with_60_month_amortization_at_29_99_percent():
+    schedule = build_schedule(200000, 29.99, 24, structure="amortizing",
+                              repayment_config={"amortization_months": 60})
+    # The payment is based on sixty months. The loan still ends at month 24;
+    # the unpaid principal is one additional maturity cash flow, not a second
+    # amortization period or an extra balloon event the desk must enter.
+    assert schedule["payment_after"] == 6469.45
+    assert schedule["term_months"] == schedule["contractual_periods"] == 24
+    assert schedule["amortization_months"] == 60
+    assert schedule["scheduled_balloons"] == []
+    assert schedule["maturity_balloon"] == 152415.68
+    assert schedule["rows"][-1]["cash_payment"] == 158885.13
+    assert schedule["total_interest"] == 107682.48
+    assert schedule["total_paid"] == 307682.48
+    assert schedule["first_year_actual_debt_service"] == 77633.4
+    assert schedule["coverage_annual_debt_service"] == 230049.08
+    assert schedule["coverage_payment_monthly"] == 19170.76
+    assert_conservation(schedule)
+
+
 def test_same_month_percentage_uses_balance_after_regular_payment_and_prior_balloon():
     config = {"balloons": [event("fixed", 3, 20000), event("half", 3, 50, "percent_balance")]}
     before = deepcopy(config)

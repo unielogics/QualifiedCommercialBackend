@@ -187,6 +187,7 @@ class SaveDB:
         result.scalar_one_or_none.return_value = None
         result.scalars.return_value.all.return_value = []
         self.execute = AsyncMock(return_value=result)
+        self.refresh = AsyncMock()
 
     def add(self, row):
         self.rows.append(row)
@@ -199,11 +200,21 @@ class SaveDB:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("frequency,custom", [("monthly", None), ("custom", 51.5)])
-async def test_versioned_client_save_read_and_adoption_preserve_config_and_actual_total(frequency, custom):
+@pytest.mark.parametrize("amount,apr,term,io_months,config", [
+    (100000, 12, 36, 0, CONFIG),
+    (200000, 29.99, 24, 0, {"amortization_months": 60}),
+    (200000, 29.99, 24, 3, {"amortization_months": 60, "after_balloon": "recast", "balloons": [
+        {"id": "fixed", "month": 6, "type": "amount", "value": 10000},
+        {"id": "remaining", "month": 12, "type": "percent_balance", "value": 15},
+    ]}),
+])
+async def test_versioned_client_save_read_and_adoption_preserve_config_and_actual_total(frequency, custom, amount, apr, term, io_months, config):
     db = SaveDB()
     profile = SimpleNamespace(id=uuid4(), financial_plan={}, primary_bucket_id=None)
     actor = SimpleNamespace(id=uuid4(), role=Role.LOAN_EXEC)
-    payload = client_payload(repayment_frequency=frequency, custom_payments_per_year=custom)
+    payload = client_payload(repayment_frequency=frequency, custom_payments_per_year=custom,
+        amount=amount, apr_pct=apr, term_months=term, interest_only_months=io_months,
+        repayment_config=deepcopy(config))
     context = client_terms.DscrContext("business", 5, 120000, "Annual earnings", 24000, None, "fixture")
     with (patch.object(client_terms, "current_term_sheet", AsyncMock(return_value=None)),
           patch.object(client_terms, "loan_type_options", AsyncMock(return_value=[LoanTypeOption(value="term", label="Term")])),
@@ -214,13 +225,26 @@ async def test_versioned_client_save_read_and_adoption_preserve_config_and_actua
         row = await client_terms.save_terms(db, profile, actor, payload)
         row.updated_at = datetime.now(UTC)
         read = await client_terms.read_terms(db, profile, row)
-    expected = build_schedule(100000, 12, 36, structure="amortizing", periods_per_year=custom or 12, repayment_config=CONFIG)
-    assert row.repayment_config == CONFIG and read.repayment_config == CONFIG
+    expected = build_schedule(amount, apr, term, structure="amortizing", interest_only_months=io_months,
+                              periods_per_year=custom or 12, repayment_config=config)
+    normalized_config = expected["repayment_config"]
+    assert row.repayment_config == normalized_config and read.repayment_config == normalized_config
     assert read.calculation.total_repayment == expected["total_paid"]
     assert read.calculation.total_repayment != row.periodic_payment * row.payment_count
     assert read.calculation.schedule["scheduled_balloons"] == expected["scheduled_balloons"]
-    assert profile.financial_plan["new_loan_repayment_config"] == CONFIG
+    assert profile.financial_plan["new_loan_repayment_config"] == normalized_config
     assert read.custom_payments_per_year == custom
+    assert row.term_months == term and read.calculation.maturity_balance == expected["maturity_balloon"]
+    assert read.calculation.first_year_debt_service == expected["first_year_actual_debt_service"]
+    assert read.calculation.max_annual_debt_service == expected["coverage_annual_debt_service"]
+    adopted = financial_plan.normalize_plan(profile.financial_plan)
+    result = evaluate(adopted)
+    assert result["schedule"]["repayment_config"]["amortization_months"] == config["amortization_months"]
+    assert result["schedule"]["term_months"] == term
+    assert result["schedule"]["scheduled_balloons"] == expected["scheduled_balloons"]
+    assert result["schedule"]["maturity_balloon"] == expected["maturity_balloon"]
+    assert result["new_payment_monthly"] == expected["coverage_payment_monthly"]
+    assert result["debt_service_after_annual"] == expected["coverage_annual_debt_service"] + 12000
 
 
 @pytest.mark.asyncio
@@ -339,7 +363,7 @@ def test_exact_retained_annual_refinance_value_survives_advanced_adoption():
 
 
 @pytest.mark.parametrize("mode", ["canonical", "staff_note", "staff_amount", "legacy"])
-def test_configured_refinance_retains_after_payoff_service_without_losing_payoff_evidence(mode):
+def test_recorded_refinance_retains_after_payoff_service_without_losing_payoff_evidence(mode):
     recorded = {"kind": "client_terms", "id": "terms", "version": 1, "label": "Terms", "amount": 100000,
         "rate_pct": 0, "term_months": 12, "structure": "amortizing", "interest_only": False,
         "payment_monthly": 8333.33, "payments_per_year": 12,
@@ -360,9 +384,11 @@ def test_configured_refinance_retains_after_payoff_service_without_losing_payoff
         service={"monthly": 3000}, proposed=None, requested_amount=None)
     assert plan == before and result["retired_ids"] == ["row:paid"]
     assert result["retired_count"] == 1 and result["payoff_total"] == 50000
-    if mode == "canonical":
+    if mode in {"canonical", "legacy"}:
         assert result["debt_service_before_new_payment_monthly"] == 1028.81
-        assert result["debt_service_after_annual"] == 112345.67
+        # Configured schedules retain exact contractual annual cash. Legacy
+        # schedules keep their existing rounded monthly annualization rule.
+        assert result["debt_service_after_annual"] == (112345.67 if mode == "canonical" else 112345.68)
         assert result["risk"]["existing_service_monthly"] == 1028.81
     elif mode == "staff_amount":
         assert result["debt_service_before_new_payment_monthly"] == 1000

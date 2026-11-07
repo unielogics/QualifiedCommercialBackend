@@ -109,7 +109,7 @@ def adopt(
 ) -> dict[str, Any]:
     """The plan with the recorded terms as its new loan. The sheet's own
     treatment decides the existing debt: additive keeps it; refinance sets it
-    to what the sheet retains (nothing, when it retains nothing)."""
+    to its known retained amount, including an explicit zero."""
     out = dict(plan or {})
     out.update(
         {
@@ -136,8 +136,8 @@ def adopt(
         }
     )
     overrides = dict(out.get("overrides") or {})
-    if recorded.get("treatment") == "refinance":
-        retained = _num(recorded.get("retained_annual_debt_service")) or 0.0
+    retained = _num(recorded.get("retained_annual_debt_service"))
+    if recorded.get("treatment") == "refinance" and retained is not None:
         overrides["debt_service_monthly"] = round(retained / 12.0, 2)
         overrides["debt_service_note"] = f"Refinance per {recorded.get('label')}: " + (
             f"{retained / 12.0:,.0f} a month of existing debt is retained."
@@ -146,7 +146,8 @@ def adopt(
         )
         out["overrides"] = overrides
     elif (overrides.get("debt_service_note") or "").startswith("Refinance per "):
-        # Terms re-recorded as additive: the earlier refinance override goes.
+        # Additive or incomplete legacy refinance terms cannot retain an
+        # earlier automatic basis. Staff-authored assumptions stay intact.
         overrides.pop("debt_service_monthly", None)
         overrides.pop("debt_service_note", None)
         out["overrides"] = overrides or None

@@ -98,6 +98,16 @@ async def put_client_terms(
 ) -> ClientTermsRead:
     _require_terms_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
+    if payload.financial_plan is not None:
+        from app.services.application_terms_plan import save_combined_terms
+
+        try:
+            result = await save_combined_terms(db, profile, user, payload)
+            await db.commit()
+            return result
+        except Exception:
+            await db.rollback()
+            raise
     row = await application_terms.save_terms(db, profile, user, payload)
     await db.commit()
     await db.refresh(row)
