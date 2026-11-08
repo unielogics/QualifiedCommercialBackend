@@ -2227,9 +2227,14 @@ def build_cockpit(
                         "reason": "The later return's comparative differs from the uploaded prior-year return. Review an amended or reconciled return; original figures have been preserved."})
     metric_review["comparative_conflicts"] = comparative_conflicts
     effective_bank = metric_review.pop("_bank")
+    source_bank = bank
+    bank = effective_bank
     business_statement = statement if not business_entity or statement and entities_match(business_entity, statement.get("business_name")) else None
     dscr = dscr_block(years, business_statement, effective_bank, service, proposed)
     metric_reviews.finish(metric_review, dscr, service, effective_bank)
+    from app.services import financial_metric_composition
+
+    financial_metric_composition.attach_and_apply(metric_review, dscr, metric_review_state)
     from app.services import financial_plan as plans
 
     plan_record = plans.normalize_plan(plan)
@@ -2300,6 +2305,7 @@ def build_cockpit(
         "bank": {
             "months": months,
             "summary": bank,
+            "source_summary": source_bank,
             "accounts": accounts,
             "account_movements": account_movements,
             "recurring": recurring,
@@ -2359,6 +2365,9 @@ def build_cockpit(
     cockpit["plan"]["economics"] = (
         internal_economics(economics, cockpit["proposed_terms"]) if economics is not None else None
     )
+    from app.services.financial_kpi_evidence import attach as attach_kpi_evidence
+
+    attach_kpi_evidence(cockpit)
     return cockpit
 
 

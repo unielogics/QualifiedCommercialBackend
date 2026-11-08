@@ -85,7 +85,7 @@ def _months(start, end):
 def prepare(analyses, years, statement, bank, months, accounts, service, *, state=None, entity=None, debt_rows=None):
     """Apply matching factual corrections before any DSCR or scenario math."""
     state = state or {}
-    bank = dict(bank)  # A DSCR operand correction never rewrites statement charts.
+    bank = dict(bank)  # Reviewed aggregates never rewrite historical statement months.
     latest = {event["input_key"]: event for event in state.get("events", []) if event.get("input_key")}
     by_file = {str(item.get("file_id")): item for item in analyses}
     from app.services.financial_fact_citations import validated_fact_citations_for_analysis
@@ -104,6 +104,7 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
                  "analysis_id": source.get("analysis_id"), "content_hash": source.get("content_hash"),
                  "accepted": bool(source.get("accepted")), "entity": record.get("entity") or record.get("business_name") or facts.get("business_name") or facts.get("entity"),
                  "period_start": record.get("period_start"), "period_end": record.get("period_end"),
+                 "statement_period": facts.get("statement_period"),
                  "currency": record.get("currency") or facts.get("currency"), "basis": record.get("basis") or facts.get("basis"),
                  "facts_stamp": stamp(facts)}]
 
@@ -121,7 +122,8 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
                 return source_number(value)
 
             fact_key = next((alias for alias in fact_keys if fact_value(alias) is not None), None)
-            citations = verified.get(str(ref.get("file_id")), {}).get(canonical or field, [])
+            canonical_keys = (canonical,) if isinstance(canonical, str) else canonical or (field,)
+            citations = [citation for name in canonical_keys for citation in verified.get(str(ref.get("file_id")), {}).get(name, [])]
             enriched.append({**ref, "fact_key": fact_key or fact_keys[0], "fact_present": fact_key is not None,
                              "citations": citations, "pages": sorted({c["page"] for c in citations if isinstance(c.get("page"), int)})})
         source_refs = enriched
@@ -260,17 +262,33 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
                              "missing_inputs": missing, "notes": notes, "source_refs": source_refs})
 
     bank_ids = {str(key) for month in months for key in month.get("file_ids", [])}
-    bank_refs = [refs({"file_id": key, "period_start": bank.get("first_month"), "period_end": bank.get("last_month")})[0] for key in sorted(bank_ids)]
+    bank_refs = [refs({"file_id": key, "period_start": (by_file.get(key, {}).get("key_facts") or {}).get("period_start"),
+                       "period_end": (by_file.get(key, {}).get("key_facts") or {}).get("period_end")})[0] for key in sorted(bank_ids)]
     bank_period = f"{bank.get('first_month') or '?'} – {bank.get('last_month') or '?'}"
     bank["avg_net"] = operand("bank.avg_net", "Average monthly bank cash retained", bank.get("avg_net"), source_refs=bank_refs, period=bank_period,
                               fact_keys=("derived:average(monthly_deposits-minus-withdrawals)",),
+                              canonical=("total_deposits_and_credits", "total_withdrawals_and_debits"),
                               details={"months": [{key: month.get(key) for key in ("month", "accounts", "file_ids", "deposits", "withdrawals", "net")} for month in months],
                                        "included_net_months": sum(month.get("net") is not None for month in months),
                                        "counted_accounts": context["accounts"]})
     if bank.get("estimates_available"):
         bank["annualized_net"] = round(bank["avg_net"] * 12, 2) if bank["avg_net"] is not None else None
     for key, label in (("avg_deposits", "Average monthly deposits"), ("avg_withdrawals", "Average monthly withdrawals")):
-        operand(f"bank.{key}", label, bank.get(key), source_refs=bank_refs, period=bank_period, editable=False)
+        fact_key = "total_deposits_and_credits" if key == "avg_deposits" else "total_withdrawals_and_debits"
+        bank[key] = operand(f"bank.{key}", label, bank.get(key), source_refs=bank_refs, period=bank_period, fact_keys=(fact_key,), canonical=fact_key,
+                            minimum=0, details={"months": months, "counted_accounts": context["accounts"]})
+    bank["average_balance"] = operand("bank.average_balance", "Reviewed average account balance", bank.get("average_balance"),
+        source_refs=bank_refs, period=bank_period, fact_keys=("average_daily_balance", "average_ledger_balance", "ending_balance"),
+        canonical="ending_balance" if bank.get("average_balance_basis") == "ending_balance" else "average_daily_balance",
+        details={"months": months, "basis": bank.get("average_balance_basis"), "counted_accounts": context["accounts"]})
+    known_nsf = [number(month.get("nsf")) for month in months]
+    known_nsf = [value for value in known_nsf if value is not None and value >= 0 and value == int(value)]
+    bank["nsf_total"] = operand("bank.nsf_total", "Reviewed NSF and overdraft item count", sum(known_nsf) if known_nsf else None,
+        source_refs=bank_refs, period=bank_period, unit="number", minimum=0, whole_number=True,
+        fact_keys=("nsf_or_overdraft_count",), canonical="nsf_or_overdraft_count", details={"months": months, "counted_accounts": context["accounts"]})
+    if bank.get("estimates_available"):
+        for source, annual in (("avg_deposits", "annualized_deposits"), ("avg_withdrawals", "annualized_withdrawals")):
+            bank[annual] = round(bank[source] * 12, 2) if bank.get(source) is not None else None
     operand("debt.monthly", "Published / provisional monthly debt service", service.get("monthly"), source_refs=[{"version_id": service.get("version_id"), "basis": service.get("source"), "currency": "USD"}], period="Monthly", editable=False, editor_action="debt_schedule",
             details={"rows": debt_rows or [], "service": dict(service)})
     operand("debt.annual", "Annual debt service", service.get("annual"), source_refs=[{"version_id": service.get("version_id"), "basis": service.get("source"), "currency": "USD"}], period="Annual", editable=False)
@@ -280,7 +298,7 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
                 and (not entity or result.get("entity_comparable"))]
     headline = next((r for r in eligible if r["kind"] != "tax_estimate"), None) or next((r for r in reversed(eligible) if r["kind"] == "tax_estimate"), None)
     return {"revision": state.get("revision", 0), "source_stamp": stamp([i["source_stamp"] for i in inputs]),
-            "inputs": inputs, "calculations": calculations, "history": state.get("events", []),
+            "inputs": inputs, "calculations": calculations, "history": [event for event in state.get("events", []) if event.get("input_key")],
             "stale_corrections": [{**event, "stale": True} for event in stale],
             "_bank": bank,
             "scope": "Effective cockpit facts and downstream cockpit consumers. Original documents, financial form versions and hypothetical plan overrides are unchanged.",
@@ -350,12 +368,21 @@ def redact_for_external(cockpit, actor):
     result = deepcopy(cockpit)
     review = result.get("metric_review") or {}
     review["history"] = []
+    review["composition_history"] = []
     review["stale_correction_count"] = len(review.get("stale_corrections", []))
     review["stale_corrections"] = []
     for item in review.get("inputs", []):
         item["editable"] = False
         if item.get("correction"):
             item["correction"] = {key: item["correction"].get(key) for key in ("value", "at")}
+    review["stale_compositions"] = []
+    for calculation in review.get("calculations", []):
+        # Recipe adjustment labels are arbitrary internal staff text. The
+        # numeric source/reviewed results remain visible without that audit.
+        calculation.pop("recipe", None)
+    for candidate in (result.get("dscr") or {}).get("candidates", []):
+        if candidate.get("calculation_review"):
+            candidate["calculation_review"] = {"revision": candidate["calculation_review"].get("revision"), "status": "staff_adjusted"}
     return result
 
 
@@ -393,6 +420,11 @@ def change(state, review, *, input_key, action, value, reason, expected_revision
         raise HTTPException(422, "Reporting months must be a whole number from 1 to 12")
     if numeric is not None and target["unit"] == "currency":
         numeric = float(Decimal(str(numeric)).quantize(Decimal("0.01")))
+    if numeric is not None and action == "correct":
+        if target.get("minimum") is not None and numeric < target["minimum"]:
+            raise HTTPException(422, "This input cannot be below its permitted minimum")
+        if target.get("whole_number") and numeric != int(numeric):
+            raise HTTPException(422, "This count must be a whole number")
     revision = expected_revision + 1
     event = {"id": str(uuid.uuid4()), **request, "value": numeric if action == "correct" else None,
              "previous_value": target["value"], "original_value": target["original_value"],
@@ -404,11 +436,76 @@ def change(state, review, *, input_key, action, value, reason, expected_revision
     return {"revision": revision, "events": [*state.get("events", []), event]}, True
 
 
-async def correct(db, profile, actor, **payload):
+def change_many(state, review, *, corrections, reason, expected_revision, idempotency_key, actor):
+    """All fields in an explicit review save succeed together or none do."""
+    if actor.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(403, "Underwriting role required")
+    state = state or {}
+    request_stamp = stamp({"corrections": corrections, "reason": reason.strip(), "expected_revision": expected_revision})
+    for event in state.get("events", []):
+        if event.get("batch_idempotency_key") == idempotency_key:
+            if event.get("batch_request_stamp") != request_stamp:
+                raise HTTPException(409, "Idempotency key already used for a different review batch")
+            return state, False
+    keys = [row["input_key"] for row in corrections]
+    if not 1 <= len(keys) <= 20 or len(keys) != len(set(keys)):
+        raise HTTPException(422, "Review between one and twenty distinct calculation inputs")
+    current = state
+    for index, payload in enumerate(corrections):
+        current, _ = change(current, review, **payload, reason=reason, expected_revision=expected_revision + index,
+                            idempotency_key=idempotency_key if index == 0 else f"{idempotency_key}:{index}", actor=actor)
+        current["events"][-1].update(batch_idempotency_key=idempotency_key, batch_request_stamp=request_stamp)
+    return current, True
+
+
+async def _persist_review(db, profile, actor, state, *, action, summary, event_prefix="financial-review"):
     from app.services import application_profiles as profiles
+    from app.services import financial_cockpit
+    from app.services.financial_publication import (
+        invalidate_financial_review_caches,
+        refresh_advisory_projections,
+    )
+
+    profile.financial_metric_review = state
+    await profiles.log_profile_action(db, profile, actor, action, summary, metadata=state["events"][-1])
+    await db.flush()
+    # Invalidation is authoritative and must commit with the reviewed receipt.
+    # A failed advisory recomputation must not roll back these stale markers.
+    await invalidate_financial_review_caches(db, profile, correction_revision=state["revision"])
+    try:
+        async with db.begin_nested():
+            await refresh_advisory_projections(db, profile, event_key=f"{event_prefix}:{state['events'][-1]['id']}")
+    except Exception:  # noqa: BLE001 - the reviewed receipt, not a failed advisory refresh, is authoritative
+        log.exception("Financial review projection refresh failed profile=%s revision=%s", profile.id, state["revision"])
+        await db.refresh(profile)
+    return await financial_cockpit.load_cockpit(db, profile)
+
+
+async def save_review(db, profile, actor, *, composition=False, **payload):
     from app.services import financial_cockpit
     from app.services.financial_workspace import lock_financial_profile
 
+    if actor.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(403, "Underwriting role required")
+    await lock_financial_profile(db, profile)
+    profile = (await db.execute(select(ApplicationProfile).where(ApplicationProfile.id == profile.id).execution_options(populate_existing=True))).scalar_one()
+    cockpit = await financial_cockpit.load_cockpit(db, profile)
+    if composition:
+        from app.services.financial_metric_composition import change as compose
+
+        state, changed = compose(getattr(profile, "financial_metric_review", None), cockpit["metric_review"], actor=actor, **payload)
+    else:
+        state, changed = change_many(getattr(profile, "financial_metric_review", None), cockpit["metric_review"], actor=actor, **payload)
+    return await _persist_review(db, profile, actor, state, action="financial_metrics.composition" if composition else "financial_metrics.reviewed",
+                                 summary="Saved a source-bound financial calculation review") if changed else cockpit
+
+
+async def correct(db, profile, actor, **payload):
+    from app.services import financial_cockpit
+    from app.services.financial_workspace import lock_financial_profile
+
+    if actor.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(403, "Underwriting role required")
     await lock_financial_profile(db, profile)
     # A loaded ORM profile can predate waiting for the lock. Refresh its state
     # under the lock before reading revision or idempotency receipts.
@@ -416,22 +513,7 @@ async def correct(db, profile, actor, **payload):
     cockpit = await financial_cockpit.load_cockpit(db, profile)
     state, changed = change(getattr(profile, "financial_metric_review", None), cockpit["metric_review"], actor=actor, **payload)
     if changed:
-        profile.financial_metric_review = state
-        await profiles.log_profile_action(db, profile, actor, "financial_metrics.corrected" if payload["action"] == "correct" else "financial_metrics.restored", "Reviewed a source-bound financial calculation input", metadata=state["events"][-1])
-        await db.flush()
-        from app.services.financial_publication import (
-            invalidate_financial_review_caches,
-            refresh_advisory_projections,
-        )
-
-        # The correction itself remains accepted if an advisory projection is
-        # temporarily unavailable. Reads also validate their authority stamp.
-        try:
-            async with db.begin_nested():
-                await invalidate_financial_review_caches(db, profile, correction_revision=state["revision"])
-                await refresh_advisory_projections(db, profile, event_key=f"financial-correction:{state['events'][-1]['id']}")
-        except Exception:  # noqa: BLE001 - keep the reviewed source correction, not a stale cache, as authority
-            log.exception("Financial correction projection refresh failed profile=%s revision=%s", profile.id, state["revision"])
-            await db.refresh(profile)
-        cockpit = await financial_cockpit.load_cockpit(db, profile)
+        cockpit = await _persist_review(db, profile, actor, state,
+            action="financial_metrics.corrected" if payload["action"] == "correct" else "financial_metrics.restored",
+            summary="Reviewed a source-bound financial calculation input", event_prefix="financial-correction")
     return cockpit

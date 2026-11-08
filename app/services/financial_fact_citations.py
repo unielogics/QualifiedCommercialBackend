@@ -14,7 +14,7 @@ import unicodedata
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-VALIDATION_VERSION = "financial_citations_v1"
+VALIDATION_VERSION = "financial_citations_v2"
 MAX_CITATIONS_PER_FIELD = 4
 MAX_QUOTE_CHARS = 320
 MAX_STATEMENTS = 60
@@ -40,10 +40,12 @@ FIELD_ALIASES = {
     "average_daily_balance": ("average_daily_balance", "average_ledger_balance"),
     "beginning_balance": ("beginning_balance",),
     "ending_balance": ("ending_balance",),
+    "nsf_or_overdraft_count": ("nsf_or_overdraft_count",),
+    "negative_balance_days": ("negative_balance_days", "negative_days"),
     "total_monthly_debt_service": ("total_monthly_debt_service",),
 }
 _NUMERIC_TOKEN = re.compile(
-    r"(?<![\w.])\(?\s*\$?\s*[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][+-]?\d+)?\s*\)?(?![\w.])"
+    r"(?<![\w.])\(?\s*(?:[+-]?\s*\$?\s*|\$\s*[+-]?\s*)(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][+-]?\d+)?\s*\)?(?!\w|[.,]\d)"
 )
 
 
@@ -72,6 +74,24 @@ def _text(value: Any) -> str:
 
 def _normalized(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).split()).casefold()
+
+
+def _quote_occurs_without_cutting_number(quote: str, page: str) -> bool:
+    """An exact substring cannot abbreviate a printed financial amount."""
+    spans = []
+    for token in _NUMERIC_TOKEN.finditer(page):
+        raw = token.group(0)
+        start = token.start() + len(raw) - len(raw.lstrip())
+        end = token.end() - len(raw) + len(raw.rstrip())
+        spans.append((start, end))
+    for occurrence in re.finditer(re.escape(quote), page):
+        first, last = occurrence.span()
+        numeric_quote_spans = [(first + token.start() + len(token.group(0)) - len(token.group(0).lstrip()),
+                                first + token.end() - len(token.group(0)) + len(token.group(0).rstrip())) for token in _NUMERIC_TOKEN.finditer(quote)]
+        if (all(not (start < last and end > first) or first <= start and end <= last for start, end in spans)
+                and all(token in spans for token in numeric_quote_spans)):
+            return True
+    return False
 
 
 def _fact_value(facts: dict, field: str) -> Decimal | None:
@@ -134,7 +154,7 @@ def _validate_candidate(candidate: Any, *, field: str, value: Decimal, facts: di
     if not label or len(label) > 160 or not quote or len(quote) > MAX_QUOTE_CHARS:
         return None, "label_or_quote_invalid"
     normalized_quote, normalized_label = _normalized(quote), _normalized(label)
-    if normalized_quote not in _normalized(page_text):
+    if not _quote_occurs_without_cutting_number(normalized_quote, _normalized(page_text)):
         return None, "quote_not_found_on_page"
     if normalized_label not in normalized_quote:
         return None, "label_not_in_quote"

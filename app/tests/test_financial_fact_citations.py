@@ -95,6 +95,32 @@ def test_value_must_be_in_the_quote_not_just_elsewhere_on_the_page():
     assert financial_analysis_citation_status(analysis)["revenue"]["reason"] == "value_not_in_quote"
 
 
+@pytest.mark.parametrize("printed", ["$10,000", "$10.1", "$100", "$10e4", "($10)", "$10,000.", "$10.1.", "$100.", "-$10"])
+def test_exact_quote_cannot_cut_through_a_larger_or_signed_source_numeric_token(printed):
+    analysis = _analysis(gross_revenue="10")
+    analysis.analysis["fact_citations"]["revenue"] = [_citation("revenue", "Gross revenue", "10", quote="Gross revenue $10")]
+    _validate(analysis, {1: f"Gross revenue {printed}"})
+    assert "revenue" not in validated_fact_citations_for_analysis(analysis)
+
+
+def test_complete_quote_can_follow_an_abbreviated_occurrence_without_trusting_that_prefix():
+    analysis = _analysis(gross_revenue="10")
+    analysis.analysis["fact_citations"]["revenue"] = [_citation("revenue", "Gross revenue", "10", quote="Gross revenue $10")]
+    _validate(analysis, {1: "Gross revenue $10,000\nGross revenue $10"})
+    assert validated_fact_citations_for_analysis(analysis)["revenue"][0]["value"] == "10"
+
+
+def test_old_citation_validation_does_not_silently_gain_stricter_highlight_guarantees():
+    from app.services.financial_fact_citations import citation_manifest_hash
+
+    analysis = _analysis()
+    manifest = _validate(analysis)
+    manifest["validation_version"] = "financial_citations_v1"
+    manifest["validation_hash"] = citation_manifest_hash(manifest)
+    assert validated_fact_citations_for_analysis(analysis) == {}
+    assert financial_analysis_citation_status(analysis)["revenue"]["reason"] == "legacy_analysis_requires_explicit_reanalysis"
+
+
 def test_negative_accounting_value_is_not_reversed_or_rounded():
     analysis = _analysis(net_income="(3000.25)")
     analysis.analysis["fact_citations"]["net_income"] = [_citation("net_income", "Net income", "(3,000.25)")]
