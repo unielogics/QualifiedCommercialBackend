@@ -19,6 +19,7 @@ explains. Retiring an obligation retires the row and its payee together.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from app.services.financial_cockpit import amortized_payment, dscr_status, month_label
@@ -102,7 +103,7 @@ def normalize_overrides(raw: Any) -> dict[str, Any]:
     income = _num(raw.get("income_annual"))
     service = _num(raw.get("debt_service_monthly"))
     return {
-        "income_annual": income if income is not None and income >= 0 else None,
+        "income_annual": income if income is not None and math.isfinite(income) else None,
         "income_note": str(raw.get("income_note") or "")[:300] or None,
         "debt_service_monthly": service if service is not None and service >= 0 else None,
         "debt_service_note": str(raw.get("debt_service_note") or "")[:300] or None,
