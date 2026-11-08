@@ -499,6 +499,7 @@ def risk_profile(
     *,
     income_monthly: float | None = None,
     existing_service_monthly: float | None = None,
+    income_currency_comparable: bool = True,
 ) -> dict[str, Any] | None:
     """Principal at risk and the coverage on every payment.
 
@@ -508,8 +509,8 @@ def risk_profile(
     balloon. With the income available for debt service after the plan and
     the existing service beside the new loan, every payment gets its own
     coverage (income over existing service plus that payment, monthly), so
-    the interest-only months and the step-up are both visible; the lowest is
-    the one underwriting stands on.
+    the interest-only months and the step-up are both visible. Signed ratios
+    remain visible for losses; earnings-based coverage shortfalls show their burden.
     """
     if not summary or not summary.get("rows"):
         return None
@@ -517,10 +518,21 @@ def risk_profile(
     cash_flows = schedule_cash_flows(summary)
     ppy = float(summary.get("periods_per_year") or 12.0)
     to_monthly = ppy / 12.0
-    income = float(income_monthly) if income_monthly else None
-    existing = max(0.0, float(existing_service_monthly or 0.0))
+    income = (float(income_monthly) if income_monthly is not None
+              and not isinstance(income_monthly, bool) and math.isfinite(float(income_monthly)) else None)
+    existing = (float(existing_service_monthly) if existing_service_monthly is not None
+                and not isinstance(existing_service_monthly, bool) and math.isfinite(float(existing_service_monthly))
+                and float(existing_service_monthly) >= 0 else None)
+    coverage_available = income is not None and existing is not None
+
+    def payment_position(payment_monthly):
+        total = _r2(existing + payment_monthly) if existing is not None else None
+        surplus = _r2(income - total) if coverage_available and income_currency_comparable else None
+        return {"debt_service_monthly": total, "cash_surplus_monthly": surplus,
+                "cash_shortfall_monthly": _r2(max(0.0, -surplus)) if surplus is not None else None}
+
     coverage_rows: list[dict[str, Any]] = []
-    if income is not None and income > 0:
+    if coverage_available:
         for index, r in enumerate(rows):
             payment_monthly = _r2((cash_flows[index] if summary.get("repayment_config") is not None else r["payment"]) * to_monthly)
             denominator = existing + payment_monthly
@@ -531,17 +543,25 @@ def risk_profile(
                     "phase": r["phase"],
                     "payment_monthly": payment_monthly,
                     "coverage": round(income / denominator, 2) if denominator > 0 else None,
+                    **payment_position(payment_monthly),
                 }
             )
     with_cov = [c for c in coverage_rows if c["coverage"] is not None]
     cash_coverage = [{"period": row["period"], "month": row["month"],
                       "payment_monthly": _r2(cash_flows[index] * to_monthly),
-                      "coverage": _r2(income / (existing + cash_flows[index] * to_monthly)) if income is not None and income > 0 and existing + cash_flows[index] * to_monthly > 0 else None}
-                     for index, row in enumerate(rows)] if income is not None and income > 0 else []
+                      "coverage": _r2(income / (existing + cash_flows[index] * to_monthly)) if existing + cash_flows[index] * to_monthly > 0 else None,
+                      **payment_position(cash_flows[index] * to_monthly)}
+                     for index, row in enumerate(rows)] if coverage_available else []
     cash_values = [row["coverage"] for row in cash_coverage if row["coverage"] is not None]
     lowest = min(with_cov, key=lambda c: c["coverage"]) if with_cov else None
     io_cov = next((c["coverage"] for c in with_cov if c["phase"] == "interest_only"), None)
     after_cov = next((c["coverage"] for c in with_cov if c["phase"] != "interest_only"), None)
+    shortfalls = [row for row in cash_coverage if row["cash_shortfall_monthly"] is not None]
+    peak_shortfall = max(shortfalls, key=lambda row: row["cash_shortfall_monthly"]) if shortfalls else None
+    coverage_note = ("Selected earnings are zero or negative. A smaller debt denominator can make a negative DSCR more negative; compare payment amounts and earnings-based coverage shortfalls rather than ranking signed ratios."
+                     if income is not None and income <= 0 else None)
+    if not income_currency_comparable:
+        coverage_note = " ".join(part for part in (coverage_note, "Source earnings currency is not confirmed against USD debt service. Earnings-based coverage shortfalls are not calculated without comparable currencies; no currency conversion is assumed.") if part)
     milestones = summary.get("recovery_milestones") or {}
     return {
         "weighted_average_life_months": summary.get("weighted_average_life_months"),
@@ -551,10 +571,17 @@ def risk_profile(
         "balloon": summary.get("balloon") or 0.0,
         "balloon_pct": summary.get("balloon_pct") or 0.0,
         "income_monthly": _r2(income) if income is not None else None,
-        "existing_service_monthly": _r2(existing),
+        "existing_service_monthly": _r2(existing) if existing is not None else None,
         "coverage_by_period": coverage_rows,
         "cash_coverage_by_period": cash_coverage,
         "lowest_cash_coverage": min(cash_values) if cash_values else None,
+        "peak_cash_shortfall_monthly": peak_shortfall["cash_shortfall_monthly"] if peak_shortfall else None,
+        "peak_cash_shortfall_period": peak_shortfall["period"] if peak_shortfall else None,
+        "peak_cash_shortfall_month": peak_shortfall["month"] if peak_shortfall else None,
+        "coverage_note": coverage_note,
+        "coverage_unavailable_reason": ("Income available for debt service has not been established." if income is None
+                                        else "Existing debt service has not been established." if existing is None
+                                        else "Earnings-based coverage shortfalls require earnings comparable with USD debt service." if not income_currency_comparable else None),
         "coverage_basis": "actual_cash_due_per_period" if summary.get("repayment_config") is not None else "legacy_regular_payment",
         "peak_rolling_12_month_debt_service": summary.get("peak_rolling_12_month_debt_service"),
         "maturity_balloon": summary.get("maturity_balloon", summary.get("balloon")),
@@ -563,7 +590,9 @@ def risk_profile(
         "coverage_after_interest_only": after_cov,
         "lowest_coverage": lowest["coverage"] if lowest else None,
         "lowest_coverage_month": lowest["month"] if lowest else None,
-        "words": risk_words(summary, lowest=lowest, io_cov=io_cov, after_cov=after_cov),
+        "words": risk_words(summary, lowest=lowest, io_cov=io_cov, after_cov=after_cov,
+                            income_nonpositive=income is not None and income <= 0)
+        + (" " + coverage_note if coverage_note else ""),
     }
 
 
@@ -573,6 +602,7 @@ def risk_words(
     lowest: dict[str, Any] | None = None,
     io_cov: float | None = None,
     after_cov: float | None = None,
+    income_nonpositive: bool = False,
 ) -> str:
     """The principal-risk reading in plain words, for the package and the offering."""
     kind = summary.get("structure")
@@ -627,10 +657,12 @@ def risk_words(
     breakeven = summary.get("breakeven_month")
     if breakeven:
         parts.append(
-            f"Counting the interest received, the capital is back by month {int(breakeven)}; nothing is at risk after that."
+            f"Cumulative principal and interest receipts equal the original advance by month {int(breakeven)}. This cash-recovery point does not eliminate credit exposure on unpaid principal."
         )
     if lowest and lowest.get("coverage") is not None:
-        if summary.get("repayment_config") is not None:
+        if income_nonpositive:
+            parts.append(f"The mathematical minimum signed payment coverage is {lowest['coverage']:.2f}x; this does not identify the largest payment or coverage shortfall when earnings are nonpositive.")
+        elif summary.get("repayment_config") is not None:
             parts.append(f"Lowest payment-period liquidity coverage {lowest['coverage']:.2f}x; annual coverage uses peak rolling twelve-month cash due.")
         elif io_cov is not None and after_cov is not None and io_cov != after_cov:
             parts.append(

@@ -96,6 +96,19 @@ async def test_recompute_persists_current_business_coverage_without_promoting_ta
     assert by_key["underwriting_dscr"]["assumption"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value,status", [(-4000, "concerning"), (0, "concerning"), (4000, "healthy")])
+async def test_known_nonpositive_adjusted_ebitda_is_not_labelled_healthy(computation, monkeypatch, value, status):
+    db, profile, _, authority = computation
+    annual = {"ebitda_annual": value, "currency": "USD"}
+    monkeypatch.setattr(readiness, "load_financial_authority", AsyncMock(return_value={**authority, "validated_annual": annual}))
+    original = readiness._calculation_inputs.return_value
+    monkeypatch.setattr(readiness, "_calculation_inputs", AsyncMock(return_value=(original[0], original[1], [], [], [])))
+    snapshot = await readiness.recompute(db, profile, idempotency_key=f"signed-ebitda-{value}", expected_snapshot_version=None)
+    metric = next(row for row in snapshot.metrics if row["key"] == "internal_adjusted_ebitda")
+    assert metric["value"] == value and metric["status"] == status
+
+
 def _receipt_database(db, profile, monkeypatch):
     snapshots = []
 
@@ -176,6 +189,29 @@ async def test_current_snapshot_refreshes_derived_history_without_mutating_old_s
     fresh = await readiness.current_snapshot(db, profile)
     assert fresh is not first and fresh.snapshot_version == first.snapshot_version + 1
     assert first.formula_version == "old-policy" and first.metrics == old_metrics
+
+
+@pytest.mark.asyncio
+async def test_signed_earnings_policy_lazily_replaces_an_old_healthy_loss_without_rewriting_history(computation, monkeypatch):
+    db, profile, _, authority = computation
+    _receipt_database(db, profile, monkeypatch)
+    monkeypatch.setattr(readiness, "load_financial_authority", AsyncMock(return_value={**authority,
+        "validated_annual": {"ebitda_annual": -4000, "currency": "USD"}}))
+    original = readiness._calculation_inputs.return_value
+    monkeypatch.setattr(readiness, "_calculation_inputs", AsyncMock(return_value=(original[0], original[1], [], [], [])))
+    current_version = readiness.FORMULA_VERSION
+    monkeypatch.setattr(readiness, "FORMULA_VERSION", "score_v3_financial_authority")
+    previous = await readiness.recompute(db, profile, idempotency_key="current-financial-authority", expected_snapshot_version=None)
+    old_metric = next(row for row in previous.metrics if row["key"] == "internal_adjusted_ebitda")
+    old_metric["status"] = "healthy"  # A historical projection produced by the old policy.
+    monkeypatch.setattr(readiness, "FORMULA_VERSION", current_version)
+    fresh = await readiness.current_snapshot(db, profile)
+    assert fresh is not previous and fresh.snapshot_version == previous.snapshot_version + 1
+    assert fresh.formula_version == "score_v4_signed_earnings"
+    metric = next(row for row in fresh.metrics if row["key"] == "internal_adjusted_ebitda")
+    assert metric["value"] == -4000 and metric["status"] == "concerning"
+    assert old_metric["value"] == -4000 and old_metric["status"] == "healthy"
+    assert previous.formula_version == "score_v3_financial_authority"
 
 
 @pytest.mark.asyncio

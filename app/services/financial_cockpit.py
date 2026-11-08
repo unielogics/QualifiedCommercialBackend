@@ -2515,10 +2515,12 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
         # Coverage on every payment: the income after the plan when there is
         # one, else today's; beside the existing service after what the plan
         # retires (or what the sheet retains when it refinances).
+        current_risk_basis = dscr.get("headline") or next((candidate for candidate in dscr.get("candidates") or []
+                                                          if candidate.get("numerator") is not None), {})
         if evaluation.get("active") and evaluation.get("income_after_annual") is not None:
             income_annual = evaluation["income_after_annual"]
         else:
-            income_annual = (dscr.get("headline") or {}).get("numerator")
+            income_annual = current_risk_basis.get("numerator")
         if base["treatment"] == "refinance" and base["retained_annual_debt_service"] is not None:
             existing = float(base["retained_annual_debt_service"]) / 12.0
         elif (
@@ -2529,10 +2531,15 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
         else:
             annual_existing = dscr.get("annual_debt_service")
             existing = float(annual_existing) / 12.0 if annual_existing is not None else None
+        risk_basis_key = evaluation.get("headline_key") if evaluation.get("active") else current_risk_basis.get("key")
+        risk_basis = next((candidate for candidate in dscr.get("candidates") or []
+                           if candidate.get("key") == risk_basis_key), current_risk_basis)
         base["risk"] = risk_profile(
             schedule,
             income_monthly=(float(income_annual) / 12.0) if income_annual is not None else None,
             existing_service_monthly=existing,
+            income_currency_comparable=bool(evaluation.get("active") and evaluation.get("income_override_annual") is not None)
+            or bool(risk_basis.get("currency_comparable")),
         ) if existing is not None else None
     else:
         base["structure_label"] = None

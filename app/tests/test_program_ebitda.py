@@ -88,6 +88,12 @@ def test_tax_and_bank_cash_are_not_substitutes_and_zero_is_a_known_earnings_valu
     assert value == 0 and source["verification_status"] == "verified"
 
 
+def test_verified_negative_ebitda_is_known_but_does_not_meet_a_positive_minimum():
+    value, source = annual_ebitda_fact([pnl(net_income=-10000)], entity=ENTITY)
+    assert value == -8000 and source["verification_status"] == "verified"
+    assert not evaluate_rules({"fit": RULE}, {"annual_ebitda": value}).matched
+
+
 def test_current_factual_correction_applies_but_stale_or_hypothetical_changes_do_not():
     analyses = [pnl()]
     cockpit = financial_cockpit.build_cockpit(analyses, [], business_entity=ENTITY)
