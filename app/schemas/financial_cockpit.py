@@ -143,7 +143,7 @@ class AddBackIn(BaseModel):
 class PlanOverridesIn(BaseModel):
     """Figures the desk sets outright, each with the reason."""
 
-    income_annual: float | None = Field(default=None, ge=0)
+    income_annual: float | None = Field(default=None, allow_inf_nan=False)
     income_note: str | None = Field(default=None, max_length=300)
     debt_service_monthly: float | None = Field(default=None, ge=0)
     debt_service_note: str | None = Field(default=None, max_length=300)

@@ -187,6 +187,32 @@ async def test_combined_save_preserves_unsaved_scenario_and_returns_authoritativ
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("income", [-24000.5, 0, None])
+async def test_combined_terms_version_persists_signed_staff_income_and_matching_coverage(env, monkeypatch, income):
+    await baseline(env)
+    # Exercise the actual cockpit-derived terms context, including a known zero
+    # rather than the fixture's older truthy fallback to source earnings.
+    monkeypatch.setattr(application_terms, "_dscr_context", application_terms._cockpit_context)
+    body = combined(env).model_dump(mode="json")
+    body["financial_plan"]["overrides"]["income_annual"] = income
+    request = ClientTermsWrite.model_validate(body)
+    result = await routes.put_client_terms(env.profile.id, request, env.actor, env.db)
+    record, evaluated = result.financial_plan.record, result.financial_plan.evaluation
+    expected = income if income is not None else 126000  # Source earnings plus the existing operating addback.
+    assert result.version == 2 and record["overrides"]["income_annual"] == income
+    assert record["overrides"]["income_note"] == "Staff-reviewed earnings"
+    assert record["retire"] == ["row:loan-a"] and record["exclude"] == ["payee:transfer"]
+    assert evaluated["income_after_annual"] == result.calculation.cash_flow_value == expected
+    assert result.calculation.dscr_after == round(expected / result.calculation.projected_annual_debt_service, 3)
+    assert evaluated["headline_after"] == round(expected / evaluated["debt_service_after_annual"], 2)
+    env.session.expire(env.profile, ["financial_plan"])
+    assert env.profile.financial_plan["overrides"]["income_annual"] == income
+    versions = env.session.scalars(select(ApplicationTermSheet).order_by(ApplicationTermSheet.version)).all()
+    assert len(versions) == 2 and versions[0].cash_flow_value == 120000
+    assert versions[1].cash_flow_value == expected
+
+
+@pytest.mark.asyncio
 async def test_terms_only_save_refreshes_concurrently_saved_financial_scenario_before_adoption(env):
     stale = await baseline(env)
     fresh = {**deepcopy(stale), "retire": ["row:loan-a"], "exclude": ["payee:transfer"],
