@@ -9,11 +9,12 @@ import math
 import re
 from copy import deepcopy
 
-SOURCE_KEYS = ("file_id", "file_name", "analysis_id", "content_hash", "accepted", "entity", "period_start", "period_end", "currency", "basis", "version_id", "fact_key", "fact_present", "citations", "pages")
+SOURCE_KEYS = ("file_id", "file_name", "analysis_id", "content_hash", "accepted", "entity", "period_start", "period_end", "statement_period", "currency", "basis", "version_id", "fact_key", "fact_present", "citations", "pages")
 CURRENCY_KEYS = ("numerator_currency", "denominator_currency", "source_currencies", "currency_comparable", "currency_status", "currency_note", "denominator_currency_basis")
 RESULT_KEYS = ("key", "label", "kind", "value", "annualized_value", "period", "months_covered", "annualization_factor",
                "formula", "complete", "provisional", "entity_mismatch", "entity_comparable", "missing_inputs", "input_keys",
-               "computed_value", "reported_value", "currency", "basis", "numerator", "denominator", "selected", "basis_status", "debt_version_id", "notes", *CURRENCY_KEYS)
+               "computed_value", "reported_value", "currency", "basis", "numerator", "denominator", "selected", "basis_status", "debt_version_id", "notes",
+               "source_value", "reviewed_value", "reviewed_label", "staff_adjusted", *CURRENCY_KEYS)
 
 
 def _number(value):
@@ -85,21 +86,33 @@ def metric_brief(cockpit):
         if row["corrected"]:
             corrections.append({"input_key": item["key"], "original_value": item.get("original_value"), "effective_value": item.get("value"),
                                 "period": item.get("period"), "source_refs": row["source_refs"], "status": "current_applied"})
+    calculation_reviews = []
+    for calculation in review.get("calculations", []):
+        recipe = calculation.get("recipe") or {}
+        if recipe.get("current_event"):
+            calculation_reviews.append({"calculation_key": calculation["key"], "status": "staff_adjusted",
+                "source_value": recipe.get("source_value"), "reviewed_value": recipe.get("reviewed_value"),
+                "period": recipe.get("period"), "annualization_factor": recipe.get("annualization_factor"),
+                "components": [{key: component.get(key) for key in ("input_key", "included", "contribution", "role")} for component in recipe.get("components", [])],
+                "adjustments": [{key: adjustment.get(key) for key in ("label", "amount")} for adjustment in recipe.get("adjustments", [])],
+                "denominator": recipe.get("denominator"),
+                "qualification_policy": "Staff-reviewed DSCR recipe; underlying source EBITDA and verified-program earnings remain distinct."})
     headline = dscr.get("headline")
     primary = None
     if headline:
-        primary = {key: headline[key] for key in ("key", "label", "value", "numerator", "numerator_label", "period", "confidence", "input_keys", "note", *CURRENCY_KEYS) if key in headline}
+        primary = {key: headline[key] for key in ("key", "label", "value", "numerator", "numerator_label", "period", "confidence", "input_keys", "note", "staff_adjusted", "source_numerator", "source_value", *CURRENCY_KEYS) if key in headline}
         primary["source_refs"] = _refs(headline.get("source_refs"))
         primary["annual_debt_service"] = dscr.get("annual_debt_service")
         primary["role"] = "Primary DSCR, exactly the current financial cockpit headline"
     return {"revision": review.get("revision", 0), "scope": "Current source-bound cockpit calculations; original documents, AI snapshots, saved forms and financial-period records are unchanged.",
             "ebitda": {"headline": _result(ebitda.get("headline")), "candidates": [_result(row) for row in ebitda.get("candidates", [])], "reason": ebitda.get("reason")},
             "primary_dscr": primary, "validated_annual": validated_annual_pair(cockpit),
-            "inputs": inputs, "corrections": corrections,
+            "inputs": inputs, "corrections": corrections, "calculation_reviews": calculation_reviews,
             "excluded_income_sources": [{key: row.get(key) for key in ("file_id", "file_name", "reason")}
                                         for row in review.get("excluded_income_sources", [])],
             "comparative_conflicts": review.get("comparative_conflicts", []),
             "stale_corrections": [{"input_key": row.get("input_key"), "period": row.get("period"), "status": "stale_not_applied"} for row in review.get("stale_corrections", [])],
+            "stale_compositions": [{"calculation_key": row.get("calculation_key"), "period": row.get("period"), "status": "stale_not_applied"} for row in review.get("stale_compositions", [])],
             "calculations": [_result(row) for row in review.get("calculations", [])]}
 
 

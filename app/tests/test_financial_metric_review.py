@@ -293,7 +293,7 @@ def test_invalid_or_unscoped_corrections_rejected(problem):
         review.change({}, c["metric_review"], **payload)
 
 
-def test_bank_correction_only_affects_cash_proxy_dscr_not_statement_figures():
+def test_bank_reviewed_aggregate_updates_current_metrics_but_preserves_source_series():
     analyses = [file("bank_statement", {"bank": "Bank", "account_last4": "1234", "statement_period": f"2026-0{month}",
                                        "total_deposits_and_credits": 10000, "total_withdrawals_and_debits": 8000}, key=f"bank-{month}") for month in (1, 2, 3)]
     c = build(analyses)
@@ -301,8 +301,10 @@ def test_bank_correction_only_affects_cash_proxy_dscr_not_statement_figures():
     updated = build(analyses, state)
     assert updated["ebitda"]["headline"] is None
     assert updated["dscr"]["headline"]["numerator"] == 48000
-    assert updated["bank"]["summary"]["avg_net"] == 2000
-    assert updated["net_profit"]["conclusion"]["value"] == 24000
+    assert updated["bank"]["summary"]["avg_net"] == 3000
+    assert updated["bank"]["source_summary"]["avg_net"] == 2000
+    assert all(month["net"] == 2000 for month in updated["bank"]["months"])
+    assert updated["net_profit"]["conclusion"]["value"] == 36000
 
 
 @pytest.mark.asyncio
