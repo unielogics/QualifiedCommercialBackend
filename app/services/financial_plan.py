@@ -612,10 +612,13 @@ def evaluate_plan(
         from app.services.loan_schedule import risk_profile
 
         income_after = headline_after["numerator_after"] if headline_after else None
+        risk_basis = next((candidate for candidate in dscr.get("candidates") or []
+                           if headline_after and candidate.get("key") == headline_after["key"]), headline)
         risk = risk_profile(
             schedule,
-            income_monthly=(float(income_after) / 12.0) if income_after else None,
-            existing_service_monthly=before_new or 0.0,
+            income_monthly=(float(income_after) / 12.0) if income_after is not None else None,
+            existing_service_monthly=before_new,
+            income_currency_comparable=income_override is not None or bool(risk_basis.get("currency_comparable")),
         )
     result = {
         "active": active,
@@ -645,7 +648,7 @@ def evaluate_plan(
         "debt_service_after_monthly": after_monthly,
         "debt_service_after_annual": _round(after_annual),
         "candidates": candidates_after,
-        "income_before_annual": headline.get("numerator"),
+        "income_before_annual": headline_after["numerator_before"] if headline_after else None,
         "income_after_annual": headline_after["numerator_after"] if headline_after else None,
         "headline_before": headline.get("value"),
         "headline_before_status": headline.get("status") or dscr_status(headline.get("value")),
@@ -964,7 +967,8 @@ def coverage_levers(
     if evaluation.get("income_after_annual") is not None:
         numerator = evaluation["income_after_annual"]
     overridden = evaluation.get("income_override_annual") is not None
-    key = headline.get("key") or ((dscr.get("candidates") or [{}])[0].get("key"))
+    key = evaluation.get("headline_key") or headline.get("key") or ((dscr.get("candidates") or [{}])[0].get("key"))
+    earnings_basis = next((candidate for candidate in dscr.get("candidates") or [] if candidate.get("key") == key), headline)
     base_service = evaluation["debt_service_after_monthly"]
     base_value = evaluation["headline_after"]
     recorded_rate = _num((terms or {}).get("rate_pct"))
@@ -1012,6 +1016,8 @@ def coverage_levers(
                 "detail": f"Payments stop: {sum(o.get('monthly') or 0 for o in advances):,.0f} a month. "
                 + sizing,
                 "dscr_after": value,
+                "income_after_annual": numerator,
+                "debt_service_after_monthly": after,
                 "status_after": dscr_status(value),
                 "uncertain": bool(unknown),
                 "apply": {
@@ -1044,6 +1050,8 @@ def coverage_levers(
                         else "; payoff balance not recorded yet."
                     ),
                     "dscr_after": value_one,
+                    "income_after_annual": numerator,
+                    "debt_service_after_monthly": after_one,
                     "status_after": dscr_status(value_one),
                     "apply": {"retire": sorted(retire | {o["id"]})},
                 }
@@ -1100,6 +1108,8 @@ def coverage_levers(
                     else "."
                 ),
                 "dscr_after": value_add,
+                "income_after_annual": numerator,
+                "debt_service_after_monthly": after_add,
                 "status_after": dscr_status(value_add),
                 "apply": adopt,
             }
@@ -1123,6 +1133,8 @@ def coverage_levers(
                     )
                     + f", and {sheet_payment:,.0f} a month begins.",
                     "dscr_after": value_refi,
+                    "income_after_annual": numerator,
+                    "debt_service_after_monthly": after_refi,
                     "status_after": dscr_status(value_refi),
                     "apply": {**adopt, "retire": sorted(retire | {o["id"] for o in in_service})},
                 }
@@ -1145,6 +1157,8 @@ def coverage_levers(
                 "label": "Add back officer compensation",
                 "detail": f"The {latest_comp.get('year')} return deducts {comp:,.0f} of officer compensation. When the owner's pay is discretionary a lender adds it back to the income available for debt service; confirm with the client that it is.",
                 "dscr_after": value_add,
+                "income_after_annual": numerator + comp,
+                "debt_service_after_monthly": base_service,
                 "status_after": dscr_status(value_add),
                 "apply": {
                     "add_backs": [
@@ -1179,6 +1193,8 @@ def coverage_levers(
                 "label": "Structure the new loan interest-only",
                 "detail": f"{loan['amount']:,.0f} at {loan['rate_pct']:g}% costs {io_payment:,.0f} a month of interest instead of {evaluation['new_payment_monthly']:,.0f}; the principal is due at maturity, so the coverage holds only through the interest-only period.",
                 "dscr_after": value_io,
+                "income_after_annual": numerator,
+                "debt_service_after_monthly": after_io,
                 "status_after": dscr_status(value_io),
                 "apply": {
                     "new_loan_interest_only": True,
@@ -1200,6 +1216,8 @@ def coverage_levers(
                     "label": f"Treat {payee['payee']} as a transfer, not spend",
                     "detail": f"{payee.get('monthly_average') or 0:,.0f} a month of {payee.get('kind_label') or 'transfers'}: if this is money moved to the owner's own accounts it is not operating spend and the bank proxy understates income by that much. Confirm with the client.",
                     "dscr_after": value_ex,
+                    "income_after_annual": numerator + (payee.get("monthly_average") or 0) * 12,
+                    "debt_service_after_monthly": base_service,
                     "status_after": dscr_status(value_ex),
                     "apply": {"exclude": sorted(exclude | {pid})},
                 }
@@ -1223,6 +1241,8 @@ def coverage_levers(
                     "label": f"Stretch the new loan to {longer} months",
                     "detail": f"{amount:,.0f} at {rate:g}% over {longer} months is {payment:,.0f} a month instead of {new_payment:,.0f}.",
                     "dscr_after": value_long,
+                    "income_after_annual": numerator,
+                    "debt_service_after_monthly": after_long,
                     "status_after": dscr_status(value_long),
                     "apply": {
                         "new_loan_amount": amount,
@@ -1254,12 +1274,35 @@ def coverage_levers(
         # edit its maturity, rate and events in the schedule editor instead.
         levers = [lever for lever in levers if not isinstance(lever.get("apply"), dict)
                   or not any(key.startswith("new_loan_") for key in lever["apply"])]
-    ranked = sorted(
+    currency_comparable = overridden or bool(earnings_basis.get("currency_comparable"))
+    base_surplus = numerator / 12 - base_service if numerator is not None and currency_comparable else None
+    nonpositive_income = numerator is not None and numerator <= 0
+    for lever in levers:
+        income_after = lever.setdefault("income_after_annual", None)
+        service_after = lever.setdefault("debt_service_after_monthly", None)
+        surplus = round(income_after / 12 - service_after, 2) if income_after is not None and service_after is not None and currency_comparable else None
+        lever["cash_surplus_monthly"] = surplus
+        lever["cash_surplus_change_monthly"] = round(surplus - base_surplus, 2) if surplus is not None and base_surplus is not None else None
+        lever.setdefault("uncertain", False)
+        # With a loss, adding debt makes the signed ratio approach zero while
+        # worsening the funding gap. Rank payment/earnings changes by their
+        # cash effect instead; never change the correctly signed DSCR itself.
+        if nonpositive_income:
+            change = lever["cash_surplus_change_monthly"]
+            lever["improves"] = (change > 0 if change is not None else
+                                 service_after is not None and service_after < base_service and income_after == numerator)
+        else:
+            lever["improves"] = lever["dscr_after"] is not None and (base_value is None or lever["dscr_after"] > base_value)
+
+    def payment_relief_order(lever):
+        change = lever["cash_surplus_change_monthly"]
+        # Payment relief alone remains comparable in USD even when the source
+        # earnings denomination is unconfirmed. Never subtract those earnings.
+        if change is None and lever["debt_service_after_monthly"] is not None and lever["income_after_annual"] == numerator:
+            change = base_service - lever["debt_service_after_monthly"]
+        return change is None, -change if change is not None else 0
+
+    ranked = sorted(levers, key=payment_relief_order) if nonpositive_income else sorted(
         levers, key=lambda lever: -(lever["dscr_after"] if lever["dscr_after"] is not None else -1)
     )
-    for lever in ranked:
-        lever.setdefault("uncertain", False)
-        lever["improves"] = lever["dscr_after"] is not None and (
-            base_value is None or lever["dscr_after"] > base_value
-        )
     return ranked[:MAX_LEVERS]

@@ -57,7 +57,7 @@ from app.services.operator_file_links import selected_files_for_intake
 log = logging.getLogger(__name__)
 
 POLICY_KEY = "qc_lending_margin_v1"
-FORMULA_VERSION = "score_v3_financial_authority"
+FORMULA_VERSION = "score_v4_signed_earnings"
 MONEY_TOLERANCE = Decimal("1.00")
 STATUS_SCORE = {
     "concerning": Decimal("25"),
@@ -3325,7 +3325,8 @@ async def recompute(
             label=_t(locale, "Internal adjusted EBITDA"),
             value=internal_adjusted_ebitda,
             unit="currency",
-            metric_status="healthy" if internal_adjusted_ebitda is not None else "unavailable",
+            metric_status=("unavailable" if internal_adjusted_ebitda is None
+                           else "concerning" if internal_adjusted_ebitda <= 0 else "healthy"),
             confidence=confidence,
             source={
                 "informational": True,

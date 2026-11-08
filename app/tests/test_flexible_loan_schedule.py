@@ -114,7 +114,7 @@ def test_maturity_scheduled_balloons_and_residual_are_not_counted_twice():
     assert last["payment"] == 60000 and last["maturity_balloon"] == 40000
     assert last["cash_payment"] == 100000 and last["total_principal"] == 100000
     assert schedule["total_paid"] == 100000 and schedule["peak_rolling_12_month_debt_service"] == 100000
-    risk = risk_profile(schedule, income_monthly=5000)
+    risk = risk_profile(schedule, income_monthly=5000, existing_service_monthly=0)
     assert risk["lowest_cash_coverage"] == risk["lowest_coverage"] == .05
     assert risk["coverage_basis"] == "actual_cash_due_per_period"
     assert "whole principal stays out" not in risk["words"]
