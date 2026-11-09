@@ -604,7 +604,7 @@ async def test_thread_detail_exposes_outbox_attachment_names(
         )
 
     db = SimpleNamespace(
-        execute=AsyncMock(side_effect=[result([message]), result([send])]),
+        execute=AsyncMock(side_effect=[result([message]), result([send]), result([])]),
         get=AsyncMock(return_value=user),
     )
     monkeypatch.setattr(communications, "_contacts", AsyncMock(return_value=([], [])))

@@ -14682,7 +14682,19 @@ async def list_file_inbox_messages(
                 message.read_at = now
         thread.unread_count = 0
         await db.commit()
+    await _hydrate_rep_message_images(db, rows)
     return rows
+
+
+async def _hydrate_rep_message_images(db: AsyncSession, rows: list[DealerRepInboxMessage]) -> None:
+    """Only called after the endpoint authorizes the thread and its messages."""
+    if not rows:
+        return
+    from app.services import inline_images
+
+    images = await inline_images.hydrate(db, "rep_inbox_message", [str(row.id) for row in rows])
+    for row in rows:
+        row.images = images.get(str(row.id), [])
 
 
 @router.get("/inbox/threads/{thread_id}/messages", response_model=list[RepInboxMessageRead])
@@ -14718,6 +14730,7 @@ async def list_rep_inbox_messages(
             row.read_at = now
     thread.unread_count = 0
     await db.commit()
+    await _hydrate_rep_message_images(db, rows)
     return rows
 
 
@@ -14770,6 +14783,8 @@ async def _send_rep_inbox_message(
     request: Request,
     user: User,
 ) -> DealerRepInboxMessage:
+    from app.services import communication_images, inline_images
+
     if dealer is not None:
         await _require_training_live_action(
             db,
@@ -14790,16 +14805,45 @@ async def _send_rep_inbox_message(
     provider_error = None
     recipient = None
     sender = user.email
+    images = []
+
+    async def load_images():
+        ids = getattr(payload, "image_ids", [])
+        if not ids:
+            return []
+        try:
+            return await communication_images.load(db, ids, user.id)
+        except inline_images.InlineImageError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+    # Scalars are captured before delivery, so rollback of failed bookkeeping
+    # never forces a lazy ORM read or turns a physical send into a retry.
+    receipt = {
+        "id": uuid4(), "thread_id": thread.id,
+        "owner_user_id": getattr(thread, "owner_user_id", None),
+        "contact_id": getattr(thread, "contact_id", None),
+        "dealer_id": getattr(thread, "dealer_id", None),
+        "direction": "outbound", "channel": channel, "subject": thread.subject,
+        "body": payload.body, "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc), "read_at": datetime.now(timezone.utc),
+    }
     if channel == "email":
         recipient = contact.email if contact else None
         if not recipient:
             raise HTTPException(status.HTTP_409_CONFLICT, "This contact has no email address.")
-        res = await asyncio.to_thread(
-            ses_client.send_email,
-            to_email=recipient,
-            subject=thread.subject,
-            body_text=payload.body,
-        )
+        images = await load_images()
+        if images:
+            res = await asyncio.to_thread(
+                ses_client.send_raw_email, to_emails=[recipient], subject=thread.subject,
+                body_text=payload.body, attachments=communication_images.attachment_bytes(images),
+            )
+        else:
+            res = await asyncio.to_thread(
+                ses_client.send_email,
+                to_email=recipient,
+                subject=thread.subject,
+                body_text=payload.body,
+            )
         provider = "ses"
         provider_id = res.message_id
         delivery_status = "sent" if res.ok else "failed"
@@ -14813,53 +14857,75 @@ async def _send_rep_inbox_message(
         allowed = bool(contact and (contact.sms_transactional_consented_at or contact.sms_marketing_consented_at))
         if not allowed:
             raise HTTPException(status.HTTP_409_CONFLICT, "This contact has not granted SMS consent.")
-        res = await consent_delivery.send_sms_guarded(
-            db, recipient, payload.body, context="rep_inbox"
-        )
-        provider = res.provider
-        provider_id = res.provider_message_id if res.ok else None
-        delivery_status = "sent" if res.ok else "failed"
-        provider_error = None if res.ok else res.detail
-        sender = res.sender
-    msg = await _append_rep_inbox_message(
-        db,
-        thread=thread,
-        contact=contact,
-        direction="outbound",
-        channel=channel,
-        subject=thread.subject,
-        body=payload.body,
-        provider=provider,
-        provider_message_id=provider_id,
-        provider_error=provider_error,
-        delivery_status=delivery_status,
-        sender=sender,
-        recipient=recipient,
-    )
-    if dealer is not None:
-        db.add(
-            DealerMessage(
-                dealer_id=dealer.id,
-                author_user_id=user.id,
-                author_name=user.name,
-                body=payload.body,
-                internal=False,
-                channel="client",
+        images = await load_images()
+        if images:
+            from app.services import sms as sms_service
+
+            res = await sms_service.send_sms_checked(
+                db, to_phone=recipient, body=payload.body, context="rep_inbox", images=images,
             )
-        )
-        await file_events.emit(
+            provider_id = res.message_id if res.ok else None
+            sender = consent_delivery.sms_sender()
+        else:
+            res = await consent_delivery.send_sms_guarded(
+                db, recipient, payload.body, context="rep_inbox"
+            )
+            provider_id = res.provider_message_id if res.ok else None
+            sender = res.sender
+        provider = res.provider
+        delivery_status = "sent" if res.ok else "failed"
+        provider_error = (res.detail if res.detail in {"sent_not_recorded", "sent_but_image_links_unavailable"} else None) if res.ok else res.detail
+    receipt.update(provider=provider, provider_message_id=provider_id, provider_error=provider_error,
+                   delivery_status=delivery_status, sender=sender, recipient=recipient)
+    try:
+        msg = await _append_rep_inbox_message(
             db,
-            dealer_id=dealer.id,
-            kind="message.sent",
-            visibility=file_events.VISIBILITY_CLIENT,
-            title=f"Message sent to {((contact.full_name or contact.company) if contact is not None else None) or dealer.name}",
-            actor=user,
-            target_type="inbox_message",
-            target_id=msg.id,
-            meta={"channel": channel, "thread_id": str(thread.id)},
+            thread=thread,
+            contact=contact,
+            direction="outbound",
+            channel=channel,
+            subject=thread.subject,
+            body=payload.body,
+            provider=provider,
+            provider_message_id=provider_id,
+            provider_error=provider_error,
+            delivery_status=delivery_status,
+            sender=sender,
+            recipient=recipient,
         )
-    await db.commit()
-    await db.refresh(msg)
+        if images:
+            await communication_images.bind(db, images, subject_kind="rep_inbox_message", subject_id=str(msg.id))
+        if dealer is not None:
+            mirror = DealerMessage(
+                id=uuid4(), dealer_id=dealer.id, author_user_id=user.id, author_name=user.name,
+                body=payload.body, internal=False, channel="client",
+            )
+            db.add(mirror)
+            if images:
+                await communication_images.bind(db, images, subject_kind="dealer_message", subject_id=str(mirror.id))
+            await file_events.emit(
+                db,
+                dealer_id=dealer.id,
+                kind="message.sent",
+                visibility=file_events.VISIBILITY_CLIENT,
+                title=f"Message sent to {((contact.full_name or contact.company) if contact is not None else None) or dealer.name}",
+                actor=user,
+                target_type="inbox_message",
+                target_id=msg.id,
+                meta={"channel": channel, "thread_id": str(thread.id)},
+            )
+        await db.commit()
+        await db.refresh(msg)
+        if images:
+            msg.images = [inline_images.serialize(image.row) for image in images]
+    except Exception:
+        if delivery_status != "sent":
+            raise
+        await db.rollback()
+        logger.exception("rep inbox: delivered message could not be recorded")
+        receipt["provider_error"] = provider_error if provider_error == "sent_but_image_links_unavailable" else "sent_not_recorded"
+        msg = DealerRepInboxMessage(**receipt)
+        msg.images = []
     return msg
 
 

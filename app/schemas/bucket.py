@@ -11,6 +11,7 @@ from app.schemas.application_profile import (
     UnlockedCopyRequestStateRead,
 )
 from app.schemas.common import ORMModel
+from app.schemas.communication import CommunicationImage
 
 PublicAnalysisClassification = Literal[
     "accounts_receivable_aging",
@@ -911,6 +912,7 @@ class BucketAIMessageRead(ORMModel):
     provider: str | None
     model: str | None
     created_at: datetime
+    images: list[CommunicationImage] = Field(default_factory=list)
 
 
 class IntakeChatActionRead(ORMModel):

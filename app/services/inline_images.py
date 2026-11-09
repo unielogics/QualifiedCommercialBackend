@@ -29,7 +29,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import boto3
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -49,6 +49,11 @@ SUBJECT_KINDS = frozenset(
         # store_bytes when the relay hands it over. Same table because the read
         # path and the rendering are identical.
         "sms_message",
+        "outbound_message",
+        "email_message",
+        "rep_message",
+        "rep_inbox_message",
+        "bucket_message",
     }
 )
 
@@ -99,7 +104,8 @@ async def start_upload(
     if subject_kind not in SUBJECT_KINDS:
         raise InlineImageError(f"Unknown subject kind {subject_kind!r}.")
     normalized = (mime_type or "").split(";")[0].strip().lower()
-    if normalized not in ALLOWED_MIME:
+    allowed = ALLOWED_MIME | {"image/heic", "image/heif"} if subject_kind == "outbound_message" else ALLOWED_MIME
+    if normalized not in allowed:
         raise InlineImageError(
             "That file type cannot be pasted here. Use a PNG, JPEG, GIF, or WebP image."
         )
@@ -150,6 +156,12 @@ async def mark_ready(db: AsyncSession, image_id: UUID, user_id: UUID | None) -> 
     # any caller needs to do, so it is not a thing this allows.
     if row is None or (user_id is not None and row.uploaded_by_user_id != user_id):
         raise InlineImageError("That upload could not be found.")
+    if row.subject_kind in {"sms_image_share", "outbound_upload_staging"} or row.subject_id is not None:
+        raise InlineImageError("That upload cannot be completed again.")
+    if row.subject_kind == "outbound_message" and row.status != "ready":
+        from app.services.communication_images import validate_upload
+
+        await validate_upload(db, row)
     row.status = "ready"
     return row
 
@@ -340,11 +352,16 @@ async def sweep_orphans(db: AsyncSession, *, limit: int = 200) -> int:
 
     settings = get_settings()
     cutoff = datetime.now(UTC) - timedelta(hours=ORPHAN_GRACE_HOURS)
+    share_cutoff = datetime.now(UTC) - timedelta(days=7)
     rows = (
         (
             await db.execute(
                 select(InlineImage)
-                .where(InlineImage.subject_id.is_(None), InlineImage.created_at < cutoff)
+                .where(or_(
+                    and_(InlineImage.subject_id.is_(None), InlineImage.created_at < cutoff, InlineImage.status != "shared"),
+                    and_(InlineImage.subject_kind == "sms_image_share", InlineImage.status == "shared", InlineImage.attached_at < share_cutoff),
+                ))
+                .with_for_update(skip_locked=True)
                 .limit(limit)
             )
         )
@@ -357,7 +374,12 @@ async def sweep_orphans(db: AsyncSession, *, limit: int = 200) -> int:
     client = _s3_client() if settings.s3_bucket else None
     removed = 0
     for row in rows:
-        if client is not None and row.s3_key:
+        shared = False
+        if row.s3_key and row.s3_key.startswith("outbound-images/"):
+            shared = (await db.execute(select(InlineImage.id).where(
+                InlineImage.s3_key == row.s3_key, InlineImage.id != row.id,
+            ).limit(1))).scalar_one_or_none() is not None
+        if client is not None and row.s3_key and not shared:
             try:
                 client.delete_object(Bucket=settings.s3_bucket, Key=row.s3_key)
             except Exception:  # noqa: BLE001

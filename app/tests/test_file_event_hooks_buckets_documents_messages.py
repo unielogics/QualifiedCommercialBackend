@@ -130,7 +130,8 @@ def test_the_reply_hooks_leave_the_intake_client_branch_and_the_outside_channels
     assert "create_human_message(" in client_branch and "file_events.emit(" not in client_branch
     for branch in ('elif parts[0] == "rep":', 'elif parts[0] == "sms":', 'elif parts[0] == "email":'):
         tail = src[src.index(branch) :]
-        next_branch = re.search(r"\n    elif parts\[0\] == |\n    return await get_unified_communication_thread", tail[1:])
+        next_branch = re.search(r"\n    elif parts\[0\] == |\n    (?:return await get_unified_communication_thread|try:\n        detail = await get_unified_communication_thread)", tail[1:])
+        assert next_branch is not None, branch
         assert "file_events.emit(" not in tail[: next_branch.start() + 1], branch
     assert "file_events.emit(" not in inspect.getsource(comms_router.compose_new_message)
     for call in _emit_calls(src):
