@@ -2429,6 +2429,7 @@ def plan_brief(cockpit: dict[str, Any]) -> dict[str, Any]:
         "dscr_before": dscr.get("before"),
         "dscr_after": dscr.get("after"),
         "dscr_basis": dscr.get("basis"),
+        "coverage_comparison": impact.get("coverage_comparison"),
         "debt_service_before_monthly": service.get("before"),
         "debt_service_after_monthly": service.get("after"),
         "ebitda": impact.get("ebitda"),
