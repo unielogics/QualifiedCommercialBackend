@@ -15,7 +15,7 @@ from app.enums import Role
 from app.routers.financial_metrics import FinancialEarningsSources, FinancialRevenueAssumptions
 from app.services import financial_cockpit
 from app.services.financial_earnings_sources import align_coverage, attach, change
-from app.tests.test_financial_metric_review import ACTOR, ENTITY, build, file, pnl
+from app.tests.test_financial_metric_review import ACTOR, ENTITY, build, correction, file, pnl
 
 
 def business(year, revenue, income, **facts):
@@ -54,6 +54,17 @@ def test_entity_alias_and_current_amortization_fix_latest_business_estimate_with
     assert next(row for row in selected["sources"] if row["file_id"] == "personal")["eligible"] is False
     assert all(ref["file_id"] != "personal" for ref in current["ebitda"]["headline"]["source_refs"])
     assert next(row for row in current["metric_review"]["inputs"] if row["key"].endswith(":2025.depreciation"))["source_refs"][0]["fact_key"] == "amortization_health_record_soft"
+
+
+def test_calendar_year_labels_use_normalized_tax_year_for_latest_source_and_coverage():
+    rows = sources()
+    rows[0]["key_facts"]["tax_year"] = "Calendar year 2024"
+    rows[1]["key_facts"]["tax_year"] = "Calendar year 2025"
+    current = build(rows)
+    assert selection(current)["selected_file_id"] == "tax-2025"
+    assert next(row for row in selection(current)["sources"] if row["selected"])["tax_year"] == "2025"
+    assert current["dscr"]["headline"]["numerator"] == -54369
+    assert current["dscr"]["headline"]["period"] == "2025"
 
 
 def test_reasoned_manual_sources_preserve_history_and_revenue_comparison_not_add_annual_returns():
@@ -248,6 +259,60 @@ def test_current_partial_pl_baseline_keeps_prior_full_years_as_annual_trend_only
     assert trend["forecast"]["projected_revenue"] == 400000
     assert trend["forecast"]["projected_ebitda"] == 52000
     assert {ref["file_id"] for ref in trend["forecast"]["source_refs"]} == {"source"}
+
+
+def test_two_full_annual_pls_provide_revenue_trend_without_adding_old_earnings():
+    prior = pnl(period_start="2024-01-01", period_end="2024-12-31", gross_revenue=100000)
+    prior.update(file_id="pl-2024", file_name="2024 P&L.pdf")
+    latest = pnl(period_start="2025-01-01", period_end="2025-12-31", gross_revenue=150000)
+    current = build([prior, latest])
+    trend = current["ebitda"]["revenue_trend"]
+    assert trend["comparison"]["prior_revenue"] == 100000
+    assert trend["comparison"]["current_revenue"] == 150000
+    assert trend["comparison"]["change_pct"] == 50 and trend["direction"] == "up"
+    assert trend["periods"][0]["source_refs"][0]["file_id"] == "pl-2024"
+    assert current["ebitda"]["headline"]["value"] == 26000
+    assert {ref["file_id"] for ref in current["ebitda"]["headline"]["source_refs"]} == {"source"}
+
+
+def test_prior_annual_pl_keeps_its_own_ebitda_as_comparison_while_latest_is_baseline():
+    prior = pnl(period_start="2024-01-01", period_end="2024-12-31", net_income=29000)
+    prior.update(file_id="pl-2024", file_name="2024 P&L.pdf")
+    latest = pnl(period_start="2025-01-01", period_end="2025-12-31", net_income=44000)
+    current = build([prior, latest])
+    periods = current["ebitda"]["revenue_trend"]["periods"]
+    assert [(row["year"], row["ebitda"], row["ebitda_kind"]) for row in periods] == [
+        ("2024", 35000, "computed_ebitda"), ("2025", 50000, "computed_ebitda")]
+    assert current["ebitda"]["headline"]["value"] == 50000
+    state = correction(current, value=None, mark_unknown=True)
+    unknown = build([prior, latest], state=state)
+    assert unknown["ebitda"]["headline"] is None
+    assert [row["ebitda"] for row in unknown["ebitda"]["revenue_trend"]["periods"]] == [35000, None]
+    assert unknown["dscr"]["headline"] is None
+
+
+def test_other_business_prior_annual_pl_never_supplies_revenue_comparison():
+    prior = pnl(period_start="2024-01-01", period_end="2024-12-31", business_name="Unrelated LLC", gross_revenue=1)
+    prior.update(file_id="other-pl-2024", file_name="Other business P&L.pdf")
+    latest = pnl(period_start="2025-01-01", period_end="2025-12-31", gross_revenue=150000)
+    current = build([prior, latest])
+    trend = current["ebitda"]["revenue_trend"]
+    assert trend["comparison"] is None and trend["direction"] is None
+    assert [row["file_id"] for row in trend["periods"]] == ["source"]
+    assert selection(current)["selected_file_id"] == "source"
+
+
+def test_matching_annual_pl_history_takes_one_observation_per_period_when_tax_also_exists():
+    prior = pnl(period_start="2024-01-01", period_end="2024-12-31", basis="cash", gross_revenue=100000)
+    prior.update(file_id="pl-2024", file_name="2024 P&L.pdf")
+    latest = pnl(period_start="2025-01-01", period_end="2025-12-31", basis="cash", gross_revenue=200000)
+    current = build([*sources(), prior, latest])
+    trend = current["ebitda"]["revenue_trend"]
+    assert selection(current)["selected_file_id"] == "source"
+    assert [row["file_id"] for row in trend["periods"]] == ["pl-2024", "source"]
+    assert trend["comparison"]["prior_revenue"] == 100000
+    assert trend["comparison"]["current_revenue"] == 200000
+    assert trend["comparison"]["change_pct"] == 100
 
 
 def test_excluding_latest_period_never_falls_back_to_previous_year():

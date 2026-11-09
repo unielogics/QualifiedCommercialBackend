@@ -107,6 +107,24 @@ def test_newer_business_tax_year_prevents_prior_pl_from_becoming_current_noi():
     assert "latest business reporting period" in result["reason"]
 
 
+def test_latest_printed_calendar_year_tax_label_prevents_older_pl_noi_fallback():
+    latest_tax = source(2025, key="tax-2025", kind="tax_return", tax_form="1120-S", tax_year="Calendar year 2025",
+                        period_start=None, period_end=None, ordinary_business_income=200000)
+    result = build([source(2024), latest_tax])
+    assert result["headline"] is None
+    assert result["years"][0]["year"] == "2024"
+    assert result["scenario"]["current"] is None
+    assert "latest business reporting period" in result["reason"]
+
+
+def test_printed_year_without_pl_dates_does_not_invent_an_annual_noi_period():
+    result = build([source(tax_year="Calendar year 2025", period_start=None, period_end=None)])
+    assert result["headline"] is None
+    assert result["candidates"][0]["months_covered"] is None
+    assert result["candidates"][0]["annualized_value"] is None
+    assert result["years"] == []
+
+
 def test_latest_excluded_pl_does_not_substitute_an_older_period():
     result = build([source(2024), source(2025)], source_selection={"excluded_file_ids": ["pnl-2025"]})
     assert result["headline"] is None and "excluded" in result["reason"]
@@ -192,6 +210,7 @@ def test_fundamental_correction_changes_working_noi_while_retaining_reported_sou
     assert headline["staff_adjusted"] and headline["provisional"]
     assert headline["reconciliation_difference"] == -20000
     assert headline["input_keys"] == ["profit_and_loss.total_operating_expenses"]
+    assert headline["active_input_keys"] == ["profit_and_loss.total_operating_expenses"]
 
 
 def test_explicit_reported_operating_income_correction_takes_priority_over_component_review():
@@ -204,7 +223,23 @@ def test_explicit_reported_operating_income_correction_takes_priority_over_compo
     headline = build([source(operating_income=20000, total_operating_expenses=380000)], metric_review=review)["headline"]
     assert headline["value"] == headline["reviewed_value"] == 45000
     assert headline["computed_value"] == 40000 and headline["reported_value"] == 20000
-    assert headline["input_keys"] == ["profit_and_loss.reported_operating_income"]
+    assert headline["input_keys"] == ["profit_and_loss.total_operating_expenses", "profit_and_loss.reported_operating_income"]
+    assert headline["active_input_keys"] == ["profit_and_loss.reported_operating_income"]
+
+
+def test_reported_noi_exposes_all_reviewable_fundamentals_but_uses_only_the_reported_amount():
+    values = {"gross_revenue": 500000, "cost_of_goods_sold": 100000,
+              "total_operating_expenses": 350000, "reported_operating_income": 50000}
+    review = {"inputs": [{"key": f"profit_and_loss.{key}", "value": value, "correction": None,
+                          "source_refs": [{"file_id": "pnl-2025", "fact_key": "operating_income" if key == "reported_operating_income" else key}]}
+                         for key, value in values.items()]}
+    headline = build([source(operating_income=50000)], metric_review=review)["headline"]
+    assert headline["input_keys"] == [f"profit_and_loss.{key}" for key in values]
+    assert headline["active_input_keys"] == ["profit_and_loss.reported_operating_income"]
+    assert headline["value"] == 50000
+    assert headline["computed_value"] == 50000
+    assert [row["source_refs"][0]["fact_key"] for row in headline["fundamentals"]] == [
+        "gross_revenue", "cost_of_goods_sold", "total_operating_expenses", "operating_income"]
 
 
 def test_marking_reported_noi_unknown_does_not_restore_its_old_source_amount():

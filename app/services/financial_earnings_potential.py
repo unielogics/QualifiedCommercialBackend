@@ -28,8 +28,8 @@ def build(ebitda, service, evaluation, *, statement=None):
         if months is not None and 6 <= months <= 12 and reported_revenue is not None:
             revenue = reported_revenue * 12 / months
             annualized = months != 12
-    currency = headline.get("currency")
-    basis = headline.get("basis")
+    currency = headline.get("currency") or period.get("currency")
+    basis = headline.get("basis") or period.get("basis")
     usable = bool(headline and not selection.get("stale") and file_id
                   and annual_earnings is not None and revenue is not None and revenue > 0
                   and currency and basis in {"cash", "accrual"})
@@ -87,7 +87,7 @@ def build(ebitda, service, evaluation, *, statement=None):
         "reason": None if usable else "A latest-year business earnings source with known annual earnings, revenue, reporting period, currency and accounting basis is needed for an earnings potential calculation.",
         "baseline": {"revenue": _rounded(revenue), "earnings": annual_earnings,
                      "kind": headline.get("kind"), "margin_pct": round(annual_earnings / revenue * 100, 4) if usable else None,
-                     "period": headline.get("period"), "currency": currency, "basis": basis,
+                     "period": headline.get("period") or period.get("year"), "currency": currency, "basis": basis,
                      "provisional": bool(headline.get("provisional")), "annualized": annualized},
         "trend": {"direction": comparison.get("direction") if comparison.get("comparable") else "unavailable",
                   "change_pct": comparison.get("change_pct"), "prior_year": comparison.get("prior_year"), "current_year": comparison.get("current_year")},

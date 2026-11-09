@@ -15,7 +15,7 @@ CURRENCY_KEYS = ("numerator_currency", "denominator_currency", "source_currencie
 RESULT_KEYS = ("key", "label", "kind", "value", "annualized_value", "period", "months_covered", "annualization_factor",
                "formula", "complete", "provisional", "entity_mismatch", "entity_comparable", "missing_inputs", "input_keys",
                "computed_value", "reported_value", "currency", "basis", "numerator", "denominator", "selected", "basis_status", "debt_version_id", "notes",
-               "source_value", "reviewed_value", "reviewed_label", "staff_adjusted", "year", "period_start", "period_end", *CURRENCY_KEYS)
+               "source_value", "reviewed_value", "reviewed_label", "staff_adjusted", "active_input_keys", "year", "period_start", "period_end", *CURRENCY_KEYS)
 
 
 def _number(value):
@@ -240,12 +240,19 @@ def current_review_projection(result, cockpit):
     annual = (brief or {}).get("validated_annual") or {}
     service = ((cockpit or {}).get("debt") or {}).get("service") or {}
     strict_ebitda = annual.get("ebitda_annual") if annual.get("currency") == "USD" else None
+    operating = (brief or {}).get("noi", {}).get("historical") or {}
+    revenue_baseline = (((cockpit or {}).get("ebitda") or {}).get("potential") or {}).get("baseline") or {}
+    current_revenue = revenue_baseline.get("revenue") if revenue_baseline.get("currency") == "USD" else None
     metrics.update({"estimated_dscr": primary.get("value"), "dscr": primary.get("value"),
                     "annual_debt_service": service.get("annual"), "monthly_debt_service": service.get("monthly"),
                     "debt_service_monthly": service.get("monthly"),
                     "annual_ebitda": strict_ebitda, "bankable_ebitda": strict_ebitda,
                     "estimated_ebitda_or_cash_flow": strict_ebitda,
                     "ebitda_source": "profit_and_loss" if strict_ebitda is not None else None,
+                    "annual_revenue": current_revenue, "annualized_revenue": current_revenue,
+                    "revenue_period": revenue_baseline.get("period"),
+                    "noi": operating.get("value"), "annual_noi": operating.get("annualized_value"),
+                    "noi_period": operating.get("period"), "noi_definition": "business_operating_income",
                     "dscr_basis": primary.get("key"), "dscr_earnings": primary.get("numerator"),
                     "dscr_earnings_label": primary.get("numerator_label"),
                     "dscr_source_refs": primary.get("source_refs") or [],

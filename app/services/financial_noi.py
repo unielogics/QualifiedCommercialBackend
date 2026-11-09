@@ -12,7 +12,7 @@ from datetime import date
 from types import SimpleNamespace
 
 from app.services.financial_metric_review import number
-from app.services.public_underwriting_packet_pdf import _num
+from app.services.public_underwriting_packet_pdf import _num, _tax_year
 
 DEFINITION = {
     "key": "business_operating_income",
@@ -60,7 +60,11 @@ def _end(facts):
     try:
         return date.fromisoformat(str(facts.get("period_end")))
     except (TypeError, ValueError):
-        year = str(facts.get("tax_year") or "")
+        # Normalize printed labels such as "Calendar year 2025" using the
+        # same year extraction as the tax history. This placeholder orders
+        # business periods only; _period still requires actual P&L dates
+        # before producing annual operating income.
+        year = _tax_year(facts) or ""
         return date(int(year), 12, 31) if len(year) == 4 and year.isdigit() and 1 <= int(year) <= 9999 else None
 
 
@@ -172,7 +176,12 @@ def _candidate(row, *, entity=None, metric_review=None):
             "reconciliation_required": reconciliation_required,
             "entity_comparable": comparable, "entity_mismatch": bool(entity and not comparable),
             "formula": "staff-reviewed operating income" if reported_corrected else DEFINITION["formula"] if use_reviewed_components else "source-reported operating income" if reported is not None else DEFINITION["formula"],
-            "input_keys": [line["input_key"] for line in active if line["input_key"]],
+            # The review workspace needs every source-bound fundamental to
+            # inspect and correct it, even when reported NOI supplies the
+            # current figure. Keep the arithmetic basis separate: exposing
+            # four inputs never means adding reported NOI to its components.
+            "input_keys": [line["input_key"] for line in fundamentals if line["input_key"]],
+            "active_input_keys": [line["input_key"] for line in active if line["input_key"]],
             "missing_inputs": missing, "fundamentals": fundamentals, "notes": notes, "source_refs": source_refs}
 
 

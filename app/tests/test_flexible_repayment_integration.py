@@ -203,7 +203,10 @@ def test_cockpit_proposed_schedule_and_plan_keep_events_without_touching_ebitda(
 
     baseline = financial_cockpit.build_cockpit([*SIX_MONTHS, TAX_2025], [LOAN_ROW])
     planned = financial_cockpit.build_cockpit([*SIX_MONTHS, TAX_2025], [LOAN_ROW], plan=plan_for())
-    assert planned["ebitda"] == baseline["ebitda"]
+    assert {key: value for key, value in planned["ebitda"].items() if key != "potential"} == {
+        key: value for key, value in baseline["ebitda"].items() if key != "potential"}
+    assert planned["ebitda"]["potential"]["baseline"] == baseline["ebitda"]["potential"]["baseline"]
+    assert planned["ebitda"]["potential"]["current"] == baseline["ebitda"]["potential"]["current"]
     assert planned["dscr"] == baseline["dscr"]
     proposed = planned["proposed_terms"]
     assert proposed["repayment_config"] == CONFIG and proposed["schedule"]["scheduled_balloons"]

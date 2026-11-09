@@ -134,12 +134,13 @@ def test_tax_only_and_bank_only_do_not_become_scenario_ebitda():
     assert bank_result["debt_service_savings_monthly"] == bank_result["cash_flow_change_monthly"] == 500
 
 
-def test_tax_dscr_and_separate_strict_pl_ebitda_keep_their_own_bases():
+def test_latest_pl_supplies_both_coverage_and_earnings_with_prior_tax_comparative():
     c = planned([tax(), pnl()], retire=["row:debt"], new_payment_monthly=500)
-    assert c["dscr"]["headline"]["key"] == "tax_return"
+    assert c["dscr"]["headline"]["key"] == "profit_and_loss"
     assert projection(c)["source_kind"] == "computed_ebitda"
     assert projection(c)["before"] == projection(c)["after"] == 26000
-    assert c["plan"]["evaluation"]["income_before_annual"] == 115000
+    assert c["plan"]["evaluation"]["income_before_annual"] == 52000
+    assert c["dscr"]["comparative_candidates"][0]["numerator"] == 115000
 
 
 def test_zero_and_loss_baselines_remain_known_and_signed():

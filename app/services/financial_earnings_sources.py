@@ -42,13 +42,15 @@ def _source_order(row):
 def attach(ebitda, review, analyses, years, statement, bank, *, state=None, entity=None, now=None):
     """Apply a current source receipt after operand/recipe reviews, before plans."""
     from app.services.document_associations import identity_matches, source_excluded
-    from app.services.financial_tax_earnings import tax_source_is_business
+    from app.services.financial_tax_earnings import normalize_tax_earnings, tax_source_is_business
 
     state = state or {}
     candidates = ebitda.get("candidates") or []
     by_file = {_file(row): row for row in candidates}
+    tax_year_by_file = {str(row.get("file_id")): str(row.get("year")) for row in years}
     sources = []
     business_periods = []
+    comparison_sources = {}
     for row in analyses:
         classes = _classes(row)
         is_tax = bool(classes.intersection({"tax_return", "personal_tax_return", "business_tax_return"}))
@@ -56,6 +58,7 @@ def attach(ebitda, review, analyses, years, statement, bank, *, state=None, enti
             continue
         facts = row.get("key_facts") or {}
         business_tax = tax_source_is_business(facts) and "personal_tax_return" not in classes
+        tax_period = normalize_tax_earnings(facts) if is_tax and business_tax else {}
         candidate = by_file.get(str(row.get("file_id")))
         identity = _identity(facts)
         scope_reason = (
@@ -68,12 +71,14 @@ def attach(ebitda, review, analyses, years, statement, bank, *, state=None, enti
         )
         reason = scope_reason or ("This source is not the current parsed earnings record for its period." if candidate is None else None)
         source_refs = candidate.get("source_refs", []) if candidate else []
+        if scope_reason is None:
+            comparison_sources[str(row.get("file_id"))] = row
         sources.append({
             "file_id": str(row.get("file_id")), "file_name": row.get("file_name"),
             "analysis_id": row.get("analysis_id"), "content_hash": row.get("content_hash"),
             "entity": identity, "period": candidate.get("period") if candidate else str(facts.get("tax_year") or facts.get("period_end") or "Unknown period"),
-            "period_end": (candidate or {}).get("period_end") or next((ref.get("period_end") for ref in source_refs if ref.get("period_end")), None) or facts.get("period_end"),
-            "tax_year": facts.get("tax_year"),
+            "period_end": (candidate or {}).get("period_end") or next((ref.get("period_end") for ref in source_refs if ref.get("period_end")), None) or facts.get("period_end") or tax_period.get("period_end"),
+            "tax_year": tax_year_by_file.get(str(row.get("file_id"))) or (str(tax_period["period_end"])[:4] if tax_period.get("period_end") else facts.get("tax_year")),
             "kind": "personal_tax_return" if is_tax and not business_tax else "tax_return" if is_tax else "profit_and_loss",
             "currency": candidate.get("currency") if candidate else facts.get("currency"),
             "eligible": reason is None, "reason": reason, "source_refs": source_refs,
@@ -145,12 +150,32 @@ def attach(ebitda, review, analyses, years, statement, bank, *, state=None, enti
         "latest_period_end": latest.get("period_end") if latest else None,
         "legacy_selection_replaced": legacy_selection_replaced,
     }
+    comparative_statements = []
+    for observed in (statement.get("statements") or [statement]) if statement else []:
+        if (str(observed.get("file_id")) == str(statement.get("file_id"))
+                and observed.get("period_start") == statement.get("period_start")
+                and observed.get("period_end") == statement.get("period_end")):
+            # Reviewed current operands, including an explicit unknown, take
+            # precedence over the retained raw history for that exact period.
+            observed = statement
+        original = comparison_sources.get(str(observed.get("file_id")))
+        if not original or entity and not identity_matches(entity, observed.get("business_name"), original.get("identity_association")):
+            continue
+        facts = original.get("key_facts") or {}
+        comparative_statements.append({**observed, "file_name": original.get("file_name"),
+            "comparison_ebitda_kind": "reported_ebitda" if number(facts.get("ebitda")) is not None else "computed_ebitda",
+            "comparison_source_refs": [{"file_id": str(original.get("file_id")), "file_name": original.get("file_name"),
+                "analysis_id": original.get("analysis_id"), "content_hash": original.get("content_hash"),
+                "accepted": bool(original.get("accepted")), "entity": observed.get("business_name") or _identity(facts),
+                "period_start": observed.get("period_start"), "period_end": observed.get("period_end"),
+                "currency": observed.get("currency"), "basis": observed.get("basis")} ]})
     ebitda["revenue_trend"] = revenue_trend(years, statement, candidates, bank, now=now,
         assumptions=forecast_assumptions,
-        selected_file_id=selected_row["file_id"] if selected_row else None)
+        selected_file_id=selected_row["file_id"] if selected_row else None,
+        comparative_statements=comparative_statements)
 
 
-def revenue_trend(years, statement, candidates, bank, *, now=None, assumptions=None, selected_file_id=None):
+def revenue_trend(years, statement, candidates, bank, *, now=None, assumptions=None, selected_file_id=None, comparative_statements=None):
     """Compare comparable full business periods, never deposits as revenue."""
     candidate_files = {_file(row): row for row in candidates}
     periods = []
@@ -173,28 +198,35 @@ def revenue_trend(years, statement, candidates, bank, *, now=None, assumptions=N
             "file_id": str(row.get("file_id")), "file_name": next((ref.get("file_name") for ref in candidate.get("source_refs", [])), None),
             "source_refs": candidate.get("source_refs", []),
         })
-    if statement:
-        candidate = candidate_files.get(str(statement.get("file_id")), {})
-        first, last = statement.get("period_start"), statement.get("period_end")
+    selected_kind = candidate_files.get(selected_file_id, {}).get("kind")
+    prefer_pl = selected_kind in {"computed_ebitda", "reported_ebitda"}
+    for observed in comparative_statements if comparative_statements is not None else [statement] if statement else []:
+        candidate = candidate_files.get(str(observed.get("file_id")), {})
+        first, last = observed.get("period_start"), observed.get("period_end")
+        if candidate and (candidate.get("period_start"), candidate.get("period_end")) != (first, last):
+            candidate = {}  # A multi-period file's current result is not prior-year earnings.
         try:
             start, end = date.fromisoformat(first), date.fromisoformat(last)
             complete = (start.day == 1 and start.month == end.month % 12 + 1 and end.day == monthrange(end.year, end.month)[1]
-                        and (end.year - start.year) * 12 + end.month - start.month + 1 == 12 and statement.get("months_covered") == 12)
+                        and (end.year - start.year) * 12 + end.month - start.month + 1 == 12 and observed.get("months_covered") == 12)
         except (TypeError, ValueError):
             complete = False
-        if complete and candidate and not candidate.get("entity_mismatch"):
-            revenue = number(statement.get("gross_revenue"))
+        if complete and not candidate.get("entity_mismatch"):
+            revenue = number(observed.get("gross_revenue"))
+            comparative_ebitda = candidate.get("value") if candidate else number(observed.get("ebitda"))
+            comparative_kind = candidate.get("kind") if candidate else observed.get("comparison_ebitda_kind") if comparative_ebitda is not None else None
             pl_period = {"year": str(end.year), "period_start": first, "period_end": last, "months_covered": 12,
                          "revenue": revenue, "average_monthly_revenue": round(revenue / 12, 2) if revenue is not None else None,
-                         "ebitda": candidate.get("value"), "ebitda_kind": candidate.get("kind"),
-                         "currency": statement.get("currency"), "basis": statement.get("basis"),
-                         "file_id": str(statement.get("file_id")), "file_name": next((ref.get("file_name") for ref in candidate.get("source_refs", [])), None),
-                         "source_refs": candidate.get("source_refs", [])}
+                         "ebitda": comparative_ebitda, "ebitda_kind": comparative_kind,
+                         "currency": observed.get("currency"), "basis": observed.get("basis"),
+                         "file_id": str(observed.get("file_id")), "file_name": next((ref.get("file_name") for ref in candidate.get("source_refs", [])), observed.get("file_name")),
+                         "source_refs": candidate.get("source_refs") or observed.get("comparison_source_refs", [])}
             duplicate = next((row for row in periods if row["period_start"] == first and row["period_end"] == last), None)
             if duplicate is None:
                 periods.append(pl_period)
-            elif pl_period["file_id"] == selected_file_id:
+            elif pl_period["file_id"] == selected_file_id or prefer_pl and not duplicate.get("is_pl"):
                 periods[periods.index(duplicate)] = pl_period
+            pl_period["is_pl"] = True
     periods.sort(key=lambda row: row.get("period_end") or row["year"])
     full = [row for row in periods if row["months_covered"] == 12 and row["revenue"] is not None]
     comparison = None
