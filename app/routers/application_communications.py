@@ -16,7 +16,7 @@ import re
 from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import Annotated, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -45,8 +45,16 @@ from app.models.referral_partner_company import ReferralPartnerCompany
 from app.models.user import User
 from app.routers import application_profiles as profile_routes
 from app.schemas.application_profile import FileCreditInviteRequest, VerificationInvitationCreate
+from app.schemas.communication import CommunicationImage, UnifiedCommunicationCompose
 from app.services import application_profiles as profiles
-from app.services import application_terms, file_contacts, production_term_sheets, provenance
+from app.services import (
+    application_terms,
+    communication_images,
+    file_contacts,
+    inline_images,
+    production_term_sheets,
+    provenance,
+)
 from app.services import merchant_processing as merchant_offers
 from app.services.application_terms_pdf import filename_for as application_terms_filename
 from app.services.application_terms_pdf import render_terms_pdf
@@ -60,7 +68,7 @@ from app.services.sms import is_opted_out, sms_available, unavailable_reason
 router = APIRouter(prefix="/application-profiles", tags=["application-communications"])
 
 MAX_EMAIL_ATTACHMENT_BYTES = 8 * 1024 * 1024
-MAX_EMAIL_ATTACHMENTS_TOTAL_BYTES = 15 * 1024 * 1024
+MAX_EMAIL_ATTACHMENTS_TOTAL_BYTES = 6 * 1024 * 1024
 DIRECT_CONTACT_SUPPRESSION_REASON = (
     "Direct client contact is suppressed on this referral-managed file. "
     "Route the email through the referring professional."
@@ -155,12 +163,14 @@ class ApplicationEmailMessageRead(BaseModel):
     delivery_status: str
     delivery_detail: str | None = None
     attachment_names: list[str] = Field(default_factory=list)
+    images: list[CommunicationImage] = Field(default_factory=list)
     created_at: datetime
 
 
 class ApplicationEmailThreadDetail(BaseModel):
     thread: ApplicationEmailThreadRead
     messages: list[ApplicationEmailMessageRead]
+    delivery_warning: str | None = None
 
 
 class MerchantOfferEmailAttachmentRef(BaseModel):
@@ -213,16 +223,16 @@ class ApplicationEmailAttachmentOptions(BaseModel):
     options: list[ApplicationEmailAttachmentOption] = Field(default_factory=list)
 
 
-class ApplicationEmailCreate(BaseModel):
+class ApplicationEmailCreate(UnifiedCommunicationCompose):
     to_contact_id: str = Field(min_length=1, max_length=80)
     cc_contact_ids: list[str] = Field(default_factory=list, max_length=8)
     subject: str = Field(min_length=1, max_length=200)
-    body: str = Field(min_length=1, max_length=10000)
+    body: str = Field(default="", max_length=10000)
     attachments: list[ApplicationEmailAttachmentRef] = Field(default_factory=list, max_length=10)
 
 
-class ApplicationEmailReply(BaseModel):
-    body: str = Field(min_length=1, max_length=10000)
+class ApplicationEmailReply(UnifiedCommunicationCompose):
+    body: str = Field(default="", max_length=10000)
     attachments: list[ApplicationEmailAttachmentRef] = Field(default_factory=list, max_length=10)
 
 
@@ -890,6 +900,7 @@ async def _thread_detail(
             .scalars()
             .all()
         }
+    message_images = await inline_images.hydrate(db, "rep_inbox_message", [str(item.id) for item in messages])
     return ApplicationEmailThreadDetail(
         thread=await _thread_read(db, thread, user, contacts),
         messages=[
@@ -918,6 +929,7 @@ async def _thread_detail(
                     if item.message_send_id in sends
                     else []
                 ),
+                images=message_images.get(str(item.id), []),
                 created_at=item.created_at,
             )
             for item in messages
@@ -1053,6 +1065,7 @@ async def _send_thread_email(
     body_html: str | None = None,
     attachments: list[tuple[str, bytes, str]] | None = None,
     headers: dict[str, str] | None = None,
+    images=None,
 ) -> DealerRepInboxMessage:
     # The firm sign-off goes on here rather than at each call site, so every
     # route out of this tab — new thread, reply, retry — is signed the same.
@@ -1081,6 +1094,7 @@ async def _send_thread_email(
         thread.provider_thread_id = outcome.provider_thread_id
     now = datetime.now(UTC)
     message = DealerRepInboxMessage(
+        id=uuid4(),
         thread_id=thread.id,
         owner_user_id=thread.owner_user_id,
         contact_id=None,
@@ -1100,10 +1114,60 @@ async def _send_thread_email(
         cc_emails=cc_emails or None,
         read_at=now,
     )
-    db.add(message)
-    thread.last_message_at = now
-    await db.flush()
+    try:
+        async with db.begin_nested():
+            db.add(message)
+            thread.last_message_at = now
+            await db.flush()
+            if images:
+                await communication_images.bind(db, images, subject_kind="rep_inbox_message", subject_id=str(message.id))
+    except Exception:
+        if not outcome.ok:
+            raise
+        message.delivery_warning = "The email was sent, but its delivery history could not be saved. Do not send it again automatically."
+        message.provider_error = "sent_not_recorded"
     return message
+
+
+async def _add_outbound_images(db, payload, user, attachments, manifest):
+    try:
+        images = await communication_images.load(db, payload.image_ids, user.id)
+    except inline_images.InlineImageError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    files = [*attachments, *communication_images.attachment_bytes(images)]
+    if len(files) > 10 or sum(len(data) for _, data, _ in files) > MAX_EMAIL_ATTACHMENTS_TOTAL_BYTES:
+        raise HTTPException(413, "All files and images together must fit within 10 attachments and 6 MB per email.")
+    manifest = [*manifest, *[{"kind": "image", "image_id": str(image.row.id), "filename": image.row.filename,
+                             "size_bytes": image.row.size_bytes} for image in images]]
+    return files, manifest, images
+
+
+def _email_send_receipt(thread, user):
+    emails = list(thread.participant_emails or [])
+    return ApplicationEmailThreadRead(
+        id=thread.id, subject=thread.subject, owner_user_id=thread.owner_user_id,
+        owner_name=user.name, owner_email=user.email, to_email=emails[0] if emails else "",
+        cc_emails=emails[1:], participant_names=emails, last_message_at=thread.last_message_at,
+        unread_count=int(thread.unread_count or 0), can_reply=True,
+        created_at=thread.created_at or datetime.now(UTC),
+    )
+
+
+async def _complete_thread_send(db, profile, thread, user, message, receipt, *, action, detail, metadata):
+    try:
+        await profiles.log_profile_action(db, profile, user, action, detail,
+                                          target_type="email_thread", target_id=thread.id, metadata=metadata)
+        await db.commit()
+        result = await _thread_detail(db, profile, thread, user)
+    except Exception:
+        if message.delivery_status != "sent":
+            raise
+        await db.rollback()
+        return ApplicationEmailThreadDetail(thread=receipt, messages=[], delivery_warning=
+            "The email was sent, but its delivery history could not be saved. Do not send it again automatically.")
+    if getattr(message, "delivery_warning", None):
+        result.delivery_warning = message.delivery_warning
+    return result
 
 
 @router.get(
@@ -1198,6 +1262,7 @@ async def create_application_email_thread(
         profile=profile,
         refs=payload.attachments,
     )
+    attachments, attachment_manifest, images = await _add_outbound_images(db, payload, user, attachments, attachment_manifest)
     now = datetime.now(UTC)
     thread = DealerRepInboxThread(
         owner_user_id=user.id,
@@ -1213,7 +1278,8 @@ async def create_application_email_thread(
     )
     db.add(thread)
     await db.flush()
-    await _send_thread_email(
+    receipt = _email_send_receipt(thread, user)
+    sent_message = await _send_thread_email(
         db,
         profile=profile,
         thread=thread,
@@ -1223,25 +1289,13 @@ async def create_application_email_thread(
         subject=payload.subject.strip(),
         body=payload.body.strip(),
         attachments=attachments,
+        **({"images": images} if images else {}),
     )
-    await profiles.log_profile_action(
-        db,
-        profile,
-        user,
-        "email.thread_created",
-        f"Started email conversation with {to.name}",
-        target_type="email_thread",
-        target_id=thread.id,
-        metadata={
-            "to": to.email,
-            "cc": cc_emails,
-            "subject": payload.subject.strip(),
-            "attachments": attachment_manifest,
-        },
+    return await _complete_thread_send(
+        db, profile, thread, user, sent_message, receipt,
+        action="email.thread_created", detail=f"Started email conversation with {to.name}",
+        metadata={"to": to.email, "cc": cc_emails, "subject": payload.subject.strip(), "attachments": attachment_manifest},
     )
-    await db.commit()
-    await db.refresh(thread)
-    return await _thread_detail(db, profile, thread, user)
 
 
 @router.get(
@@ -1301,7 +1355,9 @@ async def reply_application_email_thread(
         profile=profile,
         refs=payload.attachments,
     )
-    await _send_thread_email(
+    attachments, attachment_manifest, images = await _add_outbound_images(db, payload, user, attachments, attachment_manifest)
+    receipt = _email_send_receipt(thread, user)
+    sent_message = await _send_thread_email(
         db,
         profile=profile,
         thread=thread,
@@ -1311,19 +1367,13 @@ async def reply_application_email_thread(
         subject=f"Re: {thread.subject}",
         body=payload.body.strip(),
         attachments=attachments,
+        **({"images": images} if images else {}),
     )
-    await profiles.log_profile_action(
-        db,
-        profile,
-        user,
-        "email.thread_replied",
-        "Replied in the file email conversation",
-        target_type="email_thread",
-        target_id=thread.id,
+    return await _complete_thread_send(
+        db, profile, thread, user, sent_message, receipt,
+        action="email.thread_replied", detail="Replied in the file email conversation",
         metadata={"attachments": attachment_manifest},
     )
-    await db.commit()
-    return await _thread_detail(db, profile, thread, user)
 
 
 @router.post(
@@ -1349,10 +1399,8 @@ async def retry_application_email_message(
 
     A new row, not a mutated one: the failure happened and stays on the record.
 
-    Attachments cannot be replayed — the names are kept but the bytes are not,
-    and silently sending a stripped-down version of an email someone believes
-    they attached a file to is worse than refusing. Those go back through the
-    composer.
+    Validated image bytes can be replayed from the authorized original message.
+    Legacy attachments whose bytes were not retained still require the composer.
     """
     profile = await _load_profile(db, profile_id, user)
     await _enforce_direct_client_contact(db, profile)
@@ -1393,13 +1441,19 @@ async def retry_application_email_message(
         )
 
     names = await _attachment_names_for(db, message)
+    images = []
     if names:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "This email carried "
-            + ", ".join(names)
-            + ". Attachments cannot be re-sent automatically — reply with the file attached.",
-        )
+        from collections import Counter
+
+        try:
+            images = await communication_images.load_bound(db, "rep_inbox_message", str(message.id), user.id)
+        except inline_images.InlineImageError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if Counter(names) != Counter(image.row.filename for image in images):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "This email includes attachments whose bytes cannot be re-sent automatically. Reply with those files attached.",
+            )
 
     await _enforce_private_credit_recipient(
         db, profile, body=message.body, to_email=to_email, cc_emails=cc_emails
@@ -1415,7 +1469,8 @@ async def retry_application_email_message(
         effect="Send a live email from the application file",
     )
 
-    await _send_thread_email(
+    receipt = _email_send_receipt(thread, user)
+    sent_message = await _send_thread_email(
         db,
         profile=profile,
         thread=thread,
@@ -1426,22 +1481,13 @@ async def retry_application_email_message(
         # Already signed when it was first composed; _with_footer will not
         # append a second copy.
         body=message.body,
+        **({"images": images, "attachments": communication_images.attachment_bytes(images)} if images else {}),
     )
-    await profiles.log_profile_action(
-        db,
-        profile,
-        user,
-        "email.retried",
-        f"Retried a failed email to {to_email}",
-        target_type="email_thread",
-        target_id=thread.id,
-        metadata={
-            "retried_message_id": str(message.id),
-            "original_error": (message.provider_error or "")[:300],
-        },
+    return await _complete_thread_send(
+        db, profile, thread, user, sent_message, receipt,
+        action="email.retried", detail=f"Retried a failed email to {to_email}",
+        metadata={"retried_message_id": str(message.id), "original_error": (message.provider_error or "")[:300]},
     )
-    await db.commit()
-    return await _thread_detail(db, profile, thread, user)
 
 
 async def _attachment_names_for(db: AsyncSession, message: DealerRepInboxMessage) -> list[str]:

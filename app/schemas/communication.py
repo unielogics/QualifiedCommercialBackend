@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 CommunicationChannel = Literal[
     "client",
@@ -72,17 +72,26 @@ class UnifiedCommunicationMessage(BaseModel):
     created_at: datetime
     seen: bool = True
     delivery_status: str | None = None
-    #: Pictures on this message. Today that means an MMS the client sent us.
-    images: list[CommunicationImage] = []
+    images: list[CommunicationImage] = Field(default_factory=list)
 
 
 class UnifiedCommunicationThreadDetail(BaseModel):
     thread: UnifiedCommunicationThread
     messages: list[UnifiedCommunicationMessage] = Field(default_factory=list)
+    delivery_warning: str | None = None
 
 
 class UnifiedCommunicationCompose(BaseModel):
-    body: str = Field(min_length=1, max_length=20_000)
+    body: str = Field(default="", max_length=20_000)
+    image_ids: list[UUID] = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def content_required(self):
+        if not self.body.strip() and not self.image_ids:
+            raise ValueError("Enter a message or attach an image.")
+        if len(set(self.image_ids)) != len(self.image_ids):
+            raise ValueError("Attach each image only once.")
+        return self
 
 
 class UnifiedCommunicationSeen(BaseModel):
@@ -152,12 +161,11 @@ class ComposeRecipient(BaseModel):
     phone: str | None = None
 
 
-class UnifiedComposeRequest(BaseModel):
+class UnifiedComposeRequest(UnifiedCommunicationCompose):
     recipient_kind: Literal["client", "intake", "dealer", "rep_contact"]
     recipient_id: str
     channels: list[Literal["sms", "email"]] = Field(min_length=1)
     subject: str | None = Field(None, max_length=300)
-    body: str = Field(min_length=1, max_length=20_000)
 
 
 class ComposeChannelResult(BaseModel):
@@ -171,3 +179,4 @@ class UnifiedComposeResult(BaseModel):
     results: list[ComposeChannelResult] = Field(default_factory=list)
     #: Thread the inbox should open after a successful send.
     thread_id: str | None = None
+    delivery_warning: str | None = None

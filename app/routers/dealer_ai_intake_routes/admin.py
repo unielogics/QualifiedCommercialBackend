@@ -1814,7 +1814,7 @@ async def get_dealer_ai_client_thread(
 @core.admin_router.post("/{intake_id}/client-thread/reply", response_model=core.ClientThreadResponse)
 async def reply_dealer_ai_client_thread(
     intake_id: UUID,
-    payload: core.DealerChatRequest,
+    payload: core.ClientThreadReplyRequest,
     request: Request,
     user: core.CurrentUser,
     db: AsyncSession = Depends(core.get_db),
@@ -1830,52 +1830,84 @@ async def reply_dealer_ai_client_thread(
     An audit-log entry records the admin who authored it."""
     core._require_super_admin(user)
     intake = await core._load_admin_dealer_lead(db, intake_id)
-    if not (payload.message and payload.message.strip()):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "A message is required")
+    image_ids = getattr(payload, "image_ids", [])
+    text = (payload.message or "").strip()
+    if not text and not image_ids:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Add a message or an image")
     if intake.bucket_upload_link is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "This lead has no client upload link to reply into")
+    from app.services import communication_images, inline_images
+
+    try:
+        images = await communication_images.load(db, image_ids, user.id) if image_ids else []
+    except inline_images.InlineImageError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     attribution = f"Underwriter — {user.name}" if user.name else "Underwriter"
     portal_message = await core.create_human_message(
         db,
         bucket=intake.bucket,
         audience="uploader",
-        message=payload.message.strip(),
+        message=text,
         actor_name=attribution,
         user=user,
         upload_link=intake.bucket_upload_link,
     )
+    if images:
+        await communication_images.bind(db, images, subject_kind="bucket_message", subject_id=str(portal_message.id))
+    sms_result = None
     if payload.also_sms:
         profile_id = (
             await db.execute(
                 select(core.ApplicationProfile.id).where(core.ApplicationProfile.intake_id == intake.id)
             )
         ).scalar_one_or_none()
-        await core.send_sms_checked(
+        sms_result = await core.send_sms_checked(
             db,
             to_phone=intake.phone,
-            body=payload.message.strip(),
+            body=text,
             require_consent_kind="transactional",
             client_id=intake.client_id,
             profile_id=profile_id,
             intake_id=intake.id,
             portal_message_id=portal_message.id,
             context="intake_client_reply",
+            **({"images": images} if images else {}),
         )
     paused_until = core.engagement.pause(intake.bucket_upload_link)
-    await core._log(
-        db,
-        intake.bucket_id,
-        "dealer_ai_admin_replied_to_client",
-        request=request,
-        user=user,
-        actor_role="super_admin",
-        target_type="public_underwriting_intake",
-        target_id=str(intake.id),
-        detail=f"On-behalf reply into client thread by {user.name or user.email} · AI paused until {paused_until.isoformat()}",
-    )
-    await db.commit()
-    intake = await core._load_admin_dealer_lead(db, intake_id)
-    return await core._client_thread_response(db, intake, paused_until=paused_until)
+    persisted = False
+    try:
+        await core._log(
+            db, intake.bucket_id, "dealer_ai_admin_replied_to_client",
+            request=request, user=user, actor_role="super_admin",
+            target_type="public_underwriting_intake", target_id=str(intake.id),
+            detail=f"On-behalf reply into client thread by {user.name or user.email} · AI paused until {paused_until.isoformat()}",
+        )
+        await db.commit()
+        persisted = True
+        intake = await core._load_admin_dealer_lead(db, intake_id)
+        warning = _client_sms_delivery_warning(sms_result)
+        return await core._client_thread_response(db, intake, paused_until=paused_until,
+                                                  **({"delivery_warning": warning} if warning else {}))
+    except Exception:
+        sent = bool(sms_result is not None and getattr(sms_result, "ok", False))
+        if not sent and not persisted:
+            raise
+        await db.rollback()
+        return core.ClientThreadResponse(delivery_warning=_client_sms_delivery_warning(sms_result) or (
+            "The text was sent, but its conversation record could not be saved or reloaded. Do not send it again automatically."
+            if sent else "Your portal message was saved, but the conversation could not be reloaded. Refresh before sending again."
+        ))
+
+
+def _client_sms_delivery_warning(result) -> str | None:
+    if result is None:
+        return None
+    detail = str(getattr(result, "detail", "") or "")
+    if detail == "sent_but_image_links_unavailable":
+        return "The text was sent, but its image links are unavailable. Contact support before sending a replacement."
+    if detail.startswith("sent_not_recorded"):
+        return "The text was sent, but its delivery history could not be saved. Do not send it again automatically."
+    return None
 
 @core.admin_router.post(
     "/{intake_id}/client-thread/{message_id}/sms-retry",
@@ -1898,6 +1930,7 @@ async def retry_dealer_ai_client_thread_sms(
                 core.BucketAIMessage.bucket_id == intake.bucket_id,
                 core.BucketAIMessage.audience == "uploader",
                 core.BucketAIMessage.sender_kind == "operator",
+                core.BucketAIMessage.upload_link_id == intake.bucket_upload_link_id,
             )
         )
     ).scalar_one_or_none()
@@ -1913,10 +1946,16 @@ async def retry_dealer_ai_client_thread_sms(
     ).scalar_one_or_none()
     if prior is not None and prior.status in {"sent", "delivered"}:
         raise HTTPException(status.HTTP_409_CONFLICT, "This message was already sent by SMS")
+    from app.services import communication_images, inline_images
+
+    try:
+        images = await communication_images.load_bound(db, subject_kind="bucket_message", subject_id=str(message.id))
+    except inline_images.InlineImageError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     profile_id = (
         await db.execute(select(core.ApplicationProfile.id).where(core.ApplicationProfile.intake_id == intake.id))
     ).scalar_one_or_none()
-    await core.send_sms_checked(
+    sms_result = await core.send_sms_checked(
         db,
         to_phone=intake.phone,
         body=message.content,
@@ -1926,21 +1965,25 @@ async def retry_dealer_ai_client_thread_sms(
         intake_id=intake.id,
         portal_message_id=message.id,
         context="intake_client_retry",
+        **({"images": images} if images else {}),
     )
-    await core._log(
-        db,
-        intake.bucket_id,
-        "dealer_ai_admin_retried_client_sms",
-        request=request,
-        user=user,
-        actor_role="underwriter",
-        target_type="bucket_ai_message",
-        target_id=str(message.id),
-        detail=f"SMS delivery retried by {user.name or user.email}",
-    )
-    await db.commit()
-    intake = await core._load_admin_dealer_lead(db, intake_id)
-    return await core._client_thread_response(db, intake)
+    try:
+        await core._log(
+            db, intake.bucket_id, "dealer_ai_admin_retried_client_sms",
+            request=request, user=user, actor_role="underwriter",
+            target_type="bucket_ai_message", target_id=str(message.id),
+            detail=f"SMS delivery retried by {user.name or user.email}",
+        )
+        await db.commit()
+        intake = await core._load_admin_dealer_lead(db, intake_id)
+        warning = _client_sms_delivery_warning(sms_result)
+        return await core._client_thread_response(db, intake, **({"delivery_warning": warning} if warning else {}))
+    except Exception:
+        if not bool(getattr(sms_result, "ok", False)):
+            raise
+        await db.rollback()
+        return core.ClientThreadResponse(delivery_warning=_client_sms_delivery_warning(sms_result) or
+            "The text was sent, but its conversation record could not be saved or reloaded. Do not send it again automatically.")
 
 @core.admin_router.post("/{intake_id}/client-thread/resume", response_model=core.ClientThreadResponse)
 async def resume_dealer_ai_client_thread(

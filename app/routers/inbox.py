@@ -44,6 +44,7 @@ from app.schemas.inbox import (
     MarkReadRequest,
     StarRequest,
 )
+from app.services import communication_images, inline_images
 from app.services.email.user_inbox_sync import decrypt_body
 from app.services.email.user_mailer import send_as_user
 
@@ -194,6 +195,7 @@ async def get_thread(thread_id: str, user: CurrentUser, db: AsyncSession = Depen
     if not rows:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found")
 
+    images = await inline_images.hydrate(db, "email_message", [str(row.id) for row in rows])
     messages = [
         InboxMessageRead(
             id=r.id,
@@ -209,6 +211,7 @@ async def get_thread(thread_id: str, user: CurrentUser, db: AsyncSession = Depen
             is_read=r.is_read,
             is_starred=r.is_starred,
             has_attachments=r.has_attachments,
+            images=images.get(str(r.id), []),
             loan_id=r.loan_id,
             client_id=r.client_id,
             matched_party_role=r.matched_party_role,
@@ -240,8 +243,8 @@ async def reply_to_thread(
     reply is a normal "Re:" email; our own thread view stitches it via
     gmail_thread_id. This keeps the change isolated to the inbox surface.
     """
-    if not payload.body or not payload.body.strip():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Reply body is required")
+    if not payload.body.strip() and not payload.image_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Add a reply or an image")
 
     rows = await _load_thread_rows(db, owner_id=user.id, thread_id=thread_id)
     if not rows:
@@ -259,6 +262,12 @@ async def reply_to_thread(
     base_subject = payload.subject or latest_inbound.subject or "(no subject)"
     subject = base_subject if _RE_PREFIX.match(base_subject) else f"Re: {base_subject}"
 
+    try:
+        images = await communication_images.load(db, payload.image_ids, user.id) if payload.image_ids else []
+    except inline_images.InlineImageError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    attachment_kwargs = {"attachments": communication_images.attachment_bytes(images)} if images else {}
     result = await send_as_user(
         db,
         user.id,
@@ -266,57 +275,24 @@ async def reply_to_thread(
         subject=subject,
         body_text=payload.body,
         cc_emails=cc_emails,
+        **attachment_kwargs,
     )
     if not result.ok:
         # Do NOT persist an outbound row for a failed send.
         return InboxReplyResponse(ok=False, detail=result.detail)
-
-    # Record the sent reply as an outbound EmailMessage in the same thread. gmail
-    # message ids must be unique per (mailbox, gmail_message_id); the SES path
-    # returns no gmail id, so fall back to a synthetic local id.
-    body_enc, provider = _encrypt_reply_body(payload.body)
-    # Stitch to the same thread. For a singleton inbound (gmail_thread_id NULL) its
-    # thread key is str(id); reuse that so the outbound row groups WITH it rather
-    # than forming a disconnected new thread.
-    real_thread = latest_inbound.gmail_thread_id or str(latest_inbound.id)
-    out_gmail_id = result.message_id or f"local-{uuid.uuid4().hex}"
-    now = datetime.now(UTC)
-    # from_email is the mailbox owner's identity for THEIR OWN thread view (the row is
-    # owner-scoped). On the SES fallback the wire From is the firm address; we
-    # intentionally attribute the reply to the owner here rather than the transport.
-    db.add(
-        EmailMessage(
-            owner_user_id=user.id,
-            mailbox=latest_inbound.mailbox,
-            gmail_message_id=out_gmail_id,
-            gmail_thread_id=real_thread,
-            direction="outbound",
-            from_email=(user.email or latest_inbound.mailbox),
-            to_emails=to_emails,
-            cc_emails=cc_emails,
-            subject=subject,
-            snippet=None,
-            body_text_enc=body_enc,
-            body_html_enc=None,
-            encryption_provider=provider,
-            received_at=now,
-            loan_id=latest_inbound.loan_id,
-            client_id=latest_inbound.client_id,
-            matched_party_role=latest_inbound.matched_party_role,
-            is_read=True,
-            has_attachments=False,
-        )
-    )
-    # Sending a reply implicitly acknowledges the inbound messages in the thread.
-    for r in rows:
-        if not r.is_read:
-            r.is_read = True
 
     # The email has ALREADY been sent. Commit the outbound row + read-state now (rather
     # than relying on get_db's post-response teardown commit) so a persistence failure
     # is surfaced to the caller as a degraded result instead of silently losing the
     # record of a message that physically left.
     try:
+        await _record_outbound_message(db, user=user, result=result, body=payload.body,
+                                       to_emails=to_emails, cc_emails=cc_emails,
+                                       subject=subject, source_message=latest_inbound, images=images)
+        # Sending a reply implicitly acknowledges the inbound messages.
+        for r in rows:
+            if not r.is_read:
+                r.is_read = True
         await db.commit()
     except Exception:  # noqa: BLE001
         await db.rollback()
@@ -328,6 +304,40 @@ async def reply_to_thread(
         )
 
     return InboxReplyResponse(ok=True, detail=result.detail, message_id=result.message_id)
+
+
+async def _record_outbound_message(
+    db, *, user, result, body: str, to_emails: list[str], subject: str,
+    cc_emails: list[str] | None = None, source_message=None,
+    images: list[communication_images.OutboundImage] | None = None,
+    loan_id: uuid.UUID | None = None, client_id: uuid.UUID | None = None,
+) -> EmailMessage:
+    """Persist an already-sent message in its authorized owner's mailbox.
+
+    Callers keep transport failure and commit handling. Image references are
+    created only for a successful send; reusable uploads are never consumed.
+    """
+    if not result.ok:
+        raise ValueError("Only a sent email can be recorded")
+    mailbox = getattr(source_message, "mailbox", None) or user.email
+    body_enc, provider = _encrypt_reply_body(body)
+    thread_id = ((source_message.gmail_thread_id or str(source_message.id)) if source_message is not None
+                 else getattr(result, "thread_id", None))
+    row = EmailMessage(
+        id=uuid.uuid4(), owner_user_id=user.id, mailbox=mailbox,
+        gmail_message_id=result.message_id or f"local-{uuid.uuid4().hex}", gmail_thread_id=thread_id,
+        direction="outbound", from_email=user.email or mailbox, to_emails=to_emails, cc_emails=cc_emails,
+        subject=subject, snippet=None, body_text_enc=body_enc, body_html_enc=None,
+        encryption_provider=provider, received_at=datetime.now(UTC),
+        loan_id=getattr(source_message, "loan_id", None) or loan_id,
+        client_id=getattr(source_message, "client_id", None) or client_id,
+        matched_party_role=getattr(source_message, "matched_party_role", None),
+        is_read=True, has_attachments=bool(images),
+    )
+    db.add(row)
+    if images:
+        await communication_images.bind(db, images, subject_kind="email_message", subject_id=str(row.id))
+    return row
 
 
 @router.post("/threads/{thread_id}/mark-read", status_code=status.HTTP_204_NO_CONTENT)

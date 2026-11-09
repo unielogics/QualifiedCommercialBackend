@@ -1608,6 +1608,7 @@ class RepInboxMessageRead(ORM):
     read_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+    images: list[InlineImageRead] = Field(default_factory=list)
 
 
 class RepInboxComposeResult(BaseModel):
@@ -1616,8 +1617,15 @@ class RepInboxComposeResult(BaseModel):
 
 
 class RepInboxMessageCreate(BaseModel):
-    body: str = Field(min_length=1, max_length=4000)
+    body: str = Field(default="", max_length=4000)
     channel: Literal["email", "sms"] | None = None
+    image_ids: list[UUID] = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def require_message_or_image(self):
+        if not self.body.strip() and not self.image_ids:
+            raise ValueError("Write a message or attach an image.")
+        return self
 
 
 class DeliveryRowRead(BaseModel):

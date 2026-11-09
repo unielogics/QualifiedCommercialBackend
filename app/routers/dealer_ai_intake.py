@@ -1256,6 +1256,12 @@ class DealerChatRequest(BaseModel):
     also_sms: bool = False
 
 
+class ClientThreadReplyRequest(BaseModel):
+    message: str = Field(default="", max_length=4000)
+    also_sms: bool = False
+    image_ids: list[UUID] = Field(default_factory=list, max_length=10)
+
+
 class ReviewRunStartResponse(BaseModel):
     review_id: UUID
     status: str
@@ -7365,7 +7371,7 @@ async def _response(
         files=file_reads,
         ai_summary=summary,
         latest_review=review_read,
-        messages=[BucketAIMessageRead.model_validate(message) for message in (messages or [])],
+        messages=await _client_message_reads(db, list(messages or [])),
         chat_actions=await actions_for_messages(db, list(messages or [])),
         artifacts=[
             _artifact_read(
@@ -9773,6 +9779,7 @@ class ClientSmsMessageRead(BaseModel):
     context: str
     portal_message_id: UUID | None = None
     created_at: datetime
+    images: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ClientSmsStateRead(BaseModel):
@@ -9792,6 +9799,18 @@ class ClientThreadResponse(BaseModel):
     # is rendered as a second transport on that message rather than a duplicate.
     sms_messages: list[ClientSmsMessageRead] = Field(default_factory=list)
     sms_state: ClientSmsStateRead = Field(default_factory=ClientSmsStateRead)
+    delivery_warning: str | None = None
+
+
+async def _client_message_reads(db, messages: list[BucketAIMessage]) -> list[BucketAIMessageRead]:
+    """Hydrate pictures only after the caller authorizes its message query."""
+    from app.schemas.communication import CommunicationImage
+    from app.services import inline_images
+
+    images = await inline_images.hydrate(db, "bucket_message", [str(row.id) for row in messages]) if messages else {}
+    return [BucketAIMessageRead.model_validate(row).model_copy(update={
+        "images": [CommunicationImage.model_validate(image) for image in images.get(str(row.id), [])],
+    }) for row in messages]
 
 
 async def _client_thread_response(
@@ -9799,6 +9818,7 @@ async def _client_thread_response(
     intake: PublicUnderwritingIntake,
     *,
     paused_until: datetime | None = None,
+    delivery_warning: str | None = None,
 ) -> ClientThreadResponse:
     from app.dealer_os.services import sms_consent as sms_consent_svc
     from app.services.sms import is_opted_out, sms_available, unavailable_reason
@@ -9811,6 +9831,9 @@ async def _client_thread_response(
     from app.services.communication_scope import intake_sms_rows
 
     rows = await intake_sms_rows(db, intake)
+    from app.services import inline_images
+
+    sms_images = await inline_images.hydrate(db, "sms_message", [str(row.id) for row in rows]) if rows else {}
     opted_out = bool(phone and await is_opted_out(db, phone))
     consent = await sms_consent_svc.consent_for(db, phone_e164=phone, kind="transactional") if phone else None
     ready = sms_available()
@@ -9824,8 +9847,9 @@ async def _client_thread_response(
     elif not ready:
         reason = unavailable_reason() or "SMS delivery is not configured."
     return ClientThreadResponse(
-        messages=[BucketAIMessageRead.model_validate(message) for message in messages],
+        messages=await _client_message_reads(db, messages),
         ai_paused_until=paused_until,
+        delivery_warning=delivery_warning,
         sms_messages=[
             ClientSmsMessageRead(
                 id=row.id,
@@ -9839,6 +9863,7 @@ async def _client_thread_response(
                 context=row.context,
                 portal_message_id=row.portal_message_id,
                 created_at=row.created_at,
+                images=sms_images.get(str(row.id), []),
             )
             for row in rows
         ],

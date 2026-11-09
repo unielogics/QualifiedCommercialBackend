@@ -45,6 +45,18 @@ def selected_provider(settings: Settings | None = None) -> str:
     return value if value in {"aws", "twilio", "android"} else "invalid"
 
 
+def image_delivery_mode(settings: Settings | None = None) -> str:
+    """Picture delivery supported by the selected, unchanged SMS transport.
+
+    Twilio accepts media on its existing Messages endpoint. The handset relay
+    is text-only; AWS MMS also needs a separately provisioned media origin and
+    bucket policy. Those transports keep their sender and deliver explicitly
+    labelled private image links prepared by the guarded messaging service.
+    """
+    provider = selected_provider(settings)
+    return "mms" if provider == "twilio" else "secure_link" if provider in {"android", "aws"} else "unavailable"
+
+
 def _twilio_auth(settings: Settings) -> tuple[str, str] | None:
     if settings.twilio_api_key_sid and settings.twilio_api_key_secret:
         return settings.twilio_api_key_sid, settings.twilio_api_key_secret
@@ -201,11 +213,14 @@ def _send_aws(to_phone: str, body: str, settings: Settings) -> SmsSendResult:
         return _safe_failure("aws", exc)
 
 
-def _send_twilio(to_phone: str, body: str, settings: Settings) -> SmsSendResult:
+def _send_twilio(to_phone: str, body: str, settings: Settings, *, media_urls: list[str] | None = None) -> SmsSendResult:
     auth = _twilio_auth(settings)
     if auth is None:
         return SmsSendResult(False, "twilio", "Twilio API credentials are incomplete.")
-    payload = {"To": to_phone, "Body": body}
+    payload: dict[str, str | list[str]] = {"To": to_phone, "Body": body}
+    if media_urls:
+        # httpx form encoding emits one MediaUrl parameter per list item.
+        payload["MediaUrl"] = media_urls
     if settings.twilio_messaging_service_sid:
         payload["MessagingServiceSid"] = settings.twilio_messaging_service_sid
     else:
@@ -273,7 +288,7 @@ def _send_android(to_phone: str, body: str, settings: Settings) -> SmsSendResult
     )
 
 
-def send_sms(to_phone: str, body: str) -> SmsSendResult:
+def send_sms(to_phone: str, body: str, *, media_urls: list[str] | None = None) -> SmsSendResult:
     settings = get_settings()
     readiness = provider_readiness(settings)
     provider = str(readiness["provider"])
@@ -284,8 +299,14 @@ def send_sms(to_phone: str, body: str) -> SmsSendResult:
             detail=str(readiness["detail"]),
             sender=provider_sender(settings),
         )
+    if media_urls:
+        if image_delivery_mode(settings) != "mms":
+            return SmsSendResult(False, provider, "This SMS provider requires private image links; the pictures were not sent.")
+        if (len(media_urls) > 10 or any(not isinstance(url, str) or not url.startswith("https://") for url in media_urls)):
+            return SmsSendResult(False, provider, "Picture messages require at most ten secure image URLs.")
     if provider == "twilio":
-        return _send_twilio(to_phone, body, settings)
+        # Preserve the text-only call shape used by existing integrations.
+        return _send_twilio(to_phone, body, settings, media_urls=media_urls) if media_urls else _send_twilio(to_phone, body, settings)
     if provider == "aws":
         return _send_aws(to_phone, body, settings)
     if provider == "android":

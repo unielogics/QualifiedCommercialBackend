@@ -10,7 +10,9 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from app.schemas.communication import CommunicationImage
 
 
 class InboxMessageRead(BaseModel):
@@ -29,6 +31,7 @@ class InboxMessageRead(BaseModel):
     is_read: bool = False
     is_starred: bool = False
     has_attachments: bool = False
+    images: list[CommunicationImage] = Field(default_factory=list)
     loan_id: UUID | None = None
     client_id: UUID | None = None
     matched_party_role: str | None = None
@@ -69,7 +72,8 @@ class InboxThreadDetail(BaseModel):
 
 
 class InboxReplyRequest(BaseModel):
-    body: str
+    body: str = Field(default="", max_length=100_000)
+    image_ids: list[UUID] = Field(default_factory=list, max_length=10)
     to_emails: list[str] | None = None  # defaults to the latest inbound sender
     cc_emails: list[str] | None = None
     subject: str | None = None  # defaults to "Re: <thread subject>"

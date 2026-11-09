@@ -23,7 +23,7 @@ work merged, so each transport has exactly one implementation.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .optout import is_opted_out, record_opt_out
 
@@ -69,9 +69,10 @@ def unavailable_reason() -> str:
     return "" if _provider().sms_available() else str(readiness["detail"])
 
 
-def send_sms(to_phone: str, body: str) -> SmsResult:
+def send_sms(to_phone: str, body: str, *, media_urls: list[str] | None = None) -> SmsResult:
     """Raw transport send — no gates, no ledger. Prefer send_sms_checked."""
-    result = _provider().send_sms(to_phone, body)
+    result = (_provider().send_sms(to_phone, body, media_urls=media_urls)
+              if media_urls else _provider().send_sms(to_phone, body))
     return SmsResult(
         ok=result.ok,
         provider=result.provider,
@@ -92,6 +93,7 @@ async def send_sms_checked(
     portal_message_id=None,
     context: str = "",
     ledger_body: str | None = None,
+    images=None,
 ) -> SmsResult:
     """The entry point every call site should use. Guarded, and async.
 
@@ -115,6 +117,8 @@ async def send_sms_checked(
 
     provider_name = _provider().selected_provider()
     recorded_body = ledger_body if ledger_body is not None else body
+    if images and ledger_body is None and not recorded_body.strip():
+        recorded_body = "Image attachment"
 
     async def _blocked(detail: str, phone_for_row: str) -> SmsResult:
         # A refused send is a ledger row, not an absence — "why didn't the
@@ -147,16 +151,65 @@ async def send_sms_checked(
                 f"No {require_consent_kind} SMS consent on file for this number.", phone
             )
 
-    result = await asyncio.to_thread(send_sms, phone, body)
-    row = await ledger.record(
-        db, direction="outbound", phone_e164=phone,
-        status="sent" if result.ok else "failed",
-        body=recorded_body, provider=result.provider,
-        provider_message_id=result.message_id, detail=result.detail,
-        context=context, client_id=client_id,
-        profile_id=profile_id, intake_id=intake_id,
-        portal_message_id=portal_message_id,
-    )
+    shares = []
+    media_urls = None
+    if images:
+        from app.services import communication_images, inline_images
+
+        mode = _provider().image_delivery_mode()
+        if mode == "mms":
+            if sum(len(image.data) for image in images) > 5 * 1024 * 1024:
+                return await _blocked("MMS images must total no more than 5 MB. Attach smaller images or send them by email.", phone)
+            media_urls = [inline_images.view_url(image.row) for image in images]
+            if any(url is None for url in media_urls):
+                return await _blocked("Image delivery is unavailable because image storage is not configured.", phone)
+        elif mode == "secure_link":
+            if not communication_images.sms_share_available():
+                return await _blocked("Image links require a public HTTPS API address. Send the images by email instead.", phone)
+            try:
+                shares = await communication_images.reserve_sms_shares(db, images)
+            except Exception:
+                log.exception("SMS image-link preparation failed before sending")
+                return await _blocked("Image links could not be prepared. No text was sent; try again.", phone)
+            links = "\n".join(communication_images.sms_share_url(row) for row in shares)
+            body = f"{body.rstrip()}\n\nImages (links expire in 7 days):\n{links}".lstrip()
+        else:
+            return await _blocked("The selected SMS provider cannot deliver images.", phone)
+
+    result = (await asyncio.to_thread(send_sms, phone, body, media_urls=media_urls)
+              if media_urls else await asyncio.to_thread(send_sms, phone, body))
+    async def record_result():
+        return await ledger.record(
+            db, direction="outbound", phone_e164=phone,
+            status="sent" if result.ok else "failed",
+            body=recorded_body, provider=result.provider,
+            provider_message_id=result.message_id, detail=result.detail,
+            context=context, client_id=client_id,
+            profile_id=profile_id, intake_id=intake_id,
+            portal_message_id=portal_message_id,
+        )
+
+    if images:
+        from app.services import communication_images
+
+        try:
+            async with db.begin_nested():
+                row = await record_result()
+                if row is not None:
+                    await communication_images.bind(db, images, subject_kind="sms_message", subject_id=str(row.id))
+        except Exception:
+            log.exception("SMS delivery completed but image history could not be stored")
+            row = None
+        if result.ok and shares:
+            try:
+                await communication_images.activate_sms_shares(shares, row.id if row is not None else None)
+            except Exception:
+                log.exception("Text was sent but its image links could not be activated")
+                result = replace(result, detail="sent_but_image_links_unavailable")
+        if result.ok and row is None and result.detail != "sent_but_image_links_unavailable":
+            result = replace(result, detail="sent_not_recorded")
+    else:
+        row = await record_result()
     if not result.ok:
         try:
             from app.services.notifications import notify_sms_delivery_failure

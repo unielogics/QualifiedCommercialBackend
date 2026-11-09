@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.deps import CurrentUser
+from app.enums import Role
 from app.services import inline_images
 
 router = APIRouter(prefix="/inline-images", tags=["inline-images"])
@@ -62,6 +63,10 @@ async def start_inline_image_upload(
     user: CurrentUser,
     db: DbSession,
 ) -> InlineImageTicket:
+    if payload.subject_kind == "outbound_message" and user.role in {
+        Role.CLIENT, Role.DEALER, Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER, Role.REGIONAL_MANAGER,
+    }:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator-only action")
     try:
         ticket = await inline_images.start_upload(
             db,

@@ -6,12 +6,12 @@ import asyncio
 import json
 import logging
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import false as sql_false
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -55,7 +55,7 @@ from app.schemas.communication import (
     UnifiedContactPage,
 )
 from app.scoping import scope_client_query, scope_loan_query
-from app.services import file_events, inline_images
+from app.services import communication_images, file_events, inline_images
 from app.services.communication_events import HEARTBEAT_SECONDS, user_audience
 from app.services.communication_events import broker as communication_event_broker
 from app.services.dealer_partner_access import (
@@ -68,6 +68,67 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/communications", tags=["communications"])
 SCAN_LIMIT = 750
+
+
+@router.get("/capabilities")
+async def communication_capabilities(user: CurrentUser):
+    from app.dealer_os.services import sms_provider
+
+    mode = sms_provider.image_delivery_mode()
+    if mode == "secure_link" and not communication_images.sms_share_available():
+        mode = "unavailable"
+    return {
+        "image_upload": {"max_images": communication_images.MAX_IMAGES,
+                         "max_image_bytes": communication_images.MAX_IMAGE_BYTES,
+                         "max_total_bytes": communication_images.MAX_TOTAL_BYTES,
+                         "allowed_mime_types": sorted(communication_images.ALLOWED_MIME)},
+        "sms": {"image_delivery": mode, "max_total_bytes": 5 * 1024 * 1024 if mode == "mms" else communication_images.MAX_TOTAL_BYTES,
+                "label": "Images are sent as picture messages (MMS)." if mode == "mms" else
+                         "Images are sent as secure links that expire in 7 days." if mode == "secure_link" else
+                         "Image delivery is unavailable for the selected SMS provider."},
+    }
+
+
+@router.get("/images/{share_id}", include_in_schema=False)
+async def get_sms_image_share(share_id: UUID, db: AsyncSession = Depends(get_db)):
+    """An unguessable, time-limited link, activated only by a successful send."""
+    import urllib.parse
+
+    from app.models.inline_image import InlineImage
+
+    row = await db.get(InlineImage, share_id)
+    if row is None or row.subject_kind != "sms_image_share" or row.status != "shared" or row.attached_at is None:
+        raise HTTPException(404, "This image link is unavailable or has expired.", headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"})
+    attached = row.attached_at if row.attached_at.tzinfo else row.attached_at.replace(tzinfo=UTC)
+    if attached < datetime.now(UTC) - timedelta(days=7):
+        raise HTTPException(404, "This image link is unavailable or has expired.", headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"})
+    if row.subject_id:
+        message = await db.get(SmsMessage, UUID(row.subject_id))
+        if message is not None and (message.direction != "outbound" or message.status in {"failed", "blocked", "undelivered"}):
+            raise HTTPException(404, "This image link is unavailable or has expired.", headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"})
+    try:
+        data = await asyncio.to_thread(communication_images._read_bytes, row)
+    except Exception as exc:
+        raise HTTPException(404, "This image link is unavailable or has expired.", headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"}) from exc
+    return Response(content=data, media_type=row.mime_type, headers={
+        "Content-Disposition": "inline; filename*=UTF-8''" + urllib.parse.quote(row.filename),
+        "Cache-Control": "private, no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff", "X-Robots-Tag": "noindex, nofollow",
+    })
+
+
+async def _outbound_images(db, image_ids, user):
+    try:
+        return await communication_images.load(db, image_ids, user.id)
+    except inline_images.InlineImageError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _delivery_warning(detail: str | None) -> str | None:
+    if detail == "sent_but_image_links_unavailable":
+        return "The text was sent, but its image links are unavailable. Contact support before sending a replacement."
+    if detail and detail.startswith("sent_not_recorded"):
+        return "The message was sent, but its delivery history could not be saved. Do not send it again automatically."
+    return None
 
 
 @router.get("/events")
@@ -1127,6 +1188,7 @@ async def compose_new_message(
 
     results: list[ComposeChannelResult] = []
     body = payload.body.strip()
+    images = await _outbound_images(db, payload.image_ids, user)
 
     if "sms" in payload.channels:
         if not phone:
@@ -1135,7 +1197,8 @@ async def compose_new_message(
             from app.services import sms as sms_service
 
             sms_result = await sms_service.send_sms_checked(
-                db, to_phone=phone, body=body, client_id=client_id, context="manual"
+                db, to_phone=phone, body=body, client_id=client_id, context="manual",
+                **({"images": images} if images else {}),
             )
             results.append(ComposeChannelResult(channel="sms", ok=sms_result.ok, detail=sms_result.detail))
             if sms_result.ok:
@@ -1156,11 +1219,36 @@ async def compose_new_message(
                 to_emails=[email],
                 subject=(payload.subject or "").strip() or f"Message from {user.name or 'Qualified Commercial'}",
                 body_text=body,
+                **({"attachments": communication_images.attachment_bytes(images)} if images else {}),
             )
             results.append(ComposeChannelResult(channel="email", ok=mail.ok, detail=mail.detail or ""))
+            if mail.ok and images:
+                from app.routers.inbox import _record_outbound_message
 
-    await db.commit()
-    return UnifiedComposeResult(ok=any(r.ok for r in results), results=results, thread_id=thread_id)
+                try:
+                    async with db.begin_nested():
+                        message = await _record_outbound_message(
+                            db, user=user, result=mail, body=body, to_emails=[email],
+                            subject=(payload.subject or "").strip() or f"Message from {user.name or 'Qualified Commercial'}",
+                            images=images, client_id=client_id,
+                        )
+                        if thread_id is None:
+                            thread_id = f"email:{message.gmail_thread_id or message.id}"
+                except Exception:
+                    log.exception("Email sent but attachment history could not be stored")
+                    results[-1].detail = "sent_not_recorded"
+
+    warning = next((_delivery_warning(r.detail) for r in results if r.ok and _delivery_warning(r.detail)), None)
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        if not any(r.ok for r in results):
+            raise
+        log.exception("A composed message was sent but its delivery history could not be committed")
+        warning = _delivery_warning("sent_not_recorded")
+        thread_id = None
+    return UnifiedComposeResult(ok=any(r.ok for r in results), results=results, thread_id=thread_id, delivery_warning=warning)
 
 
 @router.get("/threads/{thread_id:path}", response_model=UnifiedCommunicationThreadDetail)
@@ -1218,12 +1306,14 @@ async def get_unified_communication_thread(
         ]
     elif parts[0] == "rep":
         rows = list((await db.execute(select(DealerRepInboxMessage).where(DealerRepInboxMessage.thread_id == UUID(parts[1])).order_by(DealerRepInboxMessage.created_at.asc()))).scalars().all())
+        rep_images = await inline_images.hydrate(db, "rep_inbox_message", [str(row.id) for row in rows])
         messages = [
             UnifiedCommunicationMessage(
                 id=str(row.id), thread_id=thread_id, body=row.body, sender_name=row.sender,
                 sender_type="rep" if row.direction == "outbound" else "rep_lead", direction=row.direction,
                 channel=row.channel, transport=row.channel, created_at=row.created_at, seen=row.read_at is not None,
                 delivery_status=row.delivery_status,
+                images=rep_images.get(str(row.id), []),
             ) for row in rows
         ]
     elif parts[0] == "sms":
@@ -1255,12 +1345,14 @@ async def get_unified_communication_thread(
         from app.routers.inbox import _decrypt, _load_thread_rows
 
         rows = await _load_thread_rows(db, owner_id=user.id, thread_id=key)
+        email_images = await inline_images.hydrate(db, "email_message", [str(row.id) for row in rows])
         messages = [
             UnifiedCommunicationMessage(
                 id=str(row.id), thread_id=thread_id, body=_decrypt(row) or row.snippet or "",
                 sender_name=row.from_email, sender_type=row.matched_party_role or "email_contact",
                 direction=row.direction, channel="email", transport="email", created_at=row.received_at or row.created_at,
                 seen=row.is_read,
+                images=email_images.get(str(row.id), []),
             ) for row in rows
         ]
     return UnifiedCommunicationThreadDetail(thread=thread, messages=messages)
@@ -1299,6 +1391,11 @@ async def reply_unified_communication_thread(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "This conversation is read-only from your desk")
     body = payload.body.strip()
     parts = thread_id.split(":")
+    delivered = False
+    warning = None
+    images = await _outbound_images(db, payload.image_ids, user) if parts[0] != "email" else []
+    if images and parts[0] not in {"sms", "email", "rep"}:
+        raise HTTPException(400, "Use the SMS or email conversation to send image attachments.")
     if parts[0] == "loan":
         role = MessageFrom.CLIENT if user.role == Role.CLIENT else MessageFrom.BROKER
         db.add(Message(loan_id=UUID(parts[1]), from_role=role, body=body))
@@ -1400,13 +1497,17 @@ async def reply_unified_communication_thread(
 
         # request is threaded through because create_rep_inbox_message uses it
         # for the training-dealer live-send guard, which must not be bypassed.
-        await create_rep_inbox_message(
+        sent_message = await create_rep_inbox_message(
             thread_id=UUID(parts[1]),
-            payload=RepInboxMessageCreate(body=body),
+            payload=RepInboxMessageCreate(body=body, image_ids=payload.image_ids),
             request=request,
             user=user,
             db=db,
         )
+        if sent_message.delivery_status == "failed":
+            raise HTTPException(502, sent_message.provider_error or "The message could not be sent")
+        delivered = True
+        warning = _delivery_warning(sent_message.provider_error)
     elif parts[0] == "sms":
         from app.services import sms as sms_service
         from app.services.communication_scope import GLOBAL_SMS_ROLES
@@ -1420,9 +1521,18 @@ async def reply_unified_communication_thread(
             raise HTTPException(409, "This phone has no unambiguous contact in your book. Reply from the explicitly linked client file instead")
         linked = client.id if client else None
         result = await sms_service.send_sms_checked(
-            db, to_phone=phone, body=body, client_id=linked, context="manual"
+            db, to_phone=phone, body=body, client_id=linked, context="manual",
+            **({"images": images} if images else {}),
         )
-        await db.commit()
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            if not result.ok:
+                raise
+            warning = _delivery_warning("sent_not_recorded")
+        delivered = result.ok
+        warning = warning or _delivery_warning(result.detail)
         if not result.ok:
             # The blocked/failed row is already in the ledger; the composer
             # still deserves the honest reason instead of a silent refresh.
@@ -1433,13 +1543,23 @@ async def reply_unified_communication_thread(
 
         result = await reply_to_thread(
             thread_id=":".join(parts[1:]),
-            payload=InboxReplyRequest(body=body),
+            payload=InboxReplyRequest(body=body, image_ids=payload.image_ids),
             user=user,
             db=db,
         )
         if not result.ok:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, result.detail or "Email could not be sent")
-    return await get_unified_communication_thread(thread_id=thread_id, user=user, db=db)
+        delivered = True
+        warning = _delivery_warning(result.detail)
+    try:
+        detail = await get_unified_communication_thread(thread_id=thread_id, user=user, db=db)
+    except Exception:
+        if not delivered:
+            raise
+        return UnifiedCommunicationThreadDetail(thread=thread, messages=[], delivery_warning=warning or _delivery_warning("sent_not_recorded"))
+    if warning:
+        detail.delivery_warning = warning
+    return detail
 
 
 @router.post("/threads/{thread_id:path}/seen", response_model=UnifiedCommunicationSeen)
