@@ -1737,6 +1737,9 @@ async def _requested_document(
         or not collects_file(requirement)
     ):
         return None
+    # This read model updates asks. Preserve our earlier writes, then replace
+    # any identity-cached room row loaded before the readiness locks were held.
+    await db.flush()
     if any(key.startswith("arf_") for key in program_keys):
         from app.services.arf_channel import approval_valid, get_configuration
         arf_config = await get_configuration(db)
@@ -1762,6 +1765,7 @@ async def _requested_document(
                 BucketRequestedDocument.created_at,
             )
             .limit(1)
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if requested is None and form_kind in {"pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule"}:
@@ -1777,10 +1781,13 @@ async def _requested_document(
                 )
                 .order_by(BucketRequestedDocument.created_at)
                 .limit(1)
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
     if requested is None and form_kind is None:
         requested = await _adopt_room_request(db, profile.primary_bucket_id, requirement)
+    if requested is not None and isinstance(db, AsyncSession):
+        await db.refresh(requested)
     source = {
         "kind": "program_readiness",
         "program_keys": program_keys,
@@ -1907,6 +1914,7 @@ async def _adopt_room_request(
                     BucketRequestedDocument.status.notin_(["closed", "not_applicable"]),
                 )
                 .order_by(BucketRequestedDocument.created_at)
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()
@@ -2315,12 +2323,13 @@ async def _sync_requirement_evidence(
     *,
     prune_automatic: bool = False,
 ) -> list[ApplicationRequirementEvidence]:
+    await db.flush()
     rows = list(
         (
             await db.execute(
                 select(ApplicationRequirementEvidence).where(
                     ApplicationRequirementEvidence.requirement_state_id == state.id
-                )
+                ).execution_options(populate_existing=True)
             )
         )
         .scalars()
@@ -3128,10 +3137,11 @@ async def _materialize_requirements(
 ) -> tuple[list[ApplicationRequirementState], dict[uuid.UUID, list[str]]]:
     from app.services import collection_tasks
 
-    files, analyses, _classifications = await _evidence_inventory(db, profile, include_pending_financial=True)
+    await db.flush()
+    files, analyses, _classifications = await _evidence_inventory(db, profile, include_pending_financial=True, refresh=True)
     inventory = {file.id: file for file in files}
     intake = (
-        await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+        await db.get(PublicUnderwritingIntake, profile.intake_id, populate_existing=True) if profile.intake_id else None
     )
     expected_entity = intake.business_name if intake else None
     from app.services import document_associations
@@ -3157,12 +3167,15 @@ async def _materialize_requirements(
             await db.execute(
                 select(ApplicationRequirementState).where(
                     ApplicationRequirementState.profile_id == profile.id
-                )
+                ).execution_options(populate_existing=True)
             )
         )
         .scalars()
         .all()
     }
+    from app.services import requirement_collection_receipts
+
+    await requirement_collection_receipts.hydrate(db, profile, list(existing.values()))
     await requirement_lifecycle.reconcile(db, profile, list(existing.values()))
     existing = {state.requirement_key: state for state in existing.values()}
     responses = await collection_tasks.latest_responses(db, profile.id)
@@ -3359,7 +3372,7 @@ async def _materialize_requirements(
                     select(ApplicationRequirementEvidence).where(
                         ApplicationRequirementEvidence.requirement_state_id == state.id,
                         ApplicationRequirementEvidence.removed_at.is_(None),
-                    )
+                    ).execution_options(populate_existing=True)
                 )
             )
             .scalars()
@@ -3828,13 +3841,22 @@ async def get_program_readiness(
     # caller that does must take the bucket lock first, as
     # run_profile_collection_outreach now does: it locked the profile and
     # arrived here second, which put the profile before the bucket again.
-    if profile.primary_bucket_id is not None:
+    with db.no_autoflush:
+        if profile.primary_bucket_id is not None:
+            await db.execute(
+                select(Bucket.id).where(Bucket.id == profile.primary_bucket_id).with_for_update()
+            )
         await db.execute(
-            select(Bucket.id).where(Bucket.id == profile.primary_bucket_id).with_for_update()
+            select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update()
         )
-    await db.execute(
-        select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update()
-    )
+    # A row lock serializes SQL, not SQLAlchemy's identity map. A GET may have
+    # loaded these objects before waiting for a staff completion to commit.
+    # Flush this transaction's own edits under the existing locks, then reload
+    # persisted state instead of spreading stale JSON over its audit receipts.
+    await db.flush()
+    profile = (await db.execute(select(ApplicationProfile).where(
+        ApplicationProfile.id == profile.id,
+    ).execution_options(populate_existing=True))).scalar_one()
     context = await profile_fit_context(db, profile)
     lending_applicable = _is_lending_applicable(context)
     candidates = await published_candidates(db, profile)
