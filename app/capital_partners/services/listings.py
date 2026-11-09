@@ -192,6 +192,31 @@ PARTNER_FINANCIAL_KEYS = (
 )
 
 
+def partner_operating_earnings(value: Any) -> dict[str, Any] | None:
+    """Published figures without access to the file's private source inventory."""
+    if not isinstance(value, dict):
+        return None
+
+    def fields(row, keys):
+        return {key: row[key] for key in keys if key in row} if isinstance(row, dict) else {}
+
+    trend = value.get("revenue_trend") or {}
+    return {
+        "historical": fields(value.get("historical"), ("value", "annualized_value", "label", "kind", "period", "months_covered",
+                                                       "currency", "complete", "provisional", "staff_adjusted")) or None,
+        "revenue_trend": {
+            **fields(trend, ("status",)),
+            "periods": [fields(row, ("year", "period_start", "period_end", "months_covered", "revenue", "average_monthly_revenue",
+                                    "ebitda", "ebitda_kind", "currency", "basis")) for row in trend.get("periods", []) if isinstance(row, dict)],
+            "comparison": fields(trend.get("comparison"), ("prior_year", "current_year", "prior_revenue", "current_revenue",
+                                                            "change_amount", "change_pct", "monthly_change", "comparable")) or None,
+            "forecast": fields(trend.get("forecast"), ("status", "method", "target_year", "projected_revenue", "change_amount",
+                                                        "change_pct", "projected_ebitda", "ebitda_kind", "margin")) or None,
+        },
+        "qualification_policy": "Historical earnings and illustrative forecasts are separate. Forecasts do not establish current program eligibility.",
+    }
+
+
 def partner_financials(listing: CpListing) -> dict[str, Any] | None:
     """The underwriting figures a member sees on an offering: what the file
     showed when the desk cut or last refreshed the listing, and the desk's
@@ -202,6 +227,9 @@ def partner_financials(listing: CpListing) -> dict[str, Any] | None:
     if not isinstance(financials, dict):
         return None
     out: dict[str, Any] = {k: financials.get(k) for k in PARTNER_FINANCIAL_KEYS if financials.get(k) is not None}
+    earnings = partner_operating_earnings(financials.get("operating_earnings"))
+    if earnings is not None:
+        out["operating_earnings"] = earnings
     plan = financials.get("plan") if isinstance(financials.get("plan"), dict) else {}
     if plan.get("active"):
         out["plan"] = {

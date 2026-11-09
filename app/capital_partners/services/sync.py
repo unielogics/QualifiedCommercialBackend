@@ -51,12 +51,14 @@ def file_sections(
 ) -> dict[str, Any]:
     """The comparable sections of a file, free of timestamps."""
     from app.services import financial_cockpit
+    from app.services.financial_metric_reporting import operating_earnings_brief
 
     figures = {
         k: v
         for k, v in financial_cockpit.listing_summary(cockpit).items()
         if k not in {"generated_at", "plan"}
     }
+    figures["operating_earnings"] = operating_earnings_brief(cockpit)
     plan = financial_cockpit.plan_summary(cockpit)
     return {
         "figures": figures,

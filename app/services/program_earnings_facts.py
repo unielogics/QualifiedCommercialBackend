@@ -9,14 +9,25 @@ from app.services.financial_metric_reporting import validated_annual_pair
 
 
 def annual_ebitda_fact(analyses: list[dict], *, entity: str | None, state: dict | None = None) -> tuple[float | None, dict]:
+    from app.services.document_associations import attach_rows, source_excluded
     from app.services.financial_cockpit import profit_and_loss, tax_years
+    from app.services.financial_earnings_sources import attach
     from app.services.financial_metric_review import prepare
 
-    review = prepare(analyses, tax_years(analyses, business_entity=entity), profit_and_loss(analyses, business_entity=entity), {}, [], [], {},
+    all_sources = [source for row in analyses for source in (
+        [row] if isinstance(row.get("identity_association"), dict)
+        else attach_rows([row], profile_id=None, expected_entity=entity, state=state)
+    )]
+    usable = [row for row in all_sources if not source_excluded(row.get("identity_association"))]
+    years = tax_years(usable, business_entity=entity)
+    statement = profit_and_loss(usable, business_entity=entity)
+    review = prepare(usable, years, statement, {}, [], [], {},
                      state=state, entity=entity)
+    attach(review["ebitda"], review, all_sources, years, statement, {}, state=state, entity=entity)
     pair = validated_annual_pair({"ebitda": review["ebitda"]})
-    result = next((row for row in review["ebitda"]["candidates"]
-                   if row.get("kind") in {"computed_ebitda", "reported_ebitda"}), {})
+    selection = review["ebitda"]["source_selection"]
+    result = next((row for row in review["ebitda"]["candidates"] if not selection.get("stale") and any(
+        str(ref.get("file_id")) == str(selection.get("selected_file_id")) for ref in row.get("source_refs", []))), {})
     if pair:
         result = pair["ebitda"]
     source = {
@@ -32,6 +43,8 @@ def annual_ebitda_fact(analyses: list[dict], *, entity: str | None, state: dict 
         "corrected_inputs": [item["key"] for item in review["inputs"]
                              if item.get("correction") and item["key"].startswith("profit_and_loss.")],
         "eligibility_policy": "current_accepted_comparable_usd_profit_and_loss_6_to_12_months",
+        "selected_file_id": selection.get("selected_file_id"),
+        "source_selection_stale": selection.get("stale", False),
     }
     if pair and pair["currency"] == "USD":
         return pair["ebitda_annual"], {**source, "verification_status": "verified", "reason": None}

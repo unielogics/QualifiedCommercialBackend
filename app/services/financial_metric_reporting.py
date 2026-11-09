@@ -5,6 +5,7 @@ validated annual P&L pair is suitable for fields that specifically mean annual
 EBITDA; a tax earnings estimate or bank proxy never fills those fields.
 """
 
+import logging
 import math
 import re
 from copy import deepcopy
@@ -28,7 +29,18 @@ def _number(value):
 
 
 def _refs(values):
-    return [{key: source[key] for key in SOURCE_KEYS if key in source} for source in values or [] if isinstance(source, dict)]
+    rows = []
+    for source in values or []:
+        if not isinstance(source, dict):
+            continue
+        row = {key: source[key] for key in SOURCE_KEYS if key in source and key != "identity_association"}
+        association = source.get("identity_association")
+        if isinstance(association, dict):
+            row["identity_association"] = {key: association[key] for key in (
+                "status", "automatic_status", "allows_financial_use", "expected_entity", "observed_entity", "observed_entities", "document_accepted"
+            ) if key in association}
+        rows.append(row)
+    return rows
 
 
 def _result(value):
@@ -37,10 +49,61 @@ def _result(value):
     return {**{key: value[key] for key in RESULT_KEYS if key in value}, "source_refs": _refs(value.get("source_refs"))}
 
 
+def operating_earnings_brief(cockpit):
+    """One shareable earnings snapshot for AI, marketplace and package PDFs.
+
+    Selection audit reasons, actor identities and concurrency receipts stay
+    internal. Historical earnings and illustrative forecasts never occupy the
+    same fact field, even when the historical value is unavailable.
+    """
+    ebitda = (cockpit or {}).get("ebitda") or {}
+    if not ebitda:
+        return None
+    selection = ebitda.get("source_selection") or {}
+    trend = ebitda.get("revenue_trend") or {}
+
+    def fields(value, keys):
+        return {key: value[key] for key in keys if key in value} if isinstance(value, dict) else {}
+
+    def observation(value):
+        return {**fields(value, ("year", "period_start", "period_end", "months_covered", "revenue",
+                                "average_monthly_revenue", "ebitda", "ebitda_kind", "currency", "basis",
+                                "file_id", "file_name")), "source_refs": _refs(value.get("source_refs"))}
+
+    forecast = trend.get("forecast")
+    return {
+        "historical": _result(ebitda.get("headline")),
+        "historical_unavailable_reason": ebitda.get("reason"),
+        "source_selection": {
+            **fields(selection, ("mode", "selected_file_id", "excluded_file_ids", "stale")),
+            "sources": [fields(row, ("file_id", "file_name", "entity", "period", "kind", "eligible", "included", "selected"))
+                        for row in selection.get("sources", []) if isinstance(row, dict)],
+        },
+        "revenue_trend": {
+            **fields(trend, ("status", "notes")),
+            "periods": [observation(row) for row in trend.get("periods", []) if isinstance(row, dict)],
+            "comparison": fields(trend.get("comparison"), ("prior_year", "current_year", "prior_revenue", "current_revenue",
+                                    "change_amount", "change_pct", "monthly_change", "comparable", "reason")) or None,
+            "forecast": ({**fields(forecast, ("status", "method", "target_year", "projected_revenue", "change_amount",
+                                    "change_pct", "projected_ebitda", "ebitda_kind", "margin", "assumptions", "reason")),
+                          "source_refs": _refs(forecast.get("source_refs"))} if isinstance(forecast, dict) else None),
+            "bank_context": fields(trend.get("bank_context"), ("average_monthly_deposits", "annualized_deposits", "note")),
+        },
+        "qualification_policy": "Historical source earnings and illustrative forecasts are separate. Forecast revenue or EBITDA does not establish current program eligibility; bank deposits are not operating revenue.",
+    }
+
+
 def validated_annual_pair(cockpit):
     """A current, reconciled P&L annual basis; never a tax or cash substitute."""
-    for result in (cockpit.get("ebitda") or {}).get("candidates", []):
+    earnings = cockpit.get("ebitda") or {}
+    selection = earnings.get("source_selection")
+    if isinstance(selection, dict) and (selection.get("stale") or not selection.get("selected_file_id")):
+        return None
+    for result in earnings.get("candidates", []):
         refs = result.get("source_refs") or []
+        if isinstance(selection, dict) and (result.get("excluded_from_ebitda") or not any(
+                str(source.get("file_id")) == str(selection["selected_file_id"]) for source in refs)):
+            continue
         annual = _number(result.get("annualized_value"))
         currency = str(result.get("currency") or (refs[0].get("currency") if refs else "") or "").upper()
         basis = str(result.get("basis") or (refs[0].get("basis") if refs else "") or "").strip().casefold()
@@ -76,6 +139,7 @@ def metric_brief(cockpit):
     dscr = cockpit.get("dscr") or {}
     if not review and not ebitda and not dscr:
         return None
+    earnings = operating_earnings_brief(cockpit) or {}
     inputs = []
     corrections = []
     for item in review.get("inputs", []):
@@ -107,7 +171,9 @@ def metric_brief(cockpit):
     return {"revision": review.get("revision", 0), "scope": "Current source-bound cockpit calculations; original documents, AI snapshots, saved forms and financial-period records are unchanged.",
             "document_associations": [{key: row.get(key) for key in ("file_id", "content_hash", "analysis_id", "status", "expected_entity", "observed_entity", "association_stamp")}
                                       for row in review.get("document_associations", [])],
-            "ebitda": {"headline": _result(ebitda.get("headline")), "candidates": [_result(row) for row in ebitda.get("candidates", [])], "reason": ebitda.get("reason")},
+            "ebitda": {"headline": _result(ebitda.get("headline")), "candidates": [_result(row) for row in ebitda.get("candidates", [])], "reason": ebitda.get("reason"),
+                       "source_selection": earnings.get("source_selection"),
+                       "revenue_trend": earnings.get("revenue_trend")},
             "primary_dscr": primary, "validated_annual": validated_annual_pair(cockpit),
             "inputs": inputs, "corrections": corrections, "calculation_reviews": calculation_reviews,
             "excluded_income_sources": [{key: row.get(key) for key in ("file_id", "file_name", "reason")}
@@ -162,6 +228,8 @@ def current_review_projection(result, cockpit):
                     "annual_debt_service": service.get("annual"), "monthly_debt_service": service.get("monthly"),
                     "debt_service_monthly": service.get("monthly"),
                     "annual_ebitda": strict_ebitda, "bankable_ebitda": strict_ebitda,
+                    "estimated_ebitda_or_cash_flow": strict_ebitda,
+                    "ebitda_source": "profit_and_loss" if strict_ebitda is not None else None,
                     "dscr_basis": primary.get("key"), "dscr_earnings": primary.get("numerator"),
                     "dscr_earnings_label": primary.get("numerator_label"),
                     "dscr_source_refs": primary.get("source_refs") or [],
@@ -174,4 +242,33 @@ def current_review_projection(result, cockpit):
     projected["key_metrics"] = metrics
     projected["financial_calculation_review"] = brief
     projected["financial_calculation_authority"] = authority
+    projected["operating_earnings"] = operating_earnings_brief(cockpit)
+    return projected
+
+
+async def current_intake_report(db, intake, result, *, external=False):
+    """Refresh business intelligence exports from the same current cockpit.
+
+    Real-estate rent/PITIA reports keep their separate calculation pathway.
+    Failure to load business evidence must clear a cached earnings number.
+    """
+    if getattr(intake, "variant", None) == "real_estate_dscr_v1":
+        return deepcopy(result) if isinstance(result, dict) else {}
+    from app.services import application_profiles, financial_cockpit
+
+    cockpit = None
+    try:
+        profile = await application_profiles.find_profile(db, intake_id=intake.id)
+        if profile is not None:
+            cockpit = await financial_cockpit.load_cockpit(db, profile)
+    except Exception:  # noqa: BLE001 - failed current evidence never revives cached metrics
+        logging.getLogger(__name__).exception("Current report financial evidence unavailable intake=%s", intake.id)
+    projected = current_review_projection(result, cockpit)
+    if external:
+        from app.capital_partners.services.listings import partner_operating_earnings
+
+        projected["operating_earnings"] = partner_operating_earnings(projected.get("operating_earnings"))
+        projected.pop("financial_calculation_review", None)
+        projected.pop("financial_calculation_authority", None)
+        projected["key_metrics"].pop("dscr_source_refs", None)
     return projected

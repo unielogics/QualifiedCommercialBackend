@@ -107,7 +107,7 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
         facts = source.get("key_facts") or {}
         return [{"file_id": record.get("file_id"), "file_name": source.get("file_name"),
                  "analysis_id": source.get("analysis_id"), "content_hash": source.get("content_hash"),
-                 "accepted": bool(source.get("accepted")), "entity": record.get("entity") or record.get("business_name") or facts.get("business_name") or facts.get("entity"),
+                 "accepted": bool(source.get("accepted")), "entity": record.get("entity") or record.get("business_name") or facts.get("entity_name") or facts.get("business_name") or facts.get("entity"),
                  "period_start": record.get("period_start"), "period_end": record.get("period_end"),
                  "statement_period": facts.get("statement_period"),
                  "currency": record.get("currency") or facts.get("currency"), "basis": record.get("basis") or facts.get("basis"),
@@ -383,6 +383,9 @@ def redact_for_external(cockpit, actor):
     review["history"] = []
     review["composition_history"] = []
     review["document_associations"] = []
+    selection = (result.get("ebitda") or {}).get("source_selection")
+    if selection:
+        selection["history"] = []
     review["stale_correction_count"] = len(review.get("stale_corrections", []))
     review["stale_corrections"] = []
     for item in review.get("inputs", []):
@@ -531,3 +534,19 @@ async def correct(db, profile, actor, **payload):
             action="financial_metrics.corrected" if payload["action"] == "correct" else "financial_metrics.restored",
             summary="Reviewed a source-bound financial calculation input", event_prefix="financial-correction")
     return cockpit
+
+
+async def save_earnings_sources(db, profile, actor, **payload):
+    """The source receipt uses the same lock, audit and invalidation as math."""
+    from app.services import financial_cockpit, financial_earnings_sources
+    from app.services.financial_workspace import lock_financial_profile
+
+    if actor.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(403, "Underwriting role required")
+    await lock_financial_profile(db, profile)
+    profile = (await db.execute(select(ApplicationProfile).where(ApplicationProfile.id == profile.id).execution_options(populate_existing=True))).scalar_one()
+    cockpit = await financial_cockpit.load_cockpit(db, profile)
+    state, changed = financial_earnings_sources.change(getattr(profile, "financial_metric_review", None),
+        cockpit["ebitda"]["source_selection"], actor=actor, **payload)
+    return await _persist_review(db, profile, actor, state, action="financial_metrics.earnings_sources",
+        summary="Reviewed the EBITDA source period and exclusions", event_prefix="financial-earnings-sources") if changed else cockpit

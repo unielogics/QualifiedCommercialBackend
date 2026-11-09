@@ -290,6 +290,9 @@ async def download_funding_review_intelligence_pdf(
         intake, _challenge, _session_token = await core._load_funding_intake_by_session(db, request)
     review = intake.latest_review if intake.latest_review else None
     latest_result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
+    from app.services.financial_metric_reporting import current_intake_report
+
+    latest_result = await current_intake_report(db, intake, latest_result, external=True)
     pdf_bytes = await asyncio.to_thread(
         core.render_dealer_intelligence_pdf,
         intake=intake,

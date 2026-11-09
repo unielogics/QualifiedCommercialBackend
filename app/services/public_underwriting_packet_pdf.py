@@ -696,7 +696,7 @@ def extract_tax_years(analyses: list[dict[str, Any]], limit: int = 2) -> list[di
         rec = {
             "file_id": item.get("file_id"),
             "year": year if re.fullmatch(r"(19|20)\d{2}", str(year or "")) else (_tax_year(facts) or "—"),
-            "entity": _text(facts.get("entity_name") or facts.get("business_name") or facts.get("taxpayer"), fallback=""),
+            "entity": _text(facts.get("entity_name") or facts.get("business_name") or facts.get("entity") or facts.get("taxpayer"), fallback=""),
             "currency": _text(facts.get("currency"), fallback=""),
             "basis": _text(facts.get("basis") or facts.get("accounting_basis"), fallback=""),
             "period_start": _iso_date(facts.get("period_start")),
@@ -1214,7 +1214,7 @@ def _executive_metric_tiles(
     financials: dict[str, Any],
 ) -> str:
     """Six high-signal values for the first-page credit snapshot."""
-    key_metrics = _record(result.get("key_metrics"))
+    key_metrics = {**_record(result.get("key_metrics")), **_record(financials.get("current_key_metrics"))}
     months = _records(financials.get("bank_months"))
     p_and_l = _record(financials.get("p_and_l"))
     balance_sheet = _record(financials.get("balance_sheet"))
@@ -1243,6 +1243,26 @@ def _executive_metric_tiles(
         or _num(p_and_l.get("ebitda"))
         or _num(key_metrics.get("estimated_ebitda_or_cash_flow"))
     )
+    annual_revenue_source = "P&L / verified extraction"
+    cash_flow_label = "EBITDA / cash flow"
+    cash_flow_source = "P&L / verified extraction"
+    annual_revenue_currency = cash_flow_currency = "USD"
+    if "operating_earnings" in financials:
+        earnings = _record(financials.get("operating_earnings"))
+        historical = _record(earnings.get("historical"))
+        cash_flow = _num(historical.get("value"))
+        periods = _records(_record(earnings.get("revenue_trend")).get("periods"))
+        annual_revenue = _num(periods[-1].get("revenue")) if periods else None
+        latest_period = periods[-1] if periods else {}
+        annual_revenue_source = ("Business tax return" if latest_period.get("ebitda_kind") == "tax_estimate"
+                                 else "Business P&L" if latest_period.get("ebitda_kind") in {"computed_ebitda", "reported_ebitda"}
+                                 else "Current business source evidence")
+        if latest_period.get("year"):
+            annual_revenue_source += f" · {latest_period['year']}"
+        cash_flow_label = str(historical.get("label") or "Business EBITDA")
+        cash_flow_source = str(historical.get("period") or "Business earnings evidence incomplete")
+        annual_revenue_currency = latest_period.get("currency")
+        cash_flow_currency = historical.get("currency")
     dscr = _num(key_metrics.get("estimated_dscr")) or _num(key_metrics.get("dscr"))
     requested = _num(intake_requested_amount(intake)) or _num(key_metrics.get("requested_amount"))
     current_ratio = _num(balance_sheet.get("current_ratio"))
@@ -1252,8 +1272,8 @@ def _executive_metric_tiles(
         ("Avg monthly deposits", _fmt_full(avg_deposits), f"{len(deposits)} bank month{'s' if len(deposits) != 1 else ''}" if deposits else "Awaiting statements"),
         ("Avg monthly net", _fmt_full(avg_net), "Deposits less withdrawals"),
         ("Latest ending balance", _fmt_full(latest_balance), "Most recent bank month"),
-        ("Annual revenue", _fmt_full(annual_revenue), "P&L / verified extraction"),
-        ("EBITDA / cash flow", _fmt_full(cash_flow), "P&L / verified extraction"),
+        ("Annual revenue", _earnings_money(annual_revenue, annual_revenue_currency), annual_revenue_source),
+        (cash_flow_label, _earnings_money(cash_flow, cash_flow_currency), cash_flow_source),
     ]
     if dscr is not None:
         candidates[-1] = ("DSCR", f"{dscr:.2f}x", "Current evidence")
@@ -1269,6 +1289,69 @@ def _executive_metric_tiles(
         for label, value, source in candidates[:6]
     )
     return f'<table class="metric-grid"><tr>{cells}</tr></table>'
+
+
+def _earnings_money(value: Any, currency: Any) -> str:
+    number = _num(value)
+    if number is None:
+        return "Unavailable"
+    code = str(currency or "").upper()
+    if code == "USD":
+        return _fmt_full(number)
+    return f"{code} {number:,.0f}" if re.fullmatch(r"[A-Z]{3}", code) and code != "XXX" else f"{number:,.0f} (currency unconfirmed)"
+
+
+def _earnings_kind_label(value: Any) -> str:
+    return {"tax_estimate": "tax-derived earnings estimate", "reviewed_assumption": "EBITDA based on a reviewed margin",
+            "computed_ebitda": "computed EBITDA", "reported_ebitda": "reported EBITDA"}.get(str(value), "EBITDA")
+
+
+def _operating_earnings_lines(financials: dict[str, Any], *, compact: bool = False) -> list[str]:
+    """The reviewed historical baseline and a separate, conditional forecast."""
+    earnings = _record(financials.get("operating_earnings"))
+    if not earnings:
+        return []
+    historical = _record(earnings.get("historical"))
+    sources = _records(historical.get("source_refs"))
+    currency = historical.get("currency") or next((row.get("currency") for row in sources if row.get("currency")), None)
+    lines = [f"Historical {historical.get('label') or 'EBITDA'}: {_earnings_money(historical.get('value'), currency)}; {historical.get('period') or 'period unknown'}." + (" Provisional source estimate." if historical.get("provisional") else "")]
+    if not historical:
+        lines.append(str(earnings.get("historical_unavailable_reason") or "Current business EBITDA evidence is incomplete."))
+    source_names = list(dict.fromkeys(str(row.get("file_name")) for row in sources if row.get("file_name")))
+    if source_names:
+        lines.append("Historical source: " + "; ".join(source_names[:2 if compact else 4]) + ".")
+    trend = _record(earnings.get("revenue_trend"))
+    comparison = _record(trend.get("comparison"))
+    if comparison.get("comparable"):
+        periods = _records(trend.get("periods"))
+        trend_currency = next((row.get("currency") for row in reversed(periods) if row.get("currency")), currency)
+        pct = _num(comparison.get("change_pct"))
+        pct_text = f" ({pct:+.1f}%)" if pct is not None else " (percentage unavailable)"
+        lines.append(f"Comparable revenue {comparison.get('prior_year')} to {comparison.get('current_year')}: {_earnings_money(comparison.get('prior_revenue'), trend_currency)} to {_earnings_money(comparison.get('current_revenue'), trend_currency)}; change {_earnings_money(comparison.get('change_amount'), trend_currency)}{pct_text}.")
+    elif comparison.get("reason"):
+        lines.append("Revenue comparison unavailable: " + str(comparison["reason"]))
+    forecast = _record(trend.get("forecast"))
+    if forecast.get("status") == "illustration":
+        pct = _num(forecast.get("change_pct"))
+        method = {"p_and_l_run_rate": "P&L run-rate illustration", "reviewed_assumptions": "Reviewed-assumptions illustration"}.get(str(forecast.get("method")), "Conditional revenue illustration")
+        forecast_refs = _records(forecast.get("source_refs"))
+        forecast_currency = next((row.get("currency") for row in forecast_refs if row.get("currency")), currency)
+        lines.append(f"{method}, {forecast.get('target_year') or 'next year'}: revenue {_earnings_money(forecast.get('projected_revenue'), forecast_currency)}" + (f" ({pct:+.1f}%)" if pct is not None else "") + f"; illustrative {_earnings_kind_label(forecast.get('ebitda_kind'))} {_earnings_money(forecast.get('projected_ebitda'), forecast_currency)}.")
+        if not compact:
+            lines.extend("Assumption: " + str(item) for item in _strings(forecast.get("assumptions"))[:4])
+    elif forecast.get("reason"):
+        lines.append("Forecast unavailable: " + str(forecast["reason"]))
+    lines.append("A refinance changes debt service and cash retained; it does not itself change EBITDA. Forecasts are conditional illustrations and do not establish current program eligibility.")
+    return lines
+
+
+def _operating_earnings_section(financials: dict[str, Any], *, compact: bool = False) -> str:
+    lines = _operating_earnings_lines(financials, compact=compact)
+    if not lines:
+        return ""
+    # A single table row also keeps the heading with its figures in the
+    # PyMuPDF fallback renderer, which does not honor every section break rule.
+    return '<table class="card wide" style="width:100%;break-inside:avoid;page-break-inside:avoid"><tr style="break-inside:avoid;page-break-inside:avoid"><td><h2 style="break-after:avoid;page-break-after:avoid">Business earnings and revenue outlook</h2>' + "".join(f"<p>{escape(line)}</p>" for line in lines) + "</td></tr></table>"
 
 
 def _executive_bank_section(months: list[dict[str, Any]]) -> str:
@@ -1937,6 +2020,7 @@ def render_executive_summary_pdf(
         "",
         "CONFIDENTIAL — Preliminary underwriting support; not a commitment to lend.",
     ]
+    fallback_lines.extend(_operating_earnings_lines(financials, compact=True))
 
     html_doc = f"""
 <!doctype html>
@@ -2011,6 +2095,7 @@ def render_executive_summary_pdf(
     <td><section class="card summary-card"><h2>Recommended structure</h2><p>{escape(approach)}</p></section></td>
   </tr></table>
   {metric_tiles}
+  {_operating_earnings_section(financials, compact=True)}
   {_plan_section(financials, compact=True)}
   <div class="next"><strong>Next desk action</strong>&nbsp;{escape(next_action)}</div>
   <table class="cols"><tr><td>{strengths_html}</td><td>{risks_html}</td></tr></table>
@@ -2092,7 +2177,7 @@ def render_underwriting_packet_pdf(
 
     variant = str(getattr(intake, "variant", "") or "")
     normalized_variant = variant.lower()
-    key_metrics = _record(result.get("key_metrics"))
+    key_metrics = {**_record(result.get("key_metrics")), **_record(financials.get("current_key_metrics"))}
     bankability = _record(result.get("bankability_assessment"))
     title = "Underwriting Packet"
     if "foreclosure" in normalized_variant:
@@ -2186,11 +2271,14 @@ def render_underwriting_packet_pdf(
         {"metric": "Requested amount", "value": requested_amount, "source": _request_source(intake)},
     ]
     exec_metrics = executive_summary.get("key_metrics")
+    def current_earnings_metric(label: str) -> bool:
+        normalized = " ".join(label.casefold().replace("_", " ").split())
+        return "operating_earnings" in financials and any(term in normalized for term in ("ebitda", "dscr", "revenue", "tax income", "tax net income", "earnings estimate"))
     if isinstance(exec_metrics, list) and exec_metrics:
         for m in exec_metrics:
             if isinstance(m, dict):
                 label = _text(m.get("label"), fallback="")
-                if _is_request_metric(label):
+                if _is_request_metric(label) or current_earnings_metric(label):
                     continue
                 value = _text(m.get("value"), fallback="")
                 note = _text(m.get("note"), fallback="")
@@ -2201,7 +2289,7 @@ def render_underwriting_packet_pdf(
             key_text = str(key)
             # Provenance stamps (*_source / *_basis) label other rows; the
             # statement figures (pl_* / balance_sheet_*) have their own section.
-            if _is_request_metric(key_text) or key_text.endswith(("_source", "_basis")) or key_text.startswith(("pl_", "balance_sheet_")):
+            if _is_request_metric(key_text) or current_earnings_metric(key_text) or key_text.endswith(("_source", "_basis")) or key_text.startswith(("pl_", "balance_sheet_")):
                 continue
             metric_rows.append({"metric": key_text.replace("_", " ").title(), "value": _text(value), "source": "AI extraction"})
 
@@ -2226,6 +2314,7 @@ def render_underwriting_packet_pdf(
         "", "Executive summary:",
     ]
     fallback_lines.extend(_wrap(summary_text))
+    fallback_lines.extend(_operating_earnings_lines(financials))
     fallback_lines.extend(["", "Recommended submission angle:"])
     fallback_lines.extend(_wrap(recommended_angle))
     if bank_months:
@@ -2319,6 +2408,7 @@ def render_underwriting_packet_pdf(
   </tr></table>
 
   {_metric_table(metric_rows)}
+  {_operating_earnings_section(financials)}
   {_simple_table("Missing confirmations", missing_rows, [("title", "Item"), ("priority", "Priority"), ("detail", "Detail")], empty_message="All Stage 1 baseline evidence received — no outstanding confirmations.")}
 
   {_pl_bs_section(p_and_l, balance_sheet)}
