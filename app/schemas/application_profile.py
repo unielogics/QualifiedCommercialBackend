@@ -188,6 +188,7 @@ class UnlockedCopyRequestStateRead(BaseModel):
 
 
 class ApplicationRequirementEvidenceRead(BaseModel):
+    identity_association: dict | None = None
     file_id: UUID
     file_name: str
     bucket_id: UUID
@@ -1266,6 +1267,7 @@ class EvidenceSourceRead(BaseModel):
 
 
 class EvidenceFileRead(BaseModel):
+    identity_association: dict | None = None
     id: UUID
     source_id: str
     bucket_id: UUID

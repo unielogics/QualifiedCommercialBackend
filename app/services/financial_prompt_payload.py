@@ -14,6 +14,11 @@ def summary_analyses(analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     result = []
     for item in analyses:
+        from app.services.document_associations import source_excluded
+
+        if source_excluded(item.get("identity_association")):
+            result.append({key: item.get(key) for key in ("file_id", "file_name", "identity_association")})
+            continue
         classes = {item.get("ai_classification"), item.get("classification"),
                    *(item.get("classifications") or [])}
         source_facts = item.get("key_facts")

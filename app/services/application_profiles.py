@@ -2191,7 +2191,11 @@ async def evidence_state(
             for file_id in by_id
         },
     )
+    from app.services import document_associations
+
+    associations = await document_associations.load_context(db, profile, raw_files, latest_analyses)
     for file_id, item in by_id.items():
+        item.identity_association = document_associations.display_record(associations.get(str(file_id)))
         analysis = latest_analyses.get(file_id)
         if analysis:
             item.analysis_status = analysis.status

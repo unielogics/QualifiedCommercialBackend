@@ -3685,6 +3685,10 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
     # an unchanged file set costs only the synthesis call.
     skipped: list[dict[str, str]] = []
     per_file_analyses: list[dict[str, Any]] = []
+    from app.services import document_associations
+
+    association_expected = await document_associations.expected_business(db, screen_profile) if screen_profile is not None else None
+    association_review_stamp = document_associations.review_context_stamp(screen_profile, association_expected) if screen_profile is not None else None
     files_done = 0
     for file in files:
         if file.id in extracted_zip_parent_ids:
@@ -3725,6 +3729,11 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         if file.id not in await document_file_ids(db, [file.id], usable=True):
             skipped.append(_skip_file(file, "latest_document_needs_review", "The latest document version needs review before its figures are included."))
             continue
+        association = document_associations.record_for_source(screen_profile.id, association_expected, file, analysis,
+            getattr(screen_profile, "financial_metric_review", None), owner=document_associations.owner_context(screen_profile)) if screen_profile is not None else None
+        if document_associations.source_excluded(association):
+            skipped.append(_skip_file(file, "document_business_association_excluded", "This document's business association is denied or needs a fresh review. Its financial figures are excluded from this application's synthesis."))
+            continue
         data = analysis.analysis or {}
         per_file_analyses.append(
             {
@@ -3742,6 +3751,7 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
                 "key_facts": data.get("key_facts") or {},
                 "profitability_diagnostics": data.get("profitability_diagnostics") or [],
                 "financial_fact_citations": data.get("financial_fact_citations") or {},
+                "identity_association": document_associations.summary(association),
             }
         )
 
@@ -3825,12 +3835,14 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         from app.services.document_version_selection import lock_latest_sources
 
         documents_current = await lock_latest_sources(db, files)
-        if not documents_current or (screen_profile is not None and not await funding_requests.lock_review_revision(db, screen_profile, int(current_request.get("revision", 0)), current_budget_revision)):
+        request_current = screen_profile is None or documents_current and await funding_requests.lock_review_revision(db, screen_profile, int(current_request.get("revision", 0)), current_budget_revision)
+        identity_current = screen_profile is None or request_current and await document_associations.review_context_current(db, screen_profile, association_review_stamp)
+        if not documents_current or not request_current or not identity_current:
             review.result = result
             review.status = "completed"
             review.completed_at = _now()
-            review.context_snapshot = {**(review.context_snapshot or {}), "document_versions_stale": not documents_current, "funding_request_stale": documents_current}
-            review.progress = {"stage": "complete", "label": "Historical review: source documents or funding request changed; run a new review", "percent": 100}
+            review.context_snapshot = {**(review.context_snapshot or {}), "document_versions_stale": not documents_current, "funding_request_stale": not request_current, "financial_versions_stale": not identity_current}
+            review.progress = {"stage": "complete", "label": "Historical review: source documents, business association, financial inputs or funding request changed; run a new review", "percent": 100}
             await db.flush()
             return review
         # Reconcile the requested-document checklist: mark an open ask as

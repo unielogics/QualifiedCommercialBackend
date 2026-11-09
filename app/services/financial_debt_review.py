@@ -157,7 +157,7 @@ async def source_context(db, profile):
 
     files, latest, _ = await programs._evidence_inventory(db, profile)
     accepted = await programs.accepted_evidence_file_ids(db, profile, files, latest)
-    analyses = cockpit._analysis_rows(files, latest, accepted)
+    analyses = await cockpit.associated_analysis_rows(db, profile, files, latest, accepted)
     for item in analyses:
         analysis = latest.get(UUID(item["file_id"]))
         item["analysis_id"] = str(analysis.id) if analysis is not None else None

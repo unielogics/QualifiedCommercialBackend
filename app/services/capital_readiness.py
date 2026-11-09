@@ -478,11 +478,16 @@ def filter_current_financial_periods(
     *,
     files: dict[UUID, BucketFile],
     newest_analyses: dict[UUID, BucketFileAnalysis],
+    document_associations: dict[str, dict[str, Any]] | None = None,
 ) -> list[ApplicationFinancialPeriod]:
     """Keep manual rows and exact observations from the live evidence ledger."""
 
     current: list[ApplicationFinancialPeriod] = []
     for period in periods:
+        if document_associations is not None:
+            # A read-local association is never written into immutable source
+            # observations, and must not survive a later reset or owner change.
+            period._document_association = None
         if period.source_file_id is None:
             current.append(period)
             continue
@@ -497,8 +502,77 @@ def filter_current_financial_periods(
             newest = newest_analyses.get(period.source_file_id)
             if newest is None or newest.id != period.source_analysis_id:
                 continue
+        if document_associations is not None:
+            from app.services.document_associations import source_excluded
+
+            association = document_associations.get(str(period.source_file_id))
+            if association is None or source_excluded(association):
+                continue
+            if not _association_matches_period_source(period, association):
+                continue
+            period._document_association = association
         current.append(period)
     return current
+
+
+def _association_matches_period_source(
+    period: ApplicationFinancialPeriod, association: dict[str, Any]
+) -> bool:
+    """Bind reviewed identity to the observation's original bytes/analysis."""
+    if str(association.get("file_id") or "") != str(period.source_file_id):
+        return False
+    if period.profile_id is not None and str(association.get("profile_id") or "") != str(period.profile_id):
+        return False
+    if not period.content_hash or str(association.get("content_hash") or "").lower() != period.content_hash.lower():
+        return False
+    return period.source_analysis_id is None or str(association.get("analysis_id") or "") == str(period.source_analysis_id)
+
+
+def filter_current_associated_facts(
+    facts: list[ApplicationExtractedFact],
+    *,
+    files: dict[UUID, BucketFile],
+    newest_analyses: dict[UUID, BucketFileAnalysis],
+    document_associations: dict[str, dict[str, Any]],
+) -> list[ApplicationExtractedFact]:
+    """A denied or obsolete document cannot re-enter through an accepted fact."""
+    from app.services.document_associations import source_excluded
+
+    current = []
+    for fact in facts:
+        source_id = getattr(fact, "source_file_id", None)
+        analysis_id = getattr(fact, "source_analysis_id", None)
+        if source_id is None:
+            if analysis_id is None:
+                current.append(fact)  # Explicit facts without a document stay independent.
+            continue
+        association = document_associations.get(str(source_id))
+        file = files.get(source_id)
+        analysis = newest_analyses.get(source_id)
+        if (association is None or source_excluded(association) or file is None or analysis is None
+                or str(association.get("file_id") or "") != str(source_id)
+                or (getattr(fact, "profile_id", None) is not None
+                    and str(association.get("profile_id") or "") != str(fact.profile_id))
+                or not file.content_hash or analysis_id is None or analysis.id != analysis_id
+                or str(getattr(analysis, "content_hash", "") or "").lower() != file.content_hash.lower()
+                or str(association.get("content_hash") or "").lower() != file.content_hash.lower()
+                or str(association.get("analysis_id") or "") != str(analysis_id)):
+            continue
+        current.append(fact)
+    return current
+
+
+def _period_business_identity(period: ApplicationFinancialPeriod) -> str:
+    """Resolve one confirmed source association without changing its printed name."""
+    from app.services.document_associations import identity_matches
+
+    printed = str(period.entity_name or "")
+    association = getattr(period, "_document_association", None)
+    if not association or association.get("status") != "accepted" or not _association_matches_period_source(period, association):
+        return printed
+    observed = None if printed.startswith("[Unidentified statement:") else printed
+    expected = association.get("expected_entity")
+    return str(expected) if expected and identity_matches(expected, observed, association) else printed
 
 
 async def _validate_profile_evidence(
@@ -751,7 +825,8 @@ async def list_financial_periods(
 def period_compatibility_key(period: ApplicationFinancialPeriod) -> tuple[str, str, str, str]:
     """Values may only be combined when entity, basis, and currency match."""
 
-    entity = normalize_entity_name(period.entity_name)
+    identity = _period_business_identity(period)
+    entity = normalize_entity_name(identity)
     basis = (period.accounting_basis or "unknown").casefold()
     currency = (period.currency or "XXX").upper()
     # Unknown context permits a source-local ratio, never a guessed merger of
@@ -760,7 +835,7 @@ def period_compatibility_key(period: ApplicationFinancialPeriod) -> tuple[str, s
         basis == "unknown"
         or currency == "XXX"
         or not entity
-        or str(period.entity_name or "").startswith("[Unidentified statement:")
+        or identity.startswith("[Unidentified statement:")
     )
     return (entity, basis, currency, str(period.id or period.idempotency_key) if unresolved else "")
 
@@ -856,7 +931,7 @@ def compatible_period_windows(
     # unidentified sources remain available for separate evidence review.
     if canonical_entities is not None:
         active = [row for row in active if period_compatibility_key(row)[0] in canonical_entities
-                  and not str(row.entity_name or "").startswith("[Unidentified statement:")]
+                  and not _period_business_identity(row).startswith("[Unidentified statement:")]
     if not active:
         return [], []
     active.sort(
@@ -1842,10 +1917,14 @@ async def _calculation_inputs(
         .all()
     )
     source_files, newest_analyses = await _current_evidence_sources(db, profile)
+    from app.services.document_associations import load_context
+
+    associations = await load_context(db, profile, source_files, newest_analyses)
     periods = filter_current_financial_periods(
         period_history,
         files=source_files,
         newest_analyses=newest_analyses,
+        document_associations=associations,
     )
     attach_financial_period_citations(
         periods, files=source_files, newest_analyses=newest_analyses
@@ -1861,6 +1940,12 @@ async def _calculation_inputs(
         )
         .scalars()
         .all()
+    )
+    facts = filter_current_associated_facts(
+        facts,
+        files=source_files,
+        newest_analyses=newest_analyses,
+        document_associations=associations,
     )
     programs = list(
         (

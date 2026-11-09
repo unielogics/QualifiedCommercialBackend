@@ -113,11 +113,13 @@ async def current_version_context(db: AsyncSession, *, profile_id: UUID | None =
         if family.kind == "debt_schedule" and is_accepted_debt_schedule_version(version):
             accepted.setdefault(getattr(family, "profile_id", None) or profile_id or family.id, version.id)
     context = []
+    association_contexts = {}
     for family, version in rows:
         scope = getattr(family, "profile_id", None) or profile_id or family.id
         if family.kind == "debt_schedule" and scope in accepted and version.id != accepted[scope]:
             continue
         item = {"kind": family.kind, "family_id": str(family.id), "label": family.label, "version_id": str(version.id), "version_number": version.version_number, "saved_at": version.created_at.isoformat(), "source_file_id": str(version.pdf_file_id or version.source_file_id), "key_facts": version.key_facts}
+        item["original_source_file_id"] = str(version.source_file_id) if version.source_file_id else None
         if family.kind == "debt_schedule":
             item["authoritative"] = is_accepted_debt_schedule_version(version)
             item["completion"] = debt_schedule_completion(getattr(version, "body", None))
@@ -130,6 +132,16 @@ async def current_version_context(db: AsyncSession, *, profile_id: UUID | None =
                 identities = debt_row_identity_context(version.body, visible_file_ids=visible_file_ids)
                 if identities:
                     item["debt_rows"] = identities
+        if isinstance(db, AsyncSession) and getattr(family, "profile_id", None):
+            from app.services import document_associations
+
+            if family.profile_id not in association_contexts:
+                profile = await db.get(ApplicationProfile, family.profile_id)
+                sources = {source_id for source_family, source_version in rows if source_family.profile_id == family.profile_id
+                           for source_id in (source_version.pdf_file_id, source_version.source_file_id) if source_id}
+                association_contexts[family.profile_id] = await document_associations.additional_context(db, profile, sources) if profile is not None and any(
+                    event.get("identity_file_id") for event in (profile.financial_metric_review or {}).get("events", [])) else {}
+            item = document_associations.version_projection(item, association_contexts[family.profile_id])
         context.append(item)
     return context
 

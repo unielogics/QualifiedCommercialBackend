@@ -29,13 +29,18 @@ async def _payees(db, profile):
 
         files, latest, _classes = await application_programs._evidence_inventory(db, profile)
         accepted = await application_programs.accepted_evidence_file_ids(db, profile, files, latest)
-        analyses = financial_cockpit._analysis_rows(files, latest, accepted)
+        analyses = await financial_cockpit.associated_analysis_rows(db, profile, files, latest, accepted)
         observed = financial_cockpit.recurring_payments(analyses).get("payees") or []
         if observed:
             return [SimpleNamespace(key=row["key"], sample_description=row["payee"], direction=-1,
                                     category=row["kind"], monthly_average=row.get("monthly_average") or 0,
                                     months=row.get("months_seen") or 0, count=row.get("occurrences") or 0)
                     for row in observed]
+        from app.services import document_associations
+
+        associations = await document_associations.load_context(db, profile, files, latest)
+        if any(document_associations.source_excluded(row) and row.get("classification") == "bank_statement" for row in associations.values()):
+            return []
     if not profile.dealer_id:
         return []
     dealer = await db.get(DealerBusiness, profile.dealer_id)

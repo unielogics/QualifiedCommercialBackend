@@ -9,7 +9,7 @@ import math
 import re
 from copy import deepcopy
 
-SOURCE_KEYS = ("file_id", "file_name", "analysis_id", "content_hash", "accepted", "entity", "period_start", "period_end", "statement_period", "currency", "basis", "version_id", "fact_key", "fact_present", "citations", "pages")
+SOURCE_KEYS = ("file_id", "file_name", "analysis_id", "content_hash", "accepted", "entity", "period_start", "period_end", "statement_period", "currency", "basis", "version_id", "fact_key", "fact_present", "citations", "pages", "identity_association")
 CURRENCY_KEYS = ("numerator_currency", "denominator_currency", "source_currencies", "currency_comparable", "currency_status", "currency_note", "denominator_currency_basis")
 RESULT_KEYS = ("key", "label", "kind", "value", "annualized_value", "period", "months_covered", "annualization_factor",
                "formula", "complete", "provisional", "entity_mismatch", "entity_comparable", "missing_inputs", "input_keys",
@@ -58,7 +58,7 @@ def validated_annual_pair(cockpit):
                           if row.get("key") == "profit_and_loss" and _number(row.get("numerator")) is not None
                           and abs(float(row["numerator"]) - annual) <= 0.01), None)
         service = (cockpit.get("debt") or {}).get("service") or {}
-        debt_validated = bool(service.get("schedule_authoritative") or service.get("observed_additions_suppressed"))
+        debt_validated = bool(service.get("schedule_authoritative") or service.get("observed_additions_suppressed")) and not service.get("identity_association_conflict")
         debt_currency = str(service.get("currency") or "USD").upper()  # The system debt templates are denominated in dollars.
         return {"ebitda": _result(result), "ebitda_annual": annual, "currency": currency,
                 "basis": "validated_profit_and_loss_annual_ebitda", "period": result.get("period"),
@@ -105,6 +105,8 @@ def metric_brief(cockpit):
         primary["annual_debt_service"] = dscr.get("annual_debt_service")
         primary["role"] = "Primary DSCR, exactly the current financial cockpit headline"
     return {"revision": review.get("revision", 0), "scope": "Current source-bound cockpit calculations; original documents, AI snapshots, saved forms and financial-period records are unchanged.",
+            "document_associations": [{key: row.get(key) for key in ("file_id", "content_hash", "analysis_id", "status", "expected_entity", "observed_entity", "association_stamp")}
+                                      for row in review.get("document_associations", [])],
             "ebitda": {"headline": _result(ebitda.get("headline")), "candidates": [_result(row) for row in ebitda.get("candidates", [])], "reason": ebitda.get("reason")},
             "primary_dscr": primary, "validated_annual": validated_annual_pair(cockpit),
             "inputs": inputs, "corrections": corrections, "calculation_reviews": calculation_reviews,
