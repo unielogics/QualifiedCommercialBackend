@@ -338,6 +338,8 @@ def test_other_published_credit_requirements_do_not_invent_equifax_fico9_gap():
     assert result["owners"][0]["required_score_model"] is None
     assert not any("required Equifax" in text for text in result["staff_review_reasons"])
     req.collection_config = {"credit_bureau": "Equifax", "credit_model": "fico_9"}
+    assert snapshot([person], [pull(person)], req)["owners"][0]["required_score_model"] is None
+    req.completion_criteria = "Review the linked Equifax FICO 9 report"
     assert (
         snapshot([person], [pull(person)], req)["owners"][0]["required_score_model"]
         == "Equifax FICO 9"
@@ -455,7 +457,8 @@ async def test_materialization_and_collection_reuse_task_and_stop_borrower_remin
 @pytest.mark.asyncio
 async def test_staff_acceptance_is_bound_to_same_report_and_definition(monkeypatch):
     prof, person, req = profile(), owner(), requirement()
-    report, requested = pull(person), SimpleNamespace(status="requested", requires_signature=False)
+    report = pull(person, fico=700, bureau_response={"parsed_report": {"scores": [{"model": "Equifax FICO 9", "score": 700}]}})
+    requested = SimpleNamespace(status="requested", requires_signature=False)
     row = state(prof)
     db = SimpleNamespace(scalars=AsyncMock(return_value=Rows([report])))
     monkeypatch.setattr(application_profiles, "owner_rows", AsyncMock(return_value=[person]))

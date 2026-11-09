@@ -4286,6 +4286,10 @@ async def patch_requirement(
         state.verified_by_user_id = None
         state.state_reason = payload.reason or "Evidence link removed by underwriting staff"
     elif payload.action == "verify":
+        from app.services.credit_requirement_sync import staff_review_only
+
+        if (state.provenance or {}).get("credit_collection") or staff_review_only(state):
+            raise HTTPException(409, "Use the linked-owner credit review action to verify the current bureau, score model and published minimum")
         if not state.verification_required:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,

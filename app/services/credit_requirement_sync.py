@@ -49,6 +49,56 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
 
 
+def owner_review_fingerprint(owner: Any) -> str:
+    """Bind a staff confirmation to the displayed owner facts, not the review flag."""
+    return _digest({key: getattr(owner, key, None) for key in (
+        "id", "profile_id", "dealer_id", "first_name", "last_name", "email", "phone",
+        "ownership_pct", "is_primary", "is_guarantor", "dob", "street", "city", "state", "zip",
+        "credit_pull_id", "archived_at",
+    )})
+
+
+def owner_review_blockers(owner: Any, owners: list) -> list[str]:
+    blockers = []
+    if not str(getattr(owner, "first_name", "") or "").strip() or not str(getattr(owner, "last_name", "") or "").strip():
+        blockers.append("Enter the owner's first and last name before confirming the imported record")
+    if _percent(owner) is None:
+        blockers.append("Enter the owner's actual ownership percentage before confirming the imported record")
+    percentages = [_percent(row) for row in owners if not getattr(row, "archived_at", None)]
+    if not percentages or any(value is None for value in percentages) or abs(sum((value or Decimal(0) for value in percentages), Decimal(0)) - 100) >= Decimal("0.005"):
+        blockers.append("Review the current ownership roster; known ownership percentages must total 100.00%")
+    return blockers
+
+
+def _required_minimum(requirement: Any, policy_context: dict | None) -> tuple[int | None, list[str]]:
+    """Read explicit score floors from the current published requirement, never a default."""
+    config = getattr(requirement, "collection_config", None) or {}
+    floors = set()
+    for key in ("minimum_credit_score", "min_credit_score", "minimum_score", "min_score", "min_fico", "credit_score_min"):
+        if config.get(key) is not None:
+            raw = str(config[key])
+            if not raw.isascii() or not raw.isdigit() or not 300 <= int(raw) <= 850:
+                return None, ["The published minimum credit score needs staff policy review"]
+            floors.add(int(raw))
+    text = " ".join(str(getattr(requirement, key, None) or "") for key in ("label", "completion_criteria"))
+    checks = (policy_context or {}).get("review_checks") or getattr(requirement, "review_checks", None) or []
+    unsupported = []
+    for raw in checks:
+        row = raw.model_dump() if hasattr(raw, "model_dump") else raw if isinstance(raw, dict) else {}
+        words = " ".join(str(row.get(key) or "") for key in ("label", "instructions"))
+        key = str(row.get("key") or "")
+        found = {int(value) for value in re.findall(r"\b([3-8][0-9]{2})\b", words) if 300 <= int(value) <= 850}
+        if key == "minimum" and isinstance(row.get("value"), int) and 300 <= row["value"] <= 850:
+            found.add(row["value"])
+        if not found or key not in {"minimum", "custom_quidity_credit_floor"}:
+            unsupported.append("The published credit policy includes additional criteria requiring staff policy review")
+        floors.update(found)
+    floors.update(int(value) for value in re.findall(r"\b([3-8][0-9]{2})\b", text) if 300 <= int(value) <= 850)
+    if len(floors) != 1:
+        return None, [*unsupported, "The published minimum credit score is missing or ambiguous; review the selected program's policy"]
+    return next(iter(floors)), unsupported
+
+
 def supports(requirement: Any, profile: Any, *, expected_subjects=None) -> bool:
     key = getattr(requirement, "canonical_key", None) or requirement.requirement_key
     config = getattr(requirement, "collection_config", None) or {}
@@ -139,11 +189,15 @@ def _required_score_model(requirement: Any, policy_context: dict | None) -> str 
     bureau = config.get("credit_bureau") or config.get("bureau")
     if configured:
         text += f" {bureau or ''} {configured}"
-    return (
-        "Equifax FICO 9"
-        if re.search(r"\bequifax\s+fico\s*(?:score\s*)?9\b", _words(text))
-        else None
-    )
+    normalized = _words(text)
+    if bureau and _words(bureau) != "equifax":
+        return None
+    if configured and not re.search(r"\bfico\s*(?:score\s*)?9\b", _words(configured)):
+        return None
+    if re.search(r"\b(?:transunion|trans union|experian)\b", normalized):
+        return None
+    models = set(re.findall(r"\bfico\s*(?:score\s*)?(\d+)\b", normalized))
+    return "Equifax FICO 9" if models == {"9"} and re.search(r"\bequifax\s+fico\s*(?:score\s*)?9\b", normalized) else None
 
 
 def _documents_required_model(item: dict, required_model: str | None) -> bool:
@@ -153,7 +207,7 @@ def _documents_required_model(item: dict, required_model: str | None) -> bool:
     score = item.get("score")
     if not isinstance(score, int) or isinstance(score, bool) or not 300 <= score <= 850:
         return False
-    if not re.search(r"\bfico\s*(?:score\s*)?9\b", model):
+    if not re.fullmatch(r"(?:equifax\s+)?fico\s*(?:score\s*)?9(?:\s+equifax)?", model):
         return False
     # Never infer that an unlabelled model belongs to another reported bureau.
     if bureau and bureau != "equifax":
@@ -184,7 +238,10 @@ def _owner_report(
         "score_models": [],
         "required_score_model": required_score_model,
         "required_score_model_present": False,
+        "required_score": None,
         "backfill_needs_review": bool(getattr(owner, "backfill_needs_review", False)),
+        "owner_review_fingerprint": owner_review_fingerprint(owner),
+        "ownership_pct": float(owner.ownership_pct) if _percent(owner) is not None else None,
     }
     if pull is None:
         if owner.credit_pull_id:
@@ -201,6 +258,7 @@ def _owner_report(
         expires = min(expires, maximum) if expires else maximum
     models = _score_models(pull)
     required_model = any(_documents_required_model(item, required_score_model) for item in models)
+    required_scores = {item["score"] for item in models if _documents_required_model(item, required_score_model)}
     from app.services.credit_pull_core import credit_status_extras
 
     facts = credit_status_extras(pull)
@@ -212,6 +270,7 @@ def _owner_report(
         score=pull.fico,
         score_models=models,
         required_score_model_present=required_model,
+        required_score=next(iter(required_scores)) if len(required_scores) == 1 else None,
         score_verified=facts["score_verified"],
         fico_source=facts["fico_source"],
     )
@@ -308,6 +367,7 @@ def collection_snapshot(
         required = [row for row in active if (_percent(row) or Decimal(0)) >= 20]
     days = getattr(requirement, "expiration_days", None)
     required_model = _required_score_model(requirement, policy_context)
+    minimum, policy_blockers = _required_minimum(requirement, policy_context)
     reports = [
         _owner_report(
             row,
@@ -354,6 +414,26 @@ def collection_snapshot(
     staff_reasons.extend(
         row["reason"] for row in reports if row["status"] not in {"collected", "missing"}
     )
+    review_blockers = list(policy_blockers)
+    if not ownership_complete:
+        review_blockers.append("Review the current ownership roster and percentages before completing credit review")
+    if not required:
+        review_blockers.append("Confirm whether this owner-credit requirement applies; no current owner meets its collection threshold")
+    if any(row["backfill_needs_review"] for row in reports):
+        review_blockers.append("Confirm the imported owner details before completing credit review")
+    if not complete:
+        review_blockers.append("Every required owner needs a current, consented report with a matching subject")
+    if required_model is None:
+        review_blockers.append("The required credit bureau and score model need staff policy review")
+    for row in reports:
+        if not row.get("score_verified"):
+            review_blockers.append("Import and verify the actual linked report score; an identity-check placeholder cannot satisfy the published minimum")
+        if not row["required_score_model_present"]:
+            review_blockers.append(f"The linked report does not establish {required_model or 'the required bureau and score model'}")
+        elif row.get("required_score") is None:
+            review_blockers.append("The linked report contains conflicting scores for the required bureau and model")
+        elif minimum is not None and row["required_score"] < minimum:
+            review_blockers.append(f"A required owner's {required_model} score of {row['required_score']} is below the published minimum of {minimum}")
     snapshot = {
         "source": "linked_owner_credit_pulls",
         "complete": complete,
@@ -366,6 +446,10 @@ def collection_snapshot(
         ),
         "staff_review_reasons": list(dict.fromkeys(staff_reasons)),
         "owners": reports,
+        "required_score_model": required_model,
+        "required_minimum_score": minimum,
+        "review_blockers": list(dict.fromkeys(review_blockers)),
+        "can_mark_met": not review_blockers,
     }
     snapshot["fingerprint"] = _digest(
         {
@@ -386,6 +470,7 @@ def collection_snapshot(
             "policy_context": policy_context,
         }
     )
+    snapshot["review_fingerprint"] = snapshot["fingerprint"]
     return snapshot
 
 
@@ -439,12 +524,21 @@ async def materialize(db, profile, requirement, state, requested, *, policy_cont
         policy_context=policy_context,
     )
     previous = (state.provenance or {}).get("credit_collection") or {}
+    saved_review = (state.provenance or {}).get("credit_review")
+    if isinstance(saved_review, dict):
+        snapshot["last_review"] = {
+            **saved_review,
+            "current": saved_review.get("fingerprint") == snapshot["fingerprint"] and state.status == {
+                "met": "verified", "failed": "failed", "incomplete": "received_unverified",
+            }.get(saved_review.get("decision")),
+        }
     no_required_owners = snapshot["ownership_complete"] and snapshot["required_owner_count"] == 0
     if not no_required_owners and not any(row["credit_pull_id"] for row in snapshot["owners"]):
         clear_projection()
         return False
     retained = bool(
         snapshot["complete"]
+        and snapshot["can_mark_met"]
         and state.status == "verified"
         and state.verified_by_user_id
         and previous.get("fingerprint") == snapshot["fingerprint"]

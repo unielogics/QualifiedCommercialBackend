@@ -1194,6 +1194,8 @@ async def resolve_profile(
 
 
 def owner_read(owner: ApplicationOwner | DealerOwner, *, include_credit_risk: bool = True) -> FileOwnerRead:
+    from app.services.credit_requirement_sync import owner_review_fingerprint
+
     summary = getattr(owner, "credit_summary", None)
     summary = summary if isinstance(summary, dict) else {}
     attention = summary.get("attention")
@@ -1233,6 +1235,7 @@ def owner_read(owner: ApplicationOwner | DealerOwner, *, include_credit_risk: bo
         credit_attention=attention,
         credit_expires_at=summary.get("expires_at"),
         backfill_needs_review=getattr(owner, "backfill_needs_review", False),
+        review_fingerprint=owner_review_fingerprint(owner),
         source="dealer" if isinstance(owner, DealerOwner) else "application",
     )
 
