@@ -17,7 +17,7 @@ def setup(monkeypatch):
     intake = SimpleNamespace(id=uuid4(), client_id=uuid4(), bucket_id=uuid4(), bucket=SimpleNamespace(),
                              bucket_upload_link=link, bucket_upload_link_id=link.id, phone="+15555550100")
     message = SimpleNamespace(id=uuid4(), content="")
-    db = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: uuid4())), commit=AsyncMock())
+    db = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: uuid4())), commit=AsyncMock(), rollback=AsyncMock())
     monkeypatch.setattr(core, "_require_super_admin", Mock())
     monkeypatch.setattr(core, "_load_admin_dealer_lead", AsyncMock(return_value=intake))
     monkeypatch.setattr(core, "create_human_message", AsyncMock(return_value=message))
@@ -96,3 +96,26 @@ async def test_successful_sms_is_not_resent(monkeypatch):
         await admin.retry_dealer_ai_client_thread_sms(intake.id, message.id, None, user, db)
     assert error.value.status_code == 409
     core.send_sms_checked.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sent_file_sms_is_reported_as_sent_even_when_history_commit_fails(monkeypatch):
+    user, intake, _, db, _ = setup(monkeypatch)
+    core.send_sms_checked.return_value = SimpleNamespace(ok=True, detail="accepted")
+    db.commit.side_effect = RuntimeError("history unavailable")
+    result = await admin.reply_dealer_ai_client_thread(intake.id, core.ClientThreadReplyRequest(image_ids=[uuid4()], also_sms=True), None, user, db)
+    assert "text was sent" in result.delivery_warning and "Do not send it again" in result.delivery_warning
+    assert core.send_sms_checked.await_count == 1
+    db.rollback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sent_file_sms_retry_preserves_image_link_failure_warning(monkeypatch):
+    user, intake, message, db, _ = setup(monkeypatch)
+    results = [message, None, uuid4()]
+    db.execute.side_effect = [SimpleNamespace(scalar_one_or_none=lambda value=value: value) for value in results]
+    core.send_sms_checked.return_value = SimpleNamespace(ok=True, detail="sent_but_image_links_unavailable")
+    db.commit.side_effect = RuntimeError("history unavailable")
+    result = await admin.retry_dealer_ai_client_thread_sms(intake.id, message.id, None, user, db)
+    assert "text was sent" in result.delivery_warning and "image links are unavailable" in result.delivery_warning
+    core.send_sms_checked.assert_awaited_once()
