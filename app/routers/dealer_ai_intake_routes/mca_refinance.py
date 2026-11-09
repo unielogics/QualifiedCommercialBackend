@@ -208,6 +208,8 @@ async def start_mca_refinance(
     intake.bucket = bucket
     core.mca_refinance_policy.persist(intake)
     db.add(intake)
+    await db.flush()
+    await core.profiles_service.provision_profile_for_intake(db, intake)
     await db.commit()
     intake = await core._load_public_intake(db, token)
     await onboarding_consent.record_for_start(db, intake, payload, request, entry="starting an MCA refinance application")

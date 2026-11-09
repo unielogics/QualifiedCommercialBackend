@@ -10128,7 +10128,7 @@ async def _start_rep_appointment_application(
         linked_existing = True
     elif intake_id is None:
         result = await intake_api._create_admin_ai_lead_core(
-            intake_api.AdminLeadCreate(
+            intake_api.business_profile._legacy_adapter(intake_api.AdminLeadCreate,
                 variant=authorized_variant,
                 full_name=appointment.invitee_name,
                 email=appointment.invitee_email,
@@ -13295,7 +13295,7 @@ async def _convert_appointment_to_ai_intake(
     if not appt.invitee_email:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "An email is required to create an AI intake.")
     result = await intake_api._create_admin_ai_lead_core(
-        intake_api.AdminLeadCreate(
+        intake_api.business_profile._legacy_adapter(intake_api.AdminLeadCreate,
             variant=authorized_variant,
             full_name=appt.invitee_name,
             email=appt.invitee_email,

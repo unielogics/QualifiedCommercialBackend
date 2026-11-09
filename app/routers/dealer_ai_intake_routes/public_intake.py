@@ -93,7 +93,7 @@ async def start_dealer_intake(
             payload,
             request,
             intent="equipment",
-            industry="other",
+            industry=payload.industry,
         )
     else:
         bucket, link = await core._create_bucket_for_intake(db, client, payload, request)
@@ -120,7 +120,7 @@ async def start_dealer_intake(
         **business_profile.state_entry(payload),
         **({"funding_intent": payload.funding_intent} if payload.funding_intent else {}),
         **(
-            {"main_street_details": {"intent": "equipment", "industry": "other"}}
+            {"main_street_details": {"intent": "equipment", "industry": payload.industry}}
             if business_equipment
             else {"dealer_details": {"financing_equipment_or_vehicle": True}}
             if equipment_application
@@ -159,6 +159,8 @@ async def start_dealer_intake(
         intake_state=intake_state,
     )
     db.add(intake)
+    await db.flush()
+    await core.profiles_service.provision_profile_for_intake(db, intake)
     if equipment_application:
         await core._configure_equipment_bucket(
             db,

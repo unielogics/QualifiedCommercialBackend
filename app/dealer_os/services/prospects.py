@@ -2907,6 +2907,7 @@ async def create_intake_from_prospect(
         _hash_token,
         _new_public_token,
     )
+    from app.services import business_profile
     from app.services.application_profiles import provision_profile_for_intake
     from app.services.main_street_programs import normalize_industry
 
@@ -2922,7 +2923,8 @@ async def create_intake_from_prospect(
     }
     if lead_type == "real_estate":
         transaction_type = "refinance" if funding_intent == "debt_refinance" else None
-        adapter = FundingReviewStart(
+        adapter = business_profile._legacy_adapter(FundingReviewStart,
+            **business_profile.existing_source_fields(company),
             full_name=contact.full_name,
             email=prospect.email_normalized,
             phone=prospect.phone_normalized,
@@ -2937,7 +2939,8 @@ async def create_intake_from_prospect(
             "transaction_type": transaction_type,
         }
     elif lead_type == "main_street" and variant == MCA_VARIANT:
-        adapter = McaRefiStart(
+        adapter = business_profile._legacy_adapter(McaRefiStart,
+            **business_profile.existing_source_fields(company),
             full_name=contact.full_name,
             email=prospect.email_normalized,
             phone=prospect.phone_normalized,
@@ -2947,7 +2950,8 @@ async def create_intake_from_prospect(
         bucket, link = await _create_bucket_for_mca_refi(db, client, adapter, request)
         intake_state["source"] = "mca_refinance"
     else:
-        adapter = DealerIntakeStart(
+        adapter = business_profile._legacy_adapter(DealerIntakeStart,
+            **business_profile.existing_source_fields(company),
             full_name=contact.full_name,
             email=prospect.email_normalized,
             phone=prospect.phone_normalized,
@@ -2968,6 +2972,7 @@ async def create_intake_from_prospect(
             }
         else:
             bucket, link = await _create_bucket_for_intake(db, client, adapter, request)
+    intake_state.update(business_profile.state_entry(adapter))
     # Preserve rep attribution without stealing a client already assigned to
     # someone else.
     if client.originating_agent_id is None:

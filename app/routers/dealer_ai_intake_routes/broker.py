@@ -179,6 +179,7 @@ async def create_broker_ai_lead(
     }
 
     adapter = core.DealerIntakeStart(
+        **core.business_profile.payload_fields(payload),
         full_name=payload.full_name,
         email=payload.email,
         phone=payload.phone,
@@ -193,6 +194,7 @@ async def create_broker_ai_lead(
     token = core._new_public_token()
     intake_state: dict[str, Any] = {
         "messages": [],
+        **core.business_profile.state_entry(payload),
         "source": "dealer_ai_intake",
         "broker_provenance": provenance,
     }
@@ -216,6 +218,8 @@ async def create_broker_ai_lead(
         intake_state=intake_state,
     )
     db.add(intake)
+    await db.flush()
+    await core.profiles_service.provision_profile_for_intake(db, intake)
     await core._log(
         db,
         bucket.id,

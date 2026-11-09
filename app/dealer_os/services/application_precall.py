@@ -167,6 +167,7 @@ async def create_draft_for_booking(
     await db.flush()
 
     from app.routers.dealer_ai_intake import AdminLeadCreate, _create_admin_ai_lead_core
+    from app.services import business_profile
 
     pin = f"{secrets.randbelow(900000) + 100000}"
     requested_amount = data.get("requested_amount")
@@ -175,7 +176,8 @@ async def create_draft_for_booking(
     except (TypeError, ValueError):
         amount_value = None
     result = await _create_admin_ai_lead_core(
-        AdminLeadCreate(
+        business_profile._legacy_adapter(AdminLeadCreate,
+            **{key: data[key] for key in business_profile.PROFILE_FIELDS if key in data},
             variant=selected_variant,
             full_name=notice.invitee_name,
             email=notice.invitee_email,
@@ -185,7 +187,6 @@ async def create_draft_for_booking(
             requested_amount=amount_value,
             loan_purpose=notice.program_name,
             intent="working_capital" if selected_variant == "main_street" else None,
-            industry="other" if selected_variant == "main_street" else None,
             notify_client=False,
             force_new=True,
             secure_room_pin=pin,

@@ -129,6 +129,8 @@ async def start_funding_review(
         },
     )
     db.add(intake)
+    await db.flush()
+    await core.profiles_service.provision_profile_for_intake(db, intake)
     await db.commit()
     intake = await core._load_public_intake(db, token)
     await onboarding_consent.record_for_start(db, intake, payload, request, entry="starting a real estate funding review")
