@@ -2356,6 +2356,7 @@ def build_cockpit(
 
     financial_earnings_sources.attach(metric_review["ebitda"], metric_review, all_sources, years, statement, effective_bank,
                                      state=metric_review_state, entity=business_entity, now=now)
+    financial_earnings_sources.align_coverage(metric_review["ebitda"], dscr, metric_review)
     from app.services import financial_plan as plans
 
     plan_record = plans.normalize_plan(plan)
@@ -2486,6 +2487,27 @@ def build_cockpit(
     cockpit["plan"]["economics"] = (
         internal_economics(economics, cockpit["proposed_terms"]) if economics is not None else None
     )
+    from app.services import financial_earnings_potential, financial_noi
+
+    cockpit["ebitda"]["potential"] = financial_earnings_potential.build(cockpit["ebitda"], service, evaluation, statement=statement)
+    cockpit["noi"] = financial_noi.build_noi(all_sources, statement=statement, entity=business_entity,
+        metric_review=metric_review, current_annual_debt_service=service.get("annual"),
+        plan_annual_debt_service=evaluation.get("debt_service_after_annual") if evaluation.get("active") and not evaluation.get("coverage_unavailable_reason") else None,
+        operating_adjustments=(evaluation.get("ebitda") or {}).get("adjusted_annual", {}).get("adjustments", []),
+        source_selection=cockpit["ebitda"].get("source_selection"))
+    metric_review["calculations"].extend(cockpit["noi"].get("candidates", []))
+    if evaluation.get("schedule"):
+        cockpit["noi"]["scenario"]["notes"].append("Saved-plan debt service uses the annual coverage window, including balloon and maturity stress where configured; the residual is not a regular-payment cash-flow forecast.")
+    if evaluation.get("debt_service_override_monthly") is not None:
+        cockpit["noi"]["scenario"]["notes"].append("Saved-plan debt service includes a hypothetical staff override; current published debt service is unchanged.")
+    selection = cockpit["ebitda"].get("source_selection") or {}
+    if selection.get("latest_file_id"):
+        selected_source = next((row for row in selection.get("sources", []) if row.get("selected")), None)
+        profit_kind = "profit_and_loss" if selected_source and selected_source.get("kind") == "profit_and_loss" else "tax_return" if selected_source else None
+        cockpit["net_profit"]["conclusion"] = next((row for row in cockpit["net_profit"].get("candidates", []) if row["key"] == profit_kind), None)
+        cockpit["net_profit"]["baseline_policy"] = "latest_business_period"
+        if not selected_source:
+            cockpit["net_profit"]["note"] = "The latest business reporting period is incomplete or excluded. Prior years are comparison evidence only."
     from app.services.financial_kpi_evidence import attach as attach_kpi_evidence
 
     attach_kpi_evidence(cockpit)

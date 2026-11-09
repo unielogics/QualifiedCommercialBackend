@@ -30,6 +30,7 @@ class FinancialCockpitRead(BaseModel):
     debt: dict[str, Any] = Field(default_factory=dict)
     dscr: dict[str, Any] = Field(default_factory=dict)
     ebitda: dict[str, Any] = Field(default_factory=dict)
+    noi: dict[str, Any] = Field(default_factory=dict)
     metric_review: dict[str, Any] = Field(default_factory=dict)
     net_profit: dict[str, Any] = Field(default_factory=dict)
     #: The plan (record, evaluation, levers); see app/services/financial_plan.py.

@@ -201,6 +201,15 @@ def partner_operating_earnings(value: Any) -> dict[str, Any] | None:
         return {key: row[key] for key in keys if key in row} if isinstance(row, dict) else {}
 
     trend = value.get("revenue_trend") or {}
+    noi = value.get("noi") or {}
+    potential = value.get("potential") or {}
+
+    def bridge(row):
+        if not isinstance(row, dict):
+            return None
+        return {**fields(row, ("annual_debt_service", "dscr", "no_debt_service", "earnings_less_debt_service", "funding_shortfall")),
+                "targets": [fields(target, ("ratio", "earnings_required", "margin_pct", "improvement_required")) for target in row.get("targets", [])]}
+
     return {
         "historical": fields(value.get("historical"), ("value", "annualized_value", "label", "kind", "period", "months_covered",
                                                        "currency", "complete", "provisional", "staff_adjusted")) or None,
@@ -209,10 +218,23 @@ def partner_operating_earnings(value: Any) -> dict[str, Any] | None:
             "periods": [fields(row, ("year", "period_start", "period_end", "months_covered", "revenue", "average_monthly_revenue",
                                     "ebitda", "ebitda_kind", "currency", "basis")) for row in trend.get("periods", []) if isinstance(row, dict)],
             "comparison": fields(trend.get("comparison"), ("prior_year", "current_year", "prior_revenue", "current_revenue",
-                                                            "change_amount", "change_pct", "monthly_change", "comparable")) or None,
+                                                            "change_amount", "change_pct", "monthly_change", "comparable", "direction")) or None,
             "forecast": fields(trend.get("forecast"), ("status", "method", "target_year", "projected_revenue", "change_amount",
                                                         "change_pct", "projected_ebitda", "ebitda_kind", "margin")) or None,
         },
+        "potential": {
+            **fields(potential, ("available",)),
+            "baseline": fields(potential.get("baseline"), ("revenue", "earnings", "kind", "margin_pct", "period", "currency", "basis", "provisional", "annualized")),
+            "current": bridge(potential.get("current")), "plan": bridge(potential.get("plan")),
+            "forecast": fields(potential.get("forecast"), ("status", "earnings", "revenue", "kind", "dscr_current", "dscr_plan")) or None,
+        } if potential else None,
+        "noi": {
+            "definition": fields(noi.get("definition"), ("key", "label", "formula", "includes_depreciation_and_amortization")),
+            "historical": fields(noi.get("historical"), ("value", "annualized_value", "label", "kind", "period", "months_covered", "currency", "basis", "complete", "provisional")) or None,
+            "years": [fields(row, ("year", "period", "value", "annualized_value", "currency", "basis", "complete", "provisional")) for row in noi.get("years", [])],
+            "trend": fields(noi.get("trend"), ("direction", "comparable", "prior_year", "current_year", "change_amount", "change_pct")),
+            "scenario": fields(noi.get("scenario"), ("current", "plan", "annual_debt_service_current", "annual_debt_service_plan", "after_debt_service_current", "after_debt_service_plan")),
+        } if noi else None,
         "qualification_policy": "Historical earnings and illustrative forecasts are separate. Forecasts do not establish current program eligibility.",
     }
 

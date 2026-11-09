@@ -169,6 +169,9 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
             aliases = income_aliases if key == "income" else tuple((year.get("component_fact_paths") or {}).get(key) or _TAX_LINE_ALIASES[key])
             year[key] = operand(f"{prefix}.{key}", label, year.get(key), source_refs=source_refs, period=period,
                                 fact_keys=aliases, canonical=income_field if key == "income" else key)
+        year["gross_receipts"] = operand(f"{prefix}.gross_receipts", "Business tax-return revenue", year.get("gross_receipts"),
+            source_refs=source_refs, period=period, fact_keys=extraction._PL_REVENUE_ALIASES,
+            canonical="revenue", minimum=0)
         year["ebitda"] = round(year["income"] + (year["interest"] or 0) + (year["depreciation"] or 0), 2) if year["income"] is not None else None
         depreciation_input = next(i for i in inputs if i["key"] == f"{prefix}.depreciation")
         year["ebitda_complete"] = all(year.get(key) is not None for key in ("income", "interest", "depreciation")) and bool(year.get("depreciation_complete") or depreciation_input.get("correction"))
@@ -204,6 +207,18 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
         source_refs = refs(statement)
         raw = (by_file.get(str(statement.get("file_id")), {}).get("key_facts") or {})
         period = statement.get("period_label") or "Unknown statement period"
+        for key, label, canonical in (
+            ("gross_revenue", "P&L operating revenue", "revenue"),
+            ("cost_of_goods_sold", "P&L cost of goods sold", "cogs"),
+            ("total_operating_expenses", "P&L operating expenses (including expensed D&A)", "operating_expenses"),
+        ):
+            aliases = extraction._PL_REVENUE_ALIASES if key == "gross_revenue" else (key, "cogs") if key == "cost_of_goods_sold" else (key, "operating_expenses")
+            source_value = next((value for alias in aliases if (value := source_number(raw.get(alias))) is not None), None)
+            statement[key] = operand(f"profit_and_loss.{key}", label, source_value, source_refs=source_refs, period=period,
+                fact_keys=aliases, canonical=canonical)
+        statement["reported_operating_income"] = operand("profit_and_loss.reported_operating_income", "Source-reported operating income (NOI)",
+            next((value for alias in ("operating_income", "operating_profit", "net_operating_income") if (value := source_number(raw.get(alias))) is not None), None), source_refs=source_refs, period=period,
+            fact_keys=("operating_income", "operating_profit", "net_operating_income"), canonical="operating_income")
         original_months = statement.get("months_covered")
         months_value = operand("profit_and_loss.months_covered", "P&L reporting months", original_months, source_refs=source_refs, period=period, unit="months", minimum=1, maximum=12)
         statement["months_covered"] = int(months_value) if months_value is not None else None

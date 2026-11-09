@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from app.enums import Role
 from app.routers.financial_metrics import FinancialEarningsSources, FinancialRevenueAssumptions
 from app.services import financial_cockpit
-from app.services.financial_earnings_sources import change
+from app.services.financial_earnings_sources import align_coverage, attach, change
 from app.tests.test_financial_metric_review import ACTOR, ENTITY, build, file, pnl
 
 
@@ -29,7 +29,7 @@ def selection(cockpit):
 
 
 def save(cockpit, state=None, **extra):
-    return change(state, selection(cockpit), mode="manual", selected_file_id="tax-2025", excluded_file_ids=["tax-2024", "personal"],
+    return change(state, selection(cockpit), mode="manual", selected_file_id=selection(cockpit)["selected_file_id"], excluded_file_ids=["tax-2024", "personal"],
         reason="Use the latest business return, retain earlier comparison", expected_revision=(state or {}).get("revision", 0),
         source_stamp=selection(cockpit)["source_stamp"], idempotency_key="source-review-1", actor=ACTOR, **extra)
 
@@ -102,14 +102,15 @@ def test_source_replacement_makes_choice_stale_instead_of_silently_reincluding_e
     assert error.value.status_code == 409
 
 
-def test_manual_no_source_removes_baseline_without_deleting_documents_or_dscr():
+def test_manual_no_source_removes_earnings_and_dscr_baselines_without_deleting_documents():
     c = build(sources())
     state, _ = change(None, selection(c), mode="manual", selected_file_id=None, excluded_file_ids=[], reason="Awaiting reconciled return",
                       expected_revision=0, source_stamp=selection(c)["source_stamp"], idempotency_key="receipt-1", actor=ACTOR)
     current = build(sources(), state=state)
     assert current["ebitda"]["headline"] is None
     assert len(current["ebitda"]["source_selection"]["sources"]) == 3
-    assert current["dscr"]["headline"]["value"] == c["dscr"]["headline"]["value"]
+    assert current["dscr"]["headline"] is None
+    assert current["dscr"]["comparative_candidates"][0]["value"] == c["dscr"]["headline"]["value"]
 
 
 def test_current_year_outlook_is_not_invented_from_explosive_growth_or_bank_deposits():
@@ -118,6 +119,8 @@ def test_current_year_outlook_is_not_invented_from_explosive_growth_or_bank_depo
     assert trend["comparison"]["current_revenue"] == 604785
     assert trend["comparison"]["change_amount"] == 563901
     assert trend["comparison"]["change_pct"] == 1379.27
+    assert trend["comparison"]["direction"] == "up"
+    assert trend["direction"] == "up"
     assert trend["forecast"]["status"] == "unavailable"
     assert trend["forecast"]["projected_revenue"] is None
     assert "Transfers" in trend["bank_context"]["note"]
@@ -146,16 +149,16 @@ def test_dated_comparable_current_p_and_l_uses_run_rate_with_explicit_seasonalit
     assert "seasonal" in forecast["assumptions"][0]
 
 
-def test_p_and_l_revenue_using_selected_tax_margin_cites_both_sources():
+def test_current_p_and_l_prevents_selecting_prior_year_tax_as_earnings_baseline():
     rows = [*sources(), pnl(basis="cash")]
     original = build(rows, now=datetime(2026, 11, 9, tzinfo=UTC))
-    state, _ = save(original)
-    current = build(rows, state=state, now=datetime(2026, 11, 9, tzinfo=UTC))
-    forecast = current["ebitda"]["revenue_trend"]["forecast"]
-    assert forecast["projected_revenue"] == 400000
-    assert forecast["projected_ebitda"] == round(400000 * -54369 / 604785, 2)
-    assert {ref["file_id"] for ref in forecast["source_refs"]} == {"source", "tax-2025"}
-    assert forecast["ebitda_kind"] == "tax_estimate"
+    with pytest.raises(HTTPException) as error:
+        change(None, selection(original), mode="manual", selected_file_id="tax-2025", excluded_file_ids=[],
+               reason="Try the prior tax period", expected_revision=0, source_stamp=selection(original)["source_stamp"],
+               idempotency_key="source-review-1", actor=ACTOR)
+    assert error.value.status_code == 422
+    assert "latest business reporting period" in error.value.detail
+    assert selection(original)["selected_file_id"] == "source"
 
 
 def test_explicit_assumptions_replace_current_p_and_l_illustration_consistently():
@@ -164,8 +167,8 @@ def test_explicit_assumptions_replace_current_p_and_l_illustration_consistently(
     current = build([*sources(), pnl(basis="cash")], state=state, now=datetime(2026, 11, 9, tzinfo=UTC))
     forecast = current["ebitda"]["revenue_trend"]["forecast"]
     assert forecast["method"] == "reviewed_assumptions"
-    assert forecast["projected_revenue"] == 665263.5
-    assert forecast["projected_ebitda"] == 33263.18
+    assert forecast["projected_revenue"] == 440000
+    assert forecast["projected_ebitda"] == 22000
     assert forecast["margin"] == 0.05
     assert forecast["ebitda_kind"] == "reviewed_assumption"
 
@@ -176,7 +179,7 @@ def test_excluded_current_p_and_l_never_supplies_projected_ebitda():
                       reason="P&L earnings awaiting reconciliation", expected_revision=0, source_stamp=selection(original)["source_stamp"],
                       idempotency_key="source-review-1", actor=ACTOR)
     current = build([*sources(), pnl(basis="cash")], state=state, now=datetime(2026, 11, 9, tzinfo=UTC))
-    assert current["ebitda"]["revenue_trend"]["forecast"]["projected_revenue"] == 400000
+    assert current["ebitda"]["revenue_trend"]["forecast"]["projected_revenue"] is None
     assert current["ebitda"]["revenue_trend"]["forecast"]["projected_ebitda"] is None
 
 
@@ -194,6 +197,191 @@ def test_automatic_source_uses_actual_dates_not_human_period_label_order():
     current_pnl = pnl(period_start="2026-01-01", period_end="2026-06-30")
     c = build([*sources(), current_pnl])
     assert selection(c)["selected_file_id"] == "source"
+
+
+def test_legacy_manual_prior_year_receipt_reads_latest_without_reusing_older_forecast():
+    original = build(sources(), now=datetime(2026, 11, 9, tzinfo=UTC))
+    state, _ = save(original, forecast_assumptions={"revenue_growth_pct": 10, "ebitda_margin_pct": 5})
+    # Simulate an existing receipt created before the latest-period policy.
+    state["events"][0].update(selected_file_id="tax-2024", excluded_file_ids=["personal"])
+    before = deepcopy(state)
+    current = build(sources(), state=state, now=datetime(2026, 11, 9, tzinfo=UTC))
+    assert selection(current)["selected_file_id"] == "tax-2025"
+    assert selection(current)["legacy_selection_replaced"]
+    assert selection(current)["forecast_assumptions"] is None
+    assert current["ebitda"]["headline"]["value"] == -54369
+    assert current["ebitda"]["revenue_trend"]["forecast"]["status"] == "unavailable"
+    assert state == before  # Projection does not rewrite the immutable receipt.
+
+
+def test_newer_business_period_invalidates_old_source_receipt_until_current_review():
+    original = build(sources())
+    state, _ = save(original)
+    rows = [*sources(), pnl(basis="cash")]
+    pending = build(rows, state=state)
+    assert selection(pending)["latest_file_id"] == "source"
+    assert selection(pending)["stale"] and pending["ebitda"]["headline"] is None
+    assert pending["dscr"]["headline"] is None
+    with pytest.raises(HTTPException) as error:
+        change(state, selection(pending), mode="automatic", selected_file_id=None, excluded_file_ids=[],
+            reason="Refresh current reporting period", expected_revision=0, source_stamp=selection(pending)["source_stamp"],
+            idempotency_key="source-review-2", actor=ACTOR)
+    assert error.value.status_code == 409
+    accepted, _ = change(state, selection(pending), mode="automatic", selected_file_id=None, excluded_file_ids=[],
+        reason="Reviewed the new current P&L", expected_revision=1, source_stamp=selection(pending)["source_stamp"],
+        idempotency_key="source-review-2", actor=ACTOR)
+    current = build(rows, state=accepted)
+    assert not selection(current)["stale"]
+    assert current["ebitda"]["headline"]["value"] == 26000
+    assert current["dscr"]["headline"]["key"] == "profit_and_loss"
+
+
+def test_current_partial_pl_baseline_keeps_prior_full_years_as_annual_trend_only():
+    current = build([*sources(), pnl(basis="cash")], now=datetime(2026, 11, 9, tzinfo=UTC))
+    trend = current["ebitda"]["revenue_trend"]
+    assert selection(current)["selected_file_id"] == "source"
+    assert current["ebitda"]["headline"]["value"] == 26000
+    assert current["dscr"]["headline"]["numerator"] == 52000
+    assert [row["year"] for row in trend["periods"]] == ["2024", "2025"]
+    assert trend["comparison"]["prior_year"] == "2024" and trend["comparison"]["current_year"] == "2025"
+    assert trend["direction"] == "up"
+    assert trend["forecast"]["projected_revenue"] == 400000
+    assert trend["forecast"]["projected_ebitda"] == 52000
+    assert {ref["file_id"] for ref in trend["forecast"]["source_refs"]} == {"source"}
+
+
+def test_excluding_latest_period_never_falls_back_to_previous_year():
+    original = build(sources())
+    state, _ = change(None, selection(original), mode="automatic", selected_file_id=None,
+        excluded_file_ids=["tax-2025"], reason="Latest return needs reconciliation", expected_revision=0,
+        source_stamp=selection(original)["source_stamp"], idempotency_key="source-review-1", actor=ACTOR)
+    current = build(sources(), state=state)
+    assert current["ebitda"]["headline"] is None
+    assert selection(current)["selected_file_id"] is None
+    assert selection(current)["latest_file_id"] == "tax-2025"
+    assert "older year is not substituted" in current["ebitda"]["reason"]
+    older = next(row for row in selection(current)["sources"] if row["file_id"] == "tax-2024")
+    assert older["eligible"] and older["comparative_only"] and not older["baseline_eligible"]
+    assert current["ebitda"]["revenue_trend"]["comparison"]["direction"] == "up"
+
+
+def test_latest_missing_income_is_unavailable_instead_of_using_previous_year():
+    rows = sources()
+    rows[1]["key_facts"]["ordinary_business_income"] = None
+    current = build(rows)
+    assert current["ebitda"]["headline"] is None
+    assert selection(current)["latest_file_id"] == "tax-2025"
+    assert not next(row for row in selection(current)["sources"] if row["file_id"] == "tax-2024")["selected"]
+    assert "older" in current["ebitda"]["reason"]
+
+
+def test_dated_business_source_without_parsed_earnings_blocks_an_older_baseline():
+    unread = file("current_p_and_l", {"business_name": ENTITY, "currency": "USD", "basis": "cash",
+        "period_start": "2026-01-01", "period_end": "2026-06-30"}, key="unread-current")
+    current = build(sources())
+    attach(current["ebitda"], current["metric_review"], [*sources(), unread], current["tax"]["years"], None, {}, entity=ENTITY)
+    assert current["ebitda"]["headline"] is None
+    assert selection(current)["selected_file_id"] is None
+    assert selection(current)["latest_file_id"] == "unread-current"
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_denied_or_stale_latest_same_business_return_never_restores_older_earnings(stale):
+    from app.services import document_associations
+
+    rows = sources()
+    rows[1]["content_hash"] = "a" * 64
+    latest = rows[1]
+    association = document_associations.record_for_source(None, ENTITY, latest, latest)
+    state, _ = document_associations.change(None, {latest["file_id"]: association}, file_id=latest["file_id"],
+        action="deny", reason="Review the exact current return", expected_revision=0, source_stamp=association["source_stamp"],
+        idempotency_key="deny-current-business", actor=ACTOR)
+    if stale:
+        latest["analysis_id"] = "updated-current-reading"
+    current = build(rows, state=state)
+    assert current["ebitda"]["headline"] is None
+    assert current["dscr"]["headline"] is None
+    assert selection(current)["latest_file_id"] == "tax-2025"
+    assert selection(current)["selected_file_id"] is None
+    assert not next(row for row in selection(current)["sources"] if row["file_id"] == "tax-2024")["baseline_eligible"]
+
+
+def test_identity_unresolved_latest_business_return_blocks_older_but_known_other_business_does_not():
+    unresolved = business(2026, 700000, 100000, entity=None)
+    current = build([*sources(), unresolved])
+    assert current["ebitda"]["headline"] is None and current["dscr"]["headline"] is None
+    assert selection(current)["latest_file_id"] == "tax-2026"
+    unrelated = business(2026, 700000, 100000, entity="Unrelated Business LLC")
+    current = build([*sources(), unrelated])
+    assert current["ebitda"]["headline"]["value"] == -54369
+    assert selection(current)["latest_file_id"] == "tax-2025"
+    assert current["dscr"]["headline"]["numerator"] == -54369
+
+
+@pytest.mark.parametrize("revenue,direction", [(40884, "neutral"), (20000, "down"), (604785, "up")])
+def test_comparable_prior_year_only_supplies_trend_direction(revenue, direction):
+    rows = sources()
+    rows[1]["key_facts"]["gross_receipts"] = revenue
+    current = build(rows)
+    assert current["ebitda"]["revenue_trend"]["direction"] == direction
+    assert selection(current)["selected_file_id"] == "tax-2025"
+    assert {ref["file_id"] for ref in current["ebitda"]["headline"]["source_refs"]} == {"tax-2025"}
+
+
+def test_same_latest_period_tax_and_p_and_l_remain_alternatives_without_summing():
+    rows = [*sources(), pnl(period_start="2025-01-01", period_end="2025-12-31", basis="cash")]
+    original = build(rows)
+    assert {row["file_id"] for row in selection(original)["sources"] if row["baseline_eligible"]} == {"source", "tax-2025"}
+    state, _ = change(None, selection(original), mode="manual", selected_file_id="tax-2025", excluded_file_ids=[],
+        reason="Use current filed tax earnings basis", expected_revision=0, source_stamp=selection(original)["source_stamp"],
+        idempotency_key="source-review-1", actor=ACTOR)
+    current = build(rows, state=state)
+    assert current["ebitda"]["headline"]["value"] == -54369
+    assert {ref["file_id"] for ref in current["ebitda"]["headline"]["source_refs"]} == {"tax-2025"}
+
+
+def test_latest_p_and_l_is_also_the_coverage_basis_and_prior_tax_is_comparative():
+    current = build([*sources(), pnl(basis="cash")])
+    align_coverage(current["ebitda"], current["dscr"], current["metric_review"])
+    assert current["dscr"]["headline"]["key"] == "profit_and_loss"
+    assert current["dscr"]["headline"]["numerator"] == 52000
+    assert {row["key"] for row in current["dscr"]["comparative_candidates"]} == {"tax_return"}
+    selected = [row["key"] for row in current["metric_review"]["calculations"] if row.get("selected")]
+    assert "dscr.profit_and_loss" in selected and "dscr.tax_return" not in selected
+
+
+def test_older_p_and_l_cannot_replace_the_newer_tax_coverage_basis():
+    current = build([*sources(), pnl(period_start="2024-01-01", period_end="2024-06-30")])
+    align_coverage(current["ebitda"], current["dscr"])
+    assert current["dscr"]["headline"]["key"] == "tax_return"
+    assert current["dscr"]["headline"]["period"] == "2025"
+    assert {row["key"] for row in current["dscr"]["candidates"]} == {"tax_return"}
+
+
+def test_incomplete_latest_period_never_exposes_previous_income_to_the_plan():
+    rows = sources()
+    rows[1]["key_facts"]["ordinary_business_income"] = None
+    current = build(rows)
+    align_coverage(current["ebitda"], current["dscr"])
+    assert current["dscr"]["headline"] is None
+    assert current["dscr"]["candidates"] == []
+    assert current["dscr"]["comparative_candidates"][0]["period"] == "2024"
+    assert "older" in current["dscr"]["reason"]
+
+
+def test_bank_proxy_remains_distinct_when_latest_business_period_is_unavailable():
+    current = build(sources())
+    dscr = {"candidates": [{"key": "bank_cash_flow", "label": "Bank cash flow", "value": 2.5,
+                            "numerator": 30000, "source_refs": [], "pro_forma_value": 2.0}]}
+    align_coverage(current["ebitda"], dscr)
+    assert dscr["headline"] is None and dscr["candidates"] == []
+    assert dscr["bank_proxy"]["value"] == 2.5
+    assert dscr["bank_proxy"]["comparative_only"]
+    no_business = {"source_selection": {"sources": [], "selected_file_id": None, "latest_file_id": None}}
+    bank_only = {"candidates": [deepcopy(dscr["bank_proxy"])]}
+    align_coverage(no_business, bank_only)
+    assert bank_only["headline"]["label"] == "Bank cash flow · provisional proxy"
+    assert "not EBITDA" in bank_only["headline"]["note"]
 
 
 def test_full_annual_p_and_l_alone_supplies_reviewed_revenue_and_ebitda_illustration():
@@ -217,17 +405,14 @@ def test_current_partial_p_and_l_alone_has_run_rate_without_inventing_prior_year
     assert forecast["change_amount"] is None and forecast["change_pct"] is None
 
 
-def test_reviewed_forecast_uses_selected_period_not_latest_excluded_annual_return():
+def test_prior_year_cannot_replace_the_latest_excluded_annual_return():
     original = build(sources(), now=datetime(2026, 11, 9, tzinfo=UTC))
-    state, _ = change(None, selection(original), mode="manual", selected_file_id="tax-2024", excluded_file_ids=["tax-2025"],
-        forecast_assumptions={"revenue_growth_pct": 10, "ebitda_margin_pct": None}, reason="Reviewed alternative historical baseline",
-        expected_revision=0, source_stamp=selection(original)["source_stamp"], idempotency_key="source-review-1", actor=ACTOR)
-    current = build(sources(), state=state, now=datetime(2026, 11, 9, tzinfo=UTC))
-    forecast = current["ebitda"]["revenue_trend"]["forecast"]
-    assert forecast["projected_revenue"] == 44972.4
-    assert forecast["projected_ebitda"] == -61391
-    assert "2024" in forecast["assumptions"][0]
-    assert current["ebitda"]["revenue_trend"]["comparison"]["current_year"] == "2025"
+    with pytest.raises(HTTPException) as error:
+        change(None, selection(original), mode="manual", selected_file_id="tax-2024", excluded_file_ids=["tax-2025"],
+            forecast_assumptions={"revenue_growth_pct": 10, "ebitda_margin_pct": None}, reason="Try an older historical baseline",
+            expected_revision=0, source_stamp=selection(original)["source_stamp"], idempotency_key="source-review-1", actor=ACTOR)
+    assert error.value.status_code == 422
+    assert "historical comparison only" in error.value.detail
 
 
 def test_full_annual_p_and_l_and_tax_same_period_are_one_comparison_observation():
@@ -243,6 +428,7 @@ def test_mismatched_unknown_and_short_periods_do_not_supply_growth(changes):
     rows[1]["key_facts"].update(changes)
     trend = build(rows)["ebitda"]["revenue_trend"]
     assert not (trend["comparison"] and trend["comparison"]["comparable"])
+    assert trend["direction"] is None
     assert trend["forecast"]["status"] == "unavailable"
 
 

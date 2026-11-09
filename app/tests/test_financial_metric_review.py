@@ -49,15 +49,16 @@ def correction(c, key="profit_and_loss.net_income", value=30000, state=None, **e
                          source_stamp=target(c, key)["source_stamp"], idempotency_key="correction-1", actor=ACTOR, **extra)[0]
 
 
-def test_complete_pl_reconciles_once_and_dscr_keeps_tax_precedence():
+def test_complete_latest_pl_reconciles_once_and_supplies_dscr_instead_of_prior_tax():
     c = build([tax(), pnl()])
     result = c["ebitda"]["headline"]
     assert result["kind"] == "computed_ebitda" and result["value"] == 26000
     assert result["annualized_value"] == 52000 and result["entity_comparable"]
-    assert c["dscr"]["headline"]["key"] == "tax_return"
-    assert c["dscr"]["headline"]["numerator"] == 115000
+    assert c["dscr"]["headline"]["key"] == "profit_and_loss"
+    assert c["dscr"]["headline"]["numerator"] == 52000
+    assert c["dscr"]["comparative_candidates"][0]["numerator"] == 115000
     assert "dscr.profit_and_loss" in target(c)["used_by"]
-    assert not target(c)["used_by_headline"]
+    assert target(c)["used_by_headline"] == ["dscr.profit_and_loss"]
     assert target(c)["source_refs"][0]["analysis_id"] == "analysis-1"
 
 
@@ -84,18 +85,18 @@ def test_dscr_blocks_known_currency_mismatch_and_retains_currency_provenance(cur
     assert target(c, "debt.annual")["source_refs"][0]["currency"] == "USD"
 
 
-def test_comparable_pl_fallback_leads_when_tax_currency_is_ineligible():
+def test_latest_comparable_pl_leads_and_prior_tax_currency_evidence_is_comparative():
     c = build([tax(currency="EUR"), pnl(currency="USD")])
     assert c["ebitda"]["headline"]["currency"] == "USD"
     assert c["dscr"]["headline"]["key"] == "profit_and_loss"
     assert c["dscr"]["headline"]["value"] == 4.33
-    tax_candidate = next(row for row in c["dscr"]["candidates"] if row["key"] == "tax_return")
+    tax_candidate = next(row for row in c["dscr"]["comparative_candidates"] if row["key"] == "tax_return")
     assert tax_candidate["source_numerator"] == 115000
     assert tax_candidate["value"] is None and tax_candidate["numerator"] is None
     assert tax_candidate["currency_status"] == "mismatch"
     assert tax_candidate["source_currencies"] == ["EUR"]
     assert "EUR" in tax_candidate["note"]
-    selected = [row["key"] for row in c["metric_review"]["calculations"] if row.get("selected")]
+    selected = [row["key"] for row in c["metric_review"]["calculations"] if row.get("selected") and row["key"].startswith("dscr.")]
     assert selected == ["dscr.profit_and_loss"]
 
 

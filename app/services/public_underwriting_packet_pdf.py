@@ -1341,6 +1341,23 @@ def _operating_earnings_lines(financials: dict[str, Any], *, compact: bool = Fal
             lines.extend("Assumption: " + str(item) for item in _strings(forecast.get("assumptions"))[:4])
     elif forecast.get("reason"):
         lines.append("Forecast unavailable: " + str(forecast["reason"]))
+    potential = _record(earnings.get("potential"))
+    if potential.get("available"):
+        for label, bridge in (("Current debt", _record(potential.get("current"))), ("Saved refinance plan", _record(potential.get("plan")))):
+            target = next((row for row in _records(bridge.get("targets")) if row.get("ratio") == 1.25), None)
+            if target:
+                lines.append(f"{label}: annual earnings needed for 1.25x coverage {_earnings_money(target.get('earnings_required'), currency)}; improvement needed {_earnings_money(target.get('improvement_required'), currency)}. Target only, not a forecast.")
+    noi = _record(earnings.get("noi"))
+    if noi:
+        operating = _record(noi.get("historical"))
+        lines.append("Business NOI = revenue - COGS - operating expenses, including expensed depreciation and amortization; before financing costs and income taxes.")
+        if operating:
+            lines.append(f"Business NOI: {_earnings_money(operating.get('value'), operating.get('currency'))}; {operating.get('period') or 'period unknown'}." + (" Provisional source figure." if operating.get("provisional") else ""))
+            if not compact:
+                values = {row.get("key"): row.get("value") for row in _records(operating.get("fundamentals"))}
+                lines.append(f"NOI inputs: revenue {_earnings_money(values.get('gross_revenue'), operating.get('currency'))}; COGS {_earnings_money(values.get('cost_of_goods_sold'), operating.get('currency'))}; operating expenses {_earnings_money(values.get('total_operating_expenses'), operating.get('currency'))}.")
+        else:
+            lines.append("NOI unavailable: " + str(noi.get("reason") or "Current operating-income evidence is incomplete."))
     lines.append("A refinance changes debt service and cash retained; it does not itself change EBITDA. Forecasts are conditional illustrations and do not establish current program eligibility.")
     return lines
 
