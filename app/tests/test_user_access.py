@@ -31,6 +31,7 @@ from app.services.user_access import (
     is_funding_client,
     synchronize_external_compatibility_role,
 )
+from app.tests._business_profile_fixture import BUSINESS_PROFILE
 
 
 def _external_user(
@@ -262,6 +263,7 @@ def test_directory_filters_distinguish_product_combinations() -> None:
 
 def test_mca_public_intake_preserves_normalized_signup_attribution() -> None:
     payload = McaRefiStart(
+        **BUSINESS_PROFILE,
         full_name="Example Owner",
         email="owner@example.com",
         phone="(973) 555-0148",

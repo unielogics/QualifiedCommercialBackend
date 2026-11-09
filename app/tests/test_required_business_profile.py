@@ -171,7 +171,8 @@ async def test_declared_industry_and_description_feed_the_existing_naics_suggest
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("variant", ["dealer", "real_estate", "main_street", "mca_refinance"])
-async def test_admin_variant_creation_preserves_full_profile_and_provisions_without_calling_ai(variant):
+@pytest.mark.parametrize("existing_source", [False, True])
+async def test_admin_variant_creation_preserves_full_profile_and_provisions_without_calling_ai(variant, existing_source):
     created = []
     client = SimpleNamespace(id=uuid4(), email="owner@example.com", lead_intake={})
     bucket, link = SimpleNamespace(id=uuid4()), SimpleNamespace(id=uuid4())
@@ -182,7 +183,8 @@ async def test_admin_variant_creation_preserves_full_profile_and_provisions_with
             created.append(row)
 
     db = SimpleNamespace(add=add, flush=AsyncMock(), commit=AsyncMock())
-    payload = core.AdminLeadCreate(**ANSWERS, variant=variant, full_name="Owner", email=client.email, phone="2025550123", secure_room_pin="123456", intent="working_capital")
+    values = {"variant": variant, "full_name": "Owner", "email": client.email, "phone": "2025550123", "secure_room_pin": "123456", "intent": "working_capital"}
+    payload = service._legacy_adapter(core.AdminLeadCreate, **values) if existing_source else core.AdminLeadCreate(**ANSWERS, **values)
     with ExitStack() as stack:
         for name in ("_find_or_create_client", "_find_or_create_funding_client", "_find_or_create_mca_client"):
             stack.enter_context(patch.object(core, name, AsyncMock(return_value=client)))
@@ -195,9 +197,15 @@ async def test_admin_variant_creation_preserves_full_profile_and_provisions_with
         provision = stack.enter_context(patch.object(core.profiles_service, "provision_profile_for_intake", AsyncMock()))
         ai = stack.enter_context(patch.object(industry_suggestion, "suggest_for_profile", AsyncMock(side_effect=RuntimeError("provider unavailable"))))
         assert await core._create_admin_ai_lead_core(payload, SimpleNamespace(), SimpleNamespace(role=Role.SUPER_ADMIN, id=uuid4(), name="Staff", email="staff@example.com"), db) == "created"
-    assert created[0].intake_state["business_profile"]["street"] == "123 Business Avenue Suite 2"
-    assert created[0].intake_state["business_profile"]["website_none"] is True
-    assert created[0].intake_state["business_profile"]["industry"] == "professional_practice"
+    if existing_source:
+        assert "business_profile" not in created[0].intake_state
+        assert service.of_intake(created[0])["industry"] is None
+        if variant == "main_street":
+            assert created[0].intake_state["main_street_details"]["industry"] is None
+    else:
+        assert created[0].intake_state["business_profile"]["street"] == "123 Business Avenue Suite 2"
+        assert created[0].intake_state["business_profile"]["website_none"] is True
+        assert created[0].intake_state["business_profile"]["industry"] == "professional_practice"
     provision.assert_awaited_once_with(db, created[0])
     ai.assert_not_awaited()
 

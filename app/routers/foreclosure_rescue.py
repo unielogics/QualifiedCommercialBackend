@@ -63,7 +63,7 @@ LegalStatus = Literal["notice_of_default", "lawsuit_lis_pendens", "chapter_11_su
 ExitStrategy = Literal["market_and_sell", "conventional_refinance", "partner_buyout_cash_infusion"]
 
 
-class ForeclosureRescueIntakeCreate(business_profile.BusinessProfileFields):
+class ForeclosureRescueIntakeCreate(business_profile.RequiredBusinessProfileFields):
     submitter_type: SubmitterType
     contact_name: str = Field(min_length=1, max_length=180)
     firm_name: str | None = Field(default=None, max_length=180)

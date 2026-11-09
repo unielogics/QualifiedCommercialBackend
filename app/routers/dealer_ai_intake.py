@@ -169,7 +169,7 @@ from app.services.bucket_ai import (
     upload_link_visible_summary,
 )
 from app.services.bucket_requests import is_open_request
-from app.services.business_profile import BusinessProfileFields
+from app.services.business_profile import BusinessProfileFields, RequiredBusinessProfileFields
 from app.services.dealer_ai_intelligence_pdf import (
     render_dealer_intelligence_pdf,  # noqa: F401  (handlers reach this through core)
 )
@@ -703,7 +703,7 @@ class CapitalReadinessDiagnostic(BaseModel):
     result: CapitalReadinessDiagnosticResult
 
 
-class CapitalReadinessClaimRequest(BusinessProfileFields):
+class CapitalReadinessClaimRequest(RequiredBusinessProfileFields):
     """Consent-bound handoff from the public diagnostic after authentication."""
 
     idempotency_key: UUID
@@ -729,7 +729,7 @@ class CapitalReadinessClaimResponse(BaseModel):
     readiness: CapitalReadinessRead
 
 
-class DealerIntakeStart(PublicIntakeAttribution, BusinessProfileFields):
+class DealerIntakeStart(PublicIntakeAttribution, RequiredBusinessProfileFields):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
     phone: RequiredPhone
@@ -752,7 +752,7 @@ class DealerIntakeStart(PublicIntakeAttribution, BusinessProfileFields):
         return None if value == "" else value
 
 
-class FundingReviewStart(PublicIntakeAttribution, BusinessProfileFields):
+class FundingReviewStart(PublicIntakeAttribution, RequiredBusinessProfileFields):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
     phone: RequiredPhone
@@ -894,7 +894,7 @@ async def _configure_equipment_bucket(
     )
 
 
-class AdminLeadCreate(BusinessProfileFields):
+class AdminLeadCreate(RequiredBusinessProfileFields):
     """Super-admin creates an AI-underwriter lead on behalf of a client. Mirrors the
     public start schemas but with no terms/throttle and an explicit variant selector.
     The client can later log in with this email exactly like a self-serve lead."""
@@ -908,7 +908,7 @@ class AdminLeadCreate(BusinessProfileFields):
     business_name: str | None = Field(default=None, max_length=180)
     loan_purpose: str | None = Field(default=None, max_length=255)
     # Intent steers the document package; industry is explicitly declared for
-    # every updated form; required API enforcement follows the caller rollout.
+    # every new application by RequiredBusinessProfileFields.
     intent: str | None = Field(default=None, max_length=64)
     # Real-estate basics (optional; mirror FundingReviewStart).
     investor_name: str | None = Field(default=None, max_length=180)
@@ -942,7 +942,7 @@ class AdminLeadCreate(BusinessProfileFields):
         return None if value == "" else value
 
 
-class BrokerLeadCreate(BusinessProfileFields):
+class BrokerLeadCreate(RequiredBusinessProfileFields):
     """Dealer partner (Role.DEALER_PARTNER) creates an AI-underwriter lead on
     behalf of their own client. Dealer-variant only — no variant selector, no
     real-estate fields. The client can later log in with this email exactly
@@ -1023,7 +1023,7 @@ class DealerLeadNoteCreate(BaseModel):
     image_ids: list[UUID] = []
 
 
-class AdminLeadFromBucketCreate(BusinessProfileFields):
+class AdminLeadFromBucketCreate(RequiredBusinessProfileFields):
     """Super-admin converts an EXISTING Bucket into an AI-underwriter lead — the
     admin already has a folder of files (collected some other way) and wants the
     AI audit + package-build against it, without a second, empty bucket being
@@ -9419,7 +9419,9 @@ async def _create_admin_ai_lead_core(
         # falls back to "other"/"not_sure" and the program screen runs blind.
         intake_state["main_street_details"] = {
             "intent": ms_intent,
-            "industry": ms_industry,
+            # Existing-source adoption may genuinely have no declared sector.
+            # The bucket's routing fallback must not become a client answer.
+            "industry": payload.industry,
         }
     if equipment_application:
         intake_state["funding_intent"] = "equipment"
@@ -10177,7 +10179,7 @@ async def _load_mca_intake_by_session(db: AsyncSession, request: Request) -> tup
     return intake, challenge, session_token
 
 
-class McaRefiStart(PublicIntakeAttribution, BusinessProfileFields):
+class McaRefiStart(PublicIntakeAttribution, RequiredBusinessProfileFields):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
     phone: RequiredPhone

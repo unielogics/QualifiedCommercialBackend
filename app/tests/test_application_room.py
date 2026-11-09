@@ -24,6 +24,7 @@ from app.routers.buckets import (
 from app.routers.dealer_ai_intake import AdminLeadCreate
 from app.schemas.application_profile import RoomPinRotateRequest
 from app.schemas.bucket import BucketUploadLinkCreate
+from app.tests._business_profile_fixture import BUSINESS_PROFILE
 
 
 def test_new_room_passcodes_are_six_numeric_digits() -> None:
@@ -111,6 +112,7 @@ def test_room_pin_lockout_is_scoped_to_room_and_ip() -> None:
 
 def test_admin_intake_requires_a_matching_shape_room_pin() -> None:
     row = AdminLeadCreate(
+        **BUSINESS_PROFILE,
         full_name="Jane Owner",
         email="jane@example.com",
         phone="(973) 555-0148",
@@ -121,6 +123,8 @@ def test_admin_intake_requires_a_matching_shape_room_pin() -> None:
     for invalid in ("QC-104293", "Welcome123!", "١٢٣٤٥٦"):
         with pytest.raises(ValidationError):
             AdminLeadCreate(
+                **BUSINESS_PROFILE,
+                phone="(973) 555-0148",
                 full_name="Jane Owner",
                 email="jane@example.com",
                 business_name="Example LLC",
