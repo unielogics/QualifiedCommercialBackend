@@ -632,7 +632,23 @@ class FileOwnerRead(BaseModel):
     credit_attention: str | None = None
     credit_expires_at: str | None = None
     backfill_needs_review: bool = False
+    review_fingerprint: str | None = None
     source: Literal["application", "dealer"] = "application"
+
+
+class FileOwnerReview(BaseModel):
+    expected_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    reason: str = Field(min_length=8, max_length=2000)
+    confirmed: Literal[True]
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def trim_reason(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
+
+
+class OwnerCreditRequirementReview(FileOwnerReview):
+    decision: Literal["met", "incomplete", "failed"]
 
 
 class FileOwnerRequirementState(BaseModel):

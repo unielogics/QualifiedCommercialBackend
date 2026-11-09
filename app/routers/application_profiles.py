@@ -121,6 +121,7 @@ from app.schemas.application_profile import (
     FileOwnerPatch,
     FileOwnerRead,
     FileOwnerRequirementState,
+    FileOwnerReview,
     FinancialFormPacket,
     FinancialFormSave,
     FinancialFormsRead,
@@ -134,6 +135,7 @@ from app.schemas.application_profile import (
     MissingItemAutomationPatch,
     OwnerCreditCandidateRead,
     OwnerCreditLinkRequest,
+    OwnerCreditRequirementReview,
     PlaidAssetReportCreate,
     PlaidAssetReportRead,
     ProfileCreditLinkReport,
@@ -1313,6 +1315,18 @@ async def update_application_requirement(
     readiness = await application_programs.get_program_readiness(db, profile)
     await db.commit()
     return readiness
+
+
+@router.post("/{profile_id}/requirements/{requirement_key}/credit-review", response_model=ApplicationProgramReadiness)
+async def review_linked_owner_credit(
+    profile_id: UUID, requirement_key: str, payload: OwnerCreditRequirementReview,
+    user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> ApplicationProgramReadiness:
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    from app.services.owner_credit_review import review_credit_requirement
+
+    return await review_credit_requirement(db, profile, requirement_key, payload, user)
 
 
 @router.post(
@@ -3041,6 +3055,18 @@ async def update_application_owner(
         ) from exc
     await db.refresh(owner)
     return profiles.owner_read(owner)
+
+
+@router.post("/{profile_id}/owners/{owner_id}/review", response_model=FileOwnerRead)
+async def review_imported_owner(
+    profile_id: UUID, owner_id: UUID, payload: FileOwnerReview,
+    user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> FileOwnerRead:
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    from app.services.owner_credit_review import confirm_owner
+
+    return await confirm_owner(db, profile, owner_id, payload, user)
 
 
 @router.delete("/{profile_id}/owners/{owner_id}", status_code=status.HTTP_204_NO_CONTENT)
