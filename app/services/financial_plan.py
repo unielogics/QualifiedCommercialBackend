@@ -720,6 +720,22 @@ def evaluate_plan(
     from app.services.financial_plan_earnings import scenario_ebitda
 
     result["ebitda"] = scenario_ebitda(ebitda, plan, result, dscr, service)
+    from app.services.coverage_comparison import coverage_comparison
+
+    comparison_basis = next((candidate for candidate in dscr.get("candidates") or []
+                             if candidate.get("key") == result["headline_key"]), headline)
+    before_annual = comparison_basis.get("annual_debt_service")
+    if before_annual is None:
+        before_annual = dscr.get("annual_debt_service")
+    if before_annual is None and service.get("monthly") is not None:
+        before_annual = float(service["monthly"]) * 12
+    currency_comparable = bool(comparison_basis.get("currency_comparable"))
+    result["coverage_comparison"] = coverage_comparison(
+        {"income_annual": result["income_before_annual"], "debt_service_annual": before_annual},
+        {"income_annual": result["income_after_annual"], "debt_service_annual": result["debt_service_after_annual"]},
+        before_comparable=currency_comparable,
+        after_comparable=income_override is not None or currency_comparable,
+    )
     return result
 
 
@@ -940,6 +956,7 @@ def plan_impact(
             "status_after": evaluation.get("headline_after_status"),
             "no_debt_left": bool(evaluation.get("no_debt_left")),
         },
+        "coverage_comparison": evaluation.get("coverage_comparison"),
         "income_annual": pair(
             evaluation.get("income_before_annual"), evaluation.get("income_after_annual")
         ),
