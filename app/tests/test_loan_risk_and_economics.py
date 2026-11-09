@@ -129,7 +129,7 @@ def test_the_proposed_terms_carry_the_schedule_and_the_risk_but_never_a_fee() ->
     assert terms["payment_io_monthly"] == 2000.0 and terms["payment_after_monthly"] == 13111.11
     assert (
         terms["monthly_payment"] == 13111.11
-    )  # the schedule's coverage payment stands in for a missing figure
+    )  # the contractual repayment installment stands in for a missing figure
     assert terms["describe"] == "over 24 months, 6 interest-only then simple interest"
     assert len(terms["schedule_rows"]) == 24 and terms["schedule_rows"][0]["exposure_pct"] == 100.0
     assert terms["risk"]["lowest_coverage"] == 1.32  # 20,000 a month over 2,000 existing + 13,111
@@ -148,6 +148,12 @@ def test_the_proposed_terms_carry_the_schedule_and_the_risk_but_never_a_fee() ->
         "repayment_config",
         "payments_per_year",
         "monthly_payment",
+        "coverage_payment_monthly",
+        "regular_payment_monthly",
+        "interest_only_payment_monthly",
+        "repayment_payment_monthly",
+        "maturity_balance",
+        "payment_phases",
         "payment_io_monthly",
         "payment_after_monthly",
         "describe",
@@ -156,6 +162,9 @@ def test_the_proposed_terms_carry_the_schedule_and_the_risk_but_never_a_fee() ->
         "schedule_rows",
         "risk",
     }
+    assert member["regular_payment_monthly"] == member["coverage_payment_monthly"] == 13111.11
+    assert member["interest_only_payment_monthly"] == 2000.0
+    assert len(member["payment_phases"]) == 2
     assert "treatment" not in member and not any("fee" in k for k in member)
     cockpit["plan"]["economics"] = internal_economics(
         {"accepted_amount": 200000, "origination_points": 2, "consulting_fee": 7500}, terms
