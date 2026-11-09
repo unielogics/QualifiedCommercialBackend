@@ -245,7 +245,7 @@ def test_baseline_period_coverage_is_distinct_and_not_one_file(kind, count, peri
         file.id: SimpleNamespace(
             analysis={"key_facts": {"statement_period": f"2026-{period:02d}"}}
             if unit == "months"
-            else {"key_facts": {"tax_year": str(period)}}
+            else {"key_facts": {"tax_year": str(period), "tax_form": "1120-S", "entity": "Example LLC"}}
         )
         for file, period in zip(files, periods, strict=True)
     }
@@ -256,6 +256,16 @@ def test_baseline_period_coverage_is_distinct_and_not_one_file(kind, count, peri
     assert _expected_classes(requirement) == {
         "bank_statement" if unit == "months" else "tax_return"
     }
+
+
+def test_a_tax_year_without_a_business_return_does_not_complete_business_coverage():
+    requirement = SimpleNamespace(requirement_key="business_tax_returns_1_years", label="Business return", category="financials")
+    file = SimpleNamespace(id=uuid4(), statement_period=None, file_name="Unscoped tax return.pdf")
+    complete, coverage = _coverage_for_files(requirement, [file], {
+        file.id: SimpleNamespace(analysis={"key_facts": {"tax_year": "2025"}}),
+    })
+    assert not complete
+    assert coverage["current"] == 0
 
 
 @pytest.mark.parametrize("policy_changed", [True, False])

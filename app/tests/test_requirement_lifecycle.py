@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 from app.models.application_profile import (
     ApplicationCollectionTask,
+    ApplicationProfile,
     ApplicationRequirementEvidence,
     ApplicationRequirementState,
 )
@@ -148,7 +149,7 @@ async def test_restoring_removed_history_never_reopens_completed_or_cancelled_co
 
 
 @pytest.mark.asyncio
-async def test_removing_staff_alias_cannot_cancel_its_required_policy_or_erase_evidence():
+async def test_removing_canonical_alias_suppresses_collection_without_erasing_policy_or_evidence():
     db, profile, actor = MemoryDB(), owner(), SimpleNamespace(id=uuid4())
     canonical = state(profile)
     canonical.source_policy_keys = ["business_evidence", "staff_added"]
@@ -156,12 +157,102 @@ async def test_removing_staff_alias_cannot_cancel_its_required_policy_or_erase_e
     duplicate = state(profile, "refinance_debt_schedule")
     duplicate.provenance = {"redirect_requirement_key": canonical.requirement_key}
     pending = task(profile, canonical.requirement_key)
-    db.rows = [canonical, duplicate, pending]
+    evidence = ApplicationRequirementEvidence(id=uuid4(), requirement_state_id=canonical.id, file_id=uuid4(), source="operator")
+    db.rows = [canonical, duplicate, pending, evidence]
     with patch.object(application_programs, "get_program_readiness", AsyncMock()):
-        with pytest.raises(HTTPException) as result:
-            await lifecycle.change(db, profile, duplicate.requirement_key, action="remove", reason="Not needed twice", actor=actor)
-    assert result.value.status_code == 409 and result.value.detail["code"] == "requirement_still_derived"
-    assert pending.status == "requested" and canonical.status == "requested"
+        await lifecycle.change(db, profile, duplicate.requirement_key, action="remove", reason="Not needed twice", actor=actor)
+    assert pending.status == "cancelled" and canonical.status == "not_applicable"
+    assert canonical.source_policy_keys == ["business_evidence", "staff_added"]
+    assert canonical.provenance["staff_removal"]["collection_suppression"] is True
+    assert "No published program condition" in canonical.provenance["staff_removal"]["qualification_effect"]
+    assert evidence.requirement_state_id == canonical.id and evidence.removed_at is None
+    assert canonical.verified_at is None and canonical.verified_by_user_id is None
+    assert len(db.rows) == 4
+
+
+@pytest.mark.parametrize("sources", [
+    {"source_program_keys": ["selected_program"]},
+    {"source_policy_keys": ["business_evidence"]},
+    {"provenance": {"source_kind": "lender"}},
+])
+@pytest.mark.asyncio
+async def test_explicit_collection_removal_survives_derived_refresh_and_restores_original_sources(sources):
+    db, profile, actor = MemoryDB(), owner(), SimpleNamespace(id=uuid4())
+    item = state(profile, "business_tax_return")
+    for key, value in sources.items():
+        setattr(item, key, value)
+    before_sources = (list(item.source_program_keys), list(item.source_policy_keys))
+    slot = BucketRequestedDocument(id=uuid4(), bucket_id=profile.primary_bucket_id, status="uploaded")
+    item.requested_document_id = slot.id
+    pending = task(profile, item.requirement_key, next_attempt_at=datetime.now(UTC) + timedelta(days=2))
+    profile.missing_item_email_requirement_key = item.requirement_key
+    next_email = profile.missing_item_email_next_send_at
+    db.rows = [item, slot, pending]
+    assert lifecycle.lifecycle_fields(item)["can_remove"] is True
+    with patch.object(application_programs, "get_program_readiness", AsyncMock()):
+        await lifecycle.change(db, profile, item.requirement_key, action="remove", reason="Already collected in the linked source", actor=actor)
+        original_receipt = deepcopy(item.provenance["staff_removal"])
+        for _ in range(2):
+            lifecycle.reactivate_for_derived(item)
+            await lifecycle.change(db, profile, item.requirement_key, action="remove", reason="Retry the same removal", actor=actor)
+        assert item.provenance["staff_removal"] == original_receipt
+        assert lifecycle.is_removed(item) and pending.status == "cancelled" and pending.next_attempt_at is None
+        assert slot.status == "not_applicable" and slot.closed_at is not None
+        assert profile.missing_item_email_next_send_at is None
+        await lifecycle.change(db, profile, item.requirement_key, action="restore", reason="", actor=actor)
+    assert not lifecycle.is_removed(item) and item.status == "requested"
+    assert (item.source_program_keys, item.source_policy_keys) == before_sources
+    assert slot.status == "uploaded" and slot.closed_at is None and slot.closed_reason is None
+    assert pending.status == "requested" and pending.attempts == 2
+    assert profile.missing_item_email_next_send_at == next_email
+    assert len(item.provenance["staff_removal_history"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_removing_one_shared_collection_item_preserves_other_open_scope():
+    db, profile, actor = MemoryDB(), owner(), SimpleNamespace(id=uuid4())
+    first, second = state(profile, "tax_business_a"), state(profile, "tax_business_b")
+    pending = task(profile, first.requirement_key, next_attempt_at=datetime.now(UTC) + timedelta(days=1))
+    pending.requirement_keys = [first.requirement_key, second.requirement_key]
+    future = pending.next_attempt_at
+    db.rows = [first, second, pending]
+    with patch.object(application_programs, "get_program_readiness", AsyncMock()):
+        await lifecycle.change(db, profile, first.requirement_key, action="remove", reason="No longer collect this business scope", actor=actor)
+    assert pending.status == "requested" and pending.next_attempt_at == future
+    assert second.status == "requested" and not lifecycle.is_removed(second)
+
+
+@pytest.mark.asyncio
+async def test_removing_last_unfinished_member_stops_followup_for_completed_shared_scope():
+    db, profile, actor = MemoryDB(), owner(), SimpleNamespace(id=uuid4())
+    first, second = state(profile, "tax_business_a"), state(profile, "tax_business_b")
+    second.status = "verified"
+    pending = task(profile, first.requirement_key, next_attempt_at=datetime.now(UTC) + timedelta(days=1))
+    pending.requirement_keys = [first.requirement_key, second.requirement_key]
+    db.rows = [first, second, pending]
+    with patch.object(application_programs, "get_program_readiness", AsyncMock()):
+        await lifecycle.change(db, profile, first.requirement_key, action="remove", reason="No longer collect this business scope", actor=actor)
+    assert pending.status == "completed" and pending.next_attempt_at is None
+    assert second.status == "verified"
+
+
+@pytest.mark.asyncio
+async def test_removal_reloads_profile_after_lock_and_preserves_another_staff_request():
+    db, profile_id, actor = MemoryDB(), uuid4(), SimpleNamespace(id=uuid4())
+    stale = ApplicationProfile(id=profile_id, primary_bucket_id=uuid4(), extra_requirements=[])
+    fresh = ApplicationProfile(id=profile_id, primary_bucket_id=stale.primary_bucket_id,
+        extra_requirements=[{"key": "custom_request", "label": "Custom request", "source": "custom"},
+                            {"key": "another_staff_request", "label": "A concurrent staff request", "source": "custom"}])
+    item = state(fresh, "custom_request")
+    item.provenance = {"staff_added": {"added_by": str(actor.id)}}
+    db.rows = [fresh, item]
+
+    async def current_readiness(_db, value):
+        assert value is fresh
+
+    with patch.object(application_programs, "get_program_readiness", AsyncMock(side_effect=current_readiness)):
+        await lifecycle.change(db, stale, item.requirement_key, action="remove", reason="Current request no longer needed", actor=actor)
+    assert [entry["key"] for entry in fresh.extra_requirements] == ["another_staff_request"]
 
 
 @pytest.mark.asyncio

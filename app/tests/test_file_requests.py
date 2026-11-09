@@ -207,7 +207,8 @@ def test_month_coverage_counts_periods_and_does_not_reuse_another_subjects_uploa
     files = [SimpleNamespace(id=uuid4(), content_hash=str(index), file_name="Statement.pdf", created_at=datetime.now(UTC),
         statement_period=period, requested_document_id=destination)
         for index, (period, destination) in enumerate([("2026-01", target_id), ("2026-01", target_id), ("2026-02", uuid4())])]
-    analyses = {file.id: SimpleNamespace(status="completed", classification="bank_statement", confidence="low", analysis={}) for file in files}
+    analyses = {file.id: SimpleNamespace(id=uuid4(), analysis_version=1, content_hash=file.content_hash,
+        status="completed", classification="bank_statement", confidence="low", analysis={}) for file in files}
     matches, complete, coverage = application_programs._matching_evidence_files(requirement, SimpleNamespace(id=target_id), files, analyses)
     assert {file.id for file in matches} == {file.id for file in files[:2]}
     assert not complete and coverage["current"] == 1 and coverage["required"] == 2
@@ -238,7 +239,8 @@ async def test_stronger_equivalent_request_reopens_coverage_and_preserves_both_b
         for index in range(2)]
     links = [SimpleNamespace(id=uuid4(), file_id=file.id, source="operator", verified_at=datetime.now(UTC),
                              verified_by_user_id=user.id, provenance={}) for file in files]
-    analyses = {file.id: SimpleNamespace(status="completed", classification="bank_statement", confidence="low", analysis={}) for file in files}
+    analyses = {file.id: SimpleNamespace(id=uuid4(), analysis_version=1, content_hash=file.content_hash,
+        status="completed", classification="bank_statement", confidence="low", analysis={}) for file in files}
     db = SimpleNamespace(execute=AsyncMock(side_effect=lambda stmt: Result(
         [state] if stmt.column_descriptions[0]["entity"] is ApplicationRequirementState else []
     )), get=AsyncMock(return_value=None), flush=AsyncMock())

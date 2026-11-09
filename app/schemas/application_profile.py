@@ -266,6 +266,8 @@ class ApplicationRequirementRead(BaseModel):
     received_at: datetime | None = None
     verified_at: datetime | None = None
     provenance: dict = Field(default_factory=dict)
+    collection_completion: dict = Field(default_factory=dict)
+    qualification_review: dict = Field(default_factory=dict)
 
 
 class ProgramReadinessItem(BaseModel):
@@ -278,6 +280,9 @@ class ProgramReadinessItem(BaseModel):
     satisfied_count: int = 0
     blocking_requirement_keys: list[str] = Field(default_factory=list)
     requirement_keys: list[str] = Field(default_factory=list)
+    collection_complete: bool = False
+    qualification_blocking_requirement_keys: list[str] = Field(default_factory=list)
+    qualification_warnings: list[str] = Field(default_factory=list)
 
 
 class MissingItemAutomationRead(BaseModel):

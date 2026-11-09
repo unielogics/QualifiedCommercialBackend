@@ -479,13 +479,17 @@ async def test_legacy_staff_refinance_alias_and_policy_schedule_materialize_once
         readiness = await application_programs.get_program_readiness(db, seed.profile)
         assert list(_by_key(readiness)) == ["business_debt_schedule"]
         canonical = readiness.requirements[0]
-        assert canonical.required_level == "required" and canonical.derived_required and not canonical.can_remove
+        assert canonical.required_level == "required" and canonical.derived_required and canonical.can_remove
         assert lib.STAFF_POLICY_KEY in canonical.source_policy_keys
         assert "refinance_debt_schedule" in canonical.provenance["requirement_aliases"]
     assert duplicate.id == old_id and duplicate.provenance["redirect_requirement_key"] == "business_debt_schedule"
-    with pytest.raises(HTTPException) as result:
-        await requirement_lifecycle.change(db, seed.profile, "refinance_debt_schedule", action="remove", reason="Remove duplicate request", actor=seed.desk)
-    assert result.value.status_code == 409
+    await requirement_lifecycle.change(db, seed.profile, "refinance_debt_schedule", action="remove", reason="Remove duplicate request", actor=seed.desk)
+    for _ in range(2):
+        readiness = await application_programs.get_program_readiness(db, seed.profile)
+        assert _by_key(readiness) == {}
+        removed = next(row for row in readiness.inactive_requirements if row.requirement_key == "business_debt_schedule")
+        assert removed.derived_required and removed.provenance["staff_removal"]["collection_suppression"]
+    await requirement_lifecycle.change(db, seed.profile, "business_debt_schedule", action="restore", reason="", actor=seed.desk)
     assert list(_by_key(await application_programs.get_program_readiness(db, seed.profile))) == ["business_debt_schedule"]
 
 
@@ -508,9 +512,10 @@ async def test_same_form_for_another_business_period_remains_a_separate_requirem
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("explicit_waiver", [False, True])
-async def test_new_policy_requirement_reactivates_prior_staff_removal_without_inventing_a_waiver(db, explicit_waiver):
+async def test_new_policy_condition_retains_explicit_collection_removal_until_staff_restores(db, explicit_waiver):
     from app.routers import application_profiles as route
     from app.schemas.application_profile import ApplicationRequirementPatch
+    from app.services import requirement_lifecycle
 
     seed = await _seed(db)
     await route.add_application_requirement(seed.profile.id, _add("business_license"), seed.desk, db)
@@ -522,12 +527,16 @@ async def test_new_policy_requirement_reactivates_prior_staff_removal_without_in
     await db.flush()
     for _ in range(2):
         readiness = await application_programs.get_program_readiness(db, seed.profile)
-        current = _by_key(readiness)["business_license"]
-        assert current.status == ("waived" if explicit_waiver else "missing")
-        assert current.derived_required and not current.can_remove
-        assert "staff_removal" not in current.provenance
-        assert len(current.provenance["staff_removal_history"]) == 1
-        assert current.provenance["staff_removal_history"][0]["reactivated_by_derived_requirement"]
+        assert "business_license" not in _by_key(readiness)
+        current = next(row for row in readiness.inactive_requirements if row.requirement_key == "business_license")
+        assert current.derived_required and current.can_remove
+        assert current.provenance["staff_removal"]["collection_suppression"]
+        assert "No published program condition" in current.provenance["staff_removal"]["qualification_effect"]
+    await requirement_lifecycle.change(db, seed.profile, "business_license", action="restore", reason="", actor=seed.desk)
+    restored = _by_key(await application_programs.get_program_readiness(db, seed.profile))["business_license"]
+    assert restored.status == ("waived" if explicit_waiver else "missing")
+    assert restored.derived_required and not restored.provenance.get("staff_removal")
+    assert len(restored.provenance["staff_removal_history"]) == 1
 
 
 @pytest.mark.asyncio

@@ -411,7 +411,8 @@ async def test_materialization_and_collection_reuse_task_and_stop_borrower_remin
     db = SimpleNamespace(scalars=AsyncMock(return_value=Rows([report])))
     monkeypatch.setattr(application_profiles, "owner_rows", AsyncMock(return_value=[person]))
     assert await sync.materialize(db, prof, req, row, requested) is True
-    assert row.status == "received_unverified" and row.verified_at is None
+    assert row.status == "verified" and row.verified_at is not None
+    assert row.provenance["qualification_review"]["blocking"] is True
     assert requested.status == "uploaded"
     assert row.provenance["coverage"] == {
         "current": 1,
@@ -419,7 +420,7 @@ async def test_materialization_and_collection_reuse_task_and_stop_borrower_remin
         "unit": "owner reports",
         "complete": True,
     }
-    assert row.provenance["verified_coverage"]["complete"] is False
+    assert row.provenance["verified_coverage"]["complete"] is True
     task = ApplicationCollectionTask(
         id=uuid4(),
         profile_id=prof.id,
@@ -445,12 +446,12 @@ async def test_materialization_and_collection_reuse_task_and_stop_borrower_remin
         application_programs, "profile_requirement_dispositions", AsyncMock(return_value={})
     )
     result = (await collection_tasks.sync_collection_tasks(db, prof, [row]))[0]
-    assert result is task and result.status == "in_review" and result.assignee == "internal"
+    assert result is task and result.status == "completed"
     assert result.next_attempt_at is None and result.attempts == 3
     assert result.action_type == "upload_documents"
-    assert row.provenance["collection_status"] == "in_review"
+    assert row.provenance["collection_status"] == "completed"
     public = collection_tasks.task_read(result, public=True)
-    assert "No duplicate" in public["description"]
+    assert public["status"] == "completed"
     assert "credit_collection" not in public["config"]
 
 
@@ -472,11 +473,43 @@ async def test_staff_acceptance_is_bound_to_same_report_and_definition(monkeypat
         "parsed_report": {"scores": [{"model": "FICO 4", "score": 662}]},
     }
     await sync.materialize(db, prof, req, row, requested)
-    assert row.status == "received_unverified" and row.verified_by_user_id is None
+    assert row.status == "verified" and row.verified_by_user_id is None
+    assert row.provenance["qualification_review"]["blocking"] is True
     row.status, row.verified_at, row.verified_by_user_id = "verified", NOW, reviewer
     req.review_checks = [{"key": "new-minimum", "value": 700}]
     await sync.materialize(db, prof, req, row, requested)
-    assert row.status == "received_unverified" and row.verified_by_user_id is None
+    assert row.status == "verified" and row.verified_by_user_id is None
+    assert row.provenance["qualification_review"]["blocking"] is True
+
+
+@pytest.mark.asyncio
+async def test_program_expiry_does_not_reopen_operational_report_collection(monkeypatch):
+    prof, person, req = profile(), owner(), requirement(expiration_days=30)
+    report = pull(person, pulled_at=NOW - timedelta(days=35), expires_at=NOW + timedelta(days=55))
+    row = state(prof)
+    db = SimpleNamespace(scalars=AsyncMock(return_value=Rows([report])))
+    monkeypatch.setattr(application_profiles, "owner_rows", AsyncMock(return_value=[person]))
+    await sync.materialize(db, prof, req, row, None)
+    assert row.status == "verified" and row.provenance["credit_collection"]["complete"]
+    assert row.provenance["credit_collection"]["owners"][0]["status"] == "collected"
+    assert not row.provenance["credit_collection"]["qualification_collection_complete"]
+    assert row.provenance["qualification_review"]["blocking"]
+
+
+@pytest.mark.asyncio
+async def test_failed_program_review_remains_current_after_collection_completed(monkeypatch):
+    prof, person, req = profile(), owner(), requirement()
+    report, row = pull(person), state(prof)
+    db = SimpleNamespace(scalars=AsyncMock(return_value=Rows([report])))
+    monkeypatch.setattr(application_profiles, "owner_rows", AsyncMock(return_value=[person]))
+    await sync.materialize(db, prof, req, row, None)
+    fingerprint = row.provenance["credit_collection"]["fingerprint"]
+    row.provenance = {**row.provenance, "credit_review": {"fingerprint": fingerprint,
+        "decision": "failed", "reason": "The actual source score does not meet this program's condition"}}
+    await sync.materialize(db, prof, req, row, None)
+    assert row.status == "verified"
+    assert row.provenance["credit_collection"]["last_review"]["current"]
+    assert row.provenance["qualification_review"]["status"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -491,10 +524,13 @@ async def test_staff_credit_failure_remains_until_source_or_policy_changes(monke
         "Staff found the actual required-model score below the published minimum",
     )
     await sync.materialize(db, prof, req, row, None)
-    assert row.status == "failed" and row.state_reason.startswith("Staff found")
+    assert row.status == "verified"
+    assert row.provenance["qualification_review"]["status"] == "failed"
+    assert row.provenance["qualification_review"]["reasons"][0].startswith("Staff found")
     req.review_checks = [{"key": "updated-source-policy"}]
     await sync.materialize(db, prof, req, row, None)
-    assert row.status == "received_unverified"
+    assert row.status == "verified"
+    assert row.provenance["qualification_review"]["status"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -661,8 +697,9 @@ async def test_actual_readiness_materializer_uses_owner_report_instead_of_reques
     )
     assert result == [row] and by_selection[selection.id] == [req.requirement_key]
     assert (
-        row.status == "received_unverified"
+        row.status == "verified"
         and row.provenance["credit_collection"]["complete"] is True
+        and row.provenance["qualification_review"]["blocking"] is True
     )
     assert requested.status == "uploaded"
     tasks.assert_awaited_once_with(db, prof, [row])

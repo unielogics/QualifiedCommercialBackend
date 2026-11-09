@@ -12,6 +12,7 @@ import json
 import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import select
@@ -521,6 +522,16 @@ async def materialize(db, profile, requirement, state, requested, *, policy_cont
     ):
         clear_projection()
         return False
+    state.provenance = {**(state.provenance or {}),
+        "published_condition_label": getattr(requirement, "label", None) or state.label,
+        "published_completion_criteria": getattr(requirement, "completion_criteria", None),
+        "completion_criteria": "One current, consented, subject-matched report for each required owner. One bureau is accepted for collection.",
+        "request_message": "Provide or link one current credit report for each required owner. A single available bureau is accepted; an already linked report does not need another upload or pull.",
+        "objective_text": "Collect the current linked owner credit reports; review program score conditions separately."}
+    state.label = "Owner credit reports"
+    if requested is not None:
+        requested.name = state.label
+        requested.description = state.provenance["completion_criteria"]
     from app.services.application_profiles import owner_rows
 
     owners = await owner_rows(db, profile)
@@ -534,21 +545,31 @@ async def materialize(db, profile, requirement, state, requested, *, policy_cont
         if ids
         else []
     )
-    snapshot = collection_snapshot(
+    policy_snapshot = collection_snapshot(
         profile,
         owners,
         {str(row.id): row for row in pulls},
         requirement,
         policy_context=policy_context,
     )
+    operational_requirement = SimpleNamespace(**{
+        name: getattr(requirement, name, None) for name in (
+            "id", "requirement_key", "canonical_key", "collection_config", "label", "objective_text",
+            "completion_criteria", "review_checks", "verification_required",
+        )
+    }, expiration_days=None)
+    snapshot = collection_snapshot(profile, owners, {str(row.id): row for row in pulls},
+        operational_requirement, policy_context=policy_context)
+    snapshot.update(review_blockers=policy_snapshot["review_blockers"], can_mark_met=policy_snapshot["can_mark_met"],
+        qualification_collection_complete=policy_snapshot["complete"])
+    snapshot["fingerprint"] = _digest({"collection": snapshot["fingerprint"], "qualification": policy_snapshot["fingerprint"]})
+    snapshot["review_fingerprint"] = snapshot["fingerprint"]
     previous = (state.provenance or {}).get("credit_collection") or {}
     saved_review = (state.provenance or {}).get("credit_review")
     if isinstance(saved_review, dict):
         snapshot["last_review"] = {
             **saved_review,
-            "current": saved_review.get("fingerprint") == snapshot["fingerprint"] and state.status == {
-                "met": "verified", "failed": "failed", "incomplete": "received_unverified",
-            }.get(saved_review.get("decision")),
+            "current": saved_review.get("fingerprint") == snapshot["fingerprint"],
         }
     no_required_owners = snapshot["ownership_complete"] and snapshot["required_owner_count"] == 0
     if not no_required_owners and not any(row["credit_pull_id"] for row in snapshot["owners"]):
@@ -604,4 +625,24 @@ async def materialize(db, profile, requirement, state, requested, *, policy_cont
             state.received_at = state.received_at or min(completed_dates)
     if requested is not None and not requested.requires_signature:
         requested.status = "uploaded" if not snapshot["client_action_required"] else "requested"
+    # One current report is collection evidence regardless of bureau count.
+    # Published bureau/model/score conditions remain qualification blockers.
+    collected_complete = bool(snapshot["complete"] and snapshot["required_owner_count"])
+    if retained_failure:
+        state.provenance = {**state.provenance, "credit_qualification_failure": {
+            "fingerprint": snapshot["fingerprint"], "reason": state.state_reason,
+        }}
+    if collected_complete and state.status not in {"waived", "not_applicable"}:
+        state.status = "verified"
+        state.verified_at = state.received_at or datetime.now(UTC)
+        state.state_reason = "Required owner reports are linked and collected. One bureau is accepted for collection; program score conditions are reviewed separately."
+    from app.services.requirement_collection_completion import qualification_review
+
+    state.provenance = {**state.provenance,
+        "collection_completion": {"source": "linked_owner_credit", "complete": collected_complete,
+            "can_complete": False, "fingerprint": snapshot["fingerprint"], "eligible_file_ids": [], "suggested_file_ids": [],
+            "reason": "Report collection accepts one bureau. Program conditions are separate."},
+        "qualification_review": qualification_review(state),
+        "verified_coverage": {"current": collected if collected_complete else 0, "required": required,
+            "unit": "owner reports", "complete": collected_complete}}
     return True
