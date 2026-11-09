@@ -25,35 +25,16 @@ def build_candidates(body, analyses, accounts, aliases=None):
     membership = {member: account["key"] for account in accounts for member in [account["key"], *(account.get("members") or [])]}
     labels = {account["key"]: account["label"] for account in accounts}
     counted = {account["key"]: account.get("counted", True) for account in accounts}
-    canonical_files = {file_id for account in accounts for month in account.get("series", []) for file_id in month.get("file_ids", [])}
-    canonical_months = {}
-    for account in accounts:
-        for month in account.get("series", []):
-            for file_id in month.get("file_ids", []):
-                canonical_months.setdefault((account["key"], file_id), set()).add(month["month"])
     grouped = {}
-    for analysis in analyses:
+    for analysis in cockpit.canonical_bank_analyses(analyses, aliases=aliases, accounts=accounts):
         if "bank_statement" not in cockpit._classes(analysis):
             continue
-        if canonical_files and analysis.get("file_id") not in canonical_files:
-            continue  # Revised/duplicate statements do not double the observed payments.
         key = cockpit.resolve_alias(cockpit.file_account_identity(analysis.get("key_facts") or {})[0], aliases)
         key = membership.get(key, key)
-        selected_months = canonical_months.get((key, analysis.get("file_id")), set())
-        facts = analysis.get("key_facts") or {}
-        if selected_months and isinstance(facts.get("months"), list):
-            filtered = deepcopy(analysis)
-            rows = [month for month in facts["months"] if cockpit.statement_period_month(month.get("statement_period")) or cockpit.statement_period_month(month.get("month"))]
-            filtered["key_facts"]["months"] = [month for month in rows if (cockpit.statement_period_month(month.get("statement_period")) or cockpit.statement_period_month(month.get("month"))) in selected_months]
-            if len(filtered["key_facts"]["months"]) != len(rows):
-                # A file-wide aggregate cannot be allocated to its surviving
-                # months after replacement without inventing monthly facts.
-                filtered["key_facts"].pop("recurring_debits", None)
-            analysis = filtered
         grouped.setdefault(key, []).append(analysis)
     candidates = []
     for account, sources in grouped.items():
-        for payee in cockpit.recurring_payments(sources, limit=None)["payees"]:
+        for payee in cockpit.recurring_payments(sources, limit=None, aliases=aliases)["payees"]:
             key = _key(payee["key"], account)
             decisions = body.get("observed_debt_reviews") or {}
             decision = decisions.get(key)

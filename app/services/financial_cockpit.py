@@ -22,6 +22,7 @@ import math
 import re
 import statistics
 import uuid
+from copy import deepcopy
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
@@ -1415,9 +1416,65 @@ def _mode(values: list[str]) -> str | None:
     return max(counts, key=lambda k: (counts[k], k)) if counts else None
 
 
+def canonical_bank_analyses(
+    analyses: list[dict[str, Any]], *,
+    aliases: dict[str, str] | None = None,
+    accounts: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Use the same account/month sources for cash totals and recurring flows.
+
+    Revised or duplicate statements must not multiply a payee's payments.
+    A file-wide aggregate cannot be allocated to a surviving subset of its
+    months: retain known monthly readings and request a re-read for the rest.
+    """
+    if accounts is None:
+        _months, accounts = bank_months(analyses, aliases=aliases)
+    selected: dict[str, set[str]] = {}
+    for account in accounts:
+        for month in account.get("series") or []:
+            for file_id in month.get("file_ids") or []:
+                selected.setdefault(str(file_id), set()).add(month["month"])
+    if not selected:
+        return analyses
+    sources = []
+    for item in analyses:
+        if "bank_statement" not in _classes(item):
+            continue
+        file_id = str(item.get("file_id") or "")
+        if file_id and file_id not in selected:
+            continue
+        facts = item.get("key_facts") or {}
+        if not isinstance(facts, dict):
+            continue
+        covered = set(_file_months(facts, item.get("period_hint")))
+        surviving = selected.get(file_id, covered)
+        if not covered or covered <= surviving:
+            sources.append(item)
+            continue
+        filtered = deepcopy(item)
+        fields = ("recurring_debits", "recurring_credits")
+        rows = facts.get("months") or []
+        filtered_rows = [row for row in rows if isinstance(row, dict) and
+                         (statement_period_month(row.get("statement_period")) or
+                          statement_period_month(row.get("month"))) in surviving]
+        filtered["key_facts"]["months"] = filtered_rows
+        unallocated = []
+        for field in fields:
+            if field in filtered["key_facts"]:
+                filtered["key_facts"].pop(field)
+                if not filtered_rows or any(field not in row for row in filtered_rows):
+                    unallocated.append(field)
+        if unallocated:
+            filtered["_recurring_unallocated_fields"] = unallocated
+        sources.append(filtered)
+    return sources
+
+
 def recurring_payments(
     analyses: list[dict[str, Any]], *, field: str = "recurring_debits", direction: int = -1,
     limit: int | None = MAX_RECURRING_PAYEES,
+    aliases: dict[str, str] | None = None,
+    canonical_accounts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Every payee (or payer, for credits) the statements move money to or
     from repeatedly, rolled up across months and classified, with the amount
@@ -1426,11 +1483,12 @@ def recurring_payments(
     groups: dict[str, dict[str, Any]] = {}
     months_read: set[str] = set()
     files_need_reread: list[str] = []
-    for item in analyses:
+    for item in canonical_bank_analyses(analyses, aliases=aliases, accounts=canonical_accounts):
         if "bank_statement" not in _classes(item):
             continue
         entries, months_all, read_any = _recurring_entries(item, field)
-        if not _statement_fields_read(item) >= set(STATEMENT_READ_FIELDS) and item.get("file_id"):
+        if (not _statement_fields_read(item) >= set(STATEMENT_READ_FIELDS)
+                or field in (item.get("_recurring_unallocated_fields") or [])) and item.get("file_id"):
             files_need_reread.append(str(item["file_id"]))
         if not read_any:
             continue
@@ -1750,6 +1808,35 @@ def dscr_status(value: float | None) -> str:
     return classify_dscr(Decimal(str(value)))
 
 
+def bank_financing_adjustment(
+    recurring_credits: dict[str, Any], months: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Identified borrowed cash is not operating income in the bank proxy.
+
+    Use the same observed net-month span as cash retained, rather than the
+    shorter span of statements that happen to have credit details. Missing
+    credit detail is disclosed; known groups are not a complete cash ledger.
+    """
+    net_months = {month["month"] for month in months if month.get("net") is not None}
+    read_months = net_months.intersection(recurring_credits.get("months_read") or [])
+    funding = [payee for payee in recurring_credits.get("payees") or []
+               if payee.get("kind") in {"advance_funding", "loan_proceeds"}]
+    total = sum(float(amount) for payee in funding for month, amount in (payee.get("monthly") or {}).items()
+                if month in net_months and amount is not None)
+    observed = bool(net_months and read_months)
+    return {
+        "identified_total": _round(total) if observed else None,
+        "identified_monthly": total / len(net_months) if observed else None,
+        "identified_annual": _round(total * 12 / len(net_months)) if observed else None,
+        "net_months": sorted(net_months),
+        "credit_months_read": sorted(read_months),
+        "unread_credit_months": sorted(net_months - read_months),
+        "files_needing_reread": list(recurring_credits.get("files_need_reread") or []),
+        "scope": "Identified loan/advance credit groups only; other non-operating inflows or unread detail may remain.",
+        "funding_payees": [{key: payee.get(key) for key in ("key", "payee", "monthly", "file_ids")} for payee in funding],
+    }
+
+
 def _dscr_candidate(
     key: str,
     label: str,
@@ -1830,21 +1917,24 @@ def dscr_block(
         )
     if bank.get("avg_net") is not None and bank.get("estimates_available"):
         monthly_service = service.get("monthly") or 0
+        funding = bank.get("financing_adjustment") or {}
+        financing_monthly = funding.get("identified_monthly")
         candidates.append(
             _dscr_candidate(
                 "bank_cash_flow",
                 "Bank cash flow",
-                numerator=(bank["avg_net"] + monthly_service) * 12,
-                numerator_label="Cash retained plus debt paid, twelve times the monthly average",
+                numerator=(bank["avg_net"] + monthly_service - (financing_monthly or 0)) * 12,
+                numerator_label="Bank cash retained plus scheduled debt service, less identified financing credits, annualized",
                 period=f"{month_label(bank['first_month'])}–{month_label(bank['last_month'])}"
                 if bank.get("first_month")
                 else None,
                 annual_debt_service=annual,
                 proposed_annual=proposed_annual,
                 confidence="proxy",
-                note="Every outflow counts as spend, including owner draws and transfers; read this as a floor, not an income statement.",
+                note="Provisional schedule-based cash-flow proxy, not EBITDA or an income statement. Scheduled debt service is an assumption, not verified cash paid. Identified loan/advance credits are excluded; owner draws, transfers, unread transactions and other non-operating cash may remain.",
             )
         )
+        candidates[-1]["financing_adjustment"] = funding or None
     headline = next((c for c in candidates if c["value"] is not None), None)
     pro_forma_headline = next((c for c in candidates if c["pro_forma_value"] is not None), None)
     reason = None
@@ -2148,7 +2238,12 @@ def build_cockpit(
         bank_months(analyses, None, account_aliases) if narrowed else (months, accounts)
     )
     all_summary = bank_summary(all_months) if narrowed else bank
-    credits = recurring_payments(analyses, field="recurring_credits", direction=1)
+    credits = recurring_payments(analyses, field="recurring_credits", direction=1,
+                                 aliases=account_aliases, canonical_accounts=accounts)
+    funding_credits = recurring_payments(analyses, field="recurring_credits", direction=1, limit=None,
+                                         aliases=account_aliases,
+                                         canonical_accounts=[account for account in accounts if account.get("counted")])
+    bank["financing_adjustment"] = bank_financing_adjustment(funding_credits, months)
     overdrafts = overdrafts_block(months)
     years = tax_years(analyses, business_entity=business_entity)
     statement = profit_and_loss(analyses, business_entity=business_entity)
@@ -2183,7 +2278,7 @@ def build_cockpit(
         ], "total_monthly_debt_service": float(financial_version_selection.debt_schedule_monthly(accepted_schedule.get("body"))),
             "total_outstanding_balance": sum(row.get("balance") or 0 for row in rows)}
     documented = documented_debts(schedule_analyses)
-    recurring = recurring_payments(analyses)
+    recurring = recurring_payments(analyses, aliases=account_aliases, canonical_accounts=accounts)
     schedule = schedule_block(rows, document, documented, schedule_state)
     service = debt_service(
         rows, document, documented, recurring, declared_none=schedule["status"] == "voided",

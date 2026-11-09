@@ -284,6 +284,11 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
                               details={"months": [{key: month.get(key) for key in ("month", "accounts", "file_ids", "deposits", "withdrawals", "net")} for month in months],
                                        "included_net_months": sum(month.get("net") is not None for month in months),
                                        "counted_accounts": context["accounts"]})
+    financing = bank.get("financing_adjustment") or {}
+    operand("bank.identified_financing_credits_monthly", "Identified financing credits (monthly equivalent; excluded)",
+            financing.get("identified_monthly"), source_refs=bank_refs, period=bank_period, editable=False,
+            fact_keys=("derived:identified_financing_credits_over_observed_net_months",), canonical="recurring_credits",
+            details=financing)
     if bank.get("estimates_available"):
         bank["annualized_net"] = round(bank["avg_net"] * 12, 2) if bank["avg_net"] is not None else None
     for key, label in (("avg_deposits", "Average monthly deposits"), ("avg_withdrawals", "Average monthly withdrawals")):
@@ -333,8 +338,8 @@ def finish(review, dscr, service, bank):
             formula = "(period EBITDA × eligible annualization factor) / annual debt service"
         else:
             earnings = None
-            keys = ["bank.avg_net", "debt.monthly"]
-            formula = "((average monthly bank cash retained + monthly debt service) × 12) / annual debt service"
+            keys = ["bank.avg_net", "debt.monthly", "bank.identified_financing_credits_monthly"]
+            formula = "((average monthly bank cash retained + scheduled monthly debt service − identified financing credits monthly equivalent) × 12) / annual debt service"
         candidate["input_keys"] = keys + ["debt.annual"]
         candidate["source_refs"] = earnings["source_refs"] if earnings else next(i["source_refs"] for i in review["inputs"] if i["key"] == "bank.avg_net")
         comparison = _currency_comparison(candidate["source_refs"])
