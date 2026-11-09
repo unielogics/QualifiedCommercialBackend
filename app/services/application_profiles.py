@@ -1193,7 +1193,8 @@ async def resolve_profile(
     return profile
 
 
-def owner_read(owner: ApplicationOwner | DealerOwner, *, include_credit_risk: bool = True) -> FileOwnerRead:
+def owner_read(owner: ApplicationOwner | DealerOwner, *, include_credit_risk: bool = True, collection: dict | None = None) -> FileOwnerRead:
+    from app.services.credit_links import tier_for
     from app.services.credit_requirement_sync import owner_review_fingerprint
 
     summary = getattr(owner, "credit_summary", None)
@@ -1201,6 +1202,9 @@ def owner_read(owner: ApplicationOwner | DealerOwner, *, include_credit_risk: bo
     attention = summary.get("attention")
     if owner.credit_score is None and str(attention or "").startswith("The bureau returned no score;"):
         attention = "The report is linked, but its score has not been imported. Import the existing report; do not request a new pull."
+    current_score = collection.get("score") if collection else None
+    if collection:
+        attention = None if collection.get("status") == "collected" else collection.get("reason")
     return FileOwnerRead(
         id=owner.id,
         full_name=owner.full_name,
@@ -1219,21 +1223,23 @@ def owner_read(owner: ApplicationOwner | DealerOwner, *, include_credit_risk: bo
         invite_sent_at=owner.invite_sent_at,
         invite_opened_at=owner.invite_opened_at,
         has_invite=owner.has_invite,
-        credit_score=owner.credit_score,
-        credit_tier=owner.credit_tier,
-        credit_pulled_at=owner.credit_pulled_at,
+        credit_score=current_score,
+        credit_tier=tier_for(current_score),
+        credit_pulled_at=collection.get("pulled_at") if collection else None,
         credit_required=owner.credit_required,
-        credit_complete=owner.credit_complete,
+        credit_complete=bool(collection and collection.get("status") == "collected"),
+        credit_collection_status=collection.get("status") if collection else "unverified",
+        credit_collection_reason=collection.get("reason") if collection else "The current linked report has not been checked",
         credit_contact_complete=owner.credit_contact_complete,
         credit_pull_id=getattr(owner, "credit_pull_id", None),
-        credit_fico_source=summary.get("fico_source"),
-        credit_score_verified=bool(summary.get("score_verified")),
-        credit_report_available=bool(summary.get("report_available")),
-        credit_report_import_status=summary.get("report_import_status"),
+        credit_fico_source=collection.get("fico_source") if collection else None,
+        credit_score_verified=bool(collection and collection.get("score_verified")),
+        credit_report_available=bool(collection and collection.get("report_available")),
+        credit_report_import_status=collection.get("report_import_status") if collection else None,
         credit_risk=summary.get("credit_risk") if include_credit_risk else None,
         credit_link_how=summary.get("linked_how"),
         credit_attention=attention,
-        credit_expires_at=summary.get("expires_at"),
+        credit_expires_at=collection.get("expires_at") if collection else None,
         backfill_needs_review=getattr(owner, "backfill_needs_review", False),
         review_fingerprint=owner_review_fingerprint(owner),
         source="dealer" if isinstance(owner, DealerOwner) else "application",
@@ -1256,9 +1262,26 @@ async def owner_rows(db: AsyncSession, profile: ApplicationProfile) -> list[Appl
                 select(model)
                 .where(predicate, *active_predicate)
                 .order_by(model.created_at.asc(), model.id.asc())
+                .execution_options(populate_existing=True)
             )
         ).scalars().all()
     )
+
+
+async def owner_reads_current(db: AsyncSession, profile: ApplicationProfile, *, owners=None, include_credit_risk: bool = True) -> list[FileOwnerRead]:
+    from app.services.credit_requirement_sync import current_owner_collections
+
+    owners = owners if owners is not None else await owner_rows(db, profile)
+    collections = await current_owner_collections(db, owners)
+    return [owner_read(owner, include_credit_risk=include_credit_risk, collection=collections.get(str(owner.id))) for owner in owners]
+
+
+async def owner_read_current(db: AsyncSession, profile: ApplicationProfile, owner: ApplicationOwner | DealerOwner, *, include_credit_risk: bool = True) -> FileOwnerRead:
+    rows = await owner_reads_current(db, profile, include_credit_risk=include_credit_risk)
+    current = next((row for row in rows if row.id == owner.id), None)
+    if current is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found")
+    return current
 
 
 REQUIRED_STATEMENT_MONTHS = 6
@@ -1319,11 +1342,14 @@ async def verification_state(
     db: AsyncSession, profile: ApplicationProfile
 ) -> FileOwnerRequirementState:
     owners = await owner_rows(db, profile)
+    from app.services.credit_requirement_sync import current_owner_collections
+
+    credit_collections = await current_owner_collections(db, owners)
     total = round(sum(float(owner.ownership_pct or 0) for owner in owners), 2)
     ownership_complete = bool(owners) and abs(total - 100.0) < 0.005
     required = [owner for owner in owners if owner.credit_required]
     missing_contact = [owner for owner in required if not owner.credit_contact_complete]
-    pending = [owner for owner in required if not owner.credit_complete]
+    pending = [owner for owner in required if credit_collections.get(str(owner.id), {}).get("status") != "collected"]
     banks = await bank_rows(db, profile)
     months = sorted({month for bank in banks for month in bank.statement_months})
     manual_evidence = await manual_statement_evidence(db, profile)
@@ -1342,7 +1368,7 @@ async def verification_state(
     ready_step_2 = ownership_complete and not missing_contact
     credit_blockers: list[str] = []
     if pending:
-        credit_blockers.append(f"{len(pending)} required owner credit authorization(s) pending")
+        credit_blockers.append(f"{len(pending)} required owner credit report(s) not yet collected or needing review")
     banking_blockers: list[str] = []
     banking_complete = banking_is_complete(
         connected=bool(banks),

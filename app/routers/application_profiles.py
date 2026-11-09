@@ -2974,7 +2974,7 @@ async def list_application_owners(
     profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[FileOwnerRead]:
     profile = await profiles.load_profile(db, profile_id, user)
-    return [profiles.owner_read(owner) for owner in await profiles.owner_rows(db, profile)]
+    return await profiles.owner_reads_current(db, profile)
 
 
 @router.post(
@@ -3012,7 +3012,7 @@ async def create_application_owner(
         await db.rollback()
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Owner conflicts with an existing row") from exc
     await db.refresh(row)
-    return profiles.owner_read(row)
+    return await profiles.owner_read_current(db, profile, row)
 
 
 @router.patch("/{profile_id}/owners/{owner_id}", response_model=FileOwnerRead)
@@ -3034,7 +3034,7 @@ async def update_application_owner(
     owner = await _owner_for_profile(db, profile, owner_id)
     patch = payload.model_dump(exclude_unset=True)
     if not patch:
-        return profiles.owner_read(owner)
+        return await profiles.owner_read_current(db, profile, owner)
     if "email" in patch:
         patch["email"] = profiles.normalized_email(str(patch["email"]) if patch["email"] else None)
         await _assert_unique_email(db, profile, patch["email"], exclude_id=owner.id)
@@ -3054,7 +3054,7 @@ async def update_application_owner(
             "Owner conflicts with an existing row; refresh the owner list and try again",
         ) from exc
     await db.refresh(owner)
-    return profiles.owner_read(owner)
+    return await profiles.owner_read_current(db, profile, owner)
 
 
 @router.post("/{profile_id}/owners/{owner_id}/review", response_model=FileOwnerRead)
@@ -3123,6 +3123,14 @@ async def _mint_credit_invite(
     channel: str,
     request: Request,
 ) -> FileCreditInviteRead:
+    from app.services.owner_credit_review import lock_review_sources
+
+    current_owners = await lock_review_sources(db, profile)
+    owner = next((row for row in current_owners if row.id == owner.id), None)
+    if owner is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found")
+    if owner.credit_pull_id is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "A credit report is already linked to this owner. Review or import the existing report instead of sending another authorization.")
     await arf_channel.require_profile_hosted_permission(db, profile, requested_fields=["credit_data"], capability="credit_pull")
     verification = await profiles.verification_state(db, profile)
     if not verification.ownership_complete:
@@ -3205,9 +3213,17 @@ async def create_pending_owner_credit_invites(
     if not verification.ownership_complete or not verification.owner_contact_complete:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Complete the 100% ownership schedule and every required owner's personal contacts before sending")
     owners = await profiles.owner_rows(db, profile)
+    from app.services.credit_requirement_sync import current_owner_collections
+
+    collections = await current_owner_collections(db, owners)
+    selected_ids = set(payload.owner_ids) if payload.owner_ids is not None else None
+    if selected_ids is not None and selected_ids.difference(owner.id for owner in owners):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found")
     items = []
     for owner in owners:
-        if owner.credit_required and not owner.credit_complete:
+        if (owner.credit_required and owner.credit_pull_id is None
+                and collections.get(str(owner.id), {}).get("status") == "missing"
+                and (selected_ids is None or owner.id in selected_ids)):
             items.append(await _mint_credit_invite(db, profile, owner, user, payload.channel, request))
     return FileCreditInviteBatch(items=items)
 
@@ -3341,7 +3357,7 @@ async def link_provider_credit(profile_id: UUID, owner_id: UUID, payload: Provid
         raise HTTPException(409, str(exc)) from exc
     await db.commit()
     await db.refresh(owner)
-    return profiles.owner_read(owner)
+    return await profiles.owner_read_current(db, profile, owner)
 
 
 @router.post("/{profile_id}/owners/{owner_id}/credit-link", response_model=FileOwnerRead)
@@ -3370,7 +3386,7 @@ async def link_owner_credit(
         raise HTTPException(status.HTTP_409_CONFLICT, str(conflict)) from conflict
     await db.commit()
     await db.refresh(owner)
-    return profiles.owner_read(owner)
+    return await profiles.owner_read_current(db, profile, owner)
 
 
 @router.delete("/{profile_id}/owners/{owner_id}/credit-link", response_model=FileOwnerRead)
@@ -3382,11 +3398,11 @@ async def unlink_owner_credit(
     profile = await profiles.load_profile(db, profile_id, user)
     owner = _application_owner_only(await _owner_for_profile(db, profile, owner_id))
     if owner.credit_pull_id is None:
-        return profiles.owner_read(owner)
+        return await profiles.owner_read_current(db, profile, owner)
     await credit_links.unlink_pull(db, profile, owner, actor=user)
     await db.commit()
     await db.refresh(owner)
-    return profiles.owner_read(owner)
+    return await profiles.owner_read_current(db, profile, owner)
 
 
 @router.get("/{profile_id}/owners/{owner_id}/credit-report")
@@ -3402,7 +3418,7 @@ async def owner_credit_report(
     pull = await db.get(CreditPull, owner.credit_pull_id) if owner.credit_pull_id else None
     if pull is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No linked credit pull")
-    return {"owner": profiles.owner_read(owner), "report": stored_report(pull.bureau_response or {})}
+    return {"owner": await profiles.owner_read_current(db, profile, owner), "report": stored_report(pull.bureau_response or {})}
 
 
 @router.post("/{profile_id}/owners/{owner_id}/credit-report/import")
@@ -3428,7 +3444,7 @@ async def import_owner_credit_report(
     )
     await db.commit()
     await db.refresh(owner)
-    return {"owner": profiles.owner_read(owner), "report": report}
+    return {"owner": await profiles.owner_read_current(db, profile, owner), "report": report}
 
 
 @router.post("/{profile_id}/credit-links/auto", response_model=ProfileCreditLinkReport)
@@ -3457,6 +3473,9 @@ async def public_application_credit_consent(
         owner.invite_opened_at = datetime.now(UTC)
         await db.commit()
     fields_needed = [field for field in ("dob", "street", "city", "state", "zip") if not getattr(owner, field)]
+    from app.services.credit_requirement_sync import current_owner_collections
+
+    collection = (await current_owner_collections(db, [owner])).get(str(owner.id), {})
     return PublicFileOwnerConsentRead(
         first_name=owner.first_name,
         last_name=owner.last_name,
@@ -3465,7 +3484,7 @@ async def public_application_credit_consent(
         phone=owner.phone or "",
         business_name=_business_label(profile, intake, client),
         fields_needed=fields_needed,
-        completed=owner.credit_complete,
+        completed=collection.get("status") == "collected",
     )
 
 
@@ -3501,6 +3520,15 @@ async def submit_public_application_credit_consent(
         await release()
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "FCRA permissible-purpose consent is required")
     profile = await db.get(ApplicationProfile, owner.profile_id)
+    if owner.credit_pull_id is not None:
+        from app.services.credit_requirement_sync import current_owner_collections
+
+        collection = (await current_owner_collections(db, [owner])).get(str(owner.id), {})
+        if collection.get("status") == "collected":
+            await db.commit()
+            return PublicFileOwnerConsentResult(completed=True, credit_tier=credit_links.tier_for(collection.get("score")), credit_score_band=_score_band(collection.get("score")))
+        await release()
+        raise HTTPException(status.HTTP_409_CONFLICT, "An existing credit report is already linked and needs review. Contact your representative; no new credit check was run.")
     state = await profiles.verification_state(db, profile)
     if not state.ownership_complete or not owner.credit_required:
         await release()
@@ -3851,7 +3879,7 @@ async def _application_room_state(
             else None
         ),
         capabilities=["documents", "ownership", "owner_credit", "business_banking", "agreements"],
-        owners=[profiles.owner_read(owner, include_credit_risk=False) for owner in owner_rows],
+        owners=await profiles.owner_reads_current(db, profile, owners=owner_rows, include_credit_risk=False),
         verification=verification,
         precall=room_precall,
         banking=banking,
@@ -3951,7 +3979,7 @@ async def public_application_room_create_owner(
     )
     await db.commit()
     await db.refresh(row)
-    return profiles.owner_read(row, include_credit_risk=False)
+    return await profiles.owner_read_current(db, profile, row, include_credit_risk=False)
 
 
 @router.patch("/public/room/{token}/owners/{owner_id}", response_model=FileOwnerRead)
@@ -3978,7 +4006,7 @@ async def public_application_room_update_owner(
     )
     await db.commit()
     await db.refresh(owner)
-    return profiles.owner_read(owner, include_credit_risk=False)
+    return await profiles.owner_read_current(db, profile, owner, include_credit_risk=False)
 
 
 @router.delete("/public/room/{token}/owners/{owner_id}", status_code=status.HTTP_204_NO_CONTENT)

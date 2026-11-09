@@ -621,6 +621,8 @@ class FileOwnerRead(BaseModel):
     credit_pulled_at: datetime | None = None
     credit_required: bool = False
     credit_complete: bool = False
+    credit_collection_status: str | None = None
+    credit_collection_reason: str | None = None
     credit_contact_complete: bool = False
     credit_pull_id: UUID | None = None
     credit_fico_source: str | None = None
@@ -677,6 +679,7 @@ class FileOwnerRequirementState(BaseModel):
 
 class FileCreditInviteRequest(BaseModel):
     channel: Literal["email", "sms", "none"] = "email"
+    owner_ids: list[UUID] | None = Field(default=None, max_length=5)
 
 
 class FileCreditInviteRead(BaseModel):

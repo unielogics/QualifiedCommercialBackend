@@ -340,6 +340,40 @@ def _owner_report(
     return row
 
 
+def report_collection_rows(
+    owners: list, pulls: dict, *, now: datetime | None = None,
+    expiration_days: int | None = None, required_score_model: str | None = None,
+) -> list[dict]:
+    """The shared source check used by ownership and selected-program views.
+
+    A cached owner timestamp is not report evidence. A source must still be
+    linked, available, current, consented and associated with that person.
+    """
+    reports = [_owner_report(row, pulls.get(str(row.credit_pull_id)) if row.credit_pull_id else None,
+        now=now or datetime.now(UTC), expiration_days=expiration_days,
+        required_score_model=required_score_model) for row in owners]
+    linked_ids = [row["credit_pull_id"] for row in reports if row["credit_pull_id"]]
+    for row in reports:
+        if row["credit_pull_id"] and linked_ids.count(row["credit_pull_id"]) > 1:
+            row.update(status="needs_review", reason="The same report is linked to multiple required owners; staff must reconcile the owner records and source link before accepting collection")
+    return reports
+
+
+async def current_owner_collections(db, owners: list) -> dict[str, dict]:
+    """Bulk-read current sources without importing, pulling or requesting anything."""
+    active = [row for row in owners if not getattr(row, "archived_at", None)]
+    ids = {row.credit_pull_id for row in active if getattr(row, "credit_pull_id", None)}
+    pulls = list((await db.scalars(select(CreditPull).where(CreditPull.id.in_(ids))
+        .execution_options(populate_existing=True))).all()) if ids else []
+    by_id = {str(row.id): row for row in pulls}
+    required = [row for row in active if (_percent(row) or Decimal(0)) >= 20]
+    reports = report_collection_rows(required, by_id)
+    for row in active:
+        if row not in required:
+            reports.extend(report_collection_rows([row], by_id))
+    return {row["owner_id"]: row for row in reports}
+
+
 def collection_snapshot(
     profile: Any,
     owners: list,
@@ -368,23 +402,7 @@ def collection_snapshot(
     days = getattr(requirement, "expiration_days", None)
     required_model = _required_score_model(requirement, policy_context)
     minimum, policy_blockers = _required_minimum(requirement, policy_context)
-    reports = [
-        _owner_report(
-            row,
-            pulls.get(str(row.credit_pull_id)),
-            now=now,
-            expiration_days=days,
-            required_score_model=required_model,
-        )
-        for row in required
-    ]
-    linked_ids = [row["credit_pull_id"] for row in reports if row["credit_pull_id"]]
-    for row in reports:
-        if row["credit_pull_id"] and linked_ids.count(row["credit_pull_id"]) > 1:
-            row.update(
-                status="needs_review",
-                reason="The same report is linked to multiple required owners; staff must reconcile the owner records and source link before accepting collection",
-            )
+    reports = report_collection_rows(required, pulls, now=now, expiration_days=days, required_score_model=required_model)
     collected = sum(row["status"] == "collected" for row in reports)
     complete = ownership_complete and collected == len(required)
     staff_reasons = []
