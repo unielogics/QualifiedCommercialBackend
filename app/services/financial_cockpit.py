@@ -2532,8 +2532,9 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
         )
         base["schedule_rows"] = [{k: r.get(k) for k in keys} for r in schedule["rows"]]
         stated = _num(base.get("monthly_payment"))
-        formula = schedule["coverage_payment_monthly"]
-        if base["payment_stated"] and stated and formula and abs(stated - formula) / formula > 0.02:
+        formula = schedule["ordinary_payment_monthly"]
+        if (schedule.get("repayment_config") is None and base["payment_stated"] and stated is not None and formula is not None
+                and abs(stated - formula) / max(abs(formula), .01) > 0.02):
             base["payment_note"] = (
                 f"The recorded payment, {stated:,.0f} a month, is the lender's own figure; "
                 f"the schedule is the formula at the stated rate ({formula:,.0f} a month)."
@@ -2542,6 +2543,17 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
             base["payment_note"] = None
         if base["monthly_payment"] is None:
             base["monthly_payment"] = formula
+        base.update(
+            coverage_payment_monthly=schedule["coverage_payment_monthly"],
+            regular_payment_monthly=schedule["ordinary_payment_monthly"],
+            interest_only_payment_monthly=schedule["payment_io_monthly"],
+            repayment_payment_monthly=schedule["payment_after_monthly"],
+            payment_phases=schedule["payment_phases"], maturity_balance=schedule["balloon"],
+        )
+        if schedule.get("repayment_config") is not None:
+            # The customer-facing terms show actual installments, with the
+            # separate stress denominator retained above for coverage readers.
+            base["monthly_payment"] = schedule["ordinary_payment_monthly"]
         # Coverage on every payment: the income after the plan when there is
         # one, else today's; beside the existing service after what the plan
         # retires (or what the sheet retains when it refinances).

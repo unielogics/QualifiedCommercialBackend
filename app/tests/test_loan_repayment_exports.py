@@ -55,10 +55,11 @@ def test_client_pdf_uses_actual_total_and_discloses_each_principal_obligation():
     assert "first" not in " ".join(repayment_lines(_schedule())).split("First-year")[0]
 
 
-def test_listing_saves_config_and_prices_actual_cash_due_instead_of_browser_snapshot():
+def test_listing_saves_config_and_separates_regular_installment_from_cash_coverage():
     product = ListingProductIn(label="Example", amount=120000, rate_pct=0, term_months=24,
         structure="amortizing", repayment_config=CONFIG, monthly_payment=1)
-    assert float(product.monthly_payment) == 5250
+    assert float(product.monthly_payment) == 2000
+    assert float(product.coverage_payment_monthly) == 5250
     assert product.model_dump(mode="json")["repayment_config"]["balloons"][1]["value"] == 25
     terms = partner_terms({"repayment_config": CONFIG, "payments_per_year": 12, "internal_note": "SECRET"})
     assert terms == {"repayment_config": CONFIG, "payments_per_year": 12}

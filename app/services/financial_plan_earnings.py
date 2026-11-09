@@ -87,11 +87,15 @@ def scenario_ebitda(ebitda, plan, evaluation, dscr, service):
     service_override = (plan.get("overrides") or {}).get("debt_service_monthly") is not None
     if service_override:
         notes.append("Projected savings include a hypothetical DSCR debt-service override; the published current debt service is unchanged.")
-    replacement_missing = bool(evaluation.get("retired_count") and evaluation.get("new_payment_monthly") is None)
+    replacement_missing = bool(evaluation.get("retired_count") and (evaluation.get("new_payment_monthly") is None or
+        "new_regular_payment_monthly" in evaluation and evaluation.get("new_regular_payment_monthly") is None))
     if replacement_missing:
         notes.append("Debt-service savings are shown before adding a replacement payment; replacement loan terms have not been provided.")
     before_service = _number(service.get("monthly"))
-    after_service = _number(evaluation.get("debt_service_after_monthly")) if before_service is not None else None
+    # Operating savings follow recurring payments; the DSCR denominator may
+    # separately include the maturity/balloon stress window.
+    after_service = _number(evaluation.get("debt_service_after_regular_monthly")
+                            if "debt_service_after_regular_monthly" in evaluation else evaluation.get("debt_service_after_monthly")) if before_service is not None else None
     net_before, net_after = _number(evaluation.get("net_before_avg")), _number(evaluation.get("net_after_avg"))
     reported, computed = _number(headline.get("reported_value")), _number(headline.get("computed_value"))
     reconciliation_conflict = reported is not None and computed is not None and abs(reported - computed) > 0.01

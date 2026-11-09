@@ -353,6 +353,24 @@ def _cash_metadata(summary: dict[str, Any], *, advanced: bool) -> dict[str, Any]
             peak, peak_end = running, row["month"]
     peak = _r2(peak)
     regular_peak = max((row["regular_payment"] for row in rows), default=0)
+    phases: list[dict[str, Any]] = []
+    for row in rows:
+        phase = "interest_only" if row["phase"] == "interest_only" else "repayment"
+        if not phases or phases[-1]["phase"] != phase:
+            phases.append({
+                "phase": phase, "start_period": row["period"], "end_period": row["period"],
+                "start_month": row["month"], "end_month": row["month"], "payment_count": 0,
+                "payment": row["regular_payment"], "monthly_equivalent": _r2(row["regular_payment"] * ppy / 12),
+                "payment_min": row["regular_payment"], "payment_max": row["regular_payment"],
+                "regular_debt_service": 0.0, "scheduled_balloon": 0.0, "maturity_balloon": 0.0, "cash_due": 0.0,
+            })
+        block = phases[-1]
+        block.update(end_period=row["period"], end_month=row["month"], payment_count=block["payment_count"] + 1,
+                     payment_min=min(block["payment_min"], row["regular_payment"]),
+                     payment_max=max(block["payment_max"], row["regular_payment"]))
+        for target, source in (("regular_debt_service", "regular_payment"), ("scheduled_balloon", "scheduled_balloon"),
+                               ("maturity_balloon", "maturity_balloon"), ("cash_due", "cash_payment")):
+            block[target] = _r2(block[target] + row[source])
     summary.update(cash_flows=flows, maturity_balloon=summary["balloon"],
                    scheduled_balloons_total=_r2(sum(row["scheduled_balloon"] for row in rows)),
                    first_year_actual_debt_service=first_year, peak_rolling_12_month_debt_service=peak,
@@ -361,6 +379,11 @@ def _cash_metadata(summary: dict[str, Any], *, advanced: bool) -> dict[str, Any]
                    principal_repaid=_r2(sum(row["total_principal"] for row in rows)),
                    maturity_exposure_pct=_r1(summary["balloon"] / principal * 100),
                    regular_coverage_payment_monthly=_r2(regular_peak * ppy / 12),
+                   ordinary_payment_monthly=summary.get("payment_after_monthly") if summary.get("payment_after_monthly") is not None else summary.get("payment_io_monthly"),
+                   interest_only_monthly_equivalent=summary.get("payment_io_monthly"),
+                   repayment_monthly_equivalent=summary.get("payment_after_monthly"),
+                   first_year_regular_debt_service=_r2(sum(row["regular_payment"] for row in rows if row["period"] <= ppy + 1e-9)),
+                   payment_phases=phases,
                    coverage_basis="peak_rolling_12_month_actual_cash_due" if advanced else "legacy_regular_payment",
                    cash_flow_convention="payment includes scheduled balloons; maturity residual is separate; cash_payment includes both",
                    balloon_period_mapping="nearest scheduled cadence period, half up; list order within a period")
@@ -401,6 +424,10 @@ def build_schedule(amount: float | None, rate_pct: float | None, term_months: in
         raise ValueError("The annual rate must be finite and nonnegative")
     if term_months is not None:
         _integer(term_months, "Maturity months", 0, MAX_TERM_MONTHS)
+    io_requested = _integer(0 if interest_only_months is None else interest_only_months, "Interest-only months", 0,
+                            int(term_months) if term_months else MAX_TERM_MONTHS)
+    if term_months and term_months * ppy / 12 < 1 - 1e-9:
+        raise ValueError("Maturity must include at least one payment period at the selected cadence")
     config = normalize_repayment_config(repayment_config, term_months, structure=structure,
                                         interest_only_months=interest_only_months, periods_per_year=ppy)
     if config is None:
@@ -410,7 +437,7 @@ def build_schedule(amount: float | None, rate_pct: float | None, term_months: in
             return None
         legacy.update(repayment_config=None, scheduled_balloons=[], after_balloon=None, amortization_months=None,
                       contractual_periods=legacy["periods"])
-        return _cash_metadata(legacy, advanced=False)
+        return _requested_timing(_cash_metadata(legacy, advanced=False), term_months, io_requested)
     principal = _r2(principal)
     if principal <= 0:
         raise ValueError("The loan amount must be at least one cent")
@@ -491,7 +518,20 @@ def build_schedule(amount: float | None, rate_pct: float | None, term_months: in
                "balloon_pct": _r1(balloon / principal * 100), "rows": rows,
                "repayment_config": config, "scheduled_balloons": applied, "after_balloon": config["after_balloon"],
                "amortization_months": None if kind == "interest_only" else config.get("amortization_months", _half_up(amort_periods * 12 / ppy))}
-    return _cash_metadata(summary, advanced=True)
+    return _requested_timing(_cash_metadata(summary, advanced=True), term_months, io_requested)
+
+
+def _requested_timing(summary: dict[str, Any], maturity: int | None, io: int) -> dict[str, Any]:
+    """Retain entered months separately from nearest-period cadence mapping."""
+    ppy = summary["periods_per_year"]
+    effective_maturity = summary.get("contractual_periods", summary["periods"]) * 12 / ppy
+    expected_io = maturity if summary["structure"] == "interest_only" and maturity else io
+    effective_io = min(summary.get("contractual_periods", summary["periods"]), _half_up(expected_io * ppy / 12)) * 12 / ppy
+    adjusted = bool(maturity and abs(effective_maturity - maturity) > .01
+                    or expected_io and abs(effective_io - expected_io) > .01)
+    summary.update(requested_interest_only_months=io, requested_maturity_months=maturity,
+                   cadence_adjustment_note=("Requested months are mapped to the nearest scheduled payment period at this cadence; review the first principal payment and maturity dates in the schedule." if adjusted else None))
+    return summary
 
 
 def risk_profile(
