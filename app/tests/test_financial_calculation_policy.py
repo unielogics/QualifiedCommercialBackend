@@ -57,14 +57,14 @@ def test_shared_payment_helper_keeps_an_unknown_rate_distinct_from_zero():
     assert loan_payment(12000, 0, 12) == 1000
 
 
-def test_ebitda_only_source_selection_invalidates_authority_even_with_same_dscr():
+def test_source_comparison_exclusion_invalidates_authority_even_with_same_latest_dscr():
     from app.services.financial_earnings_sources import change
     from app.tests.test_financial_earnings_sources import sources
     from app.tests.test_financial_metric_review import ACTOR
 
     original = build(sources())
     selection = original["ebitda"]["source_selection"]
-    state, _ = change(None, selection, mode="manual", selected_file_id="tax-2024", excluded_file_ids=[], reason="Review alternative period",
+    state, _ = change(None, selection, mode="manual", selected_file_id="tax-2025", excluded_file_ids=["tax-2024"], reason="Review latest period and comparison exclusion",
                       expected_revision=0, source_stamp=selection["source_stamp"], idempotency_key="source-selection", actor=ACTOR)
     current = build(sources(), state=state)
     assert current["dscr"]["headline"]["value"] == original["dscr"]["headline"]["value"]

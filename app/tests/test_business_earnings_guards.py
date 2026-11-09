@@ -51,7 +51,7 @@ def test_explicit_short_partial_or_reversed_tax_period_is_not_an_annual_numerato
     assert cockpit["plan"]["evaluation"]["income_after_annual"] is None
 
 
-def test_tax_fallback_citations_follow_the_eligible_full_year_not_the_newer_short_year():
+def test_latest_short_year_blocks_annual_coverage_and_prior_year_citations_stay_comparative():
     full = file("tax_return", {
         "form": "1065", "entity_name": "Example LLC", "tax_year": "2024",
         "period_start": "2024-01-01", "period_end": "2024-12-31",
@@ -63,15 +63,17 @@ def test_tax_fallback_citations_follow_the_eligible_full_year_not_the_newer_shor
         "ordinary_business_income": 900000, "interest": 0, "depreciation_and_amortization": 0,
     }, key="short-return")
     cockpit = build([full, short])
-    headline = cockpit["dscr"]["headline"]
-    assert headline["source_file_id"] == "full-return"
-    assert headline["numerator"] == 60000 and headline["value"] == 5
-    assert headline["source_refs"][0]["file_id"] == "full-return"
-    assert all("full-return" in key for key in headline["input_keys"] if key.startswith("tax_return:"))
-    selected = next(row for row in cockpit["metric_review"]["calculations"] if row.get("selected"))
-    assert selected["source_refs"][0]["file_id"] == "full-return"
-    assert not any("short-return" in item["key"] and item.get("used_by_headline")
-                   for item in cockpit["metric_review"]["inputs"])
+    assert cockpit["dscr"]["headline"] is None
+    assert cockpit["dscr"]["candidates"] == []
+    historical = cockpit["dscr"]["comparative_candidates"][0]
+    assert historical["source_file_id"] == "full-return"
+    assert historical["numerator"] == 60000 and historical["value"] == 5
+    assert historical["source_refs"][0]["file_id"] == "full-return"
+    assert all("full-return" in key for key in historical["input_keys"] if key.startswith("tax_return:"))
+    assert cockpit["ebitda"]["headline"]["value"] == 900000
+    assert cockpit["ebitda"]["headline"]["annualized_value"] is None
+    assert not any(row.get("selected") for row in cockpit["metric_review"]["calculations"] if row["key"].startswith("dscr."))
+    assert not any(item.get("used_by_headline") for item in cockpit["metric_review"]["inputs"])
 
 
 @pytest.mark.asyncio

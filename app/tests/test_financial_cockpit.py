@@ -4,7 +4,7 @@ Body Good Studio had six accepted statements, a signed authorization and no
 tax return, and the desk could only see the figures by generating the lender
 packet. The cockpit answers from the analyses on file: month by month, with
 every figure naming its source, and the DSCR and net-profit conclusions
-following the AI review's precedence (tax return, then P&L, then bank proxy).
+following the latest business reporting period, with other bases comparative.
 """
 
 from __future__ import annotations
@@ -358,7 +358,7 @@ def test_debt_service_prefers_the_rows_then_the_document_then_advance_terms() ->
     assert (nothing["monthly"], nothing["source"]) == (None, "none")
 
 
-def test_dscr_candidates_follow_the_review_precedence_and_name_their_basis() -> None:
+def test_dscr_uses_latest_business_period_and_names_other_bases_as_comparisons() -> None:
     cockpit = build_cockpit(
         [*SIX_MONTHS, TAX_2024, TAX_2025, _pnl()], [LOAN_ROW], proposed_terms=TERM_SHEET
     )
@@ -366,12 +366,10 @@ def test_dscr_candidates_follow_the_review_precedence_and_name_their_basis() -> 
     assert (
         dscr["annual_debt_service"] == 24000 and dscr["debt_service_source"] == "debt_schedule_rows"
     )
-    assert [c["key"] for c in dscr["candidates"]] == [
-        "tax_return",
-        "profit_and_loss",
-        "bank_cash_flow",
-    ]
-    tax, statement, bank = dscr["candidates"]
+    assert [c["key"] for c in dscr["candidates"]] == ["profit_and_loss"]
+    assert [c["key"] for c in dscr["comparative_candidates"]] == ["tax_return", "bank_cash_flow"]
+    statement = dscr["candidates"][0]
+    tax, bank = dscr["comparative_candidates"]
     assert (tax["value"], tax["status"], tax["confidence"]) == (2.92, "very_strong", "filed")
     assert tax["numerator"] == 70000 and "ordinary business income" in tax["numerator_label"]
     assert (tax["pro_forma_value"], tax["pro_forma_status"]) == (1.94, "very_strong")
@@ -379,7 +377,7 @@ def test_dscr_candidates_follow_the_review_precedence_and_name_their_basis() -> 
     assert statement["value"] == 3.0 and statement["period"] == "Jan–Jun 2026"
     assert bank["value"] == 3.5 and bank["confidence"] == "proxy" and "Provisional schedule-based" in bank["note"]
     assert "floor" not in bank["note"]
-    assert dscr["headline"]["key"] == "tax_return"
+    assert dscr["headline"]["key"] == "profit_and_loss"
     assert (
         dscr["proposed"]["monthly_payment"] == 1000 and dscr["proposed"]["annual_payment"] == 12000
     )
@@ -415,14 +413,14 @@ def test_proposed_payment_amortizes_when_the_sheet_has_no_monthly_figure() -> No
     assert build_cockpit([], [], proposed_terms=None)["dscr"]["proposed"] is None
 
 
-def test_net_profit_concludes_from_the_tax_return_then_the_statement_then_the_bank_proxy() -> None:
+def test_net_profit_uses_latest_business_period_and_bank_proxy_only_without_business_earnings() -> None:
     everything = build_cockpit([*SIX_MONTHS, TAX_2025, _pnl()], [LOAN_ROW])
     conclusion = everything["net_profit"]["conclusion"]
     assert (conclusion["key"], conclusion["value"], conclusion["basis"], conclusion["period"]) == (
-        "tax_return",
+        "profit_and_loss",
         60000,
-        "ordinary business income",
-        "2025",
+        "net income over 6 months, annualized",
+        "Jan–Jun 2026",
     )
     assert conclusion["margin"] == 0.1 and everything["net_profit"]["note"] is None
     assert [c["key"] for c in everything["net_profit"]["candidates"]] == [

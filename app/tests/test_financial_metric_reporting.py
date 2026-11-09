@@ -16,15 +16,15 @@ from app.services.financial_metric_reporting import (
 from app.tests.test_financial_metric_review import build, correction, pnl, tax
 
 
-def test_incomplete_tax_and_complete_pl_keep_primary_and_strict_annual_pairs_distinct():
+def test_incomplete_prior_tax_does_not_replace_complete_latest_pl_primary_or_annual_pair():
     cockpit = build([tax(interest=None, depreciation=None), pnl()])
     brief = metric_brief(cockpit)
-    assert brief["primary_dscr"]["key"] == cockpit["dscr"]["headline"]["key"] == "tax_return"
+    assert brief["primary_dscr"]["key"] == cockpit["dscr"]["headline"]["key"] == "profit_and_loss"
     assert brief["primary_dscr"]["value"] == cockpit["dscr"]["headline"]["value"]
     annual = brief["validated_annual"]
     assert annual["ebitda_annual"] == 52000 and annual["dscr"] == 4.33
     assert annual["dscr_label"] == "P&L EBITDA-based DSCR"
-    assert brief["primary_dscr"]["value"] != annual["dscr"]
+    assert brief["primary_dscr"]["value"] == annual["dscr"]
     assert next(row for row in brief["ebitda"]["candidates"] if row["kind"] == "tax_estimate")["provisional"]
 
 
@@ -153,11 +153,11 @@ async def test_intelligence_uses_current_primary_dscr_and_keeps_strict_annual_pl
         result = await application_profiles.intelligence_state(db, profile)
     assert next(row for row in result.metrics if row.key == "ebitda").value == 52000
     dscr = next(row for row in result.metrics if row.key == "dscr")
-    assert dscr.value == cockpit["dscr"]["headline"]["value"] == 8.33
-    assert "Current financial cockpit" in dscr.source and "Tax return 2025" in dscr.source
+    assert dscr.value == cockpit["dscr"]["headline"]["value"] == 4.33
+    assert "Current financial cockpit" in dscr.source and "Profit and loss" in dscr.source
     assert result.dscr_inputs["bankable_ebitda"] == 52000 and result.dscr_inputs["annual_debt_service"] == 12000
-    assert result.metric_review["primary_dscr"]["key"] == "tax_return"
-    assert result.dscr_inputs["basis"] == "current_cockpit" and result.dscr_inputs["cash_flow_value"] == 100000
+    assert result.metric_review["primary_dscr"]["key"] == "profit_and_loss"
+    assert result.dscr_inputs["basis"] == "current_cockpit" and result.dscr_inputs["cash_flow_value"] == 52000
     assert result.effective_calculation["dscr"] == 4.33
     assert result.effective_calculation["basis"] == "validated_profit_and_loss_annual_ebitda"
     assert intake.result_snapshot == before

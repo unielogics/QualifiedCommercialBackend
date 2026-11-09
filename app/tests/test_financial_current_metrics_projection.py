@@ -35,13 +35,13 @@ def test_unavailable_live_value_clears_cached_coverage_and_ebitda():
     assert source["key_metrics"]["estimated_dscr"] == 99
 
 
-def test_validated_annual_pl_remains_separate_from_primary_tax_basis():
+def test_latest_validated_pl_supplies_primary_coverage_and_annual_earnings():
     cockpit = build([tax(), pnl()])
     result = current_review_projection({}, cockpit)
     metrics = result["key_metrics"]
     assert metrics["bankable_ebitda"] == 52000
-    assert metrics["dscr_basis"] == "tax_return"
-    assert metrics["dscr_earnings"] == 115000
+    assert metrics["dscr_basis"] == "profit_and_loss"
+    assert metrics["dscr_earnings"] == 52000
     assert metrics["estimated_dscr"] == cockpit["dscr"]["headline"]["value"]
     assert result["financial_calculation_review"]["validated_annual"]["ebitda_annual"] == 52000
 

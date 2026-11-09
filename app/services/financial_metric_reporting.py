@@ -15,7 +15,7 @@ CURRENCY_KEYS = ("numerator_currency", "denominator_currency", "source_currencie
 RESULT_KEYS = ("key", "label", "kind", "value", "annualized_value", "period", "months_covered", "annualization_factor",
                "formula", "complete", "provisional", "entity_mismatch", "entity_comparable", "missing_inputs", "input_keys",
                "computed_value", "reported_value", "currency", "basis", "numerator", "denominator", "selected", "basis_status", "debt_version_id", "notes",
-               "source_value", "reviewed_value", "reviewed_label", "staff_adjusted", *CURRENCY_KEYS)
+               "source_value", "reviewed_value", "reviewed_label", "staff_adjusted", "active_input_keys", "year", "period_start", "period_end", *CURRENCY_KEYS)
 
 
 def _number(value):
@@ -71,24 +71,39 @@ def operating_earnings_brief(cockpit):
                                 "file_id", "file_name")), "source_refs": _refs(value.get("source_refs"))}
 
     forecast = trend.get("forecast")
+    noi = (cockpit or {}).get("noi") or {}
+    noi_scenario = noi.get("scenario") or {}
+    noi_historical = _result(noi.get("headline"))
+    if noi_historical:
+        noi_historical["fundamentals"] = [fields(row, ("key", "label", "value", "signed_value"))
+                                         for row in noi["headline"].get("fundamentals", [])]
     return {
         "historical": _result(ebitda.get("headline")),
         "historical_unavailable_reason": ebitda.get("reason"),
         "source_selection": {
             **fields(selection, ("mode", "selected_file_id", "excluded_file_ids", "stale")),
-            "sources": [fields(row, ("file_id", "file_name", "entity", "period", "kind", "eligible", "included", "selected"))
+            "sources": [fields(row, ("file_id", "file_name", "entity", "period", "kind", "eligible", "included", "selected", "baseline_eligible", "comparative_only"))
                         for row in selection.get("sources", []) if isinstance(row, dict)],
         },
         "revenue_trend": {
             **fields(trend, ("status", "notes")),
             "periods": [observation(row) for row in trend.get("periods", []) if isinstance(row, dict)],
             "comparison": fields(trend.get("comparison"), ("prior_year", "current_year", "prior_revenue", "current_revenue",
-                                    "change_amount", "change_pct", "monthly_change", "comparable", "reason")) or None,
+                                    "change_amount", "change_pct", "monthly_change", "comparable", "direction", "reason")) or None,
             "forecast": ({**fields(forecast, ("status", "method", "target_year", "projected_revenue", "change_amount",
                                     "change_pct", "projected_ebitda", "ebitda_kind", "margin", "assumptions", "reason")),
                           "source_refs": _refs(forecast.get("source_refs"))} if isinstance(forecast, dict) else None),
             "bank_context": fields(trend.get("bank_context"), ("average_monthly_deposits", "annualized_deposits", "note")),
         },
+        "potential": deepcopy(ebitda.get("potential")),
+        "noi": {
+            "definition": fields(noi.get("definition"), ("key", "label", "formula", "includes_depreciation_and_amortization")),
+            "historical": noi_historical, "reason": noi.get("reason"),
+            "years": [_result(row) for row in noi.get("years", [])],
+            "trend": fields(noi.get("trend"), ("direction", "comparable", "prior_year", "current_year", "change_amount", "change_pct", "reason")),
+            "scenario": fields(noi_scenario, ("current", "plan", "annual_debt_service_current", "annual_debt_service_plan",
+                "after_debt_service_current", "after_debt_service_plan", "notes")),
+        } if noi else None,
         "qualification_policy": "Historical source earnings and illustrative forecasts are separate. Forecast revenue or EBITDA does not establish current program eligibility; bank deposits are not operating revenue.",
     }
 
@@ -173,7 +188,8 @@ def metric_brief(cockpit):
                                       for row in review.get("document_associations", [])],
             "ebitda": {"headline": _result(ebitda.get("headline")), "candidates": [_result(row) for row in ebitda.get("candidates", [])], "reason": ebitda.get("reason"),
                        "source_selection": earnings.get("source_selection"),
-                       "revenue_trend": earnings.get("revenue_trend")},
+                       "revenue_trend": earnings.get("revenue_trend"), "potential": earnings.get("potential")},
+            "noi": earnings.get("noi"),
             "primary_dscr": primary, "validated_annual": validated_annual_pair(cockpit),
             "inputs": inputs, "corrections": corrections, "calculation_reviews": calculation_reviews,
             "excluded_income_sources": [{key: row.get(key) for key in ("file_id", "file_name", "reason")}
@@ -224,12 +240,19 @@ def current_review_projection(result, cockpit):
     annual = (brief or {}).get("validated_annual") or {}
     service = ((cockpit or {}).get("debt") or {}).get("service") or {}
     strict_ebitda = annual.get("ebitda_annual") if annual.get("currency") == "USD" else None
+    operating = (brief or {}).get("noi", {}).get("historical") or {}
+    revenue_baseline = (((cockpit or {}).get("ebitda") or {}).get("potential") or {}).get("baseline") or {}
+    current_revenue = revenue_baseline.get("revenue") if revenue_baseline.get("currency") == "USD" else None
     metrics.update({"estimated_dscr": primary.get("value"), "dscr": primary.get("value"),
                     "annual_debt_service": service.get("annual"), "monthly_debt_service": service.get("monthly"),
                     "debt_service_monthly": service.get("monthly"),
                     "annual_ebitda": strict_ebitda, "bankable_ebitda": strict_ebitda,
                     "estimated_ebitda_or_cash_flow": strict_ebitda,
                     "ebitda_source": "profit_and_loss" if strict_ebitda is not None else None,
+                    "annual_revenue": current_revenue, "annualized_revenue": current_revenue,
+                    "revenue_period": revenue_baseline.get("period"),
+                    "noi": operating.get("value"), "annual_noi": operating.get("annualized_value"),
+                    "noi_period": operating.get("period"), "noi_definition": "business_operating_income",
                     "dscr_basis": primary.get("key"), "dscr_earnings": primary.get("numerator"),
                     "dscr_earnings_label": primary.get("numerator_label"),
                     "dscr_source_refs": primary.get("source_refs") or [],

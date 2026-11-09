@@ -11,7 +11,7 @@ import hashlib
 import json
 from typing import Any
 
-CALCULATION_POLICY_VERSION = "business-financial-math-v5-earnings-source-selection"
+CALCULATION_POLICY_VERSION = "business-financial-math-v6-latest-period-noi-potential"
 
 
 def _digest(value: Any) -> str:
@@ -37,7 +37,9 @@ def financial_authority(cockpit: dict[str, Any]) -> dict[str, Any]:
         "selected_earnings": {key: (earnings.get("headline") or {}).get(key) for key in
                               ("key", "kind", "value", "annualized_value", "period", "currency", "basis", "source_refs")},
         "earnings_source_selection": {key: selection.get(key) for key in
-                                      ("source_stamp", "mode", "selected_file_id", "excluded_file_ids", "stale", "forecast_assumptions")},
+                                      ("source_stamp", "mode", "selected_file_id", "excluded_file_ids", "stale", "forecast_assumptions", "baseline_policy", "latest_file_id", "latest_period_end")},
+        "noi": {key: ((cockpit.get("noi") or {}).get("headline") or {}).get(key) for key in
+                ("key", "value", "annualized_value", "period", "currency", "basis", "source_refs")},
         "debt": {key: service.get(key) for key in (
             "source", "version_id", "monthly", "annual", "schedule_authoritative", "declared_none")},
     }
