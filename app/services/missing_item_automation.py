@@ -43,6 +43,10 @@ def _idempotency_key(*parts: object) -> str:
 
 
 def _client_submission_needed(requirement: object) -> bool:
+    from app.services.credit_requirement_sync import staff_review_only
+
+    if staff_review_only(requirement):
+        return False
     status_value = str(getattr(requirement, "status", ""))
     if status_value in {"verified", "waived", "not_applicable"}:
         return False
