@@ -203,7 +203,7 @@ def _legacy_adapter(model: type[BaseModel], **values: Any) -> BaseModel:
         field = BusinessProfileFields.model_fields[key]
         optional[key] = (str | None, field)
     adapter = create_model(f"_Legacy{model.__name__}", __base__=model, **optional)
-    return adapter.model_validate(values)
+    return adapter.model_validate(values, context={"existing_source": True})
 
 
 def existing_source_fields(source: Any) -> dict[str, Any]:

@@ -28,6 +28,7 @@ from pydantic import (
     ConfigDict,
     EmailStr,
     Field,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -113,6 +114,7 @@ from app.routers.public import (  # noqa: F401  (handlers reach this through cor
     _available_booking_slots,
     _to_utc_minute,
 )
+from app.schemas.application_profile import RoomDeliveryReceipt
 from app.schemas.bucket import (
     BucketAIMessageRead,
     BucketAIReviewRead,
@@ -894,7 +896,7 @@ async def _configure_equipment_bucket(
     )
 
 
-class AdminLeadCreate(RequiredBusinessProfileFields):
+class AdminLeadCreate(BusinessProfileFields):
     """Super-admin creates an AI-underwriter lead on behalf of a client. Mirrors the
     public start schemas but with no terms/throttle and an explicit variant selector.
     The client can later log in with this email exactly like a self-serve lead."""
@@ -903,8 +905,12 @@ class AdminLeadCreate(RequiredBusinessProfileFields):
     # main_street | mca_refinance.
     variant: str = Field(default="dealer")
     full_name: str = Field(min_length=1, max_length=180)
-    email: EmailStr
-    phone: RequiredPhone
+    email: EmailStr | None = None
+    phone: OptionalPhone = None
+    application_completion: Literal["client", "operator"] = "operator"
+    # Omitted preserves the legacy notify_client behavior. An explicit empty
+    # list creates a room for copying the link without sending anything.
+    invitation_channels: list[Literal["email", "sms"]] | None = Field(default=None, max_length=2)
     business_name: str | None = Field(default=None, max_length=180)
     loan_purpose: str | None = Field(default=None, max_length=255)
     # Intent steers the document package; industry is explicitly declared for
@@ -928,13 +934,44 @@ class AdminLeadCreate(RequiredBusinessProfileFields):
     broker_user_id: UUID | None = None
     secure_room_pin: str = Field(pattern=r"^[0-9]{6}$")
 
+    @model_validator(mode="before")
+    @classmethod
+    def require_operator_contact(cls, values: Any) -> Any:
+        if isinstance(values, dict) and values.get("application_completion", "operator") != "client":
+            if not values.get("phone") or not str(values["phone"]).strip():
+                raise ValueError("A mobile phone number is required for an operator-completed application")
+            if not values.get("email"):
+                raise ValueError("An email address is required for an operator-completed application")
+        return values
+
+    @model_validator(mode="after")
+    def validate_invitation_contacts(self, info: ValidationInfo) -> AdminLeadCreate:
+        channels = self.invitation_channels
+        if channels is not None:
+            self.invitation_channels = list(dict.fromkeys(channels))
+        if ("email" in (channels or []) or (channels is None and self.notify_client)) and not self.email:
+            raise ValueError("An email address is required to send an email invitation")
+        if "sms" in (channels or []) and not self.phone:
+            raise ValueError("A mobile number is required to send an SMS invitation")
+        # New staff-completed applications retain the full business-profile
+        # boundary. A client invitation may defer it, as may the private adapter
+        # adopting an existing CRM/booking record with genuinely missing facts.
+        if self.application_completion == "operator" and not (info.context or {}).get("existing_source"):
+            RequiredBusinessProfileFields.model_validate(business_profile.payload_fields(self))
+        return self
+
     @field_validator("variant", mode="before")
     @classmethod
     def normalize_variant(cls, value: object) -> object:
         return (str(value).strip().lower() if value else "dealer")
 
+    @field_validator("full_name", mode="before")
+    @classmethod
+    def trim_full_name(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
+
     @field_validator(
-        "phone", "business_name", "loan_purpose", "investor_name", "target_property_address",
+        "email", "phone", "business_name", "loan_purpose", "investor_name", "target_property_address",
         "transaction_type", "estimated_credit_tier", mode="before",
     )
     @classmethod
@@ -1766,6 +1803,7 @@ class DealerIntakeResponse(BaseModel):
     secure_room_pin: str | None = None
     room_delivery_status: str | None = None
     room_delivery_detail: str | None = None
+    room_deliveries: list[RoomDeliveryReceipt] = Field(default_factory=list)
     # Set when the client owes a signature on a Production Package: the room
     # shows the signing screen and nothing else until it is signed.
     signing_gate: dict[str, Any] | None = None
@@ -4486,7 +4524,7 @@ async def _recent_dealer_chat(db: AsyncSession, intake: PublicUnderwritingIntake
 
 
 async def _find_or_create_client(db: AsyncSession, payload: DealerIntakeStart) -> Client:
-    email = _normalize_email(str(payload.email))
+    email = _normalize_email(str(payload.email)) if payload.email else None
     attribution = _public_intake_attribution(payload)
     is_business_equipment = _is_business_equipment_application(payload)
     source_channel = "main_street_intake" if is_business_equipment else "dealer_ai_intake"
@@ -4497,14 +4535,14 @@ async def _find_or_create_client(db: AsyncSession, payload: DealerIntakeStart) -
     # otherwise fall back to the most recent.
     candidates = (
         await db.execute(select(Client).where(Client.email == email).order_by(Client.created_at.desc()))
-    ).scalars().all()
+    ).scalars().all() if email else []
     client = next((c for c in candidates if c.source_channel == source_channel), None) or (
         candidates[0] if candidates else None
     )
     owner = await primary_super_admin(db)
     if client is None:
         client = Client(
-            name=payload.full_name.strip(),
+            name=payload.full_name.strip()[:160],
             email=email,
             phone=payload.phone,
             referral_source=source_channel,
@@ -4531,7 +4569,7 @@ async def _find_or_create_client(db: AsyncSession, payload: DealerIntakeStart) -
     if not client.phone and payload.phone:
         client.phone = payload.phone
     if payload.full_name and (not client.name or client.name.lower() == email):
-        client.name = payload.full_name.strip()
+        client.name = payload.full_name.strip()[:160]
     if client.current_agent_id is None and owner is not None:
         client.current_agent_id = owner.id
     # Non-destructively tag a reused client so it's identifiable as dealer-AI
@@ -4553,8 +4591,8 @@ async def _find_or_create_client(db: AsyncSession, payload: DealerIntakeStart) -
 
 
 async def _find_or_create_funding_client(db: AsyncSession, payload: FundingReviewStart) -> Client:
-    email = _normalize_email(str(payload.email))
-    client = (await db.execute(select(Client).where(Client.email == email).order_by(Client.created_at.desc()))).scalars().first()
+    email = _normalize_email(str(payload.email)) if payload.email else None
+    client = (await db.execute(select(Client).where(Client.email == email).order_by(Client.created_at.desc()))).scalars().first() if email else None
     owner = await primary_super_admin(db)
     attribution = _public_intake_attribution(payload)
     lead_payload = {
@@ -4570,7 +4608,7 @@ async def _find_or_create_funding_client(db: AsyncSession, payload: FundingRevie
     }
     if client is None:
         client = Client(
-            name=payload.full_name.strip(),
+            name=payload.full_name.strip()[:160],
             email=email,
             phone=payload.phone,
             referral_source="funding_review",
@@ -4592,7 +4630,7 @@ async def _find_or_create_funding_client(db: AsyncSession, payload: FundingRevie
     if not client.phone and payload.phone:
         client.phone = payload.phone
     if payload.full_name and (not client.name or client.name.lower() == email):
-        client.name = payload.full_name.strip()
+        client.name = payload.full_name.strip()[:160]
     if client.current_agent_id is None and owner is not None:
         client.current_agent_id = owner.id
     intake = dict(client.lead_intake or {})
@@ -7199,6 +7237,7 @@ async def _response(
     secure_room_pin: str | None = None,
     room_delivery_status: str | None = None,
     room_delivery_detail: str | None = None,
+    room_deliveries: list[RoomDeliveryReceipt] | None = None,
 ) -> DealerIntakeResponse:
     if public_path == "/dealer-ai-underwriter" and _is_main_street_equipment_intake(intake):
         public_path = EQUIPMENT_PUBLIC_PATH
@@ -7386,7 +7425,10 @@ async def _response(
         session_token=session_token,
         signing_gate=signing_gate,
         resume_url=_public_url(f"{public_path}?token={token}") if token and public_path else None,
-        upload_url=_public_url(f"/buckets/request/{intake.bucket_upload_link.token}") if intake.bucket_upload_link else None,
+        upload_url=_public_url(
+            f"/buckets/request/{intake.bucket_upload_link.token}"
+            + ("?tab=application" if _intake_state(intake).get("application_completion") == "client" else "")
+        ) if intake.bucket_upload_link else None,
         assistant_message=assistant_message or (mca_refinance_policy.message(mca_policy, intake.preferred_language) if mca_policy is not None and not mca_policy["auto_underwriting_allowed"] else _format_review_update(latest_result) if latest_result else empty_message or _message_for_widget(widget, intake)),
         widget=widget,
         requested_documents=[
@@ -7419,6 +7461,7 @@ async def _response(
         secure_room_pin=secure_room_pin,
         room_delivery_status=room_delivery_status,
         room_delivery_detail=room_delivery_detail,
+        room_deliveries=room_deliveries or [],
     )
 
 
@@ -9309,6 +9352,14 @@ async def _create_admin_ai_lead_core(
     client_override: Client | None = None,
 ) -> DealerIntakeResponse:
     """Create an operator-owned intake after the caller has authorized access."""
+    channels = payload.invitation_channels
+    if channels is None:
+        channels = ["email"] if payload.notify_client else []
+    if channels and not commit:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Create and commit the file before sending an invitation.",
+        )
     if payload.variant not in _ADMIN_VARIANT_CONSTANTS:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -9338,7 +9389,7 @@ async def _create_admin_ai_lead_core(
 
     # Duplicate policy: unless force_new, surface the existing active lead so the
     # operator opens it instead of creating a duplicate bucket for the same email.
-    if not payload.force_new:
+    if not payload.force_new and payload.email:
         existing = await _latest_active_intake_by_email(db, str(payload.email), variant=variant_const)
         if existing is not None:
             raise HTTPException(
@@ -9361,7 +9412,7 @@ async def _create_admin_ai_lead_core(
     }
 
     if is_re:
-        adapter = business_profile._legacy_adapter(FundingReviewStart,
+        adapter = business_profile._legacy_adapter(_AdminFundingReviewStart,
             **business_profile.payload_fields(payload),
             full_name=payload.full_name,
             email=payload.email,
@@ -9379,13 +9430,15 @@ async def _create_admin_ai_lead_core(
             db, client, adapter, request, room_pin=payload.secure_room_pin
         )
     elif is_ms:
-        adapter = business_profile._legacy_adapter(DealerIntakeStart,
+        adapter = business_profile._legacy_adapter(_AdminDealerIntakeStart,
             **business_profile.payload_fields(payload),
             full_name=payload.full_name,
             email=payload.email,
             phone=payload.phone,
             business_name=payload.business_name,
-            funding_intent="equipment" if equipment_application else ms_intent,
+            # Main Street's broader intents (including not_sure and business
+            # services) are carried separately to its checklist builder.
+            funding_intent="equipment" if equipment_application else None,
             equipment_details=payload.equipment_details,
         )
         client = client_override or await _find_or_create_client(db, adapter)
@@ -9399,7 +9452,7 @@ async def _create_admin_ai_lead_core(
             room_pin=payload.secure_room_pin,
         )
     elif is_mca:
-        adapter = business_profile._legacy_adapter(McaRefiStart,
+        adapter = business_profile._legacy_adapter(_AdminMcaRefiStart,
             **business_profile.payload_fields(payload),
             full_name=payload.full_name,
             email=payload.email,
@@ -9415,7 +9468,7 @@ async def _create_admin_ai_lead_core(
             room_pin=payload.secure_room_pin,
         )
     else:
-        adapter = business_profile._legacy_adapter(DealerIntakeStart,
+        adapter = business_profile._legacy_adapter(_AdminDealerIntakeStart,
             **business_profile.payload_fields(payload),
             full_name=payload.full_name,
             email=payload.email,
@@ -9437,6 +9490,7 @@ async def _create_admin_ai_lead_core(
     intake_state: dict[str, Any] = {
         "messages": [],
         **business_profile.state_entry(payload),
+        "application_completion": payload.application_completion,
         "source": (
             "funding_review"
             if is_re
@@ -9490,7 +9544,7 @@ async def _create_admin_ai_lead_core(
         token_hash=_hash_token(token),
         variant=variant_const,
         full_name=payload.full_name.strip(),
-        email=client.email or _normalize_email(str(payload.email)),
+        email=client.email or _normalize_email(str(payload.email or "")),
         phone=payload.phone,
         business_name=(payload.investor_name if is_re else payload.business_name),
         loan_purpose=(
@@ -9561,47 +9615,77 @@ async def _create_admin_ai_lead_core(
     email_note = ""
     delivery_status = "created"
     delivery_detail = "Room created without sending"
-    if payload.notify_client:
-        room_path = f"/buckets/request/{link.token}"
-        delivery = await consent_delivery.deliver_link_checked(
-            db,
-            channel="email",
-            to_email=intake.email,
-            to_phone=intake.phone,
-            business_name=intake.business_name or intake.full_name,
-            purpose="open the secure application room",
-            path=room_path,
-            rep_name=user.name,
-            origin=get_settings().frontend_app_url,
-        )
-        delivery_status = "sent" if delivery.ok else "failed"
-        delivery_detail = delivery.detail
-        db.add(
-            ApplicationRoomDelivery(
-                bucket_id=bucket.id,
-                action_kind="room_created",
-                channel="email",
-                recipient_email=intake.email,
-                recipient_phone=intake.phone,
-                status=delivery_status,
-                detail=delivery.detail,
-                provider_result={
-                    "accepted": delivery.ok,
-                    "email_ok": delivery.email_ok,
-                    "sms_ok": delivery.sms_ok,
-                },
-                created_by_user_id=user.id,
+    room_deliveries: list[RoomDeliveryReceipt] = []
+    intake_id, bucket_id, actor_id = intake.id, bucket.id, user.id
+    invitation_email, invitation_phone = intake.email, intake.phone
+    invitation_name, actor_name = intake.business_name or intake.full_name, user.name
+    room_path = (f"/buckets/request/{link.token}" + (
+        "?tab=application" if payload.application_completion == "client" else ""
+    )) if channels else ""
+    for channel in channels:
+        try:
+            delivery = await consent_delivery.deliver_link_checked(
+                db,
+                channel=channel,
+                # The existing SMS seam also emails when given an address.
+                # Each selected channel is attempted exactly once here.
+                to_email=invitation_email if channel == "email" else None,
+                to_phone=invitation_phone if channel == "sms" else None,
+                business_name=invitation_name,
+                purpose="complete your application in the secure room",
+                path=room_path,
+                rep_name=actor_name,
+                origin=get_settings().frontend_app_url,
+                ledger_context="application_invite",
             )
+            accepted = delivery.email_ok if channel == "email" else delivery.sms_ok
+            detail = delivery.detail
+            if channel == "sms":
+                detail = detail.replace("so only the email went.", "the invitation was not texted.")
+                if accepted:
+                    detail = "Texted."
+        except Exception:
+            # The file is already committed. A provider/ledger failure must not
+            # make the operator recreate it and generate a duplicate file.
+            logging.getLogger(__name__).warning("Application invitation failed via %s", channel)
+            await db.rollback()
+            await db.refresh(user)
+            accepted = False
+            detail = "Invitation delivery failed. The file was created; share its link or retry from the file."
+        delivery_row = ApplicationRoomDelivery(
+            id=uuid4(),
+            created_at=_now(),
+            bucket_id=bucket_id,
+            action_kind="room_created",
+            channel=channel,
+            recipient_email=invitation_email if channel == "email" else None,
+            recipient_phone=invitation_phone if channel == "sms" else None,
+            status="sent" if accepted else "failed",
+            detail=detail,
+            provider_result={"accepted": accepted},
+            attempt_number=1,
+            created_by_user_id=actor_id,
         )
-        if commit:
-            await db.commit()
-        else:
-            await db.flush()
-        intake = await _load_admin_dealer_lead(db, intake.id)
+        db.add(delivery_row)
+        await db.commit()
+        # Reuse the room's receipt serializer so create and reminder results
+        # expose the same masked destination and provider acceptance semantics.
+        from app.routers.application_profiles import _room_delivery_read
+
+        room_deliveries.append(_room_delivery_read(delivery_row))
+        intake = await _load_admin_dealer_lead(db, intake_id)
+    if room_deliveries:
+        sent = sum(row.status == "sent" for row in room_deliveries)
+        delivery_status = "sent" if sent == len(room_deliveries) else "partial" if sent else "failed"
+        delivery_detail = " ".join(f"{row.channel.upper()}: {row.detail}" for row in room_deliveries)
+        intake.last_link_sent_at = _now() if sent else intake.last_link_sent_at
+        intake.last_link_status = delivery_status
+        intake.last_link_kind = "room"
+        await db.commit()
         email_note = (
-            " The secure room link was emailed to the client; share the PIN separately."
-            if delivery.ok
-            else " Room email delivery failed; copy the room link and share the PIN separately."
+            " The invitation was sent; share the PIN separately."
+            if delivery_status == "sent"
+            else " Some invitations could not be delivered. The room link is ready to copy; share the PIN separately."
         )
 
     return await _response(
@@ -9623,6 +9707,7 @@ async def _create_admin_ai_lead_core(
         secure_room_pin=payload.secure_room_pin,
         room_delivery_status=delivery_status,
         room_delivery_detail=delivery_detail,
+        room_deliveries=room_deliveries,
     )
 
 
@@ -10421,8 +10506,8 @@ def _mca_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
 
 
 async def _find_or_create_mca_client(db: AsyncSession, payload: McaRefiStart) -> Client:
-    email = _normalize_email(str(payload.email))
-    client = (await db.execute(select(Client).where(Client.email == email).order_by(Client.created_at.desc()))).scalars().first()
+    email = _normalize_email(str(payload.email)) if payload.email else None
+    client = (await db.execute(select(Client).where(Client.email == email).order_by(Client.created_at.desc()))).scalars().first() if email else None
     owner = await primary_super_admin(db)
     attribution = _public_intake_attribution(payload)
     lead_payload = {
@@ -10435,7 +10520,7 @@ async def _find_or_create_mca_client(db: AsyncSession, payload: McaRefiStart) ->
     }
     if client is None:
         client = Client(
-            name=payload.full_name.strip(),
+            name=payload.full_name.strip()[:160],
             email=email,
             phone=payload.phone,
             referral_source="mca_refinance",
@@ -10457,7 +10542,7 @@ async def _find_or_create_mca_client(db: AsyncSession, payload: McaRefiStart) ->
     if not client.phone and payload.phone:
         client.phone = payload.phone
     if payload.full_name and (not client.name or client.name.lower() == email):
-        client.name = payload.full_name.strip()
+        client.name = payload.full_name.strip()[:160]
     if client.current_agent_id is None and owner is not None:
         client.current_agent_id = owner.id
     merged = dict(client.lead_intake or {})
@@ -10552,6 +10637,23 @@ async def _create_bucket_for_mca_refi(
 # money on an unauthenticated (token-bearing) caller, so it is deliberately
 # stingier than /start.
 _MCA_PULL_LAST_BY_IP: dict[str, float] = {}
+
+
+# Operator-created invitations can defer contact details to the client. These
+# adapters keep the public start forms' required email/mobile rules intact.
+class _AdminDealerIntakeStart(DealerIntakeStart):
+    email: EmailStr | None = None
+    phone: OptionalPhone = None
+
+
+class _AdminFundingReviewStart(FundingReviewStart):
+    email: EmailStr | None = None
+    phone: OptionalPhone = None
+
+
+class _AdminMcaRefiStart(McaRefiStart):
+    email: EmailStr | None = None
+    phone: OptionalPhone = None
 
 
 # ---------------------------------------------------------------------------

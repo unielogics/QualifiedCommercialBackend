@@ -173,6 +173,11 @@ from app.schemas.bucket import (
     BucketFileUploadInitResponse,
     BucketUploadComplete,
 )
+from app.schemas.client_application import (
+    ClientApplicationFields,
+    ClientApplicationPatch,
+    ClientApplicationRead,
+)
 from app.schemas.debt_schedule_review import (
     DebtScheduleReviewRead,
     DebtScheduleReviewResult,
@@ -3900,7 +3905,7 @@ async def _application_room_state(
             if readiness_snapshot is not None
             else None
         ),
-        capabilities=["documents", "ownership", "owner_credit", "business_banking", "agreements"],
+        capabilities=["documents", "ownership", "owner_credit", "business_banking", "agreements"] + (["application"] if intake and (intake.intake_state or {}).get("application_completion") == "client" else []),
         owners=await profiles.owner_reads_current(db, profile, owners=owner_rows, include_credit_risk=False),
         verification=verification,
         precall=room_precall,
@@ -3956,6 +3961,89 @@ async def public_application_room_update_use_of_funds(
     )
     await db.commit()
     return budget.model_copy(update={"updated_by_user_id": None})
+
+
+async def _room_application_intake(db: AsyncSession, profile: ApplicationProfile, link: BucketUploadLink) -> PublicUnderwritingIntake:
+    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    if intake is None or intake.bucket_id != link.bucket_id or (intake.intake_state or {}).get("application_completion") != "client":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Application details are unavailable for this room")
+    return intake
+
+
+@router.post("/public/room/{token}/application", response_model=ClientApplicationRead)
+async def public_room_application(
+    token: str, payload: ApplicationRoomAccess, request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> ClientApplicationRead:
+    from app.services.client_application import read_application
+
+    link, profile = await _public_application_room(db, token, payload.passcode, request)
+    intake = await _room_application_intake(db, profile, link)
+    return read_application(intake, profile)
+
+
+@router.patch("/public/room/{token}/application", response_model=ClientApplicationRead)
+async def public_room_update_application(
+    token: str, payload: ClientApplicationPatch, request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> ClientApplicationRead:
+    from pydantic import ValidationError
+
+    from app.services.client_application import (
+        apply_application,
+        read_application,
+        sync_main_street_documents,
+        sync_seeded_owner,
+        validate_submission,
+    )
+
+    link, profile = await _public_application_room(db, token, payload.passcode, request)
+    # Use the same profile-first lock order as reviewed funding corrections.
+    await db.refresh(profile, with_for_update=True)
+    intake = await _room_application_intake(db, profile, link)
+    await db.refresh(intake, with_for_update=True)
+    if intake.bucket_id != link.bucket_id or (intake.intake_state or {}).get("application_completion") != "client":
+        raise HTTPException(404, "Application details are unavailable for this room")
+    previous = read_application(intake, profile)
+    changes = payload.model_dump(exclude_unset=True, exclude={"passcode", "submit"})
+    try:
+        values = ClientApplicationFields.model_validate({**previous.model_dump(), **changes})
+    except ValidationError as error:
+        problems = "; ".join(f"{str(item['loc'][0]).replace('_', ' ')}: {item['msg']}" for item in error.errors())
+        raise HTTPException(422, f"Correct the application information: {problems}") from error
+    if not values.full_name:
+        raise HTTPException(422, "Your full name is required to save the application.")
+    if payload.submit:
+        validate_submission(values, profile.vertical)
+    client = await db.get(Client, profile.client_id) if profile.client_id else None
+    apply_application(intake, profile, link, client, values, submit=payload.submit)
+    from app.services import business_profile
+
+    if business_profile.payload_fields(previous) != business_profile.payload_fields(values):
+        await business_profile.rearm_unclassified_suggestion(db, intake)
+    if profile.vertical == "main_street":
+        await sync_main_street_documents(db, intake, previous, values)
+    bucket = await db.get(Bucket, link.bucket_id)
+    if bucket is not None:
+        # Reuse each product's context builder so the answers reach underwriting.
+        from app.routers.dealer_ai_intake import _context_fn_for
+
+        if bucket.name_sync_mode == "linked":
+            bucket.name = (intake.business_name or intake.full_name)[:180]
+            bucket.client_name = bucket.name
+        bucket.ai_context = {**(bucket.ai_context or {}), **_context_fn_for(intake)(intake)}
+    for owner in await profiles.owner_rows(db, profile):
+        # Only update the identity seeded at creation; explicit owner edits win.
+        sync_seeded_owner(owner, previous, values)
+    await profiles.log_profile_action(
+        db, profile, None,
+        "application.submitted.application_room" if payload.submit else "application.saved.application_room",
+        "Client submitted application details" if payload.submit else "Client saved application details",
+        target_type="intake", target_id=intake.id,
+        metadata={"changed_fields": sorted(changes)},
+    )
+    await db.commit()
+    return read_application(intake, profile)
 
 
 @router.post("/public/room/{token}/state", response_model=ApplicationRoomState)

@@ -970,8 +970,8 @@ async def _seed_primary_owner(
     db.add(
         ApplicationOwner(
             profile_id=profile.id,
-            first_name=first or "Owner",
-            last_name=last or "Unknown",
+            first_name=(first or "Owner")[:80],
+            last_name=(last or "Unknown")[:80],
             email=normalized_email((intake.email if intake else None) or (client.email if client else None)),
             phone=(intake.phone if intake else None) or (client.phone if client else None),
             ownership_pct=Decimal("100.00"),
