@@ -146,6 +146,18 @@ def test_dated_comparable_current_p_and_l_uses_run_rate_with_explicit_seasonalit
     assert "seasonal" in forecast["assumptions"][0]
 
 
+def test_p_and_l_revenue_using_selected_tax_margin_cites_both_sources():
+    rows = [*sources(), pnl(basis="cash")]
+    original = build(rows, now=datetime(2026, 11, 9, tzinfo=UTC))
+    state, _ = save(original)
+    current = build(rows, state=state, now=datetime(2026, 11, 9, tzinfo=UTC))
+    forecast = current["ebitda"]["revenue_trend"]["forecast"]
+    assert forecast["projected_revenue"] == 400000
+    assert forecast["projected_ebitda"] == round(400000 * -54369 / 604785, 2)
+    assert {ref["file_id"] for ref in forecast["source_refs"]} == {"source", "tax-2025"}
+    assert forecast["ebitda_kind"] == "tax_estimate"
+
+
 def test_explicit_assumptions_replace_current_p_and_l_illustration_consistently():
     original = build([*sources(), pnl(basis="cash")], now=datetime(2026, 11, 9, tzinfo=UTC))
     state, _ = save(original, forecast_assumptions={"revenue_growth_pct": 10, "ebitda_margin_pct": 5})

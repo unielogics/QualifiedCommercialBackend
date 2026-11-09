@@ -240,7 +240,8 @@ def revenue_trend(years, statement, candidates, bank, *, now=None, assumptions=N
         # A provisional tax estimate remains a tax estimate in projection.
         margin = explicit_margin / 100 if explicit_margin is not None else baseline["ebitda"] / baseline["revenue"]
         forecast.update(margin=round(margin, 6), projected_ebitda=round(forecast["projected_revenue"] * margin, 2), ebitda_kind=baseline["ebitda_kind"])
-        forecast["assumptions"].append("Use the explicitly reviewed earnings margin." if explicit_margin is not None else "Hold the latest annual source earnings margin constant, including a negative margin. No expense efficiencies or loan principal/interest are added to EBITDA.")
+        forecast["source_refs"] = list({stamp(ref): ref for ref in [*forecast["source_refs"], *baseline["source_refs"]]}.values())
+        forecast["assumptions"].append("Use the explicitly reviewed earnings margin." if explicit_margin is not None else "Hold the selected annual source earnings margin constant, including a negative margin. No expense efficiencies or loan principal/interest are added to EBITDA.")
         if explicit_margin is not None:
             forecast["ebitda_kind"] = "reviewed_assumption"
     return {"status": "available" if comparison and comparison["comparable"] else "insufficient", "periods": periods,
