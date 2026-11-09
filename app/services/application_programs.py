@@ -192,7 +192,7 @@ FINANCIAL_FIT_FIELDS = frozenset({
 })
 
 
-def _fit_fact_sources(context: dict, facts: list, files: list, analyses: dict) -> dict:
+def _fit_fact_sources(context: dict, facts: list, files: list, analyses: dict, associations: dict | None = None) -> dict:
     """Require explicit staff-reviewed, current source facts for monetary fit.
 
     Legacy AI summary cards are useful observations, never verification. A
@@ -200,6 +200,7 @@ def _fit_fact_sources(context: dict, facts: list, files: list, analyses: dict) -
     Conflicting accepted scalar facts stay unresolved rather than pooled.
     """
     inventory = {file.id: file for file in files}
+    from app.services.document_associations import source_excluded
     output = {key: {"verification_status": "provisional" if context.get(key) is not None else "unknown",
                     "source_refs": []} for key in FINANCIAL_FIT_FIELDS}
     aliases = {"gross_revenue": "revenue", "annual_revenue": "annual_revenue",
@@ -216,6 +217,8 @@ def _fit_fact_sources(context: dict, facts: list, files: list, analyses: dict) -
         source_file_id = getattr(fact, "source_file_id", None)
         analysis_id = getattr(fact, "source_analysis_id", None)
         if source_file_id is not None:
+            if source_excluded((associations or {}).get(str(source_file_id))):
+                continue
             file = inventory.get(source_file_id)
             analysis = analyses.get(source_file_id)
             if (file is None or analysis is None or not file.content_hash
@@ -459,6 +462,12 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
     budget = summarize_use_of_funds(profile, requested_amount, amount_source, dealer=dealer)
     files, latest_analyses, _classifications = await _evidence_inventory(db, profile)
     accepted_file_ids = await accepted_evidence_file_ids(db, profile, files, latest_analyses)
+    from app.services import document_associations
+
+    expected_entity = getattr(intake, "business_name", None) or getattr(dealer, "legal_name", None) or getattr(dealer, "name", None)
+    associations = await document_associations.load_context(db, profile, files, latest_analyses, expected_entity=expected_entity, accepted_ids=accepted_file_ids)
+    excluded_ids = {key for key, row in associations.items() if document_associations.source_excluded(row)}
+    accepted_file_ids = {key for key in accepted_file_ids if str(key) not in excluded_ids}
     accepted_classifications = {
         classification
         for file_id, analysis in latest_analyses.items()
@@ -472,7 +481,7 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
     counted_accounts = _counted_bank_accounts(profile)
     from app.services.financial_cockpit import _analysis_rows
 
-    analysis_rows = _analysis_rows(files, latest_analyses, accepted_file_ids)
+    analysis_rows = [row for row in _analysis_rows(files, latest_analyses, accepted_file_ids, associations) if row["file_id"] not in excluded_ids]
     statement_rows, statement_refs, statement_warnings = program_bank_estimate_rows(
         analysis_rows, counted_accounts=counted_accounts,
         account_aliases=dict(getattr(profile, "bank_account_aliases", None) or {}),
@@ -655,7 +664,7 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         ApplicationExtractedFact.profile_id == profile.id,
         ApplicationExtractedFact.status == "accepted",
     ))).scalars().all())
-    context["fact_sources"] = _fit_fact_sources(context, reviewed_facts, files, latest_analyses)
+    context["fact_sources"] = _fit_fact_sources(context, reviewed_facts, files, latest_analyses, associations)
     # Six accepted statements say more than "needs information". Revenue and
     # cash flow are estimated from them when no P&L or tax return is on file;
     # the estimate is labelled as one, and a person can replace it.
@@ -683,8 +692,12 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
                 )
                 for row in source_rows
             )
-            if current_sources:
+            if current_sources and not any(str(row.get("source_file_id")) in excluded_ids for row in source_rows):
                 context["fact_sources"][field] = {"verification_status": "verified", "source_refs": source_rows[:24]}
+            elif context["fact_sources"].get(field, {}).get("verification_status") != "verified":
+                context[field] = None
+                context["fact_sources"][field] = {"verification_status": "unknown", "source_refs": [],
+                    "reason": "The saved margin's source is no longer current or its business association is excluded."}
     from app.services.program_earnings_facts import annual_ebitda_fact
 
     context["annual_ebitda"], context["fact_sources"]["annual_ebitda"] = annual_ebitda_fact(
@@ -2425,7 +2438,7 @@ def _corroborated_entity_aliases(
 
 
 async def _accepted_entity_aliases(
-    db: AsyncSession, profile_id: uuid.UUID
+    db: AsyncSession, profile_id: uuid.UUID, associations: dict | None = None
 ) -> set[str]:
     """Return legal names an underwriter explicitly accepted for this file.
 
@@ -2451,6 +2464,13 @@ async def _accepted_entity_aliases(
     )
     aliases = set()
     for row in rows:
+        from app.services.document_associations import source_excluded
+
+        source_file_id = getattr(row, "source_file_id", None)
+        association = (associations or {}).get(str(source_file_id))
+        if source_file_id is not None and associations is not None and (not association or source_excluded(association)
+                or str(getattr(row, "source_analysis_id", None)) != association.get("analysis_id")):
+            continue
         value = row.value.get("value") if isinstance(row.value, dict) else row.value
         normalized = _normalized_entity(value or row.normalized_value)
         if normalized:
@@ -2471,6 +2491,7 @@ def _evidence_decision_context_key(
     review_checks: list[dict[str, Any]] | None = None,
     check_assessment: dict[str, Any] | None = None,
     requires_human: bool = False,
+    identity_association_stamp: str | None = None,
 ) -> str:
     """Fingerprint every input that can change an automatic decision."""
 
@@ -2489,6 +2510,7 @@ def _evidence_decision_context_key(
             json.dumps(review_checks or [], sort_keys=True),
             json.dumps(check_assessment or {}, sort_keys=True),
             str(requires_human),
+            identity_association_stamp or "unreviewed-association",
         )
     )
     return hashlib.sha256(raw_key.encode()).hexdigest()
@@ -2520,21 +2542,16 @@ def _analysis_fact(analysis: BucketFileAnalysis | None, key: str) -> object | No
 
 
 def _analysis_business_entity(analysis: BucketFileAnalysis | None) -> object | None:
-    entity = _analysis_fact(analysis, "legal_entity_name")
-    if entity:
-        return entity
-    if analysis is None or not isinstance(analysis.analysis, dict):
-        return None
-    key_facts = analysis.analysis.get("key_facts")
-    if not isinstance(key_facts, dict):
-        return None
-    return key_facts.get("business_name") or key_facts.get("account_holder")
+    from app.services.document_associations import observed_names
+
+    return next(iter(observed_names(analysis)), None)
 
 
 def _entity_identity_warning(
     analysis: BucketFileAnalysis | None,
     expected_entity: str | None,
     corroborated_entities: set[str] | None = None,
+    identity_association: dict | None = None,
 ) -> dict[str, Any] | None:
     """Separate documentary usability from an unconfirmed file association.
 
@@ -2542,6 +2559,8 @@ def _entity_identity_warning(
     The exact observed name is retained for review; numerical aggregation must
     still respect source, entity, period, basis and currency boundaries.
     """
+    if identity_association and identity_association.get("status") == "accepted":
+        return None
     if (
         analysis is None
         or not _normalized_entity(expected_entity)
@@ -2596,7 +2615,16 @@ def _automatic_evidence_decision(
     review_checks: list[dict[str, Any]] | None = None,
     check_assessment: dict[str, Any] | None = None,
     requires_human: bool = False,
+    identity_association: dict | None = None,
 ) -> tuple[str, str, str, str | None]:
+    from app.services.document_associations import source_excluded
+
+    if source_excluded(identity_association):
+        return ("rejected" if identity_association["status"] == "denied" else "needs_more",
+                "entity_association_denied" if identity_association["status"] == "denied" else "entity_association_stale",
+                "Staff denied this document's association with this application. Its figures and coverage are excluded here; the source file is retained."
+                if identity_association["status"] == "denied" else "A prior business-association decision does not cover this current document, analysis or application owner. Review its association again.",
+                analysis.confidence if analysis else None)
     if duplicate_content:
         return (
             "needs_more",
@@ -2690,7 +2718,7 @@ def _automatic_evidence_decision(
             analysis.confidence,
         )
 
-    identity_warning = _entity_identity_warning(analysis, expected_entity, corroborated_entities)
+    identity_warning = _entity_identity_warning(analysis, expected_entity, corroborated_entities, identity_association)
 
     blocking_text = _blocking_analysis_text(analysis)
     if any(
@@ -2917,6 +2945,7 @@ async def _reconcile_evidence_decisions(
     review_policy_changed: bool = False,
     check_assessment: dict[str, Any] | None = None,
     requires_human: bool = False,
+    associations: dict | None = None,
 ) -> dict[uuid.UUID, ApplicationRequirementEvidenceDecision]:
     latest = await _latest_evidence_decisions(db, links)
     seen_hashes: set[str] = set()
@@ -2933,20 +2962,29 @@ async def _reconcile_evidence_decisions(
         duplicate = content_hash in seen_hashes
         seen_hashes.add(content_hash)
         current = latest.get(link.id)
+        association = (associations or {}).get(str(file.id))
+        prior_association_stamp = (getattr(link, "provenance", None) or {}).get("identity_association_stamp")
+        association_changed = bool(association and (association.get("history") or association.get("status") == "stale")
+                                   and prior_association_stamp != association["association_stamp"])
+        unrelated_staff_rejection = bool(current and current.actor_kind == "staff" and current.decision != "accepted"
+            and getattr(current, "reason_code", None) not in {"wrong_entity", "entity_mismatch", "entity_unconfirmed", "entity_mismatch_warning", "entity_unconfirmed_warning", "entity_association_denied", "entity_association_stale"})
         analysis_version = analysis.analysis_version if analysis else 0
         identity_warning = (
-            _entity_identity_warning(analysis, expected_entity, corroborated_entities)
+            _entity_identity_warning(analysis, expected_entity, corroborated_entities, association)
             if analysis is not None and getattr(analysis, "content_hash", None) == file.content_hash
             else None
         )
         link.provenance = {
             **(getattr(link, "provenance", None) or {}),
             "entity_identity_warning": identity_warning,
+            "identity_association_stamp": association.get("association_stamp") if association else None,
         }
         retained_staff_review = (
             current is not None
             and not getattr(analysis, "financial_mapping_pending", False)
             and current.actor_kind == "staff"
+            and (not association_changed or unrelated_staff_rejection)
+            and not (association and association.get("status") in {"denied", "stale"})
             and current.content_hash == content_hash
             and current.analysis_version == analysis_version
             and not review_policy_changed
@@ -2965,6 +3003,7 @@ async def _reconcile_evidence_decisions(
                 review_checks=review_checks,
                 check_assessment=check_assessment,
                 requires_human=requires_human,
+                identity_association=association,
             )
             context_key = _evidence_decision_context_key(
                 link_id=link.id,
@@ -2982,6 +3021,7 @@ async def _reconcile_evidence_decisions(
                 review_checks=review_checks,
                 check_assessment=check_assessment,
                 requires_human=requires_human,
+                identity_association_stamp=association.get("association_stamp") if association else None,
             )
             if (
                 current is not None
@@ -3030,7 +3070,7 @@ async def _reconcile_evidence_decisions(
             > (link.verified_at.replace(tzinfo=UTC) if link.verified_at.tzinfo is None else link.verified_at)
             for value in (getattr(analysis, "analyzed_at", None), getattr(file, "created_at", None))
         )
-        changed_evidence = bool(getattr(analysis, "financial_mapping_pending", False)) or bool(current and (
+        changed_evidence = association_changed or bool(getattr(analysis, "financial_mapping_pending", False)) or bool(current and (
             current.content_hash != content_hash or current.analysis_version != analysis_version
         )) or newer_evidence
         if (link.verified_by_user_id is not None and not retained_staff_review
@@ -3078,10 +3118,15 @@ async def _materialize_requirements(
         await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
     )
     expected_entity = intake.business_name if intake else None
+    from app.services import document_associations
+
+    if expected_entity is None:
+        expected_entity = await document_associations.expected_business(db, profile)
+    associations = await document_associations.load_context(db, profile, files, analyses, expected_entity=expected_entity)
     corroborated_entities = _corroborated_entity_aliases(
-        expected_entity, list(analyses.values())
+        expected_entity, [analysis for file_id, analysis in analyses.items() if not document_associations.source_excluded(associations.get(str(file_id)))]
     )
-    corroborated_entities.update(await _accepted_entity_aliases(db, profile.id))
+    corroborated_entities.update(await _accepted_entity_aliases(db, profile.id, associations))
     criteria_versions = {
         item.playbook_id: item.playbook_version for item in [*selections, *policies]
     }
@@ -3311,6 +3356,7 @@ async def _materialize_requirements(
                 else set()
             ),
             criteria_version=criteria_versions.get(requirement.playbook_id, 1),
+            associations=associations,
             review_checks=review_checks,
             check_assessment=check_assessment,
             requires_human=requires_human,
@@ -3841,6 +3887,9 @@ async def get_program_readiness(
     all_links = [link for rows in links_by_state.values() for link, _file in rows]
     latest_decisions = await _latest_evidence_decisions(db, all_links)
     available_files, available_analyses, _available_classes = await _evidence_inventory(db, profile, include_pending_financial=True)
+    from app.services import document_associations
+
+    association_records = await document_associations.load_context(db, profile, available_files, available_analyses)
     unlocked_copy_requests = await locked_file_requests.request_states_for_files(
         db,
         profile=profile,
@@ -3893,6 +3942,7 @@ async def get_program_readiness(
         inferred_decision = "accepted" if link.verified_at else "processing"
         origin, form_kind = evidence_origin(file, available_analyses.get(file.id))
         return ApplicationRequirementEvidenceRead(
+            identity_association=document_associations.display_record(association_records.get(str(file.id))),
             file_id=file.id,
             file_name=file.file_name,
             bucket_id=file.bucket_id,

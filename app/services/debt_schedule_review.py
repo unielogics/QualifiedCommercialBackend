@@ -650,7 +650,7 @@ async def schedule_documents(db: AsyncSession, profile: ApplicationProfile) -> l
     set_aside = await cockpit.set_aside_schedule_files(db, profile)
     by_id = {str(file.id): file for file in files}
     documents: list[dict[str, Any]] = []
-    for item in cockpit._analysis_rows(files, latest, set()):
+    for item in await cockpit.associated_analysis_rows(db, profile, files, latest, set()):
         if "debt_schedule" not in cockpit._classes(item) or item["file_id"] in set_aside:
             continue
         file = by_id.get(item["file_id"])

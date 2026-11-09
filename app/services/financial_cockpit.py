@@ -844,8 +844,8 @@ def bank_summary(months: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def tax_years(analyses: list[dict[str, Any]], limit: int = 3, *, business_entity: str | None = None) -> list[dict[str, Any]]:
+    from app.services.document_associations import identity_matches, source_excluded
     from app.services.financial_tax_earnings import (
-        entities_match,
         normalize_tax_earnings,
         tax_source_is_business,
     )
@@ -855,10 +855,11 @@ def tax_years(analyses: list[dict[str, Any]], limit: int = 3, *, business_entity
     years: list[dict[str, Any]] = []
     # Select the business before limiting years: personal and unrelated returns
     # in the evidence room must not displace this company's older return.
-    sources = [item for item in analyses if tax_source_is_business(item.get("key_facts") or {})]
+    sources = [item for item in analyses if tax_source_is_business(item.get("key_facts") or {}) and not source_excluded(item.get("identity_association"))]
+    associations = {str(item.get("file_id")): item.get("identity_association") for item in sources}
     for year in extract_tax_years(_extractor_rows(sources), limit=max(limit, len(sources) * 2)):
         facts = facts_by_file.get(str(year.get("file_id"))) or {}
-        if business_entity and not entities_match(business_entity, year.get("entity")):
+        if business_entity and not identity_matches(business_entity, year.get("entity"), associations.get(str(year.get("file_id")))):
             continue
         earnings = normalize_tax_earnings(facts)
         record = {
@@ -916,14 +917,16 @@ def tax_years(analyses: list[dict[str, Any]], limit: int = 3, *, business_entity
 
 
 def profit_and_loss(analyses: list[dict[str, Any]], *, business_entity: str | None = None) -> dict[str, Any] | None:
+    from app.services.document_associations import identity_matches, source_excluded
+
+    analyses = [item for item in analyses if not source_excluded(item.get("identity_association"))]
     statement = extract_profit_and_loss(_extractor_rows(analyses))
     if not statement:
         return None
     if business_entity:
-        from app.services.financial_tax_earnings import entities_match
-
+        associations = {str(item.get("file_id")): item.get("identity_association") for item in analyses}
         matching = [row for row in statement.get("statements") or [statement]
-                    if entities_match(business_entity, row.get("business_name"))]
+                    if identity_matches(business_entity, row.get("business_name"), associations.get(str(row.get("file_id"))))]
         if matching:
             statement = {**max(matching, key=lambda row: (row.get("period_end") or "", row.get("period_start") or "")),
                          "statements": statement.get("statements") or [statement]}
@@ -2110,6 +2113,8 @@ def build_cockpit(
     working_schedule: dict[str, Any] | None = None,
     metric_review_state: dict[str, Any] | None = None,
     business_entity: str | None = None,
+    profile_id: str | None = None,
+    association_owner: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The cockpit read model from plain dicts.
 
@@ -2121,6 +2126,12 @@ def build_cockpit(
     `schedule_set_aside`: ids of debt-schedule files the desk unlinked from the
     schedule requirement; their lines are not read as the schedule.
     """
+    from app.services import document_associations
+
+    all_sources = document_associations.attach_rows(analyses, profile_id=profile_id, expected_entity=business_entity,
+                                                   state=metric_review_state, owner=association_owner)
+    associations = {str(item["file_id"]): item["identity_association"] for item in all_sources}
+    analyses = [item for item in all_sources if not document_associations.source_excluded(item["identity_association"])]
     months, accounts = bank_months(analyses, counted_accounts, account_aliases)
     bank = bank_summary(months)
     from app.services.account_movements import build_account_movements
@@ -2183,27 +2194,34 @@ def build_cockpit(
     if accepted_schedule is not None:
         service["version_id"] = accepted_schedule.get("version_id")
         schedule["version_id"] = accepted_schedule.get("version_id")
+        related = [associations.get(str(accepted_schedule.get(key))) for key in ("source_file_id", "pdf_file_id")]
+        related.extend(accepted_schedule.get("source_associations") or [])
+        service["identity_association_conflict"] = any(document_associations.source_excluded(row) for row in related)
+        service["identity_association_stamp"] = document_associations.stamp([document_associations.summary(row) for row in related if row])
     reconciliation = reconcile_advances(rows, documented, recurring)
     proposed = proposed_payment(proposed_terms)
     from app.services import financial_metric_review as metric_reviews
 
     metric_review = metric_reviews.prepare(analyses, years, statement, bank, months, accounts, service,
                                           state=metric_review_state, entity=business_entity, debt_rows=rows)
-    from app.services.financial_tax_earnings import entities_match, tax_source_is_business
+    from app.services.financial_tax_earnings import tax_source_is_business
 
     excluded_earnings = []
-    for item in analyses:
-        if "tax_return" not in _classes(item):
+    for item in all_sources:
+        if not {"tax_return", "current_p_and_l", "income_statement", "profit_and_loss"}.intersection(_classes(item)):
             continue
         facts = item.get("key_facts") or {}
         identity = facts.get("entity_name") or facts.get("business_name") or facts.get("taxpayer")
-        reason = ("Personal or unscoped tax return; excluded from business earnings and DSCR."
-                  if not tax_source_is_business(facts) else
+        reason = ("Staff denied this document's business association, or its prior decision needs review for the current source."
+                  if document_associations.source_excluded(item.get("identity_association")) else
+                  "Personal or unscoped tax return; excluded from business earnings and DSCR."
+                  if "tax_return" in _classes(item) and not tax_source_is_business(facts) else
                   "Business identity does not match this file; review the association in Evidence."
-                  if business_entity and not entities_match(business_entity, identity) else None)
+                  if business_entity and not document_associations.identity_matches(business_entity, identity, item.get("identity_association")) else None)
         if reason:
             excluded_earnings.append({"file_id": item.get("file_id"), "file_name": item.get("file_name"), "reason": reason})
     metric_review["excluded_income_sources"] = excluded_earnings
+    metric_review["document_associations"] = list(associations.values())
     comparative_conflicts = []
     for row in years:
         facts = next((item.get("key_facts") or {} for item in analyses if str(item.get("file_id")) == str(row.get("file_id"))), {})
@@ -2229,8 +2247,11 @@ def build_cockpit(
     effective_bank = metric_review.pop("_bank")
     source_bank = bank
     bank = effective_bank
-    business_statement = statement if not business_entity or statement and entities_match(business_entity, statement.get("business_name")) else None
+    business_statement = statement if not business_entity or statement and document_associations.identity_matches(business_entity, statement.get("business_name"), associations.get(str(statement.get("file_id")))) else None
     dscr = dscr_block(years, business_statement, effective_bank, service, proposed)
+    if service.get("identity_association_conflict"):
+        for candidate in dscr.get("candidates", []):
+            candidate["note"] = " ".join(filter(None, [candidate.get("note"), "The published debt schedule's source business association needs review. Saved rows are preserved; review and republish before treating this debt basis as verified."]))
     metric_reviews.finish(metric_review, dscr, service, effective_bank)
     from app.services import financial_metric_composition
 
@@ -2614,8 +2635,10 @@ def listing_summary(cockpit: dict[str, Any]) -> dict[str, Any]:
 
 
 def _analysis_rows(
-    files: list[Any], latest: dict[uuid.UUID, Any], accepted: set[uuid.UUID]
+    files: list[Any], latest: dict[uuid.UUID, Any], accepted: set[uuid.UUID], associations: dict | None = None
 ) -> list[dict[str, Any]]:
+    from app.services.document_associations import observed_names
+
     rows: list[dict[str, Any]] = []
     for file in files:
         analysis = latest.get(file.id)
@@ -2641,6 +2664,16 @@ def _analysis_rows(
                 "accepted": file.id in accepted,
                 "analyzed_at": analyzed_at.isoformat() if analyzed_at else None,
                 "period_hint": getattr(file, "statement_period", None),
+                "bucket_id": str(getattr(file, "bucket_id", "") or ""),
+                "document_family_id": str(getattr(file, "document_family_id", None) or file.id),
+                "document_version_number": getattr(file, "document_version_number", 1) or 1,
+                "document_created_at": _iso(getattr(file, "created_at", None)),
+                "document_version_status": getattr(file, "document_version_status", "current"),
+                "analysis_version": getattr(analysis, "analysis_version", 0),
+                "association_classification": analysis.classification,
+                "association_observed_entities": observed_names(analysis),
+                "status": analysis.status,
+                **({"identity_association": associations[str(file.id)]} if associations and str(file.id) in associations else {}),
             }
         )
     return rows
@@ -2678,6 +2711,14 @@ def _debt_dicts(rows: list[DealerDebt]) -> list[dict[str, Any]]:
         item["category_label"] = debt_types.debt_type_label(item["category"]) or (item["category"] or "")
         out.append(item)
     return out
+
+
+async def associated_analysis_rows(db, profile, files, latest, accepted, *, include_excluded=False):
+    from app.services import document_associations
+
+    records = await document_associations.load_context(db, profile, files, latest, accepted_ids=accepted)
+    return [row for row in _analysis_rows(files, latest, accepted, records)
+            if include_excluded or not document_associations.source_excluded(records.get(row["file_id"]))]
 
 
 async def current_term_sheet(db: AsyncSession, profile_id: uuid.UUID) -> ProductionTermSheet | None:
@@ -2820,7 +2861,11 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
     """Everything the cockpit needs for one profile, then the read model."""
     files, latest, _classifications = await programs._evidence_inventory(db, profile)
     accepted = await programs.accepted_evidence_file_ids(db, profile, files, latest)
-    analyses = _analysis_rows(files, latest, accepted)
+    from app.services import document_associations
+
+    expected_entity = await document_associations.expected_business(db, profile)
+    associations = await document_associations.load_context(db, profile, files, latest, expected_entity=expected_entity, accepted_ids=accepted)
+    analyses = _analysis_rows(files, latest, accepted, associations)
     debts = list(
         (
             await db.execute(
@@ -2843,6 +2888,9 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
     set_aside = await set_aside_schedule_files(db, profile)
     recorded_terms, proposed_terms = await recorded_terms_for_profile(db, profile, sheet)
     accepted_version = await financial_version_selection.accepted_debt_schedule_snapshot(db, profile.id)
+    version_associations = await document_associations.additional_context(db, profile,
+        {accepted_version.source_file_id, accepted_version.pdf_file_id}, expected_entity) if accepted_version is not None and any(
+            event.get("identity_file_id") for event in (getattr(profile, "financial_metric_review", None) or {}).get("events", [])) else {}
     from app.services.financial_debt_review import working_snapshot
 
     working_schedule = await working_snapshot(db, profile)
@@ -2872,11 +2920,15 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
         },
         schedule_set_aside=set_aside,
         accepted_schedule={"body": accepted_body, "key_facts": accepted_version.key_facts,
+                           "source_file_id": str(accepted_version.source_file_id) if accepted_version.source_file_id else None,
+                           "pdf_file_id": str(accepted_version.pdf_file_id) if accepted_version.pdf_file_id else None,
+                           "source_associations": [document_associations.summary(row) for row in version_associations.values()],
                            "version_id": str(accepted_version.id), "saved_at": accepted_version.created_at.isoformat(),
                            "actor_name": accepted_version.actor_name} if accepted_version is not None else None,
         working_schedule=working_schedule,
         metric_review_state=getattr(profile, "financial_metric_review", None) or {},
-        business_entity=getattr(intake, "business_name", None) or getattr(_dealer, "legal_name", None) or getattr(_dealer, "name", None),
+        business_entity=expected_entity,
+        profile_id=str(profile.id), association_owner=document_associations.owner_context(profile),
     )
     cockpit["profile_id"] = str(profile.id)
     if superseded_payoffs:
@@ -3069,7 +3121,7 @@ async def bank_accounts_for_profile(
     months, its accepted months and whether the desk counts it."""
     files, latest, _classifications = await programs._evidence_inventory(db, profile)
     accepted = await programs.accepted_evidence_file_ids(db, profile, files, latest)
-    analyses = _analysis_rows(files, latest, accepted)
+    analyses = await associated_analysis_rows(db, profile, files, latest, accepted)
     _months, accounts = bank_months(
         analyses,
         list(getattr(profile, "counted_bank_accounts", None) or []),

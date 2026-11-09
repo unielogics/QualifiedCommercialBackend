@@ -25,7 +25,6 @@ from sqlalchemy import select
 from app.enums import Role
 from app.models.application_profile import ApplicationProfile
 from app.services import public_underwriting_packet_pdf as extraction
-from app.services.financial_tax_earnings import entities_match
 from app.services.public_underwriting_packet_pdf import _num as source_number
 
 log = logging.getLogger(__name__)
@@ -85,6 +84,10 @@ def _months(start, end):
 def prepare(analyses, years, statement, bank, months, accounts, service, *, state=None, entity=None, debt_rows=None):
     """Apply matching factual corrections before any DSCR or scenario math."""
     state = state or {}
+    from app.services.document_associations import attach_rows, source_excluded
+
+    if any("identity_association" not in row for row in analyses):
+        analyses = attach_rows(analyses, profile_id=None, expected_entity=entity, state=state)
     bank = dict(bank)  # Reviewed aggregates never rewrite historical statement months.
     latest = {event["input_key"]: event for event in state.get("events", []) if event.get("input_key")}
     by_file = {str(item.get("file_id")): item for item in analyses}
@@ -92,12 +95,14 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
 
     verified = {key: validated_fact_citations_for_analysis(SimpleNamespace(id=item.get("analysis_id"), bucket_file_id=key,
                 content_hash=item.get("content_hash"), status="completed", analysis={"key_facts": item.get("key_facts"), "financial_fact_citations": item.get("financial_fact_citations")})) for key, item in by_file.items()}
-    debt_context = {key: service.get(key) for key in ("version_id", "source", "monthly", "annual", "schedule_authoritative", "declared_none")}
+    debt_context = {key: service.get(key) for key in ("version_id", "source", "monthly", "annual", "schedule_authoritative", "declared_none", "identity_association_conflict", "identity_association_stamp")}
     context = {"debt": {**debt_context, "rows_stamp": stamp(debt_rows or [])}, "entity": entity,
                "accounts": [{"key": a.get("key"), "members": a.get("members"), "counted": a.get("counted")} for a in accounts]}
     inputs, calculations, results = [], [], []
 
     def refs(record):
+        from app.services.document_associations import summary
+
         source = by_file.get(str(record.get("file_id")), {})
         facts = source.get("key_facts") or {}
         return [{"file_id": record.get("file_id"), "file_name": source.get("file_name"),
@@ -106,7 +111,7 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
                  "period_start": record.get("period_start"), "period_end": record.get("period_end"),
                  "statement_period": facts.get("statement_period"),
                  "currency": record.get("currency") or facts.get("currency"), "basis": record.get("basis") or facts.get("basis"),
-                 "facts_stamp": stamp(facts)}]
+                 "identity_association": summary(source.get("identity_association")), "facts_stamp": stamp(facts)}]
 
     def operand(key, label, value, *, source_refs, period, editable=True, unit="currency", fact_keys=None, canonical=None, **extra):
         field = key.rsplit(".", 1)[-1]
@@ -134,7 +139,9 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
             dependencies["debt"] = context["debt"]
         source_stamp = stamp({"key": key, "original": value, "refs": source_refs, "period": period, "dependencies": dependencies})
         event = latest.get(key)
-        mismatch = bool(entity and any(ref.get("entity") and not entities_match(entity, ref["entity"]) for ref in source_refs))
+        from app.services.document_associations import identity_matches
+
+        mismatch = bool(entity and any(source_excluded(ref.get("identity_association")) or ref.get("entity") and not identity_matches(entity, ref.get("entity"), ref.get("identity_association")) for ref in source_refs))
         correction = event if event and event.get("action") == "correct" and event.get("source_stamp") == source_stamp and not mismatch else None
         effective = correction["value"] if correction else value
         inputs.append({"key": key, "label": label, "original_value": value, "value": effective,
@@ -172,7 +179,10 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
         if tax_months != 12:
             notes.append("The tax reporting duration is unknown or is not a full twelve months. This period estimate is not annualized; existing DSCR still uses its reported tax basis without a new annualization assumption.")
         source_entity = source_refs[0].get("entity")
-        mismatch = bool(entity and source_entity and not entities_match(entity, source_entity))
+        from app.services.document_associations import identity_matches
+
+        identity_known = bool(source_entity or (source_refs[0].get("identity_association") or {}).get("status") == "accepted")
+        mismatch = bool(entity and identity_known and not identity_matches(entity, source_entity, source_refs[0].get("identity_association")))
         if not source_entity:
             notes.append("The source business identity is not established.")
         if mismatch:
@@ -183,7 +193,7 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
                   "annualization_factor": 1 if tax_months == 12 else None, "kind": "tax_estimate", "complete": False, "provisional": True,
                   "formula": "tax income + known interest + known current-year depreciation and amortization", "input_keys": keys,
                   "missing_inputs": missing, "notes": notes, "source_refs": source_refs, "entity_mismatch": mismatch}
-        result["entity_comparable"] = bool(entity and source_entity and not mismatch)
+        result["entity_comparable"] = bool(entity and identity_known and not mismatch)
         result["currency"], result["basis"] = source_refs[0].get("currency"), source_refs[0].get("basis")
         if not _currency(result["currency"]):
             notes.append("The source currency is not established; this amount retains its source denomination without currency conversion.")
@@ -230,7 +240,10 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
         if reported is not None and computed is None:
             notes.append("Source-reported EBITDA cannot yet be reconciled to net income because one or more reconciliation components are unknown.")
         source_entity = source_refs[0].get("entity")
-        mismatch = bool(entity and source_entity and not entities_match(entity, source_entity))
+        from app.services.document_associations import identity_matches
+
+        identity_known = bool(source_entity or (source_refs[0].get("identity_association") or {}).get("status") == "accepted")
+        mismatch = bool(entity and identity_known and not identity_matches(entity, source_entity, source_refs[0].get("identity_association")))
         if not source_entity:
             notes.append("The source business identity is not established.")
         if mismatch:
@@ -245,12 +258,12 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
                   "value": value, "annualized_value": statement["annualized_ebitda"], "period": period,
                   "months_covered": covered, "annualization_factor": factor,
                   "kind": "reported_ebitda" if reported is not None else "computed_ebitda",
-                  "complete": computed is not None, "provisional": not bool(source_refs[0].get("accepted")) or not source_entity or not entity or computed is None or not currency_known or not basis_known or bool(statement.get("dscr_reconciliation_required")),
+                  "complete": computed is not None, "provisional": not bool(source_refs[0].get("accepted")) or not identity_known or not entity or computed is None or not currency_known or not basis_known or bool(statement.get("dscr_reconciliation_required")),
                   "formula": "source-reported EBITDA" if reported is not None else "net income + interest + income taxes + depreciation and amortization",
                   "input_keys": ["profit_and_loss.reported_ebitda"] if reported is not None else keys,
                   "missing_inputs": missing, "notes": notes, "source_refs": source_refs,
                   "computed_value": computed, "reported_value": reported, "entity_mismatch": mismatch}
-        result["entity_comparable"] = bool(entity and source_entity and not mismatch)
+        result["entity_comparable"] = bool(entity and identity_known and not mismatch)
         result["currency"], result["basis"] = source_refs[0].get("currency"), source_refs[0].get("basis")
         results.append(result)
         calculations.append(dict(result))
@@ -361,7 +374,7 @@ def finish(review, dscr, service, bank):
 
 def redact_for_external(cockpit, actor):
     """Retain existing numeric visibility without exposing internal staff audit."""
-    if actor.role not in {Role.CLIENT, Role.DEALER, Role.LENDER, Role.VENDOR, Role.CAPITAL_PARTNER}:
+    if actor.role in {Role.SUPER_ADMIN, Role.REGIONAL_MANAGER, Role.BROKER, Role.LOAN_EXEC, Role.FIELD_REP}:
         return cockpit
     from copy import deepcopy
 
@@ -369,6 +382,7 @@ def redact_for_external(cockpit, actor):
     review = result.get("metric_review") or {}
     review["history"] = []
     review["composition_history"] = []
+    review["document_associations"] = []
     review["stale_correction_count"] = len(review.get("stale_corrections", []))
     review["stale_corrections"] = []
     for item in review.get("inputs", []):
