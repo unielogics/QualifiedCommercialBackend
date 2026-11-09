@@ -169,6 +169,11 @@ def structure_block(
         "maturity_balance": summary.get("balloon") if summary else None,
         "first_year_debt_service": summary.get("annual_debt_service") if summary else None,
         "max_annual_debt_service": summary.get("coverage_annual_debt_service") if summary else None,
+        "regular_payment_monthly": summary.get("ordinary_payment_monthly") if summary else None,
+        "interest_only_payment_monthly": summary.get("payment_io_monthly") if summary else None,
+        "repayment_payment_monthly": summary.get("payment_after_monthly") if summary else None,
+        "payment_phases": summary.get("payment_phases", []) if summary else [],
+        "first_year_regular_debt_service": summary.get("first_year_regular_debt_service") if summary else None,
     }
 
 

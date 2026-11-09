@@ -460,7 +460,7 @@ def evaluate_plan(
                 "scheduled_balloons", "first_year_actual_debt_service", "peak_rolling_12_month_debt_service",
                 "coverage_basis", "actual_payoff_month", "maturity_balloon",
             )})
-            loan_terms["actual_regular_payment_monthly"] = schedule.get("regular_coverage_payment_monthly")
+            loan_terms["actual_regular_payment_monthly"] = schedule.get("ordinary_payment_monthly")
     if new_payment is None and loan_terms and schedule:
         new_payment = schedule["coverage_payment_monthly"]
         source = source or "manual_terms"
@@ -507,7 +507,7 @@ def evaluate_plan(
                 )})
                 loan_terms.update(interest_only=schedule["structure"] == "interest_only", structure=schedule["structure"],
                     payment_io=schedule["payment_io_monthly"], payment_after=schedule["payment_after_monthly"],
-                    actual_regular_payment_monthly=schedule["regular_coverage_payment_monthly"],
+                    actual_regular_payment_monthly=schedule["ordinary_payment_monthly"],
                     annual_debt_service=schedule["coverage_annual_debt_service"], describe=describe(schedule))
     configured_schedule_unpriced = bool(((plan.get("new_loan_amount") and plan.get("new_loan_repayment_config") is not None)
         or ((loan_terms or {}).get("amount") and (loan_terms or {}).get("repayment_config") is not None)) and schedule is None)
@@ -593,9 +593,43 @@ def evaluate_plan(
         (c for c in candidates_after if c["key"] == headline_key),
         candidates_after[0] if candidates_after else None,
     )
+    # A normalized balloon-stress denominator is not an ordinary bank debit.
+    # With no loan commencement date, replay the recurring repayment proxy
+    # only; the contractual IO step and balloon remain in the loan schedule.
+    stated_regular = bool(schedule and schedule.get("repayment_config") is None and plan.get("new_payment_monthly") is not None)
+    manual_regular = stated_regular and source == "manual"
+    regular_payment = plan.get("new_payment_monthly") if stated_regular else schedule.get("ordinary_payment_monthly") if schedule else new_payment
+    io_payment = schedule.get("payment_io_monthly") if schedule else None
+    if not plan.get("new_loan_amount") and plan.get("new_payment_monthly") is None and not source:
+        regular_payment = 0.0  # A retire-only plan has no replacement loan yet.
+    if new_loan_payment_unknown:
+        regular_payment = io_payment = None
+    if manual_regular:
+        io_payment = None  # One reviewed scalar does not establish two phase payments.
+    if loan_terms is not None and schedule is not None:
+        loan_terms.update(
+            regular_payment_monthly=regular_payment,
+            interest_only_payment_monthly=io_payment,
+            repayment_payment_monthly=schedule.get("payment_after_monthly"),
+            payment_phases=schedule.get("payment_phases", []),
+            first_year_regular_debt_service=schedule.get("first_year_regular_debt_service"),
+        )
+    ordinary_after = (round(before_new + regular_payment, 2)
+                      if before_new is not None and regular_payment is not None and not new_loan_payment_unknown else None)
+    io_after = (round(before_new + io_payment, 2)
+                if before_new is not None and io_payment is not None and not new_loan_payment_unknown else None)
     rows = replay_months(
-        months, retired, payees_by_key, recurring.get("months_read") or [], new_payment
+        months, retired, payees_by_key, recurring.get("months_read") or [], regular_payment
     )
+    replay_unknown = bool(new_loan_payment_unknown or retirement_payment_unknown)
+    if replay_unknown:
+        # Unknown replacement/retired payments cannot create a zero-cost loan
+        # or apparent bank-balance improvement. Preserve observed before data.
+        for row in rows:
+            for key in ("withdrawals_after", "net_after", "ending_after", "lowest_after", "added", "cumulative"):
+                row[key] = None
+            if retirement_payment_unknown:
+                row["removed"] = None
     net_before = [r["net"] for r in rows if r["net"] is not None]
     net_after = [r["net_after"] for r in rows if r["net_after"] is not None]
     active = bool(
@@ -642,6 +676,12 @@ def evaluate_plan(
         "schedule": {k: v for k, v in schedule.items() if k not in {"rows", "cash_flows"}} if schedule else None,
         "schedule_rows": schedule["rows"] if schedule else [],
         "new_payment_monthly": _round(float(new_payment)) if new_payment is not None else None,
+        "new_regular_payment_monthly": _round(regular_payment),
+        "new_interest_only_payment_monthly": _round(io_payment),
+        "debt_service_after_regular_monthly": ordinary_after,
+        "debt_service_after_interest_only_monthly": io_after,
+        "net_regular_monthly_change": _round(ordinary_after - service_monthly) if ordinary_after is not None and service_monthly is not None else None,
+        "net_interest_only_monthly_change": _round(io_after - service_monthly) if io_after is not None and service_monthly is not None else None,
         "new_payment_source": source if new_payment is not None else None,
         "loan_amount_needed": _round(max(payoff_total or 0.0, requested_amount or 0.0)) or None,
         "debt_service_before_monthly": _round(service_monthly),
@@ -660,9 +700,11 @@ def evaluate_plan(
         "headline_key": headline_key or (headline_after["key"] if headline_after else None),
         "no_debt_left": bool(headline_after and headline_after["no_debt_left"]),
         "replay": rows,
-        "replay_basis": "coverage_payment_proxy" if schedule and schedule.get("repayment_config") is not None else "constant_monthly_payment",
-        "replay_note": "Projected bank balances use a coverage-normalized payment proxy, not the actual monthly cash due. No loan commencement date is aligned to the historical statements; use the loan-month schedule for scheduled balloons and maturity cash flows." if schedule and schedule.get("repayment_config") is not None else None,
-        "actual_regular_payment_monthly": schedule.get("regular_coverage_payment_monthly") if schedule else None,
+        "replay_basis": "regular_payment_proxy" if schedule else "constant_monthly_payment",
+        "replay_unavailable_reason": UNKNOWN_NEW_LOAN_PAYMENT_REASON if new_loan_payment_unknown else UNKNOWN_DEBT_SERVICE_REASON if retirement_payment_unknown else None,
+        "replay_projection_available": not replay_unknown,
+        "replay_note": "Projected bank balances use the recurring repayment monthly equivalent, excluding balloon cash. No loan commencement date is aligned to the historical statements; the interest-only step, scheduled balloons and maturity cash flows are shown in the loan-month schedule." if schedule else None,
+        "actual_regular_payment_monthly": regular_payment,
         "net_before_avg": _round(sum(net_before) / len(net_before)) if net_before else None,
         "net_after_avg": _round(sum(net_after) / len(net_after)) if net_after else None,
         "ending_before_last": rows[-1]["ending"] if rows else None,
@@ -670,10 +712,10 @@ def evaluate_plan(
         "months_dipping_negative_before": sum(
             1 for r in rows if r["lowest"] is not None and r["lowest"] < 0
         ),
-        "months_dipping_negative_after": sum(
+        "months_dipping_negative_after": None if replay_unknown else sum(
             1 for r in rows if r["lowest_after"] is not None and r["lowest_after"] < 0
         ),
-        "cash_kept": rows[-1]["cumulative"] if rows else 0.0,
+        "cash_kept": None if replay_unknown else rows[-1]["cumulative"] if rows else 0.0,
     }
     from app.services.financial_plan_earnings import scenario_ebitda
 
@@ -768,7 +810,8 @@ def describe_modifications(
                 "annual_effect": None,
             }
         )
-    payment = evaluation.get("new_payment_monthly")
+    payment = (evaluation.get("new_regular_payment_monthly") if "new_regular_payment_monthly" in evaluation
+               else evaluation.get("new_payment_monthly")) if evaluation.get("new_payment_monthly") is not None else None
     loan = evaluation.get("loan_terms")
     if payment:
         ref = plan.get("terms_ref") if isinstance(plan.get("terms_ref"), dict) else None
@@ -849,6 +892,11 @@ def describe_modifications(
                     "annual_effect": _round(-float(payment) * 12),
                 }
             )
+    if loan and loan.get("balloon"):
+        for line in lines:
+            if line.get("kind") == "loan":
+                line["detail"] += (f" A separate maturity balloon of {loan['balloon']:,.2f} is due in month {loan.get('term_months')}; "
+                                   f"the coverage stress equivalent is {evaluation.get('new_payment_monthly'):,.2f} a month, not the recurring installment.")
     if accounts:
         counted = [a["label"] for a in accounts if a.get("counted")]
         left_out = [a["label"] for a in accounts if not a.get("counted")]
@@ -872,7 +920,8 @@ def plan_impact(
     a listing prints side by side."""
     headline = dscr.get("headline") or {}
     loan = evaluation.get("loan_terms")
-    payment = evaluation.get("new_payment_monthly")
+    payment = (evaluation.get("new_regular_payment_monthly") if "new_regular_payment_monthly" in evaluation
+               else evaluation.get("new_payment_monthly")) if evaluation.get("new_payment_monthly") is not None else None
 
     def pair(before: Any, after: Any) -> dict[str, Any]:
         change = (
@@ -897,7 +946,13 @@ def plan_impact(
         "ebitda": evaluation.get("ebitda"),
         "debt_service_monthly": pair(
             evaluation.get("debt_service_before_monthly"),
-            evaluation.get("debt_service_after_monthly"),
+            evaluation.get("debt_service_after_regular_monthly") if "debt_service_after_regular_monthly" in evaluation else evaluation.get("debt_service_after_monthly"),
+        ),
+        "coverage_debt_service_monthly": pair(
+            evaluation.get("debt_service_before_monthly"), evaluation.get("debt_service_after_monthly"),
+        ),
+        "interest_only_debt_service_monthly": pair(
+            evaluation.get("debt_service_before_monthly"), evaluation.get("debt_service_after_interest_only_monthly"),
         ),
         "net_cash_flow_monthly": pair(
             evaluation.get("net_before_avg"), evaluation.get("net_after_avg")
@@ -916,9 +971,10 @@ def plan_impact(
         "loan": {
             **(loan or {}),
             "payment_monthly": payment,
+            "coverage_payment_monthly": evaluation.get("new_payment_monthly"),
             "source": evaluation.get("new_payment_source"),
         }
-        if payment
+        if payment is not None
         else None,
         "accounts": {
             "counted": [a["label"] for a in accounts if a.get("counted")],
@@ -978,13 +1034,19 @@ def coverage_levers(
     retire = set(plan.get("retire") or [])
     exclude = set(plan.get("exclude") or [])
     levers: list[dict[str, Any]] = []
+    complex_contract = bool(plan.get("new_loan_repayment_config") is not None
+        or (terms or {}).get("repayment_config") is not None
+        or plan.get("new_loan_interest_only_months") or (terms or {}).get("interest_only_months")
+        or plan.get("new_loan_interest_only")
+        or float(plan.get("new_loan_payments_per_year") or 12) != 12
+        or float((terms or {}).get("payments_per_year") or 12) != 12)
 
     advances = [
         o
         for o in obligations_list
         if o.get("is_mca") and o.get("in_debt_service") and o["id"] not in retire
     ]
-    if advances and numerator is not None:
+    if advances and numerator is not None and not complex_contract:
         payoff = sum(o.get("payoff") or 0 for o in advances)
         unknown = [o for o in advances if o.get("payoff") is None]
         amount = max(payoff, requested_amount or 0.0) or None
@@ -1224,7 +1286,7 @@ def coverage_levers(
                 }
             )
     new_payment = evaluation.get("new_payment_monthly")
-    if new_payment and evaluation.get("loan_amount_needed") and numerator is not None:
+    if new_payment and evaluation.get("loan_amount_needed") and numerator is not None and not complex_contract:
         amount = float(evaluation["loan_amount_needed"])
         for longer in (120, 180):
             if longer <= term:

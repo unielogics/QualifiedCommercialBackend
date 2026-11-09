@@ -8,6 +8,7 @@ subscriptions that hold an allocation, never stored.
 from __future__ import annotations
 
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -129,7 +130,7 @@ def card(listing: CpListing, committed: Decimal, *, now: datetime | None = None)
         "personal_guarantee": listing.personal_guarantee,
         "status": listing.status,
         "outcome": listing.outcome,
-        "products": list(listing.products or []),
+        "products": [project_product_payments(product) for product in listing.products or []],
         "opens_at": listing.opens_at,
         "closes_at": listing.closes_at,
         "days_left": days_left(listing, now),
@@ -138,6 +139,30 @@ def card(listing: CpListing, committed: Decimal, *, now: datetime | None = None)
         "maturity_date": listing.maturity_date,
         "published_at": listing.published_at,
     }
+
+
+def project_product_payments(product: dict[str, Any]) -> dict[str, Any]:
+    """Correct displayed installment metadata without rewriting an offer."""
+    out = deepcopy(product)
+    if out.get("repayment_config") is None:
+        return out
+    from pydantic import ValidationError
+
+    from ..schemas import ListingProductIn
+
+    try:
+        projected = ListingProductIn.model_validate(out).model_dump(mode="json")
+    except (ValidationError, ValueError, TypeError, OverflowError):
+        out.update(recorded_monthly_payment=out.get("monthly_payment"), monthly_payment=None,
+                   coverage_payment_monthly=None, interest_only_payment_monthly=None,
+                   repayment_payment_monthly=None, maturity_balance=None, payment_phases=[],
+                   payment_projection_unavailable=True)
+        return out
+    out.pop("payment_projection_unavailable", None)
+    for key in ("monthly_payment", "coverage_payment_monthly", "interest_only_payment_monthly",
+                "repayment_payment_monthly", "maturity_balance", "payment_phases"):
+        out[key] = projected[key]
+    return out
 
 
 #: The cockpit figures a member may see on an offering.
@@ -208,6 +233,12 @@ PARTNER_TERMS_KEYS = (
     "repayment_config",
     "payments_per_year",
     "monthly_payment",
+    "coverage_payment_monthly",
+    "regular_payment_monthly",
+    "interest_only_payment_monthly",
+    "repayment_payment_monthly",
+    "maturity_balance",
+    "payment_phases",
     "payment_io_monthly",
     "payment_after_monthly",
     "describe",

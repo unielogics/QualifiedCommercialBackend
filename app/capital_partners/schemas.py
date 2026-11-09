@@ -490,6 +490,11 @@ class ListingProductIn(BaseModel):
     payment_frequency: Literal["monthly", "weekly", "daily", "biweekly", "custom"] | None = "monthly"
     payments_per_year: float | None = Field(default=None, ge=1, le=366, allow_inf_nan=False)
     monthly_payment: Decimal | None = Field(default=None, ge=0)
+    coverage_payment_monthly: Decimal | None = Field(default=None, ge=0)
+    interest_only_payment_monthly: Decimal | None = Field(default=None, ge=0)
+    repayment_payment_monthly: Decimal | None = Field(default=None, ge=0)
+    maturity_balance: Decimal | None = Field(default=None, ge=0)
+    payment_phases: list[dict[str, Any]] = Field(default_factory=list)
     dscr: Decimal | None = None
     notes: str | None = Field(default=None, max_length=600)
     primary: bool = False
@@ -517,7 +522,12 @@ class ListingProductIn(BaseModel):
         schedule = build_schedule(float(self.amount), float(self.rate_pct), self.term_months,
             structure=kind, interest_only_months=self.interest_only_months or 0,
             periods_per_year=ppy, repayment_config=self.repayment_config.model_dump(exclude_none=True))
-        self.monthly_payment = Decimal(str(schedule["coverage_payment_monthly"]))
+        self.monthly_payment = Decimal(str(schedule["ordinary_payment_monthly"]))
+        self.coverage_payment_monthly = Decimal(str(schedule["coverage_payment_monthly"]))
+        self.interest_only_payment_monthly = Decimal(str(schedule["payment_io_monthly"])) if schedule["payment_io_monthly"] is not None else None
+        self.repayment_payment_monthly = Decimal(str(schedule["payment_after_monthly"])) if schedule["payment_after_monthly"] is not None else None
+        self.maturity_balance = Decimal(str(schedule["balloon"]))
+        self.payment_phases = schedule["payment_phases"]
         return self
 
 

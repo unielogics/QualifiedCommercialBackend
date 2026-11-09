@@ -38,6 +38,25 @@ def _num(value: Any) -> float | None:
         return None
 
 
+def _ordinary_payment_details(*, amount, rate, term, structure, io, ppy, config) -> dict[str, Any]:
+    from app.services.loan_schedule import build_schedule
+
+    try:
+        summary = build_schedule(amount, rate, term, structure=structure, interest_only_months=io,
+                                 periods_per_year=ppy, repayment_config=config) if amount and rate is not None and term else None
+    except (ValueError, TypeError, OverflowError):
+        # Reading a historical scalar must not fabricate a new schedule or
+        # make the entire client file unreadable when legacy terms are invalid.
+        summary = None
+    return {
+        "regular_payment_monthly": summary.get("ordinary_payment_monthly") if summary else None,
+        "interest_only_payment_monthly": summary.get("payment_io_monthly") if summary else None,
+        "repayment_payment_monthly": summary.get("payment_after_monthly") if summary else None,
+        "payment_phases": summary.get("payment_phases", []) if summary else [],
+        "maturity_balance": summary.get("balloon") if summary else None,
+    }
+
+
 def recorded_from_client_terms(row: Any) -> dict[str, Any] | None:
     """The current client terms as the plan reads them."""
     if row is None:
@@ -61,6 +80,9 @@ def recorded_from_client_terms(row: Any) -> dict[str, Any] | None:
         "payment_monthly": round(float(row.annual_new_debt_service) / 12, 2) if repayment_config is not None else round(payment * periods / 12.0, 2) if payment is not None else None,
         "treatment": str(getattr(row, "debt_service_treatment", None) or "additive"),
         "retained_annual_debt_service": _num(getattr(row, "retained_annual_debt_service", None)),
+        **_ordinary_payment_details(amount=_num(row.amount), rate=_num(row.apr_pct), term=int(row.term_months) if row.term_months else None,
+            structure=getattr(row, "loan_structure", None) or "amortizing", io=int(getattr(row, "interest_only_months", None) or 0),
+            ppy=periods, config=repayment_config),
     }
 
 
@@ -101,6 +123,10 @@ def recorded_from_production_sheet(sheet: Any) -> dict[str, Any] | None:
         "payment_monthly": advanced.get("monthly_program_coverage_amount") if advanced else _num(sheet.monthly_debt_service),
         "treatment": str(extra.get("debt_service_treatment") or "additive"),
         "retained_annual_debt_service": _num(extra.get("retained_annual_debt_service")),
+        **_ordinary_payment_details(amount=_num(advanced.get("payment_basis_amount")) if advanced else _num(sheet.approved_amount),
+            rate=_num(sheet.rate_pct), term=term,
+            structure="interest_only" if fully_io else "simple_interest" if structure == "simple_interest" else "amortizing",
+            io=(term or 0) if fully_io else io_months, ppy=advanced.get("payments_per_year") if advanced else 12, config=repayment_config),
     }
 
 

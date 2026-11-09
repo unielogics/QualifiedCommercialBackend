@@ -107,7 +107,7 @@ def test_plan_manual_regular_payment_cannot_remove_balloon_coverage_and_replay_i
     result = evaluate(plan)
     assert result["new_payment_monthly"] == result["schedule"]["coverage_payment_monthly"]
     assert result["new_payment_monthly"] > result["actual_regular_payment_monthly"]
-    assert result["replay_basis"] == "coverage_payment_proxy" and "No loan commencement" in result["replay_note"]
+    assert result["replay_basis"] == "regular_payment_proxy" and "No loan commencement" in result["replay_note"]
 
 
 def test_config_change_reports_drift_even_when_legacy_scalar_terms_match():

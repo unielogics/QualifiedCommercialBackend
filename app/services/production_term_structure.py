@@ -285,6 +285,15 @@ def normalize_input(raw: dict[str, Any], *, entered_on: date | None = None) -> d
     io_months = max(0, _integer(_pick(raw, "interest_only_months")) or 0)
     amortization_months = _integer(_pick(raw, "amortization_months"))
     repayment_config = deepcopy(raw["repayment_config"] if "repayment_config" in raw else (raw.get("extra") or {}).get("repayment_config"))
+    if repayment == "fully_amortizing" and io_months > 0 and (repayment_config is not None or "interest_only_months" in raw):
+        # Configured amortizing loans can have an IO start. Preserve that
+        # entered phase rather than silently repricing it as principal due now.
+        repayment = "interest_only_then_amortizing"
+    if (repayment == "interest_only_then_amortizing" and term_months > 0 and io_months == term_months
+            and not amortization_months and not (repayment_config or {}).get("amortization_months")):
+        # No principal phase remains when IO reaches maturity. Preserve the
+        # entered maturity and price this as IO rather than rejecting a hybrid.
+        repayment = "interest_only"
     # Treat repayment_structure as the discriminator. Values left behind after
     # switching the drawer from one structure to another must not change the
     # economics of the newly selected structure.
@@ -493,6 +502,8 @@ def _configured_schedule(values: dict[str, Any]) -> dict[str, Any]:
         "post_io_monthly_equivalent": round(after * ppy / 12, 2) if after is not None else None,
         "monthly_equivalent_payment": round(float(initial or 0) * ppy / 12, 2),
         "monthly_program_coverage_amount": schedule["coverage_payment_monthly"],
+        "coverage_monthly_equivalent_payment": schedule["coverage_payment_monthly"],
+        "coverage_annual_debt_service": schedule["coverage_annual_debt_service"],
         "monthly_program_coverage_basis": "Peak rolling 12 months of contractual cash due, including scheduled and maturity balloons",
         "balloon_amount": schedule["balloon"], "payment_count": schedule["periods"],
         "annual_debt_service": schedule["coverage_annual_debt_service"],
@@ -502,6 +513,11 @@ def _configured_schedule(values: dict[str, Any]) -> dict[str, Any]:
         "maturity_balance": schedule["balloon"],
         "first_year_debt_service": schedule["annual_debt_service"],
         "max_annual_debt_service": schedule["coverage_annual_debt_service"],
+        "regular_payment_monthly": schedule["ordinary_payment_monthly"],
+        "interest_only_payment_monthly": schedule["payment_io_monthly"],
+        "repayment_payment_monthly": schedule["payment_after_monthly"],
+        "payment_phases": schedule["payment_phases"],
+        "first_year_regular_debt_service": schedule["first_year_regular_debt_service"],
     })
     return values
 
@@ -617,6 +633,7 @@ def public_values(raw: dict[str, Any]) -> dict[str, Any]:
     """Normalize a stored row/dict for API, PDF, and delivery summaries."""
     calculated = calculate(raw)
     calculated.setdefault("balloon_events", [])
+    calculated.setdefault("payment_phases", [])
     extra = raw.get("extra") if isinstance(raw.get("extra"), dict) else {}
     for key in (
         "dscr_before",

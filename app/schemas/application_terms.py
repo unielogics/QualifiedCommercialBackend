@@ -142,6 +142,11 @@ class ClientTermsCalculation(BaseModel):
     maturity_balance: float | None = None
     first_year_debt_service: float | None = None
     max_annual_debt_service: float | None = None
+    regular_payment_monthly: float | None = None
+    interest_only_payment_monthly: float | None = None
+    repayment_payment_monthly: float | None = None
+    payment_phases: list[dict] = Field(default_factory=list)
+    first_year_regular_debt_service: float | None = None
 
 
 class ClientTermsRead(BaseModel):
