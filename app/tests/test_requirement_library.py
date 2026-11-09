@@ -24,6 +24,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.ext.compiler import compiles
 
@@ -63,6 +64,12 @@ async def _create_schema(path) -> None:
             clone.constraints.discard(constraint)
         for column in clone.columns:
             column.foreign_keys.clear()
+            # SQLite gives an unrecognized UUID DDL type NUMERIC affinity.
+            # A valid all-numeric hex prefix ending in e999 is then converted
+            # to infinity before the ORM UUID parser sees it. Only the cloned
+            # test DDL changes; production and ORM UUID binders stay intact.
+            if isinstance(column.type, PG_UUID):
+                column.type = sa.String(36)
     for table in list(metadata.tables.values()):
         for column in table.columns:
             if column.server_default is not None:

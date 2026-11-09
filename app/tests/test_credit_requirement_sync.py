@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 
 from app.models.application_profile import ApplicationCollectionTask, ApplicationRequirementState
+from app.models.file_event import FileEvent
 from app.services import application_profiles, application_programs, collection_tasks
 from app.services import credit_requirement_sync as sync
 
@@ -661,7 +662,7 @@ async def test_actual_readiness_materializer_uses_owner_report_instead_of_reques
     )
     requested = SimpleNamespace(id=uuid4(), requires_signature=False, status="requested")
     db = SimpleNamespace(
-        execute=AsyncMock(return_value=Rows([row])),
+        execute=AsyncMock(side_effect=lambda query: Rows([] if query.column_descriptions[0].get("entity") is FileEvent else [row])),
         scalars=AsyncMock(return_value=Rows([report])),
         get=AsyncMock(return_value=None),
         flush=AsyncMock(),

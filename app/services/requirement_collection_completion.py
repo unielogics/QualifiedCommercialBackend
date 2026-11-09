@@ -163,7 +163,11 @@ async def complete(db, profile, requirement_key, payload, actor):
         raise HTTPException(403, "Underwriting role required")
     from app.services import application_profiles as profiles
     from app.services import application_programs as programs
-    from app.services import document_associations, requirement_lifecycle
+    from app.services import (
+        document_associations,
+        requirement_collection_receipts,
+        requirement_lifecycle,
+    )
     from app.services.owner_credit_review import lock_review_sources
 
     await lock_review_sources(db, profile)
@@ -180,8 +184,7 @@ async def complete(db, profile, requirement_key, payload, actor):
         raise HTTPException(422, "A collection review reason is required")
     request_stamp = digest({"file_ids": sorted(str(value) for value in payload.file_ids), "reason": payload.reason.strip(),
                             "expected_fingerprint": payload.expected_fingerprint})
-    receipts = [*((state.provenance or {}).get("collection_completion_history") or []),
-                (state.provenance or {}).get("collection_completion_receipt") or {}]
+    receipts = await requirement_collection_receipts.receipts(db, profile, state)
     receipt = next((row for row in receipts if row.get("idempotency_key") == payload.idempotency_key), None)
     if receipt is not None:
         if receipt.get("request_stamp") != request_stamp:
@@ -241,6 +244,7 @@ async def complete(db, profile, requirement_key, payload, actor):
         "idempotency_key": payload.idempotency_key, "request_stamp": request_stamp,
         "qualification_approved": False,
     }}
+    await requirement_collection_receipts.record(db, profile, state, state.provenance["collection_completion_receipt"])
     await profiles.log_profile_action(db, profile, actor, "requirement.collection_completed", "Marked document collection complete",
         target_type="application_requirement", target_id=state.id, metadata={"requirement_key": resolved, **state.provenance["collection_completion_receipt"]})
     from app.services import file_events
