@@ -74,13 +74,14 @@ async def test_provider_import_uses_shared_report_link_and_never_runs_a_pull(mon
     from app.schemas.application_profile import ProviderCreditLinkRequest
     from app.services import credit_links, credit_report_archive, isoftpull_client
 
-    profile = SimpleNamespace(id=uuid4(), client_id=uuid4())
+    profile = SimpleNamespace(id=uuid4(), client_id=uuid4(), dealer_id=None)
     owner = SimpleNamespace(id=uuid4())
     original_date = datetime(2026, 10, 15, tzinfo=UTC)
     parsed = {"personal_info": {"name": "Example Person"}, "scores": [{"score": 680}], "best_score": 680}
     monkeypatch.setattr(routes.profiles, "load_profile", AsyncMock(return_value=profile))
     monkeypatch.setattr(routes, "_owner_for_profile", AsyncMock(return_value=owner))
-    monkeypatch.setattr(routes.profiles, "owner_read", lambda value: value)
+    serialize_owner = AsyncMock(side_effect=lambda _db, _profile, value: value)
+    monkeypatch.setattr(routes.profiles, "owner_read_current", serialize_owner)
     monkeypatch.setattr(catalog, "retrieve", AsyncMock(return_value=(parsed, "<html>existing report</html>", original_date)))
     monkeypatch.setattr(credit_report_archive, "archive_report_html", lambda *args: "encrypted-archive-key")
     linked = AsyncMock()
@@ -90,6 +91,7 @@ async def test_provider_import_uses_shared_report_link_and_never_runs_a_pull(mon
     db = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(return_value=None), add=Mock(), flush=AsyncMock(), commit=AsyncMock(), refresh=AsyncMock())
     result = await routes.link_provider_credit(profile.id, owner.id, ProviderCreditLinkRequest(applicant_id="123", report_id=uuid4(), confirm_identity=True), SimpleNamespace(role="super_admin"), db)
     assert result is owner
+    serialize_owner.assert_awaited_once_with(db, profile, owner)
     pull = db.add.call_args.args[0]
     assert pull.pulled_at == original_date and pull.client_id == profile.client_id
     assert pull.bureau_response["report_s3_key"] == "encrypted-archive-key"
