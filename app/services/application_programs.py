@@ -2719,21 +2719,22 @@ def _automatic_evidence_decision(
             "The document is not readable enough to support this requirement.",
             analysis.confidence,
         )
-    if not expected:
+    proceeds_support = (getattr(requirement, "canonical_key", None) or requirement.requirement_key) == "use_of_proceeds"
+    if not expected and not proceeds_support:
         return (
             "needs_more",
             "criteria_unavailable",
             "Published criteria do not define an automatic document classification for this requirement.",
             analysis.confidence,
         )
-    if not analysis_classifications(analysis).intersection(expected):
+    if expected and not analysis_classifications(analysis).intersection(expected):
         return (
             "needs_more",
             "wrong_document",
             f"Possible different document ({classification or 'unconfirmed type'}). The file remains linked for staff to review or reassign.",
             analysis.confidence,
         )
-    if classification_confidence(analysis, expected) != "high":
+    if expected and classification_confidence(analysis, expected) != "high":
         return (
             "needs_more",
             "low_confidence",
@@ -2783,6 +2784,12 @@ def _automatic_evidence_decision(
             "needs_more",
             "wrong_period",
             "AI could not establish the tax year, so this file cannot increase coverage.",
+            analysis.confidence,
+        )
+    if proceeds_support and not expected:
+        return (
+            "needs_more", "document_review_pending",
+            "Explicitly linked proceeds support requires staff review against the current allocation and program conditions.",
             analysis.confidence,
         )
     if review_checks or getattr(requirement, "review_checks", None):
@@ -3425,7 +3432,7 @@ async def _materialize_requirements(
             collection_review_current=(
                 (state.provenance or {}).get("collection_completion_receipt", {}).get("fingerprint")
                 == completion.snapshot(state, requirement, files, analyses, expected_entity=expected_entity,
-                    associations=associations, counted_accounts=_counted_bank_accounts(profile))["fingerprint"]
+                    associations=associations, counted_accounts=_counted_bank_accounts(profile), include_structured=False)["fingerprint"]
             ),
             review_policy_changed=((bool(review_checks) and _review_checks_fingerprint(review_checks) !=
                                    (state.provenance or {}).get("review_checks_fingerprint"))
@@ -3533,8 +3540,14 @@ async def _materialize_requirements(
         result.append(state)
         state.provenance = {**state.provenance,
             "collection_completion": completion.snapshot(state, requirement, files, analyses,
-                expected_entity=expected_entity, associations=associations, counted_accounts=_counted_bank_accounts(profile)),
+                expected_entity=expected_entity, associations=associations, counted_accounts=_counted_bank_accounts(profile), include_structured=False),
             "qualification_review": completion.qualification_review(state, decisions)}
+        # Keep the existing supporting-evidence review path and its current
+        # qualification decisions. The shared budget changes collection only.
+        from app.services import use_of_proceeds
+
+        await use_of_proceeds.materialize(db, profile, requirement, state, requested, files,
+            qualification=state.provenance["qualification_review"])
         if state.provenance["qualification_review"]["blocking"]:
             state.provenance = {**state.provenance, "review_checks_status": "pending"}
     await db.flush()
@@ -4411,6 +4424,13 @@ async def patch_requirement(
         if target_ids.difference(inventory):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence file not found")
         decisions = await _latest_evidence_decisions(db, [active_links[file_id] for file_id in target_ids])
+        from app.services import use_of_proceeds
+
+        budget_review_fingerprint = None
+        if use_of_proceeds.is_requirement(requirement_read):
+            from app.services.use_of_funds import read_budget
+
+            budget_review_fingerprint = use_of_proceeds.snapshot(profile, state, await read_budget(db, profile))["fingerprint"]
         for file_id in target_ids:
             row = active_links[file_id]
             file = inventory[file_id]
@@ -4441,6 +4461,7 @@ async def patch_requirement(
                 "content_hash": content_hash, "analysis_version": analysis_version,
                 "policy_version": policy_version, "actor_id": str(user.id), "reason": reason,
                 "review_policy": (state.provenance or {}).get("review_checks_fingerprint"),
+                **({"use_of_funds_fingerprint": budget_review_fingerprint} if budget_review_fingerprint else {}),
             }, sort_keys=True)
             context_key = hashlib.sha256(raw_key.encode()).hexdigest()
             if not (current and current.actor_kind == "staff"
@@ -4464,6 +4485,15 @@ async def patch_requirement(
             row.verified_at = timestamp
             row.verified_by_user_id = user.id
             row.reason = reason
+        if budget_review_fingerprint:
+            previous_review = (state.provenance or {}).get("use_of_funds_program_review")
+            history = [*((state.provenance or {}).get("use_of_funds_program_review_history") or []),
+                       *([previous_review] if previous_review else [])]
+            state.provenance = {**(state.provenance or {}), "use_of_funds_program_review_history": history,
+                "use_of_funds_program_review": {"fingerprint": budget_review_fingerprint,
+                    "at": timestamp.isoformat(), "actor_id": str(user.id),
+                    "file_ids": sorted(str(value) for value in target_ids),
+                    "reason": payload.reason or "Verified proceeds supporting evidence against the current allocation"}}
         # The subsequent deterministic materialization decides whether the
         # verified set meets periods, years, or document-type coverage.
         state.status = "received_unverified"

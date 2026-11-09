@@ -2105,6 +2105,8 @@ def _room_reminder_copy(purpose: str) -> tuple[str, str]:
         )
     if purpose == "business_banking":
         return "tab=banking", "connect or upload business bank statements"
+    if purpose == "use_of_funds":
+        return "tab=budget", "complete the itemized business use-of-funds budget"
     return "tab=todo", "complete the requested application items"
 
 
@@ -2120,6 +2122,8 @@ async def send_application_room_reminder(
     if user.role in {Role.CLIENT, Role.DEALER, Role.VENDOR, Role.LENDER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only scoped staff may send room reminders")
     link = await _profile_room_link(db, profile)
+    if payload.purpose == "use_of_funds" and not client_room.link_is_usable(link):
+        raise HTTPException(status.HTTP_409_CONFLICT, "This file has no usable application room")
     query, purpose = _room_reminder_copy(payload.purpose)
     email = profiles.normalized_email(str(payload.recipient_email) if payload.recipient_email else link.recipient_email)
     phone = profiles.normalized_phone(payload.recipient_phone)
@@ -2152,12 +2156,14 @@ async def send_application_room_reminder(
         send_sms=payload.sms_reminder,
     )
     overall = _delivery_overall(rows)
+    link_only = not payload.email_room_link and not payload.sms_reminder
     await profiles.log_profile_action(
         db,
         profile,
         user,
-        "room.reminder_sent",
-        f"Sent {payload.purpose.replace('_', ' ')} reminder; delivery {overall}",
+        "room.link_created" if link_only else "room.reminder_sent",
+        f"Prepared {payload.purpose.replace('_', ' ')} share link without sending" if link_only
+        else f"Sent {payload.purpose.replace('_', ' ')} reminder; delivery {overall}",
         target_type="upload_link",
         target_id=link.id,
         metadata={"delivery_status": overall, "channels": [row.channel for row in rows]},

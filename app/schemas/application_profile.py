@@ -1087,7 +1087,7 @@ class RoomRequestCreate(BaseModel):
 class RoomReminderCreate(BaseModel):
     #: `bank_connect` is the desk asking for a Plaid connection by name, upload
     #: as the fallback; `business_banking` is the older neutral wording.
-    purpose: Literal["documents", "business_banking", "bank_connect", "room"] = "room"
+    purpose: Literal["documents", "business_banking", "bank_connect", "use_of_funds", "room"] = "room"
     recipient_email: EmailStr | None = None
     recipient_phone: str | None = Field(default=None, max_length=48)
     email_room_link: bool = True
