@@ -136,7 +136,7 @@ def test_bank_and_tax_coverage_count_distinct_periods_across_documents() -> None
     )
     tax_files = [_file("upload-a.pdf"), _file("upload-b.pdf")]
     tax_analyses = {
-        file.id: SimpleNamespace(analysis={"key_facts": {"tax_year": str(year)}})
+        file.id: SimpleNamespace(analysis={"key_facts": {"tax_year": str(year), "tax_form": "1120-S", "entity": "Example LLC"}})
         for file, year in zip(tax_files, (2024, 2025), strict=True)
     }
     complete, coverage = _coverage_for_files(tax_requirement, tax_files, tax_analyses)
