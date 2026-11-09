@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 from app.models.application_profile import (
     ApplicationCollectionTask,
+    ApplicationProfile,
     ApplicationRequirementEvidence,
     ApplicationRequirementState,
 )
@@ -115,7 +116,9 @@ def derived_required(state):
 
 def removable(state):
     metadata = state.provenance or {}
-    return not derived_required(state) and bool(metadata.get("staff_added") or metadata.get("source_kind") in STAFF_SOURCES)
+    # Removal is a file-level collection decision, not a change to a published
+    # program condition. The source definition and all linked evidence remain.
+    return not metadata.get("redirect_requirement_key")
 
 
 def lifecycle_fields(state):
@@ -142,6 +145,10 @@ def reactivate_for_derived(state):
     """Removing a staff ask never supplies a waiver for a future policy rule."""
     metadata = deepcopy(state.provenance or {})
     removal = metadata.get("staff_removal")
+    if removal and removal.get("collection_suppression"):
+        # Explicit current staff removal applies to this file until restored.
+        # A changed program may still surface its qualification condition.
+        return
     if not removal or not derived_required(state):
         return
     metadata["staff_removal_history"] = [*metadata.get("staff_removal_history", []), {
@@ -288,9 +295,19 @@ async def reconcile_profile(db, profile):
 
 async def change(db, profile, requirement_key, *, action, reason, actor):
     from app.services import application_programs, requirement_library
+    from app.services.financial_workspace import lock_financial_profile
 
+    await lock_financial_profile(db, profile)
+    if isinstance(profile, ApplicationProfile):
+        # A profile loaded before waiting for the lock may have stale staff
+        # requests or reminder fields. Do not overwrite another staff edit.
+        profile = (await db.execute(select(ApplicationProfile).where(ApplicationProfile.id == profile.id)
+                                    .execution_options(populate_existing=True))).scalar_one_or_none()
+        if profile is None:
+            raise HTTPException(404, "Application profile not found")
     await application_programs.get_program_readiness(db, profile)
-    states = list((await db.execute(select(ApplicationRequirementState).where(ApplicationRequirementState.profile_id == profile.id))).scalars().all())
+    states = list((await db.execute(select(ApplicationRequirementState).where(ApplicationRequirementState.profile_id == profile.id)
+                                  .execution_options(populate_existing=True))).scalars().all())
     resolved = resolve_requirement_key(states, requirement_key)
     state = next((row for row in states if row.requirement_key == resolved), None)
     if state is None:
@@ -298,17 +315,22 @@ async def change(db, profile, requirement_key, *, action, reason, actor):
     metadata = deepcopy(state.provenance or {})
     previous = metadata.get("staff_removal") or {}
     if action == "remove":
-        if derived_required(state):
-            raise HTTPException(409, {"code": "requirement_still_derived", "message": "This item is required by a selected program, evidence policy, or lender. Set it aside with a recorded waiver or not-applicable decision instead.", "actions": ["waive", "not_applicable"]})
         if not removable(state) and not previous.get("removed_at"):
-            raise HTTPException(409, "Only staff-added checklist items or file requests can be removed")
+            raise HTTPException(409, "Choose the current canonical checklist item before removing it")
         if previous.get("removed_at"):
             return
+        if not isinstance(reason, str) or len(reason.strip()) < 8 or len(reason) > 2000:
+            raise HTTPException(422, "A removal reason of at least eight characters is required")
+        reason = reason.strip()
         aliases = {state.requirement_key, *(metadata.get("requirement_aliases") or [])}
         entries = [entry for entry in requirement_library.clean_entries(profile.extra_requirements) if entry["key"] in aliases]
         profile.extra_requirements = [entry for entry in requirement_library.clean_entries(profile.extra_requirements) if entry["key"] not in aliases]
         metadata["staff_removal"] = {"removed_at": datetime.now(UTC).isoformat(), "actor_id": str(actor.id), "reason": reason,
-                                     "entries": entries, "previous_status": state.status, "previous_cancelled_at": metadata.get("cancelled_at")}
+                                     "entries": entries, "previous_status": state.status, "previous_cancelled_at": metadata.get("cancelled_at"),
+                                     "collection_suppression": True,
+                                     "source_program_keys": list(state.source_program_keys or []),
+                                     "source_policy_keys": list(state.source_policy_keys or []),
+                                     "qualification_effect": "No published program condition is waived or satisfied by removing this collection item."}
         metadata.update(cancelled_at=metadata["staff_removal"]["removed_at"], inactive_definition=True)
         state.status, state.state_reason = "not_applicable", "Removed by staff: " + reason
     elif action == "restore":
@@ -335,9 +357,19 @@ async def change(db, profile, requirement_key, *, action, reason, actor):
         if slot and (action == "remove" or slot.id == state.requested_document_id):
             if action == "remove":
                 slot_snapshots[str(slot.id)] = slot.status
+                metadata["staff_removal"].setdefault("slot_details", {})[str(slot.id)] = {
+                    "closed_at": slot.closed_at.isoformat() if slot.closed_at else None,
+                    "closed_reason": slot.closed_reason,
+                }
                 slot.status = "not_applicable"
+                slot.closed_at = slot.closed_at or datetime.now(UTC)
+                slot.closed_reason = "staff_removed_requirement"
             elif str(slot.id) in slot_snapshots:
                 slot.status = slot_snapshots[str(slot.id)]
+                details = previous.get("slot_details", {}).get(str(slot.id))
+                if details is not None:
+                    slot.closed_at = datetime.fromisoformat(details["closed_at"]) if details.get("closed_at") else None
+                    slot.closed_reason = details.get("closed_reason")
     tasks = list((await db.execute(select(ApplicationCollectionTask).where(ApplicationCollectionTask.profile_id == profile.id))).scalars().all())
     for task in tasks:
         if state.requirement_key in (task.requirement_keys or []):
@@ -345,6 +377,9 @@ async def change(db, profile, requirement_key, *, action, reason, actor):
                       and not is_removed(row) and not (row.provenance or {}).get("redirect_requirement_key")
                       and not (row.provenance or {}).get("inactive_definition")]
             if others:
+                if all(row.status in {"verified", "waived", "not_applicable"} for row in others):
+                    task.status, task.next_attempt_at = "completed", None
+                    task.completed_at = task.completed_at or datetime.now(UTC)
                 continue
             if action == "remove":
                 metadata["staff_removal"].setdefault("task_snapshots", {})[str(task.id)] = {

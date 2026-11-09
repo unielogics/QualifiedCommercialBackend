@@ -24,7 +24,7 @@ from fastapi import (
     Response,
     status,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
@@ -1315,6 +1315,28 @@ async def update_application_requirement(
     readiness = await application_programs.get_program_readiness(db, profile)
     await db.commit()
     return readiness
+
+
+class RequirementCollectionCompletionWrite(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    file_ids: list[UUID] = Field(default_factory=list, max_length=100)
+    reason: str = Field(default="Reviewed the linked evidence for this checklist item", min_length=1, max_length=2000)
+    expected_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    idempotency_key: str = Field(min_length=8, max_length=128)
+
+
+@router.post("/{profile_id}/requirements/{requirement_key}/collection-completion", response_model=ApplicationProgramReadiness)
+async def complete_application_requirement_collection(
+    profile_id: UUID, requirement_key: str, payload: RequirementCollectionCompletionWrite,
+    user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> ApplicationProgramReadiness:
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    from app.services.requirement_collection_completion import complete
+
+    result = await complete(db, profile, requirement_key, payload, user)
+    await db.commit()
+    return result
 
 
 @router.post("/{profile_id}/requirements/{requirement_key}/credit-review", response_model=ApplicationProgramReadiness)

@@ -2113,6 +2113,9 @@ def _coverage_for_files(
     analyses: dict[uuid.UUID, BucketFileAnalysis],
     counted_accounts: list[str] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
+    from app.services.requirement_collection_completion import tax_eligible_files
+
+    files = tax_eligible_files(requirement, files, analyses)
     expected = _expected_classes(requirement)
     if counted_accounts and _configured_period_count(requirement, "months"):
         # The desk chose which checking accounts count: a statement from
@@ -2309,6 +2312,8 @@ async def _sync_requirement_evidence(
     state: ApplicationRequirementState,
     inventory: dict[uuid.UUID, BucketFile],
     desired_sources: dict[uuid.UUID, str],
+    *,
+    prune_automatic: bool = False,
 ) -> list[ApplicationRequirementEvidence]:
     rows = list(
         (
@@ -2330,7 +2335,7 @@ async def _sync_requirement_evidence(
     timestamp = now()
     for file_id, row in list(active.items()):
         if file_id not in inventory or (
-            row.source == "filename_suggestion" and file_id not in desired_sources
+            (row.source == "filename_suggestion" or prune_automatic) and file_id not in desired_sources
         ):
             row.removed_at = timestamp
             row.reason = "Evidence no longer matches this requirement"
@@ -2955,6 +2960,7 @@ async def _reconcile_evidence_decisions(
     check_assessment: dict[str, Any] | None = None,
     requires_human: bool = False,
     associations: dict | None = None,
+    collection_review_current: bool = False,
 ) -> dict[uuid.UUID, ApplicationRequirementEvidenceDecision]:
     latest = await _latest_evidence_decisions(db, links)
     seen_hashes: set[str] = set()
@@ -2996,8 +3002,9 @@ async def _reconcile_evidence_decisions(
             and not (association and association.get("status") in {"denied", "stale"})
             and current.content_hash == content_hash
             and current.analysis_version == analysis_version
-            and not review_policy_changed
-            and (not review_checks or getattr(current, "policy_version", None) == criteria_version)
+            and (not review_policy_changed or collection_review_current and current.reason_code == "staff_collection_complete")
+            and (not review_checks or getattr(current, "policy_version", None) == criteria_version
+                 or collection_review_current and current.reason_code == "staff_collection_complete")
         )
         if retained_staff_review:
             effective[link.id] = current
@@ -3100,7 +3107,7 @@ async def _reconcile_evidence_decisions(
             not can_auto_verify
             and link.verified_at is not None
             and ((link.verified_by_user_id is None and link.reason == "Accepted by AI evidence review")
-                 or review_policy_changed
+                 or review_policy_changed and not retained_staff_review
                  or (current is not None and current.actor_kind == "staff" and not retained_staff_review))
         ):
             link.verified_at = None
@@ -3254,6 +3261,18 @@ async def _materialize_requirements(
         requires_human = any(_requires_human_verification(row) for row in merged_item["definitions"])
         source_programs = merged_item["program_keys"]
         source_policies = merged_item["policy_keys"]
+        if key in existing and requirement_lifecycle.is_removed(existing[key]):
+            # Staff removal is a collection suppression on this application,
+            # not a waiver of a selected program's substantive conditions.
+            removed_state = existing[key]
+            removed_state.source_program_keys = sorted(source_programs)
+            removed_state.source_policy_keys = sorted(source_policies)
+            removed_state.label, removed_state.required_level = requirement.label, requirement.required_level
+            removed_state.provenance = {**(removed_state.provenance or {}), "review_checks": review_checks}
+            requirement_lifecycle.reactivate_for_derived(removed_state)
+            if requirement_lifecycle.is_removed(removed_state):
+                result.append(removed_state)
+                continue
         requested = await _requested_document(
             db,
             profile,
@@ -3312,7 +3331,8 @@ async def _materialize_requirements(
                 for name in ("source_kind", "source_key", "catalog_approved", "external_definition", "definition_version", "definition_id",
                              "file_request_id", "request_fingerprint", "request_item", "request_instructions", "requested_by_user_id", "request_batches", "source_context")
             }}
-        state.provenance = {**(state.provenance or {}), **definition_metadata, "inactive_definition": False}
+        state.provenance = {**(state.provenance or {}), **definition_metadata, "inactive_definition": False,
+                            "review_checks": review_checks}
         from app.services import credit_requirement_sync
 
         if await credit_requirement_sync.materialize(
@@ -3355,8 +3375,13 @@ async def _materialize_requirements(
             preferred_file_ids=manual_ids,
             trust_preferred=True,
         )
+        from app.services import requirement_collection_completion as completion
+
+        matched_files = completion.tax_eligible_files(requirement, matched_files, analyses,
+            expected_entity=expected_entity, associations=associations)
         desired_sources = {file.id: "automatic" for file in matched_files}
-        links = await _sync_requirement_evidence(db, state, inventory, desired_sources)
+        links = await _sync_requirement_evidence(db, state, inventory, desired_sources,
+            prune_automatic=completion.business_tax_requirement(requirement))
         linked_files = [inventory[row.file_id] for row in links]
         _coverage_complete, coverage = _coverage_for_files(requirement, linked_files, analyses, counted_accounts=_counted_bank_accounts(profile))
         from app.services.document_qualification_review import current_assessment
@@ -3384,6 +3409,11 @@ async def _materialize_requirements(
             review_checks=review_checks,
             check_assessment=check_assessment,
             requires_human=requires_human,
+            collection_review_current=(
+                (state.provenance or {}).get("collection_completion_receipt", {}).get("fingerprint")
+                == completion.snapshot(state, requirement, files, analyses, expected_entity=expected_entity,
+                    associations=associations, counted_accounts=_counted_bank_accounts(profile))["fingerprint"]
+            ),
             review_policy_changed=((bool(review_checks) and _review_checks_fingerprint(review_checks) !=
                                    (state.provenance or {}).get("review_checks_fingerprint"))
                                    or (state.provenance or {}).get("requires_human", requires_human) != requires_human),
@@ -3488,6 +3518,12 @@ async def _materialize_requirements(
                     state.verified_by_user_id = None
                     state.state_reason = "Awaiting client evidence"
         result.append(state)
+        state.provenance = {**state.provenance,
+            "collection_completion": completion.snapshot(state, requirement, files, analyses,
+                expected_entity=expected_entity, associations=associations, counted_accounts=_counted_bank_accounts(profile)),
+            "qualification_review": completion.qualification_review(state, decisions)}
+        if state.provenance["qualification_review"]["blocking"]:
+            state.provenance = {**state.provenance, "review_checks_status": "pending"}
     await db.flush()
     await collection_tasks.sync_collection_tasks(db, profile, result)
     return result, per_selection
@@ -3868,12 +3904,32 @@ async def get_program_readiness(
     programs: list[ProgramReadinessItem] = []
     fully_loaded_program_keys: list[str] = []
     policy_requirement_keys = [item.requirement_key for item in states if item.source_policy_keys]
+    from app.services import requirement_program_qualification
+
+    common_definitions = [row for rows in grouped_policies.values() for row in rows]
+    declared_keys = {row.requirement_key for rows in [*grouped.values(), *grouped_policies.values()] for row in rows}
+    common_definitions.extend(extra.requirement for extra in extra_requirements
+        if extra.requirement.requirement_key not in declared_keys or requirement_lifecycle.debt_identity(
+            extra.requirement.requirement_key, getattr(extra.requirement, "collection_config", None), getattr(extra.requirement, "canonical_key", None)))
+    credit_sources = None
+    if any((state.provenance or {}).get("credit_collection") for state in states):
+        from app.models.credit_pull import CreditPull
+
+        owner_rows = await profiles.owner_rows(db, profile)
+        pull_ids = {owner.credit_pull_id for owner in owner_rows if owner.credit_pull_id and not getattr(owner, "archived_at", None)}
+        pull_rows = list((await db.scalars(select(CreditPull).where(CreditPull.id.in_(pull_ids)))).all()) if pull_ids else []
+        credit_sources = (owner_rows, {str(pull.id): pull for pull in pull_rows})
     for selection in selections:
+        scope_definitions = [*common_definitions, *grouped.get(selection.playbook_id, [])]
+        definitions_by_key = {key: [row for row in scope_definitions if row.requirement_key == key]
+                              for key in {row.requirement_key for row in scope_definitions}}
         keys = list(dict.fromkeys([*policy_requirement_keys, *per_selection.get(selection.id, [])]))
         required_keys = [
             key
             for key in keys
-            if requirement_map.get(key) and requirement_map[key].required_level == "required"
+            if requirement_map.get(key) and (
+                any(row.required_level == "required" for row in definitions_by_key[key])
+                if definitions_by_key.get(key) else requirement_map[key].required_level == "required")
         ]
         blocking = []
         loading_blockers = []
@@ -3888,7 +3944,27 @@ async def get_program_readiness(
                 blocking.append(key)
             if not _requirement_is_effectively_accepted(state, override):
                 loading_blockers.append(key)
-        if required_keys and not loading_blockers:
+        qualification_blocking = []
+        qualification_warnings = []
+        for key in required_keys:
+            state = requirement_map[key]
+            override = overrides.get((selection.id, key))
+            explicit_disposition = override is not None and override.disposition in {"waived", "not_applicable"}
+            definitions = definitions_by_key.get(key, [])
+            if explicit_disposition:
+                definitions = [row for row in common_definitions if row.requirement_key == key]
+            qualification = requirement_program_qualification.for_definitions(state, definitions,
+                profile=profile, owners=credit_sources[0] if credit_sources else None,
+                pulls=credit_sources[1] if credit_sources else None) if definitions or explicit_disposition else (
+                    (state.provenance or {}).get("qualification_review") or {})
+            removed_derived = requirement_lifecycle.is_removed(state) and requirement_lifecycle.derived_required(state)
+            independent_scope = bool(state.source_policy_keys or (state.provenance or {}).get("source_kind") == "lender")
+            qualification_warnings.extend(qualification.get("reasons") or [])
+            if qualification.get("blocking") or (removed_derived and (not explicit_disposition or independent_scope)):
+                qualification_blocking.append(key)
+                if not qualification.get("reasons"):
+                    qualification_warnings.append("This program requirement was removed from document collection; no program-condition waiver was recorded.")
+        if required_keys and not loading_blockers and not qualification_blocking:
             fully_loaded_program_keys.append(selection.program_key)
         percent = 0 if not required_keys else round((satisfied / len(required_keys)) * 100)
         programs.append(
@@ -3896,12 +3972,15 @@ async def get_program_readiness(
                 selection_id=selection.id,
                 program_key=selection.program_key,
                 program_name=selection.program_name,
-                complete=bool(required_keys) and not blocking,
+                complete=bool(required_keys) and not blocking and not qualification_blocking,
                 completion_percent=percent,
                 required_count=len(required_keys),
                 satisfied_count=satisfied,
                 blocking_requirement_keys=blocking,
                 requirement_keys=keys,
+                collection_complete=bool(required_keys) and not blocking,
+                qualification_blocking_requirement_keys=qualification_blocking,
+                qualification_warnings=list(dict.fromkeys(qualification_warnings)),
             )
         )
     advanced = False
@@ -4163,8 +4242,10 @@ async def get_program_readiness(
                 received_at=item.received_at,
                 verified_at=item.verified_at,
                 provenance=dict(item.provenance or {}),
+                collection_completion=dict((item.provenance or {}).get("collection_completion") or {}),
+                qualification_review=dict((item.provenance or {}).get("qualification_review") or {}),
             )
-            for item in states
+            for item in states if not requirement_lifecycle.is_removed(item)
         ],
         inactive_requirements=[ApplicationRequirementRead(
             requirement_key=item.requirement_key, label=item.label, category=item.category,

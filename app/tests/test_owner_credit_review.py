@@ -202,12 +202,14 @@ async def test_real_policy_review_is_retained_then_invalidated_by_report_or_poli
     assert row.status == "verified" and row.provenance["credit_collection"]["last_review"]["current"] is True
     report.bureau_response["parsed_report"]["scores"][0]["score"] = 660
     await sync.materialize(db, prof, req, row, None)
-    assert row.status == "received_unverified" and row.verified_by_user_id is None
+    assert row.status == "verified" and row.verified_by_user_id is None
+    assert row.provenance["qualification_review"]["blocking"] is True
     assert row.provenance["credit_collection"]["last_review"]["current"] is False
     report.bureau_response["parsed_report"]["scores"][0]["score"] = 700
     req.review_checks[0]["instructions"] = "Require every owner's Equifax FICO 9 at 720 or above"
     await sync.materialize(db, prof, req, row, None)
-    assert row.status != "verified" and row.provenance["credit_collection"]["can_mark_met"] is False
+    assert row.status == "verified" and row.provenance["credit_collection"]["can_mark_met"] is False
+    assert row.provenance["qualification_review"]["blocking"] is True
 
 
 @pytest.mark.parametrize("model", ["Equifax FICO 9 / FICO 4", "Equifax FICO 9 VantageScore", "Equifax FICO 9 Bankcard"])
