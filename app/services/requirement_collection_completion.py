@@ -72,10 +72,14 @@ def _binding(file, analysis):
             "analysis_version": analysis.analysis_version if analysis else None}
 
 
-def snapshot(state, requirement, files, analyses, *, expected_entity=None, associations=None, counted_accounts=None):
+def snapshot(state, requirement, files, analyses, *, expected_entity=None, associations=None, counted_accounts=None, include_structured=True):
     from app.services import application_programs as programs
-    from app.services import requirement_lifecycle
+    from app.services import requirement_lifecycle, use_of_proceeds
     from app.services.bucket_evidence import analysis_classifications
+
+    budget = (state.provenance or {}).get("use_of_funds_collection")
+    if include_structured and use_of_proceeds.is_requirement(requirement) and isinstance(budget, dict):
+        return dict(budget)
 
     credit = (state.provenance or {}).get("credit_collection")
     if isinstance(credit, dict):
@@ -86,6 +90,8 @@ def snapshot(state, requirement, files, analyses, *, expected_entity=None, assoc
     expected = programs._expected_classes(requirement)
     candidates = []
     for file in files:
+        if use_of_proceeds.is_requirement(requirement) and not use_of_proceeds.file_is_bound(state, file):
+            continue
         analysis = analyses.get(file.id)
         if (analysis is None or analysis.status != "completed" or not analysis.content_hash
                 or file.content_hash and analysis.content_hash != file.content_hash
@@ -195,6 +201,11 @@ async def complete(db, profile, requirement_key, payload, actor):
         return readiness
     if state.status in {"waived", "not_applicable"}:
         raise HTTPException(409, "Restore this requirement before recording new document collection")
+    if current.get("source") == "use_of_funds":
+        from app.services.use_of_proceeds import complete_collection
+
+        await complete_collection(db, profile, state, payload, actor, request_stamp=request_stamp)
+        return await programs.get_program_readiness(db, profile)
     selected = set(payload.file_ids)
     if not selected or selected.difference({uuid.UUID(value) for value in current.get("eligible_file_ids", [])}):
         raise HTTPException(422, "Choose current eligible evidence for this document request")
