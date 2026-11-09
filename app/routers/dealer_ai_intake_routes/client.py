@@ -152,12 +152,12 @@ async def claim_capital_readiness_diagnostic(
         "mca_refinance": "refinance_debt",
     }.get(purpose, "not_sure")
     create_payload = core.AdminLeadCreate(
+        **business_profile.payload_fields(payload),
         variant="main_street",
         full_name=(payload.full_name or locked_user.name or client.name).strip(),
         email=client.email or locked_user.email,
         phone=payload.phone,
         business_name=payload.business_name,
-        industry=payload.industry,
         intent=intent,
         preferred_language=core.Language(diagnostic.locale),
         capital_readiness_diagnostic=diagnostic,
@@ -230,7 +230,7 @@ async def list_my_dealer_intakes(user: core.CurrentUser, db: AsyncSession = Depe
             .order_by(core.PublicUnderwritingIntake.updated_at.desc())
         )
     ).scalars().all()
-    return [core.DealerIntakeRead.model_validate(row) for row in rows]
+    return [business_profile.apply_read(core.DealerIntakeRead.model_validate(row), row) for row in rows]
 
 @core.client_router.get("/{intake_id}", response_model=core.DealerIntakeResponse)
 async def get_my_dealer_intake(intake_id: UUID, user: core.CurrentUser, db: AsyncSession = Depends(core.get_db)) -> core.DealerIntakeResponse:

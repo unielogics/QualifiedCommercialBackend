@@ -29,6 +29,9 @@ def _intake(state=None):
     return SimpleNamespace(intake_state=state or {}, id="intake-1")
 
 
+_EMPTY_ADDRESS = {"street": None, "city": None, "state": None, "zip": None, "industry": None}
+
+
 # --- the website --------------------------------------------------------------------------------
 
 
@@ -115,7 +118,7 @@ def test_the_record_keeps_the_address_the_none_flag_and_the_words() -> None:
 
 def test_the_file_reads_what_the_client_said_and_the_desks_correction_wins() -> None:
     client_only = _intake({"business_profile": {"website": "https://example.com", "website_none": False, "description": "Coffee shops."}})
-    assert business_profile.of_intake(client_only) == {"website": "https://example.com", "website_none": False, "description": "Coffee shops."}
+    assert business_profile.of_intake(client_only) == {"website": "https://example.com", "website_none": False, "description": "Coffee shops.", **_EMPTY_ADDRESS}
 
     corrected = _intake(
         {
@@ -123,13 +126,13 @@ def test_the_file_reads_what_the_client_said_and_the_desks_correction_wins() -> 
             "desk_facts": {"business_website": "https://new.example.com", "business_website_none": False, "business_description": "Two coffee shops and a roastery."},
         }
     )
-    assert business_profile.of_intake(corrected) == {"website": "https://new.example.com", "website_none": False, "description": "Two coffee shops and a roastery."}
+    assert business_profile.of_intake(corrected) == {"website": "https://new.example.com", "website_none": False, "description": "Two coffee shops and a roastery.", **_EMPTY_ADDRESS}
 
     desk_na = _intake({"business_profile": {"website": "https://old.example.com"}, "desk_facts": {"business_website": None, "business_website_none": True}})
     assert business_profile.of_intake(desk_na)["website"] is None and business_profile.of_intake(desk_na)["website_none"] is True
 
-    assert business_profile.of_intake(_intake()) == {"website": None, "website_none": False, "description": None}
-    assert business_profile.of_intake(SimpleNamespace(intake_state=None)) == {"website": None, "website_none": False, "description": None}
+    assert business_profile.of_intake(_intake()) == {"website": None, "website_none": False, "description": None, **_EMPTY_ADDRESS}
+    assert business_profile.of_intake(SimpleNamespace(intake_state=None)) == {"website": None, "website_none": False, "description": None, **_EMPTY_ADDRESS}
 
 
 @pytest.mark.parametrize(
@@ -154,7 +157,7 @@ def test_the_ai_is_told_what_the_client_said_in_every_variant() -> None:
         assert '"business_profile": _business_profile(intake) or None' in inspect.getsource(builder), builder.__name__
 
     asked = _intake({"business_profile": {"website": None, "website_none": True, "description": "We run two coffee shops."}})
-    assert core._business_profile(asked) == {"website": None, "has_no_website": True, "description": "We run two coffee shops."}
+    assert core._business_profile(asked) == {"website": None, "has_no_website": True, "description": "We run two coffee shops.", **_EMPTY_ADDRESS}
     assert core._business_profile(_intake()) == {}
 
 
@@ -163,7 +166,7 @@ def test_the_desk_reads_and_corrects_them_through_the_existing_contact_routes() 
     assert {"business_website", "business_description"} <= set(core.AdminLeadContactUpdate.model_fields)
     update = inspect.getsource(admin.update_lead_contact)
     assert 'desk_facts' in update and "normalize_website" in update and "clean_description" in update
-    assert "business_profile.of_intake(intake)" in inspect.getsource(core._response)
+    assert "business_profile.apply_read(intake_read, intake)" in inspect.getsource(core._response)
     with pytest.raises(ValidationError, match="Enter your website address"):
         core.AdminLeadContactUpdate(business_website="nope nope")
 

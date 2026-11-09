@@ -711,7 +711,6 @@ class CapitalReadinessClaimRequest(BusinessProfileFields):
     business_name: str = Field(min_length=1, max_length=180)
     phone: RequiredPhone
     full_name: str | None = Field(default=None, max_length=180)
-    industry: str = Field(default="other", max_length=64)
     intent: str | None = Field(default=None, max_length=64)
     terms_accepted: bool
     privacy_accepted: bool
@@ -895,7 +894,7 @@ async def _configure_equipment_bucket(
     )
 
 
-class AdminLeadCreate(BaseModel):
+class AdminLeadCreate(BusinessProfileFields):
     """Super-admin creates an AI-underwriter lead on behalf of a client. Mirrors the
     public start schemas but with no terms/throttle and an explicit variant selector.
     The client can later log in with this email exactly like a self-serve lead."""
@@ -908,12 +907,8 @@ class AdminLeadCreate(BaseModel):
     phone: RequiredPhone
     business_name: str | None = Field(default=None, max_length=180)
     loan_purpose: str | None = Field(default=None, max_length=255)
-    # Main Street: an operating business is defined by what it does and what it
-    # wants, and the program screen cannot run without both. Optional so the
-    # other three variants are unaffected; normalized (never rejected) so an
-    # unrecognized value falls back to "other"/"not_sure" rather than 422-ing a
-    # lead the operator is trying to create.
-    industry: str | None = Field(default=None, max_length=64)
+    # Intent steers the document package; industry is explicitly declared for
+    # every updated form; required API enforcement follows the caller rollout.
     intent: str | None = Field(default=None, max_length=64)
     # Real-estate basics (optional; mirror FundingReviewStart).
     investor_name: str | None = Field(default=None, max_length=180)
@@ -947,7 +942,7 @@ class AdminLeadCreate(BaseModel):
         return None if value == "" else value
 
 
-class BrokerLeadCreate(BaseModel):
+class BrokerLeadCreate(BusinessProfileFields):
     """Dealer partner (Role.DEALER_PARTNER) creates an AI-underwriter lead on
     behalf of their own client. Dealer-variant only — no variant selector, no
     real-estate fields. The client can later log in with this email exactly
@@ -984,7 +979,7 @@ class LanguageUpdate(BaseModel):
     preferred_language: Language
 
 
-class AdminLeadContactUpdate(BaseModel):
+class AdminLeadContactUpdate(BusinessProfileFields):
     """Editable operator-facing identity and request fields for one intake."""
 
     full_name: str | None = Field(default=None, min_length=1, max_length=180)
@@ -1028,7 +1023,7 @@ class DealerLeadNoteCreate(BaseModel):
     image_ids: list[UUID] = []
 
 
-class AdminLeadFromBucketCreate(BaseModel):
+class AdminLeadFromBucketCreate(BusinessProfileFields):
     """Super-admin converts an EXISTING Bucket into an AI-underwriter lead — the
     admin already has a folder of files (collected some other way) and wants the
     AI audit + package-build against it, without a second, empty bucket being
@@ -1042,12 +1037,6 @@ class AdminLeadFromBucketCreate(BaseModel):
     email: EmailStr
     phone: RequiredPhone
     business_name: str | None = Field(default=None, max_length=180)  # or investor name, real-estate
-    # Main Street: an operating business is defined by what it does and what it
-    # wants, and the program screen cannot run without both. Optional so the
-    # other three variants are unaffected; normalized (never rejected) so an
-    # unrecognized value falls back to "other"/"not_sure" rather than 422-ing a
-    # lead the operator is trying to create.
-    industry: str | None = Field(default=None, max_length=64)
     intent: str | None = Field(default=None, max_length=64)
     notify_client: bool = False  # default OFF — this is an admin audit flow, not client self-service
     force_new: bool = False  # create a second lead even if one already exists for this bucket
@@ -1581,12 +1570,13 @@ def _business_profile(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     """What the client said the business is and where it is online, for the AI
     to read and not ask again. Empty when the file predates the question."""
     declared = business_profile.of_intake(intake)
-    if not (declared["website"] or declared["website_none"] or declared["description"]):
+    if not any(declared.values()):
         return {}
     return {
         "website": declared["website"],
         "has_no_website": declared["website_none"],
         "description": declared["description"],
+        **{key: declared[key] for key in ("street", "city", "state", "zip", "industry")},
     }
 
 
@@ -1646,6 +1636,11 @@ class DealerIntakeRead(ORMModel):
     business_website: str | None = None
     business_website_none: bool = False
     business_description: str | None = None
+    business_street: str | None = None
+    business_city: str | None = None
+    business_state: str | None = None
+    business_zip: str | None = None
+    industry: str | None = None
     asset_rows: list[dict[str, Any]] | None
     intake_state: dict[str, Any] | None
     result_snapshot: dict[str, Any] | None
@@ -4160,7 +4155,13 @@ def _main_street_details(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     vertical. Mirrors _dealer_details but keyed to an operating business."""
     state = _intake_state(intake)
     raw = state.get("main_street_details")
-    return raw if isinstance(raw, dict) else {}
+    result = dict(raw) if isinstance(raw, dict) else {}
+    declared = business_profile.of_intake(intake)["industry"]
+    if declared:
+        result["industry"] = declared
+    elif "industry" in (state.get("desk_facts") or {}):
+        result.pop("industry", None)
+    return result
 
 
 def _merge_main_street_details(
@@ -7293,10 +7294,7 @@ async def _response(
     )
     intake_read = DealerIntakeRead.model_validate(intake)
     intake_read.years_in_business = _years_in_business(intake)
-    declared_business = business_profile.of_intake(intake)
-    intake_read.business_website = declared_business["website"]
-    intake_read.business_website_none = declared_business["website_none"]
-    intake_read.business_description = declared_business["description"]
+    business_profile.apply_read(intake_read, intake)
     intake_read.bucket_name = intake.bucket.name
     # Redact internal-only data from the public/uploader payload. The dealer
     # sees only whitelisted intake_state keys and a sanitized review result.
@@ -9329,7 +9327,8 @@ async def _create_admin_ai_lead_core(
     }
 
     if is_re:
-        adapter = FundingReviewStart(
+        adapter = business_profile._legacy_adapter(FundingReviewStart,
+            **business_profile.payload_fields(payload),
             full_name=payload.full_name,
             email=payload.email,
             phone=payload.phone,
@@ -9346,7 +9345,8 @@ async def _create_admin_ai_lead_core(
             db, client, adapter, request, room_pin=payload.secure_room_pin
         )
     elif is_ms:
-        adapter = DealerIntakeStart(
+        adapter = business_profile._legacy_adapter(DealerIntakeStart,
+            **business_profile.payload_fields(payload),
             full_name=payload.full_name,
             email=payload.email,
             phone=payload.phone,
@@ -9365,7 +9365,8 @@ async def _create_admin_ai_lead_core(
             room_pin=payload.secure_room_pin,
         )
     elif is_mca:
-        adapter = McaRefiStart(
+        adapter = business_profile._legacy_adapter(McaRefiStart,
+            **business_profile.payload_fields(payload),
             full_name=payload.full_name,
             email=payload.email,
             phone=payload.phone,
@@ -9380,7 +9381,8 @@ async def _create_admin_ai_lead_core(
             room_pin=payload.secure_room_pin,
         )
     else:
-        adapter = DealerIntakeStart(
+        adapter = business_profile._legacy_adapter(DealerIntakeStart,
+            **business_profile.payload_fields(payload),
             full_name=payload.full_name,
             email=payload.email,
             phone=payload.phone,
@@ -9400,6 +9402,7 @@ async def _create_admin_ai_lead_core(
     token = _new_public_token()
     intake_state: dict[str, Any] = {
         "messages": [],
+        **business_profile.state_entry(payload),
         "source": (
             "funding_review"
             if is_re
@@ -9480,6 +9483,8 @@ async def _create_admin_ai_lead_core(
         partner = await _load_dealer_partner_user(db, payload.broker_user_id)
         intake.broker_id = partner.id
     db.add(intake)
+    await db.flush()
+    await profiles_service.provision_profile_for_intake(db, intake)
     if equipment_application:
         await _configure_equipment_bucket(
             db,

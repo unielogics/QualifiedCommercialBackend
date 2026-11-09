@@ -324,7 +324,7 @@ def evidence_origin(file: BucketFile, analysis: BucketFileAnalysis | None) -> tu
 
 
 async def _evidence_inventory(
-    db: AsyncSession, profile: ApplicationProfile, *, include_pending_financial: bool = False
+    db: AsyncSession, profile: ApplicationProfile, *, include_pending_financial: bool = False, refresh: bool = False
 ) -> tuple[list[BucketFile], dict[uuid.UUID, BucketFileAnalysis], set[str]]:
     state = await profiles.evidence_state(db, profile)
     ids = [item.id for item in state.files]
@@ -353,6 +353,7 @@ async def _evidence_inventory(
                     (latest_document_file_clause if include_pending_financial else current_document_file_clause)(BucketFile.id),
                     *([] if include_pending_financial else [current_financial_file_clause(BucketFile.id)]),
                 )
+                .execution_options(populate_existing=refresh)
             )
         )
         .scalars()
@@ -372,6 +373,7 @@ async def _evidence_inventory(
                     BucketFileAnalysis.analysis_version.desc(),
                     BucketFileAnalysis.created_at.desc(),
                 )
+                .execution_options(populate_existing=refresh)
             )
         )
         .scalars()
@@ -449,6 +451,8 @@ async def accepted_evidence_file_ids(
 
 
 async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
+    from app.services import business_profile
+
     intake = (
         await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
     )
@@ -601,6 +605,7 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
             .limit(1)
         )
     ).scalar_one_or_none()
+    declared_business = business_profile.of_intake(intake) if intake else {}
     context = {
         **reviewed_profitability_facts(readiness_snapshot),
         "vertical": profile.vertical,
@@ -611,7 +616,10 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         "entity_type": profile.entity_type,
         "industry": profile.industry,
         "subindustry": profile.subindustry,
-        "industry_key": profile.industry,
+        "industry_key": business_profile.routing_industry(profile, declared_business),
+        "declared_industry_key": declared_business.get("industry"),
+        "declared_business_profile": declared_business or None,
+        "declared_industry_status": "self_reported" if declared_business.get("industry") else None,
         "naics_code": profile.naics_code,
         "naics_code_valid": naics_verified,
         "loan_purpose": loan_purpose,

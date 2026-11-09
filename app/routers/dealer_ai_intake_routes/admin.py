@@ -992,7 +992,7 @@ async def update_lead_contact(
         values_logged = ["years_in_business"]
     else:
         values_logged = []
-    business_keys = [key for key in ("business_website", "business_description") if key in values]
+    business_keys = [key for key in core.business_profile.PROFILE_FIELDS if key in values]
     if business_keys:
         # Not columns either: the desk's words sit in desk_facts and win on read,
         # so correcting a website never rewrites what the client typed.
@@ -1004,9 +1004,16 @@ async def update_lead_contact(
             facts["business_website_none"] = none
         if "business_description" in values:
             facts["business_description"] = core.business_profile.clean_description(values.pop("business_description"))
+        for key in core.business_profile.ADDRESS_FIELDS:
+            if key in values:
+                facts[key] = core.business_profile.clean_address(key, values.pop(key))
+        if "industry" in values:
+            facts["industry"] = core.business_profile.clean_industry(values.pop("industry"))
         state["desk_facts"] = facts
         intake.intake_state = state
         values_logged = [*values_logged, *business_keys]
+        if {"industry", "business_description"}.intersection(business_keys):
+            await core.business_profile.rearm_unclassified_suggestion(db, intake)
     if "full_name" in values and values["full_name"] is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Principal name is required")
     if "email" in values and values["email"] is None:
@@ -1135,12 +1142,14 @@ async def create_admin_ai_lead_from_bucket(
 
     if is_re:
         adapter = core.FundingReviewStart(
+            **core.business_profile.payload_fields(payload),
             full_name=payload.full_name, email=payload.email, phone=payload.phone,
             investor_name=payload.business_name,
         )
         client = await core._find_or_create_funding_client(db, adapter)
     else:
         adapter = core.DealerIntakeStart(
+            **core.business_profile.payload_fields(payload),
             full_name=payload.full_name, email=payload.email, phone=payload.phone,
             business_name=payload.business_name,
         )
@@ -1175,6 +1184,7 @@ async def create_admin_ai_lead_from_bucket(
         preferred_language=payload.preferred_language,
         intake_state={
             "messages": [],
+            **core.business_profile.state_entry(payload),
             "source": "bucket_conversion",
             "admin_provenance": provenance,
             **(
@@ -1186,6 +1196,8 @@ async def create_admin_ai_lead_from_bucket(
     )
     db.add(intake)
     await db.flush()
+
+    await core.profiles_service.provision_profile_for_intake(db, intake)
 
     # Warm the per-file analysis cache cheaply (placeholder inserts, no model calls)
     # so the scheduler drain starts analyzing before the admin even opens the lead.

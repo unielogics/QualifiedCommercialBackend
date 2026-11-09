@@ -87,8 +87,10 @@ async def start_handoff(
         _new_public_token,
         _normalize_email,
     )
+    from app.services import business_profile
 
-    adapter = DealerIntakeStart(
+    adapter = business_profile._legacy_adapter(DealerIntakeStart,
+        **business_profile.existing_source_fields(dealer),
         full_name=dealer.name.strip(),
         email=_normalize_email(dealer.email),
         phone=dealer.phone,
@@ -110,7 +112,7 @@ async def start_handoff(
         phone=dealer.phone,
         business_name=adapter.business_name,
         asset_rows=[],
-        intake_state={"source": "dealer_os_handoff", "messages": []},
+        intake_state={"source": "dealer_os_handoff", "messages": [], **business_profile.state_entry(adapter)},
         # The acting user used to survive only in dos_audit_log, so the funding
         # file itself could not say who handed it over.
         source_kind="capital_os_handoff",

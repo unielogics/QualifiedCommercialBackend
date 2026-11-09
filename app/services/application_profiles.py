@@ -555,6 +555,13 @@ def _apply_extracted_taxonomy(profile, activity, subindustry, industry) -> bool:
             return False
     for field, row in (("industry", industry), ("subindustry", subindustry)):
         existing = getattr(profile, field, None)
+        # Older AI intakes stored the coarse selector in this column. It has no
+        # catalog identity and must not block a coherent first NAICS suggestion.
+        if field == "industry" and not getattr(profile, "industry_entry_id", None) and not getattr(profile, "naics_code", None):
+            from app.services.main_street_programs import MAIN_STREET_INDUSTRIES
+
+            if existing in MAIN_STREET_INDUSTRIES:
+                continue
         if existing and str(existing).strip().casefold() not in {
             str(row.code).casefold(), row.label.casefold(),
         }:
@@ -895,7 +902,8 @@ async def provision_profile_for_intake(
         vertical=_vertical_for_intake(intake),
         funding_category=(intake.intake_state or {}).get("funding_intent")
         or intake.loan_purpose,
-        industry=((intake.intake_state or {}).get("main_street_details") or {}).get("industry"),
+        # A declared broad intake category is not a canonical NAICS selection.
+        # It remains in business_profile/main_street_details for program context.
         communication_locale=(diagnostic or {}).get("locale")
         if (diagnostic or {}).get("locale") in {"en", "es"}
         else getattr(intake.preferred_language, "value", intake.preferred_language) or "en",
@@ -934,7 +942,7 @@ async def _seed_primary_owner(
     The credit flow needs an owner row to authorize against; this is a starting
     point the client corrects, not an assertion that they own all of it.
     """
-    if profile.dealer_id is not None:
+    if profile.dealer_id is not None or (intake is not None and getattr(intake, "client_contact_suppressed", False)):
         return
     count = int(
         (
@@ -951,6 +959,10 @@ async def _seed_primary_owner(
     client = await db.get(Client, profile.client_id) if profile.client_id else None
     if intake is None and profile.intake_id:
         intake = await db.get(PublicUnderwritingIntake, profile.intake_id)
+    if intake is not None and getattr(intake, "client_contact_suppressed", False):
+        # A professional's referral contact is not a borrower or guarantor.
+        # Keep ownership unknown until the actual owners are explicitly entered.
+        return
     name = (intake.full_name if intake else None) or (client.name if client else "")
     if not name:
         return
@@ -1127,8 +1139,6 @@ async def resolve_profile(
             profile.funding_category = _canonical_funding_category(
                 (source.intake_state or {}).get("funding_intent") or source.loan_purpose
             )
-            detail = (source.intake_state or {}).get("main_street_details") or {}
-            profile.industry = detail.get("industry")
         else:
             profile.dealer_id = source.id
             profile.intake_id = source.handoff_intake_id

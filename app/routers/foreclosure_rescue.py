@@ -542,6 +542,9 @@ async def _create_foreclosure_rescue(
     )
     db.add(intake)
     await db.flush()
+    from app.services.application_profiles import provision_profile_for_intake
+
+    await provision_profile_for_intake(db, intake)
     owner_consent_payload = payload if actor is None and payload.submitter_type == "owner_direct" else None
     await _audit(
         db,

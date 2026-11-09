@@ -193,10 +193,10 @@ async def test_start_saves_out_of_scope_application_instead_of_rejecting_it():
     async def load(*args):
         return created
 
-    db = Mock(commit=AsyncMock())
+    db = Mock(commit=AsyncMock(), flush=AsyncMock())
     payload = routes.McaRefiStart(full_name="Test Owner", email="owner@example.com", phone="+12025550123", active_mca_count=3,
                                   requested_amount=450_000, terms_accepted=True, privacy_accepted=True)
-    with patch.object(routes, "PublicUnderwritingIntake", side_effect=construct), patch.object(routes, "_throttle_or_429"), patch.object(routes, "_latest_active_intake_by_email", AsyncMock(return_value=None)), patch.object(routes, "_find_or_create_mca_client", AsyncMock(return_value=client)), patch.object(routes, "_create_bucket_for_mca_refi", AsyncMock(return_value=(bucket, SimpleNamespace(id=uuid4())))), patch.object(routes, "_load_public_intake", side_effect=load), patch.object(routes, "_record_resume_email", AsyncMock()), patch.object(routes, "_response", AsyncMock(return_value="saved")):
+    with patch.object(routes, "PublicUnderwritingIntake", side_effect=construct), patch.object(routes, "_throttle_or_429"), patch.object(routes, "_latest_active_intake_by_email", AsyncMock(return_value=None)), patch.object(routes, "_find_or_create_mca_client", AsyncMock(return_value=client)), patch.object(routes, "_create_bucket_for_mca_refi", AsyncMock(return_value=(bucket, SimpleNamespace(id=uuid4())))), patch.object(routes, "_load_public_intake", side_effect=load), patch.object(routes, "_record_resume_email", AsyncMock()), patch.object(routes, "_response", AsyncMock(return_value="saved")), patch.object(routes.profiles_service, "provision_profile_for_intake", AsyncMock()):
         result = await routes.start_mca_refinance(payload, request(), db)
     assert result == "saved"
     db.add.assert_called_once_with(created)
