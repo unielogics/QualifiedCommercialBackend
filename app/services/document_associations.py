@@ -121,10 +121,10 @@ async def expected_business(db, profile):
             await db.refresh(intake, attribute_names=["business_name"])
         if dealer is not None:
             await db.refresh(dealer, attribute_names=["legal_name", "name"])
-    if intake and intake.business_name:
+    if intake and getattr(intake, "business_name", None):
         return intake.business_name
     if dealer:
-        return dealer.legal_name or dealer.name
+        return getattr(dealer, "legal_name", None) or getattr(dealer, "name", None)
     if getattr(profile, "loan_id", None):
         from app.models.loan import Loan
 

@@ -293,3 +293,12 @@ async def test_save_boundary_scopes_before_locks_then_guards_latest_source_and_s
         promote.assert_not_awaited()
         reject.assert_not_awaited()
     assert file.document_version_status == "current" and file.is_current_document_version
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_kind", ["intake", "dealer"])
+async def test_missing_optional_owner_name_remains_unknown_instead_of_establishing_an_identity(owner_kind):
+    profile = SimpleNamespace(intake_id=uuid4() if owner_kind == "intake" else None,
+                              dealer_id=uuid4() if owner_kind == "dealer" else None, loan_id=None)
+    db = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace()))
+    assert await identity.expected_business(db, profile) is None
