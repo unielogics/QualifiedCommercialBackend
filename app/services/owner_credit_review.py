@@ -59,7 +59,7 @@ async def confirm_owner(db, profile, owner_id, payload, user):
         raise HTTPException(422, " ".join(blockers))
     if not getattr(owner, "backfill_needs_review", False):
         await db.commit()
-        return profiles.owner_read(owner)
+        return await profiles.owner_read_current(db, profile, owner)
     owner.backfill_needs_review = False
     await profiles.log_profile_action(db, profile, user, "owner.import_reviewed", f"Confirmed imported owner {owner.full_name}",
         target_type="owner", target_id=owner.id,
@@ -67,7 +67,7 @@ async def confirm_owner(db, profile, owner_id, payload, user):
     await db.flush()
     await application_programs.get_program_readiness(db, profile)
     await db.commit()
-    return profiles.owner_read(owner)
+    return await profiles.owner_read_current(db, profile, owner)
 
 
 async def lock_credit_policy(db, profile):

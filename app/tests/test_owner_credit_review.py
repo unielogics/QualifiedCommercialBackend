@@ -51,7 +51,7 @@ def patch_services(monkeypatch, owners):
     monkeypatch.setattr(service, "lock_credit_policy", AsyncMock())
     audit = AsyncMock()
     monkeypatch.setattr(service.profiles, "log_profile_action", audit)
-    monkeypatch.setattr(service.profiles, "owner_read", lambda row: row)
+    monkeypatch.setattr(service.profiles, "owner_read_current", AsyncMock(side_effect=lambda _db, _profile, row: row))
     return audit
 
 
