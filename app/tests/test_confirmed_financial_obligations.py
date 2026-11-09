@@ -48,9 +48,11 @@ def test_same_lender_loans_remain_separate_and_observations_do_not_override_save
     before = deepcopy(debt)
     result = plans.obligations(debt, observations())
     assert [item["id"] for item in result] == ["row:first", "row:second"]
-    assert result[0]["monthly"] == 400 and result[0]["observed_monthly"] == 450
+    assert result[0]["monthly"] == 400 and result[0]["observed_monthly"] is None
     assert result[1]["monthly"] is None and result[1]["balance"] is None
     assert result[1]["linked_payee_key"] is None
+    assert all(item["linked_payee_key"] is None and item["replay_requires_review"] for item in result)
+    assert all(item["candidate_payee_keys"] == ["example"] for item in result)
     assert debt == before
 
 

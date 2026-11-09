@@ -34,7 +34,9 @@ def _definition(calculation, review):
         defaults = [reported] if selected_reported else fields
         anchor = "profit_and_loss.net_income"
     elif key == "dscr.bank_cash_flow":
-        keys, defaults, anchor = ["bank.avg_net", "debt.monthly"], ["bank.avg_net", "debt.monthly"], "bank.avg_net"
+        keys, defaults, anchor = ["bank.avg_net", "debt.monthly", "bank.identified_financing_credits_monthly"], ["bank.avg_net", "debt.monthly"], "bank.avg_net"
+        if inputs.get("bank.identified_financing_credits_monthly", {}).get("value") is not None:
+            defaults.append("bank.identified_financing_credits_monthly")
     elif key == "dscr.tax_return" or calculation.get("kind") == "tax_estimate":
         keys = [name for name in source_keys if not name.startswith("debt.")]
         anchor = next((name for name in keys if name.endswith(".income")), None)
@@ -47,22 +49,26 @@ def _definition(calculation, review):
         factor = 1.0
     elif key == "dscr.bank_cash_flow":
         factor = 12.0
+    financing_key = "bank.identified_financing_credits_monthly"
     components = [{"input_key": name, "label": inputs[name]["label"], "value": inputs[name]["value"],
-                   "coefficient": 1, "contribution": inputs[name]["value"],
-                   "included": name in defaults, "required": name == anchor,
-                   "role": "anchor" if name == anchor else "addend", "source_refs": inputs[name]["source_refs"]}
+                   "coefficient": -1 if name == financing_key else 1,
+                   "contribution": -inputs[name]["value"] if name == financing_key and inputs[name]["value"] is not None else inputs[name]["value"],
+                   "included": name in defaults, "required": name == anchor or name == financing_key and inputs[name]["value"] is not None,
+                   "role": "anchor" if name == anchor else "deduction" if name == financing_key else "addend", "source_refs": inputs[name]["source_refs"]}
                   for name in keys]
     # A source-reported value and its reconciliation are alternative recipes.
     if any(name.endswith(".reported_ebitda") for name in defaults):
         for component in components:
             component["required"] = False
     definition = {"components": components, "annualization_factor": factor, "kind": "dscr" if is_dscr else "earnings",
+                  "annualize_before_rounding": key == "dscr.bank_cash_flow",
                   "unit": "ratio" if is_dscr else "currency", "period": calculation.get("period"),
                   "base_value": calculation.get("value"), "required_anchor": anchor,
                   "denominator": {"input_key": "debt.annual", "label": "Annual debt service", "value": calculation.get("denominator"), "editable": False} if is_dscr else None}
     definition["source_stamp"] = stamp({"calculation": key, "period": definition["period"], "factor": factor,
         "inputs": [{"key": name, "source_stamp": inputs[name]["source_stamp"], "value": inputs[name]["value"]} for name in keys],
-        "denominator": definition["denominator"], "source_refs": calculation.get("source_refs", [])})
+        "denominator": definition["denominator"], "source_refs": calculation.get("source_refs", []),
+        **({"annualize_before_rounding": True} if definition["annualize_before_rounding"] else {})})
     definition["can_edit"] = bool(components and factor is not None and calculation.get("currency_status") != "mismatch"
                                    and any(inputs[name].get("editable") for name in keys))
     return definition
@@ -71,9 +77,11 @@ def _definition(calculation, review):
 def _calculate(recipe, components, adjustments):
     chosen = {row["input_key"]: row["included"] for row in components}
     values = [row["contribution"] for row in recipe["components"] if chosen.get(row["input_key"], False)]
-    subtotal = _money(sum((Decimal(str(value)) for value in values), Decimal(0))
-                      + sum((Decimal(str(_money(row["amount"]))) for row in adjustments), Decimal(0))) if values and all(value is not None for value in values) else None
-    numerator = _money(Decimal(str(subtotal)) * Decimal(str(recipe["annualization_factor"]))) if subtotal is not None and recipe["annualization_factor"] is not None else None
+    precise_subtotal = (sum((Decimal(str(value)) for value in values), Decimal(0))
+                        + sum((Decimal(str(_money(row["amount"]))) for row in adjustments), Decimal(0))) if values and all(value is not None for value in values) else None
+    subtotal = _money(precise_subtotal) if precise_subtotal is not None else None
+    annual_base = precise_subtotal if recipe.get("annualize_before_rounding") else subtotal
+    numerator = _money(Decimal(str(annual_base)) * Decimal(str(recipe["annualization_factor"]))) if annual_base is not None and recipe["annualization_factor"] is not None else None
     denominator = (recipe.get("denominator") or {}).get("value")
     value = round(numerator / denominator, 2) if recipe["unit"] == "ratio" and numerator is not None and denominator is not None and denominator > 0 else numerator if recipe["unit"] != "ratio" else None
     return subtotal, numerator, value
@@ -175,6 +183,9 @@ def change(state, review, *, calculation_key, action, components, adjustments, r
             raise HTTPException(422, "Choose reported EBITDA or the net-income reconciliation, not both")
         if reported not in included and recipe["required_anchor"] not in included:
             raise HTTPException(422, "The source income anchor is required; correct that source input instead of removing the loss")
+        if any(row["input_key"] == "bank.identified_financing_credits_monthly" and row.get("required")
+               and row["input_key"] not in included for row in recipe["components"]):
+            raise HTTPException(422, "Identified financing credits must remain excluded from operating bank cash flow; review their source classification instead")
         if len(adjustments) > 20 or len({row.get("id") for row in adjustments}) != len(adjustments):
             raise HTTPException(422, "Use at most twenty uniquely identified adjustments")
         for row in adjustments:

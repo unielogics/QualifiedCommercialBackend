@@ -46,13 +46,17 @@ MAX_LEVERS = 6
 DOUBLE_COUNTED_ADD_BACK_KINDS = frozenset({"interest_refinanced", "depreciation"})
 DOUBLE_COUNTED_ADD_BACK_REASON = (
     "Interest and depreciation/amortization are already excluded from EBITDA. "
-    "The bank cash-flow basis already adds back scheduled debt paid, while noncash depreciation never reduces bank cash."
+    "The bank cash-flow proxy already adds back scheduled debt service as an assumption, while noncash depreciation never reduces bank cash."
 )
 UNKNOWN_DEBT_SERVICE_REASON = (
     "Existing debt service is unknown; complete the debt schedule or set an explicit debt-service assumption."
 )
 UNKNOWN_NEW_LOAN_PAYMENT_REASON = (
     "The new loan payment is unknown; enter its rate and terms or a reviewed monthly payment."
+)
+AMBIGUOUS_REPLAY_REASON = (
+    "Statement payments cannot be allocated uniquely to these loans. Review loan-level statement evidence "
+    "before projecting payoff cash-flow or bank-balance changes."
 )
 
 
@@ -251,18 +255,20 @@ def obligations(debt: dict[str, Any], recurring: dict[str, Any]) -> list[dict[st
             if authoritative or row.get("origin") != "ai_draft"]
     payees = [p for p in recurring.get("payees") or [] if p.get("is_debt") or p.get("is_card")]
     by_key = {p["key"]: p for p in payees}
-    used: set[str] = set()
+    possible_payees = []
+    for row in rows:
+        vendor_key = row.get("vendor_key")
+        possible_payees.append([by_key[vendor_key]] if vendor_key in by_key else
+                               [payee for payee in payees if match_names(row["lender"], payee["payee"])])
+    owners = {key: sum(any(payee["key"] == key for payee in matches) for matches in possible_payees)
+              for key in by_key}
     out: list[dict[str, Any]] = []
     source = service.get("source") or "none"
     rows_in_service = source in {"debt_schedule_rows", "debt_schedule_rows+bank_observed", "accepted_debt_schedule"}
-    for row in rows:
-        vendor_key = row.get("vendor_key")
-        linked = by_key.get(vendor_key) if vendor_key not in used else None
-        if linked is None:
-            linked = next((p for p in payees if p["key"] not in used
-                           and match_names(row["lender"], p["payee"])), None)
-        if linked is not None:
-            used.add(linked["key"])
+    for row, possible in zip(rows, possible_payees, strict=True):
+        unique = len(possible) == 1 and owners[possible[0]["key"]] == 1
+        linked = possible[0] if unique else None
+        replay_requires_review = bool(possible and not unique)
         out.append({
             "id": f"row:{row.get('id')}",
             "kind": "row",
@@ -280,6 +286,9 @@ def obligations(debt: dict[str, Any], recurring: dict[str, Any]) -> list[dict[st
             "linked_payee_key": linked["key"] if linked else None,
             "linked_payee": linked["payee"] if linked else None,
             "observed_monthly": linked["monthly_average"] if linked else None,
+            "replay_requires_review": replay_requires_review,
+            "replay_review_reason": AMBIGUOUS_REPLAY_REASON if replay_requires_review else None,
+            "candidate_payee_keys": sorted(payee["key"] for payee in possible),
             "cadence": row.get("payment_frequency") or (linked["cadence"] if linked else None),
             "source": "debt_schedule_row",
             "origin": row.get("origin"),
@@ -621,14 +630,22 @@ def evaluate_plan(
     rows = replay_months(
         months, retired, payees_by_key, recurring.get("months_read") or [], regular_payment
     )
-    replay_unknown = bool(new_loan_payment_unknown or retirement_payment_unknown)
+    replay_review_required_ids = [row["id"] for row in retired if row.get("replay_requires_review")]
+    # A stale consumer can also supply the same observed aggregate for two
+    # loans. Never remove it twice or add an unobserved fallback on top.
+    selected_link_keys = [row.get("linked_payee_key") for row in obligations_list if row.get("linked_payee_key")]
+    replay_review_required_ids.extend(row["id"] for row in retired
+                                      if row.get("linked_payee_key") and selected_link_keys.count(row["linked_payee_key"]) > 1)
+    replay_review_required_ids = sorted(set(replay_review_required_ids))
+    retirement_replay_unknown = bool(replay_review_required_ids)
+    replay_unknown = bool(new_loan_payment_unknown or retirement_payment_unknown or retirement_replay_unknown)
     if replay_unknown:
         # Unknown replacement/retired payments cannot create a zero-cost loan
         # or apparent bank-balance improvement. Preserve observed before data.
         for row in rows:
             for key in ("withdrawals_after", "net_after", "ending_after", "lowest_after", "added", "cumulative"):
                 row[key] = None
-            if retirement_payment_unknown:
+            if retirement_payment_unknown or retirement_replay_unknown:
                 row["removed"] = None
     net_before = [r["net"] for r in rows if r["net"] is not None]
     net_after = [r["net_after"] for r in rows if r["net_after"] is not None]
@@ -701,7 +718,9 @@ def evaluate_plan(
         "no_debt_left": bool(headline_after and headline_after["no_debt_left"]),
         "replay": rows,
         "replay_basis": "regular_payment_proxy" if schedule else "constant_monthly_payment",
-        "replay_unavailable_reason": UNKNOWN_NEW_LOAN_PAYMENT_REASON if new_loan_payment_unknown else UNKNOWN_DEBT_SERVICE_REASON if retirement_payment_unknown else None,
+        "replay_unavailable_reason": AMBIGUOUS_REPLAY_REASON if retirement_replay_unknown else UNKNOWN_NEW_LOAN_PAYMENT_REASON if new_loan_payment_unknown else UNKNOWN_DEBT_SERVICE_REASON if retirement_payment_unknown else None,
+        "retirement_replay_unknown": retirement_replay_unknown,
+        "replay_review_required_ids": replay_review_required_ids,
         "replay_projection_available": not replay_unknown,
         "replay_note": "Projected bank balances use the recurring repayment monthly equivalent, excluding balloon cash. No loan commencement date is aligned to the historical statements; the interest-only step, scheduled balloons and maturity cash flows are shown in the loan-month schedule." if schedule else None,
         "actual_regular_payment_monthly": regular_payment,

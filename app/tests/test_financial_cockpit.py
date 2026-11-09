@@ -377,7 +377,8 @@ def test_dscr_candidates_follow_the_review_precedence_and_name_their_basis() -> 
     assert (tax["pro_forma_value"], tax["pro_forma_status"]) == (1.94, "very_strong")
     assert cockpit["profit_and_loss"]["annualized_ebitda"] == 72000
     assert statement["value"] == 3.0 and statement["period"] == "Jan–Jun 2026"
-    assert bank["value"] == 3.5 and bank["confidence"] == "proxy" and "floor" in bank["note"]
+    assert bank["value"] == 3.5 and bank["confidence"] == "proxy" and "Provisional schedule-based" in bank["note"]
+    assert "floor" not in bank["note"]
     assert dscr["headline"]["key"] == "tax_return"
     assert (
         dscr["proposed"]["monthly_payment"] == 1000 and dscr["proposed"]["annual_payment"] == 12000
