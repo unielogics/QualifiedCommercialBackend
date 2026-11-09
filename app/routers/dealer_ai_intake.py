@@ -5944,6 +5944,16 @@ async def _generate_management_json(
             "only, matching the given shape exactly."
         )
         feature = "lender_send"
+    if "operating_earnings" in context:
+        from app.services.bucket_ai import EBITDA_REASONING_RULES
+
+        system += "\n" + EBITDA_REASONING_RULES
+        instruction += (
+            " For operating earnings, context.operating_earnings is authoritative over chat and cached review figures. "
+            "Use its historical baseline and selected business source, preserving its period, currency, estimate status and missing inputs. "
+            "Describe its revenue_trend forecast separately as a conditional illustration with its assumptions; never call it current revenue, EBITDA or program qualification. "
+            "If operating_earnings is null, current business earnings are unavailable; do not revive a number from cached reviews or chat."
+        )
     prompt = {
         "purpose": purpose,
         "variant": variant_label,
@@ -6698,6 +6708,15 @@ async def _package_generation_inputs(
     # the fingerprint: a changed plan or new terms make the package stale.
     plan_block: dict[str, Any] = {}
     proposed_terms: dict[str, Any] | None = None
+    operating_earnings: dict[str, Any] | None = None
+    from app.services.financial_metric_reporting import (
+        current_review_projection,
+        operating_earnings_brief,
+    )
+
+    current_key_metrics: dict[str, Any] = current_review_projection({}, None)["key_metrics"]
+    current_tax_years: list[dict[str, Any]] = []
+    current_p_and_l: dict[str, Any] | None = None
     try:
         from app.capital_partners.services import sync as marketplace_sync
         from app.services import financial_cockpit as cockpit_svc
@@ -6705,6 +6724,10 @@ async def _package_generation_inputs(
         cockpit = await cockpit_svc.load_cockpit(db, profile)
         plan_block = cockpit_svc.plan_summary(cockpit)
         proposed_terms = marketplace_sync.proposed_terms(cockpit)
+        operating_earnings = operating_earnings_brief(cockpit)
+        current_key_metrics = current_review_projection({}, cockpit)["key_metrics"]
+        current_tax_years = (cockpit.get("tax") or {}).get("years") or []
+        current_p_and_l = cockpit.get("profit_and_loss")
     except Exception:  # noqa: BLE001 - the package still prints without the plan
         log.exception("package: plan block unavailable intake=%s", intake.id)
     financials = {
@@ -6715,7 +6738,12 @@ async def _package_generation_inputs(
         "use_of_funds": budget_snapshot,
         "plan": {k: v for k, v in plan_block.items() if k not in {"updated_at", "updated_by"}},
         "proposed_terms": proposed_terms,
+        "operating_earnings": operating_earnings,
+        "current_key_metrics": current_key_metrics,
+        "tax_years": current_tax_years,
+        "p_and_l": current_p_and_l,
     }
+    context_snapshot["operating_earnings"] = operating_earnings
     input_fingerprint = _package_input_fingerprint(
         source_metadata=source_metadata,
         context_snapshot=context_snapshot,

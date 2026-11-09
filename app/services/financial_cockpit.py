@@ -855,7 +855,8 @@ def tax_years(analyses: list[dict[str, Any]], limit: int = 3, *, business_entity
     years: list[dict[str, Any]] = []
     # Select the business before limiting years: personal and unrelated returns
     # in the evidence room must not displace this company's older return.
-    sources = [item for item in analyses if tax_source_is_business(item.get("key_facts") or {}) and not source_excluded(item.get("identity_association"))]
+    sources = [item for item in analyses if tax_source_is_business(item.get("key_facts") or {})
+               and "personal_tax_return" not in _classes(item) and not source_excluded(item.get("identity_association"))]
     associations = {str(item.get("file_id")): item.get("identity_association") for item in sources}
     for year in extract_tax_years(_extractor_rows(sources), limit=max(limit, len(sources) * 2)):
         facts = facts_by_file.get(str(year.get("file_id"))) or {}
@@ -2211,7 +2212,7 @@ def build_cockpit(
         if not {"tax_return", "current_p_and_l", "income_statement", "profit_and_loss"}.intersection(_classes(item)):
             continue
         facts = item.get("key_facts") or {}
-        identity = facts.get("entity_name") or facts.get("business_name") or facts.get("taxpayer")
+        identity = facts.get("entity_name") or facts.get("business_name") or facts.get("entity") or facts.get("taxpayer")
         reason = ("Staff denied this document's business association, or its prior decision needs review for the current source."
                   if document_associations.source_excluded(item.get("identity_association")) else
                   "Personal or unscoped tax return; excluded from business earnings and DSCR."
@@ -2256,6 +2257,10 @@ def build_cockpit(
     from app.services import financial_metric_composition
 
     financial_metric_composition.attach_and_apply(metric_review, dscr, metric_review_state)
+    from app.services import financial_earnings_sources
+
+    financial_earnings_sources.attach(metric_review["ebitda"], metric_review, all_sources, years, statement, effective_bank,
+                                     state=metric_review_state, entity=business_entity, now=now)
     from app.services import financial_plan as plans
 
     plan_record = plans.normalize_plan(plan)

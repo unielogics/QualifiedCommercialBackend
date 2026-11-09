@@ -35,6 +35,7 @@ _AMORTIZATION = (
     "amortization", "amortization_expense", "amortization_current",
     "current_year_amortization", "amortization_current_year",
     "amortization_within_other_deductions", "other_deductions_detail.amortization",
+    "amortization_health_record_soft",
 )
 _ORDINARY_BUSINESS_INCOME = (
     "ordinary_business_income", "ordinary_business_income_loss",
@@ -131,9 +132,11 @@ def tax_source_is_business(facts: dict[str, Any]) -> bool:
     form = _tax_form(facts)
     if form in {"1040", "schedule_c", "schedule_k1"}:
         return False
+    if facts.get("filers") or facts.get("filing_status") and any(facts.get(key) is not None for key in ("agi", "total_wages_w2", "magi")):
+        return False
     if form in {"1065", "1120", "1120S"}:
         return True
-    return bool(facts.get("entity_name") or facts.get("business_name")
+    return bool(facts.get("entity_name") or facts.get("business_name") or facts.get("entity")
                 or any(facts.get(key) is not None for key in _ORDINARY_BUSINESS_INCOME))
 
 

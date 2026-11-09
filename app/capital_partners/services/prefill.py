@@ -219,6 +219,7 @@ async def readiness_snapshot(db: AsyncSession, profile: ApplicationProfile) -> d
     listing carries what the desk saw on the file when it cut the draft."""
     from app.services import application_programs as programs
     from app.services import financial_cockpit
+    from app.services.financial_metric_reporting import operating_earnings_brief
 
     selections = await programs.active_selections(db, profile.id)
     candidates = {c.program_key: c for c in await programs.published_candidates(db, profile)}
@@ -259,7 +260,7 @@ async def readiness_snapshot(db: AsyncSession, profile: ApplicationProfile) -> d
             "files_analyzed": coverage["files_analyzed"],
             "files_accepted": coverage["files_accepted"],
         },
-        "financials": financial_cockpit.listing_summary(cockpit),
+        "financials": {**financial_cockpit.listing_summary(cockpit), "operating_earnings": operating_earnings_brief(cockpit)},
         "production_package": {"stage": package.stage, "status": package.status, "version": package.version} if package else None,
     }
 

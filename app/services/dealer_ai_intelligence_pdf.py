@@ -403,6 +403,15 @@ def render_dealer_intelligence_pdf(
         else "Dealer Funding Review"
     )
     key_metrics = _record(result.get("key_metrics"))
+    operating_earnings = _record(result.get("operating_earnings"))
+    historical_earnings = _record(operating_earnings.get("historical"))
+    from app.services.public_underwriting_packet_pdf import (
+        _earnings_money,
+        _operating_earnings_lines,
+        _operating_earnings_section,
+    )
+
+    earnings_financials = {"operating_earnings": operating_earnings}
     bankability = _record(result.get("bankability_assessment"))
     evidence = _record(result.get("document_evidence_map"))
     basics = _record(state.get("funding_review_basics"))
@@ -436,6 +445,14 @@ def render_dealer_intelligence_pdf(
         annualized = _num(key_metrics.get("ytd_annualized_revenue")) or _num(key_metrics.get("annualized_adjusted_deposits"))
         debt = _num(key_metrics.get("estimated_debt_burden"))
         cash_flow = _num(key_metrics.get("estimated_ebitda_or_cash_flow"))
+        earnings_label = "Cash flow (est.)"
+        earnings_hint = _source_note(key_metrics, "ebitda_source") if cash_flow is not None else ""
+        if "operating_earnings" in result:
+            periods = _records(_record(operating_earnings.get("revenue_trend")).get("periods"))
+            annualized = _num(periods[-1].get("revenue")) if periods else None
+            cash_flow = _num(historical_earnings.get("value"))
+            earnings_label = str(historical_earnings.get("label") or "Business EBITDA")
+            earnings_hint = str(historical_earnings.get("period") or "Current business earnings unavailable")
         dscr = _num(key_metrics.get("estimated_dscr"))
         collateral_value, collateral_debt = _asset_totals(intake)
         ltv = None
@@ -445,7 +462,7 @@ def render_dealer_intelligence_pdf(
         tiles = [
             _tile("Requested capital", _money(requested), hint="" if requested is not None else "Not yet on the file — confirm in chat"),
             _tile("Annualized revenue", _money(annualized)),
-            _tile("Cash flow (est.)", _money(cash_flow), hint=_source_note(key_metrics, "ebitda_source") if cash_flow is not None else ""),
+            _tile(earnings_label, _earnings_money(cash_flow, historical_earnings.get("currency")) if "operating_earnings" in result else _money(cash_flow), hint=earnings_hint),
             _tile("Debt burden", _money(debt), hint="" if debt is not None else "Debt schedule unlocks this"),
             _tile("DSCR estimate", _ratio(dscr), hint=_source_note(key_metrics, "dscr_basis") if dscr is not None else "Debt schedule unlocks this"),
             _tile("Collateral equity", _money(equity), hint="" if equity is not None else "Real-estate schedule unlocks this"),
@@ -480,6 +497,9 @@ def render_dealer_intelligence_pdf(
             ),
             ("Debt burden", _num(key_metrics.get("estimated_debt_burden")), "#d97706"),
         ]
+        if "operating_earnings" in result:
+            cash_rows[0] = ("Historical business revenue", annualized, BRAND_TEAL)
+            cash_rows[2] = (earnings_label, cash_flow, GOOD)
         evidenced = [(label, value, color) for label, value, color in cash_rows if value is not None]
         if evidenced:
             max_bar = max(abs(value) for _, value, _ in evidenced) or 1
@@ -487,7 +507,7 @@ def render_dealer_intelligence_pdf(
                 f'<div class="barrow"><strong>{escape(label)}</strong><span>{_money(value)}</span>{_bar(abs(value) / max_bar * 100, color)}</div>'
                 for label, value, color in evidenced
             )
-            trend = str(key_metrics.get("revenue_trend") or "").strip()
+            trend = "" if "operating_earnings" in result else str(key_metrics.get("revenue_trend") or "").strip()
             consistency = str(key_metrics.get("tax_return_revenue_vs_bank_deposits") or "").strip()
             notes = " · ".join(part for part in (trend, consistency) if part)
             notes_html = f'<p class="mini">{escape(notes)}</p>' if notes else ""
@@ -623,6 +643,7 @@ def render_dealer_intelligence_pdf(
   {summary_section}
   {internal_sections}
   {cash_section}
+  {_operating_earnings_section(earnings_financials) if not is_real_estate else ''}
   {coverage_section}
   {missing_section}
   <div class="twocol">
@@ -654,6 +675,8 @@ def render_dealer_intelligence_pdf(
         fallback_lines.extend(_wrap(f"Needed: {row.get('title') or 'Missing item'} — {row.get('detail') or ''}"))
     fallback_lines.append("")
     fallback_lines.extend(_wrap(f"Next underwriting move: {next_step}"))
+    if not is_real_estate:
+        fallback_lines.extend(_operating_earnings_lines(earnings_financials))
 
     try:
         from weasyprint import HTML

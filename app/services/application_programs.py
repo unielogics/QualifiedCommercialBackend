@@ -485,7 +485,8 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
     counted_accounts = _counted_bank_accounts(profile)
     from app.services.financial_cockpit import _analysis_rows
 
-    analysis_rows = [row for row in _analysis_rows(files, latest_analyses, accepted_file_ids, associations) if row["file_id"] not in excluded_ids]
+    all_analysis_rows = _analysis_rows(files, latest_analyses, accepted_file_ids, associations)
+    analysis_rows = [row for row in all_analysis_rows if row["file_id"] not in excluded_ids]
     statement_rows, statement_refs, statement_warnings = program_bank_estimate_rows(
         analysis_rows, counted_accounts=counted_accounts,
         account_aliases=dict(getattr(profile, "bank_account_aliases", None) or {}),
@@ -709,7 +710,7 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
     from app.services.program_earnings_facts import annual_ebitda_fact
 
     context["annual_ebitda"], context["fact_sources"]["annual_ebitda"] = annual_ebitda_fact(
-        analysis_rows,
+        all_analysis_rows,
         entity=getattr(intake, "business_name", None) or getattr(dealer, "legal_name", None) or getattr(dealer, "name", None),
         state=getattr(profile, "financial_metric_review", None),
     )
