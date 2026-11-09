@@ -3304,6 +3304,21 @@ async def _materialize_requirements(
                              "file_request_id", "request_fingerprint", "request_item", "request_instructions", "requested_by_user_id", "request_batches", "source_context")
             }}
         state.provenance = {**(state.provenance or {}), **definition_metadata, "inactive_definition": False}
+        from app.services import credit_requirement_sync
+
+        if await credit_requirement_sync.materialize(
+            db, profile, requirement, state, requested,
+            policy_context={
+                "expected_business": expected_entity,
+                "review_checks": review_checks, "requires_human": requires_human,
+                "definitions": sorted(
+                    (str(row.id), str(row.playbook_id), criteria_versions.get(row.playbook_id, 1))
+                    for row in merged_item["definitions"]
+                ),
+            },
+        ):
+            result.append(state)
+            continue
         if not collection_tasks.collects_file(requirement):
             await collection_tasks.materialize_response_state(db, state, responses)
             result.append(state)
@@ -3491,6 +3506,43 @@ async def _active_overrides(
     return {(row.selection_id, row.requirement_key): row for row in rows}
 
 
+def effective_requirement_dispositions(states, selections, overrides) -> dict[str, dict[str, Any]]:
+    """Project exemptions only when every live program scope is exempt.
+
+    The saved requirement and each scoped override remain separate so adding a
+    program or restoring one exemption can require collection again. A policy,
+    staff-added request or lender condition is an independent obligation.
+    """
+    result = {}
+    for state in states:
+        metadata = getattr(state, "provenance", None) or {}
+        if state.status in SATISFIED_STATES or getattr(state, "source_policy_keys", None) or metadata.get("source_kind") == "lender":
+            continue
+        source_keys = set(getattr(state, "source_program_keys", None) or [])
+        relevant = [row for row in selections if row.program_key in source_keys]
+        if not relevant:
+            continue
+        keys = [state.requirement_key, *metadata.get("requirement_aliases", [])]
+        current = [(selection, next((overrides[(selection.id, key)] for key in keys if (selection.id, key) in overrides), None))
+                   for selection in relevant]
+        if any(override is None or override.disposition not in {"waived", "not_applicable"} for _, override in current):
+            continue
+        reasons = list(dict.fromkeys(override.reason for _, override in current))
+        result[state.requirement_key] = {
+            "status": "waived" if any(override.disposition == "waived" for _, override in current) else "not_applicable",
+            "reason": reasons[0] if len(reasons) == 1 else "; ".join(f"{selection.program_key}: {override.reason}" for selection, override in current),
+            "program_keys": sorted(selection.program_key for selection, _ in current),
+        }
+    return result
+
+
+async def profile_requirement_dispositions(db, profile, states) -> dict[str, dict[str, Any]]:
+    if not any(getattr(state, "source_program_keys", None) for state in states):
+        return {}
+    selections = await active_selections(db, profile.id)
+    return effective_requirement_dispositions(states, selections, await _active_overrides(db, selections))
+
+
 async def _automation_state(
     db: AsyncSession,
     profile: ApplicationProfile,
@@ -3553,6 +3605,8 @@ async def _automation_state(
         profile.missing_item_email_requirement_key = missing.requirement_key
         profile.missing_item_email_attempts = 0
         profile.missing_item_email_next_send_at = now()
+    if missing is None:
+        profile.missing_item_email_next_send_at = None
     next_send = profile.missing_item_email_next_send_at
     if eligible and next_send is None:
         next_send = max(
@@ -3573,6 +3627,10 @@ async def _automation_state(
 
 
 def _requirement_needs_client_evidence(state: ApplicationRequirementState) -> bool:
+    from app.services.credit_requirement_sync import staff_review_only
+
+    if staff_review_only(state):
+        return False
     if state.status in SATISFIED_STATES:
         return False
     if state.status in {"missing", "requested", "stale", "failed"}:
@@ -3610,7 +3668,8 @@ def _requirement_is_effectively_accepted(
 ) -> bool:
     if state.status in SATISFIED_STATES:
         return True
-    if override and override.disposition in {"waived", "not_applicable"}:
+    independent_scope = bool(getattr(state, "source_policy_keys", None) or (getattr(state, "provenance", None) or {}).get("source_kind") == "lender")
+    if override and not independent_scope and override.disposition in {"waived", "not_applicable"}:
         return True
     return False
 
@@ -3777,6 +3836,7 @@ async def get_program_readiness(
                 old = overrides.get((selection.id, alias))
                 if old is not None and (selection.id, state.requirement_key) not in overrides:
                     overrides[(selection.id, state.requirement_key)] = old
+    effective_dispositions = effective_requirement_dispositions(states, selections, overrides)
     requirement_map = {item.requirement_key: item for item in states}
     visibility: dict[str, bool] = {}
     can_waive: dict[str, bool] = {}
@@ -3812,9 +3872,7 @@ async def get_program_readiness(
         for key in required_keys:
             state = requirement_map[key]
             override = overrides.get((selection.id, key))
-            is_satisfied = state.status in SATISFIED_STATES or bool(
-                override and override.disposition in {"waived", "not_applicable"}
-            )
+            is_satisfied = _requirement_is_effectively_accepted(state, override)
             if is_satisfied:
                 satisfied += 1
             else:
@@ -3840,23 +3898,7 @@ async def get_program_readiness(
     advanced = False
     if lending_applicable:
         advanced = await _auto_start_underwriting_if_loaded(db, profile, fully_loaded_program_keys)
-    effectively_satisfied: set[str] = set()
-    for item in states:
-        if item.status in SATISFIED_STATES:
-            effectively_satisfied.add(item.requirement_key)
-            continue
-        relevant = [
-            selection
-            for selection in selections
-            if item.requirement_key in per_selection.get(selection.id, [])
-        ]
-        if relevant and all(
-            (selection.id, item.requirement_key) in overrides
-            and overrides[(selection.id, item.requirement_key)].disposition
-            in {"waived", "not_applicable"}
-            for selection in relevant
-        ):
-            effectively_satisfied.add(item.requirement_key)
+    effectively_satisfied = {item.requirement_key for item in states if item.status in SATISFIED_STATES} | set(effective_dispositions)
     automation = await _automation_state(
         db,
         profile,
@@ -4055,7 +4097,7 @@ async def get_program_readiness(
                 label=item.label,
                 category=item.category,
                 required_level=item.required_level,
-                status=item.status,
+                status=effective_dispositions.get(item.requirement_key, {}).get("status", item.status),
                 requested_document_id=item.requested_document_id,
                 evidence_file_id=item.evidence_file_id,
                 evidence_file_name=(
@@ -4107,7 +4149,7 @@ async def get_program_readiness(
                 client_visible=visibility.get(item.requirement_key, False),
                 can_waive=can_waive.get(item.requirement_key, False),
                 **requirement_lifecycle.lifecycle_fields(item),
-                state_reason=item.state_reason,
+                state_reason=effective_dispositions.get(item.requirement_key, {}).get("reason", item.state_reason),
                 last_requested_at=item.last_requested_at,
                 received_at=item.received_at,
                 verified_at=item.verified_at,
@@ -4327,6 +4369,7 @@ async def patch_requirement(
         state.status = "failed"
         state.state_reason = payload.reason or "Evidence failed review"
     elif payload.action in {"waive", "not_applicable"}:
+        disposition = "waived" if payload.action == "waive" else "not_applicable"
         selected = {item.program_key: item for item in await active_selections(db, profile.id)}
         source_keys = set(requirement_read.source_program_keys)
         if not source_keys and requirement_read.source_policy_keys:
@@ -4388,7 +4431,7 @@ async def patch_requirement(
                 )
             ).scalar_one_or_none()
             if current:
-                current.disposition = payload.action
+                current.disposition = disposition
                 current.reason = (payload.reason or "").strip()
                 current.created_by_user_id = user.id
             else:
@@ -4396,7 +4439,7 @@ async def patch_requirement(
                     ApplicationProgramRequirementOverride(
                         selection_id=selection.id,
                         requirement_key=requirement_key,
-                        disposition=payload.action,
+                        disposition=disposition,
                         reason=(payload.reason or "").strip(),
                         created_by_user_id=user.id,
                     )

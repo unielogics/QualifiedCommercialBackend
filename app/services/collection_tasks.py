@@ -274,6 +274,9 @@ async def materialize_response_state(
 async def sync_collection_tasks(
     db: AsyncSession, profile: ApplicationProfile, states: list[ApplicationRequirementState]
 ) -> list[ApplicationCollectionTask]:
+    from app.services.application_programs import profile_requirement_dispositions
+
+    dispositions = await profile_requirement_dispositions(db, profile, states)
     existing = list(
         (
             await db.execute(
@@ -431,18 +434,28 @@ async def sync_collection_tasks(
         if metadata.get("response"):
             task.config = {**task.config, "response": metadata["response"]}
         task.automation_approved = approved and client_visible and kind != "human_review"
+        from app.services.credit_requirement_sync import staff_review_only
+
+        credit_review_only = all(staff_review_only(row) for row in members)
+        if credit_review_only:
+            task.description = "Existing owner credit evidence is with your team for review. No duplicate upload or credit pull is requested."
+            task.state_reason = "Credit collection is recorded; program eligibility remains under staff review"
         if kind == "human_review" or not approved or not client_visible:
             task.assignee = "internal"
             if arf_permissions_blocked:
                 task.state_reason = "Written ARF permission for this item must be confirmed before borrower collection"
         elif task.status not in {"unavailable", "escalated"} and not task.assigned_user_id:
             task.assignee = "borrower"
-        if all(row.status in COMPLETE for row in members):
+        if all(dispositions.get(row.requirement_key, {}).get("status", row.status) in COMPLETE for row in members):
             task.status, task.completed_at, task.next_attempt_at = (
                 "completed",
                 task.completed_at or timestamp(),
                 None,
             )
+        elif credit_review_only:
+            # A report import/subject/eligibility question belongs to staff,
+            # even if an earlier borrower request exhausted its retry budget.
+            task.status, task.assignee, task.completed_at, task.next_attempt_at = "in_review", "internal", None, None
         elif task.status == "completed":
             task.status, task.completed_at, task.attempts = "open", None, 0
             task.next_attempt_at = timestamp()
