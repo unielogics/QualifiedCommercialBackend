@@ -35,6 +35,7 @@ from app.services.equipment_financing import (
 )
 from app.services.funding_program_baselines import suggested_baseline
 from app.services.program_rules import evaluate_rules, validate_rules
+from app.tests._business_profile_fixture import BUSINESS_PROFILE
 
 PASSING_FACTS = {
     "equipment_financing_intent": True,
@@ -292,6 +293,7 @@ def test_field_desk_catalog_insert_casts_reused_program_key_consistently():
 
 def test_signup_attribution_accepts_and_persists_equipment_intent():
     payload = DealerIntakeStart(
+        **{**BUSINESS_PROFILE, "industry": "manufacturing"},
         full_name="Sam Owner",
         email="sam@example.com",
         phone="+19735550123",

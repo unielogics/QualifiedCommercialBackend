@@ -26,10 +26,12 @@ from app.services.foreclosure_rescue import (
     urgency_for,
     validate_term_sheet_note_rate,
 )
+from app.tests._business_profile_fixture import BUSINESS_PROFILE
 
 
 def _intake(**changes):
     values = {
+        **{**BUSINESS_PROFILE, "business_description": "We own and operate commercial rental properties."},
         "submitter_type": "attorney",
         "contact_name": "A. Counsel",
         "firm_name": "Counsel LLP",

@@ -97,7 +97,7 @@ def test_the_fields_are_optional_on_the_wire_and_validated_when_sent() -> None:
 def test_every_ai_application_start_takes_the_two_answers() -> None:
     for model in (core.DealerIntakeStart, core.FundingReviewStart, core.McaRefiStart, core.CapitalReadinessClaimRequest, foreclosure_rescue.ForeclosureRescueIntakeCreate):
         assert {"business_website", "business_description"} <= set(model.model_fields), model.__name__
-        assert model.model_fields["business_website"].default is None, model.__name__
+        assert model.model_fields["business_website"].is_required(), model.__name__
 
 
 # --- what is kept --------------------------------------------------------------------------------------

@@ -2967,7 +2967,7 @@ async def create_intake_from_prospect(
             intake_state["source"] = "main_street_intake"
             intake_state["main_street_details"] = {
                 "intent": intent,
-                "industry": industry,
+                "industry": adapter.industry,
                 "funding_intent": funding_intent,
             }
         else:
