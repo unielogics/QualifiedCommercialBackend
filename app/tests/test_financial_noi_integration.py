@@ -20,6 +20,20 @@ from app.services.public_underwriting_packet_pdf import _operating_earnings_line
 from app.tests.test_financial_metric_review import ACTOR, build, pnl, target
 
 
+@pytest.mark.asyncio
+async def test_business_noi_does_not_replace_property_specific_underwriting(monkeypatch):
+    from app.services import application_profiles, financial_cockpit, financial_version_selection
+    from app.tests.test_financial_metric_reporting import profile_fixture
+
+    db, profile, _intake = profile_fixture()
+    profile.vertical = "real_estate"
+    monkeypatch.setattr(financial_cockpit, "load_cockpit", AsyncMock(return_value=build([annual()])))
+    monkeypatch.setattr(financial_version_selection, "accepted_debt_schedule_snapshot", AsyncMock(return_value=None))
+    result = await application_profiles.intelligence_state(db, profile)
+    metric = next(row for row in result.metrics if row.key == "noi")
+    assert not metric.applicable and metric.status == "not_applicable" and metric.value is None
+
+
 def annual(year=2025, *, key=None, **facts):
     row = pnl(**{"period_start": f"{year}-01-01", "period_end": f"{year}-12-31", "basis": "cash", "gross_revenue": 500000,
                  "cost_of_goods_sold": 100000, "total_operating_expenses": 380000, "operating_income": 20000,
