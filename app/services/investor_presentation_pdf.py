@@ -67,6 +67,8 @@ def _clean(value):
 def investment_metrics(terms):
     """Gross contractual return is a full-loan cash-flow illustration, not net ROI."""
     terms = _record(terms)
+    if terms.get("active_proposal") is False:
+        terms = {}
     amount = _number(terms.get("amount"))
     schedule = _record(terms.get("schedule"))
     total = _number(schedule.get("total_paid"))
@@ -266,7 +268,7 @@ def _months(report):
 
 
 def _plain_terms(terms):
-    if not terms:
+    if not terms or terms.get("active_proposal") is False:
         return "No complete repayment terms are recorded. Amount, APR, maturity, amortization and balloon terms are needed."
     schedule = _record(terms.get("schedule"))
     rate, maturity = _number(terms.get("rate_pct")), _number(terms.get("term_months"))
@@ -427,6 +429,8 @@ def render_investor_presentation_pdf(*, intake: Any, financials: dict, generated
     stamp = (generated_at or datetime.now(UTC)).strftime("%Y-%m-%d %H:%M UTC")
     doc = fitz.open()
     terms = _record(financials.get("proposed_terms"))
+    if terms.get("active_proposal") is False:
+        terms = {}
     returns = investment_metrics(terms)
     budget = _record(financials.get("use_of_funds"))
     requested = budget.get("requested_amount") if budget.get("requested_amount") is not None else intake_requested_amount(intake)
@@ -449,7 +453,7 @@ def render_investor_presentation_pdf(*, intake: Any, financials: dict, generated
     _text(page, (35, 165, 925, 185), profile or "Business website / industry details awaiting confirmation", size=9, color=MUTE)
     roi = returns["gross_contractual_roi_pct"]
     _card(page, (34, 197, 319, 316), "Requested financing", _money(requested), "Current application request")
-    _card(page, (337, 197, 622, 316), "Proposed investment", _money(returns["investment_amount"]), "Full loan; participation allocation separate")
+    _card(page, (337, 197, 622, 316), "Proposed investment", _money(returns["investment_amount"]), "Full loan; participation allocation separate" if terms else "No active financing proposal")
     _card(page, (640, 197, 925, 316), "Gross contractual return", f"{roi:.2f}%" if roi is not None else "Terms needed", "Full term, before fees / losses / taxes")
     _heading(page, 35, 333, 425, "Use of funds", _citations(report, "use_of_funds"))
     allocations = list(_record(budget.get("category_totals")).items())
@@ -602,21 +606,35 @@ def render_investor_presentation_pdf(*, intake: Any, financials: dict, generated
     _text(page, (623, 347, 921, 364), "Aggregate summary; personal identifiers withheld.", size=8.5, color=MUTE)
     collateral = _record(report.get("collateral"))
     properties = _records(collateral.get("properties")) if collateral.get("enabled") else []
-    _heading(page, 36, 371, 885, "Real estate collateral", _citations(report, "collateral"))
-    if not properties:
-        _text(page, (38, 418, 918, 454), "No real estate collateral has been offered in this file. This does not establish that the business or its owners have no property.", size=11, color=MUTE)
+    assets = _records(collateral.get("assets")) if collateral.get("enabled") else []
+    title = "Real estate and other collateral" if assets else "Real estate collateral"
+    if collateral.get("active_proposal") is False:
+        title = "Recorded collateral reference - no active financing proposal"
+    elif collateral.get("terms_stale"):
+        title += " - newer proposal requires updated terms"
+    _heading(page, 36, 371, 885, title, _citations(report, "collateral"))
+    if not properties and not assets:
+        note = "No collateral schedule was recorded with this terms version; current disclosures do not amend the issued terms." if collateral.get("basis") == "unrecorded_terms" else "No collateral has been offered in this file. This does not establish that the business or its owners have no assets."
+        _text(page, (38, 418, 918, 454), note, size=11, color=MUTE)
     else:
-        for index, row in enumerate(properties[:2]):
+        # Show one of each class when both are offered; retain the full schedule
+        # in the immutable analysis rather than overflowing the five-page report.
+        shown = [properties[0], assets[0]] if properties and assets else (properties or assets)[:2]
+        for index, row in enumerate(shown):
             y = 417 + index * 32
             if index % 2 == 0:
                 _rect(page, (34, y - 3, 925, y + 29))
             address = row.get("address")
             if isinstance(address, dict):
                 address = _company_address({"address": address})
-            _text(page, (39, y, 370, y + 29), str(address or "Address awaiting confirmation"), size=9.5, bold=True)
+            label = address or f"{str(row.get('asset_type') or 'Asset').replace('_', ' ').title()}: {row.get('description') or 'Description awaiting confirmation'}"
+            _text(page, (39, y, 370, y + 29), str(label), size=9.5, bold=True)
             _text(page, (381, y, 629, y + 29), f"Est. value {_money(row.get('value'), row.get('currency'))}\nExisting liens {_money(row.get('existing_liens'), row.get('currency'))}", size=9)
             _text(page, (645, y, 921, y + 29), f"Declared available lien {_money(row.get('available_lien_amount'), row.get('currency'))}\nPosition {row.get('lien_position') or 'unconfirmed'}; valuation {row.get('valuation_date') or 'not supplied'}", size=9)
-    _text(page, (37, 485, 922, 503), (f"{min(2, len(properties))} of {len(properties)} properties shown; full collateral schedule in the file. " if properties else "") + "Declared lien capacity is subject to title, ownership, valuation and lien review; it is not approved security.", size=8.5, color=MUTE)
+    counts = (f"1 of {len(properties)} properties and 1 of {len(assets)} assets shown. " if properties and assets else
+        f"{min(2, len(properties))} of {len(properties)} properties shown; full collateral schedule in the file. " if properties else
+        f"{min(2, len(assets))} of {len(assets)} assets shown; full collateral schedule in the file. " if assets else "")
+    _text(page, (37, 485, 922, 503), counts + "Declared values/lien capacity require ownership, valuation and priority review; this is not approved security.", size=8.5, color=MUTE)
 
     # 5 - A legible source index plus clear pointers to all retained detail.
     page = _slide(doc, "Evidence references and review conditions", business, stamp, 5)

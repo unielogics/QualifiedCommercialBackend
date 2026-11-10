@@ -8,8 +8,10 @@ transfers → consent; filings → the Regulation D tracker; issuer settings.
 from __future__ import annotations
 
 import uuid
+from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -403,12 +405,69 @@ def _apply(listing: CpListing, payload: S.ListingIn) -> None:
             setattr(listing, key, value)
 
 
+async def _apply_file_financing(db: AsyncSession, listing: CpListing, *, prior: Any = None) -> None:
+    """Staff saves inherit the file's loan rather than creating another copy."""
+    if listing.profile_id is None:
+        return
+    from app.models.application_profile import ApplicationProfile
+
+    profile = await db.get(ApplicationProfile, listing.profile_id)
+    if profile is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "The file behind this listing was not found.")
+    fresh = await P.readiness_snapshot(db, profile)
+    await _guard_financing_change(db, prior or listing, fresh)
+    SYNC.apply_canonical_financing(listing, fresh)
+    listing.source_snapshot = {**(listing.source_snapshot or {}), **fresh}
+
+
+async def _guard_financing_change(db: AsyncSession, listing: CpListing, fresh: dict[str, Any]) -> None:
+    if not SYNC.financing_changed(listing, fresh):
+        return
+    funded = listing.status in {E.ListingStatus.FUNDED, E.ListingStatus.REPAID, E.ListingStatus.WORKOUT}
+    committed = (await L.committed_amounts(db, [listing.id])).get(listing.id, Decimal(0)) if listing.id else Decimal(0)
+    if funded or committed > 0:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This listing has committed or funded capital. Financing and recorded collateral cannot be changed through a file refresh; review the existing commitments before issuing a revised offering.")
+
+
+async def _guard_committed_listing_edit(db: AsyncSession, listing: CpListing, payload: S.ListingIn) -> None:
+    protected = {"loan_id", "profile_id", "loan_amount", "offered_amount", "note_rate_pct", "term_months", "products",
+        "collateral_type", "lien_position", "ltv_pct", "ltv_kind", "payment_frequency", "maturity_date", "personal_guarantee"}
+    values = payload.model_dump(exclude_unset=True)
+    def comparable(key, value):
+        if key == "products":
+            return SYNC.economic_products(value)
+        if key in {"loan_amount", "offered_amount", "note_rate_pct", "term_months", "ltv_pct"}:
+            return SYNC.economic_number(value)
+        return SYNC.normalized_financing(value)
+    if not any(comparable(key, getattr(listing, key, None)) != comparable(key, values[key]) for key in protected & values.keys()):
+        return
+    committed = (await L.committed_amounts(db, [listing.id])).get(listing.id, Decimal(0))
+    if listing.status in {E.ListingStatus.FUNDED, E.ListingStatus.REPAID, E.ListingStatus.WORKOUT} or committed > 0:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This offering has committed or funded capital. Its financing, participation amount and linked file cannot be edited without reviewing those commitments.")
+
+
+async def _require_current_file_snapshot(db: AsyncSession, listing: CpListing) -> None:
+    if listing.profile_id is None:
+        return
+    from app.models.application_profile import ApplicationProfile
+
+    profile = await db.get(ApplicationProfile, listing.profile_id)
+    if profile is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "The file behind this listing was not found.")
+    current, _sections, _cockpit = await SYNC.current_fingerprints(db, profile)
+    snapshot = listing.source_snapshot if isinstance(listing.source_snapshot, dict) else {}
+    stamped = snapshot.get("file_fingerprints") or (snapshot.get("published") or {}).get("fingerprints") or {}
+    if any(stamped.get(key) != value for key, value in current.items() if key != "package"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "The file changed since this listing was prepared. Refresh its financial snapshot and review the current financing and collateral before publishing.")
+
+
 @router.post("/listings", response_model=S.ListingAdminOut, status_code=status.HTTP_201_CREATED)
 async def create_listing(payload: S.ListingIn, admin: CpAdmin, db: Db) -> S.ListingAdminOut:
     if not payload.name or not payload.vertical:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "A listing needs a name and a vertical.")
     listing = CpListing(ref=await R.next_listing_ref(db, payload.vertical), status=E.ListingStatus.DRAFT, created_by_id=admin.id, vertical=payload.vertical, name=payload.name)
     _apply(listing, payload)
+    await _apply_file_financing(db, listing)
     if listing.servicer_label is None:
         listing.servicer_label = (await M.issuer_settings(db)).servicer_label
     db.add(listing)
@@ -427,8 +486,11 @@ async def patch_listing(listing_id: uuid.UUID, payload: S.ListingIn, admin: CpAd
     listing = await _load_admin_listing(db, listing_id)
     if listing.status in {E.ListingStatus.REPAID, E.ListingStatus.WITHDRAWN}:
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "closed", "message": "A repaid or withdrawn listing is read-only."})
+    await _guard_committed_listing_edit(db, listing, payload)
     before = {k: str(getattr(listing, k)) for k in _LISTING_FIELDS if k != "source_snapshot"}
+    prior = SimpleNamespace(**{key: deepcopy(getattr(listing, key, None)) for key in ("id", "status", "products", "loan_amount", "offered_amount", "note_rate_pct", "term_months", "source_snapshot")})
     _apply(listing, payload)
+    await _apply_file_financing(db, listing, prior=prior)
     changed = {k: before[k] for k in before if before[k] != str(getattr(listing, k))}
     await db.flush()
     if changed:
@@ -441,6 +503,7 @@ async def publish_listing(listing_id: uuid.UUID, payload: S.PublishIn, admin: Cp
     if not payload.confirmed:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Confirm the publish.")
     listing = await _load_admin_listing(db, listing_id)
+    await _require_current_file_snapshot(db, listing)
     try:
         await L.publish(db, listing, actor_user_id=admin.id, reason=payload.reason)
     except L.RuleError as exc:
@@ -462,12 +525,14 @@ async def refresh_listing_snapshot(listing_id: uuid.UUID, admin: CpAdmin, db: Db
     if profile is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "The file behind this listing was not found.")
     fresh = await P.readiness_snapshot(db, profile)
+    await _guard_financing_change(db, listing, fresh)
+    SYNC.apply_canonical_financing(listing, fresh)
     refreshed_at = datetime.now(UTC).isoformat()
     listing.source_snapshot = {**(listing.source_snapshot or {}), **fresh, "refreshed_at": refreshed_at}
     # The figures, the plan, the terms and the programs just went onto the
     # listing: stamp them so the file page knows they are current.
     current, _sections, _cockpit = await SYNC.current_fingerprints(db, profile)
-    SYNC.mark_published(listing, current, by=admin.id, keys=["figures", "plan", "terms", "programs"])
+    SYNC.mark_published(listing, current, by=admin.id, keys=["figures", "plan", "terms", "collateral", "programs"])
     financials = fresh.get("financials") or {}
     await L.log_event(
         db,
@@ -525,6 +590,8 @@ async def publish_listing_package(listing_id: uuid.UUID, admin: CpAdmin, db: Db)
                 or _artifact_pdf_metadata(presentation).get("package_input_sha256") != summary_pdf.get("package_input_sha256")):
             raise HTTPException(status.HTTP_409_CONFLICT, "Regenerate the package so the investor presentation uses the same current evidence snapshot.")
         artifacts.append((presentation, E.DocumentKind.INVESTOR_PRESENTATION, "Investor presentation"))
+    fresh = await P.readiness_snapshot(db, profile)
+    await _guard_financing_change(db, listing, fresh)
     if not storage.configured():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Document storage is not available right now.")
     now = datetime.now(UTC)
@@ -556,7 +623,7 @@ async def publish_listing_package(listing_id: uuid.UUID, admin: CpAdmin, db: Db)
             if document.kind == E.DocumentKind.INVESTOR_PRESENTATION and document.status != E.DocumentStatus.SUPERSEDED:
                 document.status = E.DocumentStatus.SUPERSEDED
                 document.superseded_at = now
-    fresh = await P.readiness_snapshot(db, profile)
+    SYNC.apply_canonical_financing(listing, fresh)
     listing.source_snapshot = {**(listing.source_snapshot or {}), **fresh, "refreshed_at": now.isoformat()}
     current, _sections, _cockpit = await SYNC.current_fingerprints(db, profile)
     package = await SYNC.current_package(db, profile)

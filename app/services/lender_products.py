@@ -27,10 +27,21 @@ from app.enums import LoanProgram, LoanType
 from app.services.main_street_programs import MAIN_STREET_PROGRAM_LABELS
 
 MERCHANT_PROCESSING = "merchant_processing"
+PRIVATE_LOAN_BRIDGE = "private_loan_bridge"
+
+# Staff may structure these products directly. They do not carry an invented
+# program minimum, pricing recommendation, or an automatic eligibility result.
+MANUAL_FINANCING_PRODUCTS: dict[str, dict[str, str]] = {
+    PRIVATE_LOAN_BRIDGE: {
+        "label": "Private Loan / Bridge",
+        "description": "Staff-structured private financing; review terms, collateral and funding-source approval.",
+    },
+}
 
 REAL_ESTATE_PRODUCTS: tuple[str, ...] = tuple(t.value for t in LoanType)
 
 BUSINESS_LENDING_PRODUCTS: tuple[str, ...] = (
+    PRIVATE_LOAN_BRIDGE,
     "sba",
     "sba_grocery",
     "sba_made_in_america",
@@ -72,6 +83,7 @@ GROUP_LABELS: dict[str, str] = {
 }
 
 _EXTRA_LABELS: dict[str, str] = {
+    PRIVATE_LOAN_BRIDGE: MANUAL_FINANCING_PRODUCTS[PRIVATE_LOAN_BRIDGE]["label"],
     "dscr": "DSCR Rental",
     "fix_and_flip": "Fix & Flip",
     "ground_up": "Ground-Up Construction",

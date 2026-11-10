@@ -41,6 +41,7 @@ class FinancialCockpitRead(BaseModel):
     #: else the plan's loan) with the schedule and the principal at risk;
     #: see financial_cockpit.proposed_terms_block.
     proposed_terms: dict[str, Any] | None = None
+    collateral: dict[str, Any] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
 
 

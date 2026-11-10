@@ -732,6 +732,7 @@ def _underwriting_read(
     source_kind: str | None = None,
     source_id: UUID | None = None,
     fee_cap_review: dict[str, object] | None = None,
+    financing_projection: dict | None = None,
 ) -> ApplicationUnderwritingRead:
     fee_cap_review = fee_cap_review or {}
     earnings = calculate_deal_earnings(
@@ -752,6 +753,7 @@ def _underwriting_read(
         current_dscr=profile.underwriting_current_dscr,
         target_dscr=profile.underwriting_target_dscr,
         approved_dscr=profile.underwriting_approved_dscr,
+        financing=financing_projection or {},
         close_outcome=profile.underwriting_close_outcome,
         reviewer_notes=profile.underwriting_notes,
         forecast_fee_points=profile.forecast_fee_points,
@@ -969,7 +971,9 @@ async def get_application_underwriting(
     _require_underwriting_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
     fee_cap_review = await funding_programs.qc_fee_cap_review_for_profile(db, profile)
-    return _underwriting_read(profile, fee_cap_review=fee_cap_review)
+    from app.services.financing_projection import read as read_financing
+
+    return _underwriting_read(profile, fee_cap_review=fee_cap_review, financing_projection=await read_financing(db, profile))
 
 
 @router.patch("/{profile_id}/underwriting", response_model=ApplicationUnderwritingRead)
@@ -982,14 +986,16 @@ async def update_application_underwriting(
     _require_underwriting_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
     changes = payload.model_dump(exclude_unset=True)
+    from app.services.financing_projection import read as read_financing
+
     if not changes:
         fee_cap_review = await funding_programs.qc_fee_cap_review_for_profile(db, profile)
-        return _underwriting_read(profile, fee_cap_review=fee_cap_review)
+        return _underwriting_read(profile, fee_cap_review=fee_cap_review, financing_projection=await read_financing(db, profile))
     await apply_underwriting_changes(db, profile, user, changes)
     # Validate the exact response before committing. A response-model error
     # must never report failure after the lifecycle change already persisted.
     fee_cap_review = await funding_programs.qc_fee_cap_review_for_profile(db, profile)
-    result = _underwriting_read(profile, fee_cap_review=fee_cap_review)
+    result = _underwriting_read(profile, fee_cap_review=fee_cap_review, financing_projection=await read_financing(db, profile))
     if "current_dscr" in changes:
         await capital_readiness.advisory_recompute_profiles(
             db,

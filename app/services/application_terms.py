@@ -24,7 +24,7 @@ from app.schemas.application_terms import (
     LoanTypeOption,
 )
 from app.services import application_profiles as profiles
-from app.services import file_contacts, funding_programs
+from app.services import file_contacts, funding_programs, investor_collateral
 from app.services.funding_requests import current_for_profile, intake_requested_amount
 
 CADENCE_PERIODS_PER_YEAR: dict[str, float] = {
@@ -411,12 +411,17 @@ def _calculation(
 
 
 async def loan_type_options(db: AsyncSession, profile: ApplicationProfile) -> list[LoanTypeOption]:
+    from app.services.lender_products import MANUAL_FINANCING_PRODUCTS
+
     catalog = await funding_programs.public_catalog(db)
     compatible = [row for row in catalog if profile.vertical in row.verticals]
-    return [
+    result = [
         LoanTypeOption(value=row.program_key, label=row.name, description=row.short_description)
         for row in compatible
     ]
+    result.extend(LoanTypeOption(value=key, label=value["label"], description=value["description"])
+        for key, value in MANUAL_FINANCING_PRODUCTS.items() if key not in {item.value for item in result})
+    return result
 
 
 async def current_term_sheet(db: AsyncSession, profile_id: UUID) -> ApplicationTermSheet | None:
@@ -472,6 +477,16 @@ async def read_terms(
     client_email, suppressed = await _recipient_state(db, profile)
     context = await _dscr_context(db, profile)
     plan_block = await _plan_block(db, profile)
+    current_collateral = investor_collateral.snapshot(profile)
+    recorded_collateral = getattr(row, "collateral_snapshot", None) or {}
+    collateral_revision = getattr(row, "collateral_revision", None)
+    collateral_fields = {
+        "collateral_snapshot": recorded_collateral,
+        "collateral_revision": collateral_revision,
+        "current_collateral": current_collateral,
+        "current_collateral_revision": current_collateral["revision"],
+        "collateral_stale": bool(row is not None and collateral_revision != current_collateral["revision"]),
+    }
     if row is None:
         intake = (
             await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
@@ -502,6 +517,7 @@ async def read_terms(
             loan_type_options=options,
             calculation=calc,
             plan=plan_block,
+            **collateral_fields,
         )
 
     total = float(row.periodic_payment) * int(row.payment_count)
@@ -592,6 +608,7 @@ async def read_terms(
         loan_type_options=options,
         calculation=calc,
         plan=plan_block,
+        **collateral_fields,
     )
 
 
@@ -633,7 +650,10 @@ async def save_terms(
         await lock_profile_terms(db, profile.id)
     # A financial-plan-only save does not advance the terms version. Refresh
     # after the shared lock so adoption cannot overwrite that newer scenario.
-    await db.refresh(profile, attribute_names=["financial_plan"])
+    await db.refresh(profile, attribute_names=["financial_plan", "investor_collateral"])
+    collateral = investor_collateral.snapshot(profile)
+    if payload.expected_collateral_revision is not None and payload.expected_collateral_revision != collateral["revision"]:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Collateral changed in another session. Reload it before saving these terms.")
     options = await loan_type_options(db, profile)
     current = await current_term_sheet(db, profile.id)
     actual_version = current.version if current is not None else 0
@@ -737,14 +757,16 @@ async def save_terms(
         sponsor_name=payload.sponsor_name if payload.co_brand_enabled else None,
         client_note=payload.client_note,
         conditions=payload.conditions,
+        collateral_snapshot=collateral,
+        collateral_revision=collateral["revision"],
         created_by_user_id=user.id,
     )
     db.add(row)
     profile.underwriting_term_sheet_amount = payload.amount
     if calc.dscr_before is not None:
         profile.underwriting_current_dscr = calc.dscr_before
-    if calc.dscr_after is not None:
-        profile.underwriting_approved_dscr = calc.dscr_after
+    # A draft quote is a proposal, not an underwriting approval. Approval
+    # coverage remains an explicit lifecycle/reviewer action.
     profile.underwriting_updated_by_user_id = user.id
     profile.underwriting_updated_at = now
     await db.flush()
@@ -772,6 +794,7 @@ async def save_terms(
             "repayment_config": row.repayment_config,
             "dscr_before": calc.dscr_before,
             "dscr_after": calc.dscr_after,
+            "collateral_revision": collateral["revision"],
         },
     )
     return row

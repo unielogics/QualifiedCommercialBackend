@@ -298,6 +298,14 @@ def partner_financials(listing: CpListing) -> dict[str, Any] | None:
 
 
 PARTNER_TERMS_KEYS = (
+    "active_proposal",
+    "program_key",
+    "program_name",
+    "terms_state",
+    "recorded_terms_ref",
+    "collateral_revision",
+    "current_collateral_revision",
+    "collateral_stale",
     "source",
     "label",
     "amount",
@@ -329,7 +337,28 @@ PARTNER_TERMS_KEYS = (
 def partner_terms(terms: dict[str, Any]) -> dict[str, Any]:
     """The proposed terms a member sees: the structure, the schedule and the
     principal at risk, key by key. No fee lives here, and none is added."""
-    return {k: terms.get(k) for k in PARTNER_TERMS_KEYS if terms.get(k) is not None}
+    result = {k: terms.get(k) for k in PARTNER_TERMS_KEYS if terms.get(k) is not None}
+    result["collateral"] = partner_collateral(terms.get("collateral_snapshot"),
+        recorded=bool(terms.get("recorded_terms_ref")) or terms.get("source") == "term_sheet")
+    return result
+
+
+def partner_collateral(value: Any, *, recorded: bool) -> dict[str, Any]:
+    """Only declared security facts, never private notes or evidence identifiers."""
+    raw = value if isinstance(value, dict) else {}
+    allowed = ("asset_type", "description", "property_type", "estimated_value", "existing_liens_total",
+        "available_lien_amount", "proposed_lien_position", "valuation_date", "currency")
+    def project(row):
+        result = {key: deepcopy(row[key]) for key in allowed if row.get(key) is not None}
+        if isinstance(row.get("address"), dict):
+            result["address"] = {key: row["address"][key] for key in ("street", "city", "state", "postal_code") if row["address"].get(key)}
+        return result
+    enabled = bool(raw.get("enabled"))
+    return {"enabled": enabled, "revision": raw.get("revision"),
+        "basis": "recorded_terms" if recorded and raw else "unrecorded_terms" if recorded else "staff_proposal",
+        "properties": [project(row) for row in raw.get("properties") or [] if isinstance(row, dict)] if enabled else [],
+        "assets": [project(row) for row in raw.get("assets") or [] if isinstance(row, dict)] if enabled else [],
+        "status": "Declared only; ownership, valuation, priority and lending capacity require review."}
 
 
 def document_out(doc: CpListingDocument) -> dict[str, Any]:
@@ -363,6 +392,18 @@ def publish_blockers(listing: CpListing) -> list[str]:
         missing.append("minimum_investment")
     if _d(listing.minimum_investment) > _d(listing.offered_amount) > 0:
         missing.append("minimum_investment exceeds offered_amount")
+    snapshot = listing.source_snapshot if isinstance(listing.source_snapshot, dict) else {}
+    financials = snapshot.get("financials") if isinstance(snapshot.get("financials"), dict) else {}
+    terms = financials.get("proposed_terms") if isinstance(financials.get("proposed_terms"), dict) else {}
+    if terms.get("active_proposal") is False:
+        missing.append("Restore or synchronize the working financing proposal before publishing; issued terms are a historical reference")
+    if terms.get("recorded_terms_ref") and (terms.get("collateral_stale") or terms.get("terms_state") == "differs"):
+        missing.append("Save an updated terms version for the changed financing or collateral before publishing")
+    if terms.get("amount") is not None:
+        if _d(listing.offered_amount) > _d(terms["amount"]):
+            missing.append("offered_amount exceeds the canonical financing amount")
+        if any(_d(getattr(listing, field, None)) != _d(terms.get(key)) for field, key in (("loan_amount", "amount"), ("note_rate_pct", "rate_pct"), ("term_months", "term_months"))):
+            missing.append("Refresh financing from the file before publishing")
     kinds = {d.kind for d in ready_documents(listing)}
     if E.DocumentKind.PPM not in kinds:
         missing.append("private placement memorandum not uploaded")

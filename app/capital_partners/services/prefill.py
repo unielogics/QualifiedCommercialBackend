@@ -221,6 +221,8 @@ async def readiness_snapshot(db: AsyncSession, profile: ApplicationProfile) -> d
     from app.services import financial_cockpit
     from app.services.financial_metric_reporting import operating_earnings_brief
 
+    from . import sync as SYNC
+
     selections = await programs.active_selections(db, profile.id)
     candidates = {c.program_key: c for c in await programs.published_candidates(db, profile)}
     program_rows = []
@@ -249,6 +251,7 @@ async def readiness_snapshot(db: AsyncSession, profile: ApplicationProfile) -> d
         )
     ).scalar_one_or_none()
     return {
+        "file_fingerprints": SYNC.fingerprints(SYNC.file_sections(cockpit, program_keys=[selection.program_key for selection in selections], package=None)),
         "readiness": {
             "programs": program_rows,
             "bank_months": coverage["bank_months"],
@@ -260,7 +263,8 @@ async def readiness_snapshot(db: AsyncSession, profile: ApplicationProfile) -> d
             "files_analyzed": coverage["files_analyzed"],
             "files_accepted": coverage["files_accepted"],
         },
-        "financials": {**financial_cockpit.listing_summary(cockpit), "operating_earnings": operating_earnings_brief(cockpit)},
+        "financials": {**financial_cockpit.listing_summary(cockpit), "operating_earnings": operating_earnings_brief(cockpit),
+            "proposed_terms": SYNC.proposed_terms(cockpit), "collateral": cockpit.get("collateral")},
         "production_package": {"stage": package.stage, "status": package.status, "version": package.version} if package else None,
     }
 
@@ -439,6 +443,11 @@ async def prefill(db: AsyncSession, user: User, *, loan_id: uuid.UUID | None, pr
         draft["maturity_date"] = sheet.maturity_date or draft.get("maturity_date")
         if sheet.facility_type and not draft.get("program_label"):
             draft["program_label"] = sheet.facility_type.replace("_", " ").capitalize()
+
+    if profile is not None:
+        from . import sync as SYNC
+
+        draft.update(SYNC.canonical_financing_fields(snapshot.get("financials") or {}, draft))
 
     if draft.get("offered_amount"):
         offered = Decimal(str(draft["offered_amount"]))

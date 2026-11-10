@@ -454,6 +454,8 @@ class ApplicationUnderwritingRead(BaseModel):
     current_dscr: float | None = None
     target_dscr: float | None = None
     approved_dscr: float | None = None
+    # Saved workspace figures beside the explicitly recorded approval fields.
+    financing: dict[str, Any] = Field(default_factory=dict)
     close_outcome: str | None = None
     reviewer_notes: str | None = None
     forecast_fee_points: float | None = None

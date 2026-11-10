@@ -1318,6 +1318,7 @@ def proposed_payment(terms: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     return {
         "source": terms.get("source") or "term_sheet",
+        **{key: terms.get(key) for key in ("program_key", "program_name", "recorded_terms_ref", "collateral_snapshot", "collateral_revision")},
         "label": terms.get("label"),
         "amount": amount,
         "rate_pct": rate,
@@ -2568,7 +2569,10 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
     dscr = cockpit.get("dscr") or {}
     proposed = dscr.get("proposed")
     base: dict[str, Any] | None = None
-    if proposed and proposed.get("amount"):
+    terms_link = plan.get("terms_link") or {}
+    working_loan = (plan.get("impact") or {}).get("loan")
+    use_working = terms_link.get("state") == "differs" and working_loan and working_loan.get("amount")
+    if proposed and proposed.get("amount") and not use_working:
         base = {
             "source": "term_sheet",
             "label": proposed.get("label"),
@@ -2606,6 +2610,16 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
             }
     if base is None:
         return None
+    recorded = terms_link.get("recorded") or proposed or {}
+    base.update({key: recorded.get(key) for key in ("program_key", "program_name", "collateral_snapshot", "collateral_revision")})
+    base["recorded_terms_ref"] = ({key: recorded.get(key) for key in ("kind", "id", "version", "label")}
+        if recorded.get("id") else recorded.get("recorded_terms_ref"))
+    base["terms_state"] = terms_link.get("state")
+    # Cleared scenarios keep immutable recorded terms available for review,
+    # but that reference is not a current offer to hydrate or publish.
+    base["active_proposal"] = terms_link.get("state") != "recorded_not_in_plan"
+    if not base["active_proposal"]:
+        base["source"] = "recorded_reference"
     schedule = (
         build_schedule(
             base["amount"],
@@ -2880,7 +2894,10 @@ async def recorded_terms_for_profile(
     from app.services import plan_terms_link as link
 
     if sheet is not None:
-        return link.recorded_from_production_sheet(sheet), term_sheet_terms(sheet)
+        recorded = link.recorded_from_production_sheet(sheet)
+        proposed = term_sheet_terms(sheet)
+        proposed["recorded_terms_ref"] = {key: recorded.get(key) for key in ("kind", "id", "version", "label")}
+        return recorded, proposed
     try:
         from app.services.application_terms import current_term_sheet as current_client_terms
 
@@ -2892,6 +2909,11 @@ async def recorded_terms_for_profile(
         return None, None
     proposed = {
         "source": "term_sheet",
+        "program_key": recorded.get("program_key"),
+        "program_name": recorded.get("program_name"),
+        "recorded_terms_ref": {key: recorded.get(key) for key in ("kind", "id", "version", "label")},
+        "collateral_snapshot": recorded.get("collateral_snapshot") or {},
+        "collateral_revision": recorded.get("collateral_revision"),
         "label": recorded["label"],
         "amount": recorded["amount"],
         "rate_pct": recorded["rate_pct"],
@@ -2920,6 +2942,8 @@ def term_sheet_terms(sheet: ProductionTermSheet | None) -> dict[str, Any] | None
     return {
         "source": "term_sheet",
         "label": f"Term sheet v{sheet.version}: {sheet.funding_party_name}",
+        "collateral_snapshot": extra.get("collateral_snapshot") or {},
+        "collateral_revision": extra.get("collateral_revision"),
         "amount": advanced["payment_basis_amount"] if advanced else sheet.approved_amount,
         "rate_pct": sheet.rate_pct,
         "term_months": sheet.term_months,
@@ -3075,6 +3099,18 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
         analyses, cockpit, files=supporting_files, offer=await current_offer(db, profile.id))
     cockpit["operating_evidence"]["business_name"] = expected_entity
     cockpit["operating_plan"] = await operating_plan_service.published_context(db, profile, cockpit)
+    from app.services.investor_collateral import snapshot as collateral_snapshot
+
+    current_collateral = collateral_snapshot(profile)
+    cockpit["collateral"] = current_collateral
+    proposal = cockpit.get("proposed_terms")
+    if proposal is not None:
+        proposal["current_collateral"] = current_collateral
+        proposal["current_collateral_revision"] = current_collateral["revision"]
+        proposal["collateral_stale"] = bool(proposal.get("recorded_terms_ref") and proposal.get("collateral_revision") != current_collateral["revision"])
+        if not proposal.get("recorded_terms_ref"):
+            proposal["collateral_snapshot"] = current_collateral
+            proposal["collateral_revision"] = current_collateral["revision"]
     if superseded_payoffs:
         cockpit["notes"].append("A linked payoff letter has a newer or unavailable document version. Review its latest amount and date, then save the schedule before using that payoff in a refinance plan.")
     return cockpit

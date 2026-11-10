@@ -239,6 +239,16 @@ async def record_sheet(
     from app.services.application_terms import lock_profile_terms
 
     await lock_profile_terms(db, profile.id)
+    if isinstance(db, AsyncSession):
+        await db.refresh(profile, attribute_names=["investor_collateral"])
+    from app.services.investor_collateral import snapshot as collateral_snapshot
+
+    frozen_collateral = collateral_snapshot(profile)
+    expected_collateral = body.get("expected_collateral_revision")
+    if expected_collateral is None:
+        expected_collateral = (body.get("extra") or {}).get("expected_collateral_revision")
+    if expected_collateral is not None and expected_collateral != frozen_collateral["revision"]:
+        raise HTTPException(status.HTTP_409_CONFLICT, "The collateral disclosure changed. Reload it before recording a new terms version.")
     previous = await current_sheet(db, profile.id)
     expected_version = body.get("expected_version")
     if expected_version is not None and expected_version != (previous.version if previous is not None else 0):
@@ -266,6 +276,9 @@ async def record_sheet(
         term_months=int(body.get("term_months") or 0),
     )
     body["extra"] = term_structure.stored_extra(body.get("extra"), structure)
+    # Security belongs to this immutable version, regardless of any stale or
+    # caller-supplied snapshot in extra. Legacy sheets are left unrecorded.
+    body["extra"].update(collateral_snapshot=frozen_collateral, collateral_revision=frozen_collateral["revision"])
     # Validate the enriched values, not only the sparse request.  This keeps
     # every saved version internally complete even when the caller is legacy.
     validation_view = {**body, **structure}

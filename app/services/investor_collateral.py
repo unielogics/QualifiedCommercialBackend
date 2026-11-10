@@ -2,6 +2,7 @@
 from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from uuid import UUID
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -23,6 +24,14 @@ def require_staff(user):
 def stored(profile):
     value = getattr(profile, "investor_collateral", None)
     return deepcopy(value) if isinstance(value, dict) else {}
+
+
+def snapshot(profile):
+    """Freeze the proposal, without UI options or inferred lendable amounts."""
+    value = stored(profile)
+    return {"enabled": bool(value.get("enabled")), "properties": value.get("properties") or [],
+        "assets": value.get("assets") or [], "revision": int(value.get("revision") or 0),
+        "updated_at": value.get("updated_at"), "updated_by_user_id": value.get("updated_by_user_id")}
 
 
 def _amount(value):
@@ -61,11 +70,11 @@ async def read(db, profile, user=None):
     files = list((await db.execute(select(BucketFile).where(BucketFile.bucket_id == profile.primary_bucket_id,
         BucketFile.status == "uploaded", BucketFile.deleted_at.is_(None)).order_by(BucketFile.created_at.desc()))).scalars().all()) if profile.primary_bucket_id else []
     warnings = ["Staff-disclosed collateral only. Title, valuation, lien priority and available lending capacity require review."]
-    for row in value.get("properties") or []:
+    for row in [*(value.get("properties") or []), *(value.get("assets") or [])]:
         amount, estimated, liens = (_amount(row.get(key)) for key in ("available_lien_amount", "estimated_value", "existing_liens_total"))
         if amount is not None and estimated is not None and liens is not None and amount > max(0, estimated - liens):
             warnings.append("A declared available lien amount exceeds estimated value less disclosed liens; reconcile valuation and lien evidence.")
-    return CollateralRead(profile_id=profile.id, enabled=value.get("enabled", False), properties=value.get("properties") or [],
+    return CollateralRead(profile_id=profile.id, enabled=value.get("enabled", False), properties=value.get("properties") or [], assets=value.get("assets") or [],
         revision=value.get("revision", 0), updated_at=value.get("updated_at"), updated_by_user_id=value.get("updated_by_user_id"),
         can_edit=bool(user and user.role in EDIT_ROLES), property_options=await property_options(db, profile),
         source_file_options=[{"id": str(file.id), "label": safe_label(file.file_name)} for file in files if not is_internal_package_output(file)],
@@ -79,7 +88,20 @@ async def update(db, profile, payload: CollateralPatch, user):
     before = stored(locked)
     if int(before.get("revision", 0)) != payload.expected_revision:
         raise HTTPException(409, "Collateral changed; reload the saved details before saving")
-    source_ids = {file_id for row in payload.properties for file_id in row.source_file_ids}
+    properties = [row.model_dump(mode="json") for row in payload.properties]
+    # Legacy property-only clients must never erase newer asset disclosures.
+    assets = ([row.model_dump(mode="json") for row in payload.assets] if "assets" in payload.model_fields_set
+        else deepcopy(before.get("assets") or []))
+    # Turning inclusion off is reversible and preserves the entered evidence.
+    if not payload.enabled:
+        if not properties:
+            properties = deepcopy(before.get("properties") or [])
+        if not assets:
+            assets = deepcopy(before.get("assets") or [])
+    rows = [*properties, *assets]
+    if len({str(row["id"]) for row in rows}) != len(rows):
+        raise HTTPException(422, "Collateral requires distinct row IDs")
+    source_ids = {UUID(str(file_id)) for row in [*payload.properties, *payload.assets] for file_id in row.source_file_ids}
     if source_ids:
         from app.services.provenance import is_internal_package_output
         scoped = {file.id for file in (await db.execute(select(BucketFile).where(BucketFile.id.in_(source_ids),
@@ -90,14 +112,10 @@ async def update(db, profile, payload: CollateralPatch, user):
     retained_properties = {str(row.get("real_estate_property_id")) for row in before.get("properties", [])}
     if any(row.real_estate_property_id and str(row.real_estate_property_id) not in valid_properties | retained_properties for row in payload.properties):
         raise HTTPException(422, "Choose a property from this file's published real estate schedule")
-    properties = [row.model_dump(mode="json") for row in payload.properties]
-    # Toggling inclusion off must not silently erase the previously entered rows.
-    if not payload.enabled and not properties and before.get("properties"):
-        properties = deepcopy(before["properties"])
-    locked.investor_collateral = {"enabled": payload.enabled, "properties": properties,
+    locked.investor_collateral = {"enabled": payload.enabled, "properties": properties, "assets": assets,
         "revision": payload.expected_revision + 1, "updated_at": datetime.now(UTC).isoformat(), "updated_by_user_id": str(user.id)}
     from app.services.application_profiles import log_profile_action
-    await log_profile_action(db, locked, user, "investor_collateral.update", "Updated proposed real estate collateral",
+    await log_profile_action(db, locked, user, "investor_collateral.update", "Updated proposed collateral",
         metadata={"before": before, "after": locked.investor_collateral, "revision": payload.expected_revision + 1})
     await db.flush()
     return await read(db, locked, user)

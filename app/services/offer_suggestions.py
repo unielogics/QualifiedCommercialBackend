@@ -363,6 +363,14 @@ async def suggest_offers(
     )
     products = []
     for key in keys:
+        from app.services.lender_products import MANUAL_FINANCING_PRODUCTS
+
+        if key in MANUAL_FINANCING_PRODUCTS:
+            manual = MANUAL_FINANCING_PRODUCTS[key]
+            products.append({"program_key": key, "label": manual["label"], "eligible": None,
+                "amount": None, "rate_pct": None, "term_months": None, "monthly_payment": None,
+                "dscr": None, "reason": "staff_structured", "reading": manual["description"]})
+            continue
         row = by_key.get(key)
         candidate = candidates.get(key)
         label = (row.name if row else None) or (candidate.program_name if candidate else key)
