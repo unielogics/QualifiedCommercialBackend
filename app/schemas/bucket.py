@@ -350,6 +350,7 @@ class BucketRequestAccessRead(BaseModel):
     # resolved kind after the PIN gate keeps the browser from probing the
     # other two backends and treating their expected 404s as feature errors.
     room_kind: Literal["dealer", "application", "basic"] = "basic"
+    capabilities: list[str] = Field(default_factory=list)
     bucket: BucketRequestBucketRead
     recipient_name: str
     recipient_email: str | None

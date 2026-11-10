@@ -48,6 +48,8 @@ from app.models.user import User
 from app.services import (
     bank_transactions_export,
     funding_requests,
+    mca_funding_policy,
+    mca_funding_prompts,
     mca_refinance_policy,
     merchant_processing,
     provenance,
@@ -492,7 +494,7 @@ def is_admin_lookup(message: str) -> bool:
     return has_trigger or (has_field and m.endswith("?"))
 
 
-def build_review_system(review_type: str | None) -> str:
+def build_review_system(review_type: str | None, *, funding_intent: str | None = None) -> str:
     """Return the review system prompt for exactly one product persona.
 
     No returned string ever contains more than one of the dealer, real-estate
@@ -501,6 +503,8 @@ def build_review_system(review_type: str | None) -> str:
     unknown/None review_type (e.g. a generic admin document room) gets the
     neutral preamble only, with no product-specific rules.
     """
+    if review_type == "main_street_v1" and funding_intent == mca_funding_policy.PROGRAM_KEY:
+        return f"{REVIEW_PREAMBLE}\n{mca_funding_prompts.REVIEW_RULES}\n{REVIEW_PLAN_RULES}\n{REVIEW_LIMITS}\n"
     if review_type == "dealer_gatekeeper_v1":
         return f"{REVIEW_PREAMBLE}\n{DEALER_REVIEW_RULES}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_PLAN_RULES}\n{REVIEW_LIMITS}\n"
     if review_type == "real_estate_dscr_v1":
@@ -512,7 +516,7 @@ def build_review_system(review_type: str | None) -> str:
     return f"{REVIEW_PREAMBLE}\n{REVIEW_PROGRAM_SCREEN_RULES}\n{REVIEW_PLAN_RULES}\n{REVIEW_LIMITS}\n"
 
 
-def build_chat_system(review_type: str | None, *, client_language: str | None = None, audience: str | None = None) -> str:
+def build_chat_system(review_type: str | None, *, client_language: str | None = None, audience: str | None = None, funding_intent: str | None = None) -> str:
     """Return the chat prompt for exactly one product persona and audience.
 
     Mirrors build_review_system: the dealer, real-estate and Main Street chat
@@ -531,13 +535,17 @@ def build_chat_system(review_type: str | None, *, client_language: str | None = 
         # INTERNAL thread: product knowledge only — the borrower interview
         # script (stage sequencing, one-item-at-a-time requests) is
         # structurally absent so it can never leak onto the operator.
-        notes = _ADMIN_PRODUCT_NOTES.get(review_type or "", "")
+        notes = (mca_funding_prompts.PRODUCT_NOTES
+                 if review_type == "main_street_v1" and funding_intent == mca_funding_policy.PROGRAM_KEY
+                 else _ADMIN_PRODUCT_NOTES.get(review_type or "", ""))
         base = f"{CHAT_PREAMBLE}\n"
         if notes:
             base += f"\n{notes}\n"
         base += f"\n{ADMIN_THREAD_CHAT_RULES}\n{EBITDA_REASONING_RULES}\n"
         return base
-    if review_type == "dealer_gatekeeper_v1":
+    if review_type == "main_street_v1" and funding_intent == mca_funding_policy.PROGRAM_KEY:
+        base = f"{CHAT_PREAMBLE}\n{mca_funding_prompts.CHAT_RULES}\n"
+    elif review_type == "dealer_gatekeeper_v1":
         base = f"{CHAT_PREAMBLE}\n{DEALER_CHAT_RULES}\n"
     elif review_type == "real_estate_dscr_v1":
         base = f"{CHAT_PREAMBLE}\n{RE_CHAT_RULES}\n"
@@ -696,9 +704,11 @@ RE_FILE_ANALYSIS_HINT = """This document belongs to a real-estate / DSCR investo
 MAIN_STREET_FILE_ANALYSIS_HINT = """This document belongs to an operating-business financing file — a restaurant, mechanic shop, grocery, trucking company, manufacturer, retailer, contractor, or professional practice. Read it as bank-statement / tax-return / P&L / balance-sheet / debt-schedule / merchant-processing / equipment / fleet / operating-authority / license / lease / receivables evidence where applicable. Never classify it with dealer floorplan/MCA/inventory categories, and do not ask DSCR/rent questions unless the file actually concerns pledged real estate."""
 
 
-def build_file_analysis_system(review_type: str | None) -> str:
+def build_file_analysis_system(review_type: str | None, *, funding_intent: str | None = None) -> str:
     """Per-file analysis prompt, product-aware but single-persona (never mixes
     the dealer, real-estate and Main Street guidance), mirroring build_review_system."""
+    if review_type == "main_street_v1" and funding_intent == mca_funding_policy.PROGRAM_KEY:
+        return f"{FILE_ANALYSIS_PREAMBLE}\n{mca_funding_prompts.FILE_ANALYSIS_HINT}\n"
     if review_type == "dealer_gatekeeper_v1":
         return f"{FILE_ANALYSIS_PREAMBLE}\n{DEALER_FILE_ANALYSIS_HINT}\n"
     if review_type == "real_estate_dscr_v1":
@@ -730,9 +740,22 @@ def _client_visible_offer(context: dict[str, Any]) -> dict[str, Any] | None:
     return offer
 
 
+def _funding_intent(context: dict[str, Any] | None) -> str | None:
+    """Read product identity from server-owned context, retaining old aliases."""
+    context = context or {}
+    for key in ("funding_intent", "intent", "funding_program_key"):
+        if context.get(key) == mca_funding_policy.PROGRAM_KEY:
+            return mca_funding_policy.PROGRAM_KEY
+    return None
+
+
 def _public_ai_context(bucket: Bucket) -> dict[str, Any]:
     context = bucket.ai_context or {}
     review_type = context.get("review_type")
+    if review_type == "main_street_v1" and _funding_intent(context) == mca_funding_policy.PROGRAM_KEY:
+        # Rebuild the public policy from canonical product facts, rather than
+        # leaking stale generic checklist text or internal context overrides.
+        return {**mca_funding_policy.ai_context(), "industry": context.get("industry")}
     if review_type == "mca_refi_v1":
         return {
             "review_type": "mca_refi_v1",
@@ -3170,6 +3193,7 @@ async def analyze_bucket_file(
     file: BucketFile,
     *,
     review_type: str | None = None,
+    funding_intent: str | None = None,
     force: bool = False,
 ) -> BucketFileAnalysis | None:
     """Analyze a single file ONCE per (content, version) and persist a durable,
@@ -3354,13 +3378,25 @@ async def analyze_bucket_file(
         except Exception:  # noqa: BLE001
             log.exception("financial citation text unavailable file=%s", file.id)
 
+    # Some profile-driven reads call this without a persona. Read only the
+    # server-owned bucket identity, avoiding lazy relationship I/O. Queued and
+    # review callers pass identity directly and do not need another query.
+    if funding_intent is None:
+        source_bucket = getattr(file, "__dict__", {}).get("bucket")
+        if source_bucket is None and isinstance(db, AsyncSession):
+            source_bucket = await db.get(Bucket, file.bucket_id)
+        source_context = getattr(source_bucket, "ai_context", None)
+        if isinstance(source_context, dict):
+            funding_intent = _funding_intent(source_context)
+            review_type = review_type or source_context.get("review_type")
+
     try:
         model = model_heavy()
         bank_output = not offer_document and _bank_analysis_needs_long_output(row)
         analysis_system = (
             merchant_processing.MERCHANT_OFFER_ANALYSIS_SYSTEM
             if offer_document
-            else build_file_analysis_system(review_type)
+            else build_file_analysis_system(review_type, funding_intent=funding_intent)
         )
         resp = await tracked_messages_create(
             db,
@@ -3722,7 +3758,10 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
             continue
         await _set_progress("analyzing", f"Analyzing {file.file_name}…", files_done)
         try:
-            analysis = await analyze_bucket_file(db, file, review_type=review_type)
+            analysis = await analyze_bucket_file(
+                db, file, review_type=review_type,
+                funding_intent=_funding_intent(review.context_snapshot) or _funding_intent(bucket.ai_context),
+            )
         except Exception as exc:  # noqa: BLE001
             log.exception("bucket_ai: file analysis failed review=%s file=%s", review.id, file.id)
             review.status = "failed"
@@ -3829,7 +3868,9 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
             model=model,
             metadata={"bucket_id": str(bucket.id), "bucket_ai_review_id": str(review.id)},
             max_tokens=6000,
-            system=build_review_system(review_type),
+            system=build_review_system(
+                review_type, funding_intent=_funding_intent(review.context_snapshot) or _funding_intent(bucket.ai_context),
+            ),
             messages=[{"role": "user", "content": content}],
         )
         review.provider = "bedrock"
@@ -4126,12 +4167,14 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
             await db.commit()
             continue
         review_type = (file.bucket.ai_context or {}).get("review_type") if file.bucket else None
+        product_intent = _funding_intent(file.bucket.ai_context) if file.bucket else None
         try:
             await analyze_bucket_file(
                 db,
                 file,
                 review_type=review_type,
                 force=placeholder.skip_reason == "force_reanalysis",
+                **({"funding_intent": product_intent} if product_intent else {}),
             )
             await db.commit()
             processed += 1
@@ -4177,12 +4220,14 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
         )
         for file in missing_files:
             try:
+                product_intent = _funding_intent(file.bucket.ai_context) if file.bucket else None
                 await analyze_bucket_file(
                     db,
                     file,
                     review_type=(file.bucket.ai_context or {}).get("review_type")
                     if file.bucket
                     else None,
+                    **({"funding_intent": product_intent} if product_intent else {}),
                 )
                 await db.commit()
                 processed += 1
@@ -4276,6 +4321,14 @@ def _visible_review_items(items: Any, visible_names: set[str]) -> list[dict[str,
 
 
 def upload_link_visible_summary(review: BucketAIReview | None, bucket: Bucket) -> dict[str, Any] | None:
+    context = bucket.ai_context or {}
+    if context.get("review_type") == "main_street_v1" and _funding_intent(context) == mca_funding_policy.PROGRAM_KEY:
+        # Standard MCA uses the PIN-scoped, allowlisted review DTO. The legacy
+        # projection below includes staff context and unfiltered review text;
+        # it must not enter either the public response or the applicant's model
+        # context. Source evidence and current published figures are supplied
+        # independently to chat through its existing client-safe context.
+        return None
     active_files = [
         file
         for file in bucket.files
@@ -4616,6 +4669,7 @@ async def create_chat_reply(
                 review_type,
                 client_language=preferred_language if audience == "uploader" else None,
                 audience=audience,
+                funding_intent=_funding_intent(bucket.ai_context),
             )
             + (ADMIN_LOOKUP_FLOOR if admin_lookup else ""),
             messages=chat_messages_arg,

@@ -157,7 +157,7 @@ def test_the_lender_zip_the_room_file_list_and_the_review_all_skip_it():
 def test_the_offer_prompt_is_chosen_by_the_marker_before_any_persona_and_names_no_other_persona():
     source = inspect.getsource(ai.analyze_bucket_file)
     assert "merchant_processing.MERCHANT_OFFER_ANALYSIS_SYSTEM" in source
-    assert source.index("offer_document = merchant_processing.is_offer_document(file)") < source.index("build_file_analysis_system(review_type)")
+    assert source.index("offer_document = merchant_processing.is_offer_document(file)") < source.index("build_file_analysis_system(")
     prompt = mp.MERCHANT_OFFER_ANALYSIS_SYSTEM.lower()
     assert "merchant cash advance" not in prompt and "merchant-cash-advance" not in prompt
     assert "car dealer" not in prompt and "real estate" not in prompt
