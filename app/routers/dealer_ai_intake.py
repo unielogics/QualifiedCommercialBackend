@@ -904,6 +904,7 @@ class AdminLeadCreate(BusinessProfileFields):
     # One of the keys in _ADMIN_VARIANT_CONSTANTS: dealer | real_estate |
     # main_street | mca_refinance.
     variant: str = Field(default="dealer")
+    client_id: UUID | None = None
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr | None = None
     phone: OptionalPhone = None
@@ -9576,6 +9577,21 @@ async def _create_admin_ai_lead_core(
             # The bucket's routing fallback must not become a client answer.
             "industry": payload.industry,
         }
+        if ms_intent == "merchant_cash_advance":
+            from app.services import mca_funding_policy
+
+            intake_state["funding_intent"] = mca_funding_policy.PROGRAM_KEY
+            intake_state["mca_product_policy"] = mca_funding_policy.declaration_metadata()
+            # Retain the public lead's answers as a dated declaration. They do
+            # not establish accepted document facts or automatic eligibility.
+            source_answers = client.lead_intake if isinstance(client.lead_intake, dict) else {}
+            if client.source_channel == "mca_funding":
+                intake_state["mca_funding_declaration"] = {
+                    key: source_answers[key] for key in (
+                        "active_mca_count", "has_modified_mca", "last_year_tax_earnings",
+                        "tax_year", "consent_version", "consented_at", "mca_product_policy",
+                    ) if key in source_answers
+                }
     if equipment_application:
         intake_state["funding_intent"] = "equipment"
         if not is_ms:

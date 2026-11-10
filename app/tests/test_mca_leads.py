@@ -22,6 +22,9 @@ def request_body(**changes):
         "email": "owner@example.com",
         "phone": "(212) 555-0123",
         "active_mca_count": 2,
+        "has_modified_mca": False,
+        "last_year_tax_earnings": "nonnegative",
+        "tax_year": mca_leads.mca_funding_policy.required_tax_year(),
         "requested_amount": "50k_100k",
         "monthly_revenue": "25k_50k",
         "time_in_business": "2_plus_years",
@@ -41,10 +44,20 @@ def application(db):
     return app
 
 
+def persisted_answers(**changes):
+    return {"active_mca_count": 2, "has_modified_mca": False,
+            "last_year_tax_earnings": "nonnegative", "tax_year": mca_leads.mca_funding_policy.required_tax_year(),
+            "consent_version": mca_leads.CONSENT_VERSION,
+            "mca_product_policy": mca_leads.mca_funding_policy.declaration_metadata(), **changes}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changes", [
     {"active_mca_count": 3}, {"active_mca_count": 12}, {"active_mca_count": -1},
     {"active_mca_count": True}, {"active_mca_count": "2"}, {"active_mca_count": 1.5},
+    {"has_modified_mca": True}, {"has_modified_mca": None}, {"has_modified_mca": "false"},
+    {"has_modified_mca": 0}, {"last_year_tax_earnings": "negative"}, {"last_year_tax_earnings": "unknown"},
+    {"last_year_tax_earnings": None}, {"tax_year": 2024}, {"tax_year": "2025"}, {"tax_year": True},
     {"consent": False}, {"website": "https://spam.example"}, {"full_name": "  "},
     {"business_name": "  "}, {"phone": "123"}, {"monthly_revenue": "made_up"},
     {"credit_score": 800}, {"attribution": {"page": "https://other.example"}},
@@ -80,6 +93,9 @@ async def test_eligible_request_is_persisted_as_crm_lead_with_consent_and_attrib
     assert lead.lead_intake["consent_version"] == mca_leads.CONSENT_VERSION
     assert lead.lead_intake["consented_at"]
     assert lead.lead_intake["review_status"] == "pending_review"
+    assert lead.lead_intake["has_modified_mca"] is False
+    assert lead.lead_intake["mca_product_policy"]["verification_status"] == "pending_document_review"
+    assert lead.lead_intake["mca_product_policy"]["mca_count_basis"] == "existing_before_new_advance"
     assert lead.lead_intake["allowed_contact_channels"] == ["phone", "email"]
     assert "idempotency_key" not in lead.lead_intake
     assert activity.client_id == lead.id
@@ -88,7 +104,7 @@ async def test_eligible_request_is_persisted_as_crm_lead_with_consent_and_attrib
 
 @pytest.mark.asyncio
 async def test_retry_is_idempotent_and_cannot_overwrite_another_email():
-    existing = SimpleNamespace(source_channel="mca_funding", email="owner@example.com")
+    existing = SimpleNamespace(source_channel="mca_funding", email="owner@example.com", lead_intake=persisted_answers())
     db = Mock(get=AsyncMock(return_value=existing), commit=AsyncMock())
     body = request_body()
     async with AsyncClient(transport=ASGITransport(app=application(db)), base_url="http://test") as client:
@@ -101,8 +117,25 @@ async def test_retry_is_idempotent_and_cannot_overwrite_another_email():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("saved", [persisted_answers(consent_version="mca-funding-review-v1"),
+                                  persisted_answers(active_mca_count=1),
+                                  persisted_answers(mca_product_policy={}),
+                                  persisted_answers(has_modified_mca=None)])
+async def test_retry_cannot_rewrite_old_consent_or_different_qualification_answers(saved):
+    existing = SimpleNamespace(source_channel="mca_funding", email="owner@example.com", lead_intake=saved)
+    db = Mock(get=AsyncMock(return_value=existing), commit=AsyncMock())
+    original = dict(saved)
+    async with AsyncClient(transport=ASGITransport(app=application(db)), base_url="http://test") as client:
+        response = await client.post("/api/v1/public/mca/leads", json=request_body())
+    assert response.status_code == 409
+    assert existing.lead_intake == original
+    db.add.assert_not_called()
+    db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_simultaneous_duplicate_recovers_only_after_a_saved_record_exists():
-    existing = SimpleNamespace(source_channel="mca_funding", email="owner@example.com")
+    existing = SimpleNamespace(source_channel="mca_funding", email="owner@example.com", lead_intake=persisted_answers())
     db = Mock(get=AsyncMock(side_effect=[None, existing]), flush=AsyncMock(), commit=AsyncMock(side_effect=IntegrityError("duplicate", {}, None)), rollback=AsyncMock())
     with patch.object(mca_leads, "primary_super_admin", AsyncMock(return_value=None)):
         async with AsyncClient(transport=ASGITransport(app=application(db)), base_url="http://test") as client:

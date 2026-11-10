@@ -104,6 +104,24 @@ def test_missing_contact_draft_can_be_read_and_submission_requires_the_rest():
     assert "Email" in caught.value.detail and "Legal business name" in caught.value.detail
 
 
+def test_mca_product_stays_fixed_when_the_borrower_saves_application_answers():
+    row = intake()
+    row.intake_state["funding_intent"] = "merchant_cash_advance"
+    row.intake_state["main_street_details"] = {"intent": "merchant_cash_advance", "industry": "other"}
+    application_profile = profile(row, "main_street")
+    application_profile.funding_category = "merchant_cash_advance"
+    read = service.read_application(row, application_profile)
+    assert read.funding_need == "merchant_cash_advance" and not read.funding_need_editable
+    with pytest.raises(HTTPException) as error:
+        service.apply_application(row, application_profile, SimpleNamespace(), None,
+                                  complete(funding_need="working_capital"), submit=False)
+    assert error.value.status_code == 403
+    service.apply_application(row, application_profile, SimpleNamespace(), None,
+                              complete(funding_need="merchant_cash_advance"), submit=False)
+    assert application_profile.funding_category == "merchant_cash_advance"
+    assert row.intake_state["main_street_details"]["intent"] == "merchant_cash_advance"
+
+
 def test_historical_partial_answers_are_readable_for_client_correction():
     row = intake()
     row.phone = "unknown"

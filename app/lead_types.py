@@ -19,6 +19,7 @@ FundingIntent = Literal[
     "real_estate",
     "debt_refinance",
     "mca_refinance",
+    "merchant_cash_advance",
     "other",
 ]
 
@@ -32,6 +33,7 @@ FUNDING_INTENTS: Final[tuple[FundingIntent, ...]] = (
     "real_estate",
     "debt_refinance",
     "mca_refinance",
+    "merchant_cash_advance",
     "other",
 )
 

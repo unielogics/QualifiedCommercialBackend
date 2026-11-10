@@ -68,6 +68,7 @@ from app.services import (
     equipment_financing,
     file_events,
     locked_file_requests,
+    mca_funding_policy,
     mca_refinance_policy,
     provenance,
     requirement_library,
@@ -131,7 +132,7 @@ BUSINESS_ENTITY_REQUIREMENTS = {
     "current_advance_terms",
 }
 
-POLICY_KEYS = {"business_baseline", "real_estate_baseline", "mca_baseline"}
+POLICY_KEYS = {"business_baseline", "real_estate_baseline", "mca_baseline", "mca_funding_baseline"}
 
 
 def now() -> datetime:
@@ -525,6 +526,31 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
     mca_bucket_id = getattr(profile, "primary_bucket_id", None) or getattr(intake, "bucket_id", None)
     mca_bucket = await db.get(Bucket, mca_bucket_id) if mca_bucket_id else None
     mca_policy = mca_refinance_policy.evaluate(intake, bucket=mca_bucket)
+    from app.services import financial_version_selection
+    from app.services.financial_cockpit import bank_months, tax_years
+
+    standard_mca_schedule = None
+    standard_mca_policy = mca_funding_policy.assess_evidence(
+        schedule_body=None, tax_records=[], bank_months=[], business_entity=expected_entity, bank_accounts={})
+    if (getattr(profile, "funding_category", None) == mca_funding_policy.PROGRAM_KEY
+            or intake_state.get("funding_intent") == mca_funding_policy.PROGRAM_KEY
+            or (intake_state.get("main_street_details") or {}).get("intent") == mca_funding_policy.PROGRAM_KEY):
+        standard_mca_schedule = await financial_version_selection.accepted_debt_schedule_snapshot(db, profile.id)
+        _, standard_mca_accounts = bank_months(analysis_rows, counted_accounts,
+            dict(getattr(profile, "bank_account_aliases", None) or {}))
+        accepted_account_months = {account["key"]: [] for account in standard_mca_accounts if account["counted"]}
+        for reference in statement_refs:
+            if reference["account_key"] in accepted_account_months and reference["month"] in accepted_bank_months:
+                accepted_account_months[reference["account_key"]].append(reference["month"])
+        standard_mca_policy = mca_funding_policy.assess_evidence(
+            schedule_body=getattr(standard_mca_schedule, "body", None),
+            # Preserve conflicting accepted copies of the same return year for
+            # review; aggregate tax-year selection must not pick a passing copy.
+            tax_records=[year for source in analysis_rows
+                         for year in tax_years([source], business_entity=expected_entity)],
+            bank_months=list(accepted_bank_months), business_entity=expected_entity,
+            bank_accounts=accepted_account_months,
+        )
     # A model observation can tighten a cap, never establish the missing
     # declaration needed to open automatic matching. An upload count is not an
     # MCA count, and unknown does not mean zero or one active position.
@@ -630,6 +656,11 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         "active_mca_count": mca_count,
         "requested_term_months": mca_policy["requested_term_months"],
         "mca_refinance_policy": mca_policy,
+        "mca_funding_policy": standard_mca_policy,
+        "mca_funding_active_count": standard_mca_policy["active_mca_count"],
+        "mca_funding_has_modified_mca": standard_mca_policy["has_modified_mca"],
+        "mca_funding_prior_year_ordinary_income": standard_mca_policy["prior_year_ordinary_business_income"],
+        "mca_funding_last_six_months_complete": not standard_mca_policy["missing_statement_months"],
         "use_of_funds_total": budget.total if budget.items else None,
         "real_estate_equipment_amount": budget.real_estate_equipment_amount if budget.items else None,
         "real_estate_equipment_pct": budget.real_estate_equipment_pct,
@@ -676,6 +707,14 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         ApplicationExtractedFact.status == "accepted",
     ))).scalars().all())
     context["fact_sources"] = _fit_fact_sources(context, reviewed_facts, files, latest_analyses, associations)
+    for field in ("mca_funding_active_count", "mca_funding_has_modified_mca",
+                  "mca_funding_prior_year_ordinary_income", "mca_funding_last_six_months_complete"):
+        context["fact_sources"][field] = {
+            "verification_status": "verified" if context[field] is not None else "unknown",
+            "source_refs": [{"kind": "standard_mca_evidence_policy", "policy_version": mca_funding_policy.POLICY_VERSION,
+                             "schedule_version_id": str(standard_mca_schedule.id) if standard_mca_schedule is not None else None,
+                             **standard_mca_policy["source_refs"]}],
+        }
     # Six accepted statements say more than "needs information". Revenue and
     # cash flow are estimated from them when no P&L or tax return is on file;
     # the estimate is labelled as one, and a person can replace it.
@@ -1242,6 +1281,7 @@ async def published_candidates(
             # count even when another funding source currently asks for less.
             mca_assessment = intake_mca_policy
         mca_blocked = mca_assessment is not None and not mca_assessment["auto_underwriting_allowed"]
+        standard_mca_assessment = context.get("mca_funding_policy") if item.program_key == mca_funding_policy.PROGRAM_KEY else None
         if intent_outside_lending:
             recommendation_status = "not_eligible"
             reasons = ["Current intake intent is not routed to lending"]
@@ -1258,6 +1298,11 @@ async def published_candidates(
             reasons = [mca_refinance_policy.message(mca_assessment)]
             eligible = False
             rule_state = "fail" if recommendation_status == "custom_review" else "unknown"
+        elif standard_mca_assessment and not standard_mca_assessment["auto_underwriting_allowed"]:
+            recommendation_status = standard_mca_assessment["recommendation_status"]
+            reasons = standard_mca_assessment["reasons"]
+            eligible = False
+            rule_state = "fail" if recommendation_status == "not_eligible" else "unknown"
         elif not has_fit_rule or result is None:
             recommendation_status = "criteria_unavailable"
             reasons = [
@@ -1377,6 +1422,9 @@ def _automatic_candidates(
     picked: list[ProgramFitCandidate] = []
     seen: set[str] = set()
     for item in candidates:
+        if (getattr(profile, "funding_category", None) == mca_funding_policy.PROGRAM_KEY
+                and item.program_key != mca_funding_policy.PROGRAM_KEY):
+            continue
         if not item.eligible or item.program_key in seen:
             continue
         seen.add(item.program_key)
@@ -2170,6 +2218,11 @@ def _coverage_for_files(
                 months.update(file_months)
             else:
                 unknown_period_files += 1
+        config = getattr(requirement, "collection_config", None) or {}
+        wanted_months = None
+        if config.get("reporting_period") == "last_six_complete_months":
+            wanted_months = set(mca_funding_policy.required_statement_months())
+            months.intersection_update(wanted_months)
         current = len(months)
         coverage.update(
             {
@@ -2182,6 +2235,8 @@ def _coverage_for_files(
             }
         )
         complete = current >= required_months
+        if wanted_months is not None:
+            coverage["missing_months"] = sorted(wanted_months - months)
     elif required_years:
         years: set[str] = set()
         unknown_year_files = 0
@@ -4004,6 +4059,13 @@ async def get_program_readiness(
                 qualification_blocking.append(key)
                 if not qualification.get("reasons"):
                     qualification_warnings.append("This program requirement was removed from document collection; no program-condition waiver was recorded.")
+        if selection.program_key == mca_funding_policy.PROGRAM_KEY:
+            standard_mca = context.get("mca_funding_policy") or {}
+            if not standard_mca.get("auto_underwriting_allowed"):
+                # Collection receipts and waivers cannot establish product
+                # eligibility from a declaration or substitute tax EBITDA.
+                qualification_warnings.extend(standard_mca.get("reasons") or ["Review standard MCA policy evidence."])
+                qualification_blocking.append("business_debt_schedule")
         if required_keys and not loading_blockers and not qualification_blocking:
             fully_loaded_program_keys.append(selection.program_key)
         percent = 0 if not required_keys else round((satisfied / len(required_keys)) * 100)
@@ -4706,6 +4768,8 @@ async def accept_high_confidence_ai_evidence(
 
 
 def _policy_key_for_profile(profile: ApplicationProfile) -> str:
+    if getattr(profile, "funding_category", None) == mca_funding_policy.PROGRAM_KEY:
+        return mca_funding_policy.EVIDENCE_POLICY_KEY
     return {
         "real_estate": "real_estate_baseline",
         "mca": "mca_baseline",

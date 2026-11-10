@@ -465,6 +465,20 @@ def _commercial_terms_read(
 
 
 def _validate_mca_commercial_limits(program_key: str, values: Any) -> None:
+    if program_key == "merchant_cash_advance":
+        from app.services.mca_funding_policy import MAX_FACTOR, MIN_FACTOR
+
+        if getattr(values, "pricing_basis", None) != "factor_rate":
+            raise HTTPException(422, detail=_field_validation_detail(
+                "pricing_basis", message="Standard MCA pricing uses a factor rate, not APR.",
+                input_value=getattr(values, "pricing_basis", None)))
+        for field in ("minimum_pricing", "maximum_pricing"):
+            value = getattr(values, field, None)
+            if value is None or not float(MIN_FACTOR) <= float(value) <= float(MAX_FACTOR):
+                raise HTTPException(422, detail=_field_validation_detail(
+                    field, message="Standard MCA factor pricing must be between 1.22x and 1.38x.",
+                    input_value=float(value) if value is not None else None))
+        return
     if program_key != "mca_refinance":
         return
     for field, maximum in (("minimum_amount", MAX_AMOUNT), ("maximum_amount", MAX_AMOUNT),

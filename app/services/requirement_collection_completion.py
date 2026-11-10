@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from datetime import UTC, datetime
 
@@ -45,6 +46,12 @@ def tax_eligible_files(requirement, files, analyses, *, expected_entity=None, as
     from app.services.financial_tax_earnings import tax_source_is_business
 
     candidates = []
+    config = getattr(requirement, "collection_config", None) or {}
+    target_year = None
+    if config.get("reporting_period") == "prior_calendar_year":
+        from app.services.mca_funding_policy import required_tax_year
+
+        target_year = str(required_tax_year())
     for file in files:
         analysis = analyses.get(file.id)
         facts = (getattr(analysis, "analysis", None) or {}).get("key_facts") or {}
@@ -54,6 +61,13 @@ def tax_eligible_files(requirement, files, analyses, *, expected_entity=None, as
             continue
         if expected_entity and not identity_matches(expected_entity, entity, association):
             continue
+        if target_year is not None:
+            # A comparative prior-year figure inside an older return or the
+            # filename alone cannot change its actual filing year.
+            explicit_year = facts.get("tax_year") or facts.get("fiscal_year") or facts.get("return_year")
+            years = re.findall(r"\b(?:19|20)\d{2}\b", str(explicit_year or ""))
+            if years != [target_year]:
+                continue
         candidates.append(file)
     years = programs._configured_period_count(requirement, "years")
     if years == 1 and candidates:

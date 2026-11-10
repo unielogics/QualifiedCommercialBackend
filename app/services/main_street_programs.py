@@ -66,6 +66,11 @@ IntentKind = Literal["lending", "non_lending", "route_out"]
 # than screened against the wrong package — and so the dealer and real-estate
 # funnels stop being polluted by Main Street traffic.
 MAIN_STREET_INTENTS: dict[str, dict[str, Any]] = {
+    "merchant_cash_advance": {
+        "kind": "lending",
+        "en": "Merchant cash advance (MCA)",
+        "es": "Adelanto de efectivo comercial (MCA)",
+    },
     "working_capital": {
         "kind": "lending",
         "en": "Working capital or a business loan",
@@ -364,6 +369,11 @@ def documents_for(intent: Any, industry: Any = None) -> list[dict[str, Any]]:
     """
     slug = normalize_intent(intent)
     kind = intent_kind(slug)
+
+    if slug == "merchant_cash_advance":
+        from app.services.mca_funding_policy import intake_documents
+
+        return intake_documents()
 
     if slug == "business_systems":
         return []
@@ -670,6 +680,14 @@ def compute_main_street_program_fit(
 
     if kind == "route_out" or slug == "business_systems":
         return {}
+
+    if slug == "merchant_cash_advance":
+        # This older screen receives model metrics, not current accepted
+        # source records. Keep it out of the generic two-tax-year/FICO/DSCR
+        # screen; the versioned program engine performs the evidence gate.
+        return {"merchant_cash_advance": {"eligible": False, "blocked_by": [],
+            "needs": ["Review six complete bank statement months, the saved debt schedule, and the prior-year business tax return against the MCA policy."],
+            "recommendation_status": "needs_information"}}
 
     # ── Merchant services: its own screen, its own evidence ──
     # The dealer implementation derives this from annualized bank deposits,
