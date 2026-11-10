@@ -1575,6 +1575,8 @@ async def update_operator_file_economics(
     if "origination_fee_points" in changes:
         alias_value = changes.pop("origination_fee_points")
         changes.setdefault("forecast_fee_points", alias_value)
+    from app.services.deal_budget import sync_legacy_write
+    await sync_legacy_write(db, profile, changes, user)
     if "accepted_amount" in changes:
         value = changes["accepted_amount"]
         profile.underwriting_accepted_amount = (

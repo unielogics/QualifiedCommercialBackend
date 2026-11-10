@@ -411,12 +411,60 @@ def _open_conditions(financials, improvement, terms):
     missing.extend(str(issue) for row in _records(improvement.get("adjustments")) for issue in row.get("issues") or [])
     if not terms:
         missing.append("Proposed investment amount, pricing, amortization and maturity terms are not recorded.")
+    budget = _record(_record(financials.get("investor_report")).get("deal_budget"))
+    if budget.get("stale"):
+        missing.append("The cost proposal changed; record a new terms version before offering updated investor charges.")
+    if budget and _record(budget.get("calculation")).get("status") != "ready":
+        missing.append("Confirm the cost schedule, reserves, capital to raise and minimum contribution.")
+    reconciliation = _record(budget.get("current_allocation_reconciliation")) or _record(_record(budget.get("calculation")).get("allocation_reconciliation"))
+    if reconciliation.get("scope") == "requested_reference":
+        missing.insert(0, "Allocate net proceeds for the proposed loan; the displayed requested-budget uses are a reference and the proposed allocation remains unconfirmed.")
+    if reconciliation.get("status") == "overallocated":
+        missing.insert(0, f"Use-of-funds allocations exceed net loan proceeds at funding by {_money(abs(float(reconciliation['variance'])))}; revise the budget or document additional borrower cash.")
     metrics = _record(financials.get("current_key_metrics"))
     if metrics.get("annual_noi") is None:
         missing.append("Reconciled business operating-income statement needed for NOI.")
     if metrics.get("annual_ebitda") is None:
         missing.append("Validated P&L EBITDA is unavailable; tax-derived coverage earnings remain a separately labelled estimate.")
     return list(dict.fromkeys(filter(None, missing)))
+
+
+def _budget_overview(page, report, terms, use_of_funds, requested, disclosure):
+    from app.services.financing_budget_disclosure import cost_formula
+
+    calc = _record(disclosure.get("calculation"))
+    allocation = _record(disclosure.get("current_allocation_reconciliation")) or _record(calc.get("allocation_reconciliation"))
+    currency = disclosure.get("currency") or "USD"
+    gross_roi, net_roi = calc.get("investor_gross_roi_pct"), calc.get("investor_net_roi_pct")
+    minimum = calc.get("minimum_investor_contribution")
+    mode = "Single investor" if disclosure.get("funding_mode") == "single_investor" else "Multiple investors"
+    _card(page, (34, 197, 319, 316), "Requested financing", _money(requested), f"Proposed gross loan {_money(calc.get('gross_loan_amount'), currency)}")
+    _card(page, (337, 197, 622, 316), "Investment capital to raise", _money(calc.get("investor_funding_amount"), currency), f"{mode}; minimum {_money(minimum, currency)}")
+    _card(page, (640, 197, 925, 316), "Gross contractual return", f"{gross_roi:.2f}%" if gross_roi is not None else "Unknown", f"Net after charges: {net_roi:.2f}% on {_money(calc.get('investor_initial_outlay'), currency)} initial outlay" if net_roi is not None else "Net return unknown; confirm all costs")
+    _text(page, (35, 329, 468, 350), f"Net loan proceeds at funding: {_money(calc.get('net_client_cash'), currency)}", size=11.5, bold=True, color=TEAL)
+    allocations = list(_record(use_of_funds.get("category_totals")).items())
+    uses = "; ".join(f"{str(key).replace('_', ' ').title()}: {_money(amount)}" for key, amount in allocations[:4])
+    if len(allocations) > 4:
+        uses += f"; {len(allocations) - 4} more uses in the file"
+    uses_label = "Requested-budget reference" if allocation.get("scope") == "requested_reference" else "Uses"
+    _text(page, (36, 352, 468, 390), f"{uses_label}: {uses or 'Awaiting confirmation'}. Separate borrower closing cash {_money(calc.get('borrower_paid_separately'), currency)}. Other funding required {_money(calc.get('other_funding_required'), currency)} (unconfirmed). Reserves are not fee income.", size=9)
+    _text(page, (486, 329, 922, 350), "Terms and return basis", size=12, bold=True)
+    _text(page, (488, 352, 922, 390), _plain_terms(terms).replace("\n", " ").replace("APR ", "Stated note rate ") + " Full-term return before losses/taxes. All-in borrower APR including fees has not been calculated.", size=9)
+    rows = _records(disclosure.get("rows"))
+    status = "New proposal requires updated terms" if disclosure.get("stale") else "Use-of-funds gap; review required" if allocation.get("status") == "overallocated" else "Review required" if calc.get("status") != "ready" else "Recorded cost disclosure"
+    _text(page, (36, 392, 923, 406), f"CLOSING / INVESTOR COSTS  |  {status}  |  {min(8, len(rows))} of {len(rows)} rows; full schedule in file  " + _citations(report, "deal_budget"), size=9, bold=True, color=TEAL)
+    for index, row in enumerate(rows[:8]):
+        x, y = (36 if index % 2 == 0 else 486), 407 + index // 2 * 24
+        if index // 2 % 2 == 0:
+            _rect(page, (x - 2, y - 1, x + 438, y + 23))
+        label = row.get("label") or "Cost"
+        if row.get("category") == "escrow_reserve":
+            label += " [reserve]"
+        _text(page, (x + 2, y, x + 326, y + 12), f"{label} / {str(row.get('payer') or 'Unknown').title()}", size=8.5, bold=True)
+        _text(page, (x + 329, y, x + 437, y + 12), _money(row.get("total_amount"), currency), size=8.5, bold=True)
+        _text(page, (x + 2, y + 12, x + 437, y + 24), cost_formula(row, currency) + ("; release unconfirmed" if row.get("category") == "escrow_reserve" and row.get("reserve_release") != "maturity" else ""), size=8.5, color=MUTE)
+    if not rows:
+        _text(page, (38, 420, 921, 467), "Staff confirmed no listed charges." if disclosure.get("costs_confirmed") else "No complete cost schedule is recorded. Unknown fees and reserve terms prevent a reliable net investor return.", size=11, color=MUTE)
 
 
 def render_investor_presentation_pdf(*, intake: Any, financials: dict, generated_at=None) -> bytes:
@@ -451,35 +499,39 @@ def render_investor_presentation_pdf(*, intake: Any, financials: dict, generated
     _text(page, (35, 139, 925, 162), _company_address(company), size=10, color=MUTE)
     profile = "  |  ".join(str(value) for value in (company.get("website"), company.get("industry"), "NAICS " + str(company["naics"]) if company.get("naics") else None) if value)
     _text(page, (35, 165, 925, 185), profile or "Business website / industry details awaiting confirmation", size=9, color=MUTE)
-    roi = returns["gross_contractual_roi_pct"]
-    _card(page, (34, 197, 319, 316), "Requested financing", _money(requested), "Current application request")
-    _card(page, (337, 197, 622, 316), "Proposed investment", _money(returns["investment_amount"]), "Full loan; participation allocation separate" if terms else "No active financing proposal")
-    _card(page, (640, 197, 925, 316), "Gross contractual return", f"{roi:.2f}%" if roi is not None else "Terms needed", "Full term, before fees / losses / taxes")
-    _heading(page, 35, 333, 425, "Use of funds", _citations(report, "use_of_funds"))
-    allocations = list(_record(budget.get("category_totals")).items())
-    colors = [TEAL, (.32, .45, .65), (.56, .68, .76), (.70, .77, .82)]
-    amounts = [_number(value) for _, value in allocations]
-    total = sum(value for value in amounts if value is not None and value > 0)
-    x = 37
-    for index, (_, value) in enumerate(allocations):
-        amount = _number(value)
-        if amount is not None and amount > 0 and total:
-            width = amount / total * 405
-            _rect(page, (x, 378, x + width, 389), fill=colors[index % len(colors)])
-            x += width
-    if not allocations:
-        _text(page, (37, 380, 448, 421), "Allocation awaiting confirmation.", size=11, color=MUTE)
-    for index, (category, amount) in enumerate(allocations[:4]):
-        label = str(category).replace("_", " ").title()
-        _rect(page, (37, 403 + index * 19, 44, 410 + index * 19), fill=colors[index % len(colors)])
-        _text(page, (51, 397 + index * 19, 448, 418 + index * 19), f"{label}: {_money(amount)}", size=10)
-    _heading(page, 486, 333, 435, "Proposed terms and return basis", _citations(report, "terms"))
-    _text(page, (488, 380, 918, 432), _plain_terms(terms), size=10.5)
-    _text(page, (488, 439, 918, 493), returns["note"], size=9, color=MUTE)
-    allocation_note = f"Allocated {_money(budget.get('total'))}; unallocated {_money(budget.get('unallocated_amount'))}."
-    if len(allocations) > 4:
-        allocation_note += f" {len(allocations) - 4} additional use categories in the file."
-    _text(page, (36, 482, 450, 503), allocation_note, size=8.5, color=MUTE)
+    cost_budget = _record(report.get("deal_budget"))
+    if cost_budget:
+        _budget_overview(page, report, terms, budget, requested, cost_budget)
+    else:
+        roi = returns["gross_contractual_roi_pct"]
+        _card(page, (34, 197, 319, 316), "Requested financing", _money(requested), "Current application request")
+        _card(page, (337, 197, 622, 316), "Proposed investment", _money(returns["investment_amount"]), "Full loan; participation allocation separate" if terms else "No active financing proposal")
+        _card(page, (640, 197, 925, 316), "Gross contractual return", f"{roi:.2f}%" if roi is not None else "Terms needed", "Full term, before fees / losses / taxes")
+        _heading(page, 35, 333, 425, "Use of funds", _citations(report, "use_of_funds"))
+        allocations = list(_record(budget.get("category_totals")).items())
+        colors = [TEAL, (.32, .45, .65), (.56, .68, .76), (.70, .77, .82)]
+        amounts = [_number(value) for _, value in allocations]
+        total = sum(value for value in amounts if value is not None and value > 0)
+        x = 37
+        for index, (_, value) in enumerate(allocations):
+            amount = _number(value)
+            if amount is not None and amount > 0 and total:
+                width = amount / total * 405
+                _rect(page, (x, 378, x + width, 389), fill=colors[index % len(colors)])
+                x += width
+        if not allocations:
+            _text(page, (37, 380, 448, 421), "Allocation awaiting confirmation.", size=11, color=MUTE)
+        for index, (category, amount) in enumerate(allocations[:4]):
+            label = str(category).replace("_", " ").title()
+            _rect(page, (37, 403 + index * 19, 44, 410 + index * 19), fill=colors[index % len(colors)])
+            _text(page, (51, 397 + index * 19, 448, 418 + index * 19), f"{label}: {_money(amount)}", size=10)
+        _heading(page, 486, 333, 435, "Proposed terms and return basis", _citations(report, "terms"))
+        _text(page, (488, 380, 918, 432), _plain_terms(terms), size=10.5)
+        _text(page, (488, 439, 918, 493), returns["note"], size=9, color=MUTE)
+        allocation_note = f"Allocated {_money(budget.get('total'))}; unallocated {_money(budget.get('unallocated_amount'))}."
+        if len(allocations) > 4:
+            allocation_note += f" {len(allocations) - 4} additional use categories in the file."
+        _text(page, (36, 482, 450, 503), allocation_note, size=8.5, color=MUTE)
 
     # 2 - A bounded twelve-month view with explicit missing values.
     banking = _record(report.get("banking"))
@@ -526,7 +578,7 @@ def render_investor_presentation_pdf(*, intake: Any, financials: dict, generated
         ("NOI / operating income", metrics.get("annual_noi"), _record(_record(earnings.get("noi")).get("scenario")).get("plan") if plan.get("active") else None, proposed.get("noi"), lambda value: _money(value, noi_currency)),
         ("Annual EBITDA (validated P&L)", metrics.get("annual_ebitda"), _record(impact.get("ebitda")).get("annual_after") if metrics.get("annual_ebitda") is not None else None, operating_ebitda_projection(financials), _money),
         ("Coverage earnings basis", earnings_value, _record(impact.get("income_annual")).get("after"), proposed.get("earnings"), lambda value: _money(value, source_currency)),
-        ("Signed DSCR", metrics.get("dscr"), _record(impact.get("dscr")).get("after"), proposed.get("dscr_current"), _ratio),
+        ("Signed DSCR / base evidence" if cost_budget else "Signed DSCR", metrics.get("dscr"), _record(impact.get("dscr")).get("after"), proposed.get("dscr_current"), _ratio),
         ("Monthly debt service", metrics.get("monthly_debt_service"), _record(impact.get("debt_service_monthly")).get("after"), None, _money),
     ]
     for index, (label, current, after, operating, render) in enumerate(rows):
@@ -537,7 +589,15 @@ def render_investor_presentation_pdf(*, intake: Any, financials: dict, generated
         for x0, x1, value in ((345, 530, current), (546, 730, after), (745, 922, operating)):
             _text(page, (x0, y, x1, y + 24), render(value), size=11, bold=True, color=RED if _number(value) is not None and float(value) < 0 else INK)
     source_note = "Coverage source: " + str(metrics.get("dscr_earnings_label") or metrics.get("dscr_basis") or "Pending evidence")
-    _text(page, (36, 314, 925, 345), source_note + ". Signed negative ratios remain losses; tax-derived earnings are not validated P&L EBITDA. " + ("Validated P&L EBITDA is unavailable. " if metrics.get("annual_ebitda") is None else "") + _citations(report, "financials"), size=9, color=MUTE)
+    fee_coverage = _record(cost_budget.get("current_financing_fee_coverage")) or _record(_record(cost_budget.get("calculation")).get("financing_fee_coverage"))
+    if fee_coverage:
+        base_fee_ratio = f"{float(fee_coverage['base_dscr']):.4f}x" if fee_coverage.get("base_dscr") is not None else "Pending evidence"
+        after_fee_ratio = f"{float(fee_coverage['with_financing_fees_dscr']):.4f}x" if fee_coverage.get("with_financing_fees_dscr") is not None else "Pending evidence"
+        coverage_basis = "current earnings" if cost_budget.get("current_financing_fee_coverage") else "recorded quote"
+        source_note += f". Financing-fee scenario ({coverage_basis}): base {base_fee_ratio} -> including borrower recurring charges {after_fee_ratio}; annual charges {_money(fee_coverage.get('annual_borrower_financing_fees'))}. Source NOI / EBITDA are unchanged."
+    else:
+        source_note += ". Signed negative ratios remain losses; tax-derived earnings are not validated P&L EBITDA. " + ("Validated P&L EBITDA is unavailable. " if metrics.get("annual_ebitda") is None else "")
+    _text(page, (36, 314, 925, 345), source_note + " " + _citations(report, "financials"), size=9, color=MUTE)
     _heading(page, 36, 352, 406, "Operating cost mix and disclosure", _citations(report, "operating_plan"))
     costs = sorted(_records(_record(improvement.get("disclosure")).get("cost_mix")), key=lambda row: _number(row.get("annual_amount")) or 0, reverse=True)[:4]
     maximum = max([_number(row.get("annual_amount")) or 0 for row in costs] + [1])
@@ -572,8 +632,8 @@ def render_investor_presentation_pdf(*, intake: Any, financials: dict, generated
 
     # 4 - Principal exposure, aggregate credit and explicitly declared collateral.
     page = _slide(doc, "Repayment, credit and collateral", business, stamp, 4)
-    _card(page, (34, 94, 319, 195), "Contractual receipts", _money(returns["total_contractual_receipts"]))
-    _card(page, (337, 94, 622, 195), "Gross finance income", _money(returns["gross_finance_income"]))
+    _card(page, (34, 94, 319, 195), "Full-loan contractual receipts" if cost_budget else "Contractual receipts", _money(returns["total_contractual_receipts"]))
+    _card(page, (337, 94, 622, 195), "Full-loan gross finance income" if cost_budget else "Gross finance income", _money(returns["gross_finance_income"]))
     _card(page, (640, 94, 925, 195), "Due at maturity", _money(returns["maturity_balloon"]))
     _heading(page, 36, 208, 545, "Principal after scheduled cash payments", _citations(report, "terms"))
     schedule = _records(terms.get("schedule_rows"))

@@ -394,11 +394,32 @@ def finish(review, dscr, service, bank):
 
 def redact_for_external(cockpit, actor):
     """Retain existing numeric visibility without exposing internal staff audit."""
-    if actor.role in {Role.SUPER_ADMIN, Role.REGIONAL_MANAGER, Role.BROKER, Role.LOAN_EXEC, Role.FIELD_REP}:
+    if actor.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
         return cockpit
     from copy import deepcopy
 
     result = deepcopy(cockpit)
+    from app.services.financing_budget_disclosure import public_budget
+
+    budget = result.get("deal_budget") or {}
+    safe_budget = public_budget({"current": budget, "basis": "staff_proposal", "calculation": budget.get("calculation")}) if budget else {}
+    private_budget_keys = {"deal_budget", "deal_budget_snapshot", "deal_budget_calculation", "current_deal_budget", "current_deal_budget_calculation"}
+    def remove_private_budget(value):
+        if isinstance(value, dict):
+            for key in list(value):
+                if key in private_budget_keys:
+                    value.pop(key)
+                else:
+                    remove_private_budget(value[key])
+        elif isinstance(value, list):
+            for item in value:
+                remove_private_budget(item)
+    remove_private_budget(result)
+    result["deal_budget"] = safe_budget
+    # These roles retain their pre-existing financial/audit visibility, while
+    # cost recipient identities use the dedicated budget endpoint's narrower ACL.
+    if actor.role in {Role.REGIONAL_MANAGER, Role.BROKER, Role.FIELD_REP}:
+        return result
     # The new staff source picker contains the private file inventory and
     # review concurrency fingerprints. Client forms use their own scoped links.
     result["operating_evidence"] = {}

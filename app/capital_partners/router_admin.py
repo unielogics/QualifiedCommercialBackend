@@ -297,6 +297,19 @@ async def prefill_listing(payload: S.PrefillIn, admin: CpAdmin, db: Db) -> dict[
     return out
 
 
+@router.post("/listings/ai-draft", response_model=S.ListingAIDraftOut)
+async def draft_listing(payload: S.ListingAIDraftIn, admin: CpAdmin, db: Db) -> S.ListingAIDraftOut:
+    """Reviewable copy and known capital figures; no listing is published."""
+    if not payload.profile_id and not payload.loan_id and not payload.intake_id:
+        raise HTTPException(422, "Pass profile_id, loan_id or intake_id.")
+    from .services import listing_draft
+
+    try:
+        return S.ListingAIDraftOut(**await listing_draft.prepare(db, admin, payload))
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
 async def _listing_admin_out(db: AsyncSession, listing: CpListing) -> S.ListingAdminOut:
     # created_at / updated_at are database-stamped and expire on every write
     # (see TimestampMixin); load them before the serializer touches them.
@@ -405,19 +418,33 @@ def _apply(listing: CpListing, payload: S.ListingIn) -> None:
             setattr(listing, key, value)
 
 
-async def _apply_file_financing(db: AsyncSession, listing: CpListing, *, prior: Any = None) -> None:
+async def _apply_file_financing(db: AsyncSession, listing: CpListing, *, prior: Any = None, payload: S.ListingIn | None = None) -> None:
     """Staff saves inherit the file's loan rather than creating another copy."""
     if listing.profile_id is None:
         return
     from app.models.application_profile import ApplicationProfile
 
-    profile = await db.get(ApplicationProfile, listing.profile_id)
+    if isinstance(db, AsyncSession):
+        profile = (await db.execute(select(ApplicationProfile).where(ApplicationProfile.id == listing.profile_id).with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+    else:
+        profile = await db.get(ApplicationProfile, listing.profile_id)
     if profile is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "The file behind this listing was not found.")
     fresh = await P.readiness_snapshot(db, profile)
+    if payload is not None:
+        from .services.listing_draft import source_fingerprint
+
+        current_budget = ((fresh.get("financials") or {}).get("deal_budget") or {}).get("current") or {}
+        if payload.expected_deal_budget_revision is not None and payload.expected_deal_budget_revision != int(current_budget.get("revision") or 0):
+            raise HTTPException(409, "The cost budget changed after this draft was prepared. Reload and review the latest draft before applying it.")
+        if payload.expected_source_fingerprint is not None and payload.expected_source_fingerprint != source_fingerprint(fresh):
+            raise HTTPException(409, "The file or financing changed after this draft was prepared. Draft again before applying it.")
     await _guard_financing_change(db, prior or listing, fresh)
     SYNC.apply_canonical_financing(listing, fresh)
     listing.source_snapshot = {**(listing.source_snapshot or {}), **fresh}
+    if payload is not None and payload.ai_draft_id:
+        listing.source_snapshot = {**listing.source_snapshot, "ai_draft": {"id": payload.ai_draft_id,
+            "source_fingerprint": payload.expected_source_fingerprint, "deal_budget_revision": payload.expected_deal_budget_revision}}
 
 
 async def _guard_financing_change(db: AsyncSession, listing: CpListing, fresh: dict[str, Any]) -> None:
@@ -430,13 +457,13 @@ async def _guard_financing_change(db: AsyncSession, listing: CpListing, fresh: d
 
 
 async def _guard_committed_listing_edit(db: AsyncSession, listing: CpListing, payload: S.ListingIn) -> None:
-    protected = {"loan_id", "profile_id", "loan_amount", "offered_amount", "note_rate_pct", "term_months", "products",
+    protected = {"loan_id", "profile_id", "loan_amount", "offered_amount", "minimum_investment", "note_rate_pct", "term_months", "products",
         "collateral_type", "lien_position", "ltv_pct", "ltv_kind", "payment_frequency", "maturity_date", "personal_guarantee"}
     values = payload.model_dump(exclude_unset=True)
     def comparable(key, value):
         if key == "products":
             return SYNC.economic_products(value)
-        if key in {"loan_amount", "offered_amount", "note_rate_pct", "term_months", "ltv_pct"}:
+        if key in {"loan_amount", "offered_amount", "minimum_investment", "note_rate_pct", "term_months", "ltv_pct"}:
             return SYNC.economic_number(value)
         return SYNC.normalized_financing(value)
     if not any(comparable(key, getattr(listing, key, None)) != comparable(key, values[key]) for key in protected & values.keys()):
@@ -465,9 +492,21 @@ async def _require_current_file_snapshot(db: AsyncSession, listing: CpListing) -
 async def create_listing(payload: S.ListingIn, admin: CpAdmin, db: Db) -> S.ListingAdminOut:
     if not payload.name or not payload.vertical:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "A listing needs a name and a vertical.")
+    if payload.profile_id or payload.loan_id:
+        from app.models.application_profile import ApplicationProfile
+        from app.models.loan import Loan
+
+        source_model, source_id = (ApplicationProfile, payload.profile_id) if payload.profile_id else (Loan, payload.loan_id)
+        await db.execute(select(source_model.id).where(source_model.id == source_id).with_for_update())
+        existing = await P.existing_listing(db, profile_id=payload.profile_id, loan_id=payload.loan_id)
+        if existing:
+            previous = await _load_admin_listing(db, uuid.UUID(str(existing["id"])))
+            if payload.ai_draft_id and ((previous.source_snapshot or {}).get("ai_draft") or {}).get("id") == payload.ai_draft_id:
+                return await _listing_admin_out(db, previous)
+            raise HTTPException(409, detail={"code": "listing_exists", "message": "This file already has an offering. Open it to review or update the draft.", "listing_id": existing["id"]})
     listing = CpListing(ref=await R.next_listing_ref(db, payload.vertical), status=E.ListingStatus.DRAFT, created_by_id=admin.id, vertical=payload.vertical, name=payload.name)
     _apply(listing, payload)
-    await _apply_file_financing(db, listing)
+    await _apply_file_financing(db, listing, payload=payload)
     if listing.servicer_label is None:
         listing.servicer_label = (await M.issuer_settings(db)).servicer_label
     db.add(listing)
@@ -488,9 +527,9 @@ async def patch_listing(listing_id: uuid.UUID, payload: S.ListingIn, admin: CpAd
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "closed", "message": "A repaid or withdrawn listing is read-only."})
     await _guard_committed_listing_edit(db, listing, payload)
     before = {k: str(getattr(listing, k)) for k in _LISTING_FIELDS if k != "source_snapshot"}
-    prior = SimpleNamespace(**{key: deepcopy(getattr(listing, key, None)) for key in ("id", "status", "products", "loan_amount", "offered_amount", "note_rate_pct", "term_months", "source_snapshot")})
+    prior = SimpleNamespace(**{key: deepcopy(getattr(listing, key, None)) for key in ("id", "status", "products", "loan_amount", "offered_amount", "minimum_investment", "note_rate_pct", "term_months", "source_snapshot")})
     _apply(listing, payload)
-    await _apply_file_financing(db, listing, prior=prior)
+    await _apply_file_financing(db, listing, prior=prior, payload=payload)
     changed = {k: before[k] for k in before if before[k] != str(getattr(listing, k))}
     await db.flush()
     if changed:
@@ -532,7 +571,7 @@ async def refresh_listing_snapshot(listing_id: uuid.UUID, admin: CpAdmin, db: Db
     # The figures, the plan, the terms and the programs just went onto the
     # listing: stamp them so the file page knows they are current.
     current, _sections, _cockpit = await SYNC.current_fingerprints(db, profile)
-    SYNC.mark_published(listing, current, by=admin.id, keys=["figures", "plan", "terms", "collateral", "programs"])
+    SYNC.mark_published(listing, current, by=admin.id, keys=["figures", "plan", "terms", "collateral", "deal_budget", "programs"])
     financials = fresh.get("financials") or {}
     await L.log_event(
         db,

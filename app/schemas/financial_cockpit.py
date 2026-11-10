@@ -42,6 +42,7 @@ class FinancialCockpitRead(BaseModel):
     #: see financial_cockpit.proposed_terms_block.
     proposed_terms: dict[str, Any] | None = None
     collateral: dict[str, Any] = Field(default_factory=dict)
+    deal_budget: dict[str, Any] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
 
 

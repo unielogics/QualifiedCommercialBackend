@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from app.models.application_terms import ApplicationTermSheet
+from app.services.financing_budget_disclosure import BUDGET_CSS, frozen_budget, render_budget_html
 from app.services.loan_repayment_display import repayment_lines
 
 _APP = Path(__file__).resolve().parents[1]
@@ -129,6 +130,11 @@ def render_terms_html(
     payment = float(row.periodic_payment)
     amount = float(row.amount)
     summary = _stored_schedule(row)
+    budget = frozen_budget(getattr(row, "deal_budget_snapshot", None), getattr(row, "deal_budget_revision", None), {
+        "amount": amount, "rate_pct": float(row.apr_pct), "term_months": row.term_months,
+        "structure": getattr(row, "loan_structure", None), "interest_only_months": getattr(row, "interest_only_months", None) or 0,
+        "payments_per_year": getattr(row, "payments_per_year", None) or 12, "repayment_config": getattr(row, "repayment_config", None)},
+        getattr(row, "deal_budget_calculation", None))
     total = float(summary["total_paid"]) if summary else payment * row.payment_count
     advanced = bool(getattr(row, "repayment_config", None))
     repayment_html = ""
@@ -158,6 +164,7 @@ def render_terms_html(
     html = f"""
 <!doctype html>
 <html><head><meta charset="utf-8"><style>
+  {BUDGET_CSS}
   @page {{ size: Letter; margin: 28px 0 44px; @bottom-right {{ content: "Page " counter(page) " of " counter(pages); color: #718096; font: 8px Arial; margin: 0 32px 8px 0; }} }}
   @page:first {{ margin-top: 0; }}
   * {{ box-sizing: border-box; }}
@@ -229,7 +236,7 @@ def render_terms_html(
     <h2>Proposed financing</h2>
     <div class="terms-grid">
       <div class="term"><span class="label">Amount</span><strong>{_money(amount)}</strong></div>
-      <div class="term"><span class="label">APR</span><strong>{float(row.apr_pct):.2f}%</strong></div>
+      <div class="term"><span class="label">Stated note rate (before fees)</span><strong>{float(row.apr_pct):.2f}%</strong></div>
       <div class="term"><span class="label">Time</span><strong>{row.term_months} months</strong></div>
       <div class="term"><span class="label">Loan type</span><strong style="font-size:11px">{escape(row.program_name)}</strong></div>
       <div class="term"><span class="label">Funder type</span><strong style="font-size:11px">{escape(funder)}</strong></div>
@@ -250,12 +257,13 @@ def render_terms_html(
     </div>
     <p class="method">{escape(row.dscr_explanation)} {escape(dscr_treatment)} Source: {escape(row.dscr_source)}.</p>
     {_collateral_html(row)}
+    {render_budget_html(budget)}
     {note_html}
     <div class="two">
       <section class="card"><h2>Conditions</h2><ul>{conditions_html}</ul></section>
       <section class="card"><h2>What happens next</h2><ul><li>Confirm the structure and any payoff assumptions.</li><li>Complete final underwriting and verification.</li><li>Coordinate closing with the selected funding source.</li></ul></section>
     </div>
-    <div class="fine"><b>Important:</b> This is an indicative term summary, not a commitment to lend or a final credit approval. Terms may change following verification of information, underwriting, documentation, legal review, and funding-source approval. APR, payment, total repayment, and DSCR are estimates based on the stored inputs shown above. Fees, third-party costs, reserves, taxes, insurance, default charges, legal expenses, and closing costs are separate unless expressly included. Qualified Commercial is not the lender unless identified in the final loan documents.</div>
+    <div class="fine"><b>Important:</b> This is an indicative term summary, not a commitment to lend or a final credit approval. Terms may change following verification of information, underwriting, documentation, legal review, and funding-source approval. The stated note rate is the recorded pricing input; all-in borrower APR including fees has not been calculated. Payment, total repayment and DSCR use the stored inputs shown above. Additional unrecorded costs, taxes, insurance, default charges and legal expenses remain subject to final documentation. Qualified Commercial is not the lender unless identified in the final loan documents.</div>
   </main>
 </body></html>
 """

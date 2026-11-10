@@ -218,7 +218,7 @@ async def readiness_snapshot(db: AsyncSession, profile: ApplicationProfile) -> d
     """Program readiness and the financial cockpit's headline figures, so the
     listing carries what the desk saw on the file when it cut the draft."""
     from app.services import application_programs as programs
-    from app.services import financial_cockpit
+    from app.services import deal_budget, financial_cockpit
     from app.services.financial_metric_reporting import operating_earnings_brief
 
     from . import sync as SYNC
@@ -264,7 +264,8 @@ async def readiness_snapshot(db: AsyncSession, profile: ApplicationProfile) -> d
             "files_accepted": coverage["files_accepted"],
         },
         "financials": {**financial_cockpit.listing_summary(cockpit), "operating_earnings": operating_earnings_brief(cockpit),
-            "proposed_terms": SYNC.proposed_terms(cockpit), "collateral": cockpit.get("collateral")},
+            "proposed_terms": SYNC.proposed_terms(cockpit), "collateral": cockpit.get("collateral"),
+            "deal_budget": deal_budget.reporting(profile, SYNC.proposed_terms(cockpit))},
         "production_package": {"stage": package.stage, "status": package.status, "version": package.version} if package else None,
     }
 
@@ -447,9 +448,9 @@ async def prefill(db: AsyncSession, user: User, *, loan_id: uuid.UUID | None, pr
     if profile is not None:
         from . import sync as SYNC
 
-        draft.update(SYNC.canonical_financing_fields(snapshot.get("financials") or {}, draft))
+        draft.update(SYNC.canonical_financing_fields(snapshot.get("financials") or {}, draft, is_new=True))
 
-    if draft.get("offered_amount"):
+    if profile is None and draft.get("offered_amount"):
         offered = Decimal(str(draft["offered_amount"]))
         # A sensible default the desk can change: 1% of the offering, floored
         # at $10K and rounded to the nearest $5K.

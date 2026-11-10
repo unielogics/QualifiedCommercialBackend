@@ -113,6 +113,9 @@ class ApplicationTermSheet(TimestampMixin, Base):
     # snapshots mean "not recorded", never permission to borrow today's data.
     collateral_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
     collateral_revision: Mapped[int | None] = mapped_column(Integer)
+    deal_budget_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    deal_budget_revision: Mapped[int | None] = mapped_column(Integer)
+    deal_budget_calculation: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )

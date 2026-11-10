@@ -24,7 +24,7 @@ from app.schemas.application_terms import (
     LoanTypeOption,
 )
 from app.services import application_profiles as profiles
-from app.services import file_contacts, funding_programs, investor_collateral
+from app.services import deal_budget, file_contacts, funding_programs, investor_collateral
 from app.services.funding_requests import current_for_profile, intake_requested_amount
 
 CADENCE_PERIODS_PER_YEAR: dict[str, float] = {
@@ -486,6 +486,12 @@ async def read_terms(
         "current_collateral": current_collateral,
         "current_collateral_revision": current_collateral["revision"],
         "collateral_stale": bool(row is not None and collateral_revision != current_collateral["revision"]),
+        "deal_budget_snapshot": getattr(row, "deal_budget_snapshot", None) or {},
+        "deal_budget_revision": getattr(row, "deal_budget_revision", None),
+        "deal_budget_calculation": getattr(row, "deal_budget_calculation", None) or {},
+        "current_deal_budget": deal_budget.snapshot(profile),
+        "current_deal_budget_revision": deal_budget.snapshot(profile)["revision"],
+        "deal_budget_stale": bool(row is not None and getattr(row, "deal_budget_revision", None) != deal_budget.snapshot(profile)["revision"]),
     }
     if row is None:
         intake = (
@@ -650,8 +656,14 @@ async def save_terms(
         await lock_profile_terms(db, profile.id)
     # A financial-plan-only save does not advance the terms version. Refresh
     # after the shared lock so adoption cannot overwrite that newer scenario.
-    await db.refresh(profile, attribute_names=["financial_plan", "investor_collateral"])
+    await db.refresh(profile, attribute_names=["financial_plan", "investor_collateral", "deal_budget"])
     collateral = investor_collateral.snapshot(profile)
+    budget = deal_budget.snapshot(profile)
+    if payload.expected_deal_budget_revision is not None and payload.expected_deal_budget_revision != budget["revision"]:
+        raise HTTPException(409, "Deal costs changed in another session. Reload before saving these terms.")
+    await deal_budget.enforce_origination_cap(db, profile, budget, payload.amount)
+    from app.services.use_of_funds import source_funding_data
+    requested_amount, _request_source, _purpose, _dealer = await source_funding_data(db, profile)
     if payload.expected_collateral_revision is not None and payload.expected_collateral_revision != collateral["revision"]:
         raise HTTPException(status.HTTP_409_CONFLICT, "Collateral changed in another session. Reload it before saving these terms.")
     options = await loan_type_options(db, profile)
@@ -759,6 +771,14 @@ async def save_terms(
         conditions=payload.conditions,
         collateral_snapshot=collateral,
         collateral_revision=collateral["revision"],
+        deal_budget_snapshot=budget,
+        deal_budget_revision=budget["revision"],
+        deal_budget_calculation=deal_budget.calculate(budget, {"amount": payload.amount, "rate_pct": payload.apr_pct,
+            "requested_amount": deal_budget.money(requested_amount),
+            "term_months": payload.term_months, "structure": structure["loan_structure"], "interest_only_months": structure["interest_only_months"],
+            "repayment_config": structure["repayment_config"], "payments_per_year": periods,
+            "coverage_context": {"income_annual": calc.cash_flow_value, "debt_service_annual": calc.projected_annual_debt_service,
+                "new_loan_annual_debt_service": annual, "base_dscr": calc.dscr_after, "basis": calc.cash_flow_label}}, getattr(profile, "use_of_funds", None)),
         created_by_user_id=user.id,
     )
     db.add(row)
@@ -795,6 +815,7 @@ async def save_terms(
             "dscr_before": calc.dscr_before,
             "dscr_after": calc.dscr_after,
             "collateral_revision": collateral["revision"],
+            "deal_budget_revision": budget["revision"],
         },
     )
     return row
