@@ -209,14 +209,23 @@ def partner_operating_earnings(value: Any) -> dict[str, Any] | None:
         return fields(row, ("status", "earnings", "noi", "first_year_earnings", "dscr_current", "dscr_with_refinance",
             "annual_debt_service", "refinance_annual_debt_service", "target_gap_current", "target_gap_refinance"))
 
+    def plan_adjustment(row):
+        safe = fields(row, ("label", "kind", "review_state", "net_annual_impact", "first_year_impact", "implementation_one_time",
+            "effective_date", "explanation", "source_note", "owner_name", "included_in_approved_projection", "issues", "risk_flags", "source_names"))
+        safe["calculation"] = fields(row.get("calculation"), ("cadence", "units_per_period", "current_amount", "proposed_amount",
+            "current_unit_price", "proposed_unit_price", "current_unit_cost", "proposed_unit_cost", "contribution_margin_pct",
+            "processing_volume", "processing_transaction_count", "current_processing_rate_pct", "proposed_processing_rate_pct",
+            "current_processing_rate_basis", "proposed_processing_rate_basis", "current_processing_fixed_fee", "proposed_processing_fixed_fee",
+            "current_processing_per_transaction_fee", "proposed_processing_per_transaction_fee"))
+        return safe
+
     safe_improvement = None
     if improvement:
         safe_improvement = {
             "baseline": fields(improvement.get("baseline"), ("period", "currency", "basis", "revenue", "earnings", "earnings_kind", "noi", "dscr", "annual_debt_service", "provisional")),
             "projection": {key: plan_projection((improvement.get("projection") or {}).get(key)) for key in ("proposed", "approved")},
             "totals": {key: fields((improvement.get("totals") or {}).get(key), ("annual_impact", "monthly_impact", "first_year_impact", "one_time_cost", "complete", "count")) for key in ("proposed", "approved")},
-            "adjustments": [fields(row, ("label", "kind", "review_state", "net_annual_impact", "first_year_impact", "implementation_one_time",
-                "effective_date", "explanation", "source_note", "owner_name", "included_in_approved_projection", "issues", "risk_flags", "source_names")) for row in improvement.get("adjustments", []) if isinstance(row, dict)],
+            "adjustments": [plan_adjustment(row) for row in improvement.get("adjustments", []) if isinstance(row, dict)],
             "missing": list(improvement.get("missing") or []), "risk_flags": list(improvement.get("risk_flags") or []),
             "notes": list(improvement.get("notes") or []), "all_actions_reviewed": bool(improvement.get("all_actions_reviewed")),
         }

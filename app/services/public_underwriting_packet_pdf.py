@@ -1385,6 +1385,15 @@ def _operating_plan_lines(earnings):
         lines.append(f"{label}: annual earnings {_earnings_money(baseline.get('earnings'), currency)} to {_earnings_money(result.get('earnings'), currency)}; NOI {_earnings_money(baseline.get('noi'), currency)} to {_earnings_money(result.get('noi'), currency)}; current-debt coverage {coverage}; coverage with refinance {ratio_text}; recurring improvement {_earnings_money(totals.get('annual_impact'), currency)} per year; first-year improvement {_earnings_money(totals.get('first_year_impact'), currency)}; implementation costs {_earnings_money(totals.get('one_time_cost'), currency)}.")
     for index, action in enumerate(_records(plan.get("adjustments")), 1):
         lines.append(f"{index}. {action.get('label') or 'Operating adjustment'} ({str(action.get('kind') or '').replace('_', ' ')}; {action.get('review_state') or 'proposed'}). Recurring annual effect {_earnings_money(action.get('net_annual_impact'), currency)}; first-year {_earnings_money(action.get('first_year_impact'), currency)}; effective {action.get('effective_date') or 'not supplied'}; responsible: {action.get('owner_name') or 'not assigned'}.")
+        calculation = _record(action.get("calculation"))
+        drivers = [f"{key.replace('_', ' ')}: {calculation[key]}" for key in (
+            "cadence", "units_per_period", "current_amount", "proposed_amount", "current_unit_price", "proposed_unit_price",
+            "current_unit_cost", "proposed_unit_cost", "contribution_margin_pct", "processing_volume", "processing_transaction_count",
+            "current_processing_rate_pct", "proposed_processing_rate_pct", "current_processing_rate_basis", "proposed_processing_rate_basis",
+            "current_processing_fixed_fee", "proposed_processing_fixed_fee", "current_processing_per_transaction_fee", "proposed_processing_per_transaction_fee"
+        ) if calculation.get(key) is not None and calculation.get(key) != "unknown"]
+        if drivers:
+            lines.append("Calculation inputs: " + "; ".join(drivers))
         if action.get("explanation"):
             lines.append("Explanation: " + str(action["explanation"]))
         if action.get("source_note"):

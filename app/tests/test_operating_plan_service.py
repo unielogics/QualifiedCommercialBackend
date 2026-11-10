@@ -185,6 +185,7 @@ def test_operating_pdf_is_not_a_supporting_source_and_package_omits_review_secre
     lines = _operating_earnings_lines({"operating_earnings": {"improvement_plan": summary}})
     assert any("New lease" in line for line in lines)
     assert any("Signed new lease" in line for line in lines)
+    assert any("current amount: 2000" in line and "proposed amount: 1500" in line for line in lines)
 
 
 def test_external_cockpit_uses_shareable_plan_and_hides_staff_picker_context():
