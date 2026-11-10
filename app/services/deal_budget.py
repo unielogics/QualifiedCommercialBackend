@@ -230,7 +230,7 @@ def allocation_reconciliation(net_client_cash, use_of_funds):
         "status": "unknown" if variance is None else "overallocated" if variance < 0 else "balanced" if variance == 0 else "unallocated"}
 
 
-def scoped_allocation_reconciliation(net_client_cash, terms, requested_uses):
+def scoped_allocation_reconciliation(net_client_cash, terms, requested_uses, *, budget=None):
     """A client request is not a smaller or different financing proposal."""
     proposal = terms.get("proposal_use_of_funds")
     loan, requested = number(terms.get("amount")), number(terms.get("requested_amount"))
@@ -256,6 +256,16 @@ def scoped_allocation_reconciliation(net_client_cash, terms, requested_uses):
             return {**result, **metadata, "scope": "proposed_gross_budget", "status": "needs_closing_reconciliation",
                 "variance": None, "condition": "Approved gross-facility uses are recorded. Confirm which uses include closing deductions and the final net disbursement allocation."}
         return {**result, **metadata, "scope": "proposed_loan"}
+    target = number((budget or {}).get("target_net_amount"))
+    net = number(net_client_cash)
+    if ((budget or {}).get("loan_amount_mode") == "target_net" and target is not None
+        and target == requested and net == target and requested_reference["allocated_uses"] is not None
+        and number(requested_reference["allocated_uses"]) == target):
+        # The staff-entered net target explicitly preserves the client's
+        # request. Only this exact, reconciled net scope can bridge a higher
+        # gross note; a smaller/different proposal still remains separate.
+        return {**allocation_reconciliation(net_client_cash, requested_uses), **metadata,
+            "scope": "requested_net_budget", "target_net_amount": money(target)}
     if "requested_amount" in terms and (requested is None or loan is None or requested != loan):
         return {**metadata, "scope": "requested_reference", "status": "different_scope" if requested is not None and loan is not None else "unknown",
             "allocated_uses": None, "available_for_uses": money(number(net_client_cash)), "variance": None,
@@ -446,7 +456,7 @@ def calculate(budget, terms_dict, use_of_funds=None):
     fee_dscr = adjusted_numerator / fee_denominator if adjusted_numerator is not None and fee_denominator is not None and fee_denominator > 0 else None
     if net_client is not None and net_client < 0:
         issues.append("Closing deductions exceed the gross loan; reconcile borrower funding before proceeding.")
-    allocation = scoped_allocation_reconciliation(net_client, terms, use_of_funds)
+    allocation = scoped_allocation_reconciliation(net_client, terms, use_of_funds, budget=budget)
     if allocation["status"] == "overallocated":
         issues.append("Borrower uses exceed cash available after closing deductions; reconcile use of funds.")
     elif allocation["status"] == "unallocated":
@@ -502,7 +512,7 @@ def reporting(profile, terms_dict):
     basis = "staff_proposal" if working else "recorded_terms" if has_terms and revision is not None else "unrecorded_terms" if has_terms else "staff_proposal"
     selected = recorded if has_terms and not working else current
     calculation = deepcopy(terms["deal_budget_calculation"]) if has_terms and terms.get("source") != "plan" and terms.get("deal_budget_calculation") else calculate(selected, terms, getattr(profile, "use_of_funds", None))
-    allocation = scoped_allocation_reconciliation(calculation.get("net_client_cash"), terms, getattr(profile, "use_of_funds", None))
+    allocation = scoped_allocation_reconciliation(calculation.get("net_client_cash"), terms, getattr(profile, "use_of_funds", None), budget=selected)
     current_coverage = None
     if terms.get("coverage_context"):
         current_coverage = calculate(selected, terms).get("financing_fee_coverage")
@@ -635,6 +645,79 @@ def _budget_payload(payload):
         if key in DealBudgetPatch.model_fields and key != "expected_revision"}
 
 
+def _keep_receipts(before, after):
+    for key in ("apply_receipts", "terms_save_receipts"):
+        if before.get(key):
+            after[key] = deepcopy(before[key])
+    return after
+
+
+async def stage_for_terms(db, profile, budget_patch: DealBudgetPatch, loan_terms, user):
+    """Stage costs and solve principal under the caller's existing profile lock.
+
+    This never commits or flushes. The caller must validate its terms, plan and
+    collateral revisions before invoking it, and use the returned G throughout
+    schedule generation and the new immutable version.
+    """
+    require_staff(user)
+    before = snapshot(profile)
+    if before.get("revision", 0) != budget_patch.expected_revision:
+        raise HTTPException(409, "Deal costs changed; reload before saving the budget and terms together.")
+    if budget_patch.currency != "USD":
+        raise HTTPException(422, "Loan cost budgets use USD; no currency conversion is performed.")
+    declared = {key: before[key] for key in DealBudgetPatch.model_fields if key != "expected_revision" and key in before}
+    normalized_before = DealBudgetPatch(expected_revision=before.get("revision", 0), **declared)
+    unchanged = normalized_before.model_dump(exclude={"expected_revision"}) == budget_patch.model_dump(exclude={"expected_revision"})
+    after = deepcopy(before) if unchanged else _keep_receipts(before, _budget_payload(budget_patch))
+    solution = solve_principal(after, loan_terms)
+    if solution["status"] != "calculated":
+        raise HTTPException(422, " ".join(solution["issues"]) or "The principal could not be solved from these draft costs.")
+    await enforce_origination_cap(db, profile, after, solution["gross_loan_amount"])
+    if not unchanged:
+        after.update(schema_version=1, revision=before.get("revision", 0) + 1,
+            updated_at=datetime.now(UTC).isoformat(), updated_by_user_id=str(user.id))
+    profile.deal_budget = after
+    project_legacy(profile, after)
+    return after, solution
+
+
+def save_request_fingerprint(kind, profile_id, payload):
+    value = payload.model_dump(mode="json") if hasattr(payload, "model_dump") else payload
+    encoded = json.dumps({"kind": kind, "profile_id": str(profile_id), "payload": value}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def find_terms_save_receipt(profile, kind, key, fingerprint, user, current_id, current_version):
+    """An exact retry may read its version; it must never recreate an old save."""
+    budget = snapshot(profile)
+    receipt = next((item for item in budget.get("terms_save_receipts") or []
+        if item.get("kind") == kind and item.get("key") == key), None)
+    if receipt is None:
+        return None
+    if receipt.get("fingerprint") != fingerprint or receipt.get("actor_id") != str(user.id):
+        raise HTTPException(409, "This save key was already used by another request or staff member. Reload before saving again.")
+    from app.services import investor_collateral
+    current_plan = getattr(profile, "financial_plan", None) or {}
+    if (str(current_id) != receipt.get("source_id") or current_version != receipt.get("version")
+        or budget.get("revision", 0) != receipt.get("budget_revision")
+        or _timestamp(current_plan.get("updated_at")) != _timestamp(receipt.get("plan_updated_at"))
+        or investor_collateral.snapshot(profile).get("revision", 0) != receipt.get("collateral_revision")):
+        raise HTTPException(409, "This save already succeeded and the file has since changed. Reload its current terms; no new version was created.")
+    return receipt
+
+
+def record_terms_save_receipt(profile, kind, key, fingerprint, user, source_id, version):
+    from app.services import investor_collateral
+    budget = snapshot(profile)
+    receipts = list(budget.get("terms_save_receipts") or [])
+    receipts.append({"kind": kind, "key": key, "fingerprint": fingerprint, "actor_id": str(user.id),
+        "source_id": str(source_id), "version": version, "budget_revision": budget.get("revision", 0),
+        "plan_updated_at": (getattr(profile, "financial_plan", None) or {}).get("updated_at"),
+        "collateral_revision": investor_collateral.snapshot(profile).get("revision", 0)})
+    budget["terms_save_receipts"] = receipts[-100:]
+    profile.deal_budget = budget
+
+
 async def apply_principal(db, profile, payload: DealBudgetApply, user):
     """Save reviewed costs and their shared working principal in one transaction."""
     require_staff(user)
@@ -667,7 +750,7 @@ async def apply_principal(db, profile, payload: DealBudgetApply, user):
     expected_ref = payload.expected_terms_ref.model_dump(mode="json") if payload.expected_terms_ref else None
     if _terms_ref(cockpit) != expected_ref:
         raise HTTPException(409, "The saved terms version changed; reload before applying the budget and loan.")
-    after = _budget_payload(payload)
+    after = _keep_receipts(before, _budget_payload(payload))
     record = {**saved_plan, **(payload.financial_plan or {})}
     if payload.financial_plan is None and record.get("new_loan_amount") is None:
         proposed = cockpit.get("proposed_terms") or {}
@@ -716,8 +799,7 @@ async def update(db, profile, payload: DealBudgetPatch, user):
     if before["revision"] != payload.expected_revision:
         raise HTTPException(409, "Deal costs changed; reload before saving")
     after = payload.model_dump(mode="json", exclude={"expected_revision"})
-    if before.get("apply_receipts"):
-        after["apply_receipts"] = deepcopy(before["apply_receipts"])
+    _keep_receipts(before, after)
     # Fixed-dollar platform origination charges share the same published cap.
     loan_amount = (getattr(locked, "financial_plan", None) or {}).get("new_loan_amount")
     if loan_amount is None and any(row["enabled"] and row["category"] == "origination" and row["method"] == "fixed" and row["recipient_role"] == "platform" for row in after["rows"]):

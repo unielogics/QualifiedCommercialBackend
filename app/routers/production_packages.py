@@ -194,15 +194,34 @@ async def record_term_sheet(
     profile_id: UUID, payload: ProductionTermSheetBody, request: Request, user: CurrentUser, db: AsyncSession = Depends(get_db),
 ) -> ProductionTermSheetResult:
     access = await _profile_access(db, profile_id, user)
-    _sheet, reapplied = await sheets_svc.record_sheet(db, profile=access.profile, user=user, body=payload.model_dump(exclude_unset=True), request=request)
-    await db.commit()
-    await svc._load_family(db, access)
-    state = ProductionTermSheetState(**await svc.term_sheet_state(db, access))
-    final_read = None
-    if reapplied is not None:
-        child_access = await svc.load_package_access(db, reapplied.id, user)
-        final_read = await svc.serialize(db, child_access)
-    return ProductionTermSheetResult(state=state, final=final_read)
+    combined = payload.deal_budget is not None
+    try:
+        _sheet, reapplied = await sheets_svc.record_sheet(db, profile=access.profile, user=user, body=payload.model_dump(exclude_unset=True), request=request)
+        if not combined:
+            await db.commit()
+        await svc._load_family(db, access)
+        state = ProductionTermSheetState(**await svc.term_sheet_state(db, access))
+        final_read = None
+        if reapplied is not None:
+            child_access = await svc.load_package_access(db, reapplied.id, user)
+            final_read = await svc.serialize(db, child_access)
+        budget, plan = None, None
+        if combined:
+            from app.schemas.financial_cockpit import FinancialPlanRead
+            from app.services import capital_readiness, deal_budget
+
+            await capital_readiness.advisory_recompute_profiles(db, [access.profile],
+                event_key=f"production-terms-budget:{access.profile.id}:{_sheet.id}:{_sheet.version}")
+            budget = await deal_budget.read(db, access.profile, user)
+            plan = FinancialPlanRead.model_validate(budget.financial_plan)
+        result = ProductionTermSheetResult(state=state, final=final_read, financial_plan=plan, deal_budget=budget)
+        if combined:
+            await db.commit()
+        return result
+    except Exception:
+        if combined:
+            await db.rollback()
+        raise
 
 
 @router.get("/term-sheets/{profile_id}/client.pdf")

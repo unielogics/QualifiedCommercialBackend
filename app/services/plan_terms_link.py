@@ -108,7 +108,7 @@ def recorded_from_production_sheet(sheet: Any) -> dict[str, Any] | None:
     fully_io = structure in {"interest_only", "revolving_interest_only"}
     repayment_config = deepcopy(extra.get("repayment_config"))
     advanced = None
-    if repayment_config is not None:
+    if repayment_config is not None or extra.get("combined_funded_principal_v1") is True:
         from app.services.production_term_sheets import sheet_structure
 
         advanced = sheet_structure(sheet)

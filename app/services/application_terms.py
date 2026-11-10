@@ -652,6 +652,8 @@ async def save_terms(
     user: User,
     payload: ClientTermsWrite,
 ) -> ApplicationTermSheet:
+    if payload.deal_budget is not None:
+        raise HTTPException(422, "Draft deal costs must be saved through the combined client terms and financial plan transaction.")
     # Serialize version creation per profile. Without this row lock, two quick
     # saves can both derive the same version number and collide at commit time.
     with getattr(db, "no_autoflush", nullcontext()):

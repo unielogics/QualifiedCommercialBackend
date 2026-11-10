@@ -6,6 +6,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
+from app.schemas.deal_budget import DealBudgetPatch
 from app.schemas.financial_cockpit import FinancialPlanRead, FinancialPlanWrite
 from app.schemas.loan_repayment import LoanRepaymentConfig, validate_repayment_config
 
@@ -60,6 +61,10 @@ class ClientTermsWrite(BaseModel):
     # Optional atomic save of the unsaved Financials scenario alongside these
     # versioned loan terms. Existing terms-only callers retain their behavior.
     financial_plan: FinancialPlanWrite | None = None
+    # An explicit combined save stages these draft costs and automatically
+    # derives contractual principal from their separate target/base anchor.
+    deal_budget: DealBudgetPatch | None = None
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
 
     @field_validator("loan_type", "funder_name", "custom_repayment_label", "sponsor_name", "client_note", mode="before")
     @classmethod
@@ -91,6 +96,15 @@ class ClientTermsWrite(BaseModel):
 
     @model_validator(mode="after")
     def validate_custom_schedule(self) -> ClientTermsWrite:
+        if self.deal_budget is not None:
+            if not self.idempotency_key:
+                raise ValueError("An atomic budget and terms save requires an idempotency key")
+            if self.financial_plan is None or "expected_updated_at" not in self.financial_plan.model_fields_set:
+                raise ValueError("Include the financial plan revision, or null for a new plan, when saving draft costs with terms")
+            if self.expected_collateral_revision is None:
+                raise ValueError("Include the current collateral revision when saving draft costs with terms")
+            if self.expected_deal_budget_revision is not None and self.expected_deal_budget_revision != self.deal_budget.expected_revision:
+                raise ValueError("The terms and draft budget must identify the same cost revision")
         if self.repayment_frequency == "custom" and not self.custom_payments_per_year:
             raise ValueError("Custom repayment requires payments per year")
         if self.repayment_frequency != "custom":
