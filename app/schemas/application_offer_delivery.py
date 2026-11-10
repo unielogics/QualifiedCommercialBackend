@@ -83,6 +83,8 @@ class OfferDeliveryCreate(BaseModel):
 class OfferDeliveryItemRead(BaseModel):
     id: UUID
     item_key: str
+    source_id: UUID | None = None
+    source_version: int | None = None
     kind: Literal[
         "merchant_offer", "production_term_sheet", "application_term_sheet", "evidence_file"
     ]

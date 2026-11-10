@@ -185,11 +185,15 @@ class ResolvedOffer:
             summary.update(
                 accepted_amount=str(self.source.approved_amount),
                 accepted_amount_field="approved_amount",
+                rate_pct=str(self.source.rate_pct),
+                term_months=self.source.term_months,
             )
         elif self.kind == "application_term_sheet":
             summary.update(
                 accepted_amount=str(self.source.amount),
                 accepted_amount_field="amount",
+                rate_pct=str(self.source.apr_pct),
+                term_months=self.source.term_months,
             )
         return summary
 
@@ -333,6 +337,14 @@ async def _business_context(
     return file_contacts.business_label(sources), recipient.name
 
 
+async def lock_offer_profile(db: AsyncSession, profile_id: UUID) -> None:
+    """Use the terms-save lock before delivery, source, or response-item locks."""
+
+    if isinstance(db, AsyncSession):
+        with db.no_autoflush:
+            await application_terms.lock_profile_terms(db, profile_id)
+
+
 async def resolve_offers(
     db: AsyncSession,
     profile: ApplicationProfile,
@@ -344,6 +356,8 @@ async def resolve_offers(
 
     if not refs:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Select at least one offer.")
+    if lock:
+        await lock_offer_profile(db, profile.id)
     seen: set[tuple[str, UUID]] = set()
     business_name, _ = await _business_context(db, profile)
     resolved: list[ResolvedOffer] = []
@@ -835,6 +849,8 @@ def item_read(
     return OfferDeliveryItemRead(
         id=item.id,
         item_key=item.item_key,
+        source_id=getattr(item, "source_id", None),
+        source_version=getattr(item, "source_version", None),
         kind=item.kind,
         label=item.label,
         title=item.title,
@@ -951,6 +967,14 @@ async def record_response(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "This attachment does not require a decision."
         )
+    if response == "accepted" and item.kind in {"application_term_sheet", "production_term_sheet"} and isinstance(db, AsyncSession):
+        # Deliveries have separate row locks. Serialize their shared profile
+        # projection and refresh the immutable item before deciding, so a
+        # concurrent newer delivery cannot be overwritten by stale state.
+        with db.no_autoflush:
+            await lock_offer_profile(db, profile.id)
+            await db.refresh(profile, attribute_names=["underwriting_accepted_amount", "underwriting_accepted_at", "accepted_terms_ref"])
+            await db.refresh(item, attribute_names=["decision_status", "expires_at", "responded_at"], with_for_update=True)
     now = datetime.now(UTC)
     if item.decision_status in {"accepted", "declined"}:
         if item.decision_status == response:
@@ -1027,14 +1051,43 @@ async def record_response(
         accepted_amount = accepted_amount_from_snapshot(item)
         if accepted_amount is not None:
             previous = profile.underwriting_accepted_amount
-            profile.underwriting_accepted_amount = accepted_amount
-            profile.underwriting_updated_at = responded_at
+            previous_ref = getattr(profile, "accepted_terms_ref", None)
+            previous_ref = previous_ref if isinstance(previous_ref, dict) else {}
+            previous_at = getattr(profile, "underwriting_accepted_at", None)
+            if isinstance(previous_at, datetime) and previous_at.tzinfo is None:
+                previous_at = previous_at.replace(tzinfo=UTC)
+            summary = item.canonical_summary if isinstance(item.canonical_summary, dict) else {}
+            rate = summary.get("rate_pct")
+            try:
+                rate = float(rate) if rate is not None and Decimal(str(rate)).is_finite() and Decimal(str(rate)) >= 0 else None
+            except (InvalidOperation, TypeError, ValueError):
+                rate = None
+            try:
+                term = int(summary["term_months"]) if int(summary.get("term_months") or 0) > 0 else None
+            except (TypeError, ValueError):
+                term = None
+            ref = {"kind": item.kind, "id": str(item.source_id), "version": item.source_version,
+                "amount": float(accepted_amount), "rate_pct": rate, "term_months": term,
+                "label": getattr(item, "label", None) or f"Financing terms v{item.source_version}",
+                "delivery_id": str(delivery.id), "item_id": str(item.id), "snapshot_sha256": item.sha256}
+            same_kind = previous_ref.get("kind") in {item.kind, "client_terms" if item.kind == "application_term_sheet" else item.kind}
+            try:
+                older_version = bool(same_kind and int(previous_ref.get("version") or 0) > int(item.source_version or 0))
+            except (TypeError, ValueError):
+                older_version = False
+            older_response = isinstance(previous_at, datetime) and previous_at > responded_at
+            projection_updated = not (older_response or older_version)
+            if projection_updated:
+                profile.underwriting_accepted_amount = accepted_amount
+                profile.underwriting_accepted_at = responded_at
+                profile.accepted_terms_ref = ref
+                profile.underwriting_updated_at = responded_at
             await application_profiles.log_profile_action(
                 db,
                 profile,
                 None,
-                "underwriting.accepted_amount_synced",
-                "Synced accepted amount from the client's immutable term-sheet response",
+                "underwriting.accepted_amount_synced" if projection_updated else "underwriting.historical_acceptance_recorded",
+                "Synced acceptance from the client's immutable term-sheet response" if projection_updated else "Retained a historical acceptance without replacing the newer accepted terms",
                 target_type="application_offer_delivery_item",
                 target_id=item.id,
                 metadata={
@@ -1047,6 +1100,8 @@ async def record_response(
                     "previous_accepted_amount": (
                         float(previous) if previous is not None else None
                     ),
+                    "accepted_terms_ref": ref,
+                    "profile_projection_updated": projection_updated,
                     "response_channel": channel,
                     "response_user_id": str(user_id) if user_id else None,
                 },
