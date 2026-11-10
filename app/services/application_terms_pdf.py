@@ -11,6 +11,11 @@ from typing import Any
 from app.models.application_terms import ApplicationTermSheet
 from app.services.financing_budget_disclosure import BUDGET_CSS, frozen_budget, render_budget_html
 from app.services.loan_repayment_display import repayment_lines
+from app.services.loan_terms_visuals import (
+    LOAN_VISUALS_CSS,
+    closing_preparation_html,
+    schedule_visuals_html,
+)
 
 _APP = Path(__file__).resolve().parents[1]
 _QC_MARK = _APP / "templates" / "_qcmark.svg.html"
@@ -165,6 +170,7 @@ def render_terms_html(
 <!doctype html>
 <html><head><meta charset="utf-8"><style>
   {BUDGET_CSS}
+  {LOAN_VISUALS_CSS}
   @page {{ size: Letter; margin: 28px 0 44px; @bottom-right {{ content: "Page " counter(page) " of " counter(pages); color: #718096; font: 8px Arial; margin: 0 32px 8px 0; }} }}
   @page:first {{ margin-top: 0; }}
   * {{ box-sizing: border-box; }}
@@ -209,7 +215,7 @@ def render_terms_html(
   ul {{ margin: 5px 0 0; padding-left: 16px; }} li {{ margin: 0 0 4px; }}
   .repayment {{ border: 1px solid #dce3ec; border-radius: 9px; padding: 10px 12px; margin-bottom: 15px; }}
   .repayment li {{ break-inside: avoid; overflow-wrap: anywhere; }}
-  .collateral {{ border: 1px solid #dce3ec; border-radius: 9px; padding: 10px 12px; margin-bottom: 15px; break-inside: avoid; }}
+  .collateral {{ border: 1px solid #dce3ec; border-radius: 9px; padding: 10px 12px; margin-bottom: 15px; }}
   .collateral h2 {{ break-after: avoid; }}
   .collateral table {{ border-collapse: collapse; width: 100%; font-size: 9px; }}
   .collateral tr {{ break-inside: avoid; }}
@@ -256,8 +262,10 @@ def render_terms_html(
       <div class="dscr-card after"><span class="label">After acceptance</span><strong>{_ratio(float(row.dscr_after) if row.dscr_after is not None else None)}</strong><p>Projected with the proposed repayment schedule.</p></div>
     </div>
     <p class="method">{escape(row.dscr_explanation)} {escape(dscr_treatment)} Source: {escape(row.dscr_source)}.</p>
+    {schedule_visuals_html(summary)}
     {_collateral_html(row)}
     {render_budget_html(budget)}
+    {closing_preparation_html(version=row.version, prepared=_date(issue_date), expires=_date(row.expires_on), collateral_revision=getattr(row, "collateral_revision", None), budget_revision=getattr(row, "deal_budget_revision", None), collateral_snapshot=getattr(row, "collateral_snapshot", None), budget=budget, conditions=conditions)}
     {note_html}
     <div class="two">
       <section class="card"><h2>Conditions</h2><ul>{conditions_html}</ul></section>
