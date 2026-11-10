@@ -10,7 +10,7 @@ from sqlalchemy import select
 from app.models.bucket import BucketFileAnalysis
 from app.services import business_profile
 
-LAYOUT_VERSION = "qc.investor_report.v4.five_pages.structured_deal_budget"
+LAYOUT_VERSION = "qc.investor_report.v5.five_pages.target_net_financing"
 PAGE_LIMIT = 5
 
 

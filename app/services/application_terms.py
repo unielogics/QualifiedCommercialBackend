@@ -204,7 +204,7 @@ async def _cockpit_context(db: AsyncSession, profile: ApplicationProfile) -> Dsc
     evaluation = plan.get("evaluation") or {}
     active = bool(evaluation.get("active"))
     income = (
-        evaluation.get("income_after_annual")
+        evaluation.get("income_after_annual_before_budget", evaluation.get("income_after_annual"))
         if active and evaluation.get("income_after_annual") is not None
         else basis.get("numerator")
     )
@@ -536,6 +536,8 @@ async def read_terms(
             interest_only_months=getattr(row, "interest_only_months", None), repayment_config=repayment_config,
         )
     calc = ClientTermsCalculation(
+        financing_fee_coverage=(getattr(row, "deal_budget_calculation", None) or {}).get("financing_fee_coverage"),
+        principal_solution=(getattr(row, "deal_budget_calculation", None) or {}).get("principal_solution"),
         periodic_payment=float(row.periodic_payment),
         payment_count=row.payment_count,
         payments_per_year=float(row.payments_per_year),
@@ -724,6 +726,15 @@ async def save_terms(
         treatment=payload.debt_service_treatment,
         retained_annual_debt_service=payload.retained_annual_debt_service,
     )
+    from app.services.financial_plan_budget import apply_to_terms_calculation, validate_write
+    budget_terms = {"amount": payload.amount, "rate_pct": payload.apr_pct, "requested_amount": deal_budget.money(requested_amount),
+        "term_months": payload.term_months, "structure": structure["loan_structure"], "interest_only_months": structure["interest_only_months"],
+        "repayment_config": structure["repayment_config"], "payments_per_year": periods,
+        "coverage_context": {"income_annual": calc.cash_flow_value, "debt_service_annual": calc.projected_annual_debt_service,
+            "new_loan_annual_debt_service": annual, "base_dscr": calc.dscr_after, "basis": calc.cash_flow_label}}
+    validate_write(budget, payload.expected_deal_budget_revision, budget_terms)
+    budget_calculation = deal_budget.calculate(budget, budget_terms, getattr(profile, "use_of_funds", None))
+    calc = apply_to_terms_calculation(calc, budget, budget_calculation)
     now = datetime.now(UTC)
     if current is not None:
         current.is_current = False
@@ -773,12 +784,7 @@ async def save_terms(
         collateral_revision=collateral["revision"],
         deal_budget_snapshot=budget,
         deal_budget_revision=budget["revision"],
-        deal_budget_calculation=deal_budget.calculate(budget, {"amount": payload.amount, "rate_pct": payload.apr_pct,
-            "requested_amount": deal_budget.money(requested_amount),
-            "term_months": payload.term_months, "structure": structure["loan_structure"], "interest_only_months": structure["interest_only_months"],
-            "repayment_config": structure["repayment_config"], "payments_per_year": periods,
-            "coverage_context": {"income_annual": calc.cash_flow_value, "debt_service_annual": calc.projected_annual_debt_service,
-                "new_loan_annual_debt_service": annual, "base_dscr": calc.dscr_after, "basis": calc.cash_flow_label}}, getattr(profile, "use_of_funds", None)),
+        deal_budget_calculation=budget_calculation,
         created_by_user_id=user.id,
     )
     db.add(row)

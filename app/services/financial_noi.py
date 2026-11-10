@@ -212,9 +212,27 @@ def _trend(years):
             "reason": None if comparable else empty["reason"]}
 
 
+def preview_scenario(noi, evaluation):
+    """Reuse the current source NOI while replacing only unsaved plan effects."""
+    from copy import deepcopy
+
+    scenario = deepcopy(noi.get("scenario") or {})
+    headline = noi.get("headline") or {}
+    current, operating = number(scenario.get("current")), number(evaluation.get("annual_new_operating_expenses", 0))
+    comparable = headline.get("currency") == "USD" and headline.get("complete") and not headline.get("provisional") and not headline.get("reconciliation_required")
+    adjustments = [row for row in (evaluation.get("ebitda") or {}).get("adjusted_annual", {}).get("adjustments", [])
+        if row.get("kind") in {"owner_salary", "one_time_expense", "rent_to_owner"} and row.get("status") == "hypothetical_unverified"] if comparable else []
+    total = sum(number(row.get("amount_annual")) or 0 for row in adjustments)
+    planned = round(current + total - operating, 2) if current is not None and operating is not None and (headline.get("currency") == "USD" or total == operating == 0) else None
+    debt = number(evaluation.get("debt_service_after_annual"))
+    scenario.update(plan=planned, operating_adjustments=deepcopy(adjustments), annual_new_operating_expenses=operating,
+        annual_debt_service_plan=debt, after_debt_service_plan=round(planned - debt, 2) if comparable and planned is not None and debt is not None else None)
+    return scenario
+
+
 def build_noi(analyses, *, statement=None, entity=None, metric_review=None,
               current_annual_debt_service=None, plan_annual_debt_service=None,
-              operating_adjustments=None, source_selection=None):
+              operating_adjustments=None, source_selection=None, additional_operating_expense_annual=0):
     """Build source-bound operating income without changing evidence or reviews."""
     from app.services.document_associations import identity_matches, source_excluded
     from app.services.financial_tax_earnings import tax_source_is_business
@@ -291,7 +309,8 @@ def build_noi(analyses, *, statement=None, entity=None, metric_review=None,
             used_adjustments.add(identity)
             adjustments.append({key: item.get(key) for key in ("id", "kind", "label", "note", "source", "status")}
                                | {"amount_annual": amount})
-    planned = round(annual + sum(item["amount_annual"] for item in adjustments), 2) if annual is not None else None
+    new_operating = number(additional_operating_expense_annual)
+    planned = round(annual + sum(item["amount_annual"] for item in adjustments) - new_operating, 2) if annual is not None and new_operating is not None and (usd or new_operating == 0) else None
     scenario_notes = ["Refinancing changes debt service, not business operating income. Loan proceeds, principal payments and interest savings are not operating-income addbacks.",
                       "After-debt-service amounts are an illustration of operating income less total debt payments, not a complete cash-flow statement or DSCR numerator reconciliation."]
     if not usd and (current_debt is not None or plan_debt is not None):
@@ -302,9 +321,12 @@ def build_noi(analyses, *, statement=None, entity=None, metric_review=None,
         scenario_notes.append("After-debt-service results are unavailable until loan payments already included in expenses are reconciled, avoiding a second deduction of the same debt payments.")
     if adjustments:
         scenario_notes.append("The plan's operating adjustments are explicit staff hypotheses, not verified NOI or lender-accepted facts. The historical operating result stays unchanged.")
+    if new_operating is None or new_operating:
+        scenario_notes.append("New recurring budget rows classified as operating expenses reduce projected operating income once. Financing charges, capitalized fees and escrow do not alter historical NOI.")
     return {"definition": dict(DEFINITION), "headline": headline, "candidates": candidates, "years": years,
             "trend": _trend(years), "reason": reason,
             "scenario": {"current": annual, "plan": planned, "operating_adjustments": adjustments,
+                         "annual_new_operating_expenses": new_operating,
                          "annual_debt_service_current": current_debt, "annual_debt_service_plan": plan_debt,
                          "after_debt_service_current": round(annual - current_debt, 2) if residual_comparable and annual is not None and current_debt is not None else None,
                          "after_debt_service_plan": round(planned - plan_debt, 2) if residual_comparable and planned is not None and plan_debt is not None else None,

@@ -2005,6 +2005,10 @@ def _fingerprint(
         "accepted_debt_version_id": str(accepted_debt_version_id) if accepted_debt_version_id else None,
         "use_of_funds_revision": profile.use_of_funds_revision,
         "use_of_funds": profile.use_of_funds or [],
+        "financing_scenario_dependencies": {
+            "deal_budget_revision": (getattr(profile, "deal_budget", None) or {}).get("revision", 0),
+            "plan": getattr(profile, "financial_plan", None) or {},
+        },
         "periods": sorted(
             (str(row.id), row.content_hash, row.review_status) for row in periods
         ),
@@ -3742,6 +3746,10 @@ async def recompute(
             readiness_state="awaiting_review" if reconciliation_pending or entity_mismatch else "provisional",
         )},
     ]
+    scenario = next((candidate.fact_sources.get("financing_scenario") for candidate in program_candidates
+        if isinstance(getattr(candidate, "fact_sources", None), dict) and candidate.fact_sources.get("financing_scenario")), None)
+    if scenario is not None:
+        source_manifest.append(dict(scenario))
     source_manifest.extend(
         {
             "kind": "financial_period",

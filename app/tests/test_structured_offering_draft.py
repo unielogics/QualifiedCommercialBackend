@@ -106,7 +106,7 @@ def test_frozen_cost_html_uses_stored_math_and_preserves_unknowns():
     with patch.object(deal_budget, "calculate", side_effect=AssertionError("Historical math must remain frozen")):
         disclosure = frozen_budget(budget, 3, terms, data["deal_budget"]["calculation"])
     html = render_budget_html(disclosure)
-    for text in ("Tax escrow", "Insurance escrow", "2% of gross loan", "per month", "Reserve, not fee income", "Unknown - complete the cost review"):
+    for text in ("Tax escrow", "Insurance escrow", "2% of gross loan", "per month", "reserve, not expense/income", "Unknown - complete the cost review"):
         assert text in html
     assert "PRIVATE RECIPIENT" not in html and "PRIVATE COMMISSION NOTE" not in html
 
@@ -118,7 +118,7 @@ def test_investor_cost_report_stays_five_pages_with_net_cash_fees_and_separate_c
     document = fitz.open(stream=render_investor_presentation_pdf(intake=SimpleNamespace(), financials=data), filetype="pdf")
     text = " ".join(" ".join(page.get_text().split()) for page in document)
     assert len(document) == 5 and all("CONFIDENTIAL" in page.get_text() for page in document)
-    for expected in ("Investment capital to raise", "Net loan proceeds at funding", "Tax escrow", "Insurance escrow", "2% of gross loan", "Financing-fee scenario", "Full-loan contractual receipts"):
+    for expected in ("Investment capital to raise", "Net proceeds:", "Tax escrow", "Insurance escrow", "2% of gross loan", "Budget scenario", "Full-loan contractual receipts"):
         assert expected.casefold() in text.casefold()
     if unknown:
         assert "Net return unknown" in text and "8 of 160 rows" in text

@@ -1,8 +1,10 @@
 """One audited cost schedule; funding math never changes the debt contract."""
+import hashlib
+import json
 from contextlib import nullcontext
 from copy import deepcopy
 from datetime import UTC, datetime
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal, InvalidOperation
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, uuid5
 
@@ -12,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import Role
 from app.models.application_profile import ApplicationProfile
-from app.schemas.deal_budget import DealBudgetPatch, DealBudgetRead, DealCostRow
+from app.schemas.deal_budget import DealBudgetApply, DealBudgetPatch, DealBudgetRead, DealCostRow
 
 EDIT_ROLES = {Role.SUPER_ADMIN, Role.LOAN_EXEC}
 ZERO = Decimal(0)
@@ -100,6 +102,123 @@ def _schedule(terms):
         return None
 
 
+def _borrower_closing_rows(budget, settlements):
+    return [row for row in budget.get("rows") or [] if row.get("enabled", True)
+        and row.get("payer", "borrower") == "borrower" and row.get("timing", "closing") == "closing"
+        and row.get("settlement", "separate") in settlements]
+
+
+def _closing_amount(row, gross, budget, terms):
+    value = number(row.get("value"))
+    if value is None:
+        return None
+    if row.get("method", "fixed") == "fixed":
+        return value.quantize(CENT, rounding=ROUND_HALF_UP)
+    basis = row.get("basis", "loan_amount")
+    if basis in {"loan_amount", "outstanding_principal"}:
+        base = gross
+    elif basis == "investor_funding":
+        base = number(budget.get("investor_funding_amount"))
+        base = gross if base is None else base
+    elif basis == "interest":
+        schedule = _schedule({**terms, "amount": money(gross)})
+        base = number(schedule.get("total_interest")) if schedule else None
+    else:
+        base = None
+    return (value * base / 100).quantize(CENT, rounding=ROUND_HALF_UP) if base is not None else None
+
+
+def solve_principal(budget, terms_dict):
+    """Solve the smallest feasible cent principal without feeding gross back as base.
+
+    Each fee is rounded separately. Its affine rounding error bounds a finite
+    candidate window; scanning that window handles one-cent net discontinuities
+    which ordinary binary search incorrectly assumes away. Exotic interest-based
+    gross-ups and excessive near-100% windows remain explicitly unresolved.
+    """
+    budget, terms = budget or {}, terms_dict or {}
+    mode = budget.get("loan_amount_mode") or "gross_loan"
+    current = number(terms.get("amount")) if terms.get("active_proposal") is not False else None
+    base, target = number(budget.get("base_loan_amount")), number(budget.get("target_net_amount"))
+    anchor = current if mode == "gross_loan" else base if mode == "base_loan" else target
+    result = {"mode": mode, "status": "unknown", "input_amount": money(anchor), "base_loan_amount": money(base),
+        "target_net_amount": money(target), "current_loan_amount": money(current), "gross_loan_amount": None,
+        "financed_closing_costs": None, "withheld_closing_costs": None, "net_client_cash": None,
+        "funding_variance": None, "requires_apply": False, "issues": []}
+    if anchor is None or anchor <= 0:
+        result["issues"].append("Enter a positive gross loan, explicit base loan, or target net amount for the selected mode.")
+        return result
+    if (budget.get("currency") or "USD") != (terms.get("currency") or "USD"):
+        result["issues"].append("Budget and loan currencies differ; no gross-up or currency conversion is assumed.")
+        return result
+    financed = _borrower_closing_rows(budget, {"financed"})
+    withheld = _borrower_closing_rows(budget, {"withheld"})
+    solved_rows = financed + (withheld if mode == "target_net" else [])
+    gross = anchor
+    if mode != "gross_loan":
+        constant, slope, dynamic_count = ZERO, ZERO, 0
+        for row in solved_rows:
+            value = number(row.get("value"))
+            if value is None:
+                result["issues"].append(f"{row.get('label') or 'Closing cost'}: amount or rate is unknown.")
+                return result
+            basis = row.get("basis", "loan_amount")
+            if row.get("method", "fixed") == "fixed":
+                constant += value.quantize(CENT, rounding=ROUND_HALF_UP)
+            elif basis in {"loan_amount", "outstanding_principal"} or basis == "investor_funding" and number(budget.get("investor_funding_amount")) is None:
+                slope += value / 100
+                dynamic_count += 1
+            elif basis == "investor_funding":
+                constant += (value * number(budget["investor_funding_amount"]) / 100).quantize(CENT, rounding=ROUND_HALF_UP)
+            else:
+                result["issues"].append("Automatic gross-up supports fixed closing costs and percentages of principal or known investor funding. Review interest-based closing costs using a fixed gross loan.")
+                return result
+        if slope >= 1:
+            result["status"] = "impossible"
+            result["issues"].append("Closing costs consume 100% or more of each additional loan dollar; no positive gross-up can deliver this amount.")
+            return result
+        estimate = (anchor + constant) / (1 - slope)
+        error = Decimal(dynamic_count) * Decimal(".005") / (1 - slope)
+        first = max(anchor, (estimate - error).quantize(CENT, rounding=ROUND_CEILING))
+        last = (estimate + error).quantize(CENT, rounding=ROUND_CEILING)
+        if last > Decimal("999999999999"):
+            result["status"] = "impossible"
+            result["issues"].append("The required principal exceeds the supported loan amount.")
+            return result
+        if (last - first) / CENT > 100_000:
+            result["issues"].append("The aggregate percentage is too close to 100% for a bounded cent-exact gross-up. Reduce the rate or enter and review a fixed gross principal.")
+            return result
+        gross = first
+        while gross <= last:
+            total = sum((_closing_amount(row, gross, budget, terms) for row in solved_rows), ZERO)
+            if gross - total >= anchor:
+                break
+            gross += CENT
+        if gross > last:
+            result["issues"].append("No cent-rounded principal could be verified; enter a fixed gross loan for review.")
+            return result
+    def total(rows):
+        amounts = [_closing_amount(row, gross, budget, terms) for row in rows]
+        return sum(amounts, ZERO) if all(value is not None for value in amounts) else None
+    financed_total, withheld_total = total(financed), total(withheld)
+    net = gross - financed_total - withheld_total if financed_total is not None and withheld_total is not None else None
+    delivered = gross - financed_total if mode == "base_loan" and financed_total is not None else net
+    result.update(status="calculated", gross_loan_amount=money(gross), financed_closing_costs=money(financed_total),
+        withheld_closing_costs=money(withheld_total), net_client_cash=money(net),
+        funding_variance=money(delivered - anchor) if mode != "gross_loan" and delivered is not None else None,
+        requires_apply=current is None or gross != current)
+    return result
+
+
+def assert_principal_matches(budget, terms):
+    solution = solve_principal(budget, terms)
+    if solution["status"] != "calculated":
+        raise HTTPException(422, " ".join(solution["issues"]) or "The loan principal cannot be calculated from these costs.")
+    if solution["requires_apply"]:
+        raise HTTPException(409, "Apply the calculated gross principal to the shared loan before saving its terms or coverage plan.")
+    return solution
+
+
 def allocation_reconciliation(net_client_cash, use_of_funds):
     """Current use allocations against a supplied immutable proceeds figure."""
     net = number(net_client_cash)
@@ -151,13 +270,20 @@ def calculate(budget, terms_dict, use_of_funds=None):
     interest is applied to interval interest once, without annualizing twice.
     Reserves remain held assets and never become fees or investor income.
     """
-    budget, terms = budget or {}, terms_dict or {}
+    budget, terms = budget or {}, dict(terms_dict or {})
+    principal = solve_principal(budget, terms)
+    if principal["status"] == "calculated":
+        terms["amount"] = principal["gross_loan_amount"]
+    elif principal["mode"] != "gross_loan":
+        terms["amount"] = None
     loan = number(terms.get("amount")) if terms.get("active_proposal") is not False else None
     funding = number(budget.get("investor_funding_amount"))
     funding = loan if funding is None else funding
     mode = budget.get("funding_mode") or "single_investor"
     minimum = funding if mode == "single_investor" else number(budget.get("minimum_investor_contribution"))
-    issues = []
+    issues = list(principal["issues"])
+    if principal["requires_apply"]:
+        issues.append("The solved gross principal is a working preview; save the budget and shared loan together before issuing or publishing terms.")
     if loan is None or loan <= 0:
         issues.append("Enter an active gross loan amount.")
     if funding is not None and loan is not None and funding > loan:
@@ -184,8 +310,8 @@ def calculate(budget, terms_dict, use_of_funds=None):
     ppy = number(schedule.get("periods_per_year")) if schedule else None
     gross_interest = number(schedule.get("total_interest")) * share if schedule and share is not None else None
     gross_receipts = sum((number(row["cash_payment"]) for row in schedule_rows), ZERO) * share if schedule and share is not None else None
-    buckets = {key: ZERO for key in ("borrower_withheld_fees", "borrower_paid_separately", "borrower_recurring_fees",
-        "borrower_withheld_reserves", "borrower_separate_reserves", "escrow_reserves", "investor_fees", "investor_closing_fees", "investor_reserves", "sponsor_costs",
+    buckets = {key: ZERO for key in ("borrower_withheld_fees", "borrower_financed_fees", "borrower_paid_separately", "borrower_recurring_fees",
+        "borrower_withheld_reserves", "borrower_financed_reserves", "borrower_separate_reserves", "escrow_reserves", "investor_fees", "investor_closing_fees", "investor_reserves", "sponsor_costs",
         "platform_fee_revenue", "management_revenue", "borrower_closing_costs", "investor_closing_costs", "sponsor_closing_costs")}
     unknown = set()
     monthly = {}
@@ -197,6 +323,8 @@ def calculate(budget, terms_dict, use_of_funds=None):
             flow["interest"] += number(row["interest"]) * share
     results = []
     borrower_monthly_fees = {}
+    borrower_monthly_operating = {}
+    unknown_new_financing, unknown_new_operating = False, False
     unknown_investor_reserve = False
     for row in budget.get("rows") or []:
         row_issues = []
@@ -236,8 +364,11 @@ def calculate(budget, terms_dict, use_of_funds=None):
                     allocations.append((month, amount))
                     opening = number(event["balance_after_cash"])
                 previous_month = due_month
-        key = ("borrower_withheld_reserves" if row.get("settlement") == "withheld" else "borrower_separate_reserves") if reserve and payer == "borrower" else "escrow_reserves" if reserve else (
-            "borrower_withheld_fees" if timing == "closing" and row.get("settlement") == "withheld" else "borrower_paid_separately" if timing == "closing" else "borrower_recurring_fees") if payer == "borrower" else "investor_fees" if payer == "investor" else "sponsor_costs"
+        settlement = row.get("settlement", "separate")
+        key = ("borrower_withheld_reserves" if settlement == "withheld" else "borrower_financed_reserves" if settlement == "financed" else "borrower_separate_reserves") if reserve and payer == "borrower" else "escrow_reserves" if reserve else (
+            "borrower_withheld_fees" if timing == "closing" and settlement == "withheld" else "borrower_financed_fees" if timing == "closing" and settlement == "financed" else "borrower_paid_separately" if timing == "closing" else "borrower_recurring_fees") if payer == "borrower" else "investor_fees" if payer == "investor" else "sponsor_costs"
+        new_borrower = enabled and payer == "borrower" and timing != "closing" and not reserve and row.get("coverage_treatment", "new_cost") != "already_in_baseline"
+        operating = row.get("earnings_treatment", "financing_cost") == "operating_expense"
         keys = {key}
         if reserve:
             keys.add("escrow_reserves")
@@ -257,6 +388,11 @@ def calculate(budget, terms_dict, use_of_funds=None):
                 if row.get("category") in {"servicing", "management"}:
                     keys.add("management_revenue")
         if row_issues and enabled:
+            if new_borrower:
+                if operating:
+                    unknown_new_operating = True
+                else:
+                    unknown_new_financing = True
             unknown.update(keys)
             issues.extend(f"{row.get('label') or 'Cost row'}: {issue}" for issue in dict.fromkeys(row_issues))
         else:
@@ -265,9 +401,10 @@ def calculate(budget, terms_dict, use_of_funds=None):
             if payer == "investor" and not reserve:
                 for month, amount in allocations:
                     monthly[month]["fees"] += amount
-            if payer == "borrower" and timing != "closing" and not reserve:
+            if new_borrower:
                 for month, amount in allocations:
-                    borrower_monthly_fees[month] = borrower_monthly_fees.get(month, ZERO) + amount
+                    flow = borrower_monthly_operating if operating else borrower_monthly_fees
+                    flow[month] = flow.get(month, ZERO) + amount
             if payer == "investor" and reserve and enabled and row.get("reserve_release") == "maturity" and monthly:
                 monthly[max(monthly)]["reserve_release"] += total
         results.append({"id": str(row.get("id")), "total_amount": None if row_issues else money(total),
@@ -277,12 +414,15 @@ def calculate(budget, terms_dict, use_of_funds=None):
     def known(key):
         return buckets[key] if confirmed and key not in unknown else None
     withheld, held = known("borrower_withheld_fees"), known("borrower_withheld_reserves")
-    net_client = loan - withheld - held if loan is not None and withheld is not None and held is not None else None
+    financed, financed_held = known("borrower_financed_fees"), known("borrower_financed_reserves")
+    net_client = loan - withheld - held - financed - financed_held if all(value is not None for value in (loan, withheld, held, financed, financed_held)) else None
     fees, upfront, reserves = known("investor_fees"), known("investor_closing_fees"), known("investor_reserves")
     initial = funding + upfront + reserves if funding is not None and upfront is not None and reserves is not None else None
     net_income = gross_interest - fees if gross_interest is not None and fees is not None and not unknown_investor_reserve else None
     annual_borrower_fees = (max((sum((value for due, value in borrower_monthly_fees.items() if end - 12 < due <= end), ZERO)
-        for end in borrower_monthly_fees), default=ZERO) if known("borrower_recurring_fees") is not None else None)
+        for end in borrower_monthly_fees), default=ZERO) if confirmed and not unknown_new_financing else None)
+    annual_operating = (max((sum((value for due, value in borrower_monthly_operating.items() if end - 12 < due <= end), ZERO)
+        for end in borrower_monthly_operating), default=ZERO) if confirmed and not unknown_new_operating else None)
     coverage = terms.get("coverage_context") or {}
     numerator, denominator = number(coverage.get("income_annual")), number(coverage.get("debt_service_annual"))
     fee_denominator, coverage_method = None, "unavailable"
@@ -302,7 +442,8 @@ def calculate(budget, terms_dict, use_of_funds=None):
         else:
             fee_denominator = denominator + annual_borrower_fees
             coverage_method = "conservative_sum_of_separate_peaks"
-    fee_dscr = numerator / fee_denominator if numerator is not None and fee_denominator is not None and fee_denominator > 0 else None
+    adjusted_numerator = numerator - annual_operating if numerator is not None and annual_operating is not None else None
+    fee_dscr = adjusted_numerator / fee_denominator if adjusted_numerator is not None and fee_denominator is not None and fee_denominator > 0 else None
     if net_client is not None and net_client < 0:
         issues.append("Closing deductions exceed the gross loan; reconcile borrower funding before proceeding.")
     allocation = scoped_allocation_reconciliation(net_client, terms, use_of_funds)
@@ -313,7 +454,19 @@ def calculate(budget, terms_dict, use_of_funds=None):
     cash_flows = [{"month": 0, "gross_receipts": 0, "interest": 0, "fees": money(upfront), "reserve_release": 0, "net_cash_flow": money(-initial) if initial is not None else None}]
     cash_flows.extend({**{key: money(value) if key != "month" else value for key, value in flow.items()},
         "net_cash_flow": money(flow["gross_receipts"] - flow["fees"] + flow["reserve_release"]) if fees is not None and not unknown_investor_reserve else None} for flow in monthly.values())
+    payment = schedule.get("payment_after") if schedule and schedule.get("payment_after") is not None else schedule.get("payment_io") if schedule else None
     return {"loan_currency": terms.get("currency") or "USD", "gross_loan_amount": money(loan), "investor_funding_amount": money(funding), "funding_mode": mode,
+        "principal_solution": principal,
+        "scheduled_payment": {"amount": payment, "frequency": terms.get("repayment_frequency"),
+            "monthly_equivalent": schedule.get("ordinary_payment_monthly", schedule.get("payment_after_monthly") or schedule.get("payment_io_monthly")) if schedule else None,
+            "payments_per_year": schedule.get("periods_per_year") if schedule else None,
+            "annual_debt_service": schedule.get("coverage_annual_debt_service") if schedule else None,
+            "total_interest": schedule.get("total_interest") if schedule else None,
+            "total_repayment": schedule.get("total_paid") if schedule else None,
+            "residual_balloon": schedule.get("balloon") if schedule else None},
+        "borrower_fee_cash_flows": [{"month": month, "amount": money(value)} for month, value in sorted(borrower_monthly_fees.items())] if annual_borrower_fees is not None else None,
+        "borrower_operating_expense_cash_flows": [{"month": month, "amount": money(value)} for month, value in sorted(borrower_monthly_operating.items())] if annual_operating is not None else None,
+        "annual_new_operating_expenses": money(annual_operating),
         "other_funding_required": money(max(ZERO, loan - funding)) if loan is not None and funding is not None else None,
         "other_funding_status": "unknown" if loan is None or funding is None else "not_confirmed" if loan > funding else "not_required",
         "platform_origination_equivalent_points": float(cap_points) if not cap_unresolved else None,
@@ -329,13 +482,14 @@ def calculate(budget, terms_dict, use_of_funds=None):
         "closing_costs_by_payer": {payer: money(known(f"{payer}_closing_costs")) for payer in ("borrower", "investor", "sponsor")},
         "financing_fee_coverage": {"base_dscr": coverage.get("base_dscr"), "with_financing_fees_dscr": float(round(fee_dscr, 4)) if fee_dscr is not None else None,
             "annual_borrower_financing_fees": money(annual_borrower_fees), "basis": coverage.get("basis"),
+            "annual_new_operating_expenses": money(annual_operating), "income_annual_after_new_operating_expenses": money(adjusted_numerator),
             "annual_debt_service_including_fees": money(fee_denominator), "method": coverage_method,
             "assumption": "Future proposal financing fees only; verify these charges are not already in retained debt or the operating earnings baseline. Closing costs and investor-paid fees do not change this denominator."},
         "assumptions": ["Contractual full collection; no guarantee, defaults, taxes or unrecorded fees are assumed.",
             "Investor receives a pro rata share of principal and interest; borrower fees are not assumed to be investor income.",
             "Recurring monthly or annual charges accrue pro rata over actual repayment intervals using opening principal. Rates on interest apply once to scheduled interval interest.",
             "Reserves are held assets, not fees or income. Only explicitly recorded maturity releases are illustrated.",
-            "Costs do not change contractual APR, principal or recorded DSCR/EBITDA/NOI baselines. Coverage including future borrower financing fees is a separate pro forma illustration."]}
+            "Recorded APR and DSCR/EBITDA/NOI baselines stay unchanged. Explicitly financed closing costs change the proposed principal when applied. New recurring financing costs affect projected coverage; explicit operating expenses affect projected earnings once."]}
 
 
 def reporting(profile, terms_dict):
@@ -344,8 +498,9 @@ def reporting(profile, terms_dict):
     recorded = terms.get("deal_budget_snapshot") or {}
     has_terms = bool(terms.get("recorded_terms_ref")) or terms.get("source") == "term_sheet"
     revision = terms.get("deal_budget_revision")
-    basis = "recorded_terms" if has_terms and revision is not None else "unrecorded_terms" if has_terms else "staff_proposal"
-    selected = recorded if has_terms else current
+    working = terms.get("source") == "plan"
+    basis = "staff_proposal" if working else "recorded_terms" if has_terms and revision is not None else "unrecorded_terms" if has_terms else "staff_proposal"
+    selected = recorded if has_terms and not working else current
     calculation = deepcopy(terms["deal_budget_calculation"]) if has_terms and terms.get("source") != "plan" and terms.get("deal_budget_calculation") else calculate(selected, terms, getattr(profile, "use_of_funds", None))
     allocation = scoped_allocation_reconciliation(calculation.get("net_client_cash"), terms, getattr(profile, "use_of_funds", None))
     current_coverage = None
@@ -366,19 +521,61 @@ def reporting(profile, terms_dict):
         "current_allocation_conditions": allocation_conditions}
 
 
-async def read(db, profile, user=None, *, budget=None, loan=None):
-    if loan is None:
-        from app.services.financial_cockpit import load_cockpit
-        loan = (await load_cockpit(db, profile)).get("proposed_terms") or {}
-    loan = dict(loan)
+def _terms_ref(cockpit):
+    ref = (cockpit.get("proposed_terms") or {}).get("recorded_terms_ref")
+    return {"kind": "application_term_sheet" if ref.get("kind") == "client_terms" else ref.get("kind"),
+        "id": str(ref["id"]), "version": ref.get("version")} if isinstance(ref, dict) and ref.get("id") else None
+
+
+def _loan_plan(record, loan):
+    value = deepcopy(record or {})
+    if loan is not None:
+        for source, target in {"amount": "new_loan_amount", "rate_pct": "new_loan_rate_pct", "term_months": "new_loan_term_months",
+            "structure": "new_loan_structure", "interest_only_months": "new_loan_interest_only_months",
+            "payments_per_year": "new_loan_payments_per_year", "repayment_config": "new_loan_repayment_config"}.items():
+            if source in loan:
+                value[target] = loan[source]
+        value["new_loan_interest_only"] = loan.get("structure") == "interest_only"
+        value["new_payment_monthly"] = None
+    return value
+
+
+async def read(db, profile, user=None, *, budget=None, loan=None, financial_plan=None):
+    from app.services import financial_cockpit
+    cockpit = await financial_cockpit.load_cockpit(db, profile)
+    current_loan = cockpit.get("proposed_terms") or {}
+    value = budget if budget is not None else snapshot(profile)
+    evaluation = (cockpit.get("plan") or {}).get("evaluation")
+    if budget is not None or financial_plan is not None or loan is not None:
+        plan = _loan_plan(financial_plan if financial_plan is not None else (cockpit.get("plan") or {}).get("record"), loan)
+        preview = financial_cockpit.financing_preview(cockpit, plan, value)
+        preview_loan, evaluation = preview["loan"], preview["evaluation"]
+        if loan is not None and "payments_per_year" in loan and loan["payments_per_year"] is None:
+            # FinancialPlan's ordinary missing cadence defaults to monthly.
+            # A partial custom-cadence preview explicitly says unknown instead.
+            preview_loan = {**preview_loan, "payments_per_year": None, "schedule_unavailable": True}
+            evaluation = None
+        loan = preview_loan
+    else:
+        loan = current_loan
+    loan = dict(loan or {})
     if "requested_amount" not in loan:
         from app.services.use_of_funds import source_funding_data
         requested, _source, _purpose, _dealer = await source_funding_data(db, profile)
         loan["requested_amount"] = money(requested)
-    value = budget if budget is not None else snapshot(profile)
+    calculation = calculate(value, loan, getattr(profile, "use_of_funds", None))
+    if isinstance(evaluation, dict) and isinstance(evaluation.get("principal_solution"), dict):
+        # The evaluator retains the input principal before solving. Its output
+        # loan already contains G, so recalculation alone would falsely say the
+        # original working loan needed no application.
+        calculation["principal_solution"] = deepcopy(evaluation["principal_solution"])
     return DealBudgetRead(profile_id=profile.id, **{key: value.get(key) for key in DealBudgetRead.model_fields if key in value},
         can_edit=bool(user and user.role in EDIT_ROLES), suggested_rows=await suggestions(db, profile, value),
-        calculation=calculate(value, loan, getattr(profile, "use_of_funds", None)))
+        financing_context={"plan_updated_at": (getattr(profile, "financial_plan", None) or {}).get("updated_at"),
+            "terms_ref": _terms_ref(cockpit), "current_loan_amount": current_loan.get("amount")},
+        financial_plan={"profile_id": str(profile.id), "obligations": (cockpit.get("debt") or {}).get("obligations", []), **(cockpit.get("plan") or {})},
+        financial_plan_evaluation=evaluation,
+        calculation=calculation)
 
 
 async def suggestions(db, profile, budget):
@@ -424,6 +621,91 @@ def project_legacy(profile, budget):
         setattr(profile, field, sum(values, ZERO) if values and all(value is not None for value in values) else None)
 
 
+def _timestamp(value):
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+    return value.astimezone(UTC).isoformat() if isinstance(value, datetime) and value.utcoffset() is not None else value
+
+
+def _budget_payload(payload):
+    return {key: value for key, value in payload.model_dump(mode="json").items()
+        if key in DealBudgetPatch.model_fields and key != "expected_revision"}
+
+
+async def apply_principal(db, profile, payload: DealBudgetApply, user):
+    """Save reviewed costs and their shared working principal in one transaction."""
+    require_staff(user)
+    if payload.currency != "USD":
+        raise HTTPException(422, "Loan cost budgets use USD; no currency conversion is performed.")
+    with getattr(db, "no_autoflush", nullcontext()):
+        locked = (await db.execute(select(ApplicationProfile).where(ApplicationProfile.id == profile.id).with_for_update()
+            .execution_options(populate_existing=True))).scalar_one()
+    before = snapshot(locked)
+    saved_plan = deepcopy(getattr(locked, "financial_plan", None) or {})
+    fingerprint = hashlib.sha256(json.dumps(payload.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    receipts = list(before.get("apply_receipts") or [])
+    receipt = next((item for item in receipts if item.get("key") == payload.idempotency_key), None)
+    if receipt:
+        if receipt.get("fingerprint") != fingerprint:
+            raise HTTPException(409, "This apply key was already used with different costs or loan inputs.")
+        if receipt.get("revision") != before.get("revision") or _timestamp(receipt.get("plan_updated_at")) != _timestamp(saved_plan.get("updated_at")):
+            raise HTTPException(409, "This change was already applied and the file has since changed. Reload the current loan.")
+        return await read(db, locked, user)
+    if before.get("revision", 0) != payload.expected_revision:
+        raise HTTPException(409, "Deal costs changed; reload before saving the budget and loan.")
+    if _timestamp(saved_plan.get("updated_at")) != _timestamp(payload.expected_plan_updated_at):
+        raise HTTPException(409, "The coverage plan changed; reload before applying a new principal.")
+    from app.schemas.financial_cockpit import FinancialPlanWrite
+    from app.services import financial_cockpit
+    from app.services.financial_plan import validate_plan_write
+    from app.services.financial_plan_budget import loan_from_plan
+
+    cockpit = await financial_cockpit.load_cockpit(db, locked)
+    expected_ref = payload.expected_terms_ref.model_dump(mode="json") if payload.expected_terms_ref else None
+    if _terms_ref(cockpit) != expected_ref:
+        raise HTTPException(409, "The saved terms version changed; reload before applying the budget and loan.")
+    after = _budget_payload(payload)
+    record = {**saved_plan, **(payload.financial_plan or {})}
+    if payload.financial_plan is None and record.get("new_loan_amount") is None:
+        proposed = cockpit.get("proposed_terms") or {}
+        recorded = ((cockpit.get("plan") or {}).get("terms_link") or {}).get("recorded")
+        if expected_ref:
+            from app.services.plan_terms_link import adopt
+            # The full recorded form carries refinance treatment and retained
+            # service. Older cockpit references expose those beside a bare ref.
+            if not isinstance(recorded, dict) or not recorded.get("id"):
+                recorded = {**proposed, **(proposed.get("recorded_terms_ref") or {}),
+                    "payment_monthly": proposed.get("monthly_payment")}
+            record = adopt(record, recorded, by=user.id)
+        else:
+            record = _loan_plan(record, proposed)
+    solution = solve_principal(after, loan_from_plan(record))
+    if solution["status"] != "calculated":
+        raise HTTPException(422, " ".join(solution["issues"]) or "The principal could not be solved.")
+    record.update(new_loan_amount=solution["gross_loan_amount"], new_payment_monthly=None,
+        new_payment_source="recorded_terms" if record.get("new_payment_source") == "recorded_terms" else "manual_terms",
+        expected_updated_at=payload.expected_plan_updated_at)
+    plan_payload = FinancialPlanWrite.model_validate(record)
+    validate_plan_write(saved_plan, plan_payload)
+    await enforce_origination_cap(db, locked, after, solution["gross_loan_amount"])
+    record = plan_payload.model_dump(mode="json", exclude={"expected_updated_at", "expected_deal_budget_revision"})
+    stamp = datetime.now(UTC).isoformat()
+    record.update(updated_at=stamp, updated_by=str(user.id))
+    revision = before.get("revision", 0) + 1
+    receipts.append({"key": payload.idempotency_key, "fingerprint": fingerprint, "revision": revision, "plan_updated_at": stamp})
+    after.update(schema_version=1, revision=revision, updated_at=stamp, updated_by_user_id=str(user.id), apply_receipts=receipts[-100:])
+    locked.deal_budget, locked.financial_plan = after, record
+    project_legacy(locked, after)
+    from app.services.application_profiles import log_profile_action
+    await log_profile_action(db, locked, user, "deal_budget.principal_applied", "Saved deal costs and the calculated shared loan principal together",
+        metadata={"before_budget": before, "after_budget": after, "before_plan": saved_plan, "after_plan": record, "principal_solution": solution})
+    await db.flush()
+    return await read(db, locked, user)
+
+
 async def update(db, profile, payload: DealBudgetPatch, user):
     require_staff(user)
     if payload.currency != "USD":
@@ -434,11 +716,16 @@ async def update(db, profile, payload: DealBudgetPatch, user):
     if before["revision"] != payload.expected_revision:
         raise HTTPException(409, "Deal costs changed; reload before saving")
     after = payload.model_dump(mode="json", exclude={"expected_revision"})
+    if before.get("apply_receipts"):
+        after["apply_receipts"] = deepcopy(before["apply_receipts"])
     # Fixed-dollar platform origination charges share the same published cap.
     loan_amount = (getattr(locked, "financial_plan", None) or {}).get("new_loan_amount")
     if loan_amount is None and any(row["enabled"] and row["category"] == "origination" and row["method"] == "fixed" and row["recipient_role"] == "platform" for row in after["rows"]):
         from app.services.financial_cockpit import load_cockpit
         loan_amount = ((await load_cockpit(db, locked)).get("proposed_terms") or {}).get("amount")
+    solution = solve_principal(after, {"amount": loan_amount})
+    if after.get("loan_amount_mode") != "gross_loan" and solution["status"] == "calculated" and solution["requires_apply"]:
+        raise HTTPException(409, "These costs change the loan principal. Use Save budget and loan to apply both atomically.")
     await enforce_origination_cap(db, locked, after, loan_amount)
     after.update(schema_version=1, revision=payload.expected_revision + 1, updated_at=datetime.now(UTC).isoformat(), updated_by_user_id=str(user.id))
     locked.deal_budget = after
@@ -480,6 +767,9 @@ async def sync_legacy_write(db, profile, changes, user):
             after["rows"].append(replacement)
     after.update(revision=before["revision"] + 1, costs_confirmed=False, updated_at=datetime.now(UTC).isoformat(), updated_by_user_id=str(user.id))
     loan_amount = (getattr(profile, "financial_plan", None) or {}).get("new_loan_amount") or getattr(profile, "underwriting_term_sheet_amount", None)
+    solution = solve_principal(after, {"amount": loan_amount})
+    if after.get("loan_amount_mode", "gross_loan") != "gross_loan" and solution["status"] == "calculated" and solution["requires_apply"]:
+        raise HTTPException(409, "These fee settings change the target-net loan principal. Edit and save the budget and shared loan together.")
     await enforce_origination_cap(db, profile, after, loan_amount)
     profile.deal_budget = after
     from app.services.application_profiles import log_profile_action

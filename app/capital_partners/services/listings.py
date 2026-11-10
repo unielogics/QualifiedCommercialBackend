@@ -423,6 +423,9 @@ def publish_blockers(listing: CpListing) -> list[str]:
             missing.append("Save an updated terms version for the changed cost budget before publishing")
         if (budget.get("calculation") or {}).get("status") != "ready":
             missing.append("Confirm the closing cost budget, funding mode and investor charges before publishing")
+        principal = (budget.get("calculation") or {}).get("principal_solution") or {}
+        if principal and (principal.get("status") != "calculated" or principal.get("requires_apply")):
+            missing.append("Apply the solved gross principal to the shared loan before publishing")
         allocation = budget.get("current_allocation_reconciliation") or (budget.get("calculation") or {}).get("allocation_reconciliation") or {}
         if allocation.get("status") in {"overallocated", "unallocated"}:
             missing.append("Reconcile the current use-of-funds allocations with net loan proceeds at funding before publishing")

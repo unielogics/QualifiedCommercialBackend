@@ -830,6 +830,11 @@ def _apply_current_business_coverage(context: dict[str, Any], cockpit: dict[str,
                      if sources[field]["verification_status"] == "estimated_from_statements")
     context["estimated_fit_facts"] = estimated
     context["financial_calculation_authority"] = authority
+    from app.services.financing_projection import scenario_reference
+    scenario = scenario_reference(current)
+    if scenario is not None:
+        context["financing_scenario"] = scenario
+        sources["financing_scenario"] = scenario
 
 
 #: Facts the rules may evaluate. A staff-reviewed fact is verified; a value the

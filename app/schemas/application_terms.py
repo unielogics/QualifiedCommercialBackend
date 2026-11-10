@@ -115,6 +115,8 @@ class ClientTermsWrite(BaseModel):
 
 
 class ClientTermsCalculation(BaseModel):
+    financing_fee_coverage: dict | None = None
+    principal_solution: dict | None = None
     periodic_payment: float | None = None
     payment_count: int | None = None
     payments_per_year: float | None = None

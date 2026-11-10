@@ -470,14 +470,15 @@ async def test_plan_api_locks_refreshes_and_rejects_stale_write_before_mutation(
     from app.routers import application_profiles as routes
 
     current = {**plan_for(), "updated_at": "2026-11-06T12:00:00+00:00"}
-    profile = SimpleNamespace(id=uuid4(), financial_plan=deepcopy(current))
+    budget = {"revision": 3, "rows": [], "costs_confirmed": True}
+    profile = SimpleNamespace(id=uuid4(), financial_plan=deepcopy(current), deal_budget=deepcopy(budget))
     db = SimpleNamespace(execute=AsyncMock(), refresh=AsyncMock(), commit=AsyncMock())
     actor = SimpleNamespace(id=uuid4(), role=Role.LOAN_EXEC)
     with patch.object(routes.profiles, "load_profile", AsyncMock(return_value=profile)):
         with pytest.raises(HTTPException) as error:
             await routes.put_financial_plan(profile.id, FinancialPlanWrite(new_loan_repayment_config=None,
                 expected_updated_at="2026-11-06T11:00:00+00:00"), actor, db)
-    assert error.value.status_code == 409 and profile.financial_plan == current
+    assert error.value.status_code == 409 and profile.financial_plan == current and profile.deal_budget == budget
     db.execute.assert_awaited_once()
-    db.refresh.assert_awaited_once_with(profile, attribute_names=["financial_plan"])
+    db.refresh.assert_awaited_once_with(profile, attribute_names=["financial_plan", "deal_budget"])
     db.commit.assert_not_awaited()
