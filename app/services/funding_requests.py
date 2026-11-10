@@ -14,8 +14,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import func, literal, select, update
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import Role
@@ -25,6 +24,7 @@ from app.models.funding_request import FundingRequestChange
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.schemas.funding_request import FundingRequestPatch, FundingRequestRead
+from app.services.financial_snapshot_objects import snapshot_object, sql_mark_snapshot
 
 EDIT_ROLES = {Role.SUPER_ADMIN, Role.LOAN_EXEC}
 
@@ -124,20 +124,19 @@ async def invalidate_request_reviews(db: AsyncSession, profile: ApplicationProfi
         "use_of_funds_revision": profile.use_of_funds_revision or 0,
     }
     await db.execute(update(BucketAIReview).where(BucketAIReview.bucket_id == profile.primary_bucket_id).values(
-        context_snapshot=func.coalesce(BucketAIReview.context_snapshot, literal({}, type_=JSONB)).op("||")(literal(marker, type_=JSONB)),
+        context_snapshot=sql_mark_snapshot(BucketAIReview.context_snapshot, marker),
     ).execution_options(synchronize_session=False))
     await db.execute(update(PublicUnderwritingIntake).where(PublicUnderwritingIntake.bucket_id == profile.primary_bucket_id).values(
         latest_review_id=None,
-        result_snapshot=PublicUnderwritingIntake.result_snapshot.op("||")(literal({"_funding_request_stale": True}, type_=JSONB)),
+        result_snapshot=sql_mark_snapshot(PublicUnderwritingIntake.result_snapshot, {"_funding_request_stale": True}),
     ).execution_options(synchronize_session=False))
     for row in getattr(db, "identity_map", {}).values():
         if isinstance(row, BucketAIReview) and row.bucket_id == profile.primary_bucket_id:
-            row.context_snapshot = {**(row.context_snapshot or {}), **marker}
+            row.context_snapshot = {**snapshot_object(row.context_snapshot), **marker}
         elif isinstance(row, PublicUnderwritingIntake) and row.bucket_id == profile.primary_bucket_id:
             row.latest_review_id = None
             row.latest_review = None
-            if row.result_snapshot:
-                row.result_snapshot = {**row.result_snapshot, "_funding_request_stale": True}
+            row.result_snapshot = {**snapshot_object(row.result_snapshot), "_funding_request_stale": True}
 
 
 async def current_for_intake(db: AsyncSession, intake: Any) -> Decimal | None:
