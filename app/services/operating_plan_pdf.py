@@ -44,12 +44,13 @@ def _before_after(summary, currency):
         ("Coverage with current debt", "dscr", "dscr_current", True),
         ("Coverage with refinance", None, "dscr_with_refinance", True),
         ("First-year earnings", None, "first_year_earnings", False),
+        ("First-year operating income (NOI)", None, "first_year_noi", False),
         ("Earnings still needed for 1.25x - current debt", None, "target_gap_current", False),
         ("Earnings still needed for 1.25x - refinance", None, "target_gap_refinance", False),
     ]
     rows = []
     for label, current_key, key, ratio in metrics:
-        row_currency = baseline.get("noi_currency", currency) if key == "noi" else currency
+        row_currency = baseline.get("noi_currency", currency) if key in {"noi", "first_year_noi"} else currency
         show = _ratio if ratio else lambda value, code=row_currency: _money(value, code)
         rows.append(f"<tr><td>{label}</td><td class='num'>{show(baseline.get(current_key))}</td><td class='num'>{show(proposed.get(key))}</td><td class='num'>{show(approved.get(key))}</td></tr>")
     noi = baseline.get("noi_governance") or {}
@@ -58,6 +59,10 @@ def _before_after(summary, currency):
         noi_basis = (f"<p class='muted'>NOI basis: {_text(noi.get('label') or baseline.get('noi_label'))}; "
                      f"{_text(noi.get('period') or baseline.get('noi_period'))}; {_text(noi.get('currency') or baseline.get('noi_currency'))}. "
                      f"Status: {_text(noi.get('status'))}. {_text(noi.get('status_reason'))}</p>")
+    if proposed.get("noi_status") or approved.get("noi_status"):
+        noi_basis += (f"<p class='muted'>NOI illustration status - all proposals: {_text(proposed.get('noi_status')).replace('_', ' ')}; "
+                      f"staff-reviewed adjustments: {_text(approved.get('noi_status')).replace('_', ' ')}. "
+                      "Projected NOI can be shown from a comparable NOI baseline independently of EBITDA; it does not establish debt coverage.</p>")
     totals = summary.get("totals") or {}
     impacts = "".join(f"<tr><td>{label}</td><td class='num'>{_money((totals.get('proposed') or {}).get(key), currency)}</td><td class='num'>{_money((totals.get('approved') or {}).get(key), currency)}</td></tr>"
         for key, label in (("annual_impact", "Net annual improvement"), ("monthly_impact", "Monthly improvement"), ("first_year_impact", "First-year improvement"), ("one_time_cost", "One-time implementation cost")))
@@ -79,6 +84,47 @@ def _released_cash_flow(summary, body):
         f"<p>Monthly released cash flow: {_money(cash.get('amount_monthly'), 'USD')}; allocated: {_money(cash.get('allocated_monthly'), 'USD')}; remaining: {_money(cash.get('unallocated_monthly'), 'USD')}. Status: {_text(cash.get('status'))}.</p>"
         "<table><thead><tr><th>Monthly use</th><th>Monthly amount</th><th>Explanation</th></tr></thead><tbody>"
         + (details or "<tr><td colspan='3'>No monthly allocation entered.</td></tr>") + "</tbody></table>")
+
+
+def _expense_groups(summary, body, currency):
+    groups = summary.get("expense_groups") or []
+    if not groups:
+        return ""
+    details = []
+    for group in groups:
+        group_currency = group.get("currency") or currency
+        rows = [row for row in body.get("expenses") or []
+                if not row.get("excluded") and group.get("key") and row.get("source_group_key") == group.get("key")]
+        amounts = (f"Source annual reference: {_money(group.get('baseline_annual_amount'), group_currency)}; "
+                   f"disclosed annual detail: {_money(group.get('disclosed_annual_amount'), group_currency)}; "
+                   f"difference: {_money(group.get('difference_annual'), group_currency)}.")
+        items = "".join(f"<li>{_text(row.get('label') or row.get('category'))}: {_money(cost_amount(row), currency)} / "
+                        f"{_text(row.get('cadence')).replace('_', ' ')}"
+                        + (f"; {_text(row.get('payee'))}" if row.get("payee") else "") + "</li>" for row in rows)
+        notes = " ".join(str(note) for note in group.get("notes") or [])
+        details.append(f"<div class='expense-note'><h3>{_text(group.get('label') or group.get('category'))}</h3>"
+            f"<p>{amounts} Status: {_text(group.get('status')).replace('_', ' ')}.</p>"
+            + ("<ul>" + items + "</ul>" if items else "<p>No active expense detail is linked to this source reference.</p>")
+            + (f"<p class='muted'>{_text(notes)}</p>" if notes else "") + "</div>")
+    return ("<h2>Source expense groups and disclosed detail</h2>"
+        "<p class='muted'>Source totals are references for reconciliation. Their detailed expense lines replace the reference in the disclosure; the source total is not added again. A difference does not change historical NOI or create a savings adjustment.</p>"
+        + "".join(details))
+
+
+def _marketing_assumptions(row, impact, currency):
+    if row.get("kind") != "marketing_investment":
+        return ""
+    calculation = impact.get("calculation") or {}
+    multiple = row.get("revenue_return_multiple")
+    margin = row.get("contribution_margin_pct")
+    margin_text = f"{float(margin):g}%" if margin is not None else "Not available"
+    return (f"<p><b>Product or service:</b> {_text(row.get('product_name'))}. "
+        f"<b>Assumed revenue per added marketing dollar:</b> {_ratio(multiple)}; "
+        f"<b>Contribution margin:</b> {margin_text}.</p>"
+        f"<p>Per {_text(row.get('cadence')).replace('_', ' ')} period: added spend {_money(calculation.get('incremental_spend'), currency)}; "
+        f"modeled added revenue {_money(calculation.get('incremental_revenue'), currency)}; "
+        f"contribution before added marketing spend {_money(calculation.get('incremental_contribution'), currency)}.</p>"
+        "<p class='muted'>Net effect = added spend times (revenue return multiple times contribution margin / 100 - 1), before separately disclosed implementation costs. Added marketing spend is deducted once. These are assumptions, not guaranteed sales or historical income.</p>")
 
 
 def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
@@ -113,6 +159,7 @@ def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
         impact = impacts.get(str(row.get("id"))) or {}
         proposal = f"{_money(cost_amount(row), currency)} to {_money(cost_amount(row, 'proposed'), currency)} / {_text(row.get('cadence')).replace('_', ' ')}"
         drivers = [(key.replace("_", " "), row[key]) for key in (
+            "product_name",
             "cost_basis", "unit_label", "current_units_per_period", "proposed_units_per_period", "current_fixed_amount", "proposed_fixed_amount",
             "units_per_period", "current_unit_price", "proposed_unit_price", "current_unit_cost", "proposed_unit_cost", "contribution_margin_pct",
             "processing_volume", "processing_transaction_count", "current_processing_rate_pct", "proposed_processing_rate_pct",
@@ -123,6 +170,7 @@ def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
         adjustment_html.append(f"<section><h3>{index}. {_text(row.get('label'))} <small>{_text(impact.get('review_state') or row.get('status') or 'proposed').upper().replace('_', ' ')}</small></h3>"
             f"<p><b>Change:</b> {_text(row.get('kind')).replace('_', ' ')} - {proposal}</p>"
             f"<p>{_text(row.get('explanation'))}</p>" + (f"<p>{driver_html}</p>" if driver_html else "") +
+            _marketing_assumptions(row, impact, currency) +
             f"<p><b>Net annual impact:</b> {_money(impact.get('net_annual_impact'), currency)}; <b>Monthly:</b> {_money(impact['net_annual_impact'] / 12 if impact.get('net_annual_impact') is not None else None, currency)}; <b>First year:</b> {_money(impact.get('first_year_impact'), currency)}</p>"
             f"<p><b>Implementation cost:</b> {_money(row.get('implementation_cost'), currency)} / {_text(row.get('implementation_cost_cadence')).replace('_', ' ')}"
             f"<br><b>Effective:</b> {_text(row.get('effective_date'))} - <b>Responsible:</b> {_text(row.get('owner_name'))}</p>"
@@ -139,6 +187,7 @@ def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
         "<div class='notice'>Expense disclosures and proposed earnings improvements. These are separate from historical P&amp;L, NOI, EBITDA, current debt coverage and program qualification. Client submissions await staff review; improvements are conditional and require baseline reconciliation and supporting evidence.</div>" + \
         _before_after(summary, currency) + \
         _released_cash_flow(summary, body) + \
+        _expense_groups(summary, body, currency) + \
         f"<h2>Operating expense disclosure</h2><p class='muted'>Loan payments, transfers, income taxes, owner draws and noncash depreciation are disclosed separately from operating cash costs.</p><table><thead><tr><th>Expense</th><th>Payee</th><th>Current amount</th><th>Cadence</th><th>Essential</th></tr></thead><tbody>{expense_rows}</tbody></table>{expense_notes}" + \
         f"<h2>Earnings adjustments and explanation</h2>{''.join(adjustment_html) or '<p>No improvements proposed.</p>'}" + \
         f"<p class='muted'>{excluded} excluded or duplicate rows remain in the immutable version history.</p><h2>Plan notes</h2><p>{_text(body.get('notes'))}</p></body></html>"

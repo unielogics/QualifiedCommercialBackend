@@ -22,7 +22,8 @@ def _first(row, *keys):
     return next((row[key] for key in keys if row.get(key) is not None), None)
 
 
-def build_evidence(analyses: list[dict], cockpit: dict, *, files=None, offer=None) -> dict[str, Any]:
+def build_evidence(analyses: list[dict], cockpit: dict, *, files=None, offer=None,
+                   business_name=None, naics_code=None, industry=None) -> dict[str, Any]:
     inventory = []
     by_id = {str(row["file_id"]): row for row in analyses}
     raw_files = files if files is not None else analyses
@@ -38,6 +39,7 @@ def build_evidence(analyses: list[dict], cockpit: dict, *, files=None, offer=Non
             "content_hash": get("content_hash") or row.get("content_hash"),
             "association_status": association.get("status", "unconfirmed"),
             "association_stamp": association.get("association_stamp"),
+            "eligible_for_guidance": bool(association.get("allows_financial_use") and get("status", "uploaded") != "rejected"),
             "eligible_for_review": bool(association.get("allows_financial_use") and row.get("accepted")
                 and row.get("analysis_id") and row.get("content_hash") and get("status", "uploaded") != "rejected")})
     inventory_by_id = {row["file_id"]: row for row in inventory}
@@ -109,7 +111,15 @@ def build_evidence(analyses: list[dict], cockpit: dict, *, files=None, offer=Non
 
         offers = [{"id": str(offer.id), "source_file_id": str(offer.source_file_id), "status": offer.status,
                    "terms_version": offer.terms_version, **clean_terms(offer.terms or {})}]
-    return {"files": sorted(inventory, key=lambda row: row["file_id"]),
+    from app.services.operating_plan_guidance import build_guidance
+
+    guidance, source_candidates = build_guidance(analyses, cockpit, business_name=business_name,
+                                                naics_code=naics_code, industry=industry)
+    candidates.extend(source_candidates)
+    for candidate in candidates:
+        candidate.setdefault("source_candidate_key", candidate["key"])
+        candidate.setdefault("source_group_key", "")
+    return {"files": sorted(inventory, key=lambda row: row["file_id"]), "guidance": guidance,
             "expense_candidates": sorted(candidates, key=lambda row: row["key"])[:500],
             "merchant_sources": sorted(sources, key=lambda row: row["source_key"]),
             "merchant_offers": offers, "warnings": warnings}

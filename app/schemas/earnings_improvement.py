@@ -15,7 +15,8 @@ ExpenseCategory = Literal["rent", "salaries", "payroll_taxes", "insurance", "uti
     "professional_fees", "supplies", "repairs", "transportation", "cogs", "merchant_processing", "other",
     "loan_payments", "income_taxes", "owner_draws", "transfers", "depreciation_amortization"]
 ActionKind = Literal["price_change", "product_cost_change", "revenue_change", "expense_reduction", "expense_increase",
-                     "processing_cost_change", "one_time_adjustment"]
+                     "processing_cost_change", "marketing_investment", "one_time_adjustment"]
+CategoryConfirmation = Literal["confirmed", "not_applicable", "needs_help"]
 ReviewDecision = Literal["proposed", "approved", "rejected"]
 BaselineTreatment = Literal["unreconciled", "included_in_baseline", "incremental_to_baseline", "outside_operating_earnings"]
 RateBasis = Literal["all_in", "processor_markup", "unknown"]
@@ -54,6 +55,8 @@ class ExpenseRow(_Form):
     cadence: Cadence = "monthly"
     essential: bool = True
     source_file_ids: list[UUID] = Field(default_factory=list, max_length=100)
+    source_group_key: str = Field(default="", max_length=240)
+    source_candidate_key: str = Field(default="", max_length=240)
     bank_vendor_key: str | None = Field(default=None, max_length=200)
     notes: str = Field(default="", max_length=4000)
     excluded: bool = False
@@ -65,6 +68,7 @@ class AdjustmentRow(_Form):
     kind: ActionKind = "expense_reduction"
     label: str = Field(default="", max_length=240)
     driver_key: str = Field(default="", max_length=200)
+    product_name: str = Field(default="", max_length=240)
     expense_row_id: UUID | None = None
     current_amount: float | None = Field(default=None, ge=0, le=1e15)
     proposed_amount: float | None = Field(default=None, ge=0, le=1e15)
@@ -81,6 +85,7 @@ class AdjustmentRow(_Form):
     current_unit_cost: float | None = Field(default=None, ge=0, le=1e15)
     proposed_unit_cost: float | None = Field(default=None, ge=0, le=1e15)
     contribution_margin_pct: float | None = Field(default=None, ge=0, le=100)
+    revenue_return_multiple: float | None = Field(default=None, ge=0, le=1e15)
     implementation_cost: float | None = Field(default=None, ge=0, le=1e15)
     implementation_cost_cadence: Literal["one_time", "monthly", "annual"] = "one_time"
     effective_date: date | None = None
@@ -154,6 +159,7 @@ class OperatingPlanBody(_Form):
     client_attestation: bool = False
     notes: str = Field(default="", max_length=10000)
     expenses: list[ExpenseRow] = Field(default_factory=list, max_length=500)
+    category_confirmations: dict[ExpenseCategory, CategoryConfirmation] = Field(default_factory=dict)
     adjustments: list[AdjustmentRow] = Field(default_factory=list, max_length=300)
     released_cash_flow: ReleasedCashFlow = Field(default_factory=ReleasedCashFlow)
     field_sources: dict[str, Any] = Field(default_factory=dict)
@@ -184,6 +190,10 @@ class OperatingPlanBody(_Form):
                     row.excluded = True
         if self.no_operating_expenses_confirmed and any(not row.excluded for row in self.expenses):
             raise ValueError("A no-expenses confirmation cannot coexist with active expense rows")
+        active_categories = {row.category for row in self.expenses if not row.excluded}
+        if any(decision == "not_applicable" and category in active_categories
+               for category, decision in self.category_confirmations.items()):
+            raise ValueError("A category marked not applicable cannot contain active expenses")
         known_expenses = {row.id for row in self.expenses}
         if any(row.expense_row_id and row.expense_row_id not in known_expenses for row in self.adjustments):
             raise ValueError("An adjustment must refer to an expense in this operating plan")
@@ -217,6 +227,9 @@ def action_missing(row):
         required += ["units_per_period", "current_unit_cost", "proposed_unit_cost"]
     elif kind == "processing_cost_change":
         required += ["processing_volume", "current_processing_rate_pct", "proposed_processing_rate_pct"]
+    elif kind == "marketing_investment":
+        required += ["product_name", "expense_row_id", "current_amount", "proposed_amount",
+                     "revenue_return_multiple", "contribution_margin_pct"]
     elif kind in {"expense_reduction", "expense_increase"} and row.get("cost_basis") == "per_unit":
         required += ["unit_label", "current_units_per_period", "proposed_units_per_period", "current_unit_cost",
                      "proposed_unit_cost", "current_fixed_amount", "proposed_fixed_amount"]
@@ -259,6 +272,12 @@ def completion(raw):
     active = [row for row in body["expenses"] if not row["excluded"]]
     if not active and not body["no_operating_expenses_confirmed"]:
         missing.append("expenses_or_no_expenses_confirmation")
+    missing.extend(f"category_confirmations.{category}" for category, decision in body["category_confirmations"].items()
+                   if decision == "needs_help")
+    active_categories = {row["category"] for row in active}
+    missing.extend(f"category_confirmations.{category}.expense_detail"
+                   for category, decision in body["category_confirmations"].items()
+                   if decision == "confirmed" and category not in active_categories)
     for row in active:
         missing.extend(f"expenses.{row['id']}.{key}" for key in expense_missing(row))
     for row in body["adjustments"]:

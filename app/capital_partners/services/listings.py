@@ -214,14 +214,15 @@ def partner_operating_earnings(value: Any) -> dict[str, Any] | None:
     improvement = value.get("improvement_plan") or {}
 
     def plan_projection(row):
-        return fields(row, ("status", "earnings", "noi", "first_year_earnings", "dscr_current", "dscr_with_refinance",
+        return fields(row, ("status", "earnings", "noi", "noi_status", "first_year_noi", "first_year_earnings", "dscr_current", "dscr_with_refinance",
             "annual_debt_service", "refinance_annual_debt_service", "target_gap_current", "target_gap_refinance"))
 
     def plan_adjustment(row):
-        safe = fields(row, ("label", "kind", "review_state", "net_annual_impact", "first_year_impact", "implementation_one_time",
+        safe = fields(row, ("label", "kind", "product_name", "review_state", "net_annual_impact", "first_year_impact", "implementation_one_time",
             "effective_date", "explanation", "source_note", "owner_name", "included_in_approved_projection", "issues", "risk_flags", "source_names"))
         safe["calculation"] = fields(row.get("calculation"), ("cadence", "units_per_period", "current_amount", "proposed_amount",
             "current_unit_price", "proposed_unit_price", "current_unit_cost", "proposed_unit_cost", "contribution_margin_pct",
+            "product_name", "revenue_return_multiple", "incremental_spend", "incremental_revenue", "incremental_contribution", "formula",
             "processing_volume", "processing_transaction_count", "current_processing_rate_pct", "proposed_processing_rate_pct",
             "current_processing_rate_basis", "proposed_processing_rate_basis", "current_processing_fixed_fee", "proposed_processing_fixed_fee",
             "current_processing_per_transaction_fee", "proposed_processing_per_transaction_fee"))
@@ -230,11 +231,14 @@ def partner_operating_earnings(value: Any) -> dict[str, Any] | None:
     safe_improvement = None
     if improvement:
         safe_improvement = {
-            "baseline": {**fields(improvement.get("baseline"), ("period", "currency", "basis", "revenue", "earnings", "earnings_kind", "noi", "noi_kind", "noi_label", "noi_year", "noi_period", "noi_currency", "noi_basis", "noi_staff_reviewed", "noi_provisional", "dscr", "annual_debt_service", "provisional")),
+            "baseline": {**fields(improvement.get("baseline"), ("period", "currency", "plan_currency", "basis", "revenue", "earnings", "earnings_kind", "noi", "noi_kind", "noi_label", "noi_year", "noi_period", "noi_currency", "noi_basis", "noi_staff_reviewed", "noi_provisional", "dscr", "annual_debt_service", "provisional")),
                 "noi_governance": noi_governance_brief((improvement.get("baseline") or {}).get("noi_governance"), internal=False)},
             "projection": {key: plan_projection((improvement.get("projection") or {}).get(key)) for key in ("proposed", "approved")},
             "totals": {key: fields((improvement.get("totals") or {}).get(key), ("annual_impact", "monthly_impact", "first_year_impact", "one_time_cost", "complete", "count")) for key in ("proposed", "approved")},
             "adjustments": [plan_adjustment(row) for row in improvement.get("adjustments", []) if isinstance(row, dict)],
+            "expense_groups": [fields(row, ("category", "label", "baseline_annual_amount", "disclosed_annual_amount",
+                "difference_annual", "currency", "year", "status", "notes"))
+                for row in improvement.get("expense_groups", []) if isinstance(row, dict)],
             "missing": list(improvement.get("missing") or []), "risk_flags": list(improvement.get("risk_flags") or []),
             "notes": list(improvement.get("notes") or []), "all_actions_reviewed": bool(improvement.get("all_actions_reviewed")),
         }

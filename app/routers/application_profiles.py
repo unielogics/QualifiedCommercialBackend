@@ -6762,6 +6762,10 @@ async def public_financial_form(token: str, db: AsyncSession = Depends(get_db)) 
     if managed:
         response = _client_form_response(managed, link, token)
         body = response["body"]
+        if link.kind == "operating_plan":
+            from app.services.operating_plan_service import client_preview
+
+            response["operating_plan"] = await client_preview(db, profile, body, current=managed["body"])
     await db.commit()
     return {
         "kind": link.kind,
@@ -6779,6 +6783,66 @@ async def public_financial_form(token: str, db: AsyncSession = Depends(get_db)) 
         "prefill": prefill,
         **(response if managed else {"permission": getattr(link, "permission", "edit"), "can_edit": getattr(link, "permission", "edit") == "edit"}),
     }
+
+
+class PublicOperatingPlanEvaluate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    body: dict
+
+
+async def _public_operating_scope(db, token, *, require_edit=False):
+    from app.models.financial_form_version import (
+        FinancialFormDraft,
+        FinancialFormFamily,
+        FinancialFormVersion,
+    )
+    from app.schemas.earnings_improvement import empty_body
+
+    link = await _open_link_or_404(db, token)
+    if link.kind != "operating_plan":
+        raise HTTPException(404, "This link is no longer available")
+    if require_edit and getattr(link, "permission", "edit") != "edit":
+        raise HTTPException(403, "This form link is read-only")
+    profile = await db.get(ApplicationProfile, link.profile_id)
+    family = await db.get(FinancialFormFamily, link.financial_family_id)
+    if profile is None or family is None or family.profile_id != profile.id or family.kind != "operating_plan":
+        raise HTTPException(404, "This link is no longer available")
+    draft = await db.get(FinancialFormDraft, family.id)
+    version = await db.get(FinancialFormVersion, family.current_version_id) if family.current_version_id else None
+    if version is not None and version.family_id != family.id:
+        raise HTTPException(404, "This link is no longer available")
+    return profile, (draft.body if draft else version.body if version else empty_body())
+
+
+@router.post("/public/financial-forms/{token}/evaluate")
+async def public_operating_plan_evaluate(token: str, payload: PublicOperatingPlanEvaluate,
+                                         db: AsyncSession = Depends(get_db)) -> dict:
+    """A scenario preview never saves a draft or promotes a client's proposal."""
+    from app.services.operating_plan_service import client_preview
+
+    profile, current = await _public_operating_scope(db, token, require_edit=True)
+    return await client_preview(db, profile, payload.body, current=current)
+
+
+@router.get("/public/financial-forms/{token}/evidence/{file_id}")
+async def public_operating_plan_evidence(token: str, file_id: UUID,
+                                        db: AsyncSession = Depends(get_db)) -> dict:
+    from app.routers.buckets import PROTECTED_RETENTION_CLASSES, _download_url
+    from app.services.financial_cockpit import load_cockpit
+    from app.services.operating_plan_guidance import client_evidence
+
+    profile, _current = await _public_operating_scope(db, token)
+    evidence = client_evidence((await load_cockpit(db, profile)).get("operating_evidence"))
+    if str(file_id) not in {row["file_id"] for row in evidence["files"]}:
+        raise HTTPException(404, "Source document not found")
+    file = await db.get(BucketFile, file_id)
+    if (file is None or file.bucket_id != profile.primary_bucket_id or file.deleted_at is not None
+            or file.status != "uploaded" or file.retention_class in PROTECTED_RETENTION_CLASSES):
+        raise HTTPException(404, "Source document not found")
+    preview_url = _download_url(file.s3_key, file_name=file.file_name, content_type=file.content_type,
+                                version_id=file.s3_version_id, ttl=300)
+    return {"file": {"id": str(file.id), "file_name": file.file_name, "content_type": file.content_type},
+            "preview_url": preview_url, "expires_in": 300}
 
 
 @router.post("/public/financial-forms/{token}/draft")
