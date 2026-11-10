@@ -14,6 +14,7 @@ from app.services.loan_repayment_display import repayment_lines
 from app.services.loan_terms_visuals import (
     LOAN_VISUALS_CSS,
     closing_preparation_html,
+    payment_phases_html,
     schedule_visuals_html,
 )
 
@@ -154,6 +155,13 @@ def render_terms_html(
         conditions_html = "<li>Final approval, documentation, and closing remain subject to the funding source’s review.</li>"
     custom = row.custom_repayment_label if row.repayment_frequency == "custom" else None
     cadence = custom or _FREQUENCY_LABELS.get(row.repayment_frequency, row.repayment_frequency.replace("_", " ").title())
+    phases_html = payment_phases_html(summary)
+    payment_html = phases_html or f'''<div class="payment">
+      <div class="primary"><span class="label">{payment_label} {escape(cadence.lower())} payment</span><strong>{_money(payment)}</strong></div>
+      <div><span class="label">{annual_label}</span><strong>{_money(float(row.annual_new_debt_service))}</strong></div>
+      <div><span class="label">Estimated total repayment</span><strong>{_money(total)}</strong></div>
+    </div>'''
+    structure_html = "" if phases_html else f'<div class="term"><span class="label">Structure</span><strong style="font-size:11px">{escape(_structure_line(row))}</strong><small>{escape(_structure_note(row))}</small></div>'
     funder = _FUNDER_LABELS.get(row.funder_type, row.funder_type.replace("_", " ").title())
     if row.funder_name:
         funder = f"{funder} · {row.funder_name}"
@@ -203,7 +211,7 @@ def render_terms_html(
   .payment {{ border-radius: 11px; background: #edf8f7; border: 1px solid #bfe6e2; padding: 13px 15px; display: grid; grid-template-columns: 1.2fr 1fr 1fr; gap: 14px; margin-bottom: 15px; }}
   .payment .primary strong {{ color: #0f7a73; font-size: 22px; display: block; margin-top: 2px; }}
   .payment strong {{ color: #0b1d3a; font-size: 13px; display: block; margin-top: 4px; }}
-  .dscr {{ display: grid; grid-template-columns: 1fr 36px 1fr; align-items: stretch; gap: 8px; margin-bottom: 15px; }}
+  .dscr {{ display: grid; grid-template-columns: 1fr 36px 1fr; align-items: stretch; gap: 8px; margin-bottom: 15px; break-inside: avoid; }}
   .dscr-card {{ border: 1px solid #dce3ec; border-radius: 10px; padding: 12px 14px; }}
   .dscr-card.after {{ border-color: #99d9d3; background: #f4fbfa; }}
   .dscr-card strong {{ display: block; font-size: 22px; margin-top: 5px; color: #0b1d3a; }}
@@ -247,13 +255,9 @@ def render_terms_html(
       <div class="term"><span class="label">Loan type</span><strong style="font-size:11px">{escape(row.program_name)}</strong></div>
       <div class="term"><span class="label">Funder type</span><strong style="font-size:11px">{escape(funder)}</strong></div>
       <div class="term"><span class="label">Repayment</span><strong style="font-size:11px">{escape(cadence)}</strong><small>{row.payment_count} estimated payments</small></div>
-      <div class="term"><span class="label">Structure</span><strong style="font-size:11px">{escape(_structure_line(row))}</strong><small>{escape(_structure_note(row))}</small></div>
+      {structure_html}
     </div>
-    <div class="payment">
-      <div class="primary"><span class="label">{payment_label} {escape(cadence.lower())} payment</span><strong>{_money(payment)}</strong></div>
-      <div><span class="label">{annual_label}</span><strong>{_money(float(row.annual_new_debt_service))}</strong></div>
-      <div><span class="label">Estimated total repayment</span><strong>{_money(total)}</strong></div>
-    </div>
+    {payment_html}
     {repayment_html}
     <h2>Debt-service coverage</h2>
     <div class="dscr">

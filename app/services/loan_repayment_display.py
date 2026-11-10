@@ -8,6 +8,16 @@ from __future__ import annotations
 from typing import Any
 
 
+def schedule_cadence_label(summary: dict[str, Any]) -> str:
+    """Describe the recorded count without calling a 48-period year weekly."""
+    count = float(summary.get("periods_per_year") or 12)
+    if count == 48:
+        return "48 payments per year (4 per month equivalent)"
+    labels = {12: "Monthly", 26: "Every two weeks", 52: "Weekly", 252: "Business-day"}
+    label = labels.get(count)
+    return f"{label} ({count:g} payments per year)" if label else f"{count:g} payments per year"
+
+
 def configured_structure_label(values: dict[str, Any], label: str) -> str:
     if not values.get("repayment_config"):
         return label

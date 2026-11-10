@@ -394,8 +394,10 @@ def evaluate_plan(
     requested_amount: float | None,
     ebitda: dict[str, Any] | None = None,
     financing_budget: dict[str, Any] | None = None,
+    operating_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from app.services.financial_plan_budget import apply_to_evaluation, solve_plan
+    from app.services.financial_plan_operating import coverage_adjustment, finish_evaluation
 
     plan, principal_solution = solve_plan(plan, financing_budget)
     retire = set(plan.get("retire") or [])
@@ -422,6 +424,7 @@ def evaluate_plan(
                                  if a.get("kind") not in DOUBLE_COUNTED_ADD_BACK_KINDS), 2)
     add_backs_annual = round(add_backs_monthly * 12, 2)
     income_override = overrides.get("income_annual")
+    operating = coverage_adjustment(operating_plan, plan, dscr)
     service_override = overrides.get("debt_service_monthly")
     interest_only = (
         bool(plan.get("new_loan_interest_only"))
@@ -565,6 +568,7 @@ def evaluate_plan(
             numerator
             + add_backs_annual
             + (excluded_monthly * 12 if candidate.get("key") == "bank_cash_flow" else 0.0)
+            + (operating["candidate_impacts"].get(candidate.get("key"), 0) if operating["applied"] else 0)
         )
         numerator_after = float(income_override) if income_override is not None else adjusted
         value = round(numerator_after / after_annual, 2) if after_annual is not None and after_annual > 0 else None
@@ -663,6 +667,8 @@ def evaluate_plan(
         or plan.get("new_loan_amount")
         or (plan.get("new_payment_source") == "term_sheet" and new_payment is not None)
     )
+    operating["financing_active_before_operating_plan"] = active
+    active = active or operating["applied"]
     risk = None
     if schedule and before_new is not None:
         from app.services.loan_schedule import risk_profile
@@ -744,6 +750,7 @@ def evaluate_plan(
     from app.services.financial_plan_earnings import scenario_ebitda
 
     result["ebitda"] = scenario_ebitda(ebitda, plan, result, dscr, service)
+    finish_evaluation(result, operating, operating_plan, dscr)
     from app.services.coverage_comparison import coverage_comparison
 
     comparison_basis = next((candidate for candidate in dscr.get("candidates") or []
