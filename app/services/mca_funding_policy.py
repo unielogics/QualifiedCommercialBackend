@@ -46,12 +46,15 @@ def intake_documents() -> list[dict[str, Any]]:
     """Exactly the standard product's three collection lines, any industry."""
     return [
         {"name": "Business bank statements — last 6 months", "category": "Bank Statements",
+         "requirement_key": "business_bank_statements_6_months",
          "description": "Six consecutive complete statement months for the business's accounts, with all pages. One combined PDF may cover multiple months.",
          "allow_multiple_files": True, "required": True},
         {"name": "Business debt schedule", "category": "Debts",
+         "requirement_key": "business_debt_schedule",
          "description": "A current complete business debt schedule, including each active MCA and whether its terms or remittance have been modified.",
          "allow_multiple_files": True, "required": True},
         {"name": "Business tax return — prior calendar year", "category": "Tax Returns",
+         "requirement_key": "business_tax_returns_1_years",
          "description": f"The complete {required_tax_year()} business tax return. Review reported ordinary business income before interest, depreciation or amortization addbacks. An older or personal return does not substitute.",
          "allow_multiple_files": True, "required": True},
     ]
@@ -65,6 +68,33 @@ def declaration_metadata() -> dict[str, Any]:
             "required_tax_year": required_tax_year(),
             "factor_range": {"minimum": str(MIN_FACTOR), "maximum": str(MAX_FACTOR)},
             "verification_status": "pending_document_review"}
+
+
+def ai_context() -> dict[str, Any]:
+    """Product framing shared by intake, secure-room chat and AI review."""
+    documents = [row["name"] for row in intake_documents()]
+    return {"review_type": "main_street_v1", "funding_intent": PROGRAM_KEY,
+            "funding_program_key": PROGRAM_KEY, "intent": PROGRAM_KEY, "intent_kind": "lending",
+            "deal_type": "standard merchant cash advance for an operating business",
+            "documentation_level": "three-item standard MCA review",
+            "screening_stage": "stage_1_standard_mca", "stage_1_required_items": documents,
+            "mca_funding_policy": declaration_metadata(),
+            "baseline_document_policy": {"stage": "stage_1_standard_mca", "allowed_document_categories": documents,
+                "do_not_request_other_document_categories": True, "conditional_after_industry_known": [],
+                "stage_2_after_good_probability_only": [], "max_new_conditional_documents_per_turn": 0},
+            "underwriting_focus": (
+                "Standard MCA is already selected under Main Street. Review six complete business statement months for each counted account, "
+                "the completed published business debt schedule, and the prior calendar-year business tax return for the same entity. "
+                "At most two EXISTING active MCAs before this new advance; no modified active MCA; reported ordinary business tax income "
+                "must be nonnegative BEFORE interest, depreciation or amortization addbacks. Zero is allowed. "
+                "Missing/conflicting source evidence needs review, never a guessed pass. Exclude removed/duplicate obligations and preserve separate loans at the same lender."),
+            "custom_instructions": (
+                "Collect exactly these three document groups; combined PDFs may cover several statement months. Offer the debt schedule form "
+                "or an existing schedule upload. Never add P&L, balance sheet, PFS, credit reports/authorization, two tax years, contracts, "
+                "or industry documents as baseline requirements. Do not invent FICO, revenue, business-age, EBITDA or DSCR minimums. "
+                "Declarations are unverified; program qualification comes from accepted evidence and staff review. Financing alone does not "
+                "change historical earnings. Factor pricing 1.22–1.38x is not APR and is subject to final review. No automatic credit pull. "
+                "Keep this product fixed; chat cannot reclassify it or modify published financial values. Request clarification within the existing three groups, not a new document category.")}
 
 
 def _number(value: Any) -> float | None:

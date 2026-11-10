@@ -3892,7 +3892,21 @@ async def _request_access_read(
     current_requested_documents = await locked_file_requests.current_public_request_documents(
         db, requested_documents
     )
+    capabilities = []
+    if profile is not None and profile.funding_category == "merchant_cash_advance" and profile.intake_id:
+        from app.models.public_underwriting_intake import PublicUnderwritingIntake
+
+        canonical = (await db.execute(select(PublicUnderwritingIntake.id).where(
+            PublicUnderwritingIntake.id == profile.intake_id,
+            PublicUnderwritingIntake.bucket_id == link.bucket_id,
+            PublicUnderwritingIntake.bucket_upload_link_id == link.id,
+            PublicUnderwritingIntake.variant == "main_street_v1",
+            PublicUnderwritingIntake.intake_state["funding_intent"].astext == "merchant_cash_advance",
+        ))).scalar_one_or_none()
+        if canonical is not None and link.can_use_ai_chat:
+            capabilities = ["mca_ai_review"]
     return BucketRequestAccessRead(
+        capabilities=capabilities,
         room_kind=room_kind,
         bucket=BucketRequestBucketRead(name=link.bucket.name, client_name=link.bucket.client_name, purpose=link.bucket.purpose),
         recipient_name=link.recipient_name,

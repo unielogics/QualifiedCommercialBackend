@@ -850,10 +850,25 @@ def _is_main_street_equipment_intake(intake: PublicUnderwritingIntake) -> bool:
 
 
 def _dealer_route_public_path(intake: PublicUnderwritingIntake) -> str:
+    if _is_main_street_mca_intake(intake):
+        return "/mca-funding-intake"
     return EQUIPMENT_PUBLIC_PATH if _is_main_street_equipment_intake(intake) else "/dealer-ai-underwriter"
 
 
+def _is_main_street_mca_intake(intake: PublicUnderwritingIntake) -> bool:
+    if intake.variant != MAIN_STREET_VARIANT:
+        return False
+    state = _intake_state(intake)
+    details = state.get("main_street_details")
+    return state.get("funding_intent") == "merchant_cash_advance" or (
+        isinstance(details, dict) and details.get("intent") == "merchant_cash_advance")
+
+
 def _dealer_route_welcome_back(intake: PublicUnderwritingIntake) -> str:
+    if _is_main_street_mca_intake(intake):
+        return ("Bienvenido de nuevo. Revise sus seis meses de estados de cuenta, el calendario de deudas y la declaración comercial del año anterior en su sala segura."
+                if intake.preferred_language == "es" else
+                "Welcome back. Your secure MCA file keeps your six statement months, debt schedule and prior-year business tax return together for review.")
     if _is_main_street_equipment_intake(intake):
         return _equipment_welcome_back(intake.preferred_language)
     return _dealer_welcome_back(intake.preferred_language)
@@ -2030,6 +2045,11 @@ async def _record_resume_email(
     sender_user_id: UUID | None = None,
 ) -> dict[str, Any]:
     resume_url = _public_url(f"{public_path}?token={token}")
+    if _is_main_street_mca_intake(intake):
+        link = intake.bucket_upload_link
+        if link is None or not client_room.link_is_usable(link):
+            raise HTTPException(409, "This file has no active secure room")
+        resume_url = client_room.room_url(link.token) + "?tab=ai-review"
     subject = f"Your Qualified Commercial {review_label} link"
     body_text = (
         f"Hi {intake.full_name},\n\n"
@@ -2040,7 +2060,7 @@ async def _record_resume_email(
         "Qualified Commercial LLC"
     )
     body_html = (
-        f"<p>Hi {intake.full_name},</p>"
+        f"<p>Hi {html.escape(intake.full_name)},</p>"
         f"<p>Use this secure link to resume your Qualified Commercial {review_label}:</p>"
         f'<p><a href="{resume_url}">Resume {html.escape(review_label)}</a></p>'
         f"<p>This link opens your encrypted AI underwriting room for the {html.escape(room_label)}. "
@@ -4258,6 +4278,8 @@ def _merge_main_street_details(
     if _is_main_street_equipment_intake(intake):
         accepted["intent"] = "equipment"
         accepted["financing_equipment_or_vehicle"] = True
+    if _is_main_street_mca_intake(intake):
+        accepted["intent"] = "merchant_cash_advance"
     existing.update(accepted)
     state["main_street_details"] = existing
     intake.intake_state = state
@@ -4313,6 +4335,11 @@ def _main_street_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "merchant_processing_offer": _merchant_processing_offer(intake) or None,
         "chat_facts": state.get("chat_facts") if isinstance(state.get("chat_facts"), list) else [],
     }
+
+    if _is_main_street_mca_intake(intake):
+        from app.services.mca_funding_policy import ai_context
+
+        return {**context, **ai_context(), "mca_funding_declaration": state.get("mca_funding_declaration")}
 
     if kind == "non_lending":
         # No lending package, no program fit, no fundability verdict. Asking a
@@ -4811,6 +4838,12 @@ async def _create_bucket_for_main_street(
     db.add(bucket)
     await db.flush()
 
+    if intent == "merchant_cash_advance":
+        from app.services.mca_funding_policy import ai_context
+
+        bucket.purpose = "Standard MCA funding AI review"
+        bucket.ai_context = {**(bucket.ai_context or {}), **ai_context()}
+
     for doc in documents_for(intent, industry):
         db.add(
             BucketRequestedDocument(
@@ -4822,6 +4855,7 @@ async def _create_bucket_for_main_street(
                 allow_multiple_files=bool(doc.get("allow_multiple_files", False)),
                 status="requested",
                 is_custom=False,
+                requirement_key=doc.get("requirement_key"),
             )
         )
 
@@ -7490,7 +7524,9 @@ async def _response(
         token=token,
         session_token=session_token,
         signing_gate=signing_gate,
-        resume_url=_public_url(f"{public_path}?token={token}") if token and public_path else None,
+        resume_url=(client_room.room_url(intake.bucket_upload_link.token) + "?tab=ai-review"
+                    if _is_main_street_mca_intake(intake) and intake.bucket_upload_link else
+                    _public_url(f"{public_path}?token={token}") if token and public_path else None),
         upload_url=_public_url(
             f"/buckets/request/{intake.bucket_upload_link.token}"
             + ("?tab=application" if _intake_state(intake).get("application_completion") == "client" else "")
@@ -9926,6 +9962,7 @@ async def _client_chat_turn(
     *,
     actor_name: str,
     user: User | None = None,
+    preferred_language: str | None = None,
 ) -> tuple[list[Any], str | None, bool]:
     """Record the borrower's own turn in the client thread.
 
@@ -9954,7 +9991,7 @@ async def _client_chat_turn(
         actor_name=actor_name,
         user=user,
         upload_link=link,
-        preferred_language=intake.preferred_language,
+        preferred_language=preferred_language or intake.preferred_language,
         intake_id=getattr(intake, "id", None),
         sender_kind="client",
     )

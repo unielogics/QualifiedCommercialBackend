@@ -5,13 +5,16 @@ Qualification is enforced before writes; no new database tables are required.
 """
 from __future__ import annotations
 
+# FastAPI dependencies are evaluated by the framework.
+# ruff: noqa: B008
 import time
 from datetime import UTC, datetime
 from typing import Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -192,3 +195,188 @@ async def capture_mca_lead(
             raise
         _check_replay(existing, payload)
     return McaLeadResult()
+
+
+class McaIntakeAttribution(Attribution):
+    page: str = Field(default="/mca-funding-intake", max_length=256)
+    entry_page: str | None = Field(default=None, max_length=256)
+    campaign: str | None = Field(default=None, max_length=80, pattern=r"^[a-zA-Z0-9_-]{1,80}$")
+    cta: str | None = Field(default=None, max_length=80, pattern=r"^[a-zA-Z0-9_-]{1,80}$")
+    vertical: Literal["main_street"] = "main_street"
+    program: Literal["merchant_cash_advance"] = "merchant_cash_advance"
+    funding_intent: Literal["merchant_cash_advance"] = "merchant_cash_advance"
+    profile: Literal["main_street_v1"] = "main_street_v1"
+
+    @field_validator("page", "entry_page")
+    @classmethod
+    def safe_website_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        path = value.removesuffix("/") or "/"
+        english = "/" if path == "/es" else path[3:] if path.startswith("/es/") else path
+        if english not in {"/", "/programs", "/main-street", "/business-funding", "/merchant-cash-advance",
+                           "/mca-funding-intake", "/programs/main-street", "/programs/merchant-cash-advance",
+                           "/industries/main-street", "/working-capital-loans", "/manufacturing-business-loans",
+                           "/medical-practice-financing", "/grocery-store-financing"}:
+            raise ValueError("Use a known MCA or Main Street website path without query strings or fragments.")
+        return path
+
+
+class McaIntakeStart(McaLeadRequest):
+    attribution: McaIntakeAttribution
+    monthly_revenue: Range | None = None
+    time_in_business: Literal["under_6_months", "6_12_months", "1_2_years", "2_plus_years"] | None = None
+    active_mca_count: int | None = Field(default=None, strict=True, ge=0, le=2)
+    has_modified_mca: bool | None = Field(default=None, strict=True)
+    secure_room_pin: str = Field(pattern=r"^[0-9]{6}$")
+    terms_accepted: Literal[True]
+    privacy_accepted: Literal[True]
+    consent_version: Literal["mca-ai-intake-v3"] = "mca-ai-intake-v3"
+
+    @field_validator("has_modified_mca")
+    @classmethod
+    def unmodified_active_mcas(cls, value: bool | None) -> bool | None:
+        if value is True:
+            raise ValueError("This product requires no modified active MCA.")
+        return value
+
+    @field_validator("last_year_tax_earnings")
+    @classmethod
+    def nonnegative_reported_income(cls, value: str) -> str:
+        if value == "negative":
+            raise ValueError("This product requires nonnegative prior-year ordinary business tax income before addbacks.")
+        return value
+
+
+class McaIntakeResult(BaseModel):
+    intake_id: UUID
+    variant: Literal["main_street_v1"] = "main_street_v1"
+    funding_intent: Literal["merchant_cash_advance"] = "merchant_cash_advance"
+    room_url: str
+    resume_url: str
+
+
+class McaRoomAccess(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    passcode: str = Field(pattern=r"^[0-9]{6}$")
+
+
+class McaRoomChat(McaRoomAccess):
+    message: str = Field(min_length=1, max_length=6000)
+
+    @field_validator("message")
+    @classmethod
+    def nonempty_message(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Enter a message.")
+        return value.strip()
+
+
+class McaResumeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    email: EmailStr
+
+
+class McaReviewProgress(BaseModel):
+    stage: str
+    label: str
+    percent: float | None = None
+    files_total: int = 0
+    files_done: int = 0
+
+
+class McaReviewMessage(BaseModel):
+    id: str
+    role: str
+    content: str
+    sender_kind: str | None = None
+    author_name: str | None = None
+    created_at: datetime | None = None
+
+
+class McaReviewRequirement(BaseModel):
+    key: str
+    label: str
+    status: str
+    received: int
+    required: int
+    unit: str
+
+
+class McaReviewAction(BaseModel):
+    kind: Literal["upload", "debt_schedule", "application"]
+    label: str
+
+
+class McaReviewState(BaseModel):
+    funding_intent: Literal["merchant_cash_advance"] = "merchant_cash_advance"
+    business_name: str | None = None
+    preferred_language: Literal["en", "es"] = "en"
+    payment_methods_enabled: bool = False
+    status: Literal["not_started", "queued", "running", "completed", "failed"]
+    progress: McaReviewProgress
+    messages: list[McaReviewMessage] = Field(default_factory=list)
+    summary: str | None = None
+    requirements: list[McaReviewRequirement] = Field(default_factory=list)
+    actions: list[McaReviewAction] = Field(default_factory=list)
+    policy_status: Literal["pending_review", "needs_information", "not_eligible", "ready_for_staff_review"]
+
+
+@router.post("/intake/start", status_code=201, response_model=McaIntakeResult)
+async def start_mca_intake(payload: McaIntakeStart, request: Request, db: AsyncSession = Depends(get_db)):
+    from app.services import mca_public_intake
+
+    return await mca_public_intake.start(db, payload, request)
+
+
+@router.post("/intake/resume")
+async def resume_mca_intake(payload: McaResumeRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    from app.services import mca_public_intake
+
+    return await mca_public_intake.resume(db, str(payload.email), request)
+
+
+@router.post("/room/{token}/review", response_model=McaReviewState)
+async def mca_room_review(token: str, payload: McaRoomAccess, request: Request, db: AsyncSession = Depends(get_db)):
+    from app.services import mca_public_intake
+
+    intake, link, profile = await mca_public_intake.authorize_room(db, token, payload.passcode, request)
+    return await mca_public_intake.room_state(db, intake, link, profile)
+
+
+@router.post("/room/{token}/chat", response_model=McaReviewState)
+async def mca_room_chat(token: str, payload: McaRoomChat, request: Request, db: AsyncSession = Depends(get_db)):
+    from app.routers import dealer_ai_intake as core
+    from app.services import mca_public_intake
+
+    intake, link, profile = await mca_public_intake.authorize_room(db, token, payload.passcode, request)
+    core._throttle_or_429(mca_public_intake._CHATS, str(link.id), 2,
+                         "Please wait a moment before sending another message.")
+    intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **core._main_street_context(intake)}
+    locale = getattr(profile, "communication_locale", None)
+    await core._client_chat_turn(db, intake, payload.message.strip(), actor_name=intake.full_name,
+                                preferred_language=locale if locale in {"en", "es"} else None)
+    await db.commit()
+    return await mca_public_intake.room_state(db, intake, link, profile)
+
+
+@router.post("/room/{token}/run", response_model=McaReviewState)
+async def mca_room_run(token: str, payload: McaRoomAccess, request: Request, background: BackgroundTasks,
+                       db: AsyncSession = Depends(get_db)):
+    from app.models.bucket import BucketAIReview
+    from app.routers import dealer_ai_intake as core
+    from app.services import mca_public_intake
+
+    intake, link, profile = await mca_public_intake.authorize_room(db, token, payload.passcode, request)
+    # One in-flight review per bucket, even across distinct authorized links.
+    await db.execute(select(core.Bucket.id).where(core.Bucket.id == link.bucket_id).with_for_update())
+    pending = (await db.execute(select(BucketAIReview).where(BucketAIReview.bucket_id == link.bucket_id,
+        BucketAIReview.status.in_(["queued", "running", "processing"])).limit(1))).scalar_one_or_none()
+    if pending is None:
+        core._throttle_or_429(core._REVIEW_LAST_BY_TOKEN, str(link.id), core._REVIEW_MIN_INTERVAL_SECONDS,
+                             "A review was just started. Please wait before starting another.")
+        review = await core._create_queued_review(db, intake, request=request, actor_name=intake.full_name,
+            actor_email=intake.email, actor_role="uploader", log_event="mca_funding_review_requested",
+            detail="Client requested review of the standard MCA evidence")
+        background.add_task(core._run_review_background, review.id, intake.id)
+    return await mca_public_intake.room_state(db, intake, link, profile)
