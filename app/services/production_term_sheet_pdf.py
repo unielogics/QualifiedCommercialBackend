@@ -15,6 +15,11 @@ from app.services import production_term_structure as term_structure
 from app.services.application_terms_pdf import _collateral_html
 from app.services.financing_budget_disclosure import BUDGET_CSS, frozen_budget, render_budget_html
 from app.services.loan_repayment_display import configured_structure_label, repayment_lines
+from app.services.loan_terms_visuals import (
+    LOAN_VISUALS_CSS,
+    closing_preparation_html,
+    schedule_visuals_html,
+)
 from app.services.production_arrangement import USE_OF_FUNDS_KEYS
 
 _APP = Path(__file__).resolve().parents[1]
@@ -100,14 +105,45 @@ def _use_of_funds_rows(raw: dict[str, Any] | None) -> str:
     return f'<table><tbody>{"".join(rows)}</tbody></table>'
 
 
-def _condition_items(conditions: str | None) -> str:
+def _condition_lines(conditions: str | None) -> list[str]:
     text = (conditions or "").strip()
     if not text:
-        return "<li>Final verification, underwriting approval, and documentation satisfactory to the funding source.</li>"
+        return []
     items = [part.strip(" -\t") for part in text.replace("\r", "\n").split("\n") if part.strip(" -\t")]
+    return items or [text]
+
+
+def _condition_items(conditions: str | None) -> str:
+    items = _condition_lines(conditions)
     if not items:
-        items = [text]
+        return "<li>Final verification, underwriting approval, and documentation satisfactory to the funding source.</li>"
     return "".join(f"<li>{escape(item)}</li>" for item in items)
+
+
+def _visual_schedule(structure: dict[str, Any]) -> dict[str, Any] | None:
+    """Rebuild only a calculated schedule from this version's stored terms.
+
+    Production public values intentionally omit rows. Fixed/custom payments,
+    explicit nonconfigured balloon targets and legacy unstructured snapshots do
+    not establish an allocation compatible with the shared schedule engine.
+    """
+    from app.services.loan_schedule import build_schedule
+
+    kind = structure.get("repayment_structure")
+    if kind in {"fixed_payment", "custom"} or structure.get("lender_payment_override"):
+        return None
+    config = structure.get("repayment_config")
+    if config is None:
+        # Older production pricing used unrounded target-payment formulas and
+        # explicit maturity amounts. Never replace those historical cash flows
+        # with a newly inferred rounded schedule.
+        return None
+    return build_schedule(
+        structure.get("payment_basis_amount"), structure.get("effective_rate_pct"), structure.get("term_months"),
+        structure="interest_only" if kind in {"interest_only", "revolving_interest_only"} else "simple_interest" if kind == "simple_interest" else "amortizing",
+        interest_only_months=structure.get("interest_only_months") or 0,
+        periods_per_year=structure.get("payments_per_year") or 12, repayment_config=config,
+    )
 
 
 def render_term_sheet_html(
@@ -236,16 +272,18 @@ def render_term_sheet_html(
 <!doctype html>
 <html><head><meta charset="utf-8"><style>
   {BUDGET_CSS}
+  {LOAN_VISUALS_CSS}
   @page {{ size: Letter; margin: 28px 0 44px; @bottom-right {{ content: "Page " counter(page) " of " counter(pages); color: #6d7e91; font: 8px Arial; margin: 0 32px 8px 0; }} }}
   @page:first {{ margin-top: 0; }}
   * {{ box-sizing: border-box; }}
   body {{ margin: 0; color: #14243c; font-family: Arial, Helvetica, sans-serif; font-size: 10px; line-height: 1.42; background: white; }}
   .watermark {{ position: fixed; top: 44%; left: 13%; transform: rotate(-32deg); color: rgba(11,29,58,.055); font-size: 70px; font-weight: 800; letter-spacing: .12em; z-index: -1; }}
-  .collateral {{ border: 1px solid #dce3ec; border-radius: 9px; padding: 10px 12px; margin-bottom: 15px; break-inside: avoid; }}
+  .collateral {{ border: 1px solid #dce3ec; border-radius: 9px; padding: 10px 12px; margin-bottom: 15px; }}
   .collateral h2 {{ break-after: avoid; }}
   .collateral table {{ border-collapse: collapse; width: 100%; font-size: 9px; }}
   .collateral tr {{ break-inside: avoid; }}
   .collateral td {{ padding: 7px; border-bottom: 1px solid #dce3ec; vertical-align: top; overflow-wrap: anywhere; }}
+  .collateral table td, .deal-budget table td {{ text-align: left; font-weight: normal; }}
   .collateral td:first-child {{ width: 43%; }}
   .collateral p {{ color: #52637a; font-size: 8px; }}
   .hero {{ background: #0b1d3a; color: white; padding: 24px 34px 22px; min-height: 164px; }}
@@ -313,8 +351,10 @@ def render_term_sheet_html(
     </div>
     {f'<div class="fine"><b>Payment structure:</b> {escape(str(payment_summary))}</div>' if payment_summary else ''}
     {repayment_html}
+    {schedule_visuals_html(_visual_schedule(structure))}
     {collateral_html}
     {render_budget_html(budget)}
+    {closing_preparation_html(version=sheet.version, prepared=_date(sheet.entered_at), expires=_date(structure.get("expires_on")) if structure.get("expires_on") else None, collateral_revision=extra.get("collateral_revision"), budget_revision=extra.get("deal_budget_revision"), collateral_snapshot=extra.get("collateral_snapshot"), budget=budget, conditions=_condition_lines(sheet.conditions))}
     <h2>Estimated timing</h2>
     <div class="schedule">{schedule}</div>
     <div class="two">
