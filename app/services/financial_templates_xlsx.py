@@ -336,7 +336,7 @@ class _Form:
     def data(self, row: Row) -> None:
         self.row += 1
         if not self.keys_beside_inputs:
-            self.ws.cell(row=self.row, column=self.key_column, value=f"{row.block}.{row.row_key}" if self.sheet.kind == "real_estate_schedule" else f"r{row.ordinal}")
+            self.ws.cell(row=self.row, column=self.key_column, value=f"{row.block}.{row.row_key}" if self.sheet.kind in {"real_estate_schedule", "operating_plan"} else f"r{row.ordinal}")
         for cell in row.cells:
             target = self.ws.cell(row=self.row, column=cell.c)
             if cell.type == "formula":

@@ -539,9 +539,9 @@ def test_the_link_check_admits_all_four_kinds_and_the_migration_agrees():
     from app.models.financial_form_link import FinancialFormLink
 
     checks = [c.sqltext.text for c in FinancialFormLink.__table__.constraints if getattr(c, "name", None) == "ck_financial_form_links_kind"]
-    # The standard packet keeps its four forms; the standalone real estate
-    # schedule and an explicitly scoped worksheet are additional link kinds.
-    assert checks == ["kind in ('pfs','debt_schedule','p_and_l','balance_sheet','real_estate_schedule','worksheet')"]
+    # The standard packet keeps its four forms; standalone real estate and
+    # operating plans and an explicitly scoped worksheet are additional kinds.
+    assert checks == ["kind in ('pfs','debt_schedule','p_and_l','balance_sheet','real_estate_schedule','operating_plan','worksheet')"]
     assert FinancialFormLink.__table__.c.packet_id.nullable
     migration = Path("alembic/versions/0203_business_statements_and_packets.py").read_text()
     assert "kind in ('pfs','debt_schedule','p_and_l','balance_sheet')" in migration
@@ -553,6 +553,10 @@ def test_the_link_check_admits_all_four_kinds_and_the_migration_agrees():
     real_estate = Path("alembic/versions/0261_real_estate_schedule.py").read_text()
     assert "'real_estate_schedule'" in real_estate
     assert 'down_revision = "0260_financial_debt_evidence"' in real_estate
+    operating_plan = Path("alembic/versions/0270_operating_plan_form.py").read_text()
+    assert "'operating_plan'" in operating_plan
+    assert 'down_revision = "0269_dealer_document_versions"' in operating_plan
+    assert all(name in operating_plan for name in ("ck_financial_form_family_kind", "ck_financial_form_links_kind", "ck_financial_form_link_sheets_kind"))
 
 
 def test_the_statement_table_is_its_own_and_pins_its_kinds():

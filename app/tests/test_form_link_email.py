@@ -262,3 +262,25 @@ def test_every_form_kind_the_route_accepts_has_a_requirement_to_mark_as_asked():
 
     assert set(fle.REQUIREMENT_KEYS) == set(route._FORM_SLOT_CATEGORY)
     assert fle.DUPLICATE_WINDOW == timedelta(minutes=2)
+
+
+@pytest.mark.asyncio
+async def test_operating_plan_email_binds_the_shared_versioned_family_and_requirement(wired, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from app.services import operating_plan_forms
+
+    profile, user, family_id = _profile(), _user(), uuid.uuid4()
+    held = SimpleNamespace(id=uuid.uuid4(), expires_at=wired.expires, financial_family_id=None)
+    prepare = AsyncMock(return_value={"family_id": str(family_id)})
+    monkeypatch.setattr(operating_plan_forms, "ensure_workspace", prepare)
+    monkeypatch.setattr(fle.financial_statements, "mint_link", AsyncMock(return_value=(held, "operating-form-token")))
+    state = SimpleNamespace(last_requested_at=None, first_requested_at=None, status="missing")
+    db = _DB(intake=_intake(), state=state)
+    delivery = await fle.email_form_link(db, profile=profile, kind="operating_plan",
+        label="Operating expenses and earnings plan", slot=None, user=user)
+    prepare.assert_awaited_once_with(db, profile, actor=user)
+    assert held.financial_family_id == family_id
+    assert fle.REQUIREMENT_KEYS["operating_plan"] == "operating_expenses_and_earnings_plan"
+    assert delivery.status == "sent" and state.status == "requested"
+    assert "/forms/operating_plan/operating-form-token" in wired.sent[0]["body_text"]

@@ -14,7 +14,7 @@ from openpyxl import load_workbook
 
 from app.services import business_statement_schema as bss
 from app.services import financial_templates_xlsx as templates
-from app.services import pfs_schema
+from app.services import pfs_schema, sheet_layout
 from app.services.bucket_ai import MAX_SPREADSHEET_ROWS, MAX_SPREADSHEET_SHEETS
 from app.services.bucket_evidence import filename_evidence_classification
 from app.services.financial_statements import DEBT_COLUMN_LABELS, DEBT_COLUMNS
@@ -54,9 +54,16 @@ def test_every_schema_key_has_a_defined_name_and_a_hidden_key_beside_it(kind):
     ws = wb.active
     hidden = [letter for letter, dim in ws.column_dimensions.items() if dim.hidden]
     assert hidden, "no hidden key column"
-    if kind not in {"debt_schedule", "real_estate_schedule"}:
+    if kind not in {"debt_schedule", "real_estate_schedule", "operating_plan"}:
         keys = {cell.value for cell in ws["C"] if cell.value}
         assert set(templates.schema_keys(kind)) <= keys
+    else:
+        # Grid rows carry their stable collection/row identity in the hidden
+        # key column; individual fields are addressed by the defined names.
+        keys = {cell.value for letter in hidden for cell in ws[letter] if cell.value}
+        rows = [row for row in sheet_layout.layout(kind).rows if row.kind == "data"]
+        expected = {f"r{row.ordinal}" if kind == "debt_schedule" else f"{row.block}.{row.row_key}" for row in rows}
+        assert expected <= keys
 
 
 @pytest.mark.parametrize("kind", KINDS)

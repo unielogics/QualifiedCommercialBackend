@@ -185,3 +185,17 @@ def test_operating_pdf_is_not_a_supporting_source_and_package_omits_review_secre
     lines = _operating_earnings_lines({"operating_earnings": {"improvement_plan": summary}})
     assert any("New lease" in line for line in lines)
     assert any("Signed new lease" in line for line in lines)
+
+
+def test_external_cockpit_uses_shareable_plan_and_hides_staff_picker_context():
+    from app.services.financial_metric_review import redact_for_external
+
+    current = cockpit()
+    current["operating_evidence"] = {"files": [{"file_id": "private-id", "content_hash": "private-hash"}]}
+    current["operating_plan"] = {"available": True, "state": "published", "version_number": 1,
+        "evaluation": {"context_stamp": "private-context"},
+        "package": {"adjustments": [{"label": "Renew lease", "review_reason": "Private reason", "reviewed_by_user_id": "private-actor"}]}}
+    result = redact_for_external(current, SimpleNamespace(role=Role.CLIENT))
+    assert result["operating_evidence"] == {}
+    assert "private" not in str(result["operating_plan"]).lower()
+    assert result["operating_plan"]["package"]["adjustments"][0]["label"] == "Renew lease"

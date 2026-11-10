@@ -62,6 +62,7 @@ REQUIREMENT_KEYS = {
     "p_and_l": "ytd_p_and_l_balance_sheet",
     "balance_sheet": "ytd_p_and_l_balance_sheet",
     "real_estate_schedule": "real_estate_schedule",
+    "operating_plan": "operating_expenses_and_earnings_plan",
 }
 
 
@@ -155,11 +156,15 @@ async def email_form_link(
         return recent
 
     statement_id = await _placeholder_statement_id(db, profile, user) if kind == "pfs" else None
-    real_estate_workspace = None
+    managed_workspace = None
+    if kind == "operating_plan":
+        from app.services.operating_plan_forms import ensure_workspace
+
+        managed_workspace = await ensure_workspace(db, profile, actor=user)
     if kind == "real_estate_schedule":
         from app.services.real_estate_forms import ensure_workspace
 
-        real_estate_workspace = await ensure_workspace(db, profile, actor=user)
+        managed_workspace = await ensure_workspace(db, profile, actor=user)
     link, token = await financial_statements.mint_link(
         db,
         profile,
@@ -169,8 +174,8 @@ async def email_form_link(
         invitee_email=recipient,
         created_by=user.id,
     )
-    if real_estate_workspace:
-        link.financial_family_id = uuid.UUID(real_estate_workspace["family_id"])
+    if managed_workspace:
+        link.financial_family_id = uuid.UUID(managed_workspace["family_id"])
     base = get_settings().frontend_app_url.rstrip("/")
     room_url = None
     if room_link is not None:
