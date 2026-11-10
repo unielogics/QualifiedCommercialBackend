@@ -1,4 +1,6 @@
 """Proposal cost effects, without rewriting any historical earnings evidence."""
+import hashlib
+import json
 from copy import deepcopy
 
 
@@ -79,6 +81,12 @@ def coverage_context(evaluation):
 def apply_to_evaluation(result, budget, principal_solution=None):
     if budget is None or not result.get("loan_terms"):
         return
+    # Bind downstream allocation reviews to the current classifications and
+    # revision, even when equal dollar totals survive a reclassification.
+    # Only the opaque digest crosses into the shared cockpit evaluation.
+    result["financing_budget_fingerprint"] = hashlib.sha256(
+        json.dumps(budget, sort_keys=True, default=str, separators=(",", ":")).encode()
+    ).hexdigest()
     from app.services.deal_budget import calculate
     from app.services.financial_cockpit import dscr_status
 
