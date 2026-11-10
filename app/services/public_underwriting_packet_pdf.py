@@ -1384,7 +1384,8 @@ def _operating_plan_lines(earnings):
     if not plan:
         return []
     baseline = _record(plan.get("baseline"))
-    currency = baseline.get("currency")
+    currency = baseline.get("plan_currency") or baseline.get("currency")
+    earnings_currency = baseline.get("currency")
     projection = _record(plan.get("projection"))
     lines = ["Operating expenses and earnings improvement plan - conditional operating changes; current source figures remain unchanged."]
     snapshot = _record(plan.get("snapshot"))
@@ -1417,12 +1418,14 @@ def _operating_plan_lines(earnings):
         coverage = f"{current_ratio:.2f}x" if current_ratio is not None else "unavailable"
         coverage += " to " + (f"{projected_ratio:.2f}x" if projected_ratio is not None else "unavailable")
         noi_currency = baseline.get("noi_currency", currency)
-        lines.append(f"{label}: annual earnings {_earnings_money(baseline.get('earnings'), currency)} to {_earnings_money(result.get('earnings'), currency)}; NOI {_earnings_money(baseline.get('noi'), noi_currency)} to {_earnings_money(result.get('noi'), noi_currency)}; current-debt coverage {coverage}; coverage with refinance {ratio_text}; recurring improvement {_earnings_money(totals.get('annual_impact'), currency)} per year; first-year improvement {_earnings_money(totals.get('first_year_impact'), currency)}; implementation costs {_earnings_money(totals.get('one_time_cost'), currency)}.")
+        lines.append(f"{label}: annual earnings {_earnings_money(baseline.get('earnings'), earnings_currency)} to {_earnings_money(result.get('earnings'), earnings_currency)}; NOI {_earnings_money(baseline.get('noi'), noi_currency)} to {_earnings_money(result.get('noi'), noi_currency)}; first-year NOI {_earnings_money(result.get('first_year_noi'), noi_currency)}; NOI projection {result.get('noi_status') or 'not supplied'}; current-debt coverage {coverage}; coverage with refinance {ratio_text}; recurring improvement {_earnings_money(totals.get('annual_impact'), currency)} per year; first-year improvement {_earnings_money(totals.get('first_year_impact'), currency)}; implementation costs {_earnings_money(totals.get('one_time_cost'), currency)}.")
+    for group in _records(plan.get("expense_groups")):
+        lines.append(f"Expense clarification: {group.get('label') or group.get('category')}; source annual reference {_earnings_money(group.get('baseline_annual_amount'), group.get('currency') or currency)}; disclosed annual detail {_earnings_money(group.get('disclosed_annual_amount'), group.get('currency') or currency)}; {group.get('status') or 'needs review'}. A variance is not an automatic earnings improvement.")
     for index, action in enumerate(_records(plan.get("adjustments")), 1):
         lines.append(f"{index}. {action.get('label') or 'Operating adjustment'} ({str(action.get('kind') or '').replace('_', ' ')}; {action.get('review_state') or 'proposed'}). Recurring annual effect {_earnings_money(action.get('net_annual_impact'), currency)}; first-year {_earnings_money(action.get('first_year_impact'), currency)}; effective {action.get('effective_date') or 'not supplied'}; responsible: {action.get('owner_name') or 'not assigned'}.")
         calculation = _record(action.get("calculation"))
         drivers = [f"{key.replace('_', ' ')}: {calculation[key]}" for key in (
-            "cadence", "cost_basis", "unit_label", "current_units_per_period", "proposed_units_per_period",
+            "cadence", "cost_basis", "unit_label", "product_name", "revenue_return_multiple", "incremental_spend", "incremental_revenue", "incremental_contribution", "current_units_per_period", "proposed_units_per_period",
             "current_fixed_amount", "proposed_fixed_amount", "units_per_period", "current_amount", "proposed_amount", "current_unit_price", "proposed_unit_price",
             "current_unit_cost", "proposed_unit_cost", "contribution_margin_pct", "processing_volume", "processing_transaction_count",
             "current_processing_rate_pct", "proposed_processing_rate_pct", "current_processing_rate_basis", "proposed_processing_rate_basis",

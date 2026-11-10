@@ -529,7 +529,7 @@ def render_investor_presentation_pdf(*, intake: Any, financials: dict, generated
     source_currency = historical.get("currency")
     noi_basis = _record(_record(earnings.get("noi")).get("historical"))
     noi_currency = noi_basis.get("currency")
-    plan_currency = improvement.get("currency") or _record(improvement.get("baseline")).get("currency")
+    plan_currency = improvement.get("currency") or _record(improvement.get("baseline")).get("plan_currency") or _record(improvement.get("baseline")).get("currency")
 
     # 1 - Identity, ask, uses, and contractual return remain distinct.
     page = _slide(doc, "Investment overview", business, stamp, 1)
@@ -667,6 +667,11 @@ def render_investor_presentation_pdf(*, intake: Any, financials: dict, generated
     for index, row in enumerate(actions[:3]):
         y = 380 + index * 31
         explanation = str(row.get("explanation") or row.get("source_note") or "Evidence and implementation details require review.")
+        if row.get("kind") == "marketing_investment":
+            calculation = _record(row.get("calculation"))
+            multiple = calculation.get("revenue_return_multiple")
+            margin = calculation.get("contribution_margin_pct")
+            explanation = (f"{calculation.get('product_name') or 'Product/service'}: assumed {multiple if multiple is not None else 'unknown'}x revenue per added marketing dollar, {margin if margin is not None else 'unknown'}% contribution margin; added spend deducted. " + explanation)
         _text(page, (487, y, 921, y + 29), f"{index + 1}. {row.get('label') or 'Operating adjustment'} | {row.get('review_state') or 'proposed'} | annual change {_money(row.get('net_annual_impact'), plan_currency)}. {explanation}", size=9.5)
     reviewed = operating_ebitda_projection(financials, "approved")
     detail = f"{len(actions)} total actions. Missing amounts remain unknown; timing and evidence require review."

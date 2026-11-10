@@ -91,7 +91,26 @@ async def preview(db, profile, body):
     cockpit = await load_cockpit(db, profile)
     evidence = cockpit.get("operating_evidence") or {}
     evaluation = math.evaluate(body, cockpit, source_file_ids=[row["file_id"] for row in evidence.get("files", [])])
-    return {"evaluation": evaluation, "evidence": evidence, "context_stamp": math.context_stamp(cockpit)}
+    return {"evaluation": evaluation, "evidence": evidence, "guidance": evidence.get("guidance") or {},
+            "context_stamp": math.context_stamp(cockpit)}
+
+
+async def client_preview(db, profile, body, *, current):
+    """Read-only scenario for the token's form, with server-owned review state."""
+    from app.services.operating_plan_guidance import client_evaluation, client_evidence
+
+    protected = protect_reviews(body, current)
+    result = await preview(db, profile, protected)
+    evidence = client_evidence(result["evidence"])
+    permitted = {row["file_id"] for row in evidence["files"]}
+    retained = {str(fid) for block in ("expenses", "adjustments") for row in (current or {}).get(block, [])
+                for fid in row.get("source_file_ids", [])}
+    supplied = {str(fid) for block in ("expenses", "adjustments") for row in protected[block]
+                for fid in row.get("source_file_ids", [])}
+    if supplied - permitted - retained:
+        raise HTTPException(422, "Use supporting sources available to this operating form")
+    return {"evaluation": client_evaluation(result["evaluation"]), "evidence": evidence,
+            "guidance": evidence.get("guidance") or {}}
 
 
 async def summary(db, profile, *, family_id=None):

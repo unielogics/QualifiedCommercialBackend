@@ -69,15 +69,40 @@ def context_stamp(cockpit):
     return _stamp(_context_values(cockpit))
 
 
+def _before_guidance(context):
+    """Reconstruct only the previous evidence shape for existing receipts.
+
+    New reviews bind the full guidance context. Original source identities,
+    analyses, hashes, associations and prior bank/merchant suggestions remain
+    dependencies even when the display adds derived expense suggestions.
+    """
+    context = deepcopy(context)
+    evidence = context["evidence"]
+    evidence.pop("guidance", None)
+    for row in evidence.get("files", []):
+        row.pop("eligible_for_guidance", None)
+    candidates = []
+    for row in evidence.get("expense_candidates", []):
+        if row.get("source_group_key") and str(row.get("key") or "").startswith("source:"):
+            continue
+        row.pop("source_group_key", None)
+        row.pop("source_candidate_key", None)
+        candidates.append(row)
+    if "expense_candidates" in evidence:
+        evidence["expense_candidates"] = candidates
+    return context
+
+
 def proposal_stamp(action, linked_expense=None, body=None):
     proposal = {key: value for key, value in action.items() if key not in REVIEW_FIELDS}
     expense = deepcopy(linked_expense)
     # Adding optional unit controls must not stale a previously reviewed total
     # solely because schema validation materialized their empty defaults.
     action_defaults = {"cost_basis": "total", "unit_label": "", "current_units_per_period": None,
-        "proposed_units_per_period": None, "current_fixed_amount": None, "proposed_fixed_amount": None}
+        "proposed_units_per_period": None, "current_fixed_amount": None, "proposed_fixed_amount": None,
+        "product_name": "", "revenue_return_multiple": None}
     expense_defaults = {"cost_basis": "total", "unit_label": "", "current_units_per_period": None,
-        "current_unit_cost": None, "current_fixed_amount": None}
+        "current_unit_cost": None, "current_fixed_amount": None, "source_group_key": "", "source_candidate_key": ""}
     for row, defaults in ((proposal, action_defaults), (expense, expense_defaults)):
         if row is not None:
             for key, default in defaults.items():
@@ -95,13 +120,23 @@ def review_stamp(action, cockpit, linked_expense=None, body=None):
     context = _context_values(cockpit)
     for key in ("financing", "legacy_adjustments", "legacy_overrides"):
         context.pop(key, None)
+    return _stamp({"review_schema": "operating-evidence-v3", "proposal": proposal_stamp(action, linked_expense, body), "context": _stamp(context),
+                   "treatment": action.get("baseline_treatment"), "reconciliation": action.get("baseline_reconciliation_note")})
+
+
+def _prior_v2_review_stamp(action, cockpit, linked_expense=None, body=None):
+    context = _before_guidance(_context_values(cockpit))
+    for key in ("financing", "legacy_adjustments", "legacy_overrides"):
+        context.pop(key, None)
     return _stamp({"review_schema": "operating-evidence-v2", "proposal": proposal_stamp(action, linked_expense, body), "context": _stamp(context),
                    "treatment": action.get("baseline_treatment"), "reconciliation": action.get("baseline_reconciliation_note")})
 
 
-def _legacy_review_stamp(action, cockpit, linked_expense=None, body=None):
+def _legacy_review_stamp(action, cockpit, linked_expense=None, body=None, *, before_guidance=False):
     """Retain an existing review only while its original context still matches."""
     context = _context_values(cockpit)
+    if before_guidance:
+        context = _before_guidance(context)
     applied = (((cockpit.get("plan") or {}).get("evaluation") or {}).get("operating_plan") or {})
     if applied.get("applied") and "financing_active_before_operating_plan" in applied:
         # This feature may activate a projection without adding a loan. Ignore
@@ -261,6 +296,7 @@ def _processing(action, cockpit, issues, risks):
 def _impact(action, body, expenses, cockpit, allowed_files, now):
     issues = [f"Missing {key.replace('_', ' ')}" for key in action_missing(action)]
     risks = []
+    marketing_calculation = {}
     linked = expenses.get(action.get("expense_row_id"))
     if linked and linked["excluded"]:
         issues.append("The linked expense is excluded or marked duplicate; restore or relink it before using this action.")
@@ -284,6 +320,25 @@ def _impact(action, body, expenses, cockpit, allowed_files, now):
         elif kind == "revenue_change":
             gross = (action["proposed_amount"] - action["current_amount"]) * action["contribution_margin_pct"] / 100
             risks.append("Incremental revenue uses the stated contribution margin after variable costs; it is not dollar-for-dollar earnings.")
+        elif kind == "marketing_investment":
+            incremental_spend = action["proposed_amount"] - action["current_amount"]
+            incremental_revenue = incremental_spend * action["revenue_return_multiple"]
+            contribution = incremental_revenue * action["contribution_margin_pct"] / 100
+            gross = contribution - incremental_spend
+            marketing_calculation = {"incremental_spend": _money(incremental_spend),
+                "incremental_revenue": _money(incremental_revenue), "incremental_contribution": _money(contribution),
+                "formula": "(proposed spend - current spend) * (revenue return multiple * contribution margin / 100 - 1)"}
+            if incremental_spend < 0:
+                issues.append("A marketing investment must keep or increase current spend; use an expense reduction for a lower marketing budget.")
+            if linked is None or linked["category"] != "marketing":
+                issues.append("Link the investment to a disclosed marketing expense row.")
+            else:
+                issues.extend(_cost_issues(linked))
+                declared = _annual(cost_amount(linked), linked["cadence"])
+                current = _annual(action["current_amount"], action["cadence"])
+                if declared is None or current is None or not _near(declared, current):
+                    issues.append("Current marketing spend and cadence must reconcile to the linked marketing expense disclosure.")
+            risks.append("Marketing revenue return and contribution margin are explicit assumptions, not guaranteed sales. Incremental spend is deducted once from its modeled contribution.")
         elif kind == "processing_cost_change":
             enriched = {**cockpit, "_operating_body_currency": body["currency"]}
             gross = _processing(action, enriched, issues, risks)
@@ -342,14 +397,16 @@ def _impact(action, body, expenses, cockpit, allowed_files, now):
         "included_in_approved_projection": False, "issues": issues, "risk_flags": risks,
         "source_file_ids": list(action["source_file_ids"]), "effective_date": action["effective_date"],
         "explanation": action["explanation"], "source_note": action["source_note"], "owner_name": action["owner_name"],
-        "driver_key": action["driver_key"], "expense_row_id": action["expense_row_id"], "excluded": action["excluded"],
+        "driver_key": action["driver_key"], "product_name": action["product_name"],
+        "expense_row_id": action["expense_row_id"], "excluded": action["excluded"],
         "merchant_source_key": action.get("merchant_source_key"), "merchant_offer_id": action.get("merchant_offer_id"),
-        "calculation": {key: action.get(key) for key in ("cadence", "cost_basis", "unit_label", "current_units_per_period", "proposed_units_per_period",
+        "calculation": {**{key: action.get(key) for key in ("cadence", "cost_basis", "unit_label", "current_units_per_period", "proposed_units_per_period",
             "current_fixed_amount", "proposed_fixed_amount", "units_per_period", "current_amount", "proposed_amount",
             "current_unit_price", "proposed_unit_price", "current_unit_cost", "proposed_unit_cost", "contribution_margin_pct",
+            "product_name", "revenue_return_multiple",
             "processing_volume", "processing_transaction_count", "current_processing_rate_pct", "proposed_processing_rate_pct",
             "current_processing_rate_basis", "proposed_processing_rate_basis", "current_processing_fixed_fee", "proposed_processing_fixed_fee",
-            "current_processing_per_transaction_fee", "proposed_processing_per_transaction_fee")}}
+            "current_processing_per_transaction_fee", "proposed_processing_per_transaction_fee")}, **marketing_calculation}}
 
 
 def _conflicts(actions, expenses):
@@ -373,7 +430,7 @@ def _conflicts(actions, expenses):
     for group in by_expense.values():
         # Distinct products may share a COGS disclosure, but a whole-expense
         # reduction cannot also count the same processor/product savings.
-        if len(group) > 1 and any(row["kind"] in {"expense_reduction", "expense_increase", "processing_cost_change"} for row in group):
+        if len(group) > 1 and any(row["kind"] in {"expense_reduction", "expense_increase", "processing_cost_change", "marketing_investment"} for row in group):
             for row in group:
                 conflicts[row["id"]].append("This expense is adjusted more than once. Select one treatment to avoid counting the same savings twice.")
     for group in merchant.values():
@@ -396,6 +453,10 @@ def _conflicts(actions, expenses):
     if aggregate and unit_or_cogs:
         for row in [*aggregate, *unit_or_cogs]:
             conflicts[row["id"]].append("Choose aggregate revenue/contribution-margin modeling or itemized price/product-cost modeling; combining them can duplicate the same margin change.")
+    marketing = [row for row in actions if row["kind"] == "marketing_investment"]
+    if aggregate and marketing:
+        for row in [*aggregate, *marketing]:
+            conflicts[row["id"]].append("Choose aggregate revenue/contribution-margin modeling or the marketing-return model; the marketing model already includes its incremental revenue and spend.")
     return conflicts
 
 
@@ -472,7 +533,9 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
                 fresh = bool(action["reviewed_by_user_id"] and action["reviewed_at"] and action["review_reason"]
                              and action["review_source_stamp"] in {
                                  review_stamp(action, cockpit, expenses.get(action.get("expense_row_id")), body),
-                                 _legacy_review_stamp(action, cockpit, expenses.get(action.get("expense_row_id")), body)})
+                                 _prior_v2_review_stamp(action, cockpit, expenses.get(action.get("expense_row_id")), body),
+                                 _legacy_review_stamp(action, cockpit, expenses.get(action.get("expense_row_id")), body),
+                                 _legacy_review_stamp(action, cockpit, expenses.get(action.get("expense_row_id")), body, before_guidance=True)})
                 if not fresh:
                     result["review_state"] = "stale"
                     result["risk_flags"].append("The proposal, linked expense or financial evidence changed. Staff must review the action again.")
@@ -522,7 +585,7 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
     annual_noi = number(noi.get("annualized_value"))
     from app.services.document_associations import identity_matches
 
-    refs = earnings.get("source_refs") or []
+    refs = [*(earnings.get("source_refs") or []), *(noi.get("source_refs") or [])]
     expected_business = (cockpit.get("operating_evidence") or {}).get("business_name") or next((
         (ref.get("identity_association") or {}).get("expected_entity") or ref.get("entity") for ref in refs
         if (ref.get("identity_association") or {}).get("expected_entity") or ref.get("entity")), None)
@@ -530,8 +593,9 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
     comparable = bool(entity_comparable and _period_matches(body, earnings) and earnings.get("currency") == body["currency"] == "USD" and earnings.get("basis") == body["basis"] and not (cockpit.get("ebitda") or {}).get("source_selection", {}).get("stale") and not debt.get("identity_association_conflict"))
     reviewed_noi = bool(noi.get("staff_reviewed") and not (cockpit.get("noi") or {}).get("review", {}).get("stale"))
     noi_comparable = bool(entity_comparable and _period_matches(body, noi) and noi.get("currency") == body["currency"] == "USD"
-                          and (noi.get("basis") == body["basis"] or reviewed_noi))
-    baseline = {"period": earnings.get("period"), "currency": earnings.get("currency"), "basis": earnings.get("basis"),
+                          and (noi.get("basis") == body["basis"] or reviewed_noi)
+                          and not (cockpit.get("noi") or {}).get("review", {}).get("stale"))
+    baseline = {"period": earnings.get("period"), "currency": earnings.get("currency"), "plan_currency": body["currency"], "basis": earnings.get("basis"),
         "revenue": source_baseline.get("revenue"), "earnings": annual_earnings, "earnings_kind": earnings.get("kind"),
         "noi": annual_noi, "noi_kind": noi.get("kind"), "noi_label": noi.get("label"),
         "noi_year": noi.get("year"), "noi_basis": noi.get("basis"), "noi_staff_reviewed": reviewed_noi,
@@ -547,6 +611,7 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
 
     def projection(total, reviewed):
         available = comparable and annual_earnings is not None and total["complete"]
+        noi_available = noi_comparable and annual_noi is not None and total["complete"]
         after = annual_earnings + total["annual_impact"] if available else None
         first_year = annual_earnings + total["first_year_impact"] if available else None
         coverage_rows = approved_rows if reviewed else proposed_rows
@@ -556,9 +621,12 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
         new_operating = number(evaluation.get("annual_new_operating_expenses", 0))
         refinance_after = after - new_operating if after is not None and new_operating is not None else None
         refinance_first_year = first_year_coverage - new_operating if first_year_coverage is not None and new_operating is not None else None
-        after_noi = annual_noi + total["annual_impact"] if noi_comparable and annual_noi is not None and total["complete"] else None
+        after_noi = annual_noi + total["annual_impact"] if noi_available else None
+        first_year_noi = annual_noi + total["first_year_impact"] if noi_available else None
         return {"status": "awaiting_review" if reviewed and total["count"] == 0 else "no_actions" if not reviewed and not active else "reviewed_illustration" if reviewed and available else "unreviewed_illustration" if available else "unavailable",
             "earnings": _money(after), "noi": _money(after_noi),
+            "noi_status": "awaiting_review" if reviewed and total["count"] == 0 else "no_actions" if not reviewed and not active else "reviewed_illustration" if reviewed and noi_available else "unreviewed_illustration" if noi_available else "unavailable",
+            "first_year_noi": _money(first_year_noi),
             "first_year_earnings": _money(first_year),
             "first_year_coverage_impact": _money(coverage_impact), "first_year_coverage_earnings": _money(first_year_coverage),
             "first_year_dscr_current": round(first_year_coverage / current_service, 2) if first_year_coverage is not None and current_service is not None and current_service > 0 else None,
@@ -598,7 +666,10 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
 
     released = evaluate_released_cash_flow(body, cockpit)
     missing.extend(released["missing"])
+    from app.services.operating_plan_guidance import reconcile_groups
+
     return {"schema_version": "earnings-improvement-v1", "context_stamp": context_stamp(cockpit), "disclosure": _disclosure(body),
+        "expense_groups": reconcile_groups(body, cockpit.get("operating_evidence") or {}),
         "released_cash_flow": released,
         "actions": results, "totals": sums, "baseline": baseline, "recommendation": recommendation,
         "projection": {"proposed": projection(sums["proposed"], False), "approved": projection(sums["approved"], True)},
@@ -645,12 +716,13 @@ def review_actions(raw, cockpit, action_ids, decision, reason, actor, *, baselin
 def package_summary(evaluation):
     """Shareable explanations, never private review reasons, actors or hashes."""
     return {"baseline": deepcopy(evaluation["baseline"]), "disclosure": deepcopy(evaluation["disclosure"]),
+        "expense_groups": deepcopy(evaluation.get("expense_groups") or []),
         "released_cash_flow": deepcopy(evaluation.get("released_cash_flow")),
         "projection": deepcopy(evaluation["projection"]), "totals": deepcopy(evaluation["totals"]),
         "targets": deepcopy(evaluation["targets"]), "missing": list(evaluation["missing"]),
         "risk_flags": list(evaluation["risk_flags"]), "notes": list(evaluation["notes"]),
         "all_actions_reviewed": evaluation["all_actions_reviewed"], "recommendation": deepcopy(evaluation.get("recommendation")),
-        "adjustments": [{key: deepcopy(row.get(key)) for key in ("id", "label", "kind", "review_state", "gross_annual_impact",
+        "adjustments": [{key: deepcopy(row.get(key)) for key in ("id", "label", "kind", "product_name", "review_state", "gross_annual_impact",
             "net_annual_impact", "first_year_impact", "implementation_recurring_annual", "implementation_one_time",
             "included_in_approved_projection", "effective_date", "explanation", "source_note", "owner_name", "issues", "risk_flags", "source_file_ids", "calculation")}
             for row in evaluation["actions"] if not row["excluded"]]}
