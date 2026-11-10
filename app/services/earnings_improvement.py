@@ -488,10 +488,14 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
         if (ref.get("identity_association") or {}).get("expected_entity") or ref.get("entity")), None)
     entity_comparable = bool(expected_business and identity_matches(expected_business, body["business_name"]))
     comparable = bool(entity_comparable and body["period_start"] and body["period_end"] and earnings.get("currency") == body["currency"] == "USD" and earnings.get("basis") == body["basis"] and not (cockpit.get("ebitda") or {}).get("source_selection", {}).get("stale") and not debt.get("identity_association_conflict"))
-    noi_comparable = bool(entity_comparable and noi.get("currency") == body["currency"] == "USD" and noi.get("basis") == body["basis"])
+    reviewed_noi = bool(noi.get("staff_reviewed") and not (cockpit.get("noi") or {}).get("review", {}).get("stale"))
+    noi_comparable = bool(entity_comparable and noi.get("currency") == body["currency"] == "USD"
+                          and (noi.get("basis") == body["basis"] or reviewed_noi))
     baseline = {"period": earnings.get("period"), "currency": earnings.get("currency"), "basis": earnings.get("basis"),
         "revenue": source_baseline.get("revenue"), "earnings": annual_earnings, "earnings_kind": earnings.get("kind"),
-        "noi": annual_noi, "dscr": ((cockpit.get("dscr") or {}).get("headline") or {}).get("value"),
+        "noi": annual_noi, "noi_kind": noi.get("kind"), "noi_label": noi.get("label"),
+        "noi_year": noi.get("year"), "noi_basis": noi.get("basis"), "noi_staff_reviewed": reviewed_noi,
+        "dscr": ((cockpit.get("dscr") or {}).get("headline") or {}).get("value"),
         "annual_debt_service": current_service, "provisional": bool(earnings.get("provisional", True)),
         "noi_provisional": bool(noi.get("provisional", True))}
     ratio = number(baseline["dscr"])
@@ -517,12 +521,14 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
     if annual_earnings is None:
         missing.append("A latest-period annual earnings baseline is needed to translate operating changes into coverage.")
     if annual_noi is None:
-        missing.append("A supported operating-income statement is needed for a projected NOI figure.")
+        missing.append("A supported operating-income statement or an explicit annual staff NOI review is needed for a projected NOI figure.")
     if current_service is None:
         missing.append("Current annual debt service is not established.")
     if not comparable:
         missing.append("Reconcile the disclosure and current earnings business, currency, accounting basis and period before relying on projected coverage.")
     risks = []
+    if reviewed_noi:
+        risks.append("Projected NOI starts from an explicit annual staff review; its tax-derived or manual basis is separate from the historical P&L and does not establish program eligibility.")
     if baseline["provisional"]:
         risks.append("The current earnings baseline is provisional; a reviewed plan does not remove its source limitations.")
     if (plan.get("record") or {}).get("add_backs") or ((plan.get("record") or {}).get("overrides") or {}).get("income_annual") is not None:

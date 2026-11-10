@@ -15,7 +15,8 @@ CURRENCY_KEYS = ("numerator_currency", "denominator_currency", "source_currencie
 RESULT_KEYS = ("key", "label", "kind", "value", "annualized_value", "period", "months_covered", "annualization_factor",
                "formula", "complete", "provisional", "entity_mismatch", "entity_comparable", "missing_inputs", "input_keys",
                "computed_value", "reported_value", "currency", "basis", "numerator", "denominator", "selected", "basis_status", "debt_version_id", "notes",
-               "source_value", "reviewed_value", "reviewed_label", "staff_adjusted", "active_input_keys", "year", "period_start", "period_end", *CURRENCY_KEYS)
+               "source_value", "reviewed_value", "reviewed_label", "staff_adjusted", "staff_reviewed", "tax_derived_estimate",
+               "source_accepted", "active_input_keys", "year", "period_start", "period_end", *CURRENCY_KEYS)
 
 
 def _number(value):
@@ -100,6 +101,8 @@ def operating_earnings_brief(cockpit):
         "noi": {
             "definition": fields(noi.get("definition"), ("key", "label", "formula", "includes_depreciation_and_amortization")),
             "historical": noi_historical, "reason": noi.get("reason"),
+            "source_historical": _result(noi.get("source_headline")),
+            "source_reason": noi.get("source_reason"),
             "years": [_result(row) for row in noi.get("years", [])],
             "trend": fields(noi.get("trend"), ("direction", "comparable", "prior_year", "current_year", "change_amount", "change_pct", "reason")),
             "scenario": fields(noi_scenario, ("current", "plan", "annual_debt_service_current", "annual_debt_service_plan",
@@ -254,6 +257,7 @@ def current_review_projection(result, cockpit):
                     "revenue_period": revenue_baseline.get("period"),
                     "noi": operating.get("value"), "annual_noi": operating.get("annualized_value"),
                     "noi_period": operating.get("period"), "noi_definition": "business_operating_income",
+                    "noi_kind": operating.get("kind"), "noi_label": operating.get("label"), "noi_currency": operating.get("currency"),
                     "dscr_basis": primary.get("key"), "dscr_earnings": primary.get("numerator"),
                     "dscr_earnings_label": primary.get("numerator_label"),
                     "dscr_source_refs": primary.get("source_refs") or [],

@@ -425,6 +425,11 @@ def redact_for_external(cockpit, actor):
     # The new staff source picker contains the private file inventory and
     # review concurrency fingerprints. Client forms use their own scoped links.
     result["operating_evidence"] = {}
+    noi = result.get("noi") or {}
+    noi.pop("review", None)
+    for calculation in [noi.get("headline"), *((result.get("metric_review") or {}).get("calculations") or [])]:
+        if isinstance(calculation, dict):
+            calculation.pop("review_receipt", None)
     operating = result.get("operating_plan")
     if operating:
         from app.capital_partners.services.listings import partner_operating_earnings
@@ -603,3 +608,19 @@ async def save_earnings_sources(db, profile, actor, **payload):
         cockpit["ebitda"]["source_selection"], actor=actor, **payload)
     return await _persist_review(db, profile, actor, state, action="financial_metrics.earnings_sources",
         summary="Reviewed the EBITDA source period and exclusions", event_prefix="financial-earnings-sources") if changed else cockpit
+
+
+async def save_noi_review(db, profile, actor, **payload):
+    """Record an explicit annual NOI basis using the financial review lock."""
+    from app.services import financial_cockpit, financial_noi_review
+    from app.services.financial_workspace import lock_financial_profile
+
+    if actor.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(403, "Underwriting role required")
+    await lock_financial_profile(db, profile)
+    profile = (await db.execute(select(ApplicationProfile).where(ApplicationProfile.id == profile.id).execution_options(populate_existing=True))).scalar_one()
+    cockpit = await financial_cockpit.load_cockpit(db, profile)
+    state, changed = financial_noi_review.change(getattr(profile, "financial_metric_review", None),
+        cockpit["noi"]["review"], actor=actor, **payload)
+    return await _persist_review(db, profile, actor, state, action="financial_metrics.noi_reviewed",
+        summary="Reviewed an annual business NOI basis", event_prefix="financial-noi") if changed else cockpit

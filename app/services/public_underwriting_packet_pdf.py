@@ -1357,8 +1357,13 @@ def _operating_earnings_lines(financials: dict[str, Any], *, compact: bool = Fal
         operating = _record(noi.get("historical"))
         lines.append("Business NOI = revenue - COGS - operating expenses, including expensed depreciation and amortization; before financing costs and income taxes.")
         if operating:
-            lines.append(f"Business NOI: {_earnings_money(operating.get('value'), operating.get('currency'))}; {operating.get('period') or 'period unknown'}." + (" Provisional source figure." if operating.get("provisional") else ""))
-            if not compact:
+            lines.append(f"{operating.get('label') or 'Business NOI'}: {_earnings_money(operating.get('value'), operating.get('currency'))}; {operating.get('period') or 'period unknown'}." + (" Provisional source figure." if operating.get("provisional") else ""))
+            if operating.get("staff_reviewed"):
+                lines.append("Staff-reviewed annual basis. " + ("Tax-derived estimate; operating classifications require review." if operating.get("tax_derived_estimate") else "Manually reviewed operating income; source documents are unchanged."))
+            names = list(dict.fromkeys(str(row.get("file_name")) for row in _records(operating.get("source_refs")) if row.get("file_name")))
+            if names:
+                lines.append("NOI source: " + "; ".join(names[:2 if compact else 4]) + ".")
+            if not compact and operating.get("fundamentals"):
                 values = {row.get("key"): row.get("value") for row in _records(operating.get("fundamentals"))}
                 lines.append(f"NOI inputs: revenue {_earnings_money(values.get('gross_revenue'), operating.get('currency'))}; COGS {_earnings_money(values.get('cost_of_goods_sold'), operating.get('currency'))}; operating expenses {_earnings_money(values.get('total_operating_expenses'), operating.get('currency'))}.")
         else:
@@ -2363,7 +2368,7 @@ def render_underwriting_packet_pdf(
     exec_metrics = executive_summary.get("key_metrics")
     def current_earnings_metric(label: str) -> bool:
         normalized = " ".join(label.casefold().replace("_", " ").split())
-        return "operating_earnings" in financials and any(term in normalized for term in ("ebitda", "dscr", "revenue", "tax income", "tax net income", "earnings estimate"))
+        return "operating_earnings" in financials and ("noi" in normalized.split() or any(term in normalized for term in ("operating income", "ebitda", "dscr", "revenue", "tax income", "tax net income", "earnings estimate")))
     if isinstance(exec_metrics, list) and exec_metrics:
         for m in exec_metrics:
             if isinstance(m, dict):

@@ -1,5 +1,6 @@
 """Advanced staff corrections of source-bound financial calculation inputs."""
 
+from datetime import date
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -118,6 +119,28 @@ class FinancialEarningsSources(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=128)
 
 
+class FinancialNoiReview(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    mode: Literal["automatic", "source", "manual"]
+    selected_file_id: UUID | None = None
+    annual_value: float | None = Field(default=None, ge=-1e15, le=1e15)
+    year: int | None = Field(default=None, ge=1900, le=2100, strict=True)
+    currency: str | None = Field(default=None, min_length=3, max_length=3)
+    period_start: date | None = None
+    period_end: date | None = None
+    reason: str = Field(min_length=1, max_length=2000)
+    expected_revision: int = Field(ge=0)
+    source_stamp: str = Field(pattern=r"^[0-9a-f]{64}$")
+    idempotency_key: str = Field(min_length=8, max_length=128)
+
+    @field_validator("annual_value", mode="before")
+    @classmethod
+    def numeric_not_boolean(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("Use a numeric annual NOI amount")
+        return value
+
+
 @router.get("", response_model=FinancialCockpitRead)
 async def read_metrics(profile_id: UUID, user: CurrentUser, db: Db):
     if user.role in {Role.CLIENT, Role.DEALER, Role.LENDER, Role.VENDOR, Role.CAPITAL_PARTNER}:
@@ -162,5 +185,15 @@ async def review_earnings_sources(profile_id: UUID, payload: FinancialEarningsSo
         raise HTTPException(403, "Underwriting role required")
     profile = await profiles.load_profile(db, profile_id, user)
     cockpit = await financial_metric_review.save_earnings_sources(db, profile, user, **payload.model_dump())
+    await db.commit()
+    return cockpit
+
+
+@router.post("/noi-review", response_model=FinancialCockpitRead)
+async def review_noi(profile_id: UUID, payload: FinancialNoiReview, user: CurrentUser, db: Db):
+    if user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(403, "Underwriting role required")
+    profile = await profiles.load_profile(db, profile_id, user)
+    cockpit = await financial_metric_review.save_noi_review(db, profile, user, **payload.model_dump())
     await db.commit()
     return cockpit

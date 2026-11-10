@@ -2498,8 +2498,10 @@ def build_cockpit(
         plan_annual_debt_service=evaluation.get("debt_service_after_annual") if evaluation.get("active") and not evaluation.get("coverage_unavailable_reason") else None,
         operating_adjustments=(evaluation.get("ebitda") or {}).get("adjusted_annual", {}).get("adjustments", []),
         additional_operating_expense_annual=evaluation.get("annual_new_operating_expenses", 0),
-        source_selection=cockpit["ebitda"].get("source_selection"))
+        source_selection=cockpit["ebitda"].get("source_selection"), review_state=metric_review_state)
     metric_review["calculations"].extend(cockpit["noi"].get("candidates", []))
+    if (cockpit["noi"].get("headline") or {}).get("staff_reviewed"):
+        metric_review["calculations"].append(cockpit["noi"]["headline"])
     if evaluation.get("schedule"):
         cockpit["noi"]["scenario"]["notes"].append("Saved-plan debt service uses the annual coverage window, including balloon and maturity stress where configured; the residual is not a regular-payment cash-flow forecast.")
     if evaluation.get("debt_service_override_monthly") is not None:
