@@ -87,7 +87,9 @@ class ApplicationTermSheet(TimestampMixin, Base):
     annual_new_debt_service: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
     projected_annual_debt_service: Mapped[float | None] = mapped_column(Numeric(14, 2))
     cash_flow_value: Mapped[float | None] = mapped_column(Numeric(14, 2))
-    cash_flow_label: Mapped[str] = mapped_column(String(80), nullable=False)
+    # Generated labels include the selected earnings basis and reviewed plan;
+    # provenance is not a user input with a fixed display-length limit.
+    cash_flow_label: Mapped[str] = mapped_column(Text, nullable=False)
     current_annual_debt_service: Mapped[float | None] = mapped_column(Numeric(14, 2))
     annual_property_carrying_costs: Mapped[float | None] = mapped_column(Numeric(14, 2))
     dscr_before: Mapped[float | None] = mapped_column(Numeric(8, 4))
@@ -95,7 +97,7 @@ class ApplicationTermSheet(TimestampMixin, Base):
     dscr_method: Mapped[str] = mapped_column(String(24), nullable=False)
     dscr_status: Mapped[str] = mapped_column(String(24), nullable=False)
     dscr_explanation: Mapped[str] = mapped_column(Text, nullable=False)
-    dscr_source: Mapped[str] = mapped_column(String(200), nullable=False)
+    dscr_source: Mapped[str] = mapped_column(Text, nullable=False)
     expiration_days: Mapped[int] = mapped_column(Integer, nullable=False)
     closing_estimate_days: Mapped[int] = mapped_column(Integer, nullable=False)
     issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -15,6 +15,7 @@ from sqlalchemy import (
     MetaData,
     Numeric,
     Table,
+    Text,
     Uuid,
     create_engine,
     select,
@@ -151,6 +152,44 @@ async def baseline(env):
     response = await routes.put_client_terms(env.profile.id, payload(), env.actor, env.db)
     assert response.version == 1 and response.financial_plan is None
     return deepcopy(env.profile.financial_plan)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("earnings", [-54_369, 0])
+async def test_saved_terms_preserve_full_cockpit_provenance_and_signed_earnings(env, monkeypatch, earnings):
+    # The generated source includes up to four complete plan explanations. It
+    # legitimately exceeds the old varchar(200), even for short business names.
+    label = "2025 filed business earnings reconciled to reviewed financial evidence and operating adjustments"
+    changes = [f"Reviewed change {index}: " + "documented annual operating cost reconciliation " * 3 for index in range(4)]
+    source_cockpit = {
+        "dscr": {"headline": {"label": label, "numerator": earnings, "value": earnings / 36_000}},
+        "debt": {"service": {"monthly": 3000}},
+        "plan": {"evaluation": {"active": True, "income_after_annual": earnings,
+                    "debt_service_before_new_payment_monthly": 2000},
+                 "modifications": [{"kind": "add_back", "label": value} for value in changes]},
+    }
+    monkeypatch.setattr(financial_cockpit, "load_cockpit", AsyncMock(return_value=source_cockpit))
+    context = await application_terms._cockpit_context(env.db, env.profile)
+    assert context is not None and context.cash_flow == earnings
+    assert len(context.source) > 200 and len(context.cash_flow_label) > 80
+    monkeypatch.setattr(application_terms, "_dscr_context", AsyncMock(return_value=context))
+
+    response = await routes.put_client_terms(env.profile.id, payload(), env.actor, env.db)
+    env.session.expire_all()
+    row = env.session.execute(select(ApplicationTermSheet)).scalar_one()
+    assert row.dscr_source == context.source
+    assert all(change in row.dscr_source for change in changes)
+    assert row.cash_flow_label == context.cash_flow_label
+    assert row.cash_flow_value == earnings
+    assert float(row.dscr_before) == pytest.approx(round(earnings / 36_000, 4))
+    assert response.calculation.source == context.source
+    assert response.calculation.cash_flow_value == earnings
+    assert response.calculation.dscr_after is not None
+    assert response.calculation.dscr_after < 0 if earnings < 0 else response.calculation.dscr_after == 0
+    # SQLite permits any varchar length, so also assert the production ORM
+    # schema uses unbounded text instead of a limit that would fail PostgreSQL.
+    assert isinstance(ApplicationTermSheet.__table__.c.dscr_source.type, Text)
+    assert isinstance(ApplicationTermSheet.__table__.c.cash_flow_label.type, Text)
 
 
 def combined(env, **extra):
