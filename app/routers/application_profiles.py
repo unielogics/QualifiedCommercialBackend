@@ -179,7 +179,12 @@ from app.schemas.client_application import (
     ClientApplicationPatch,
     ClientApplicationRead,
 )
-from app.schemas.deal_budget import DealBudgetPatch, DealBudgetPreview, DealBudgetRead
+from app.schemas.deal_budget import (
+    DealBudgetApply,
+    DealBudgetPatch,
+    DealBudgetPreview,
+    DealBudgetRead,
+)
 from app.schemas.debt_schedule_review import (
     DebtScheduleReviewRead,
     DebtScheduleReviewResult,
@@ -931,7 +936,9 @@ async def patch_application_deal_budget(profile_id: UUID, payload: DealBudgetPat
     db: AsyncSession = Depends(get_db)) -> DealBudgetRead:
     from app.services import deal_budget
     deal_budget.require_staff(user)
-    result = await deal_budget.update(db, await profiles.load_profile(db, profile_id, user), payload, user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    result = await deal_budget.update(db, profile, payload, user)
+    await capital_readiness.advisory_recompute_profiles(db, [profile], event_key=f"deal-budget:{profile.id}:{result.revision}")
     await db.commit()
     return result
 
@@ -942,9 +949,26 @@ async def preview_application_deal_budget(profile_id: UUID, payload: DealBudgetP
     from app.services import deal_budget
     deal_budget.require_staff(user)
     profile = await profiles.load_profile(db, profile_id, user)
-    value = payload.model_dump(mode="json", exclude={"expected_revision", "loan"})
+    value = payload.model_dump(mode="json", exclude={"expected_revision", "loan", "financial_plan"})
     value["revision"] = payload.expected_revision
-    return await deal_budget.read(db, profile, user, budget=value, loan=payload.loan.model_dump(mode="json") if payload.loan else None)
+    return await deal_budget.read(db, profile, user, budget=value, loan=payload.loan.model_dump(mode="json") if payload.loan else None,
+        financial_plan=payload.financial_plan)
+
+
+@router.post("/{profile_id}/deal-budget/apply-principal", response_model=DealBudgetRead)
+async def apply_application_deal_budget_principal(profile_id: UUID, payload: DealBudgetApply, user: CurrentUser,
+    db: AsyncSession = Depends(get_db)) -> DealBudgetRead:
+    from app.services import deal_budget
+    deal_budget.require_staff(user)
+    try:
+        profile = await profiles.load_profile(db, profile_id, user)
+        result = await deal_budget.apply_principal(db, profile, payload, user)
+        await capital_readiness.advisory_recompute_profiles(db, [profile], event_key=f"deal-budget-principal:{profile.id}:{result.revision}")
+        await db.commit()
+        return result
+    except Exception:
+        await db.rollback()
+        raise
 
 
 @router.get("/{profile_id}/funding-request", response_model=FundingRequestRead)
@@ -2645,9 +2669,12 @@ async def put_financial_plan(
     from app.services.financial_plan import validate_plan_write
 
     await lock_profile_terms(db, profile.id)
-    await db.refresh(profile, attribute_names=["financial_plan"])
+    await db.refresh(profile, attribute_names=["financial_plan", "deal_budget"])
     validate_plan_write(profile.financial_plan, payload)
-    record = payload.model_dump(exclude={"expected_updated_at"})
+    from app.services import deal_budget, financial_plan_budget
+    financial_plan_budget.validate_write(deal_budget.snapshot(profile), payload.expected_deal_budget_revision,
+        financial_plan_budget.loan_from_plan(payload.model_dump()))
+    record = payload.model_dump(exclude={"expected_updated_at", "expected_deal_budget_revision"})
     record["updated_at"] = datetime.now(UTC).isoformat()
     record["updated_by"] = str(user.id)
     profile.financial_plan = record
@@ -2660,6 +2687,9 @@ async def put_financial_plan(
         + (f", new payment {payload.new_payment_monthly:,.0f}/mo" if payload.new_payment_monthly else "")
         + (f", new loan {payload.new_loan_amount:,.0f} at {payload.new_loan_rate_pct or 0:g}% over {payload.new_loan_term_months or 0} months" if payload.new_loan_amount else ""),
         metadata={"retire": payload.retire, "exclude": payload.exclude},
+    )
+    await capital_readiness.advisory_recompute_profiles(
+        db, [profile], event_key=f"financial-plan:{profile.id}:{record['updated_at']}",
     )
     await db.commit()
     cockpit = await financial_cockpit.load_cockpit(db, profile)

@@ -2207,6 +2207,7 @@ def build_cockpit(
     business_entity: str | None = None,
     profile_id: str | None = None,
     association_owner: dict[str, Any] | None = None,
+    financing_budget: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The cockpit read model from plain dicts.
 
@@ -2384,6 +2385,7 @@ def build_cockpit(
         proposed=proposed,
         requested_amount=_num(requested_amount),
         ebitda=metric_review["ebitda"],
+        financing_budget=financing_budget,
     )
     levers = plans.coverage_levers(
         plan_record,
@@ -2495,6 +2497,7 @@ def build_cockpit(
         metric_review=metric_review, current_annual_debt_service=service.get("annual"),
         plan_annual_debt_service=evaluation.get("debt_service_after_annual") if evaluation.get("active") and not evaluation.get("coverage_unavailable_reason") else None,
         operating_adjustments=(evaluation.get("ebitda") or {}).get("adjusted_annual", {}).get("adjustments", []),
+        additional_operating_expense_annual=evaluation.get("annual_new_operating_expenses", 0),
         source_selection=cockpit["ebitda"].get("source_selection"))
     metric_review["calculations"].extend(cockpit["noi"].get("candidates", []))
     if evaluation.get("schedule"):
@@ -2509,10 +2512,34 @@ def build_cockpit(
         cockpit["net_profit"]["baseline_policy"] = "latest_business_period"
         if not selected_source:
             cockpit["net_profit"]["note"] = "The latest business reporting period is incomplete or excluded. Prior years are comparison evidence only."
+    from app.services.financial_plan_budget import profit_projection
+    cockpit["net_profit"]["budget_scenario"] = profit_projection(cockpit["net_profit"], cockpit["ebitda"], evaluation)
     from app.services.financial_kpi_evidence import attach as attach_kpi_evidence
 
     attach_kpi_evidence(cockpit)
     return cockpit
+
+
+def financing_preview(cockpit: dict[str, Any], plan_dict: dict[str, Any], budget: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate an unsaved loan AND its payoff/addback context with draft costs."""
+    from app.services import financial_plan
+    from app.services.financial_plan_budget import coverage_context, loan_from_plan
+
+    record = financial_plan.normalize_plan(plan_dict)
+    debt = cockpit.get("debt") or {}
+    bank = cockpit.get("bank") or {}
+    result = financial_plan.evaluate_plan(record, obligations_list=debt.get("obligations") or [],
+        recurring=bank.get("recurring") or {}, months=bank.get("months") or [],
+        dscr=cockpit.get("dscr") or {}, service=debt.get("service") or {},
+        proposed=(cockpit.get("dscr") or {}).get("proposed"), requested_amount=cockpit.get("requested_amount"),
+        ebitda=cockpit.get("ebitda"), financing_budget=budget)
+    from app.services.financial_noi import preview_scenario
+    from app.services.financial_plan_budget import profit_projection
+    result["noi_scenario"] = preview_scenario(cockpit.get("noi") or {}, result)
+    result["net_profit_budget_scenario"] = profit_projection(cockpit.get("net_profit") or {}, cockpit.get("ebitda") or {}, result)
+    loan = dict(result.get("loan_terms") or loan_from_plan(record))
+    loan.update(coverage_context=coverage_context(result), requested_amount=cockpit.get("requested_amount"))
+    return {"loan": loan, "evaluation": result, "record": record}
 
 
 def plan_summary(cockpit: dict[str, Any]) -> dict[str, Any]:
@@ -2618,6 +2645,8 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
     # Cleared scenarios keep immutable recorded terms available for review,
     # but that reference is not a current offer to hydrate or publish.
     base["active_proposal"] = terms_link.get("state") != "recorded_not_in_plan"
+    if evaluation.get("principal_solution"):
+        base["principal_solution"] = dict(evaluation["principal_solution"])
     if not base["active_proposal"]:
         base["source"] = "recorded_reference"
     schedule = (
@@ -3070,6 +3099,7 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
     projected_debts = payoff_review_projection(_debt_dicts(debts), superseded_payoffs)
     accepted_body = ({**accepted_version.body, "debts": payoff_review_projection(accepted_version.body.get("debts") or [], superseded_payoffs)}
                      if accepted_version is not None else None)
+    from app.services import deal_budget
     cockpit = build_cockpit(
         analyses,
         projected_debts,
@@ -3077,6 +3107,7 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
         proposed_terms=proposed_terms,
         counted_accounts=list(getattr(profile, "counted_bank_accounts", None) or []),
         plan=getattr(profile, "financial_plan", None) or {},
+        financing_budget=deal_budget.snapshot(profile),
         account_aliases=dict(getattr(profile, "bank_account_aliases", None) or {}),
         schedule_state=schedule_state,
         recorded_terms=recorded_terms,
@@ -3123,12 +3154,15 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
     current_budget = deal_budget.snapshot(profile)
     evaluation = (cockpit.get("plan") or {}).get("evaluation") or {}
     headline = (cockpit.get("dscr") or {}).get("headline") or {}
-    coverage_context = {"income_annual": evaluation.get("income_after_annual") if evaluation.get("active") else headline.get("numerator"),
-        "debt_service_annual": evaluation.get("debt_service_after_annual"),
-        "new_loan_annual_debt_service": evaluation.get("new_payment_monthly") * 12 if evaluation.get("new_payment_monthly") is not None else None,
-        "base_dscr": evaluation.get("headline_after"), "basis": evaluation.get("headline_key") or headline.get("key")}
+    from app.services.financial_plan_budget import coverage_context as budget_coverage_context
+    coverage_context = budget_coverage_context(evaluation)
+    if not evaluation.get("active"):
+        coverage_context["income_annual"] = headline.get("numerator")
+    coverage_context["basis"] = coverage_context["basis"] or headline.get("key")
     budget_loan = {**(proposal or {}), "coverage_context": coverage_context, "requested_amount": cockpit.get("requested_amount")}
     cockpit["deal_budget"] = {**current_budget, "calculation": deal_budget.calculate(current_budget, budget_loan, getattr(profile, "use_of_funds", None))}
+    if evaluation.get("principal_solution"):
+        cockpit["deal_budget"]["calculation"]["principal_solution"] = dict(evaluation["principal_solution"])
     if proposal is not None:
         proposal["coverage_context"] = coverage_context
         proposal["requested_amount"] = cockpit.get("requested_amount")

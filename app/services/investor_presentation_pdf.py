@@ -443,7 +443,9 @@ def _budget_overview(page, report, terms, use_of_funds, requested, disclosure):
     _card(page, (34, 197, 319, 316), "Requested financing", _money(requested), f"Proposed gross loan {_money(calc.get('gross_loan_amount'), currency)}")
     _card(page, (337, 197, 622, 316), "Investment capital to raise", _money(calc.get("investor_funding_amount"), currency), f"{mode}; minimum {_money(minimum, currency)}")
     _card(page, (640, 197, 925, 316), "Gross contractual return", f"{gross_roi:.2f}%" if gross_roi is not None else "Unknown", f"Net after charges: {net_roi:.2f}% on {_money(calc.get('investor_initial_outlay'), currency)} initial outlay" if net_roi is not None else "Net return unknown; confirm all costs")
-    _text(page, (35, 329, 468, 350), f"Net loan proceeds at funding: {_money(calc.get('net_client_cash'), currency)}", size=11.5, bold=True, color=TEAL)
+    principal = _record(calc.get("principal_solution"))
+    target_label = f" (target {_money(principal.get('target_net_amount'), currency)})" if principal.get("mode") == "target_net" else ""
+    _text(page, (35, 329, 468, 350), f"Net proceeds: {_money(calc.get('net_client_cash'), currency)}{target_label}", size=10.5, bold=True, color=TEAL)
     allocations = list(_record(use_of_funds.get("category_totals")).items())
     proposal_uses = terms.get("proposal_use_of_funds")
     if allocation.get("scope") in {"proposed_loan", "proposed_reference", "proposed_gross_budget"}:
@@ -471,7 +473,8 @@ def _budget_overview(page, report, terms, use_of_funds, requested, disclosure):
             label += " [reserve]"
         _text(page, (x + 2, y, x + 326, y + 12), f"{label} / {str(row.get('payer') or 'Unknown').title()}", size=8.5, bold=True)
         _text(page, (x + 329, y, x + 437, y + 12), _money(row.get("total_amount"), currency), size=8.5, bold=True)
-        _text(page, (x + 2, y + 12, x + 437, y + 24), cost_formula(row, disclosure.get("currency") or currency) + ("; release unconfirmed" if row.get("category") == "escrow_reserve" and row.get("reserve_release") != "maturity" else ""), size=8.5, color=MUTE)
+        treatment = "; financed in principal" if row.get("settlement") == "financed" else "; already in baseline" if row.get("coverage_treatment") == "already_in_baseline" and row.get("timing") != "closing" else "; new operating cost" if row.get("earnings_treatment") == "operating_expense" else ""
+        _text(page, (x + 2, y + 12, x + 437, y + 24), cost_formula(row, disclosure.get("currency") or currency) + treatment + ("; release unconfirmed" if row.get("category") == "escrow_reserve" and row.get("reserve_release") != "maturity" else ""), size=8.5, color=MUTE)
     if not rows:
         _text(page, (38, 420, 921, 467), "Staff confirmed no listed charges." if disclosure.get("costs_confirmed") else "No complete cost schedule is recorded. Unknown fees and reserve terms prevent a reliable net investor return.", size=11, color=MUTE)
 
@@ -587,7 +590,7 @@ def render_investor_presentation_pdf(*, intake: Any, financials: dict, generated
         ("NOI / operating income", metrics.get("annual_noi"), _record(_record(earnings.get("noi")).get("scenario")).get("plan") if plan.get("active") else None, proposed.get("noi"), lambda value: _money(value, noi_currency)),
         ("Annual EBITDA (validated P&L)", metrics.get("annual_ebitda"), _record(impact.get("ebitda")).get("annual_after") if metrics.get("annual_ebitda") is not None else None, operating_ebitda_projection(financials), _money),
         ("Coverage earnings basis", earnings_value, _record(impact.get("income_annual")).get("after"), proposed.get("earnings"), lambda value: _money(value, source_currency)),
-        ("Signed DSCR / base evidence" if cost_budget else "Signed DSCR", metrics.get("dscr"), _record(impact.get("dscr")).get("after"), proposed.get("dscr_current"), _ratio),
+        ("Signed DSCR / with new costs" if cost_budget else "Signed DSCR", metrics.get("dscr"), _record(impact.get("dscr")).get("after"), proposed.get("dscr_current"), _ratio),
         ("Monthly debt service", metrics.get("monthly_debt_service"), _record(impact.get("debt_service_monthly")).get("after"), None, _money),
     ]
     for index, (label, current, after, operating, render) in enumerate(rows):
@@ -603,7 +606,7 @@ def render_investor_presentation_pdf(*, intake: Any, financials: dict, generated
         base_fee_ratio = f"{float(fee_coverage['base_dscr']):.4f}x" if fee_coverage.get("base_dscr") is not None else "Pending evidence"
         after_fee_ratio = f"{float(fee_coverage['with_financing_fees_dscr']):.4f}x" if fee_coverage.get("with_financing_fees_dscr") is not None else "Pending evidence"
         coverage_basis = "current earnings" if cost_budget.get("current_financing_fee_coverage") else "recorded quote"
-        source_note += f". Financing-fee scenario ({coverage_basis}): base {base_fee_ratio} -> including borrower recurring charges {after_fee_ratio}; annual charges {_money(fee_coverage.get('annual_borrower_financing_fees'))}. Source NOI / EBITDA are unchanged."
+        source_note += f". Budget scenario ({coverage_basis}): before new costs {base_fee_ratio} -> with costs {after_fee_ratio}; annual finance {_money(fee_coverage.get('annual_borrower_financing_fees'))}, operating {_money(fee_coverage.get('annual_new_operating_expenses', 0))}. Source earnings are unchanged."
     else:
         source_note += ". Signed negative ratios remain losses; tax-derived earnings are not validated P&L EBITDA. " + ("Validated P&L EBITDA is unavailable. " if metrics.get("annual_ebitda") is None else "")
     _text(page, (36, 314, 925, 345), source_note + " " + _citations(report, "financials"), size=9, color=MUTE)

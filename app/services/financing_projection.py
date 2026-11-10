@@ -7,6 +7,22 @@ from app.services.deal_budget import snapshot as budget_snapshot
 from app.services.investor_collateral import snapshot
 
 
+def scenario_reference(cockpit):
+    evaluation = (cockpit.get("plan") or {}).get("evaluation") or {}
+    proposal = cockpit.get("proposed_terms") or {}
+    if not evaluation.get("active") or proposal.get("active_proposal") is False:
+        return None
+    return {"kind": "financing_scenario", "verification_status": "hypothetical_staff_proposal",
+        "gross_loan_amount": (evaluation.get("loan_terms") or {}).get("amount", proposal.get("amount")),
+        "projected_dscr_including_new_costs": evaluation.get("headline_after"),
+        "projected_annual_debt_service": evaluation.get("debt_service_after_annual"),
+        "annual_new_financing_fees": evaluation.get("annual_new_financing_fees"),
+        "annual_new_operating_expenses": evaluation.get("annual_new_operating_expenses"),
+        "deal_budget_revision": (cockpit.get("deal_budget") or {}).get("revision"),
+        "principal_requires_apply": bool((evaluation.get("principal_solution") or {}).get("requires_apply")),
+        "qualification_basis": "Historical program eligibility remains evidence-based; this proposal is not approval or a verified current financial fact."}
+
+
 def from_cockpit(profile, cockpit):
     plan = cockpit.get("plan") or {}
     impact = plan.get("impact") or {}
@@ -25,7 +41,7 @@ def from_cockpit(profile, cockpit):
     after = coverage.get("after", evaluation.get("headline_after")) if active else current_dscr
     current_service = service.get("before", (cockpit.get("debt") or {}).get("service", {}).get("monthly"))
     with_service = service.get("after", evaluation.get("debt_service_after_monthly")) if active else current_service
-    amount = record.get("new_loan_amount")
+    amount = (evaluation.get("loan_terms") or {}).get("amount", record.get("new_loan_amount"))
     # A saved cleared scenario intentionally leaves recorded terms outside
     # the plan. Do not resurrect their amount into the current controls.
     if amount is None and terms_link.get("state") != "recorded_not_in_plan":
@@ -47,6 +63,9 @@ def from_cockpit(profile, cockpit):
         "terms_deal_budget_revision": recorded.get("deal_budget_revision"),
         "deal_budget_stale": bool(recorded and recorded.get("deal_budget_revision") != budget["revision"]),
         "financing_fee_coverage": ((cockpit.get("deal_budget") or {}).get("calculation") or {}).get("financing_fee_coverage"),
+        "principal_solution": evaluation.get("principal_solution"),
+        "annual_new_operating_expenses": evaluation.get("annual_new_operating_expenses"),
+        "annual_new_financing_fees": evaluation.get("annual_new_financing_fees"),
     }
 
 

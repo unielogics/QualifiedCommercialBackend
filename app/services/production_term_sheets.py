@@ -187,6 +187,8 @@ async def _add_dscr_snapshot(
     db: AsyncSession,
     profile: ApplicationProfile,
     values: dict[str, Any],
+    budget: dict[str, Any] | None = None,
+    budget_context: dict[str, Any] | None = None,
 ) -> None:
     """Reuse the application-term DSCR evidence pipeline when it is available.
 
@@ -209,6 +211,17 @@ async def _add_dscr_snapshot(
             treatment=str(values.get("debt_service_treatment") or "additive"),
             retained_annual_debt_service=values.get("retained_annual_debt_service"),
         )
+        if budget is not None:
+            from app.services import deal_budget
+            from app.services.financial_plan_budget import apply_to_terms_calculation
+
+            terms = {**_budget_terms(values), **(budget_context or {})}
+            terms["coverage_context"] = {"income_annual": calculation.cash_flow_value,
+                "debt_service_annual": calculation.projected_annual_debt_service,
+                "new_loan_annual_debt_service": values.get("annual_debt_service"),
+                "base_dscr": calculation.dscr_after, "basis": calculation.cash_flow_label}
+            values["deal_budget_calculation"] = deal_budget.calculate(budget, terms, getattr(profile, "use_of_funds", None))
+            calculation = apply_to_terms_calculation(calculation, budget, values["deal_budget_calculation"])
         values.update(
             {
                 "dscr_before": calculation.dscr_before,
@@ -228,6 +241,16 @@ async def _add_dscr_snapshot(
                 "dscr_source": "File evidence unavailable",
             }
         )
+
+
+def _budget_terms(values):
+    kind = values.get("repayment_structure")
+    return {"amount": values.get("payment_basis_amount") or values.get("approved_amount"),
+        "rate_pct": values.get("effective_rate_pct", values.get("rate_pct")), "term_months": values.get("term_months"),
+        "structure": "interest_only" if kind in {"interest_only", "revolving_interest_only"} else "simple_interest" if kind == "simple_interest" else "amortizing",
+        "schedule_unavailable": kind in {"fixed_payment", "custom"} or bool(values.get("lender_payment_override")),
+        "interest_only_months": values.get("interest_only_months"), "repayment_config": values.get("repayment_config"),
+        "payments_per_year": values.get("payments_per_year") or 12}
 
 
 async def record_sheet(
@@ -278,7 +301,11 @@ async def record_sheet(
         structure = term_structure.calculate(body, entered_on=now.date())
     except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "term_sheet_invalid", "errors": [str(exc)]}) from exc
-    await _add_dscr_snapshot(db, profile, structure)
+    from app.services.financial_plan_budget import validate_write
+    validate_write(frozen_budget, expected_budget, _budget_terms({**body, **structure}))
+    await _add_dscr_snapshot(db, profile, structure, frozen_budget,
+        {"requested_amount": deal_budget.money(requested_amount), "proposal_use_of_funds": body.get("use_of_funds"),
+            "proposal_use_of_funds_amount": structure.get("payment_basis_amount") or body.get("approved_amount")})
     body["rate_pct"] = structure["effective_rate_pct"]
     body["monthly_debt_service"] = structure["monthly_program_coverage_amount"] if structure.get("repayment_config") is not None else structure["monthly_equivalent_payment"]
     body["debt_service_is_level_payment"] = term_structure.is_level_payment(
@@ -290,7 +317,7 @@ async def record_sheet(
     # caller-supplied snapshot in extra. Legacy sheets are left unrecorded.
     body["extra"].update(collateral_snapshot=frozen_collateral, collateral_revision=frozen_collateral["revision"])
     body["extra"].update(deal_budget_snapshot=frozen_budget, deal_budget_revision=frozen_budget["revision"],
-        deal_budget_calculation=deal_budget.calculate(frozen_budget, {"amount": structure.get("payment_basis_amount") or body.get("approved_amount"),
+        deal_budget_calculation=structure.get("deal_budget_calculation") or deal_budget.calculate(frozen_budget, {"amount": structure.get("payment_basis_amount") or body.get("approved_amount"),
             "requested_amount": deal_budget.money(requested_amount), "proposal_use_of_funds": body.get("use_of_funds"),
             "proposal_use_of_funds_amount": structure.get("payment_basis_amount") or body.get("approved_amount"),
             "rate_pct": body["rate_pct"], "term_months": body.get("term_months"),

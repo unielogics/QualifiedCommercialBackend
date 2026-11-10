@@ -160,6 +160,7 @@ class FinancialPlanWrite(BaseModel):
     and the new payment or the loan it comes from (level or interest-only)."""
 
     expected_updated_at: datetime | None = None
+    expected_deal_budget_revision: int | None = Field(default=None, ge=0)
     retire: list[str] = Field(default_factory=list, max_length=60)
     exclude: list[str] = Field(default_factory=list, max_length=60)
     new_payment_monthly: float | None = Field(default=None, ge=0)

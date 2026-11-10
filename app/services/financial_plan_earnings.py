@@ -76,10 +76,18 @@ def scenario_ebitda(ebitda, plan, evaluation, dscr, service):
             included.append({**adjustment, "status": "hypothetical_unverified"})
 
     adjustment_total = round(sum(item["amount_annual"] for item in included), 2)
-    adjusted_after = round(adjusted_base + adjustment_total, 2) if adjusted_base is not None else None
+    operating_cost = _number(evaluation.get("annual_new_operating_expenses", 0))
+    adjusted_after = round(adjusted_base + adjustment_total - operating_cost, 2) if adjusted_base is not None and operating_cost is not None else None
+    annual_after = round(annual - operating_cost, 2) if annual is not None and operating_cost is not None and (currency == "USD" or operating_cost == 0) else None
+    factor = _number(headline.get("annualization_factor"))
+    if factor is None and headline.get("months_covered") == 12:
+        factor = 1.0
+    after = round(before - operating_cost / factor, 2) if before is not None and operating_cost is not None and factor and (currency == "USD" or operating_cost == 0) else before if operating_cost == 0 else None
     adjusted_status = "unavailable" if adjusted_base is None else "hypothetical_adjusted" if included else "unchanged"
     if included:
         notes.append("Operating addbacks are staff hypotheses, not verified facts or lender-accepted adjustments. They change hypothetical Adjusted EBITDA only.")
+    if operating_cost is None or operating_cost:
+        notes.append("New recurring budget rows classified as operating expenses reduce hypothetical earnings once. Financing charges, capitalized costs and reserves do not change source EBITDA.")
     if (plan.get("overrides") or {}).get("income_annual") is not None:
         notes.append("The generic DSCR income override does not replace source EBITDA or create an EBITDA adjustment.")
     if plan.get("exclude"):
@@ -100,9 +108,10 @@ def scenario_ebitda(ebitda, plan, evaluation, dscr, service):
     reported, computed = _number(headline.get("reported_value")), _number(headline.get("computed_value"))
     reconciliation_conflict = reported is not None and computed is not None and abs(reported - computed) > 0.01
     bank_basis = next((candidate for candidate in dscr.get("candidates", []) if candidate.get("key") == "bank_cash_flow"), {})
-    return {"before": before, "after": before, "change": 0.0 if before is not None else None,
-            "value_basis": "period_ebitda", "annual_before": annual, "annual_after": annual,
-            "annual_change": 0.0 if annual is not None else None, "status": status,
+    return {"before": before, "after": after, "change": _difference(before, after),
+            "value_basis": "period_ebitda", "annual_before": annual, "annual_after": annual_after,
+            "annual_change": _difference(annual, annual_after), "status": "projected_operating_costs" if operating_cost else status,
+            "annual_new_operating_expenses": operating_cost,
             "label": "EBITDA", "after_label": "After refinance EBITDA", "source_kind": kind,
             "period": headline.get("period"), "months_covered": headline.get("months_covered"),
             "annualization_factor": headline.get("annualization_factor"), "currency": currency,
@@ -110,7 +119,7 @@ def scenario_ebitda(ebitda, plan, evaluation, dscr, service):
             "source_refs": headline.get("source_refs") or [], "baseline": headline if supported else None,
             "tax_estimate": headline if kind == "tax_estimate" else None,
             "adjusted_annual": {"before": adjusted_base, "after": adjusted_after,
-                                "change": adjustment_total if adjusted_base is not None else None,
+                                "change": round(adjustment_total - operating_cost, 2) if adjusted_base is not None and operating_cost is not None else None,
                                 "status": adjusted_status, "verified": False,
                                 "label": "Hypothetical Adjusted EBITDA (annual)", "currency": "USD" if adjusted_base is not None else None,
                                 "adjustments": included, "excluded_adjustments": excluded},

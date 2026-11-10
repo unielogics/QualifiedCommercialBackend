@@ -393,7 +393,11 @@ def evaluate_plan(
     proposed: dict[str, Any] | None,
     requested_amount: float | None,
     ebitda: dict[str, Any] | None = None,
+    financing_budget: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    from app.services.financial_plan_budget import apply_to_evaluation, solve_plan
+
+    plan, principal_solution = solve_plan(plan, financing_budget)
     retire = set(plan.get("retire") or [])
     exclude = set(plan.get("exclude") or [])
     add_backs = plan.get("add_backs") or []
@@ -736,6 +740,7 @@ def evaluate_plan(
         ),
         "cash_kept": None if replay_unknown else rows[-1]["cumulative"] if rows else 0.0,
     }
+    apply_to_evaluation(result, financing_budget, principal_solution)
     from app.services.financial_plan_earnings import scenario_ebitda
 
     result["ebitda"] = scenario_ebitda(ebitda, plan, result, dscr, service)

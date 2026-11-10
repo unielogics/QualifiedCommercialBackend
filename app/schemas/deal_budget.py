@@ -19,7 +19,9 @@ class DealCostRow(BaseModel):
     value: Annotated[Decimal, Field(ge=0, le=999_999_999_999, decimal_places=4, allow_inf_nan=False)] | None = None
     basis: Literal["loan_amount", "investor_funding", "outstanding_principal", "interest"] = "loan_amount"
     timing: Literal["closing", "monthly", "annual"] = "closing"
-    settlement: Literal["withheld", "separate"] = "separate"
+    settlement: Literal["withheld", "separate", "financed"] = "separate"
+    coverage_treatment: Literal["new_cost", "already_in_baseline"] = "new_cost"
+    earnings_treatment: Literal["financing_cost", "operating_expense"] = "financing_cost"
     enabled: bool = True
     recipient: str | None = Field(default=None, max_length=180)
     recipient_role: Literal["platform", "lender", "third_party", "escrow"] | None = None
@@ -50,6 +52,10 @@ class DealCostRow(BaseModel):
             raise ValueError("Percentage cannot exceed 100")
         if self.settlement == "withheld" and (self.payer == "sponsor" or self.payer == "investor" and self.timing == "closing"):
             raise ValueError("Sponsor costs and investor closing costs must be paid separately")
+        if self.settlement == "financed" and (self.payer != "borrower" or self.timing != "closing"):
+            raise ValueError("Only borrower one-time closing costs can be financed into principal")
+        if self.earnings_treatment == "operating_expense" and (self.timing == "closing" or self.category == "escrow_reserve"):
+            raise ValueError("Only recurring costs can be marked as operating expenses")
         if self.category == "escrow_reserve" and self.timing != "closing":
             raise ValueError("Reserves are closing held assets, not recurring fees")
         if self.legacy_field:
@@ -62,6 +68,9 @@ class DealCostRow(BaseModel):
 class DealBudgetPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_revision: int = Field(ge=0)
+    loan_amount_mode: Literal["gross_loan", "base_loan", "target_net"] = "gross_loan"
+    base_loan_amount: Money | None = None
+    target_net_amount: Money | None = None
     funding_mode: Literal["single_investor", "multiple_investors"] = "single_investor"
     investor_funding_amount: Money | None = None
     minimum_investor_contribution: Money | None = None
@@ -70,7 +79,7 @@ class DealBudgetPatch(BaseModel):
     rows: list[DealCostRow] = Field(default_factory=list, max_length=100)
     note: str | None = Field(default=None, max_length=2000)
 
-    @field_validator("investor_funding_amount", "minimum_investor_contribution", mode="before")
+    @field_validator("investor_funding_amount", "minimum_investor_contribution", "base_loan_amount", "target_net_amount", mode="before")
     @classmethod
     def not_boolean(cls, value):
         if isinstance(value, bool):
@@ -87,6 +96,9 @@ class DealBudgetPatch(BaseModel):
         for amount in (self.investor_funding_amount, self.minimum_investor_contribution):
             if amount is not None and amount <= 0:
                 raise ValueError("Funding and minimum contributions must be positive when supplied")
+        for amount in (self.base_loan_amount, self.target_net_amount):
+            if amount is not None and amount <= 0:
+                raise ValueError("Base loan and target net amounts must be positive when supplied")
         return self
 
 
@@ -103,11 +115,49 @@ class DealBudgetLoan(BaseModel):
 
 class DealBudgetPreview(DealBudgetPatch):
     loan: DealBudgetLoan | None = None
+    financial_plan: dict[str, Any] | None = None
+
+    @field_validator("financial_plan")
+    @classmethod
+    def validate_financial_plan(cls, value):
+        if value is not None:
+            from app.schemas.financial_cockpit import FinancialPlanWrite
+            return FinancialPlanWrite.model_validate(value).model_dump(mode="json", exclude_unset=True)
+        return value
+
+
+class DealBudgetTermsRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["application_term_sheet", "production_term_sheet"]
+    id: UUID
+    version: int = Field(ge=1)
+
+
+class DealBudgetApply(DealBudgetPatch):
+    expected_plan_updated_at: datetime | None
+    expected_terms_ref: DealBudgetTermsRef | None
+    idempotency_key: str = Field(min_length=8, max_length=128)
+    financial_plan: dict[str, Any] | None = None
+
+    @field_validator("expected_plan_updated_at")
+    @classmethod
+    def aware_timestamp(cls, value):
+        if value is not None and value.utcoffset() is None:
+            raise ValueError("The expected plan timestamp must include a timezone")
+        return value
+
+    @field_validator("financial_plan")
+    @classmethod
+    def validate_financial_plan(cls, value):
+        return DealBudgetPreview.validate_financial_plan(value)
 
 
 class DealBudgetRead(BaseModel):
     profile_id: UUID
     revision: int = 0
+    loan_amount_mode: Literal["gross_loan", "base_loan", "target_net"] = "gross_loan"
+    base_loan_amount: Money | None = None
+    target_net_amount: Money | None = None
     funding_mode: Literal["single_investor", "multiple_investors"] = "single_investor"
     investor_funding_amount: Money | None = None
     minimum_investor_contribution: Money | None = None
@@ -120,3 +170,6 @@ class DealBudgetRead(BaseModel):
     can_edit: bool = False
     suggested_rows: list[DealCostRow] = Field(default_factory=list)
     calculation: dict[str, Any] = Field(default_factory=dict)
+    financing_context: dict[str, Any] = Field(default_factory=dict)
+    financial_plan: dict[str, Any] | None = None
+    financial_plan_evaluation: dict[str, Any] | None = None

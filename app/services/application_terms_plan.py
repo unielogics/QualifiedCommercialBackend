@@ -27,7 +27,7 @@ async def save_combined_terms(db, profile, user, payload):
     # Stage only the submitted scenario. save_terms uses this basis for DSCR,
     # then its existing adoption service replaces the new-loan fields with the
     # accepted terms while retaining payoff selections, exclusions and addbacks.
-    record = draft.model_dump(exclude={"expected_updated_at"})
+    record = draft.model_dump(exclude={"expected_updated_at", "expected_deal_budget_revision"})
     overrides = dict(record.get("overrides") or {})
     if payload.debt_service_treatment != "refinance" and (overrides.get("debt_service_note") or "").startswith("Refinance per "):
         # Adoption clears this obsolete automatic basis too. Clear it before

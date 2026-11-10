@@ -10,13 +10,20 @@ from pydantic import ValidationError
 from app.enums import Role
 from app.routers import application_profiles as routes
 from app.schemas.deal_budget import DealBudgetPatch, DealBudgetPreview, DealCostRow
-from app.services import application_terms, deal_budget
+from app.services import application_terms, deal_budget, financial_cockpit
 from app.tests.test_atomic_client_terms_plan import baseline, combined, payload
 from app.tests.test_atomic_client_terms_plan import env as env
 
 
 def cost(**changes):
     return DealCostRow.model_validate({"id": uuid4(), "label": "Reviewed cost", "category": "closing_cost", "value": 100, **changes}).model_dump(mode="json")
+
+
+async def preview_cockpit(_db, profile):
+    """The preview now evaluates the existing payoff context as well as costs."""
+    return {"plan": {"record": deepcopy(getattr(profile, "financial_plan", None) or {})},
+        "requested_amount": (getattr(profile, "current_funding_request", None) or {}).get("requested_amount"),
+        "proposed_terms": {}, "debt": {"obligations": [], "service": {}}, "dscr": {}, "bank": {}}
 
 
 @pytest.mark.asyncio
@@ -75,7 +82,8 @@ async def test_preview_is_nonmutating_and_accepts_explicit_zero_rate():
     actor = SimpleNamespace(id=uuid4(), role=Role.LOAN_EXEC)
     db = SimpleNamespace(commit=AsyncMock())
     request = DealBudgetPreview(expected_revision=2, costs_confirmed=True, loan={"amount": 120000, "rate_pct": 0, "term_months": 12, "structure": "amortizing"})
-    with patch.object(routes.profiles, "load_profile", AsyncMock(return_value=profile)):
+    with patch.object(routes.profiles, "load_profile", AsyncMock(return_value=profile)), \
+        patch.object(financial_cockpit, "load_cockpit", AsyncMock(side_effect=preview_cockpit)):
         result = await routes.preview_application_deal_budget(profile.id, request, actor, db)
     assert result.calculation["investor_net_income"] == 0 and result.calculation["investor_net_roi_pct"] == 0
     assert profile.deal_budget == before
@@ -130,10 +138,10 @@ async def test_fixed_origination_dollars_share_cap_with_points_on_terms_saves(en
             raise HTTPException(422, "Published three-point ceiling")
     with patch("app.services.funding_programs.enforce_qc_fee_cap_for_profile", AsyncMock(side_effect=enforce)) as cap:
         with pytest.raises(HTTPException) as error:
-            await application_terms.save_terms(env.db, env.profile, env.actor, payload(amount=100000))
+            await application_terms.save_terms(env.db, env.profile, env.actor, payload(amount=100000, expected_deal_budget_revision=1))
         assert error.value.status_code == 422
         assert env.session.scalars(select(ApplicationTermSheet)).all() == []
-        saved = await application_terms.save_terms(env.db, env.profile, env.actor, payload(amount=200000))
+        saved = await application_terms.save_terms(env.db, env.profile, env.actor, payload(amount=200000, expected_deal_budget_revision=1))
     assert [float(call.args[2]) for call in cap.await_args_list] == [4, 3]
     assert saved.amount == 200000 and saved.version == 1
     unknown = deal_budget.calculate({"costs_confirmed": True, "rows": rows}, {})
@@ -167,7 +175,8 @@ async def test_partial_preview_accepts_null_io_and_unknown_custom_cadence_withou
             "interest_only_months": None, "payments_per_year": None})
     actor = SimpleNamespace(id=uuid4(), role=Role.LOAN_EXEC)
     db = SimpleNamespace(commit=AsyncMock())
-    with patch.object(routes.profiles, "load_profile", AsyncMock(return_value=profile)):
+    with patch.object(routes.profiles, "load_profile", AsyncMock(return_value=profile)), \
+        patch.object(financial_cockpit, "load_cockpit", AsyncMock(side_effect=preview_cockpit)):
         response = await routes.preview_application_deal_budget(profile.id, payload, actor, db)
     assert response.calculation["net_client_cash"] == 99900
     assert response.calculation["investor_net_roi_pct"] is None
@@ -264,7 +273,8 @@ async def test_preview_lower_loan_uses_exact_current_request_context_without_cha
     request = DealBudgetPreview(expected_revision=0, costs_confirmed=True,
         loan={"amount": 150000, "rate_pct": 10, "term_months": 12})
     actor = SimpleNamespace(id=uuid4(), role=Role.LOAN_EXEC)
-    with patch.object(routes.profiles, "load_profile", AsyncMock(return_value=profile)):
+    with patch.object(routes.profiles, "load_profile", AsyncMock(return_value=profile)), \
+        patch.object(financial_cockpit, "load_cockpit", AsyncMock(side_effect=preview_cockpit)):
         result = await routes.preview_application_deal_budget(profile.id, request, actor, SimpleNamespace())
     assert result.calculation["allocation_reconciliation"]["status"] == "different_scope"
     assert result.calculation["status"] == "ready" and vars(profile) == before

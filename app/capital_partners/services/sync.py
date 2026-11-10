@@ -95,6 +95,9 @@ def canonical_financing_fields(financials: dict[str, Any], existing: dict[str, A
     terms = financials.get("proposed_terms")
     if not isinstance(terms, dict) or terms.get("active_proposal") is False or terms.get("amount") is None:
         return {}
+    principal = terms.get("principal_solution") or {}
+    if principal.get("requires_apply") or principal and principal.get("status") != "calculated":
+        return {}
     products = [deepcopy(row) for row in existing.get("products") or [] if isinstance(row, dict)]
     old_primary = next((row for row in products if row.get("primary")), {})
     key = terms.get("program_key") or old_primary.get("program_key")

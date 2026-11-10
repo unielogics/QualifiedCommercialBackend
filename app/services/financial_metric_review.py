@@ -403,12 +403,14 @@ def redact_for_external(cockpit, actor):
 
     budget = result.get("deal_budget") or {}
     safe_budget = public_budget({"current": budget, "basis": "staff_proposal", "calculation": budget.get("calculation")}) if budget else {}
-    private_budget_keys = {"deal_budget", "deal_budget_snapshot", "deal_budget_calculation", "current_deal_budget", "current_deal_budget_calculation"}
+    private_budget_keys = {"deal_budget", "deal_budget_snapshot", "deal_budget_calculation", "current_deal_budget", "current_deal_budget_calculation", "financing_budget_calculation"}
     def remove_private_budget(value):
         if isinstance(value, dict):
             for key in list(value):
                 if key in private_budget_keys:
                     value.pop(key)
+                elif key == "principal_solution" and isinstance(value[key], dict):
+                    value[key].pop("issues", None)
                 else:
                     remove_private_budget(value[key])
         elif isinstance(value, list):
