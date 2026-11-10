@@ -222,6 +222,8 @@ async def _add_dscr_snapshot(
                 "new_loan_annual_debt_service": values.get("annual_debt_service"),
                 "base_dscr": calculation.dscr_after, "basis": calculation.cash_flow_label}
             values["deal_budget_calculation"] = deal_budget.calculate(budget, terms, getattr(profile, "use_of_funds", None))
+            if getattr(context, "operating_plan", None):
+                values["deal_budget_calculation"]["operating_plan"] = dict(context.operating_plan)
             calculation = apply_to_terms_calculation(calculation, budget, values["deal_budget_calculation"])
         values.update(
             {

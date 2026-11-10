@@ -12,6 +12,8 @@ from decimal import ROUND_HALF_UP, Decimal
 from html import escape
 from typing import Any
 
+from app.services.loan_repayment_display import schedule_cadence_label
+
 LOAN_VISUALS_CSS = """
 .loan-visuals { margin: 16px 0; }
 .loan-visuals--schedule { margin-top: 0; break-before: page; }
@@ -42,6 +44,18 @@ LOAN_VISUALS_CSS = """
 .closing-preparation tr { break-inside: avoid; }
 .closing-preparation table td { text-align: left; font-weight: normal; padding: 4px 3px; border-bottom: 1px solid #e5eaf0; vertical-align: top; overflow-wrap: anywhere; }
 .closing-preparation td:first-child { width: 25%; color: #52637a; }
+.loan-payment-phases { margin: 12px 0; break-inside: avoid; }
+.loan-payment-phases h2 { break-after: avoid; }
+.loan-phase-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.loan-phase { border: 1px solid #bfe6e2; border-radius: 9px; padding: 10px 11px; background: #f4fbfa; }
+.loan-phase .phase-title { display: block; color: #52637a; font-size: 8px; font-weight: bold; }
+.loan-phase .phase-months { display: block; color: #0f7a73; font-size: 9px; margin: 4px 0; font-weight: bold; }
+.loan-phase strong { display: block; color: #0f7a73; font-size: 18px; line-height: 1.2; margin: 5px 0; }
+.loan-phase small { display: block; color: #52637a; font-size: 8px; margin: 3px 0; }
+.loan-payment-totals { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; padding: 8px 11px; background: #f4f7fb; border-radius: 7px; }
+.loan-payment-totals span { display: block; color: #52637a; font-size: 7.5px; }
+.loan-payment-totals b { display: block; color: #0b1d3a; font-size: 12px; margin-top: 3px; }
+.loan-payment-phases p { color: #52637a; font-size: 8px; margin: 6px 0; }
 """
 
 _COLORS = ("#0f7a73", "#7694b4", "#cf8b1b", "#ad4e52")
@@ -62,6 +76,40 @@ def _cents(value: Any) -> int:
 
 def _money(value: Any) -> str:
     return "Not recorded" if value is None else f"${_number(value):,.2f}"
+
+
+def payment_phases_html(summary: dict[str, Any] | None) -> str:
+    """Show IO, later regular payments and maturity cash from one saved schedule.
+
+    Only actual canonical phase rows establish the step-up. Legacy scalar
+    payments deliberately retain their original presentation.
+    """
+    phases = summary.get("payment_phases") if isinstance(summary, dict) else None
+    if not phases or not any(phase.get("phase") == "interest_only" for phase in phases):
+        return ""
+    cadence = schedule_cadence_label(summary)
+    count = float(summary["periods_per_year"])
+    term = int(summary.get("requested_maturity_months") or summary["term_months"])
+    requested_io = int(summary.get("requested_interest_only_months") or summary.get("interest_only_months") or term)
+    cards = []
+    for index, phase in enumerate(phases, start=1):
+        io = phase["phase"] == "interest_only"
+        title = "Interest-only payments" if io else "Principal and interest payments"
+        low, high = float(phase["payment_min"]), float(phase["payment_max"])
+        amount = _money(low) if low == high else f"{_money(low)} - {_money(high)}"
+        monthly = _money(_cents(low * count / 12) / 100) if low == high else f"{_money(_cents(low * count / 12) / 100)} - {_money(_cents(high * count / 12) / 100)}"
+        start = 1 if io else requested_io + 1
+        end = min(term, requested_io if io else term, math.ceil(float(phase["end_month"]) - 1e-7))
+        timing = f"Months {start}-{end}" if start != end else f"Month {start}"
+        variable = " Regular payments vary after principal events; see the amortization report." if low != high else ""
+        detail = "Interest only; principal is not reduced by these regular payments." if io else "Regular principal and interest; extra principal is shown separately."
+        cards.append(f'<div class="loan-phase"><span class="phase-title">{index}. {title}</span><span class="phase-months">{timing}</span><strong>{amount}</strong><small>Per payment - {escape(cadence)}</small><small>{int(phase["payment_count"])} payments; {monthly} monthly equivalent.</small><small>{detail}{variable}</small></div>')
+    maturity = float(summary.get("maturity_balloon") or 0)
+    maturity_detail = "In addition to the final scheduled payment; not another recurring installment." if maturity else "No residual principal remains after the final scheduled payment."
+    cards.append(f'<div class="loan-phase"><span class="phase-title">{len(cards) + 1}. Principal at maturity</span><span class="phase-months">Month {term}</span><strong>{_money(maturity)}</strong><small>{maturity_detail}</small></div>')
+    note = "The peak 12-month figure is an underwriting cash requirement, not your regular payment. It includes regular payments, scheduled extra principal and the maturity balance once. Total repayment includes all regular payment phases and all principal due once."
+    mapping = f' {escape(str(summary["cadence_adjustment_note"]))}' if summary.get("cadence_adjustment_note") else ""
+    return '<section class="loan-payment-phases"><h2>Your payment phases</h2><div class="loan-phase-grid">' + "".join(cards) + f'</div><div class="loan-payment-totals"><div><span>Peak rolling 12-month cash due</span><b>{_money(summary.get("peak_rolling_12_month_debt_service"))}</b></div><div><span>Estimated total repayment</span><b>{_money(summary.get("total_paid"))}</b></div></div><p>{note}{mapping}</p></section>'
 
 
 def _short_money(value: float) -> str:
