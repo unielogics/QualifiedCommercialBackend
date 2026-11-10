@@ -292,12 +292,19 @@ def partner_financials(listing: CpListing) -> dict[str, Any] | None:
     terms = financials.get("proposed_terms")
     if isinstance(terms, dict) and terms.get("amount"):
         out["proposed_terms"] = partner_terms(terms)
+    if isinstance(financials.get("deal_budget"), dict):
+        from app.services.financing_budget_disclosure import public_budget
+
+        out["deal_budget"] = public_budget(financials["deal_budget"])
     if snapshot.get("refreshed_at"):
         out["refreshed_at"] = snapshot["refreshed_at"]
     return out or None
 
 
 PARTNER_TERMS_KEYS = (
+    "deal_budget_revision",
+    "current_deal_budget_revision",
+    "deal_budget_stale",
     "active_proposal",
     "program_key",
     "program_name",
@@ -336,13 +343,21 @@ PARTNER_TERMS_KEYS = (
 
 def partner_terms(terms: dict[str, Any]) -> dict[str, Any]:
     """The proposed terms a member sees: the structure, the schedule and the
-    principal at risk, key by key. No fee lives here, and none is added."""
+    principal at risk, with explicit investor-safe recorded cost disclosures."""
     result = {k: terms.get(k) for k in PARTNER_TERMS_KEYS if terms.get(k) is not None}
     # Partial/legacy schedule callers have supplied no security disclosure.
     # Do not turn that absence into a claim that collateral was disabled.
     if "collateral_snapshot" in terms or terms.get("recorded_terms_ref"):
         result["collateral"] = partner_collateral(terms.get("collateral_snapshot"),
             recorded=bool(terms.get("recorded_terms_ref")) or terms.get("source") == "term_sheet")
+    if isinstance(terms.get("deal_budget_snapshot"), dict) and terms.get("deal_budget_revision") is not None:
+        from app.services.financing_budget_disclosure import public_budget
+
+        recorded = bool(terms.get("recorded_terms_ref")) or terms.get("source") == "term_sheet"
+        result["deal_budget"] = public_budget({"recorded": terms["deal_budget_snapshot"] if recorded else {},
+            "current": {"revision": terms.get("current_deal_budget_revision")} if recorded else terms["deal_budget_snapshot"],
+            "basis": "recorded_terms" if recorded else "staff_proposal", "stale": terms.get("deal_budget_stale"),
+            "calculation": terms.get("deal_budget_calculation") or {}})
     return result
 
 
@@ -402,6 +417,15 @@ def publish_blockers(listing: CpListing) -> list[str]:
         missing.append("Restore or synchronize the working financing proposal before publishing; issued terms are a historical reference")
     if terms.get("recorded_terms_ref") and (terms.get("collateral_stale") or terms.get("terms_state") == "differs"):
         missing.append("Save an updated terms version for the changed financing or collateral before publishing")
+    budget = financials.get("deal_budget")
+    if isinstance(budget, dict):
+        if budget.get("stale") or terms.get("deal_budget_stale"):
+            missing.append("Save an updated terms version for the changed cost budget before publishing")
+        if (budget.get("calculation") or {}).get("status") != "ready":
+            missing.append("Confirm the closing cost budget, funding mode and investor charges before publishing")
+        allocation = budget.get("current_allocation_reconciliation") or (budget.get("calculation") or {}).get("allocation_reconciliation") or {}
+        if allocation.get("status") in {"overallocated", "unallocated"}:
+            missing.append("Reconcile the current use-of-funds allocations with net loan proceeds at funding before publishing")
     if terms.get("amount") is not None:
         if _d(listing.offered_amount) > _d(terms["amount"]):
             missing.append("offered_amount exceeds the canonical financing amount")

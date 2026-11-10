@@ -178,6 +178,7 @@ from app.schemas.client_application import (
     ClientApplicationPatch,
     ClientApplicationRead,
 )
+from app.schemas.deal_budget import DealBudgetPatch, DealBudgetPreview, DealBudgetRead
 from app.schemas.debt_schedule_review import (
     DebtScheduleReviewRead,
     DebtScheduleReviewResult,
@@ -917,6 +918,34 @@ async def patch_application_collateral(profile_id: UUID, payload: CollateralPatc
     return result
 
 
+@router.get("/{profile_id}/deal-budget", response_model=DealBudgetRead)
+async def get_application_deal_budget(profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> DealBudgetRead:
+    from app.services import deal_budget
+    deal_budget.require_staff(user)
+    return await deal_budget.read(db, await profiles.load_profile(db, profile_id, user), user)
+
+
+@router.patch("/{profile_id}/deal-budget", response_model=DealBudgetRead)
+async def patch_application_deal_budget(profile_id: UUID, payload: DealBudgetPatch, user: CurrentUser,
+    db: AsyncSession = Depends(get_db)) -> DealBudgetRead:
+    from app.services import deal_budget
+    deal_budget.require_staff(user)
+    result = await deal_budget.update(db, await profiles.load_profile(db, profile_id, user), payload, user)
+    await db.commit()
+    return result
+
+
+@router.post("/{profile_id}/deal-budget/preview", response_model=DealBudgetRead)
+async def preview_application_deal_budget(profile_id: UUID, payload: DealBudgetPreview, user: CurrentUser,
+    db: AsyncSession = Depends(get_db)) -> DealBudgetRead:
+    from app.services import deal_budget
+    deal_budget.require_staff(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    value = payload.model_dump(mode="json", exclude={"expected_revision", "loan"})
+    value["revision"] = payload.expected_revision
+    return await deal_budget.read(db, profile, user, budget=value, loan=payload.loan.model_dump(mode="json") if payload.loan else None)
+
+
 @router.get("/{profile_id}/funding-request", response_model=FundingRequestRead)
 async def get_application_funding_request(
     profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db),
@@ -1082,8 +1111,13 @@ async def apply_underwriting_changes(
     if "reviewer_notes" in changes:
         profile.underwriting_notes = changes["reviewer_notes"]
     if "forecast_fee_points" in changes:
+        from app.services.deal_budget import sync_legacy_write
+        await sync_legacy_write(db, profile, changes, user)
         profile.forecast_fee_points = changes["forecast_fee_points"]
     if "forecast_consulting_fee" in changes:
+        if "forecast_fee_points" not in changes:
+            from app.services.deal_budget import sync_legacy_write
+            await sync_legacy_write(db, profile, changes, user)
         profile.forecast_consulting_fee = changes["forecast_consulting_fee"]
     if "estimated_close_date" in changes:
         profile.estimated_close_date = changes["estimated_close_date"]
@@ -2575,6 +2609,8 @@ async def get_financial_plan(profile_id: UUID, user: CurrentUser, db: AsyncSessi
     """The plan on the file with its evaluation and the levers that would raise coverage."""
     profile = await profiles.load_profile(db, profile_id, user)
     cockpit = await financial_cockpit.load_cockpit(db, profile)
+    from app.services.financial_metric_review import redact_for_external
+    cockpit = redact_for_external(cockpit, user)
     return FinancialPlanRead(profile_id=profile.id, obligations=cockpit["debt"]["obligations"], **cockpit["plan"])
 
 

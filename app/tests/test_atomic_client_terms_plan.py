@@ -103,7 +103,7 @@ def env(monkeypatch):
         if index.name == "uq_application_term_sheet_current":
             index.dialect_options["sqlite"]["where"] = index.dialect_options["postgresql"]["where"]
     profiles = Table("application_profiles", metadata, Column("id", Uuid, primary_key=True),
-        Column("financial_plan", JSON), Column("investor_collateral", JSON), Column("underwriting_term_sheet_amount", Numeric),
+        Column("financial_plan", JSON), Column("investor_collateral", JSON), Column("deal_budget", JSON), Column("underwriting_term_sheet_amount", Numeric),
         Column("underwriting_current_dscr", Numeric), Column("underwriting_approved_dscr", Numeric),
         Column("underwriting_updated_by_user_id", Uuid), Column("underwriting_updated_at", DateTime(timezone=True)))
     mapper = registry()

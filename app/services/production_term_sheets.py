@@ -240,10 +240,20 @@ async def record_sheet(
 
     await lock_profile_terms(db, profile.id)
     if isinstance(db, AsyncSession):
-        await db.refresh(profile, attribute_names=["investor_collateral"])
+        await db.refresh(profile, attribute_names=["investor_collateral", "deal_budget"])
     from app.services.investor_collateral import snapshot as collateral_snapshot
 
     frozen_collateral = collateral_snapshot(profile)
+    from app.services import deal_budget
+    frozen_budget = deal_budget.snapshot(profile)
+    expected_budget = body.get("expected_deal_budget_revision")
+    if expected_budget is None:
+        expected_budget = (body.get("extra") or {}).get("expected_deal_budget_revision")
+    if expected_budget is not None and expected_budget != frozen_budget["revision"]:
+        raise HTTPException(409, "Deal costs changed. Reload before recording a new terms version.")
+    await deal_budget.enforce_origination_cap(db, profile, frozen_budget, body.get("approved_amount"))
+    from app.services.use_of_funds import source_funding_data
+    requested_amount, _request_source, _purpose, _dealer = await source_funding_data(db, profile)
     expected_collateral = body.get("expected_collateral_revision")
     if expected_collateral is None:
         expected_collateral = (body.get("extra") or {}).get("expected_collateral_revision")
@@ -279,6 +289,15 @@ async def record_sheet(
     # Security belongs to this immutable version, regardless of any stale or
     # caller-supplied snapshot in extra. Legacy sheets are left unrecorded.
     body["extra"].update(collateral_snapshot=frozen_collateral, collateral_revision=frozen_collateral["revision"])
+    body["extra"].update(deal_budget_snapshot=frozen_budget, deal_budget_revision=frozen_budget["revision"],
+        deal_budget_calculation=deal_budget.calculate(frozen_budget, {"amount": structure.get("payment_basis_amount") or body.get("approved_amount"),
+            "requested_amount": deal_budget.money(requested_amount), "proposal_use_of_funds": body.get("use_of_funds"),
+            "proposal_use_of_funds_amount": structure.get("payment_basis_amount") or body.get("approved_amount"),
+            "rate_pct": body["rate_pct"], "term_months": body.get("term_months"),
+            "structure": "interest_only" if structure.get("repayment_structure") in {"interest_only", "revolving_interest_only"} else "simple_interest" if structure.get("repayment_structure") == "simple_interest" else "amortizing",
+            "schedule_unavailable": structure.get("repayment_structure") in {"fixed_payment", "custom"} or bool(structure.get("lender_payment_override")),
+            "interest_only_months": structure.get("interest_only_months"), "repayment_config": structure.get("repayment_config"),
+            "payments_per_year": structure.get("payments_per_year") or 12}, getattr(profile, "use_of_funds", None)))
     # Validate the enriched values, not only the sparse request.  This keeps
     # every saved version internally complete even when the caller is legacy.
     validation_view = {**body, **structure}

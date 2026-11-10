@@ -192,6 +192,7 @@ class ApplicationProfile(TimestampMixin, Base):
     investor_collateral: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
+    deal_budget: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
     #: Account keys (bank + last four, as financial_cockpit names them) the desk
     #: chose to count toward the statement-months requirement and to read by
     #: default in the cockpit. Empty means every account counts.

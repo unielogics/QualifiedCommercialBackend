@@ -10,7 +10,7 @@ from sqlalchemy import select
 from app.models.bucket import BucketFileAnalysis
 from app.services import business_profile
 
-LAYOUT_VERSION = "qc.investor_report.v3.five_pages.frozen_collateral"
+LAYOUT_VERSION = "qc.investor_report.v4.five_pages.structured_deal_budget"
 PAGE_LIMIT = 5
 
 
@@ -294,10 +294,11 @@ def collateral_report(current, terms, register):
 
 
 async def build(db, intake, profile, cockpit, financials, files, context):
-    from app.services import application_profiles, investor_collateral
+    from app.services import application_profiles, deal_budget, investor_collateral
     from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
     from app.services.credit_requirement_sync import current_owner_collections
     from app.services.financial_workspace import filter_current_files
+    from app.services.financing_budget_disclosure import public_budget
     current = await filter_current_files(db, files) if getattr(profile, "primary_bucket_id", None) else []
     analyses = {}
     if current:
@@ -326,6 +327,16 @@ async def build(db, intake, profile, cockpit, financials, files, context):
     collections = await current_owner_collections(db, owners)
     credit = credit_summary(owners, collections, register)
     collateral = collateral_report(investor_collateral.stored(profile), record(financials.get("proposed_terms")), register)
+    budget = deal_budget.reporting(profile, record(financials.get("proposed_terms")))
+    financials["deal_budget"] = deepcopy(budget)
+    public_costs = public_budget(budget)
+    register.add(label="Recorded financing cost budget" if public_costs["basis"] == "recorded_terms" else "Proposed financing cost budget",
+        kind="staff_deal_budget", version_number=public_costs.get("revision"), metric_keys=["deal_budget", "terms", "use_of_funds"],
+        status="new_proposal_requires_terms_version" if public_costs["stale"] else public_costs["basis"])
+    selected_costs = record(budget.get("recorded")) if public_costs["basis"] == "recorded_terms" else record(budget.get("current"))
+    for source in sorted({str(row.get("source_ref")) for row in selected_costs.get("rows") or [] if row.get("source_ref")}):
+        register.add(label="Configured pricing source", kind="pricing_setting", source_id=source,
+            metric_keys=["deal_budget"], status="staff_reviewed_setting_reference")
     request_revision = record(getattr(profile, "current_funding_request", None)).get("revision", 0)
     use_revision = getattr(profile, "use_of_funds_revision", 0)
     register.add(label=f"Current funding request r{request_revision} and use-of-funds r{use_revision}", kind="staff_funding_request",
@@ -375,9 +386,9 @@ async def build(db, intake, profile, cockpit, financials, files, context):
             row["status"] = "alternative_source_not_added_to_baseline"
     for row in register.rows:
         row["used_for"] = list(row["metric_keys"])
-    sections = {key: [row["id"] for row in register.rows if key in row["metric_keys"]] for key in ("company", "programs", "banking", "financials", "terms", "collateral", "credit", "use_of_funds", "operating_plan")}
+    sections = {key: [row["id"] for row in register.rows if key in row["metric_keys"]] for key in ("company", "programs", "banking", "financials", "terms", "collateral", "credit", "use_of_funds", "operating_plan", "deal_budget")}
     return {"layout_version": LAYOUT_VERSION, "max_pages": PAGE_LIMIT, "company": company(intake, profile), "banking": bank,
-        "credit": credit, "collateral": collateral, "references": deepcopy(register.rows), "section_reference_ids": sections,
+        "credit": credit, "collateral": collateral, "deal_budget": public_costs, "references": deepcopy(register.rows), "section_reference_ids": sections,
         "reference_note": "The complete immutable register is retained with this generated report in the file; source originals remain access-controlled."}
 
 
@@ -392,7 +403,7 @@ def analysis_snapshot(financials):
             return re.sub(r"https?://\S*(?:X-Amz-Signature|X-Amz-Credential|AWSAccessKeyId|[?&]token=)\S*", "[access-controlled source link]", value, flags=re.I)
         return deepcopy(value)
     return freeze({key: financials.get(key) for key in ("investor_report", "current_key_metrics", "use_of_funds", "plan",
-        "proposed_terms", "operating_earnings", "tax_years", "p_and_l", "package_readiness", "package_options", "reviewed_math")})
+        "proposed_terms", "deal_budget", "operating_earnings", "tax_years", "p_and_l", "package_readiness", "package_options", "reviewed_math")})
 
 
 def reviewed_math(cockpit):

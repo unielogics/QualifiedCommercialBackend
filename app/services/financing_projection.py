@@ -3,6 +3,7 @@
 These figures describe a proposal. They never confer approval, acceptance or
 funding, and reading them does not overwrite explicit lifecycle decisions.
 """
+from app.services.deal_budget import snapshot as budget_snapshot
 from app.services.investor_collateral import snapshot
 
 
@@ -18,6 +19,7 @@ def from_cockpit(profile, cockpit):
     terms_link = plan.get("terms_link") or {}
     recorded = terms_link.get("recorded") or {}
     collateral = snapshot(profile)
+    budget = budget_snapshot(profile)
     active = bool(evaluation.get("active"))
     current_dscr = headline.get("value")
     after = coverage.get("after", evaluation.get("headline_after")) if active else current_dscr
@@ -41,6 +43,10 @@ def from_cockpit(profile, cockpit):
         "collateral_revision": collateral["revision"],
         "terms_collateral_revision": recorded.get("collateral_revision"),
         "collateral_stale": bool(recorded and recorded.get("collateral_revision") != collateral["revision"]),
+        "deal_budget_revision": budget["revision"],
+        "terms_deal_budget_revision": recorded.get("deal_budget_revision"),
+        "deal_budget_stale": bool(recorded and recorded.get("deal_budget_revision") != budget["revision"]),
+        "financing_fee_coverage": ((cockpit.get("deal_budget") or {}).get("calculation") or {}).get("financing_fee_coverage"),
     }
 
 

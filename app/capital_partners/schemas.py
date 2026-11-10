@@ -451,6 +451,43 @@ class PrefillIn(BaseModel):
     intake_id: UUID | None = None
 
 
+class ListingAIDraftIn(PrefillIn):
+    listing_id: UUID | None = None
+    expected_deal_budget_revision: int | None = Field(default=None, ge=0)
+    current_title: str | None = Field(default=None, max_length=200)
+    current_summary: str | None = Field(default=None, max_length=6000)
+    preserve_title: bool = True
+    preserve_summary: bool = True
+
+
+class ListingAIDraftFields(BaseModel):
+    name: str
+    summary: str
+    loan_amount: Decimal | None = None
+    offered_amount: Decimal | None = None
+    minimum_investment: Decimal | None = None
+    program_label: str | None = None
+    city: str | None = None
+    state: str | None = None
+
+
+class ListingAIDraftOut(BaseModel):
+    draft_id: str
+    status: Literal["ai_draft", "file_prefill"]
+    profile_id: UUID | None = None
+    loan_id: UUID | None = None
+    existing_listing: dict[str, Any] | None = None
+    draft: ListingAIDraftFields
+    source_fingerprint: str
+    deal_budget_revision: int
+    terms_ref: dict[str, Any] | None = None
+    field_provenance: list[dict[str, str]]
+    missing: list[str]
+    warnings: list[str]
+    preserved_fields: list[str]
+    budget_suggestions: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class ListingRef(BaseModel):
     id: UUID
     ref: str
@@ -553,6 +590,9 @@ class ListingIn(BaseModel):
     """Create or patch. Every field optional on patch; create needs name + vertical."""
 
     source_kind: Literal["loan", "profile", "manual"] | None = None
+    expected_deal_budget_revision: int | None = Field(default=None, ge=0)
+    expected_source_fingerprint: str | None = Field(default=None, min_length=64, max_length=64)
+    ai_draft_id: str | None = Field(default=None, max_length=80)
     loan_id: UUID | None = None
     profile_id: UUID | None = None
     vertical: Literal["real_estate", "auto", "business"] | None = None
@@ -586,6 +626,8 @@ class ListingIn(BaseModel):
 
     @model_validator(mode="after")
     def _product_slots(self):
+        if self.ai_draft_id is not None and (self.expected_deal_budget_revision is None or self.expected_source_fingerprint is None):
+            raise ValueError("Applying an AI draft requires its source fingerprint and deal budget revision")
         products = self.products or []
         canonical = sum(product.financing_source == "canonical_financing" for product in products)
         if canonical > 1 or len(products) - canonical > 8:

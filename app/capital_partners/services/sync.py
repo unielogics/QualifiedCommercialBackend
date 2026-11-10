@@ -28,6 +28,7 @@ SECTION_LABELS: dict[str, str] = {
     "plan": "The desk's plan",
     "terms": "Proposed terms",
     "collateral": "Collateral disclosure",
+    "deal_budget": "Closing costs and investor charges",
     "programs": "Programs",
     "package": "Package PDFs",
 }
@@ -80,10 +81,12 @@ def file_sections(
     }
     if isinstance(cockpit.get("collateral"), dict):
         sections["collateral"] = deepcopy(cockpit["collateral"])
+    if isinstance(cockpit.get("deal_budget"), dict):
+        sections["deal_budget"] = deepcopy(cockpit["deal_budget"])
     return sections
 
 
-def canonical_financing_fields(financials: dict[str, Any], existing: dict[str, Any]) -> dict[str, Any]:
+def canonical_financing_fields(financials: dict[str, Any], existing: dict[str, Any], *, is_new: bool = False) -> dict[str, Any]:
     """One primary loan from the saved file; alternative products stay explicit.
 
     This runs only on a staff save/refresh. It never publishes a listing and
@@ -117,12 +120,23 @@ def canonical_financing_fields(financials: dict[str, Any], existing: dict[str, A
     # financing. A full-loan offering follows changes in that total.
     if existing.get("offered_amount") is None or existing.get("offered_amount") == existing.get("loan_amount"):
         result["offered_amount"] = terms["amount"]
+    budget = financials.get("deal_budget")
+    if isinstance(budget, dict):
+        calculation = budget.get("calculation") or {}
+        reviewed = int((budget.get("current") or {}).get("revision") or 0) > 0
+        if is_new or reviewed:
+            result["offered_amount"] = calculation.get("investor_funding_amount")
+            result["minimum_investment"] = calculation.get("minimum_investor_contribution")
+        else:
+            for field in ("offered_amount", "minimum_investment"):
+                if existing.get(field) is not None:
+                    result[field] = existing[field]
     return result
 
 
 def apply_canonical_financing(listing: CpListing, fresh: dict[str, Any]) -> None:
-    existing = {key: getattr(listing, key, None) for key in ("products", "loan_amount", "offered_amount")}
-    for key, value in canonical_financing_fields(fresh.get("financials") or {}, existing).items():
+    existing = {key: getattr(listing, key, None) for key in ("products", "loan_amount", "offered_amount", "minimum_investment")}
+    for key, value in canonical_financing_fields(fresh.get("financials") or {}, existing, is_new=getattr(listing, "id", None) is None).items():
         setattr(listing, key, value)
 
 
@@ -159,11 +173,11 @@ def economic_number(value: Any) -> Any:
 def financing_changed(listing: CpListing, fresh: dict[str, Any]) -> bool:
     """Economic/security changes need a separate process once capital is held."""
     normalized = normalized_financing
-    existing = {key: getattr(listing, key, None) for key in ("products", "loan_amount", "offered_amount")}
+    existing = {key: getattr(listing, key, None) for key in ("products", "loan_amount", "offered_amount", "minimum_investment")}
     updates = canonical_financing_fields(fresh.get("financials") or {}, existing)
     if not updates:
         return False
-    for key in ("loan_amount", "offered_amount", "note_rate_pct", "term_months"):
+    for key in ("loan_amount", "offered_amount", "minimum_investment", "note_rate_pct", "term_months"):
         if key in updates and economic_number(getattr(listing, key, None)) != economic_number(updates[key]):
             return True
     primary = next((row for row in existing["products"] or [] if row.get("primary")), {})
@@ -171,7 +185,26 @@ def financing_changed(listing: CpListing, fresh: dict[str, Any]) -> bool:
         return True
     old = ((getattr(listing, "source_snapshot", None) or {}).get("financials") or {}).get("proposed_terms") or {}
     new = (fresh.get("financials") or {}).get("proposed_terms") or {}
-    return normalized(old.get("collateral_snapshot")) != normalized(new.get("collateral_snapshot"))
+    if normalized(old.get("collateral_snapshot")) != normalized(new.get("collateral_snapshot")):
+        return True
+    old_financials = (getattr(listing, "source_snapshot", None) or {}).get("financials") or {}
+    return budget_economics(old_financials.get("deal_budget")) != budget_economics((fresh.get("financials") or {}).get("deal_budget"))
+
+
+def budget_economics(value: Any) -> dict[str, Any]:
+    from app.services.financing_budget_disclosure import public_budget
+
+    if not isinstance(value, dict):
+        return {}
+    current, recorded = value.get("current") or {}, value.get("recorded") or {}
+    if not recorded and int(current.get("revision") or 0) == 0 and not current.get("costs_confirmed"):
+        return {}
+    public = public_budget(value)
+    calculation = {key: economic_number(item) if not isinstance(item, (dict, list)) else normalized_financing(item)
+        for key, item in public["calculation"].items() if key not in {"status", "financing_fee_coverage", "allocation_reconciliation", "coverage_with_costs"}}
+    rows = [{key: economic_number(item) if key in {"value", "total_amount", "closing_amount", "recurring_total"} else item
+        for key, item in row.items() if key not in {"label", "status"}} for row in public["rows"]]
+    return {"rows": rows, "calculation": calculation, "costs_confirmed": public["costs_confirmed"]}
 
 
 def fingerprints(sections: dict[str, Any]) -> dict[str, str]:

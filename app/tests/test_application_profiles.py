@@ -118,6 +118,7 @@ async def test_underwriting_write_handles_string_stage_loaded_by_the_orm() -> No
     db = SimpleNamespace(flush=AsyncMock())
 
     with (
+        patch("app.services.application_terms.lock_profile_terms", AsyncMock()),
         patch(
             "app.routers.application_profiles._sync_profile_loan_stage",
             AsyncMock(return_value=loan),
@@ -166,6 +167,7 @@ async def test_underwriting_write_uses_same_accepted_economics_fields_as_intake(
     )
 
     with (
+        patch("app.services.application_terms.lock_profile_terms", AsyncMock()),
         patch(
             "app.routers.application_profiles._sync_profile_loan_stage",
             AsyncMock(return_value=loan),

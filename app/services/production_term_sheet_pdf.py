@@ -13,6 +13,7 @@ from app.models.production_package import ProductionTermSheet
 from app.services import production_term_sheets as sheet_service
 from app.services import production_term_structure as term_structure
 from app.services.application_terms_pdf import _collateral_html
+from app.services.financing_budget_disclosure import BUDGET_CSS, frozen_budget, render_budget_html
 from app.services.loan_repayment_display import configured_structure_label, repayment_lines
 from app.services.production_arrangement import USE_OF_FUNDS_KEYS
 
@@ -124,6 +125,9 @@ def render_term_sheet_html(
     structure = sheet_service.sheet_structure(sheet)
     extra = sheet.extra if isinstance(sheet.extra, dict) else {}
     collateral_html = _collateral_html(SimpleNamespace(collateral_snapshot=extra.get("collateral_snapshot"), collateral_revision=extra.get("collateral_revision")))
+    from app.services.plan_terms_link import recorded_from_production_sheet
+
+    budget = frozen_budget(extra.get("deal_budget_snapshot"), extra.get("deal_budget_revision"), recorded_from_production_sheet(sheet), extra.get("deal_budget_calculation"))
     advanced = bool(structure.get("repayment_config"))
     advanced_lines = repayment_lines(structure.get("schedule"))
     repayment_html = (
@@ -143,7 +147,7 @@ def render_term_sheet_html(
     amount_label = "Credit limit" if facility_kind in {"revolving_loc", "heloc", "hybrid"} else "Approved amount"
     terms: list[str] = [
         _term_card(amount_label, _money(float(sheet.approved_amount))),
-        _term_card("Rate", rate, compact=True),
+        _term_card("Stated note rate", rate, compact=True),
         _term_card("Contract term", f"{int(sheet.term_months)} months"),
         _term_card("Facility", sheet.facility_type, compact=True),
         _term_card("Repayment structure", repayment_label, compact=True),
@@ -231,6 +235,7 @@ def render_term_sheet_html(
     html = f"""
 <!doctype html>
 <html><head><meta charset="utf-8"><style>
+  {BUDGET_CSS}
   @page {{ size: Letter; margin: 28px 0 44px; @bottom-right {{ content: "Page " counter(page) " of " counter(pages); color: #6d7e91; font: 8px Arial; margin: 0 32px 8px 0; }} }}
   @page:first {{ margin-top: 0; }}
   * {{ box-sizing: border-box; }}
@@ -309,6 +314,7 @@ def render_term_sheet_html(
     {f'<div class="fine"><b>Payment structure:</b> {escape(str(payment_summary))}</div>' if payment_summary else ''}
     {repayment_html}
     {collateral_html}
+    {render_budget_html(budget)}
     <h2>Estimated timing</h2>
     <div class="schedule">{schedule}</div>
     <div class="two">
