@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from app.lead_types import intake_variant_for, normalize_funding_intent
 from app.schemas.funding_program import FundingProgramVersionCreate
 from app.services import application_programs as programs
+from app.services import lender_products
 from app.services import mca_funding_policy as policy
 from app.services import requirement_collection_completion as completion
 from app.services.financial_cockpit import tax_years
@@ -119,6 +120,8 @@ def test_all_industries_get_exact_three_documents_and_separate_evidence_policy()
         assert len(documents_for(policy.PROGRAM_KEY, industry)) == 3
     assert normalize_funding_intent(policy.PROGRAM_KEY) == policy.PROGRAM_KEY
     assert intake_variant_for("main_street", policy.PROGRAM_KEY) == "main_street_v1"
+    assert lender_products.normalize_products([policy.PROGRAM_KEY, "mca_refinance"]) == [policy.PROGRAM_KEY, "mca_refinance"]
+    assert lender_products.LENDER_PRODUCT_LABELS[policy.PROGRAM_KEY] == "Merchant Cash Advance"
     assert programs._policy_key_for_profile(SimpleNamespace(vertical="main_street", funding_category=policy.PROGRAM_KEY)) == policy.EVIDENCE_POLICY_KEY
     assert programs._policy_key_for_profile(SimpleNamespace(vertical="mca", funding_category="mca_refinance")) == "mca_baseline"
     baseline = suggested_baseline(policy.PROGRAM_KEY)
