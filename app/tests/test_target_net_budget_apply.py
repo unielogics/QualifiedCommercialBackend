@@ -98,7 +98,7 @@ async def test_apply_key_cannot_be_reused_for_different_inputs_or_after_later_pl
         with pytest.raises(HTTPException) as mismatch:
             await deal_budget.apply_principal(db, profile, DealBudgetApply(**{**body, "target_net_amount": 120000}), actor)
         assert mismatch.value.status_code == 409
-        profile.financial_plan["updated_at"] = datetime.now(UTC).isoformat()
+        profile.financial_plan["updated_at"] = (datetime.fromisoformat(profile.financial_plan["updated_at"]) + timedelta(seconds=1)).isoformat()
         with pytest.raises(HTTPException) as later:
             await deal_budget.apply_principal(db, profile, DealBudgetApply(**body), actor)
         assert later.value.status_code == 409

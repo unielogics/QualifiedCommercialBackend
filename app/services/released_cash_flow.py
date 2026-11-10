@@ -18,6 +18,47 @@ def _stamp(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
 
 
+def _same_money(left, right):
+    first, second = number(left), number(right)
+    return first is not None and second is not None and round(first, 2) == round(second, 2)
+
+
+def _reconciled_retained_override(cockpit):
+    """A recorded remaining-debt amount must reconcile to this exact schedule."""
+    debt, plan = cockpit.get("debt") or {}, cockpit.get("plan") or {}
+    service, record = debt.get("service") or {}, plan.get("record") or {}
+    evaluation, link = plan.get("evaluation") or {}, plan.get("terms_link") or {}
+    recorded, adopted = link.get("recorded") or {}, record.get("terms_ref") or {}
+    retained = number((record.get("overrides") or {}).get("debt_service_monthly"))
+    if (retained is None or retained < 0 or service.get("source") != "accepted_debt_schedule"
+            or service.get("schedule_authoritative") is not True or not service.get("version_id")
+            or service.get("identity_association_conflict") or link.get("state") != "mirrored"
+            or recorded.get("kind") not in {"client_terms", "production_term_sheet"}
+            or not recorded.get("id") or not recorded.get("version")
+            or recorded.get("treatment") != "refinance"
+            or any(str(adopted.get(key)) != str(recorded.get(key)) for key in ("kind", "id", "version"))):
+        return False
+    selected = record.get("retire") or []
+    rows = debt.get("obligations") or []
+    ids = [row.get("id") for row in rows]
+    selected_ids = set(selected)
+    if (not selected or len(selected) != len(selected_ids) or any(not key for key in ids)
+            or len(ids) != len(set(ids)) or not selected_ids.issubset(ids)
+            or set(evaluation.get("retired_ids") or []) != selected_ids
+            or any(row.get("source") != "debt_schedule_row" or row.get("replay_requires_review") for row in rows)):
+        return False
+    payments = [number(row.get("monthly")) for row in rows]
+    if any(value is None or value < 0 for value in payments):
+        return False
+    total = sum(payments)
+    remaining = sum(value for row, value in zip(rows, payments, strict=True) if row["id"] not in selected_ids)
+    annual = number(service.get("annual"))
+    recorded_annual = number(recorded.get("retained_annual_debt_service"))
+    return bool(_same_money(total, service.get("monthly")) and annual is not None and _same_money(annual / 12, total)
+        and _same_money(remaining, retained) and recorded_annual is not None and _same_money(recorded_annual / 12, retained)
+        and _same_money(evaluation.get("debt_service_before_new_payment_monthly"), retained))
+
+
 def source(cockpit):
     plan = cockpit.get("plan") or {}
     record = plan.get("record") or {}
@@ -27,7 +68,12 @@ def source(cockpit):
     saved = bool(record.get("updated_at") and evaluation.get("active"))
     before = number(service.get("monthly"))
     after = number(evaluation.get("debt_service_after_regular_monthly"))
-    candidate = round(before - after, 2) if before is not None and after is not None else None
+    operating = number(evaluation.get("annual_new_operating_expenses", 0))
+    financing = number(evaluation.get("annual_new_financing_fees", 0))
+    # Regular debt service already includes the new financing-fee proxy. The
+    # separately classified operating costs reduce available cash once here.
+    candidate = round(before - after - operating / 12, 2) if before is not None and after is not None and operating is not None else None
+    reconciled = _reconciled_retained_override(cockpit)
     reasons = []
     if not saved:
         reasons.append("Save an active coverage plan before allocating its recurring released cash flow.")
@@ -37,8 +83,15 @@ def source(cockpit):
         reasons.append(str(evaluation["coverage_unavailable_reason"]))
     if earnings.get("replacement_payment_missing"):
         reasons.append("Complete the replacement loan payment before allocating debt-service relief.")
-    if earnings.get("debt_service_override_applied") or (record.get("overrides") or {}).get("debt_service_monthly") is not None:
+    if (earnings.get("debt_service_override_applied") or (record.get("overrides") or {}).get("debt_service_monthly") is not None) and not reconciled:
         reasons.append("Reconcile the hypothetical debt-service override to current obligations before allocating relief.")
+    if operating is None or operating < 0:
+        reasons.append("Reconcile the new recurring operating expenses before allocating released cash flow; unknown costs are not zero.")
+    if financing is None or financing < 0:
+        reasons.append("Reconcile the new recurring financing fees included in debt service before allocating released cash flow.")
+    principal = evaluation.get("principal_solution") or {}
+    if principal and (principal.get("status") != "calculated" or principal.get("requires_apply")):
+        reasons.append("Apply and save the current deal costs and their shared loan principal before allocating released cash flow.")
     if service.get("identity_association_conflict") or evaluation.get("retirement_replay_unknown"):
         reasons.append("Resolve the debt business association and retirement allocation before using released cash flow.")
     if service.get("currency") not in (None, "USD"):
@@ -46,16 +99,27 @@ def source(cockpit):
     if before is not None and before < 0 or after is not None and after < 0:
         reasons.append("Debt-service amounts must be nonnegative.")
     available = saved and not reasons
-    fingerprint = _stamp({"record": record, "service": service,
+    link = plan.get("terms_link") or {}
+    fingerprint = _stamp({"record": record,
+        "service": {key: service.get(key) for key in ("source", "version_id", "schedule_authoritative", "monthly", "annual", "currency", "identity_association_conflict")},
+        "retained_reconciliation": {"matched": reconciled,
+            "obligations": sorted(({key: row.get(key) for key in ("id", "source", "monthly", "balance", "replay_requires_review")}
+                for row in (cockpit.get("debt") or {}).get("obligations") or []), key=lambda row: str(row["id"])),
+            "link_state": link.get("state"), "recorded": {key: (link.get("recorded") or {}).get(key)
+                for key in ("kind", "id", "version", "treatment", "retained_annual_debt_service")}},
         "evaluation": {key: evaluation.get(key) for key in (
             "retired_ids", "debt_service_before_monthly", "debt_service_after_regular_monthly",
             "new_regular_payment_monthly", "coverage_unavailable_reason", "retirement_replay_unknown",
-            "loan_terms", "schedule")}}) if saved else None
+            "loan_terms", "schedule", "annual_new_operating_expenses", "annual_new_financing_fees",
+            "financing_budget_fingerprint", "principal_solution")}}) if saved else None
     return {"saved": saved, "available": available, "amount_monthly": max(0, candidate) if available and candidate is not None else None,
         "positive": bool(saved and candidate is not None and candidate > 0),
         "requires_reconciliation": bool(saved and not available and (record.get("retire") or evaluation.get("retired_count"))),
         "fingerprint": fingerprint, "currency": "USD", "reasons": list(dict.fromkeys(reasons)),
-        "updated_at": record.get("updated_at"), "before_monthly": before, "after_monthly": after}
+        "updated_at": record.get("updated_at"), "before_monthly": before, "after_monthly": after,
+        "new_operating_expenses_monthly": round(operating / 12, 2) if operating is not None else None,
+        "new_financing_fees_monthly": round(financing / 12, 2) if financing is not None else None,
+        "reconciled_retained_override": reconciled}
 
 
 def evaluate(body, cockpit):
@@ -94,7 +158,8 @@ def evaluate(body, cockpit):
         "currency": "USD", "source_fingerprint": current["fingerprint"], "amount_monthly": amount,
         "allocated_monthly": allocated, "unallocated_monthly": remaining, "complete": complete,
         "missing": list(dict.fromkeys(missing)), "allocations": rows,
-        "source": {key: current[key] for key in ("updated_at", "before_monthly", "after_monthly")},
+        "source": {key: current[key] for key in ("updated_at", "before_monthly", "after_monthly",
+            "new_operating_expenses_monthly", "new_financing_fees_monthly", "reconciled_retained_override")},
         "note": "Recurring cash allocation only. Debt-service relief does not increase historical earnings, EBITDA or NOI."}
 
 
