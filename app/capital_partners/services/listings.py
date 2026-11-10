@@ -257,7 +257,8 @@ def partner_operating_earnings(value: Any) -> dict[str, Any] | None:
         } if potential else None,
         "noi": {
             "definition": fields(noi.get("definition"), ("key", "label", "formula", "includes_depreciation_and_amortization")),
-            "historical": fields(noi.get("historical"), ("value", "annualized_value", "label", "kind", "period", "months_covered", "currency", "basis", "complete", "provisional")) or None,
+            "historical": fields(noi.get("historical"), ("value", "annualized_value", "label", "kind", "period", "year", "months_covered", "currency", "basis", "complete", "provisional", "staff_reviewed", "tax_derived_estimate", "source_accepted")) or None,
+            "source_historical": fields(noi.get("source_historical"), ("value", "annualized_value", "label", "kind", "period", "year", "currency", "basis", "complete", "provisional")) or None,
             "years": [fields(row, ("year", "period", "value", "annualized_value", "currency", "basis", "complete", "provisional")) for row in noi.get("years", [])],
             "trend": fields(noi.get("trend"), ("direction", "comparable", "prior_year", "current_year", "change_amount", "change_pct")),
             "scenario": fields(noi.get("scenario"), ("current", "plan", "annual_debt_service_current", "annual_debt_service_plan", "after_debt_service_current", "after_debt_service_plan")),

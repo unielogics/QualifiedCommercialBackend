@@ -33,7 +33,7 @@ def test_source_period_noi_is_not_silently_annualized_or_replaced_by_tax_income(
     data = {"current_key_metrics": {"tax_net_income": 300_000}, "operating_earnings": {
         "noi": {"historical": {"value": 12_000, "period": "2026-01-01 to 2026-03-31"}}}}
     conditions = _open_conditions(data, {}, {}, requested_amount=100_000)
-    assert any("dated six-to-twelve-month P&L" in item for item in conditions)
+    assert any("reporting period and annual NOI" in item and "Calculate / override NOI" in item for item in conditions)
     assert any("Validated P&L EBITDA is unavailable" in item for item in conditions)
     assert not any("current application request" in item for item in conditions)
     assert "300000" not in str(conditions)

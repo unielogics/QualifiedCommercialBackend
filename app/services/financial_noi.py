@@ -232,7 +232,8 @@ def preview_scenario(noi, evaluation):
 
 def build_noi(analyses, *, statement=None, entity=None, metric_review=None,
               current_annual_debt_service=None, plan_annual_debt_service=None,
-              operating_adjustments=None, source_selection=None, additional_operating_expense_annual=0):
+              operating_adjustments=None, source_selection=None, additional_operating_expense_annual=0,
+              review_state=None):
     """Build source-bound operating income without changing evidence or reviews."""
     from app.services.document_associations import identity_matches, source_excluded
     from app.services.financial_tax_earnings import tax_source_is_business
@@ -289,6 +290,14 @@ def build_noi(analyses, *, statement=None, entity=None, metric_review=None,
         if item["months_covered"] == 12:
             by_period[(item["period_start"], item["period_end"])] = item
     years = list(by_period.values())
+    from app.services import financial_noi_review
+
+    source_headline, source_reason = headline, reason
+    review = financial_noi_review.prepare(analyses, candidates, state=review_state, entity=entity)
+    if review["mode"] != "automatic":
+        headline = financial_noi_review.effective(review)
+        reason = ("Financial source evidence changed. Review and save the annual NOI basis again."
+                  if review["stale"] else None)
     annual = headline.get("annualized_value") if headline else None
     usd = bool(headline and headline.get("currency") == "USD")
     residual_comparable = usd and not headline.get("reconciliation_required") if headline else False
@@ -324,7 +333,8 @@ def build_noi(analyses, *, statement=None, entity=None, metric_review=None,
     if new_operating is None or new_operating:
         scenario_notes.append("New recurring budget rows classified as operating expenses reduce projected operating income once. Financing charges, capitalized fees and escrow do not alter historical NOI.")
     return {"definition": dict(DEFINITION), "headline": headline, "candidates": candidates, "years": years,
-            "trend": _trend(years), "reason": reason,
+            "trend": _trend(years), "reason": reason, "source_headline": source_headline,
+            "source_reason": source_reason, "review": review,
             "scenario": {"current": annual, "plan": planned, "operating_adjustments": adjustments,
                          "annual_new_operating_expenses": new_operating,
                          "annual_debt_service_current": current_debt, "annual_debt_service_plan": plan_debt,
