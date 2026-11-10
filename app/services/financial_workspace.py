@@ -37,6 +37,7 @@ from app.services import business_statement_schema as bss
 from app.services import (
     business_statements,
     financial_statements,
+    operating_plan_schema,
     pfs_schema,
     real_estate_schema,
     sheet_layout,
@@ -55,8 +56,8 @@ from app.services.financial_version_selection import (
 from app.services.loan_progress import originated_on
 
 KINDS = sheet_layout.KINDS
-CLASSIFICATIONS = {"pfs": "personal_financial_statement", "debt_schedule": "debt_schedule", "p_and_l": "current_p_and_l", "balance_sheet": "balance_sheet", "real_estate_schedule": "real_estate_schedule"}
-LABELS = {"pfs": "Personal financial statement", "debt_schedule": "Business debt schedule", "p_and_l": "Profit and loss statement", "balance_sheet": "Balance sheet", "real_estate_schedule": "Real estate schedule"}
+CLASSIFICATIONS = {"pfs": "personal_financial_statement", "debt_schedule": "debt_schedule", "p_and_l": "current_p_and_l", "balance_sheet": "balance_sheet", "real_estate_schedule": "real_estate_schedule", "operating_plan": "operating_plan"}
+LABELS = {"pfs": "Personal financial statement", "debt_schedule": "Business debt schedule", "p_and_l": "Profit and loss statement", "balance_sheet": "Balance sheet", "real_estate_schedule": "Real estate schedule", "operating_plan": "Operating expenses and earnings plan"}
 MAX_ROWS = 500
 
 
@@ -90,6 +91,8 @@ def empty_body(kind: str) -> dict:
         return bss.empty_body(kind)
     if kind == "pfs":
         return pfs_schema.empty_body()
+    if kind == "operating_plan":
+        return operating_plan_schema.empty_body()
     if kind == "real_estate_schedule":
         return real_estate_schema.empty_body()
     return {"schema_version": sheet_layout.SCHEMA_VERSIONS[kind], "business_name": "", "debts": []}
@@ -111,6 +114,8 @@ def validate_body(kind: str, raw: dict) -> dict:
     _kind(kind)
     if not isinstance(raw, dict) or len(json.dumps(raw, default=str)) > 2_000_000:
         raise HTTPException(422, "Financial form is too large")
+    if kind == "operating_plan":
+        return _json(operating_plan_schema.validate(raw))
     if kind == "real_estate_schedule":
         return _json(real_estate_schema.validate(raw))
     body = copy.deepcopy(raw)
@@ -190,6 +195,8 @@ def _present(values: Iterable[Any]) -> bool:
 def facts_for_body(kind: str, body: dict) -> dict:
     """Never turn an unfilled financial answer into an asserted zero."""
     body = active_body(kind, body)
+    if kind == "operating_plan":
+        return _json(operating_plan_schema.key_facts(body))
     if kind == "real_estate_schedule":
         return _json(real_estate_schema.key_facts(body))
     if kind == "debt_schedule":
@@ -300,6 +307,8 @@ async def _legacy_body(db: AsyncSession, profile: ApplicationProfile, kind: str,
         # schedule from a PFS or turn a property mortgage into business debt.
         return real_estate_schema.empty_body(), None
     prefill = await financial_statements.form_prefill(db, profile)
+    if kind == "operating_plan":
+        return {**operating_plan_schema.empty_body(), "business_name": prefill.get("business_name") or ""}, None
     if kind in bss.KINDS:
         return await business_statements.body_for_profile(db, profile, kind, prefill)
     if kind == "pfs":
@@ -338,6 +347,8 @@ async def _legacy_body(db: AsyncSession, profile: ApplicationProfile, kind: str,
 def _identity(kind: str, body: dict, statement: Any = None) -> dict:
     if kind == "debt_schedule":
         return {"subject": "business"}
+    if kind == "operating_plan":
+        return {"subject": body.get("business_name") or "business", **{key: body.get(key) or None for key in ("period_start", "period_end")}}
     if kind == "pfs":
         return {"subject": (body.get("applicant") or {}).get("name") or "applicant", "statement_id": str(statement.id) if statement is not None else None, "as_of": body.get("as_of") or None}
     header = body.get("header") or {}
@@ -457,6 +468,9 @@ async def create_family(db: AsyncSession, profile: ApplicationProfile, *, kind: 
     elif kind == "real_estate_schedule":
         body["owner_name"] = identity["subject"] if identity["subject"] != "business" else ""
         body["as_of"] = identity.get("as_of") or ""
+    elif kind == "operating_plan":
+        body.update({key: identity.get(key) for key in ("period_start", "period_end")})
+        body["business_name"] = identity["subject"] if identity["subject"] != "business" else ""
     elif kind in bss.KINDS:
         body["header"].update({key: value for key, value in identity.items() if key in body["header"]})
         if identity["subject"] != "business":
@@ -537,7 +551,7 @@ async def load_workspace(db: AsyncSession, profile: ApplicationProfile, *, kind:
         for cell in row["cells"]:
             if cell.get("key") in shape.by_key:
                 cell["path"] = list(shape.by_key[cell["key"]][1].path or ())
-    return {"kind": kind, "family_id": str(family.id), "label": family.label, "body": body, "schema": sheets._schema_for(kind), "worksheet": {"layout": layout, "values": sheet_layout.flatten(kind, visible), "computed": computed}, "draft": {"revision": draft.revision, "base_version_id": str(draft.base_version_id) if draft.base_version_id else None, "updated_at": draft.updated_at.isoformat(), "dirty": current is None or body_hash(body) != current.body_sha256}, "completion": debt_schedule_completion(body) if kind == "debt_schedule" else None, "accepted_completion": debt_schedule_completion(accepted.body) if accepted else None, "accepted_version_id": str(accepted.id) if accepted else None, "current_version_id": str(family.current_version_id) if family.current_version_id else None, "versions": [_version_read(version) for version in versions], "families": [{"id": str(item.id), "kind": item.kind, "label": item.label, "current_version_id": str(item.current_version_id) if item.current_version_id else None} for item in await _families(db, profile.id)], "evidence": evidence}
+    return {"kind": kind, "family_id": str(family.id), "label": family.label, "body": body, "schema": sheets._schema_for(kind), "worksheet": {"layout": layout, "values": sheet_layout.flatten(kind, visible), "computed": computed}, "draft": {"revision": draft.revision, "base_version_id": str(draft.base_version_id) if draft.base_version_id else None, "updated_at": draft.updated_at.isoformat(), "dirty": current is None or body_hash(body) != current.body_sha256}, "completion": debt_schedule_completion(body) if kind == "debt_schedule" else operating_plan_schema.completion(body) if kind == "operating_plan" else None, "accepted_completion": debt_schedule_completion(accepted.body) if accepted else None, "accepted_version_id": str(accepted.id) if accepted else None, "current_version_id": str(family.current_version_id) if family.current_version_id else None, "versions": [_version_read(version) for version in versions], "families": [{"id": str(item.id), "kind": item.kind, "label": item.label, "current_version_id": str(item.current_version_id) if item.current_version_id else None} for item in await _families(db, profile.id)], "evidence": evidence}
 
 
 def _check_revision(draft: FinancialFormDraft, expected_revision: int) -> None:
@@ -653,6 +667,10 @@ async def stage_draft(db: AsyncSession, profile: ApplicationProfile, family: Fin
             normalized_rows.append(normalized)
         body["debts"] = normalized_rows
         body["field_sources"] = sources
+    if family.kind == "operating_plan":
+        from app.services.operating_plan_service import prepare_draft
+
+        body = await prepare_draft(db, profile, incoming=body, current=draft.body, actor=actor)
     validated = validate_body(family.kind, body)
     if family.kind == "debt_schedule":
         if getattr(actor, "id", None):
@@ -678,6 +696,9 @@ async def save_draft(db: AsyncSession, profile: ApplicationProfile, *, kind: str
 
 
 async def _project(db: AsyncSession, profile: ApplicationProfile, family: FinancialFormFamily, body: dict, facts: dict, *, actor: Any, submit: bool, pdf_file_id: UUID) -> None:
+    if family.kind == "operating_plan":
+        # A proposed operating plan never overwrites historical book earnings.
+        return
     if family.kind == "real_estate_schedule":
         # Accepted facts live on this immutable version and generated analysis;
         # mortgage rows deliberately never project into dos_debts or DSCR.
@@ -770,6 +791,10 @@ def _render(kind: str, body: dict, facts: dict) -> bytes:
     from app.services import dealer_forms_pdf
 
     visible = active_body(kind, body)
+    if kind == "operating_plan":
+        from app.services.operating_plan_pdf import render_pdf
+
+        return render_pdf(body=visible, financial_totals=facts)
     if kind == "real_estate_schedule":
         return dealer_forms_pdf.render_real_estate_schedule_pdf(body=visible, financial_totals=facts)
     if kind == "pfs":
@@ -800,6 +825,19 @@ async def publish_version(db: AsyncSession, profile: ApplicationProfile, *, kind
     if profile.primary_bucket_id is None:
         raise HTTPException(409, "This file needs a document room before saving a PDF version")
     body = validate_body(kind, draft.body)
+    operating_client_submission = False
+    operating_context = None
+    if kind == "operating_plan":
+        from app.enums import Role
+        from app.schemas.earnings_improvement import empty_body as empty_operating_body
+        from app.services import earnings_improvement, operating_plan_service
+        from app.services.financial_cockpit import load_cockpit
+
+        operating_client_submission = submit and (getattr(actor, "id", None) is None or getattr(actor, "role", None) == Role.CLIENT)
+        if operating_client_submission:
+            body = operating_plan_service.protect_reviews(body, empty_operating_body())
+        body = await operating_plan_service.prepare_draft(db, profile, incoming=body, current=body, actor=actor)
+        operating_context = await load_cockpit(db, profile)
     if kind == "real_estate_schedule":
         described_properties = {row["id"] for row in real_estate_schema.properties(body)}
         missing = [f"mortgages.{row['id']}.property_row_id" for row in real_estate_schema.mortgages(body)
@@ -812,6 +850,12 @@ async def publish_version(db: AsyncSession, profile: ApplicationProfile, *, kind
     if kind == "debt_schedule":
         await validate_debt_scope(db, profile, body)
     facts = facts_for_body(kind, body)
+    if kind == "operating_plan":
+        evaluation = earnings_improvement.evaluate(body, operating_context)
+        facts["improvement_plan"] = operating_plan_service.shareable_package(evaluation, operating_context.get("operating_evidence"))
+        facts["evidence_sources"] = [{key: row.get(key) for key in ("file_id", "file_name", "classification")}
+                                     for row in (operating_context.get("operating_evidence") or {}).get("files", [])]
+        facts["proposal_status"] = "client_submitted" if operating_client_submission else "staff_saved"
     versions = list((await db.execute(select(FinancialFormVersion).where(FinancialFormVersion.family_id == family.id))).scalars().all())
     if kind == "debt_schedule":
         completion = debt_schedule_completion(body)
@@ -852,7 +896,7 @@ async def publish_version(db: AsyncSession, profile: ApplicationProfile, *, kind
     file = BucketFile(id=file_id, bucket_id=profile.primary_bucket_id, requested_document_id=slot.id if slot and filed else None, file_name=f"{family.label} - v{number} - {stamp.strftime('%Y-%m-%d')}.pdf"[:255], s3_key=key, content_type="application/pdf", size_bytes=len(pdf), uploaded_by_name=getattr(actor, "name", None), uploaded_by_email=getattr(actor, "email", None), status="uploaded", content_hash=pdf_sha, source_kind="drafted_form", source_detail=f"financial_version:{version_id}")
     db.add(file)
     await db.flush()
-    version = FinancialFormVersion(id=version_id, family_id=family.id, version_number=number, schema_version=sheet_layout.SCHEMA_VERSIONS[kind], body=body, key_facts=facts, body_sha256=body_hash(body), pdf_sha256=pdf_sha, source="form", status="filed" if filed else "published", parent_version_id=family.current_version_id, pdf_file_id=file_id, idempotency_key=idempotency_key, actor_user_id=getattr(actor, "id", None), actor_name=getattr(actor, "name", None) or getattr(actor, "email", None), created_at=stamp)
+    version = FinancialFormVersion(id=version_id, family_id=family.id, version_number=number, schema_version=sheet_layout.SCHEMA_VERSIONS[kind], body=body, key_facts=facts, body_sha256=body_hash(body), pdf_sha256=pdf_sha, source="form", status="client_submitted" if operating_client_submission else "filed" if filed else "published", parent_version_id=family.current_version_id, pdf_file_id=file_id, idempotency_key=idempotency_key, actor_user_id=getattr(actor, "id", None), actor_name=getattr(actor, "name", None) or getattr(actor, "email", None), created_at=stamp)
     db.add(version)
     await db.flush()
     db.add(BucketFileAnalysis(bucket_file_id=file_id, bucket_id=profile.primary_bucket_id, content_hash=pdf_sha, analysis_version=CURRENT_FILE_ANALYSIS_VERSION, provider="drafted_form", status="completed", classification=CLASSIFICATIONS[kind], confidence="high", summary=f"{family.label} v{number}, saved {stamp.isoformat()}", analysis={"key_facts": facts, "financial_version": {"family_id": str(family.id), "version_id": str(version_id), "version_number": number}}, analyzed_at=stamp))
@@ -1515,6 +1559,8 @@ def _import_read(row: FinancialFormImport, kind: str, current_body: dict | None 
 
 async def propose_import(db: AsyncSession, profile: ApplicationProfile, *, kind: str, file_id: UUID, family_id: UUID | None = None, actor: Any = None, analysis: BucketFileAnalysis | None = None, extract_full: bool = True) -> dict:
     _kind(kind)
+    if kind == "operating_plan":
+        raise HTTPException(422, "Complete the operating expenses and earnings plan online; link supporting documents to its rows")
     file = await db.get(BucketFile, file_id)
     if file is None or file.bucket_id != profile.primary_bucket_id or file.deleted_at is not None or file.status != "uploaded":
         raise HTTPException(404, "Financial source file not found")

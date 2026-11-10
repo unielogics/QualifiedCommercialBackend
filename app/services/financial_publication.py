@@ -120,6 +120,17 @@ async def current_version_context(db: AsyncSession, *, profile_id: UUID | None =
             continue
         item = {"kind": family.kind, "family_id": str(family.id), "label": family.label, "version_id": str(version.id), "version_number": version.version_number, "saved_at": version.created_at.isoformat(), "source_file_id": str(version.pdf_file_id or version.source_file_id), "key_facts": version.key_facts}
         item["original_source_file_id"] = str(version.source_file_id) if version.source_file_id else None
+        if family.kind == "operating_plan":
+            from copy import deepcopy
+
+            from app.schemas.earnings_improvement import REVIEW_FIELDS
+
+            facts = deepcopy(version.key_facts or {})
+            for action in (facts.get("operating_plan") or {}).get("adjustments", []):
+                for key in REVIEW_FIELDS:
+                    action.pop(key, None)
+            item.update(key_facts=facts, authoritative=False, proposal_status=version.status,
+                financial_fact_policy="Operating disclosure and conditional improvements; never historical earnings or current program qualification.")
         if family.kind == "debt_schedule":
             item["authoritative"] = is_accepted_debt_schedule_version(version)
             item["completion"] = debt_schedule_completion(getattr(version, "body", None))

@@ -44,7 +44,7 @@ from decimal import Decimal
 from typing import Any
 
 from app.services import business_statement_schema as bss
-from app.services import pfs_schema, real_estate_schema
+from app.services import operating_plan_schema, pfs_schema, real_estate_schema
 from app.services.debt_terms import PAYMENT_FREQUENCIES, normalize_terms
 from app.services.debt_types import DEBT_TYPE_SLUGS, DEBT_TYPES
 from app.services.financial_statements import DEBT_COLUMN_LABELS, DEBT_COLUMNS
@@ -55,7 +55,7 @@ LAYOUT_VERSION = "qc_sheets.v1"
 #: The debt schedule has no schema module of its own; the version travels here.
 DEBT_SCHEMA_VERSION = "qc_ds.v2"
 
-KINDS: tuple[str, ...] = ("p_and_l", "balance_sheet", "debt_schedule", "pfs", "real_estate_schedule")
+KINDS: tuple[str, ...] = ("p_and_l", "balance_sheet", "debt_schedule", "pfs", "real_estate_schedule", "operating_plan")
 
 SHEET_TITLES: dict[str, str] = {
     "p_and_l": "Profit and Loss",
@@ -63,6 +63,7 @@ SHEET_TITLES: dict[str, str] = {
     "debt_schedule": "Business Debt Schedule",
     "pfs": "Personal Financial Statement",
     "real_estate_schedule": "Real Estate Schedule",
+    "operating_plan": "Operating Plan",
 }
 
 NAME_PREFIX: dict[str, str] = {
@@ -71,6 +72,7 @@ NAME_PREFIX: dict[str, str] = {
     "debt_schedule": "ds",
     "pfs": "pfs",
     "real_estate_schedule": "res",
+    "operating_plan": "op",
 }
 
 SCHEMA_VERSIONS: dict[str, str] = {
@@ -79,6 +81,7 @@ SCHEMA_VERSIONS: dict[str, str] = {
     "debt_schedule": DEBT_SCHEMA_VERSION,
     "pfs": pfs_schema.SCHEMA_VERSION,
     "real_estate_schedule": real_estate_schema.SCHEMA_VERSION,
+    "operating_plan": operating_plan_schema.SCHEMA_VERSION,
 }
 
 #: Rows in the debt-schedule grid. The owner's template had fifteen.
@@ -834,6 +837,32 @@ def _real_estate_schedule(per: Mapping[str, Sequence[str]]) -> Sheet:
     return _sheet("real_estate_schedule", columns, rows.rows, freeze=(0, 1))
 
 
+
+def _operating_plan(per: Mapping[str, Sequence[str]]) -> Sheet:
+    rows = _Rows()
+    rows.heading("Operating Expenses and Earnings Plan")
+    for spec in operating_plan_schema.HEADER:
+        boolean = spec["input"] == "boolean"
+        rows.field(spec["key"], spec["label"], (spec["key"],), input="select" if boolean else spec["input"], options=("true", "false") if boolean else spec.get("options"))
+    for block, specs in operating_plan_schema.COLLECTIONS.items():
+        rows.heading("Operating expense disclosure" if block == "expenses" else "Proposed earnings adjustments")
+        rows.r += 1
+        rows._add(Row(rows.r, "colhead", block=block, cells=tuple(_label(index, spec["label"]) for index, spec in enumerate(specs, 1))))
+        for ordinal, row_key in enumerate(per[block], 1):
+            rows.r += 1
+            cells = tuple(Cell(c=index, type="select" if spec["input"] == "boolean" else spec["input"], key=f"{block}.{row_key}.{spec['key']}", xlsx_name=f"{block}.r{ordinal}.{spec['key']}", editable=True,
+                               format="money" if spec["input"] == "money" else "date" if spec["input"] == "date" else "text",
+                               options=("true", "false") if spec["input"] == "boolean" else tuple(spec["options"]) if spec.get("options") else None,
+                               path=(block, row_key, spec["key"])) for index, spec in enumerate(specs, 1))
+            rows._add(Row(rows.r, "data", cells=cells, block=block, row_key=row_key, ordinal=ordinal))
+    for block, key, label in (("expenses", "disclosed_expense_rows", "Disclosed expense rows"), ("adjustments", "adjustment_rows", "Proposed adjustment rows")):
+        refs = ",".join("{" + f"{block}.{row_key}.label" + "}" for row_key in per[block])
+        rows.formula(key, label, f"=COUNTA({refs})" if refs else "=0", compute=key, format="count")
+    rows.note("Disclosures and proposed changes do not overwrite historical P&L, NOI, EBITDA or current qualification. Staff must review earnings improvements and supporting evidence.")
+    columns = tuple(Column(index, "", 24 if index == 1 else 18) for index in range(1, max(len(specs) for specs in operating_plan_schema.COLLECTIONS.values()) + 1))
+    return _sheet("operating_plan", columns, rows.rows, freeze=(0, 1))
+
+
 def layout(
     kind: str,
     *,
@@ -847,6 +876,9 @@ def layout(
     ids — the grid). `schedule_rows` may be one count for every schedule or a
     mapping by schedule key; a schedule left out gets PFS_SCHEDULE_ROWS.
     """
+    if kind == "operating_plan":
+        per = {block: _row_keys(schedule_rows.get(block, 2) if isinstance(schedule_rows, Mapping) else 2 if schedule_rows is None else schedule_rows) for block in operating_plan_schema.COLLECTIONS}
+        return _operating_plan(per)
     if kind in bss.KINDS:
         return _p_and_l() if kind == "p_and_l" else _balance_sheet()
     if kind == "debt_schedule":
@@ -879,6 +911,8 @@ def _list_row_key(row: Any, ordinal: int) -> str:
 def layout_for_body(kind: str, body: Mapping[str, Any] | None) -> Sheet:
     """The layout whose list rows are the body's rows, keyed by identity."""
     body = body or {}
+    if kind == "operating_plan":
+        return layout(kind, schedule_rows={block: [_list_row_key(row, n) for n, row in enumerate(body.get(block) or [], 1)] for block in operating_plan_schema.COLLECTIONS})
     if kind == "real_estate_schedule":
         sheet = layout(kind, schedule_rows={block: [_list_row_key(row, n) for n, row in enumerate(body.get(block) or [], 1)] for block in real_estate_schema.COLLECTIONS})
         addresses = {_list_row_key(row, n): str(row.get("address") or "").strip()[:160] for n, row in enumerate(body.get("properties") or [], 1)}
@@ -934,6 +968,8 @@ def debt_totals(body: Mapping[str, Any] | None) -> dict[str, Decimal]:
 def totals(kind: str, body: Mapping[str, Any] | None) -> dict[str, Any]:
     """The computed values of one kind, by the schema that owns it."""
     body = dict(body or {})
+    if kind == "operating_plan":
+        return operating_plan_schema.totals(body)
     if kind in bss.KINDS:
         return bss.totals(kind, body)
     if kind == "pfs":
@@ -990,7 +1026,7 @@ def _get(body: Mapping[str, Any], path: tuple[str, ...]) -> Any:
 def _is_row_step(path: tuple[str, ...], index: int) -> bool:
     """Whether path[index] is a row key inside a list — `debts.<row>.<col>`
     and `schedules.<schedule>.<row>.<col>` are the two list-shaped paths."""
-    if path[0] in {"debts", "properties", "mortgages"}:
+    if path[0] in {"debts", "properties", "mortgages", "expenses", "adjustments"}:
         return index == 1
     return path[0] == "schedules" and index == 2
 
@@ -1046,6 +1082,10 @@ def _path_for_key(kind: str, key: str) -> tuple[str, ...]:
     static = layout(kind).by_key.get(key)
     if static is not None and static[1].path is not None:
         return static[1].path
+    if kind == "operating_plan":
+        parts = key.split(".")
+        if len(parts) == 3 and parts[0] in operating_plan_schema.COLLECTIONS and parts[2] in {spec["key"] for spec in operating_plan_schema.COLLECTIONS[parts[0]]}:
+            return tuple(parts)
     if kind == "real_estate_schedule":
         parts = key.split(".")
         if len(parts) == 3 and parts[0] in real_estate_schema.COLLECTIONS and parts[2] in {spec["key"] for spec in real_estate_schema.COLLECTIONS[parts[0]]}:

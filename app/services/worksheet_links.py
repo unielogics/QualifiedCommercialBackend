@@ -63,7 +63,7 @@ LINK_KIND = "worksheet"
 #: The workbook's four sheets in tab order. Duplicated from `sheet_layout.KINDS`
 #: rather than imported at module scope so this module stays importable without
 #: the grid service; `_ordered` checks against it.
-SHEET_KINDS: tuple[str, ...] = ("p_and_l", "balance_sheet", "debt_schedule", "pfs", "real_estate_schedule")
+SHEET_KINDS: tuple[str, ...] = ("p_and_l", "balance_sheet", "debt_schedule", "pfs", "real_estate_schedule", "operating_plan")
 
 _PIN_MAX_ATTEMPTS = 5
 _PIN_LOCKOUT = timedelta(minutes=15)

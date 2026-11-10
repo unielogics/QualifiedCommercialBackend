@@ -89,6 +89,7 @@ SLUGS: dict[str, str] = {
     "business-debt-schedule": "debt_schedule",
     "personal-financial-statement": "pfs",
     "real-estate-schedule": "real_estate_schedule",
+    "operating-expenses-earnings-plan": "operating_plan",
 }
 
 #: The fifth download: all four forms as four tabs of one workbook, in this
@@ -116,6 +117,7 @@ ATTACHMENT_FILENAMES: dict[str, str] = {
     "debt_schedule": "Qualified Commercial - Business Debt Schedule.xlsx",
     "pfs": "Qualified Commercial - Personal Financial Statement.xlsx",
     "real_estate_schedule": "Qualified Commercial - Real Estate Schedule.xlsx",
+    "operating_plan": "Qualified Commercial - Operating Expenses and Earnings Plan.xlsx",
 }
 
 MONEY_FORMAT = '#,##0.00;(#,##0.00);"-"'
@@ -177,7 +179,7 @@ class _Form:
         self.prefix = sheet.name_prefix
         self.row = 0
         self.cells: dict[str, int] = {}
-        self.keys_beside_inputs = sheet.kind not in {"debt_schedule", "real_estate_schedule"}
+        self.keys_beside_inputs = sheet.kind not in {"debt_schedule", "real_estate_schedule", "operating_plan"}
         self.monthly_equivalent_column = len(sheet.columns) + 1 if sheet.kind == "debt_schedule" else None
         self.key_column = 3 if self.keys_beside_inputs else len(sheet.columns) + 2
         self.last_column = self.monthly_equivalent_column or max(column.c for column in sheet.columns)
@@ -615,7 +617,7 @@ def workbook_for_slug(slug: str) -> tuple[str, bytes] | None:
 
 def schema_keys(kind: str) -> list[str]:
     """Every key the workbook of this kind must carry a defined name for."""
-    if kind == "real_estate_schedule":
+    if kind in {"real_estate_schedule", "operating_plan"}:
         return list(sheet_layout.layout(kind).by_xlsx_name)
     if kind in bss.KINDS:
         schema = bss.SCHEMA_FOR[kind]

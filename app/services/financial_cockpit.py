@@ -3066,6 +3066,15 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
         profile_id=str(profile.id), association_owner=document_associations.owner_context(profile),
     )
     cockpit["profile_id"] = str(profile.id)
+    from app.services import operating_plan_evidence, operating_plan_service
+    from app.services.financial_workspace import filter_current_files, source_files_for_profile
+    from app.services.merchant_processing import current_offer
+
+    supporting_files = await filter_current_files(db, await source_files_for_profile(db, profile))
+    cockpit["operating_evidence"] = operating_plan_evidence.build_evidence(
+        analyses, cockpit, files=supporting_files, offer=await current_offer(db, profile.id))
+    cockpit["operating_evidence"]["business_name"] = expected_entity
+    cockpit["operating_plan"] = await operating_plan_service.published_context(db, profile, cockpit)
     if superseded_payoffs:
         cockpit["notes"].append("A linked payoff letter has a newer or unavailable document version. Review its latest amount and date, then save the schedule before using that payoff in a refinance plan.")
     return cockpit

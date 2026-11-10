@@ -117,6 +117,7 @@ EXPECTED_CLASSIFICATIONS: dict[str, set[str]] = {
     "business_debt_schedule": {"debt_schedule"},
     "owner_personal_financial_statement": {"personal_financial_statement"},
     "real_estate_schedule": {"real_estate_schedule"},
+    "operating_expenses_and_earnings_plan": {"operating_plan"},
     "property_debt_evidence": {"collateral_debt_evidence", "payoff_or_mortgage_statement"},
     "entity_or_vesting": {"entity_or_vesting"},
     "signed_credit_authorization": {"identity", "credit_authorization"},
@@ -306,6 +307,7 @@ _FORM_KIND_BY_CLASSIFICATION = {
     "current_p_and_l": "p_and_l",
     "balance_sheet": "balance_sheet",
     "real_estate_schedule": "real_estate_schedule",
+    "operating_plan": "operating_plan",
 }
 
 
@@ -1750,7 +1752,7 @@ async def _requested_document(
             return None
     collection_config = getattr(requirement, "collection_config", None) or {}
     form_kind = collection_config.get("form_kind") if getattr(requirement, "requirement_kind", None) == "form" else None
-    request_category = {"pfs": "Personal Financials", "debt_schedule": "Debts", "p_and_l": "Financials", "balance_sheet": "Financials", "real_estate_schedule": "Real estate"}.get(form_kind, requirement.category)
+    request_category = {"pfs": "Personal Financials", "debt_schedule": "Debts", "p_and_l": "Financials", "balance_sheet": "Financials", "real_estate_schedule": "Real estate", "operating_plan": "Financials"}.get(form_kind, requirement.category)
     requested = (
         await db.execute(
             select(BucketRequestedDocument)
@@ -1768,7 +1770,7 @@ async def _requested_document(
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    if requested is None and form_kind in {"pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule"}:
+    if requested is None and form_kind in {"pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule", "operating_plan"}:
         from app.routers.application_profiles import _requested_slot
         requested = await _requested_slot(db, profile, form_kind)
     if requested is None and not collection_config.get("file_request_id"):
@@ -3329,6 +3331,9 @@ async def _materialize_requirements(
         if (getattr(requirement, "canonical_key", None) or key) == "real_estate_schedule":
             definition_metadata = {**definition_metadata, "requirement_kind": "form",
                 "collection_config": {**definition_metadata["collection_config"], "form_kind": "real_estate_schedule", "document_type": "real_estate_schedule"}}
+        if (getattr(requirement, "canonical_key", None) or key) == "operating_expenses_and_earnings_plan":
+            definition_metadata = {**definition_metadata, "requirement_kind": "form",
+                "collection_config": {**definition_metadata["collection_config"], "form_kind": "operating_plan", "document_type": "operating_plan"}}
         staff_added = extra_by_key.get(key)
         if staff_added is not None and requirement_library.STAFF_POLICY_KEY in source_policies:
             definition_metadata = {

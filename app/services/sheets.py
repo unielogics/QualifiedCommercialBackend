@@ -67,6 +67,7 @@ from app.services import business_statement_schema as bss
 from app.services import (
     business_statements,
     financial_statements,
+    operating_plan_schema,
     pfs_schema,
     real_estate_schema,
     sheet_layout,
@@ -195,6 +196,8 @@ def _layout_for(
     delete as one fewer instead of being rounded back up to the floor.
     """
     body = body or {}
+    if kind == "operating_plan":
+        return sheet_layout.layout(kind, schedule_rows={block: _row_keys([row for row in body.get(block) or [] if not row.get("excluded")], 0 if exact == block else BLANK_SCHEDULE_ROWS) for block in operating_plan_schema.COLLECTIONS})
     if kind == "real_estate_schedule":
         return sheet_layout.layout(kind, schedule_rows={block: _row_keys(body.get(block) or [], 0 if exact == block else BLANK_SCHEDULE_ROWS) for block in real_estate_schema.COLLECTIONS})
     if kind == "debt_schedule":
@@ -305,6 +308,8 @@ def _schema_for(kind: str) -> dict[str, Any]:
         return bss.describe(kind)
     if kind == "pfs":
         return pfs_schema.describe()
+    if kind == "operating_plan":
+        return operating_plan_schema.describe()
     if kind == "real_estate_schedule":
         return real_estate_schema.describe()
     return {"kind": "debt_schedule", "columns": list(financial_statements.DEBT_COLUMNS)}
@@ -800,7 +805,7 @@ async def refresh_touched_pdfs(
     from app.services import drafted_forms
 
     for kind in dict.fromkeys(kinds):
-        if kind not in KINDS or kind == "real_estate_schedule":
+        if kind not in KINDS or kind in {"real_estate_schedule", "operating_plan"}:
             continue
         try:
             await drafted_forms.enqueue_form_refresh(
@@ -946,7 +951,7 @@ async def apply_row_op(
     picture of the sheet came from a read.
     """
     _kind_or_400(kind)
-    if kind not in ("debt_schedule", "pfs", "real_estate_schedule"):
+    if kind not in ("debt_schedule", "pfs", "real_estate_schedule", "operating_plan"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "This sheet has a fixed row list")
     if op not in ("insert", "delete"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown row operation")
@@ -976,15 +981,19 @@ async def apply_row_op(
             event["data"]["family_id"] = loaded.workspace["family_id"]
         return event
 
-    if kind == "real_estate_schedule":
-        if block not in real_estate_schema.COLLECTIONS:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Choose properties or mortgages")
+    if kind in {"real_estate_schedule", "operating_plan"}:
+        collections = operating_plan_schema.COLLECTIONS if kind == "operating_plan" else real_estate_schema.COLLECTIONS
+        if block not in collections:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Choose expenses or adjustments" if kind == "operating_plan" else "Choose properties or mortgages")
         body = dict(loaded.body)
         rows = _as_seen(list(body.get(block) or []), minimum=BLANK_SCHEDULE_ROWS, origin=origin, visible=visible)
         fresh = _blank_line(origin) if op == "insert" else None
-        rows = _apply_rows(rows, op=op, row_id=row_id, after=after, blank=fresh)
+        if kind == "operating_plan" and op == "delete" and any(str(row.get("id")) == str(row_id) for row in body.get(block) or []):
+            rows = [{**row, "excluded": True} if str(row.get("id")) == str(row_id) else row for row in rows]
+        else:
+            rows = _apply_rows(rows, op=op, row_id=row_id, after=after, blank=fresh)
         body[block] = rows
-        if block == "properties" and op == "delete":
+        if kind == "real_estate_schedule" and block == "properties" and op == "delete":
             remaining = {str(row.get("id")) for row in rows}
             body["mortgages"] = [row for row in body.get("mortgages") or [] if not row.get("property_row_id") or str(row["property_row_id"]) in remaining]
         saved = await _save_kind(db, profile, kind, loaded, body, origin=origin, actor_user_id=actor_user_id)

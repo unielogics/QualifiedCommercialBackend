@@ -72,7 +72,7 @@ WORKSHEET_PERMISSION = "edit"
 
 #: The single-form kinds the chat can mint on their own. The P&L and balance
 #: sheet are asked for as one requirement and opened as one worksheet link.
-FORM_KINDS: tuple[str, ...] = ("pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule")
+FORM_KINDS: tuple[str, ...] = ("pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule", "operating_plan")
 
 _FORM_LABEL = {
     "pfs": "personal financial statement",
@@ -80,6 +80,7 @@ _FORM_LABEL = {
     "p_and_l": "profit and loss statement",
     "balance_sheet": "balance sheet",
     "real_estate_schedule": "real estate schedule",
+    "operating_plan": "operating expenses and earnings plan",
 }
 
 #: Which sheets each actionable requirement opens when the borrower chooses to
@@ -90,6 +91,7 @@ COMPLETE_NOW_TARGETS: dict[str, tuple[str, tuple[str, ...]]] = {
     "business_debt_schedule": ("debt_schedule", ()),
     "ytd_p_and_l_balance_sheet": ("worksheet", ("p_and_l", "balance_sheet")),
     "real_estate_schedule": ("real_estate_schedule", ()),
+    "operating_expenses_and_earnings_plan": ("operating_plan", ()),
 }
 
 def _base_url() -> str:
@@ -116,7 +118,7 @@ def target_for(action_type: str, requirement_key: str | None) -> tuple[str, tupl
     chat's earlier link for the other.
     """
     if action_type == "open_worksheet":
-        return ("worksheet", tuple(kind for kind in sheets_service.KINDS if kind != "real_estate_schedule"))
+        return ("worksheet", tuple(sheets_service.DEFAULT_KINDS))
     if action_type == "complete_now":
         return COMPLETE_NOW_TARGETS.get(requirement_key or "")
     return None
@@ -148,6 +150,10 @@ async def mint_form_link(
 
     statement_id: uuid.UUID | None = None
     real_estate_workspace = None
+    if kind == "operating_plan":
+        from app.services.operating_plan_forms import ensure_workspace
+
+        real_estate_workspace = await ensure_workspace(db, profile)
     if kind == "real_estate_schedule":
         from app.services.real_estate_forms import ensure_workspace
 

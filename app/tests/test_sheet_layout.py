@@ -17,7 +17,7 @@ from openpyxl.utils import get_column_letter
 
 from app.services import business_statement_schema as bss
 from app.services import financial_templates_xlsx as templates
-from app.services import pfs_schema
+from app.services import operating_plan_schema, pfs_schema
 from app.services import sheet_layout as sl
 from app.services.bucket_ai import MAX_SPREADSHEET_ROWS
 from app.services.financial_statements import DEBT_COLUMN_LABELS, DEBT_COLUMNS
@@ -34,6 +34,8 @@ def _empty_body(kind):
         return bss.empty_body(kind)
     if kind == "pfs":
         return pfs_schema.empty_body()
+    if kind == "operating_plan":
+        return operating_plan_schema.empty_body()
     return {"debts": []}
 
 
