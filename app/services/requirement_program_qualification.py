@@ -77,6 +77,13 @@ def for_definitions(state, definitions, *, profile=None, owners=None, pulls=None
         return {"status": "not_required", "blocking": False, "reasons": [], "checks": []}
     if state.status in {"waived", "not_applicable"} and getattr(state, "verified_by_user_id", None) is not None:
         return {"status": "not_required", "blocking": False, "reasons": [], "checks": checks}
+    budget = metadata.get("use_of_funds_collection")
+    if isinstance(budget, dict) and (metadata.get("use_of_funds_program_review") or {}).get("fingerprint") != budget.get("fingerprint"):
+        # A shared proceeds row may carry checks for several programs. An old
+        # per-check document assessment cannot bypass a changed allocation.
+        return {"status": "pending", "blocking": any(check.get("severity", "block") == "block" for check in checks),
+                "reasons": ["Review this program's permitted uses against the current allocation and funding request."],
+                "checks": checks}
     if _check_ids(checks) == _check_ids(original_checks) or (
         original.get("status") == "met" and _check_ids(checks).issubset(_check_ids(original_checks))
     ):
