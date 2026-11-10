@@ -186,6 +186,7 @@ class DscrContext:
     current_annual_debt_service: float | None
     real_estate_carrying_costs: float | None
     source: str
+    operating_plan: dict[str, Any] | None = None
 
 
 async def _cockpit_context(db: AsyncSession, profile: ApplicationProfile) -> DscrContext | None:
@@ -231,6 +232,9 @@ async def _cockpit_context(db: AsyncSession, profile: ApplicationProfile) -> Dsc
         current_annual_debt_service=round(float(existing_monthly) * 12, 2) if existing_monthly is not None else None,
         real_estate_carrying_costs=None,
         source=source,
+        operating_plan={key: evaluation["operating_plan"].get(key) for key in (
+            "source", "version_id", "version_number", "baseline_annual", "annual_impact", "applied_annual_impact", "basis")}
+        if (evaluation.get("operating_plan") or {}).get("applied") else None,
     )
 
 
@@ -736,6 +740,8 @@ async def save_terms(
             "new_loan_annual_debt_service": annual, "base_dscr": calc.dscr_after, "basis": calc.cash_flow_label}}
     validate_write(budget, payload.expected_deal_budget_revision, budget_terms)
     budget_calculation = deal_budget.calculate(budget, budget_terms, getattr(profile, "use_of_funds", None))
+    if getattr(context, "operating_plan", None):
+        budget_calculation["operating_plan"] = dict(context.operating_plan)
     calc = apply_to_terms_calculation(calc, budget, budget_calculation)
     now = datetime.now(UTC)
     if current is not None:

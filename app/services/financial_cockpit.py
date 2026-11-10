@@ -2534,7 +2534,7 @@ def financing_preview(cockpit: dict[str, Any], plan_dict: dict[str, Any], budget
         recurring=bank.get("recurring") or {}, months=bank.get("months") or [],
         dscr=cockpit.get("dscr") or {}, service=debt.get("service") or {},
         proposed=(cockpit.get("dscr") or {}).get("proposed"), requested_amount=cockpit.get("requested_amount"),
-        ebitda=cockpit.get("ebitda"), financing_budget=budget)
+        ebitda=cockpit.get("ebitda"), financing_budget=budget, operating_plan=cockpit.get("operating_plan"))
     from app.services.financial_noi import preview_scenario
     from app.services.financial_plan_budget import profit_projection
     result["noi_scenario"] = preview_scenario(cockpit.get("noi") or {}, result)
@@ -3140,6 +3140,11 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
         analyses, cockpit, files=supporting_files, offer=await current_offer(db, profile.id))
     cockpit["operating_evidence"]["business_name"] = expected_entity
     cockpit["operating_plan"] = await operating_plan_service.published_context(db, profile, cockpit)
+    from app.services.deal_budget import snapshot as operating_budget_snapshot
+    from app.services.financial_plan_operating import refresh_cockpit
+
+    if cockpit["operating_plan"].get("available"):
+        refresh_cockpit(cockpit, operating_budget_snapshot(profile))
     from app.services.investor_collateral import snapshot as collateral_snapshot
 
     current_collateral = collateral_snapshot(profile)

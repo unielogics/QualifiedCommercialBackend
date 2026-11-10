@@ -217,6 +217,7 @@ def preview_scenario(noi, evaluation):
     from copy import deepcopy
 
     scenario = deepcopy(noi.get("scenario") or {})
+    scenario.pop("operating_plan", None)
     headline = noi.get("headline") or {}
     current, operating = number(scenario.get("current")), number(evaluation.get("annual_new_operating_expenses", 0))
     comparable = headline.get("currency") == "USD" and headline.get("complete") and not headline.get("provisional") and not headline.get("reconciliation_required")
@@ -224,9 +225,14 @@ def preview_scenario(noi, evaluation):
         if row.get("kind") in {"owner_salary", "one_time_expense", "rent_to_owner"} and row.get("status") == "hypothetical_unverified"] if comparable else []
     total = sum(number(row.get("amount_annual")) or 0 for row in adjustments)
     planned = round(current + total - operating, 2) if current is not None and operating is not None and (headline.get("currency") == "USD" or total == operating == 0) else None
+    operating_plan = evaluation.get("operating_plan") or {}
+    if operating_plan.get("applied") and operating_plan.get("noi_eligible") and comparable and planned is not None:
+        planned = round(planned + (number(operating_plan.get("applied_annual_impact")) or 0), 2)
     debt = number(evaluation.get("debt_service_after_annual"))
     scenario.update(plan=planned, operating_adjustments=deepcopy(adjustments), annual_new_operating_expenses=operating,
         annual_debt_service_plan=debt, after_debt_service_plan=round(planned - debt, 2) if comparable and planned is not None and debt is not None else None)
+    if operating_plan.get("applied"):
+        scenario["operating_plan"] = deepcopy(operating_plan)
     return scenario
 
 

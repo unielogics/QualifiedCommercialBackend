@@ -75,7 +75,8 @@ def coverage_context(evaluation):
         "debt_service_annual": evaluation.get("debt_service_after_annual_before_financing_fees", evaluation.get("debt_service_after_annual")),
         "new_loan_annual_debt_service": evaluation.get("new_payment_monthly") * 12 if evaluation.get("new_payment_monthly") is not None else None,
         "base_dscr": evaluation.get("headline_after_before_budget", evaluation.get("headline_after")),
-        "basis": evaluation.get("headline_key")}
+        "basis": evaluation.get("headline_key"),
+        "operating_plan": deepcopy(evaluation.get("operating_plan"))}
 
 
 def apply_to_evaluation(result, budget, principal_solution=None):

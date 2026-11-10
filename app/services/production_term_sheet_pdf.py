@@ -18,6 +18,7 @@ from app.services.loan_repayment_display import configured_structure_label, repa
 from app.services.loan_terms_visuals import (
     LOAN_VISUALS_CSS,
     closing_preparation_html,
+    payment_phases_html,
     schedule_visuals_html,
 )
 from app.services.production_arrangement import USE_OF_FUNDS_KEYS
@@ -164,6 +165,8 @@ def render_term_sheet_html(
     from app.services.plan_terms_link import recorded_from_production_sheet
 
     budget = frozen_budget(extra.get("deal_budget_snapshot"), extra.get("deal_budget_revision"), recorded_from_production_sheet(sheet), extra.get("deal_budget_calculation"))
+    visual_summary = _visual_schedule(structure)
+    phases_html = payment_phases_html(visual_summary)
     advanced = bool(structure.get("repayment_config"))
     advanced_lines = repayment_lines(structure.get("schedule"))
     repayment_html = (
@@ -204,12 +207,12 @@ def render_term_sheet_html(
         terms.append(_term_card("Payment basis", _money(float(basis))))
     if structure.get("draw_period_months") is not None:
         terms.append(_term_card("Draw period", f"{int(structure['draw_period_months'])} months"))
-    if int(structure.get("interest_only_months") or 0) > 0:
+    if int(structure.get("interest_only_months") or 0) > 0 and not phases_html:
         terms.append(_term_card("Interest-only period", f"{int(structure['interest_only_months'])} months"))
-    if structure.get("amortization_months") is not None:
+    if structure.get("amortization_months") is not None and not phases_html:
         terms.append(_term_card("Amortization", f"{int(structure['amortization_months'])} months"))
     balloon = float(structure.get("balloon_amount") or 0)
-    if balloon > 0:
+    if balloon > 0 and not phases_html:
         terms.append(_term_card("Balloon due at maturity", _money(balloon)))
     coverage_amount = structure.get("monthly_program_coverage_amount")
     if coverage_amount is not None:
@@ -241,6 +244,11 @@ def render_term_sheet_html(
         if structure.get("post_io_payment") is not None
         else float(structure["monthly_equivalent_payment"] if structure.get("monthly_equivalent_payment") is not None else sheet.monthly_debt_service)
     )
+    payment_html = phases_html or f'''<div class="payment">
+      <div class="primary"><span class="label">{escape(periodic_label)}</span><strong>{_money(float(structure.get("periodic_payment") or 0))}</strong></div>
+      <div><span class="label">{escape(payment_middle_label)}</span><strong>{_money(payment_middle_value)}</strong></div>
+      <div><span class="label">{annual_label}</span><strong>{_money(float(structure.get("annual_debt_service") or 0))}</strong></div>
+    </div>'''
     payment_summary = term_structure.payment_summary_text(structure)
     prepared_for = client_name or business_name
     date_rows = (
@@ -344,14 +352,10 @@ def render_term_sheet_html(
     </div>
     <h2>Proposed facility</h2>
     <div class="terms-grid">{term_cards}</div>
-    <div class="payment">
-      <div class="primary"><span class="label">{escape(periodic_label)}</span><strong>{_money(float(structure.get("periodic_payment") or 0))}</strong></div>
-      <div><span class="label">{escape(payment_middle_label)}</span><strong>{_money(payment_middle_value)}</strong></div>
-      <div><span class="label">{annual_label}</span><strong>{_money(float(structure.get("annual_debt_service") or 0))}</strong></div>
-    </div>
+    {payment_html}
     {f'<div class="fine"><b>Payment structure:</b> {escape(str(payment_summary))}</div>' if payment_summary else ''}
     {repayment_html}
-    {schedule_visuals_html(_visual_schedule(structure))}
+    {schedule_visuals_html(visual_summary)}
     {collateral_html}
     {render_budget_html(budget)}
     {closing_preparation_html(version=sheet.version, prepared=_date(sheet.entered_at), expires=_date(structure.get("expires_on")) if structure.get("expires_on") else None, collateral_revision=extra.get("collateral_revision"), budget_revision=extra.get("deal_budget_revision"), collateral_snapshot=extra.get("collateral_snapshot"), budget=budget, conditions=_condition_lines(sheet.conditions))}
