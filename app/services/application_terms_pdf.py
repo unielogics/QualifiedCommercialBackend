@@ -84,6 +84,41 @@ def filename_for(row: ApplicationTermSheet, business_name: str) -> str:
     return f"{safe or 'Client'}-Financing-Terms-v{row.version}.pdf"
 
 
+def _collateral_html(row: ApplicationTermSheet) -> str:
+    """Historical terms disclose only the collateral frozen on that version."""
+    snapshot = getattr(row, "collateral_snapshot", None)
+    revision = getattr(row, "collateral_revision", None)
+    if not isinstance(snapshot, dict) or revision is None:
+        return '<section class="collateral"><h2>Collateral</h2><p>No collateral schedule was recorded with this terms version. Refer to executed security documents; current file disclosures do not amend these terms.</p></section>'
+    if not snapshot.get("enabled"):
+        return '<section class="collateral"><h2>Collateral</h2><p>No collateral schedule is included in this terms version. This does not confirm an unsecured facility or establish that no assets exist.</p></section>'
+    rows = []
+    properties = snapshot.get("properties") or []
+    assets = snapshot.get("assets") or []
+    for item in [*properties, *assets]:
+        if not isinstance(item, dict):
+            continue
+        address = item.get("address") if isinstance(item.get("address"), dict) else {}
+        label = ", ".join(str(address.get(key)) for key in ("street", "city", "state", "postal_code") if address.get(key))
+        if not label:
+            label = str(item.get("description") or "Asset description not recorded")
+        kind = "Real estate" if address else str(item.get("asset_type") or "Other asset").replace("_", " ").title()
+        currency = str(item.get("currency") or "Currency unconfirmed")
+        def money(key, source=item, unit=currency):
+            value = source.get(key)
+            return "Not supplied" if value is None else f"{float(value):,.2f} {escape(unit)}"
+        detail = [f"Declared value: {money('estimated_value')}", f"Existing liens: {money('existing_liens_total')}",
+            f"Declared available lien: {money('available_lien_amount')}",
+            f"Proposed lien position: {escape(str(item.get('proposed_lien_position') or 'Unconfirmed'))}",
+            f"Valuation date: {escape(str(item.get('valuation_date') or 'Not supplied'))}"]
+        if item.get("owner_name"):
+            detail.append(f"Declared owner: {escape(str(item['owner_name']))}")
+        evidence = len(item.get("source_file_ids") or [])
+        detail.append(f"{evidence} supporting file{'s' if evidence != 1 else ''} linked in the originating file")
+        rows.append(f'<tr><td><b>{escape(kind)}</b><br>{escape(label)}</td><td>{"<br>".join(detail)}</td></tr>')
+    return f'<section class="collateral"><h2>Proposed collateral - recorded revision {revision}</h2><table>{"".join(rows)}</table><p>Staff-disclosed values and available lien amounts are unverified. Security is subject to ownership, valuation, title, priority, documentation and funding-source review. This schedule is not an approved borrowing base.</p></section>'
+
+
 def render_terms_html(
     row: ApplicationTermSheet,
     *,
@@ -127,6 +162,7 @@ def render_terms_html(
   @page:first {{ margin-top: 0; }}
   * {{ box-sizing: border-box; }}
   body {{ margin: 0; color: #13233d; font-family: Arial, Helvetica, sans-serif; font-size: 10px; line-height: 1.45; background: white; }}
+  .watermark {{ position: fixed; top: 44%; left: 13%; transform: rotate(-32deg); color: rgba(11,29,58,.055); font-size: 70px; font-weight: 800; letter-spacing: .12em; z-index: -1; }}
   .hero {{ background: #0b1d3a; color: white; padding: 25px 34px 23px; min-height: 158px; }}
   .brand-row {{ display: flex; align-items: center; justify-content: space-between; gap: 28px; }}
   .brand-lockup {{ display: flex; align-items: center; gap: 11px; }}
@@ -166,10 +202,18 @@ def render_terms_html(
   ul {{ margin: 5px 0 0; padding-left: 16px; }} li {{ margin: 0 0 4px; }}
   .repayment {{ border: 1px solid #dce3ec; border-radius: 9px; padding: 10px 12px; margin-bottom: 15px; }}
   .repayment li {{ break-inside: avoid; overflow-wrap: anywhere; }}
+  .collateral {{ border: 1px solid #dce3ec; border-radius: 9px; padding: 10px 12px; margin-bottom: 15px; break-inside: avoid; }}
+  .collateral h2 {{ break-after: avoid; }}
+  .collateral table {{ border-collapse: collapse; width: 100%; font-size: 9px; }}
+  .collateral tr {{ break-inside: avoid; }}
+  .collateral td {{ padding: 7px; border-bottom: 1px solid #dce3ec; vertical-align: top; overflow-wrap: anywhere; }}
+  .collateral td:first-child {{ width: 43%; }}
+  .collateral p {{ color: #52637a; font-size: 8px; }}
   .client-note {{ border-left: 3px solid #0f7a73; background: #f6f9fc; padding: 9px 11px; margin: 12px 0; color: #31445e; }}
   .fine {{ border-top: 1px solid #dce3ec; margin-top: 16px; padding-top: 10px; color: #718096; font-size: 7.6px; line-height: 1.55; }}
   .fine b {{ color: #41546e; }}
 </style></head><body>
+  <div class="watermark">CONFIDENTIAL</div>
   <header class="hero">
     <div class="brand-row">{_brand_html(row)}</div>
     <div class="eyebrow">{status_label} · Version {row.version}</div>
@@ -205,6 +249,7 @@ def render_terms_html(
       <div class="dscr-card after"><span class="label">After acceptance</span><strong>{_ratio(float(row.dscr_after) if row.dscr_after is not None else None)}</strong><p>Projected with the proposed repayment schedule.</p></div>
     </div>
     <p class="method">{escape(row.dscr_explanation)} {escape(dscr_treatment)} Source: {escape(row.dscr_source)}.</p>
+    {_collateral_html(row)}
     {note_html}
     <div class="two">
       <section class="card"><h2>Conditions</h2><ul>{conditions_html}</ul></section>

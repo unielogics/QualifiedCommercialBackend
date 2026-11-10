@@ -32,6 +32,7 @@ class LoanTypeOption(BaseModel):
 
 class ClientTermsWrite(BaseModel):
     expected_version: int = Field(ge=0)
+    expected_collateral_revision: int | None = Field(default=None, ge=0)
     loan_type: str = Field(min_length=2, max_length=64)
     amount: float = Field(gt=0, le=1_000_000_000)
     apr_pct: float = Field(ge=0, le=100)
@@ -187,6 +188,11 @@ class ClientTermsRead(BaseModel):
     #: with the plan, and whether the plan's loan mirrors these terms.
     plan: dict[str, Any] | None = None
     financial_plan: FinancialPlanRead | None = None
+    collateral_snapshot: dict[str, Any] = Field(default_factory=dict)
+    collateral_revision: int | None = None
+    current_collateral: dict[str, Any] = Field(default_factory=dict)
+    current_collateral_revision: int = 0
+    collateral_stale: bool = False
 
 
 class ClientTermsEmailRequest(BaseModel):

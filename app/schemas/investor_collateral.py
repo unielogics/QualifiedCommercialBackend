@@ -1,7 +1,7 @@
 """Staff-disclosed security offered for this file, separate from asset ownership."""
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -44,18 +44,48 @@ class CollateralProperty(BaseModel):
         return list(dict.fromkeys(value))
 
 
+class CollateralAsset(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: UUID
+    asset_type: Literal["equipment", "vehicle", "inventory", "receivables", "cash", "securities", "other"]
+    description: str = Field(min_length=1, max_length=300)
+    owner_name: str | None = Field(default=None, max_length=180)
+    estimated_value: Amount | None = None
+    existing_liens_total: Amount | None = None
+    available_lien_amount: Amount | None = None
+    proposed_lien_position: int | None = Field(default=None, ge=1, le=10)
+    valuation_date: date | None = None
+    currency: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
+    notes: str | None = Field(default=None, max_length=2000)
+    source_file_ids: list[UUID] = Field(default_factory=list, max_length=20)
+
+    @field_validator("description")
+    @classmethod
+    def description_required(cls, value):
+        if not value.strip():
+            raise ValueError("Describe the proposed asset")
+        return value.strip()
+
+    @field_validator("source_file_ids")
+    @classmethod
+    def distinct_sources(cls, value):
+        return list(dict.fromkeys(value))
+
+
 class CollateralPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_revision: int = Field(ge=0)
     enabled: bool
     properties: list[CollateralProperty] = Field(default_factory=list, max_length=100)
+    assets: list[CollateralAsset] = Field(default_factory=list, max_length=100)
 
     @model_validator(mode="after")
     def validate_properties(self):
-        if len({row.id for row in self.properties}) != len(self.properties):
-            raise ValueError("Collateral properties require distinct row IDs")
-        if self.enabled and not self.properties:
-            raise ValueError("Add a property before including real estate collateral")
+        rows = [*self.properties, *self.assets]
+        if len({row.id for row in rows}) != len(rows):
+            raise ValueError("Collateral requires distinct row IDs")
+        if self.enabled and not rows:
+            raise ValueError("Add a property or asset before including collateral")
         if self.enabled and any(not all((row.address.street, row.address.city, row.address.state, row.address.postal_code)) for row in self.properties):
             raise ValueError("Enter the complete property address, including city, state and postal code")
         return self
@@ -65,6 +95,7 @@ class CollateralRead(BaseModel):
     profile_id: UUID
     enabled: bool = False
     properties: list[CollateralProperty] = Field(default_factory=list)
+    assets: list[CollateralAsset] = Field(default_factory=list)
     revision: int = 0
     updated_at: datetime | None = None
     updated_by_user_id: UUID | None = None

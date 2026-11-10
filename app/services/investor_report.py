@@ -10,7 +10,7 @@ from sqlalchemy import select
 from app.models.bucket import BucketFileAnalysis
 from app.services import business_profile
 
-LAYOUT_VERSION = "qc.investor_report.v2.five_pages"
+LAYOUT_VERSION = "qc.investor_report.v3.five_pages.frozen_collateral"
 PAGE_LIMIT = 5
 
 
@@ -247,6 +247,52 @@ def _link_refs(value, register, section):
             _link_refs(row, register, section)
 
 
+def collateral_report(current, terms, register):
+    """Show the offered version; later disclosures remain identifiable proposals."""
+    current, terms = record(current), record(terms)
+    has_terms = terms.get("source") == "term_sheet" or bool(terms.get("recorded_terms_ref"))
+    recorded_revision = terms.get("collateral_revision") if has_terms else None
+    raw = record(terms.get("collateral_snapshot")) if has_terms else current
+    # Legacy terms did not freeze security: the present-day schedule cannot
+    # retroactively become collateral offered on that historical document.
+    unrecorded = has_terms and recorded_revision is None
+    stale = bool(terms.get("collateral_stale")) or (has_terms and recorded_revision != current.get("revision", 0))
+    result = {"enabled": bool(raw.get("enabled")) and not unrecorded,
+        "revision": raw.get("revision", recorded_revision if has_terms else 0),
+        "recorded_revision": recorded_revision, "current_revision": current.get("revision", 0),
+        "basis": "unrecorded_terms" if unrecorded else "recorded_terms" if has_terms else "staff_proposal",
+        "active_proposal": terms.get("active_proposal") is not False,
+        "terms_stale": stale, "properties": [], "assets": [],
+        "note": "Staff-disclosed collateral; ownership, valuation, priority and available lending capacity are unverified.",
+        "current_proposal": deepcopy(current) if stale else None}
+    if result["enabled"]:
+        for group in ("properties", "assets"):
+            for row in raw.get(group) or []:
+                if not isinstance(row, dict):
+                    continue
+                address = record(row.get("address"))
+                result[group].append({"id": row.get("id"),
+                    "address": safe_text(", ".join(str(address.get(key)) for key in ("street", "city", "state", "postal_code") if address.get(key))),
+                    "address_fields": deepcopy(address), "real_estate_property_id": row.get("real_estate_property_id"),
+                    "description": safe_text(row.get("description")), "asset_type": safe_text(row.get("asset_type")),
+                    "owner_name": safe_text(row.get("owner_name")), "property_type": safe_text(row.get("property_type")),
+                    "value": number(row.get("estimated_value")), "existing_liens": number(row.get("existing_liens_total")),
+                    "available_lien_amount": number(row.get("available_lien_amount")), "lien_position": row.get("proposed_lien_position"),
+                    "valuation_date": row.get("valuation_date"), "currency": row.get("currency"), "notes": safe_text(row.get("notes")),
+                    "source_ids": [ref for file_id in row.get("source_file_ids") or [] if (ref := register.use(file_id, "collateral"))]})
+    register.add(label="Collateral recorded with financing terms" if has_terms else "Staff proposed collateral disclosure",
+        kind="staff_collateral_disclosure", version_number=result["revision"],
+        period=str(raw.get("updated_at") or "")[:10] or None, metric_keys=["collateral"],
+        status="unrecorded_terms_collateral" if unrecorded else "staff_declared_unverified")
+    if stale:
+        register.add(label="New collateral proposal - updated terms version required", kind="staff_collateral_proposal",
+            version_number=current.get("revision", 0), metric_keys=["collateral"], status="not_recorded_in_financing_terms")
+        for row in [*(current.get("properties") or []), *(current.get("assets") or [])]:
+            for file_id in row.get("source_file_ids") or []:
+                register.use(file_id, "collateral")
+    return result
+
+
 async def build(db, intake, profile, cockpit, financials, files, context):
     from app.services import application_profiles, investor_collateral
     from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
@@ -279,21 +325,7 @@ async def build(db, intake, profile, cockpit, financials, files, context):
     owners = await application_profiles.owner_rows(db, profile) if getattr(profile, "primary_bucket_id", None) else []
     collections = await current_owner_collections(db, owners)
     credit = credit_summary(owners, collections, register)
-    raw_collateral = investor_collateral.stored(profile)
-    collateral = {"enabled": raw_collateral.get("enabled", False), "revision": raw_collateral.get("revision", 0), "properties": [],
-        "note": "Staff-disclosed proposed collateral. Title, valuation, priority and available lending capacity are unverified."}
-    if collateral["enabled"]:
-        for row in raw_collateral.get("properties") or []:
-            address = record(row.get("address"))
-            collateral["properties"].append({"address": ", ".join(str(address.get(key)) for key in ("street", "city", "state", "postal_code") if address.get(key)),
-                "id": row.get("id"), "address_fields": deepcopy(address), "real_estate_property_id": row.get("real_estate_property_id"),
-                "owner_name": safe_text(row.get("owner_name")), "property_type": safe_text(row.get("property_type")),
-                "value": number(row.get("estimated_value")), "existing_liens": number(row.get("existing_liens_total")),
-                "available_lien_amount": number(row.get("available_lien_amount")), "lien_position": row.get("proposed_lien_position"),
-                "valuation_date": row.get("valuation_date"), "currency": row.get("currency"), "notes": safe_text(row.get("notes")),
-                "source_ids": [ref for file_id in row.get("source_file_ids") or [] if (ref := register.use(file_id, "collateral"))]})
-    register.add(label="Staff proposed collateral disclosure", kind="staff_collateral_disclosure", version_number=collateral["revision"],
-        period=str(raw_collateral.get("updated_at") or "")[:10] or None, metric_keys=["collateral"], status="staff_declared_unverified")
+    collateral = collateral_report(investor_collateral.stored(profile), record(financials.get("proposed_terms")), register)
     request_revision = record(getattr(profile, "current_funding_request", None)).get("revision", 0)
     use_revision = getattr(profile, "use_of_funds_revision", 0)
     register.add(label=f"Current funding request r{request_revision} and use-of-funds r{use_revision}", kind="staff_funding_request",
@@ -411,7 +443,8 @@ def analysis_notes(snapshot):
     for item in record(snapshot.get("package_readiness")).get("requirements") or []:
         if item.get("effectively_open"):
             rows.append({"section": "Open evidence condition", "label": safe_text(item.get("label") or item.get("requirement_key")), "text": safe_text(item.get("state_reason") or item.get("status") or "Evidence remains open")})
-    for item in record(record(snapshot.get("investor_report")).get("collateral")).get("properties") or []:
+    collateral = record(record(snapshot.get("investor_report")).get("collateral"))
+    for item in [*(collateral.get("properties") or []), *(collateral.get("assets") or [])]:
         if item.get("notes"):
-            rows.append({"section": "Collateral disclosure", "label": safe_text(item.get("address")), "text": safe_text(item["notes"])})
+            rows.append({"section": "Collateral disclosure", "label": safe_text(item.get("address") or item.get("description")), "text": safe_text(item["notes"])})
     return rows

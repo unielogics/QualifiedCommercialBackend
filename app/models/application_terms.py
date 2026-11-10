@@ -109,6 +109,10 @@ class ApplicationTermSheet(TimestampMixin, Base):
     sponsor_name: Mapped[str | None] = mapped_column(String(160))
     client_note: Mapped[str | None] = mapped_column(Text)
     conditions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default="[]")
+    # Every term version carries its own security disclosure. Empty legacy
+    # snapshots mean "not recorded", never permission to borrow today's data.
+    collateral_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    collateral_revision: Mapped[int | None] = mapped_column(Integer)
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )

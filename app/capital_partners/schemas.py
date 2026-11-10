@@ -475,6 +475,7 @@ class ListingProductIn(BaseModel):
     """One product offered on a listing: a program with suggested amount, rate and term."""
 
     program_key: str | None = Field(default=None, max_length=80)
+    financing_source: Literal["canonical_financing"] | None = None
     label: str = Field(min_length=1, max_length=120)
     amount: Decimal | None = Field(default=None, ge=0)
     rate_pct: Decimal | None = Field(default=None, ge=0, le=100)
@@ -581,7 +582,15 @@ class ListingIn(BaseModel):
     maturity_date: date | None = None
     closes_at: datetime | None = None
     source_snapshot: dict[str, Any] | None = None
-    products: list[ListingProductIn] | None = Field(default=None, max_length=8)
+    products: list[ListingProductIn] | None = Field(default=None, max_length=9)
+
+    @model_validator(mode="after")
+    def _product_slots(self):
+        products = self.products or []
+        canonical = sum(product.financing_source == "canonical_financing" for product in products)
+        if canonical > 1 or len(products) - canonical > 8:
+            raise ValueError("Keep one synchronized financing product and at most eight explicit alternatives")
+        return self
 
 
 class ListingEventOut(_Out):

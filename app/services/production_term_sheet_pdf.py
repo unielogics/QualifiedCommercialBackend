@@ -6,11 +6,13 @@ import unicodedata
 from datetime import date, datetime
 from html import escape
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from app.models.production_package import ProductionTermSheet
 from app.services import production_term_sheets as sheet_service
 from app.services import production_term_structure as term_structure
+from app.services.application_terms_pdf import _collateral_html
 from app.services.loan_repayment_display import configured_structure_label, repayment_lines
 from app.services.production_arrangement import USE_OF_FUNDS_KEYS
 
@@ -120,6 +122,8 @@ def render_term_sheet_html(
     internal underwriting commentary. Only the client-facing conditions print.
     """
     structure = sheet_service.sheet_structure(sheet)
+    extra = sheet.extra if isinstance(sheet.extra, dict) else {}
+    collateral_html = _collateral_html(SimpleNamespace(collateral_snapshot=extra.get("collateral_snapshot"), collateral_revision=extra.get("collateral_revision")))
     advanced = bool(structure.get("repayment_config"))
     advanced_lines = repayment_lines(structure.get("schedule"))
     repayment_html = (
@@ -231,6 +235,14 @@ def render_term_sheet_html(
   @page:first {{ margin-top: 0; }}
   * {{ box-sizing: border-box; }}
   body {{ margin: 0; color: #14243c; font-family: Arial, Helvetica, sans-serif; font-size: 10px; line-height: 1.42; background: white; }}
+  .watermark {{ position: fixed; top: 44%; left: 13%; transform: rotate(-32deg); color: rgba(11,29,58,.055); font-size: 70px; font-weight: 800; letter-spacing: .12em; z-index: -1; }}
+  .collateral {{ border: 1px solid #dce3ec; border-radius: 9px; padding: 10px 12px; margin-bottom: 15px; break-inside: avoid; }}
+  .collateral h2 {{ break-after: avoid; }}
+  .collateral table {{ border-collapse: collapse; width: 100%; font-size: 9px; }}
+  .collateral tr {{ break-inside: avoid; }}
+  .collateral td {{ padding: 7px; border-bottom: 1px solid #dce3ec; vertical-align: top; overflow-wrap: anywhere; }}
+  .collateral td:first-child {{ width: 43%; }}
+  .collateral p {{ color: #52637a; font-size: 8px; }}
   .hero {{ background: #0b1d3a; color: white; padding: 24px 34px 22px; min-height: 164px; }}
   .brand-row {{ display: flex; align-items: center; justify-content: space-between; gap: 28px; }}
   .brand-lockup {{ display: flex; align-items: center; gap: 11px; }}
@@ -274,6 +286,7 @@ def render_term_sheet_html(
   .fine {{ border-top: 1px solid #dce3ec; margin-top: 10px; padding-top: 7px; color: #718096; font-size: 7.2px; line-height: 1.38; }}
   .fine b {{ color: #41546e; }}
 </style></head><body>
+  <div class="watermark">CONFIDENTIAL</div>
   <header class="hero">
     <div class="brand-row">{_brand_html(sponsor_name)}</div>
     <div class="eyebrow">Client loan terms - Version {sheet.version}</div>
@@ -295,6 +308,7 @@ def render_term_sheet_html(
     </div>
     {f'<div class="fine"><b>Payment structure:</b> {escape(str(payment_summary))}</div>' if payment_summary else ''}
     {repayment_html}
+    {collateral_html}
     <h2>Estimated timing</h2>
     <div class="schedule">{schedule}</div>
     <div class="two">

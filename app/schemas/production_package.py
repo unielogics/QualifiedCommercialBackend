@@ -263,6 +263,7 @@ ProductionDebtServiceTreatment = Literal["additive", "refinance"]
 
 class ProductionTermSheetBody(BaseModel):
     expected_version: int | None = Field(default=None, ge=0)
+    expected_collateral_revision: int | None = Field(default=None, ge=0)
     funding_party_kind: Literal["Sponsor", "Qualified Commercial LLC", "Lender"]
     lender_id: UUID | None = None
     funding_party_name: str = Field(default="", max_length=180)
