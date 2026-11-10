@@ -70,7 +70,7 @@ def test_principal_chart_uses_the_real_shared_terms_schedule_and_counts_maturity
     data = synthetic_financials()
     data["proposed_terms"] = terms
     pdf = render_investor_presentation_pdf(intake=SimpleNamespace(business_name="Synthetic LLC"), financials=data)
-    page = fitz.open(stream=pdf, filetype="pdf")[2]
+    page = fitz.open(stream=pdf, filetype="pdf")[3]
     text = " ".join(page.get_text().split())
     assert "$0 remains after all due principal, including the balloon, is received" in text
     assert "$66,973" in text
@@ -87,12 +87,12 @@ def test_negative_earnings_incomplete_plan_and_current_request_render_without_gu
     assert "Unreviewed working draft" in text
     assert "Terms needed" in text and "Pending evidence" in text
     assert "Validated P&L EBITDA is unavailable" in text
-    assert "per seat: quantity 10" in text and "$2,000 per month" in text and "$9,999" not in text
+    assert "Per seat: quantity 10" in text and "$2,000 per month" in text and "$9,999" not in text
     assert "Missing proposed amount" in text and "Current balance sheet" in text
     assert "Working Capital: $130,000" in text
 
 
-def test_long_expense_and_action_explanations_paginate_without_losing_final_words():
+def test_long_expense_and_action_explanations_keep_five_pages_and_refer_to_full_file():
     data = synthetic_financials()
     plan = data["operating_earnings"]["improvement_plan"]
     plan["expenses"][0]["notes"] = "Long source note. " * 240 + "EXPENSE-END-MARKER"
@@ -101,8 +101,10 @@ def test_long_expense_and_action_explanations_paginate_without_losing_final_word
     pdf = render_investor_presentation_pdf(intake=SimpleNamespace(business_name="Synthetic LLC"), financials=data)
     document = fitz.open(stream=pdf, filetype="pdf")
     text = "\n".join(page.get_text() for page in document)
-    assert all(marker in text for marker in ("EXPENSE-END-MARKER", "ACTION-END-MARKER", "PLAN-END-MARKER"))
-    assert len(document) > 8
+    assert all(marker not in text for marker in ("EXPENSE-END-MARKER", "ACTION-END-MARKER", "PLAN-END-MARKER"))
+    assert len(document) == 5
+    assert "complete notes" in text and "originating file" in text
+    assert plan["plan_notes"].endswith("PLAN-END-MARKER")
 
 
 def documented_ebitda_financials():
@@ -124,7 +126,7 @@ def test_documented_matching_annual_ebitda_shows_operating_effect_and_annual_ref
     assert operating_ebitda_projection(data) == 138_000
     assert operating_ebitda_projection(data, "approved") == 132_000
     pdf = render_investor_presentation_pdf(intake=SimpleNamespace(business_name="Synthetic LLC"), financials=data)
-    page = fitz.open(stream=pdf, filetype="pdf")[1]
+    page = fitz.open(stream=pdf, filetype="pdf")[2]
     text = " ".join(page.get_text().split())
     assert "Annual EBITDA (validated P&L) $120,000 $120,000 $138,000" in text
     assert "Staff-reviewed operating EBITDA projection: $132,000" in text

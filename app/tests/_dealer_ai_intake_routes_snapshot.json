@@ -86,6 +86,12 @@
   [
     "admin_router",
     "GET",
+    "/admin/ai-underwriter-leads/{intake_id}/package-readiness/references",
+    "get_package_readiness_references"
+  ],
+  [
+    "admin_router",
+    "GET",
     "/admin/ai-underwriter-leads/{intake_id}/package.zip",
     "download_dealer_ai_package_zip"
   ],

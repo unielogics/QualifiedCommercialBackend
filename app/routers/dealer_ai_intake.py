@@ -5436,8 +5436,10 @@ def _artifact_read(
         else active_bucket_file_ids is None
     )
 
+    public_body = {key: value for key, value in body.items() if key not in {"_reference_manifest", "_analysis_snapshot"}}
     return PublicUnderwritingArtifactRead.model_validate(artifact).model_copy(
         update={
+            "body_json": public_body,
             "download_url": _artifact_download_url(artifact),
             "preview_url": _artifact_download_url(artifact, disposition="inline"),
             "version": _version(package.get("version")),
@@ -6541,11 +6543,24 @@ async def _create_investor_presentation_artifact(
     title = f"{intake.business_name or intake.full_name or 'Business'} investor presentation"
     pdf = await asyncio.to_thread(render_investor_presentation_pdf, intake=intake,
                                   financials=financials, generated_at=generated_at)
+    import fitz
+
+    from app.services.investor_report import LAYOUT_VERSION, PAGE_LIMIT, analysis_snapshot
+    with fitz.open(stream=pdf, filetype="pdf") as rendered:
+        page_count = len(rendered)
+    if not 1 <= page_count <= PAGE_LIMIT:
+        raise ValueError("Investor report must contain no more than five pages")
+    report_snapshot = financials.get("investor_report") if isinstance(financials.get("investor_report"), dict) else None
     key = await _store_underwriting_pdf(intake, pdf, title, "investor-presentation")
     cleanup_s3_keys.append(key)
     artifact = PublicUnderwritingIntakeArtifact(intake_id=intake.id, artifact_type="investor_presentation",
         title=title[:240], body_text="Source-bound investor presentation: investment, contractual return, client impact and open evidence.",
         body_json={"investment": investment_metrics(financials.get("proposed_terms")),
+            "investor_report_format": {"version": LAYOUT_VERSION, "max_pages": PAGE_LIMIT, "page_count": page_count},
+            "reference_manifest": {"available": report_snapshot is not None, "count": len((report_snapshot or {}).get("references") or [])},
+            "_reference_manifest": {"references": (financials.get("investor_report") or {}).get("references") or [],
+                "section_reference_ids": (financials.get("investor_report") or {}).get("section_reference_ids") or {}} if report_snapshot is not None else None,
+            "_analysis_snapshot": analysis_snapshot(financials),
             "operating_plan_snapshot": ((financials.get("operating_earnings") or {}).get("improvement_plan") or {}).get("snapshot"),
             "_pdf": {"size_bytes": len(pdf), "sha256": hashlib.sha256(pdf).hexdigest(),
                      "content_type": "application/pdf", **source_snapshot_metadata}},
@@ -6833,6 +6848,7 @@ async def _package_generation_inputs(
     current_key_metrics: dict[str, Any] = current_review_projection({}, None)["key_metrics"]
     current_tax_years: list[dict[str, Any]] = []
     current_p_and_l: dict[str, Any] | None = None
+    cockpit: dict[str, Any] = {}
     try:
         from app.capital_partners.services import sync as marketplace_sync
         from app.services import financial_cockpit as cockpit_svc
@@ -6868,6 +6884,12 @@ async def _package_generation_inputs(
         "package_options": choices,
         "package_document_types": list(_PACKAGE_READINESS_TYPES),
     }
+    from app.services import investor_report
+    financials["reviewed_math"] = investor_report.reviewed_math(cockpit)
+    report = await investor_report.build(db, intake, profile, cockpit, financials, source_files, context_snapshot)
+    financials["investor_report"] = report
+    context_snapshot["investor_report_format"] = {"layout_version": investor_report.LAYOUT_VERSION, "max_pages": investor_report.PAGE_LIMIT}
+    context_snapshot["investor_collateral"] = report["collateral"]
     context_snapshot["operating_earnings"] = operating_earnings
     input_fingerprint = _package_input_fingerprint(
         source_metadata=source_metadata,
@@ -6885,6 +6907,8 @@ async def _package_generation_inputs(
         "package_input_sha256": input_fingerprint,
         "package_options": choices,
         "package_document_types": list(_PACKAGE_READINESS_TYPES),
+        "report_layout_version": investor_report.LAYOUT_VERSION,
+        "report_page_limit": investor_report.PAGE_LIMIT,
     }
     return (
         source_files,
@@ -6997,6 +7021,31 @@ async def _fresh_package_artifact_pair(
             "The file or program readiness changed. Refresh both PDFs before delivery.",
         )
     return summary, packet
+
+
+async def _primary_delivery_artifact(db: AsyncSession, intake: PublicUnderwritingIntake,
+    summary: PublicUnderwritingIntakeArtifact, packet: PublicUnderwritingIntakeArtifact) -> PublicUnderwritingIntakeArtifact:
+    """Select the condensed investor report after the complete generation passed freshness checks.
+
+    The existing include/attach_lender_packet wire flags mean the primary
+    package PDF. Detailed supporting packets remain explicit archive choices.
+    """
+    from app.services.investor_report import LAYOUT_VERSION, PAGE_LIMIT
+    summary_pdf = _artifact_pdf_metadata(summary)
+    if "investor_presentation" not in (summary_pdf.get("package_document_types") or []) and not summary_pdf.get("report_layout_version"):
+        return packet  # Compatibility for an explicitly legacy two-document generation.
+    presentation = await _latest_artifact(db, intake.id, "investor_presentation")
+    metadata = _artifact_package_metadata(presentation)
+    body = presentation.body_json if presentation is not None and isinstance(presentation.body_json, dict) else {}
+    layout = body.get("investor_report_format") if isinstance(body.get("investor_report_format"), dict) else {}
+    pages = layout.get("page_count")
+    generation = _artifact_package_metadata(summary).get("generation_id")
+    if (presentation is None or not generation or metadata.get("generation_id") != generation or metadata.get("status") != "current"
+        or not summary_pdf.get("package_input_sha256") or _artifact_pdf_metadata(presentation).get("package_input_sha256") != summary_pdf.get("package_input_sha256")
+        or layout.get("version") != LAYOUT_VERSION or layout.get("max_pages") != PAGE_LIMIT
+        or type(pages) is not int or not 1 <= pages <= PAGE_LIMIT):
+        raise HTTPException(409, "Regenerate the package to deliver its current investor report of no more than five pages.")
+    return presentation
 
 
 def _artifact_package_metadata(artifact: PublicUnderwritingIntakeArtifact | None) -> dict[str, Any]:
