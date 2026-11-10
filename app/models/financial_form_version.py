@@ -32,7 +32,7 @@ class FinancialFormFamily(Base):
     __tablename__ = "financial_form_families"
     __table_args__ = (
         UniqueConstraint("profile_id", "kind", "identity_key", name="uq_financial_form_family_identity"),
-        CheckConstraint("kind in ('pfs','debt_schedule','p_and_l','balance_sheet','real_estate_schedule')", name="ck_financial_form_family_kind"),
+        CheckConstraint("kind in ('pfs','debt_schedule','p_and_l','balance_sheet','real_estate_schedule','operating_plan')", name="ck_financial_form_family_kind"),
         Index("ix_financial_form_family_profile_kind", "profile_id", "kind"),
     )
 

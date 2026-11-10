@@ -5,7 +5,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-FinancialKind = Literal["pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule"]
+FinancialKind = Literal["pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule", "operating_plan"]
 
 
 class FinancialFamilyCreate(BaseModel):

@@ -96,6 +96,7 @@ def operating_earnings_brief(cockpit):
             "bank_context": fields(trend.get("bank_context"), ("average_monthly_deposits", "annualized_deposits", "note")),
         },
         "potential": deepcopy(ebitda.get("potential")),
+        "improvement_plan": deepcopy((cockpit.get("operating_plan") or {}).get("package")),
         "noi": {
             "definition": fields(noi.get("definition"), ("key", "label", "formula", "includes_depreciation_and_amortization")),
             "historical": noi_historical, "reason": noi.get("reason"),

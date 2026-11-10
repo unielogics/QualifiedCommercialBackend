@@ -1359,6 +1359,51 @@ def _operating_earnings_lines(financials: dict[str, Any], *, compact: bool = Fal
         else:
             lines.append("NOI unavailable: " + str(noi.get("reason") or "Current operating-income evidence is incomplete."))
     lines.append("A refinance changes debt service and cash retained; it does not itself change EBITDA. Forecasts are conditional illustrations and do not establish current program eligibility.")
+    lines.extend(_operating_plan_lines(earnings))
+    return lines
+
+
+def _operating_plan_lines(earnings):
+    plan = _record(earnings.get("improvement_plan"))
+    if not plan:
+        return []
+    baseline = _record(plan.get("baseline"))
+    currency = baseline.get("currency")
+    projection = _record(plan.get("projection"))
+    lines = ["Operating expenses and earnings improvement plan - conditional operating changes; current source figures remain unchanged."]
+    for key, label in (("proposed", "Proposed"), ("approved", "Staff-reviewed")):
+        result = _record(projection.get(key))
+        totals = _record(_record(plan.get("totals")).get(key))
+        if result.get("status") == "awaiting_review":
+            lines.append("Staff-reviewed projection: awaiting supported adjustment review and baseline reconciliation.")
+            continue
+        ratio = _num(result.get("dscr_with_refinance"))
+        ratio_text = f"{ratio:.2f}x" if ratio is not None else "unavailable"
+        current_ratio, projected_ratio = _num(baseline.get("dscr")), _num(result.get("dscr_current"))
+        coverage = f"{current_ratio:.2f}x" if current_ratio is not None else "unavailable"
+        coverage += " to " + (f"{projected_ratio:.2f}x" if projected_ratio is not None else "unavailable")
+        lines.append(f"{label}: annual earnings {_earnings_money(baseline.get('earnings'), currency)} to {_earnings_money(result.get('earnings'), currency)}; NOI {_earnings_money(baseline.get('noi'), currency)} to {_earnings_money(result.get('noi'), currency)}; current-debt coverage {coverage}; coverage with refinance {ratio_text}; recurring improvement {_earnings_money(totals.get('annual_impact'), currency)} per year; first-year improvement {_earnings_money(totals.get('first_year_impact'), currency)}; implementation costs {_earnings_money(totals.get('one_time_cost'), currency)}.")
+    for index, action in enumerate(_records(plan.get("adjustments")), 1):
+        lines.append(f"{index}. {action.get('label') or 'Operating adjustment'} ({str(action.get('kind') or '').replace('_', ' ')}; {action.get('review_state') or 'proposed'}). Recurring annual effect {_earnings_money(action.get('net_annual_impact'), currency)}; first-year {_earnings_money(action.get('first_year_impact'), currency)}; effective {action.get('effective_date') or 'not supplied'}; responsible: {action.get('owner_name') or 'not assigned'}.")
+        calculation = _record(action.get("calculation"))
+        drivers = [f"{key.replace('_', ' ')}: {calculation[key]}" for key in (
+            "cadence", "units_per_period", "current_amount", "proposed_amount", "current_unit_price", "proposed_unit_price",
+            "current_unit_cost", "proposed_unit_cost", "contribution_margin_pct", "processing_volume", "processing_transaction_count",
+            "current_processing_rate_pct", "proposed_processing_rate_pct", "current_processing_rate_basis", "proposed_processing_rate_basis",
+            "current_processing_fixed_fee", "proposed_processing_fixed_fee", "current_processing_per_transaction_fee", "proposed_processing_per_transaction_fee"
+        ) if calculation.get(key) is not None and calculation.get(key) != "unknown"]
+        if drivers:
+            lines.append("Calculation inputs: " + "; ".join(drivers))
+        if action.get("explanation"):
+            lines.append("Explanation: " + str(action["explanation"]))
+        if action.get("source_note"):
+            lines.append("Support: " + str(action["source_note"]))
+        if action.get("source_names"):
+            lines.append("Evidence: " + "; ".join(_strings(action["source_names"])))
+        lines.extend("Unresolved: " + item for item in _strings(action.get("issues")))
+        lines.extend("Assumption: " + item for item in _strings(action.get("risk_flags")))
+    lines.extend("Missing: " + item for item in _strings(plan.get("missing")))
+    lines.extend("Plan condition: " + item for item in _strings(plan.get("risk_flags")))
     return lines
 
 
@@ -1368,7 +1413,12 @@ def _operating_earnings_section(financials: dict[str, Any], *, compact: bool = F
         return ""
     # A single table row also keeps the heading with its figures in the
     # PyMuPDF fallback renderer, which does not honor every section break rule.
-    return '<table class="card wide" style="width:100%;break-inside:avoid;page-break-inside:avoid"><tr style="break-inside:avoid;page-break-inside:avoid"><td><h2 style="break-after:avoid;page-break-after:avoid">Business earnings and revenue outlook</h2>' + "".join(f"<p>{escape(line)}</p>" for line in lines) + "</td></tr></table>"
+    plan_lines = _operating_plan_lines(_record(financials.get("operating_earnings")))
+    if plan_lines:
+        lines = lines[:-len(plan_lines)]
+    historical = '<table class="card wide" style="width:100%;break-inside:avoid;page-break-inside:avoid"><tr style="break-inside:avoid;page-break-inside:avoid"><td><h2 style="break-after:avoid;page-break-after:avoid">Business earnings and revenue outlook</h2>' + "".join(f"<p>{escape(line)}</p>" for line in lines) + "</td></tr></table>"
+    # A long improvement plan flows across pages; never put the entire action list in an unbreakable row.
+    return historical + ("<section class='wide'><h2>Operating improvement plan</h2>" + "".join(f"<p>{escape(line)}</p>" for line in plan_lines) + "</section>" if plan_lines else "")
 
 
 def _executive_bank_section(months: list[dict[str, Any]]) -> str:

@@ -100,6 +100,14 @@ DEBT = document(
     "Business debt schedule and supporting obligations",
     "List every lender, balance, payment, maturity, lien, and MCA/RBF position. Reconcile recurring statement debits to agreements and payoff information; flag omitted obligations.",
 )
+
+OPERATING_PLAN = {
+    **document("operating_expenses_and_earnings_plan", "Operating expenses and earnings plan",
+        "Disclose recurring operating costs, payroll, rent and other expenses for the stated period, link supporting evidence, and explain proposed improvements. Staff reviews each proposal and reconciles it to the historical baseline. Submission does not change historical P&L, NOI, EBITDA, DSCR or program qualification."),
+    "requirement_kind": "form",
+    "collection_config": {"form_kind": "operating_plan", "document_type": "operating_plan", "quantity": 1, "unit": "files", "evidence_classes": ["operating_plan"]},
+}
+
 PFS = document(
     "owner_personal_financial_statement",
     "Owner personal financial statement",

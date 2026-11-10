@@ -81,6 +81,7 @@ FORM_KINDS_BY_KEY: dict[str, tuple[str, ...]] = {
     "ytd_p_and_l_balance_sheet": ("p_and_l", "balance_sheet"),
     "ytd_profit_and_loss": ("p_and_l",),
     "real_estate_schedule": ("real_estate_schedule",),
+    "operating_expenses_and_earnings_plan": ("operating_plan",),
 }
 
 
@@ -196,6 +197,7 @@ def baseline_definitions() -> dict[str, dict[str, Any]]:
             key = item.get("requirement_key")
             if key and key not in found and item.get("category") not in EXCLUDED_CATEGORIES:
                 found[key] = item
+    found.setdefault("operating_expenses_and_earnings_plan", funding_program_baselines.OPERATING_PLAN)
     return found
 
 
@@ -205,7 +207,7 @@ def candidate_from_baseline(item: dict[str, Any]) -> LibraryCandidate:
         key=key,
         label=item["label"],
         category=item["category"],
-        kind="document",
+        kind=item.get("requirement_kind", "document"),
         required_level=item.get("required_level", "required"),
         description=_description(item.get("objective_text"), item.get("completion_criteria")),
         canonical_key=None,
@@ -458,7 +460,7 @@ async def materialize_baseline_row(db: AsyncSession, definition: dict[str, Any])
     row = AICollectionRequirement(
         playbook_id=playbook.id,
         requirement_key=definition["requirement_key"],
-        requirement_kind="document",
+        requirement_kind=definition.get("requirement_kind", "document"),
         label=definition["label"],
         category=definition["category"],
         required_level=definition.get("required_level", "required"),
@@ -471,7 +473,7 @@ async def materialize_baseline_row(db: AsyncSession, definition: dict[str, Any])
         objective_text=definition.get("objective_text") or "",
         completion_criteria=definition.get("completion_criteria") or "",
         review_checks=list(definition.get("review_checks") or []),
-        collection_config={},
+        collection_config=dict(definition.get("collection_config") or {}),
     )
     db.add(row)
     await db.flush()

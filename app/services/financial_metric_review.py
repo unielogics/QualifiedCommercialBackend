@@ -399,6 +399,16 @@ def redact_for_external(cockpit, actor):
     from copy import deepcopy
 
     result = deepcopy(cockpit)
+    # The new staff source picker contains the private file inventory and
+    # review concurrency fingerprints. Client forms use their own scoped links.
+    result["operating_evidence"] = {}
+    operating = result.get("operating_plan")
+    if operating:
+        from app.capital_partners.services.listings import partner_operating_earnings
+
+        safe = partner_operating_earnings({"improvement_plan": operating.get("package")}) or {}
+        result["operating_plan"] = {key: operating[key] for key in ("available", "state", "version_number", "saved_at") if key in operating}
+        result["operating_plan"]["package"] = safe.get("improvement_plan")
     review = result.get("metric_review") or {}
     review["history"] = []
     review["composition_history"] = []

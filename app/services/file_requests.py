@@ -34,6 +34,7 @@ DOCUMENT_CLASSES = {
     "tax_return": ["tax_return"],
     "debt_schedule": ["debt_schedule"],
     "real_estate_schedule": ["real_estate_schedule"],
+    "operating_plan": ["operating_plan"],
     "pfs": ["personal_financial_statement"],
     "personal_financial_statement": ["personal_financial_statement"],
     "profit_and_loss": ["current_p_and_l"],
@@ -61,12 +62,29 @@ def item_config(item: FileRequestItem, request_id: UUID) -> dict:
         # Explicit upload/association selects which obligation a file satisfies.
         "explicit_assignment_only": True,
         "automation_approved": True,
-        **({"form_kind": "real_estate_schedule"} if _online_real_estate_form(item) else {}),
+        **({"form_kind": item.document_type} if _online_form(item) else {}),
     }
 
 
-def _online_real_estate_form(item: FileRequestItem) -> bool:
-    return item.document_type == "real_estate_schedule" and item.quantity == 1 and item.unit == "files"
+def _online_form(item: FileRequestItem) -> bool:
+    return item.document_type in {"real_estate_schedule", "operating_plan"} and item.quantity == 1 and item.unit == "files"
+
+
+
+def _same_operating_request(state, item):
+    if item.document_type != "operating_plan" or not _online_form(item):
+        return False
+    metadata = state.provenance or {}
+    config = metadata.get("collection_config") or {}
+    if (state.status == "not_applicable" or metadata.get("inactive_definition")
+            or metadata.get("cancelled_at") or metadata.get("redirect_requirement_key")):
+        return False
+    if state.requirement_key != "operating_expenses_and_earnings_plan" and config.get("form_kind") != "operating_plan":
+        return False
+    def normalize(value):
+        return " ".join(str(value).casefold().split())
+    return (normalize(config.get("subject") or "business") == normalize(item.subject)
+            and normalize(config.get("period") or "current") == normalize(item.period))
 
 
 def request_label(item: FileRequestItem) -> str:
@@ -129,7 +147,7 @@ async def apply_memberships(db, state, memberships: dict) -> None:
     definition = deepcopy(metadata["external_definition"])
     definition.update(collection_config=config, label=label, objective_text=effective.instructions,
                       ai_request_message_template=request_message,
-                      requirement_kind="form" if _online_real_estate_form(effective) else "document")
+                      requirement_kind="form" if _online_form(effective) else "document")
     metadata.update(request_batches=memberships, request_item=effective.model_dump(), collection_config=config,
                     external_definition=definition, request_instructions=effective.instructions,
                     objective_text=effective.instructions, request_message=request_message,
@@ -176,7 +194,7 @@ async def create_batch(
         await require_hosted_permission(db, requested_documents=[item.document_type for item in items])
     states = []
     candidates = await request_states(db, profile.id)
-    debt_states = list((await db.execute(select(ApplicationRequirementState).where(ApplicationRequirementState.profile_id == profile.id))).scalars().all()) if any(item.document_type == "debt_schedule" for item in items) else []
+    debt_states = list((await db.execute(select(ApplicationRequirementState).where(ApplicationRequirementState.profile_id == profile.id))).scalars().all()) if any(item.document_type in {"debt_schedule", "operating_plan"} for item in items) else []
     namespace = uuid5(profile.id, str(request_id))
     for index, item in enumerate(items):
         context = source_contexts[index] if source_contexts is not None else source_context
@@ -191,14 +209,17 @@ async def create_batch(
             )
             semantic_key = debt_identity("debt_schedule", normalize_subject(item_config(item, request_id), await profile_subjects(db, profile)))
             candidates = list({state.id: state for state in [*candidates, *debt_states]}.values())
+        if item.document_type == "operating_plan" and _online_form(item):
+            candidates = list({state.id: state for state in [*candidates, *debt_states]}.values())
         previous = next((state for state in candidates
                          if not (state.provenance or {}).get("cancelled_at")
                          and not (state.provenance or {}).get("redirect_requirement_key")
                          and ((state.provenance or {}).get("canonical_key") == semantic_key
-                              or item.document_type == "debt_schedule" and state_key(state) == semantic_key)), None)
+                              or item.document_type == "debt_schedule" and state_key(state) == semantic_key
+                              or _same_operating_request(state, item))), None)
         membership = {"fingerprint": fingerprint, "item": item.model_dump(), "created_at": datetime.now(UTC).isoformat(), "cancelled_at": None}
         if previous is not None:
-            if item.document_type == "debt_schedule":
+            if item.document_type in {"debt_schedule", "operating_plan"}:
                 metadata = deepcopy(previous.provenance or {})
                 metadata.setdefault("file_request_id", str(request_id))
                 metadata.setdefault("source_kind", source_kind)
@@ -206,7 +227,7 @@ async def create_batch(
                 metadata.setdefault("catalog_approved", True)
                 metadata.setdefault("external_definition", {"requirement_key": previous.requirement_key,
                     "label": previous.label, "category": previous.category, "required_level": previous.required_level,
-                    "requirement_kind": "document", "visibility": ["borrower", "underwriter"],
+                    "requirement_kind": "form" if _online_form(item) else "document", "visibility": ["borrower", "underwriter"],
                     "completion_mode": "requires_human_verify" if previous.verification_required else "ai_can_complete",
                     "can_underwriter_waive": True})
                 previous.provenance = metadata
@@ -224,8 +245,8 @@ async def create_batch(
         custom = item.document_type not in DOCUMENT_CLASSES
         # Free-text reporting windows are preserved as client instructions.
         # Their exact meaning needs staff review before claiming fulfillment.
-        requires_review = custom or item.period.strip().casefold() not in {"current", "any", "any period"}
-        requirement_kind = "form" if _online_real_estate_form(item) else "document"
+        requires_review = custom or item.document_type == "operating_plan" or item.period.strip().casefold() not in {"current", "any", "any period"}
+        requirement_kind = "form" if _online_form(item) else "document"
         definition = {
             "requirement_key": key, "canonical_key": semantic_key,
             "label": label, "category": "Other", "required_level": "required",

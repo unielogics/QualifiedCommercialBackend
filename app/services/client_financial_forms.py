@@ -18,7 +18,7 @@ from sqlalchemy import select
 from app.models.financial_form_version import FinancialFormVersion
 from app.services import business_statement_schema as bss
 from app.services import financial_workspace as workspace
-from app.services import pfs_schema, real_estate_schema
+from app.services import operating_plan_schema, pfs_schema, real_estate_schema
 from app.services.financial_workspace_legacy import merge_source_debts
 
 
@@ -55,6 +55,10 @@ def client_body(kind: str, body: dict, *, can_edit: bool = True) -> dict:
         for row in visible.get("debts") or []:
             row["owner"] = row.get("origin") or row.get("owner") or "admin"
             row["editable"] = can_edit
+    if kind == "operating_plan":
+        for row in visible.get("adjustments") or []:
+            for key in operating_plan_schema.STAFF_FIELDS - {"status"}:
+                row.pop(key, None)
     return visible
 
 
@@ -97,6 +101,21 @@ def merge_client_body(kind: str, current: dict, incoming: dict) -> dict:
             merged["business_name"] = incoming["business_name"]
         return merged
     result = copy.deepcopy(current)
+    if kind == "operating_plan":
+        result = _copy_fields(result, incoming, operating_plan_schema.CLIENT_HEADER_FIELDS)
+        for block, fields in (("expenses", operating_plan_schema.CLIENT_EXPENSE_FIELDS), ("adjustments", operating_plan_schema.CLIENT_ADJUSTMENT_FIELDS)):
+            if block in incoming:
+                before = result.get(block) or []
+                merged = _merge_rows(before, incoming[block], fields)
+                supplied = {row["id"] for row in merged}
+                # Removal is recoverable even before the next publication.
+                merged.extend({**copy.deepcopy(row), "excluded": True} for row in before if row.get("id") not in supplied)
+                excluded = {row["id"] for row in merged if row.get("excluded")}
+                for row in merged:
+                    if row.get("duplicate_of") in excluded:
+                        row.update(excluded=True, duplicate_of=None)
+                result[block] = merged
+        return result
     if kind == "real_estate_schedule":
         result = _copy_fields(result, incoming, [spec["key"] for spec in real_estate_schema.HEADER])
         for block, specs in real_estate_schema.COLLECTIONS.items():

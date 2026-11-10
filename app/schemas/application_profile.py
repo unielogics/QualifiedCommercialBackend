@@ -1451,7 +1451,7 @@ class FinancialFormStatus(BaseModel):
     reopened, corrected, or handed back to the borrower to finish.
     """
 
-    kind: Literal["pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule"]
+    kind: Literal["pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule", "operating_plan"]
     label: str
     #: Whether the checklist actually asks for it on this file. A form nobody
     #: has requested is not outstanding — it is simply not part of this deal.
@@ -1567,7 +1567,7 @@ class ApplicationEvidenceWorkspace(BaseModel):
 # The worksheet: the four forms as one grid
 # ---------------------------------------------------------------------------
 
-SheetKind = Literal["p_and_l", "balance_sheet", "debt_schedule", "pfs", "real_estate_schedule"]
+SheetKind = Literal["p_and_l", "balance_sheet", "debt_schedule", "pfs", "real_estate_schedule", "operating_plan"]
 
 
 class WorksheetCellEdit(BaseModel):

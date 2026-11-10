@@ -119,7 +119,7 @@ class FinancialFormLink(TimestampMixin, Base):
 
     __table_args__ = (
         CheckConstraint(
-            "kind in ('pfs','debt_schedule','p_and_l','balance_sheet','real_estate_schedule','worksheet')",
+            "kind in ('pfs','debt_schedule','p_and_l','balance_sheet','real_estate_schedule','operating_plan','worksheet')",
             name="ck_financial_form_links_kind",
         ),
         CheckConstraint(
