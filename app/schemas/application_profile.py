@@ -475,6 +475,20 @@ class ApplicationUnderwritingRead(BaseModel):
     updated_at: datetime | None = None
 
 
+class MarketplacePublicationListing(BaseModel):
+    id: UUID
+    ref: str
+    name: str
+    status: str
+    published_at: datetime | None = None
+
+
+class MarketplacePublicationRead(BaseModel):
+    profile_id: UUID
+    listing: MarketplacePublicationListing | None = None
+    can_manage: bool = False
+
+
 class ApplicationUnderwritingPatch(BaseModel):
     underwriting_status: UnderwritingLifecycleStatus | None = None
     approved_amount: float | None = Field(default=None, ge=0)

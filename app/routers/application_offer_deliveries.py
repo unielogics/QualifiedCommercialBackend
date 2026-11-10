@@ -140,6 +140,8 @@ async def _load_delivery(
     published_only: bool = False,
     lock: bool = False,
 ) -> ApplicationOfferDelivery:
+    if lock and profile_id is not None:
+        await offers.lock_offer_profile(db, profile_id)
     stmt = (
         select(ApplicationOfferDelivery)
         .where(ApplicationOfferDelivery.id == delivery_id)
@@ -1787,11 +1789,20 @@ async def _client_delivery(
         )
         .options(selectinload(ApplicationOfferDelivery.items))
     )
-    if lock:
-        stmt = stmt.with_for_update()
     row = (await db.execute(stmt)).one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Offer delivery not found.")
+    if lock:
+        # Authorize before locking, then use the same profile -> delivery order
+        # as staff/room responses and publication. A joined FOR UPDATE can lock
+        # the two relations in a planner-dependent order.
+        await offers.lock_offer_profile(db, row[1].id)
+        row = (await db.execute(stmt.execution_options(populate_existing=True))).one_or_none()
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Offer delivery not found.")
+        delivery = await _load_delivery(db, delivery_id=delivery_id, profile_id=row[1].id,
+            published_only=True, lock=True)
+        return row[1], delivery
     return row[1], row[0]
 
 

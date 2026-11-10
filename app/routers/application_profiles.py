@@ -132,6 +132,7 @@ from app.schemas.application_profile import (
     FundingCategoryCreate,
     FundingCategoryRead,
     ManualBankOverrideRequest,
+    MarketplacePublicationRead,
     MissingItemAutomationPatch,
     OwnerCreditCandidateRead,
     OwnerCreditLinkRequest,
@@ -1003,6 +1004,23 @@ async def get_application_underwriting(
     from app.services.financing_projection import read as read_financing
 
     return _underwriting_read(profile, fee_cap_review=fee_cap_review, financing_projection=await read_financing(db, profile))
+
+
+@router.get("/{profile_id}/marketplace-publication", response_model=MarketplacePublicationRead)
+async def get_marketplace_publication(profile_id: UUID, user: CurrentUser,
+    db: AsyncSession = Depends(get_db)) -> MarketplacePublicationRead:
+    """Scoped publication status without granting capital-admin privileges."""
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    from app.capital_partners.models import CpListing
+    predicates = [CpListing.profile_id == profile.id]
+    if getattr(profile, "loan_id", None):
+        predicates.append(CpListing.loan_id == profile.loan_id)
+    listing = (await db.execute(select(CpListing).where(or_(*predicates), CpListing.status != "withdrawn")
+        .order_by(CpListing.created_at.desc()).limit(1))).scalar_one_or_none()
+    return MarketplacePublicationRead(profile_id=profile.id, can_manage=user.role == Role.SUPER_ADMIN,
+        listing={"id": listing.id, "ref": listing.ref, "name": listing.name, "status": listing.status,
+            "published_at": listing.published_at} if listing else None)
 
 
 @router.patch("/{profile_id}/underwriting", response_model=ApplicationUnderwritingRead)
