@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import fitz
 
-from app.services.investor_presentation_pdf import render_investor_presentation_pdf
+from app.services.investor_presentation_pdf import _credit_lines, render_investor_presentation_pdf
 from app.tests.test_investor_presentation import documented_ebitda_financials
 
 
@@ -105,3 +105,11 @@ def test_valid_long_business_name_and_single_account_scope_are_visible():
     assert "Only 1 of 3 counted accounts shown" in document[1].get_text()
     credit = " ".join(document[3].get_text().split())
     assert "620-659, 680-719" in credit and "Review flags: 3 (1 high priority)" in credit
+
+
+def test_credit_coverage_distinguishes_no_required_owners_from_an_unknown_roster():
+    complete_roster = {"required_owner_count": 0, "coverage_status": "not_required"}
+    pending_roster = {"required_owner_count": 0, "coverage_status": "pending"}
+    assert "Required-owner coverage: not required under current rule" in _credit_lines(complete_roster)
+    assert "Required-owner coverage: not established" in _credit_lines(pending_roster)
+    assert "Required-owner coverage: not established" in _credit_lines({})

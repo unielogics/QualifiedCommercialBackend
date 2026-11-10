@@ -370,6 +370,8 @@ def _credit_lines(credit):
     current = _number(credit.get("current_required_report_count"))
     if required is not None and required > 0:
         lines.append(f"Current required reports: {int(current) if current is not None else 'pending'} / {int(required)}")
+    elif required == 0 and credit.get("coverage_status") == "not_required":
+        lines.append("Required-owner coverage: not required under current rule")
     else:
         lines.append("Required-owner coverage: not established")
     band = credit.get("score_band")

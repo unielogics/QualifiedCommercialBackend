@@ -222,6 +222,7 @@ def credit_summary(owners, collections, register):
     roster_note = ("No owners meet the file's current required-credit threshold. " if roster_complete else
         "A required-owner credit roster is not established; confirm ownership completeness. ")
     return {"report_count": len(statuses), "required_owner_count": len(required), "current_required_report_count": current,
+        "coverage_status": "not_required" if roster_complete and not required else "established" if roster_complete and required and current == len(required) else "pending",
         "score_bands": sorted(bands), "score_band": ", ".join(sorted(bands)) or None, "bureaus": sorted(bureaus), "models": sorted(models),
         "as_of": max(dates) if dates else None, "risk_flag_count": flag_count if risk_available else None,
         "high_risk_flag_count": high_count if risk_available else None,

@@ -193,9 +193,11 @@ def test_credit_note_distinguishes_complete_zero_required_roster_from_unknown_ow
     owners = [SimpleNamespace(id=uuid4(), credit_required=False, ownership_pct=10, backfill_needs_review=False) for _ in range(10)]
     current = investor_report.credit_summary(owners, {}, investor_report.Register([], {}))
     assert "No owners meet" in current["risk_summary"]
+    assert current["coverage_status"] == "not_required"
     owners[0].ownership_pct = None
     unknown = investor_report.credit_summary(owners, {}, investor_report.Register([], {}))
     assert "confirm ownership completeness" in unknown["risk_summary"]
+    assert unknown["coverage_status"] == "pending"
 
 
 @pytest.mark.asyncio
