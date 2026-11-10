@@ -68,6 +68,9 @@ async def test_only_bank_or_movement_reads_receive_the_larger_bounded_retry(prev
     final = {"classification": "bank_statement" if not offer else "other", "summary": "Complete read.", "key_facts": {}}
     result, provider = await _analyze(previous, [_response(partial, truncated=True), _response(final)], offer=offer)
     assert result.status == "completed"
+    if offer:
+        assert provider.await_args_list[0].kwargs["system"] == bucket_ai.merchant_processing.MERCHANT_OFFER_ANALYSIS_SYSTEM
+        assert provider.await_args_list[1].kwargs["system"].startswith(bucket_ai.merchant_processing.MERCHANT_OFFER_ANALYSIS_SYSTEM)
     assert [call.kwargs["max_tokens"] for call in provider.await_args_list] == expected
     assert provider.await_args_list[1].kwargs["metadata"]["retry_reason"] == "truncated_output"
 
