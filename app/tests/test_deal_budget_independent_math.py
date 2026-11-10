@@ -1,10 +1,13 @@
 """Independent cash reconciliation examples for the investor cost schedule."""
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 
-from app.schemas.deal_budget import DealCostRow
-from app.services.deal_budget import calculate
+from app.enums import Role
+from app.schemas.deal_budget import DealBudgetPatch, DealCostRow
+from app.services.deal_budget import calculate, update
 
 
 def cost(**changes):
@@ -115,7 +118,18 @@ def test_unknown_exchange_rate_prevents_combining_fee_currency_with_note_currenc
     assert result["investor_net_income"] is None
     assert result["investor_net_roi_pct"] is None
     assert result["net_client_cash"] is None
+    assert result["investor_funding_amount"] is None
+    assert result["investor_gross_roi_pct"] is None
+    assert result["rows"][0]["total_amount"] is None
+    assert result["loan_currency"] == "USD"
     assert any("currenc" in issue.lower() for issue in result["issues"])
+
+
+@pytest.mark.asyncio
+async def test_foreign_cost_budget_cannot_project_unconverted_fees_into_usd_billing_fields():
+    with pytest.raises(HTTPException) as error:
+        await update(None, None, DealBudgetPatch(expected_revision=0, currency="EUR"), SimpleNamespace(role=Role.SUPER_ADMIN))
+    assert error.value.status_code == 422
 
 
 def test_separately_funded_borrower_escrow_is_cash_required_but_not_fee_income():

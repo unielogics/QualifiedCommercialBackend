@@ -64,6 +64,9 @@ def facts_for_draft(profile, draft):
         facts["terms"] = ", ".join(parts) + "."
     else:
         missing.append("Record or restore the active loan proposal.")
+    allocation = budget.get("current_allocation_reconciliation") or calculation.get("allocation_reconciliation") or {}
+    if allocation.get("condition"):
+        missing.append(safe_text(allocation["condition"]))
     before, after = financials.get("dscr"), financials.get("dscr_after_plan")
     if before is not None:
         coverage = f"Source-based debt-service coverage {float(before):.2f}x" + (f"; base refinance coverage {float(after):.2f}x" if after is not None else "")

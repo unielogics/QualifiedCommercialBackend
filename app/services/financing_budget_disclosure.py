@@ -11,7 +11,7 @@ from app.services.investor_report import safe_text
 COST_LABELS = {"closing_cost": "Closing cost", "escrow_reserve": "Escrow / reserve", "referral": "Referral fee",
     "origination": "Origination / points", "consulting": "Consulting fee", "servicing": "Servicing fee",
     "management": "Management fee", "other": "Other cost"}
-CALCULATION_FIELDS = ("gross_loan_amount", "investor_funding_amount", "minimum_investor_contribution", "funding_mode",
+CALCULATION_FIELDS = ("loan_currency", "gross_loan_amount", "investor_funding_amount", "minimum_investor_contribution", "funding_mode",
     "other_funding_required", "other_funding_status",
     "borrower_withheld_fees", "borrower_paid_separately", "escrow_reserves", "net_client_cash", "investor_gross_interest",
     "investor_gross_receipts", "investor_fees", "investor_initial_outlay", "investor_net_income", "investor_net_roi_pct",

@@ -236,6 +236,14 @@ def test_fresh_summary_uses_live_coverage_and_keeps_recorded_return_math():
     assert financials["deal_budget"]["calculation"]["investor_net_roi_pct"] == frozen_roi
 
 
+def test_ai_review_includes_proposed_allocation_closing_condition():
+    profile, draft = draft_fixture()
+    draft["source_snapshot"]["financials"]["deal_budget"]["current_allocation_reconciliation"] = {
+        "scope": "requested_reference", "status": "different_scope", "condition": "Confirm proposed-loan uses before closing."}
+    _, _, missing = listing_draft.facts_for_draft(profile, draft)
+    assert "Confirm proposed-loan uses before closing." in missing
+
+
 def test_ai_apply_requires_both_snapshot_guards_but_manual_edits_remain_supported():
     with pytest.raises(ValidationError):
         ListingIn(ai_draft_id="draft")

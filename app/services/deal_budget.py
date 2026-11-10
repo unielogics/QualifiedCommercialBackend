@@ -167,13 +167,16 @@ def calculate(budget, terms_dict, use_of_funds=None):
     confirmed = bool(budget.get("costs_confirmed"))
     if not confirmed:
         issues.append("Confirm the cost schedule, including any decision that no additional charges apply.")
-    if (budget.get("currency") or "USD") != (terms.get("currency") or "USD"):
+    currency_matches = (budget.get("currency") or "USD") == (terms.get("currency") or "USD")
+    if not currency_matches:
         confirmed = False
+        funding, minimum = None, None
         issues.append("Budget and loan currencies differ; no currency conversion is assumed.")
     schedule = _schedule(terms)
     if schedule is None:
         issues.append("A complete repayment schedule is required for recurring costs and investor returns.")
     cap_points, cap_unresolved = origination_points(budget, loan)
+    cap_unresolved = cap_unresolved or not currency_matches
     if cap_unresolved:
         issues.append("Platform origination pricing or its loan basis is unknown; the published fee cap cannot be confirmed.")
     share = funding / loan if funding is not None and loan is not None and 0 < funding <= loan else None
@@ -198,6 +201,8 @@ def calculate(budget, terms_dict, use_of_funds=None):
     for row in budget.get("rows") or []:
         row_issues = []
         enabled = row.get("enabled", True)
+        if enabled and not currency_matches:
+            row_issues.append("The cost and loan currencies differ; convert reviewed amounts before calculating.")
         value = number(row.get("value"))
         timing, payer = row.get("timing", "closing"), row.get("payer", "borrower")
         reserve = row.get("category") == "escrow_reserve"
@@ -308,7 +313,7 @@ def calculate(budget, terms_dict, use_of_funds=None):
     cash_flows = [{"month": 0, "gross_receipts": 0, "interest": 0, "fees": money(upfront), "reserve_release": 0, "net_cash_flow": money(-initial) if initial is not None else None}]
     cash_flows.extend({**{key: money(value) if key != "month" else value for key, value in flow.items()},
         "net_cash_flow": money(flow["gross_receipts"] - flow["fees"] + flow["reserve_release"]) if fees is not None and not unknown_investor_reserve else None} for flow in monthly.values())
-    return {"gross_loan_amount": money(loan), "investor_funding_amount": money(funding), "funding_mode": mode,
+    return {"loan_currency": terms.get("currency") or "USD", "gross_loan_amount": money(loan), "investor_funding_amount": money(funding), "funding_mode": mode,
         "other_funding_required": money(max(ZERO, loan - funding)) if loan is not None and funding is not None else None,
         "other_funding_status": "unknown" if loan is None or funding is None else "not_confirmed" if loan > funding else "not_required",
         "platform_origination_equivalent_points": float(cap_points) if not cap_unresolved else None,
@@ -421,6 +426,8 @@ def project_legacy(profile, budget):
 
 async def update(db, profile, payload: DealBudgetPatch, user):
     require_staff(user)
+    if payload.currency != "USD":
+        raise HTTPException(422, "Loan cost budgets use USD. Enter reviewed USD amounts before saving; no currency conversion is performed.")
     locked = (await db.execute(select(ApplicationProfile).where(ApplicationProfile.id == profile.id).with_for_update()
         .execution_options(populate_existing=True))).scalar_one()
     before = snapshot(locked)

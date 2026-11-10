@@ -417,7 +417,9 @@ def _open_conditions(financials, improvement, terms):
     if budget and _record(budget.get("calculation")).get("status") != "ready":
         missing.append("Confirm the cost schedule, reserves, capital to raise and minimum contribution.")
     reconciliation = _record(budget.get("current_allocation_reconciliation")) or _record(_record(budget.get("calculation")).get("allocation_reconciliation"))
-    if reconciliation.get("scope") == "requested_reference":
+    if reconciliation.get("condition"):
+        missing.insert(0, str(reconciliation["condition"]))
+    elif reconciliation.get("scope") == "requested_reference":
         missing.insert(0, "Allocate net proceeds for the proposed loan; the displayed requested-budget uses are a reference and the proposed allocation remains unconfirmed.")
     if reconciliation.get("status") == "overallocated":
         missing.insert(0, f"Use-of-funds allocations exceed net loan proceeds at funding by {_money(abs(float(reconciliation['variance'])))}; revise the budget or document additional borrower cash.")
@@ -434,7 +436,7 @@ def _budget_overview(page, report, terms, use_of_funds, requested, disclosure):
 
     calc = _record(disclosure.get("calculation"))
     allocation = _record(disclosure.get("current_allocation_reconciliation")) or _record(calc.get("allocation_reconciliation"))
-    currency = disclosure.get("currency") or "USD"
+    currency = calc.get("loan_currency") or terms.get("currency") or "USD"
     gross_roi, net_roi = calc.get("investor_gross_roi_pct"), calc.get("investor_net_roi_pct")
     minimum = calc.get("minimum_investor_contribution")
     mode = "Single investor" if disclosure.get("funding_mode") == "single_investor" else "Multiple investors"
@@ -443,10 +445,17 @@ def _budget_overview(page, report, terms, use_of_funds, requested, disclosure):
     _card(page, (640, 197, 925, 316), "Gross contractual return", f"{gross_roi:.2f}%" if gross_roi is not None else "Unknown", f"Net after charges: {net_roi:.2f}% on {_money(calc.get('investor_initial_outlay'), currency)} initial outlay" if net_roi is not None else "Net return unknown; confirm all costs")
     _text(page, (35, 329, 468, 350), f"Net loan proceeds at funding: {_money(calc.get('net_client_cash'), currency)}", size=11.5, bold=True, color=TEAL)
     allocations = list(_record(use_of_funds.get("category_totals")).items())
+    proposal_uses = terms.get("proposal_use_of_funds")
+    if allocation.get("scope") in {"proposed_loan", "proposed_reference", "proposed_gross_budget"}:
+        if isinstance(proposal_uses, dict):
+            allocations = [(key, value) for key, value in proposal_uses.items() if key != "other_label" and value is not None]
+        elif isinstance(proposal_uses, list):
+            allocations = [(row.get("label") or row.get("category") or "Other", row.get("amount")) for row in proposal_uses if isinstance(row, dict)]
     uses = "; ".join(f"{str(key).replace('_', ' ').title()}: {_money(amount)}" for key, amount in allocations[:4])
     if len(allocations) > 4:
         uses += f"; {len(allocations) - 4} more uses in the file"
-    uses_label = "Requested-budget reference" if allocation.get("scope") == "requested_reference" else "Uses"
+    uses_label = {"requested_reference": "Requested-budget reference", "proposed_reference": "Prior-proposal uses reference",
+        "proposed_gross_budget": "Gross-facility uses; net allocation pending", "proposed_loan": "Proposed-loan uses"}.get(allocation.get("scope"), "Uses")
     _text(page, (36, 352, 468, 390), f"{uses_label}: {uses or 'Awaiting confirmation'}. Separate borrower closing cash {_money(calc.get('borrower_paid_separately'), currency)}. Other funding required {_money(calc.get('other_funding_required'), currency)} (unconfirmed). Reserves are not fee income.", size=9)
     _text(page, (486, 329, 922, 350), "Terms and return basis", size=12, bold=True)
     _text(page, (488, 352, 922, 390), _plain_terms(terms).replace("\n", " ").replace("APR ", "Stated note rate ") + " Full-term return before losses/taxes. All-in borrower APR including fees has not been calculated.", size=9)
@@ -462,7 +471,7 @@ def _budget_overview(page, report, terms, use_of_funds, requested, disclosure):
             label += " [reserve]"
         _text(page, (x + 2, y, x + 326, y + 12), f"{label} / {str(row.get('payer') or 'Unknown').title()}", size=8.5, bold=True)
         _text(page, (x + 329, y, x + 437, y + 12), _money(row.get("total_amount"), currency), size=8.5, bold=True)
-        _text(page, (x + 2, y + 12, x + 437, y + 24), cost_formula(row, currency) + ("; release unconfirmed" if row.get("category") == "escrow_reserve" and row.get("reserve_release") != "maturity" else ""), size=8.5, color=MUTE)
+        _text(page, (x + 2, y + 12, x + 437, y + 24), cost_formula(row, disclosure.get("currency") or currency) + ("; release unconfirmed" if row.get("category") == "escrow_reserve" and row.get("reserve_release") != "maturity" else ""), size=8.5, color=MUTE)
     if not rows:
         _text(page, (38, 420, 921, 467), "Staff confirmed no listed charges." if disclosure.get("costs_confirmed") else "No complete cost schedule is recorded. Unknown fees and reserve terms prevent a reliable net investor return.", size=11, color=MUTE)
 
