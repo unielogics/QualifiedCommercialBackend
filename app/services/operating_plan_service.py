@@ -17,6 +17,17 @@ from app.services import earnings_improvement as math
 REVIEW_KIND = "operating_plan.adjustments_reviewed"
 
 
+def completion(body, cockpit):
+    from app.schemas.earnings_improvement import completion as disclosure_completion
+    from app.services.released_cash_flow import evaluate
+
+    progress = disclosure_completion(body)
+    allocation = evaluate(body, cockpit)
+    missing = [*progress["missing"], *allocation["missing"]]
+    return {**progress, "complete": not missing, "missing": missing, "missing_count": len(missing),
+            "released_cash_flow": allocation}
+
+
 def shareable_package(evaluation, evidence):
     result = math.package_summary(evaluation)
     names = {row["file_id"]: row.get("file_name") for row in (evidence or {}).get("files", [])}
@@ -85,7 +96,7 @@ async def preview(db, profile, body):
 
 async def summary(db, profile, *, family_id=None):
     """Inspect the saved draft without creating a family, request or publication."""
-    from app.schemas.earnings_improvement import completion, empty_body
+    from app.schemas.earnings_improvement import empty_body
     from app.services.financial_cockpit import load_cockpit
     from app.services.financial_workspace import existing_family
 
@@ -99,7 +110,7 @@ async def summary(db, profile, *, family_id=None):
     body = validate_body(draft.body if draft else version.body if version else empty_body())
     cockpit = await load_cockpit(db, profile)
     evaluation = math.evaluate(body, cockpit)
-    progress = completion(body)
+    progress = completion(body, cockpit)
     disclosure = evaluation["disclosure"]
     stamp = draft.updated_at if draft else version.created_at if version else None
     return {"has_plan": bool(family), "state": "working_draft" if draft and (version is None or body != validate_body(version.body)) else "published" if version else "not_started",
@@ -166,7 +177,11 @@ async def published_context(db, profile, cockpit):
     family = await existing_family(db, profile.id, "operating_plan")
     version = await db.get(FinancialFormVersion, family.current_version_id) if family and family.current_version_id else None
     if version is None or not version.body:
-        return {"available": False, "state": "not_started", "requirement_key": "operating_expenses_and_earnings_plan"}
+        from app.schemas.earnings_improvement import empty_body
+
+        evaluation = math.evaluate(empty_body(), cockpit)
+        return {"available": False, "state": "not_started", "requirement_key": "operating_expenses_and_earnings_plan",
+            "evaluation": evaluation, "package": shareable_package(evaluation, cockpit.get("operating_evidence"))}
     body = version.body
     if version.status == "client_submitted":
         from app.schemas.earnings_improvement import empty_body

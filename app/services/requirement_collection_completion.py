@@ -135,11 +135,16 @@ def snapshot(state, requirement, files, analyses, *, expected_entity=None, assoc
                     "associations": {str(file.id): (associations or {}).get(str(file.id), {}).get("association_stamp") for file in candidates}})
     removed = requirement_lifecycle.is_removed(state)
     available = bool(enough and not removed and state.status not in {"waived", "not_applicable"})
-    return {"source": "files", "complete": state.status == "verified", "can_complete": available,
+    result = {"source": "files", "complete": state.status == "verified", "can_complete": available,
             "fingerprint": stamp, "eligible_file_ids": [str(file.id) for file in candidates],
             "suggested_file_ids": [str(file.id) for file in candidates],
             "completed_at": metadata.get("collection_completion_receipt", {}).get("at"),
             "reason": None if enough else "Link readable, current evidence covering the requested document type and reporting period before marking this item complete."}
+    if include_structured:
+        from app.services.released_cash_flow import guard_collection
+
+        return guard_collection(result, state)
+    return result
 
 
 def qualification_review(state, decisions=None):
@@ -218,6 +223,9 @@ async def complete(db, profile, requirement_key, payload, actor):
         return readiness
     if state.status in {"waived", "not_applicable"}:
         raise HTTPException(409, "Restore this requirement before recording new document collection")
+    allocation = (state.provenance or {}).get("released_cash_flow") or {}
+    if allocation.get("required") and not allocation.get("complete"):
+        raise HTTPException(422, current.get("reason") or "Complete the recurring released-cash-flow allocation before document collection can complete.")
     if current.get("source") == "use_of_funds":
         from app.services.use_of_proceeds import complete_collection
 

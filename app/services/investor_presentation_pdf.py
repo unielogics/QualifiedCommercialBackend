@@ -404,8 +404,25 @@ def _credit_lines(credit):
     return lines
 
 
-def _open_conditions(financials, improvement, terms):
-    missing = [str(row.get("label") or row.get("requirement_key")) for row in _records(_record(financials.get("package_readiness")).get("requirements")) if row.get("effectively_open")]
+def _open_conditions(financials, improvement, terms, *, requested_amount=None):
+    earnings = _record(financials.get("operating_earnings"))
+    noi = _record(earnings.get("noi"))
+    historical_noi = _record(noi.get("historical"))
+    metrics = _record(financials.get("current_key_metrics"))
+    missing = []
+    if metrics.get("annual_noi") is None:
+        reason = noi.get("reason")
+        if not reason and historical_noi.get("value") is not None:
+            reason = "Confirm a dated six-to-twelve-month P&L before showing annual NOI; the source-period operating result remains in the financial review."
+        missing.append("NOI: " + str(reason or "Reconcile the latest business P&L revenue, COGS and operating expenses."))
+    elif historical_noi.get("provisional") or historical_noi.get("reconciliation_required"):
+        missing.append("NOI is provisional. Review its source, reporting period and operating expenses before relying on the figure.")
+    if metrics.get("annual_ebitda") is None:
+        missing.append("Validated P&L EBITDA is unavailable. " + str(earnings.get("historical_unavailable_reason") or "Review the latest P&L inputs; tax-derived coverage earnings remain a separate estimate."))
+    requested = _number(requested_amount if requested_amount is not None else _record(financials.get("use_of_funds")).get("requested_amount"))
+    if requested is None or requested <= 0:
+        missing.append("Confirm the current application request in Current request. A proposed loan does not amend the client's requested amount.")
+    missing.extend(str(row.get("label") or row.get("requirement_key")) for row in _records(_record(financials.get("package_readiness")).get("requirements")) if row.get("effectively_open"))
     missing.extend(str(item) for item in improvement.get("missing") or [])
     missing.extend(str(item) for item in improvement.get("risk_flags") or [])
     missing.extend(str(issue) for row in _records(improvement.get("adjustments")) for issue in row.get("issues") or [])
@@ -423,12 +440,17 @@ def _open_conditions(financials, improvement, terms):
         missing.insert(0, "Allocate net proceeds for the proposed loan; the displayed requested-budget uses are a reference and the proposed allocation remains unconfirmed.")
     if reconciliation.get("status") == "overallocated":
         missing.insert(0, f"Use-of-funds allocations exceed net loan proceeds at funding by {_money(abs(float(reconciliation['variance'])))}; revise the budget or document additional borrower cash.")
-    metrics = _record(financials.get("current_key_metrics"))
-    if metrics.get("annual_noi") is None:
-        missing.append("Reconciled business operating-income statement needed for NOI.")
-    if metrics.get("annual_ebitda") is None:
-        missing.append("Validated P&L EBITDA is unavailable; tax-derived coverage earnings remain a separately labelled estimate.")
     return list(dict.fromkeys(filter(None, missing)))
+
+
+def _financing_card(requested, proposed, currency="USD"):
+    """Never present a proposal as the client's recorded application request."""
+    current, gross = _number(requested), _number(proposed)
+    if current is not None and current > 0:
+        return "Requested financing", _money(current), (f"Proposed gross loan {_money(gross, currency)}" if gross is not None and gross > 0 else "Current application request")
+    if gross is not None and gross > 0:
+        return "Proposed financing", _money(gross, currency), "Proposed gross loan; application request not recorded"
+    return "Requested financing", "Not entered", "Record the current request; proposed terms are separate"
 
 
 def _budget_overview(page, report, terms, use_of_funds, requested, disclosure):
@@ -440,7 +462,7 @@ def _budget_overview(page, report, terms, use_of_funds, requested, disclosure):
     gross_roi, net_roi = calc.get("investor_gross_roi_pct"), calc.get("investor_net_roi_pct")
     minimum = calc.get("minimum_investor_contribution")
     mode = "Single investor" if disclosure.get("funding_mode") == "single_investor" else "Multiple investors"
-    _card(page, (34, 197, 319, 316), "Requested financing", _money(requested), f"Proposed gross loan {_money(calc.get('gross_loan_amount'), currency)}")
+    _card(page, (34, 197, 319, 316), *_financing_card(requested, calc.get("gross_loan_amount"), currency))
     _card(page, (337, 197, 622, 316), "Investment capital to raise", _money(calc.get("investor_funding_amount"), currency), f"{mode}; minimum {_money(minimum, currency)}")
     _card(page, (640, 197, 925, 316), "Gross contractual return", f"{gross_roi:.2f}%" if gross_roi is not None else "Unknown", f"Net after charges: {net_roi:.2f}% on {_money(calc.get('investor_initial_outlay'), currency)} initial outlay" if net_roi is not None else "Net return unknown; confirm all costs")
     principal = _record(calc.get("principal_solution"))
@@ -516,7 +538,7 @@ def render_investor_presentation_pdf(*, intake: Any, financials: dict, generated
         _budget_overview(page, report, terms, budget, requested, cost_budget)
     else:
         roi = returns["gross_contractual_roi_pct"]
-        _card(page, (34, 197, 319, 316), "Requested financing", _money(requested), "Current application request")
+        _card(page, (34, 197, 319, 316), *_financing_card(requested, returns["investment_amount"], terms.get("currency") or "USD"))
         _card(page, (337, 197, 622, 316), "Proposed investment", _money(returns["investment_amount"]), "Full loan; participation allocation separate" if terms else "No active financing proposal")
         _card(page, (640, 197, 925, 316), "Gross contractual return", f"{roi:.2f}%" if roi is not None else "Terms needed", "Full term, before fees / losses / taxes")
         _heading(page, 35, 333, 425, "Use of funds", _citations(report, "use_of_funds"))
@@ -734,7 +756,7 @@ def render_investor_presentation_pdf(*, intake: Any, financials: dict, generated
     reference_note = reference_note.replace("in the file register", "in the full file register")
     reference_y = max(238, min(360, 162 + min(12, len(indexed_rows)) * 16 + 10))
     _text(page, (37, reference_y, 924, reference_y + 23), reference_note, size=9, color=MUTE)
-    conditions = _open_conditions(financials, improvement, terms)
+    conditions = _open_conditions(financials, improvement, terms, requested_amount=requested)
     conditions_y = reference_y + 31
     items_y = conditions_y + 28
     visible_conditions = max(4, 2 * int((477 - items_y) // 29))
