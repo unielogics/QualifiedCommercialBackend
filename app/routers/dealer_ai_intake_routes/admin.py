@@ -80,6 +80,7 @@ __all__ = [
     "create_dealer_ai_prequalification",
     "create_dealer_ai_lender_packet",
     "generate_package_readiness_documents",
+    "get_package_readiness_references",
     "download_dealer_ai_package_zip",
     "preview_dealer_ai_vendor_email",
     "send_dealer_ai_vendor_email"
@@ -609,6 +610,32 @@ async def admin_restore_lead(
         underwriting_status=underwriting_by_intake.get(intake.id),
         effective_profile_hold=profile_hold,
     )
+
+@core.admin_router.get("/{intake_id}/package-readiness/references")
+async def get_package_readiness_references(intake_id: UUID, artifact_id: UUID,
+    user: core.CurrentUser, db: AsyncSession = Depends(core.get_db), include_analysis_snapshot: bool = False) -> dict:
+    """Read one generated report's immutable register, never today's edited sources."""
+    from copy import deepcopy
+
+    from app.services.investor_report import analysis_notes
+    core._require_intake_operator(user)
+    await core._load_admin_dealer_lead(db, intake_id)
+    artifact = (await db.execute(select(core.PublicUnderwritingIntakeArtifact).where(
+        core.PublicUnderwritingIntakeArtifact.id == artifact_id,
+        core.PublicUnderwritingIntakeArtifact.intake_id == intake_id,
+        core.PublicUnderwritingIntakeArtifact.artifact_type == "investor_presentation"))).scalar_one_or_none()
+    if artifact is None:
+        raise HTTPException(404, "Investor report not found in this file")
+    body = artifact.body_json if isinstance(artifact.body_json, dict) else {}
+    manifest = body.get("_reference_manifest") if isinstance(body.get("_reference_manifest"), dict) else {}
+    package = body.get("_package") if isinstance(body.get("_package"), dict) else {}
+    snapshot = body.get("_analysis_snapshot") if isinstance(body.get("_analysis_snapshot"), dict) else {}
+    return {"artifact_id": str(artifact.id), "generation_id": package.get("generation_id"),
+        "generated_at": package.get("generated_at") or artifact.created_at.isoformat(),
+        "available": bool(manifest), "reason": None if manifest else "Regenerate the investor report to capture its complete source register.",
+        "references": deepcopy(manifest.get("references") or []), "section_reference_ids": deepcopy(manifest.get("section_reference_ids") or {}),
+        "analysis_notes": analysis_notes(snapshot), **({"analysis_snapshot": deepcopy(snapshot)} if include_analysis_snapshot else {})}
+
 
 @core.admin_router.post(
     "/{intake_id}/legal-hold",
@@ -2521,7 +2548,7 @@ async def preview_dealer_ai_vendor_email(
     core._require_super_admin(user)
     intake = await core._load_admin_dealer_lead(db, intake_id)
     summary_artifact, current_packet = await core._fresh_package_artifact_pair(db, intake)
-    packet_artifact = current_packet if payload.include_lender_packet else None
+    packet_artifact = await core._primary_delivery_artifact(db, intake, summary_artifact, current_packet) if payload.include_lender_packet else None
     draft = await core._generate_management_json(
         db,
         intake,
@@ -2569,7 +2596,7 @@ async def send_dealer_ai_vendor_email(
     # The lender packet is attached when explicitly requested (attach_lender_packet)
     # or, for backward-compat, via the legacy include_lender_packet flag.
     want_packet = payload.attach_lender_packet if payload.attach_lender_packet is not None else payload.include_lender_packet
-    packet_artifact = current_packet if want_packet else None
+    packet_artifact = await core._primary_delivery_artifact(db, intake, summary_artifact, current_packet) if want_packet else None
     cc_emails = [str(email).lower().strip() for email in payload.cc_emails if str(email).strip()]
     requested_recipients = [
         str(email).lower().strip()
@@ -2792,9 +2819,11 @@ async def send_dealer_ai_vendor_email(
                 .with_for_update()
             )
             fresh_summary, fresh_packet = await core._fresh_package_artifact_pair(db, intake)
+            fresh_primary = await core._primary_delivery_artifact(db, intake, fresh_summary, fresh_packet) if want_packet else None
             if (
                 fresh_summary.id != summary_artifact.id
                 or fresh_packet.id != current_packet.id
+                or packet_artifact is not None and (fresh_primary is None or fresh_primary.id != packet_artifact.id)
             ):
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,

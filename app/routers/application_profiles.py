@@ -202,6 +202,7 @@ from app.schemas.financial_cockpit import (
 )
 from app.schemas.form_answers import FormAnswerFile, FormAnswersRead
 from app.schemas.funding_request import FundingRequestPatch, FundingRequestRead
+from app.schemas.investor_collateral import CollateralPatch, CollateralRead
 from app.schemas.requirement_library import RequirementAddWrite, RequirementLibraryRead
 from app.schemas.retention import LegalHoldChange, RetentionStatusRead
 from app.schemas.use_of_funds import (
@@ -895,6 +896,23 @@ async def get_application_use_of_funds(
 
     profile = await profiles.load_profile(db, profile_id, user)
     return (await read_budget(db, profile)).model_copy(update={"can_edit": user.role in EDIT_ROLES})
+
+
+@router.get("/{profile_id}/collateral", response_model=CollateralRead)
+async def get_application_collateral(profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> CollateralRead:
+    from app.services import investor_collateral
+    investor_collateral.require_staff(user)
+    return await investor_collateral.read(db, await profiles.load_profile(db, profile_id, user), user)
+
+
+@router.patch("/{profile_id}/collateral", response_model=CollateralRead)
+async def patch_application_collateral(profile_id: UUID, payload: CollateralPatch, user: CurrentUser,
+    db: AsyncSession = Depends(get_db)) -> CollateralRead:
+    from app.services import investor_collateral
+    investor_collateral.require_staff(user)
+    result = await investor_collateral.update(db, await profiles.load_profile(db, profile_id, user), payload, user)
+    await db.commit()
+    return result
 
 
 @router.get("/{profile_id}/funding-request", response_model=FundingRequestRead)
