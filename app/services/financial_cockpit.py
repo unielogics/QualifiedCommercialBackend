@@ -2967,7 +2967,7 @@ def term_sheet_terms(sheet: ProductionTermSheet | None) -> dict[str, Any] | None
         return None
     extra = sheet.extra if isinstance(sheet.extra, dict) else {}
     advanced = None
-    if extra.get("repayment_config") is not None:
+    if extra.get("repayment_config") is not None or extra.get("combined_funded_principal_v1") is True:
         from app.services.production_term_sheets import sheet_structure
 
         advanced = sheet_structure(sheet)

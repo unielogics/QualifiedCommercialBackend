@@ -9,6 +9,8 @@ from uuid import UUID
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from app.schemas.application_profile import UnifiedAuditEvent
+from app.schemas.deal_budget import DealBudgetPatch, DealBudgetRead
+from app.schemas.financial_cockpit import FinancialPlanRead, FinancialPlanWrite
 from app.schemas.loan_repayment import LoanRepaymentConfig
 
 
@@ -265,6 +267,10 @@ class ProductionTermSheetBody(BaseModel):
     expected_version: int | None = Field(default=None, ge=0)
     expected_collateral_revision: int | None = Field(default=None, ge=0)
     expected_deal_budget_revision: int | None = Field(default=None, ge=0)
+    deal_budget: DealBudgetPatch | None = None
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
+    expected_plan_updated_at: datetime | None = None
+    financial_plan: FinancialPlanWrite | None = None
     funding_party_kind: Literal["Sponsor", "Qualified Commercial LLC", "Lender"]
     lender_id: UUID | None = None
     funding_party_name: str = Field(default="", max_length=180)
@@ -330,6 +336,32 @@ class ProductionTermSheetBody(BaseModel):
         if isinstance(raw, dict) and "repayment_config" not in raw and isinstance(raw.get("extra"), dict) and "repayment_config" in raw["extra"]:
             return {**raw, "repayment_config": raw["extra"]["repayment_config"]}
         return raw
+
+    @model_validator(mode="after")
+    def _combined_cost_save(self):
+        if self.deal_budget is not None:
+            if not self.idempotency_key or self.financial_plan is None:
+                raise ValueError("Saving loan terms with deal costs requires an idempotency key and the working financial plan")
+            if not {"expected_version", "expected_collateral_revision", "expected_plan_updated_at"}.issubset(self.model_fields_set):
+                raise ValueError("Include the terms version, collateral revision and explicit plan timestamp when saving deal costs")
+            if self.expected_version is None or self.expected_collateral_revision is None:
+                raise ValueError("Include the current terms version and collateral revision")
+            if "expected_updated_at" not in self.financial_plan.model_fields_set:
+                raise ValueError("Include the financial plan timestamp, or explicit null for a new plan")
+            if self.expected_plan_updated_at != self.financial_plan.expected_updated_at:
+                raise ValueError("The financial plan timestamps must describe the same working revision")
+            if self.expected_deal_budget_revision is not None and self.expected_deal_budget_revision != self.deal_budget.expected_revision:
+                raise ValueError("The deal cost revisions must match")
+        elif self.idempotency_key is not None:
+            raise ValueError("An idempotency key for combined terms requires a deal cost budget")
+        return self
+
+    @field_validator("expected_plan_updated_at")
+    @classmethod
+    def _aware_plan_timestamp(cls, value):
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("Expected plan timestamp must include a timezone")
+        return value
 
 
 class ProductionTermSheetRead(BaseModel):
@@ -442,6 +474,8 @@ class ProductionTermSheetState(BaseModel):
 class ProductionTermSheetResult(BaseModel):
     state: ProductionTermSheetState
     final: ProductionPackageRead | None = None
+    financial_plan: FinancialPlanRead | None = None
+    deal_budget: DealBudgetRead | None = None
 
 
 class ProductionTermSheetEmailRequest(BaseModel):

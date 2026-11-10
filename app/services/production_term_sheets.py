@@ -5,6 +5,7 @@ drafted. Append-only versions; one `current` row per profile."""
 from __future__ import annotations
 
 from calendar import monthrange
+from copy import deepcopy
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -253,28 +254,59 @@ def _budget_terms(values):
         "payments_per_year": values.get("payments_per_year") or 12}
 
 
+def _apply_financed_principal(body, structure, gross):
+    """A full term loan follows G; independent approved limits stay separate."""
+    from app.services.deal_budget import number
+
+    approved, basis = number(body.get("approved_amount")), number(structure.get("payment_basis_amount"))
+    initial = number(structure.get("initial_draw_amount"))
+    gross = number(gross)
+    if initial is not None and initial != basis:
+        raise HTTPException(422, "The actual draw and payment basis disagree. Confirm the funded principal before saving loan costs together.")
+    full_facility = approved == basis and (initial is None or initial == approved)
+    if full_facility:
+        body.update(approved_amount=float(gross), payment_basis_amount=float(gross), initial_draw_amount=float(gross))
+    elif (structure.get("facility_kind") in {"revolving_loc", "heloc", "hybrid"}
+            and structure.get("repayment_structure") not in {"fixed_payment", "custom"}
+            and not structure.get("lender_payment_override") and approved is not None and gross <= approved):
+        body.update(payment_basis_amount=float(gross), initial_draw_amount=float(gross))
+    else:
+        raise HTTPException(422, "The calculated funded principal does not fit this independently approved facility or partial draw. Review its approved limit and funded draw before saving financed costs.")
+
+
 async def record_sheet(
     db: AsyncSession, *, profile: ApplicationProfile, user: User, body: dict[str, Any], request: Request | None,
 ) -> tuple[ProductionTermSheet, ProductionPackage | None]:
     """Create or supersede the profile's current term sheet. Returns (sheet, re-applied draft final or None)."""
     require_term_role(user)
-    body = dict(body)
+    body = deepcopy(body)
+    combined = body.get("deal_budget") is not None
+    combined_payload, fingerprint = None, None
+    from app.services import deal_budget
+    if combined:
+        from app.schemas.production_package import ProductionTermSheetBody
+
+        combined_payload = ProductionTermSheetBody.model_validate(body)
+        body = combined_payload.model_dump(mode="json", exclude_unset=True)
+        fingerprint = deal_budget.save_request_fingerprint("production", profile.id, combined_payload.model_dump(mode="json"))
     from app.services.application_terms import lock_profile_terms
 
     await lock_profile_terms(db, profile.id)
-    if isinstance(db, AsyncSession):
-        await db.refresh(profile, attribute_names=["investor_collateral", "deal_budget"])
+    if isinstance(db, AsyncSession) or combined and hasattr(db, "refresh"):
+        await db.refresh(profile, attribute_names=["investor_collateral", "deal_budget", "financial_plan"])
     from app.services.investor_collateral import snapshot as collateral_snapshot
 
     frozen_collateral = collateral_snapshot(profile)
-    from app.services import deal_budget
     frozen_budget = deal_budget.snapshot(profile)
+    previous = await current_sheet(db, profile.id) if combined else None
+    if combined and deal_budget.find_terms_save_receipt(profile, "production", combined_payload.idempotency_key,
+            fingerprint, user, getattr(previous, "id", None), getattr(previous, "version", None)):
+        return previous, None
     expected_budget = body.get("expected_deal_budget_revision")
     if expected_budget is None:
         expected_budget = (body.get("extra") or {}).get("expected_deal_budget_revision")
     if expected_budget is not None and expected_budget != frozen_budget["revision"]:
         raise HTTPException(409, "Deal costs changed. Reload before recording a new terms version.")
-    await deal_budget.enforce_origination_cap(db, profile, frozen_budget, body.get("approved_amount"))
     from app.services.use_of_funds import source_funding_data
     requested_amount, _request_source, _purpose, _dealer = await source_funding_data(db, profile)
     expected_collateral = body.get("expected_collateral_revision")
@@ -282,7 +314,8 @@ async def record_sheet(
         expected_collateral = (body.get("extra") or {}).get("expected_collateral_revision")
     if expected_collateral is not None and expected_collateral != frozen_collateral["revision"]:
         raise HTTPException(status.HTTP_409_CONFLICT, "The collateral disclosure changed. Reload it before recording a new terms version.")
-    previous = await current_sheet(db, profile.id)
+    if not combined:
+        previous = await current_sheet(db, profile.id)
     expected_version = body.get("expected_version")
     if expected_version is not None and expected_version != (previous.version if previous is not None else 0):
         raise HTTPException(status.HTTP_409_CONFLICT, "These production terms changed in another session. Reload before saving a new version.")
@@ -301,6 +334,29 @@ async def record_sheet(
         structure = term_structure.calculate(body, entered_on=now.date())
     except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "term_sheet_invalid", "errors": [str(exc)]}) from exc
+    if combined:
+        from app.services import financial_plan
+
+        draft = combined_payload.financial_plan
+        financial_plan.validate_plan_write(getattr(profile, "financial_plan", None), draft)
+        if deal_budget._timestamp((getattr(profile, "financial_plan", None) or {}).get("updated_at")) != deal_budget._timestamp(combined_payload.expected_plan_updated_at):
+            raise HTTPException(409, "The financial plan changed. Reload before saving the loan and costs together.")
+        frozen_budget, principal = await deal_budget.stage_for_terms(db, profile, combined_payload.deal_budget, _budget_terms({**body, **structure}), user)
+        _apply_financed_principal(body, structure, principal["gross_loan_amount"])
+        try:
+            structure = term_structure.calculate(body, entered_on=now.date())
+        except ValueError as exc:
+            raise HTTPException(422, detail={"code": "term_sheet_invalid", "errors": [str(exc)]}) from exc
+        expected_budget = frozen_budget["revision"]
+        record = draft.model_dump(mode="json", exclude={"expected_updated_at", "expected_deal_budget_revision"})
+        overrides = dict(record.get("overrides") or {})
+        if structure.get("debt_service_treatment") != "refinance" and (overrides.get("debt_service_note") or "").startswith("Refinance per "):
+            overrides.pop("debt_service_monthly", None)
+            overrides.pop("debt_service_note", None)
+            record["overrides"] = overrides or None
+        record.update(updated_at=now.isoformat(), updated_by=str(user.id))
+        profile.financial_plan = financial_plan.normalize_plan(record)
+    await deal_budget.enforce_origination_cap(db, profile, frozen_budget, _budget_terms({**body, **structure})["amount"] if combined else body.get("approved_amount"))
     from app.services.financial_plan_budget import validate_write
     validate_write(frozen_budget, expected_budget, _budget_terms({**body, **structure}))
     await _add_dscr_snapshot(db, profile, structure, frozen_budget,
@@ -313,6 +369,10 @@ async def record_sheet(
         term_months=int(body.get("term_months") or 0),
     )
     body["extra"] = term_structure.stored_extra(body.get("extra"), structure)
+    if combined:
+        # Only new combined versions opt into this funded-principal adapter;
+        # historical unconfigured sheets retain their previous interpretation.
+        body["extra"]["combined_funded_principal_v1"] = True
     # Security belongs to this immutable version, regardless of any stale or
     # caller-supplied snapshot in extra. Legacy sheets are left unrecorded.
     body["extra"].update(collateral_snapshot=frozen_collateral, collateral_revision=frozen_collateral["revision"])
@@ -389,6 +449,8 @@ async def record_sheet(
         from app.services.production_packages import reapply_terms
 
         reapplied = await reapply_terms(db, child, sheet, user)
+    if combined:
+        deal_budget.record_terms_save_receipt(profile, "production", combined_payload.idempotency_key, fingerprint, user, sheet.id, sheet.version)
     return sheet, reapplied
 
 
