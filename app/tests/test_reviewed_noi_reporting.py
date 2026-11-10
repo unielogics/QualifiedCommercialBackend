@@ -8,9 +8,15 @@ import fitz
 import pytest
 
 from app.capital_partners.services.listings import partner_operating_earnings
-from app.services.financial_metric_reporting import current_review_projection, operating_earnings_brief
+from app.services.financial_metric_reporting import (
+    current_review_projection,
+    operating_earnings_brief,
+)
 from app.services.investor_presentation_pdf import render_investor_presentation_pdf
-from app.services.public_underwriting_packet_pdf import _operating_earnings_lines, render_underwriting_packet_pdf
+from app.services.public_underwriting_packet_pdf import (
+    _operating_earnings_lines,
+    render_underwriting_packet_pdf,
+)
 from app.tests.test_financial_metric_review import build
 from app.tests.test_financial_noi_integration import annual
 from app.tests.test_investor_presentation import synthetic_financials
