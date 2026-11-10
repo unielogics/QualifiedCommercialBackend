@@ -18,7 +18,8 @@ def _money(value, currency):
     if value in (None, ""):
         return "Not available"
     amount = float(value)
-    return f"{'-' if amount < 0 else ''}${abs(amount):,.2f}" if currency == "USD" else f"{html.escape(currency)} {amount:,.2f}"
+    code = str(currency or "").upper()
+    return f"{'-' if amount < 0 else ''}${abs(amount):,.2f}" if code == "USD" else f"{html.escape(code or 'Currency unconfirmed')} {amount:,.2f}"
 
 
 def _ratio(value):
@@ -48,15 +49,22 @@ def _before_after(summary, currency):
     ]
     rows = []
     for label, current_key, key, ratio in metrics:
-        show = _ratio if ratio else lambda value: _money(value, currency)
+        row_currency = baseline.get("noi_currency", currency) if key == "noi" else currency
+        show = _ratio if ratio else lambda value, code=row_currency: _money(value, code)
         rows.append(f"<tr><td>{label}</td><td class='num'>{show(baseline.get(current_key))}</td><td class='num'>{show(proposed.get(key))}</td><td class='num'>{show(approved.get(key))}</td></tr>")
+    noi = baseline.get("noi_governance") or {}
+    noi_basis = ""
+    if noi:
+        noi_basis = (f"<p class='muted'>NOI basis: {_text(noi.get('label') or baseline.get('noi_label'))}; "
+                     f"{_text(noi.get('period') or baseline.get('noi_period'))}; {_text(noi.get('currency') or baseline.get('noi_currency'))}. "
+                     f"Status: {_text(noi.get('status'))}. {_text(noi.get('status_reason'))}</p>")
     totals = summary.get("totals") or {}
     impacts = "".join(f"<tr><td>{label}</td><td class='num'>{_money((totals.get('proposed') or {}).get(key), currency)}</td><td class='num'>{_money((totals.get('approved') or {}).get(key), currency)}</td></tr>"
         for key, label in (("annual_impact", "Net annual improvement"), ("monthly_impact", "Monthly improvement"), ("first_year_impact", "First-year improvement"), ("one_time_cost", "One-time implementation cost")))
     warnings = list(dict.fromkeys([*(summary.get("missing") or []), *(summary.get("risk_flags") or []), *(summary.get("notes") or [])]))
     warning_html = "<h3>Missing confirmations and risks</h3><ul>" + "".join(f"<li>{_text(item)}</li>" for item in warnings) + "</ul>" if warnings else ""
     return f"<h2>Earnings and coverage - before and after</h2><p class='muted'>Selected baseline: {_text(baseline.get('period'))}; {_text(baseline.get('currency'))}; {_text(baseline.get('basis'))} basis. Proposed and staff-reviewed columns are conditional illustrations; financing proceeds and principal repayments do not create earnings.</p>" + \
-        "<table><thead><tr><th>Measure</th><th>Current baseline</th><th>All proposals</th><th>Staff-reviewed adjustments</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>" + \
+        noi_basis + "<table><thead><tr><th>Measure</th><th>Current baseline</th><th>All proposals</th><th>Staff-reviewed adjustments</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>" + \
         "<h3>Adjustment totals</h3><table><thead><tr><th>Impact</th><th>All proposals</th><th>Staff-reviewed adjustments</th></tr></thead><tbody>" + impacts + "</tbody></table>" + warning_html
 
 

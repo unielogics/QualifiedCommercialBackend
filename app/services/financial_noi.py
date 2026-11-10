@@ -23,6 +23,7 @@ DEFINITION = {
 }
 PL_CLASSES = {"current_p_and_l", "profit_and_loss", "income_statement"}
 TAX_CLASSES = {"tax_return", "business_tax_return"}
+NOI_POLICY_VERSION = "business-noi-v2"
 ALIASES = {
     "gross_revenue": ("gross_revenue", "revenue", "total_revenue", "gross_receipts", "sales", "gross_sales", "total_sales"),
     "cost_of_goods_sold": ("cost_of_goods_sold", "cogs"),
@@ -212,6 +213,142 @@ def _trend(years):
             "reason": None if comparable else empty["reason"]}
 
 
+def _automatic_tax(source, metric_review):
+    values = source["tax_operands"]
+    value = source["proposed_annual_value"]
+    annual = value if source.get("months_covered") == 12 else None
+    inputs = [item["key"] for item in (metric_review or {}).get("inputs", [])
+              if item.get("key", "").startswith(f"tax_return:{source['file_id']}:")
+              and item["key"].endswith((".income", ".interest"))]
+    return {"key": f"noi-tax:{source['file_id']}", "kind": "tax_derived_noi", "label": "Tax-derived NOI estimate",
+        "value": value, "annualized_value": annual, "year": str(source["year"]) if source.get("year") else None,
+        "period": f"{source['period_start']} – {source['period_end']}" if source.get("period_start") and source.get("period_end") else f"Tax year {source['year']} (reporting duration unconfirmed)" if source.get("year") else "Unknown tax reporting period",
+        "period_start": source.get("period_start"), "period_end": source.get("period_end"),
+        "months_covered": source.get("months_covered"), "annualization_factor": 1 if annual is not None else None,
+        "annualized_run_rate": False, "currency": source.get("currency"), "basis": source.get("basis"),
+        "complete": True, "provisional": True, "tax_derived_estimate": True, "staff_reviewed": False,
+        "staff_adjusted": False, "source_accepted": source["accepted"], "entity_comparable": True,
+        "entity_mismatch": False, "reconciliation_required": False,
+        "formula": "ordinary business tax income + known deducted interest (D&A remains expensed)",
+        "source_value": value, "reviewed_value": None, "input_keys": inputs, "active_input_keys": inputs,
+        "missing_inputs": [], "fundamentals": [
+            {"key": "ordinary_business_income", "label": "Ordinary business tax income", "value": values["income"], "signed_value": values["income"], "source_refs": source["source_refs"]},
+            {"key": "interest", "label": "Known deducted interest", "value": values["interest"], "signed_value": values["interest"], "source_refs": source["source_refs"]}],
+        "notes": [*source["notes"], "Automatic provisional estimate only. Review its business, annual reporting period, tax/book differences and non-operating items before relying on it; no program condition is approved."],
+        "source_refs": source["source_refs"]}
+
+
+def _automatic_basis(review, candidates, metric_review):
+    from app.services.financial_noi_review import period_key
+
+    sources = review["sources"]
+    latest = review["latest_period"]
+    current = [row for row in sources if row["belongs_to_business"] and not row["automatic_reason"] and period_key(row) == latest]
+    eligible = [row for row in current if row["automatic_eligible"]]
+    by_file = {row["source_refs"][0]["file_id"]: row for row in candidates}
+    pl = [by_file[row["file_id"]] for row in eligible if row["kind"] == "profit_and_loss"
+          and row["file_id"] in by_file and by_file[row["file_id"]]["value"] is not None]
+    if pl:
+        return max(pl, key=lambda row: (bool(row["complete"]), not row["provisional"], row["key"])), []
+    tax = [row for row in eligible if row["kind"] == "business_tax_return" and row["proposed_annual_value"] is not None]
+    if tax:
+        return _automatic_tax(tax[0], metric_review), ["tax_estimate"]
+    if current and not eligible:
+        return None, ["business_identity_review"]
+    older_tax = [row for row in sources if row["automatic_eligible"] and row["kind"] == "business_tax_return"
+                 and row["proposed_annual_value"] is not None and period_key(row) < latest]
+    if older_tax:
+        return _automatic_tax(max(older_tax, key=period_key), metric_review), ["tax_estimate", "older_tax_fallback"]
+    if any(row["belongs_to_business"] and row["automatic_reason"] for row in sources) and not current:
+        return None, ["forecast_or_future_source"]
+    return None, ["missing_noi_operands"]
+
+
+def _governance(headline, review, automatic_codes):
+    from app.services.financial_metric_review import stamp
+
+    source = next((row for row in review["sources"] if headline and any(
+        ref.get("file_id") == row["file_id"] for ref in headline.get("source_refs", []))), None)
+    limitations = []
+    if source and not source["accepted"]:
+        limitations.append("source_not_accepted")
+    if source and not any(row.get("status") == "verified" for row in source.get("citation_status", {}).values()):
+        limitations.append("source_quotations_unverified")
+    if headline and headline.get("tax_derived_estimate"):
+        limitations.append("tax_book_and_non_operating_review")
+    if headline and headline.get("staff_reviewed") and not headline.get("source_refs"):
+        limitations.append("manual_without_linked_source")
+    if headline and headline.get("forecast_assumption"):
+        limitations.append("forecast_or_future_reporting_assumption")
+    if review["stale"]:
+        status, reason, codes = "stale", review["stale_reason"], ["review_source_changed"]
+    elif headline and headline.get("staff_reviewed"):
+        status, reason, codes = "reviewed", "Staff explicitly reviewed this annual NOI basis. Source limitations remain disclosed; document acceptance and program qualification are separate.", ["explicit_staff_review"]
+        if headline.get("forecast_assumption"):
+            reason = "Staff explicitly reviewed this annual NOI assumption from forecast or future-period information. It is not historical actual income, document acceptance or program qualification."
+            codes.append("forecast_or_future_reporting_assumption")
+    elif headline:
+        codes = list(automatic_codes)
+        if headline.get("annualized_value") is None:
+            codes.append("annual_period_unconfirmed")
+        if not headline.get("currency"):
+            codes.append("currency_unconfirmed")
+        if headline.get("reconciliation_required"):
+            codes.append("financing_expenses_need_reconciliation")
+        if headline.get("annualized_run_rate"):
+            codes.append("annualized_run_rate")
+        if headline.get("provisional") and not codes:
+            codes.append("source_reconciliation_needed")
+        if source and not source["accepted"]:
+            codes.append("source_not_accepted")
+        status = "provisional" if codes else "source_supported"
+        reason = ("A newer business reporting period is incomplete. This explicitly dated older tax estimate is shown for review, rather than substituted as current-year P&L income."
+                  if "older_tax_fallback" in codes else
+                  "Tax-derived operating-income estimate: ordinary business tax income plus known deducted interest, with D&A retained as an expense. Staff review is required; it is not verified P&L income or program eligibility."
+                  if "tax_estimate" in codes else
+                  "The source amount is computable, but its reporting period, currency or operating-expense reconciliation needs staff review."
+                  if codes else "The latest supported business P&L supplies operating income. Refinancing and EBITDA remain separate.")
+    else:
+        status, codes = "unavailable", list(automatic_codes)
+        reason = ("The latest business source's identity or association needs review before NOI can be used."
+                  if "business_identity_review" in codes else
+                  "Only forecast or future-period business sources are available. Add a completed historical P&L or business tax return, or explicitly review an annual NOI assumption."
+                  if "forecast_or_future_source" in codes else
+                  "The latest business P&L has missing operating-income inputs for the latest business reporting period, and no computable business tax estimate is available. Tax net income alone is not NOI: tax income and deducted interest must both be known; missing operands are never assumed to be zero.")
+    result = {"policy_version": NOI_POLICY_VERSION, "status": status,
+        "review_needed": status not in {"source_supported", "reviewed"}, "status_reason": reason,
+        "reason_codes": list(dict.fromkeys(codes)), "source_limitations": limitations}
+    result["authority_stamp"] = stamp({**result, "headline": {key: (headline or {}).get(key) for key in (
+        "key", "kind", "value", "annualized_value", "year", "period_start", "period_end", "currency", "basis")},
+        "financial_source": source.get("financial_stamp") if source else None,
+        "identity": review["entity_stamp"], "latest_period": review["latest_period"],
+        "review_id": (review.get("current") or {}).get("id")})
+    return result
+
+
+def _residual_comparable(headline):
+    return bool(headline and number(headline.get("annualized_value")) is not None
+                and headline.get("currency") == "USD" and not headline.get("reconciliation_required"))
+
+
+def _operating_adjustments(headline, items):
+    if not (_residual_comparable(headline) and headline.get("complete") and not headline.get("provisional")):
+        return []
+    adjustments, used = [], set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        amount = number(item.get("amount_annual"))
+        identity = str(item.get("id") or f"{item.get('kind')}:{item.get('label')}:{amount}:{item.get('source')}")
+        if (amount is not None and amount > 0 and item.get("kind") in {"owner_salary", "one_time_expense", "rent_to_owner"}
+                and item.get("status") == "hypothetical_unverified"
+                and all(str(item.get(key) or "").strip() for key in ("label", "note", "source")) and identity not in used):
+            used.add(identity)
+            adjustments.append({key: item.get(key) for key in ("id", "kind", "label", "note", "source", "status")}
+                               | {"amount_annual": amount})
+    return adjustments
+
+
 def preview_scenario(noi, evaluation):
     """Reuse the current source NOI while replacing only unsaved plan effects."""
     from copy import deepcopy
@@ -219,12 +356,12 @@ def preview_scenario(noi, evaluation):
     scenario = deepcopy(noi.get("scenario") or {})
     headline = noi.get("headline") or {}
     current, operating = number(scenario.get("current")), number(evaluation.get("annual_new_operating_expenses", 0))
-    comparable = headline.get("currency") == "USD" and headline.get("complete") and not headline.get("provisional") and not headline.get("reconciliation_required")
-    adjustments = [row for row in (evaluation.get("ebitda") or {}).get("adjusted_annual", {}).get("adjustments", [])
-        if row.get("kind") in {"owner_salary", "one_time_expense", "rent_to_owner"} and row.get("status") == "hypothetical_unverified"] if comparable else []
+    comparable = _residual_comparable(headline)
+    adjustments = _operating_adjustments(headline,
+        (evaluation.get("ebitda") or {}).get("adjusted_annual", {}).get("adjustments", []))
     total = sum(number(row.get("amount_annual")) or 0 for row in adjustments)
     planned = round(current + total - operating, 2) if current is not None and operating is not None and (headline.get("currency") == "USD" or total == operating == 0) else None
-    debt = number(evaluation.get("debt_service_after_annual"))
+    debt = number(evaluation.get("debt_service_after_annual")) if evaluation.get("active") and not evaluation.get("coverage_unavailable_reason") else None
     scenario.update(plan=planned, operating_adjustments=deepcopy(adjustments), annual_new_operating_expenses=operating,
         annual_debt_service_plan=debt, after_debt_service_plan=round(planned - debt, 2) if comparable and planned is not None and debt is not None else None)
     return scenario
@@ -233,7 +370,7 @@ def preview_scenario(noi, evaluation):
 def build_noi(analyses, *, statement=None, entity=None, metric_review=None,
               current_annual_debt_service=None, plan_annual_debt_service=None,
               operating_adjustments=None, source_selection=None, additional_operating_expense_annual=0,
-              review_state=None):
+              review_state=None, now=None):
     """Build source-bound operating income without changing evidence or reviews."""
     from app.services.document_associations import identity_matches, source_excluded
     from app.services.financial_tax_earnings import tax_source_is_business
@@ -292,32 +429,30 @@ def build_noi(analyses, *, statement=None, entity=None, metric_review=None,
     years = list(by_period.values())
     from app.services import financial_noi_review
 
-    source_headline, source_reason = headline, reason
-    review = financial_noi_review.prepare(analyses, candidates, state=review_state, entity=entity)
+    # Retain the legacy candidate preparation for old review-stamp compatibility;
+    # the independent NOI policy now selects its own operating-income basis.
+    pnl_headline = headline
+    review = financial_noi_review.prepare(analyses, candidates, state=review_state, entity=entity, metric_review=metric_review, now=now)
+    historical_ids = {row["file_id"] for row in review["sources"] if not row["automatic_reason"]}
+    years = [row for row in years if row["source_refs"][0]["file_id"] in historical_ids]
+    headline, automatic_codes = _automatic_basis(review, candidates, metric_review)
+    for item in candidates:
+        item["selected"] = item is headline
+        item["historical_comparison_only"] = item is not headline
+        item["automatic_eligible"] = item["source_refs"][0]["file_id"] in historical_ids
+    source_headline = headline
+    source_reason = _governance(headline, {**review, "stale": False}, automatic_codes)["status_reason"] if not headline else None
     if review["mode"] != "automatic":
         headline = financial_noi_review.effective(review)
-        reason = ("Financial source evidence changed. Review and save the annual NOI basis again."
-                  if review["stale"] else None)
+    governance = _governance(headline, review, automatic_codes)
+    reason = governance["status_reason"] if headline is None else None
     annual = headline.get("annualized_value") if headline else None
     usd = bool(headline and headline.get("currency") == "USD")
-    residual_comparable = usd and not headline.get("reconciliation_required") if headline else False
+    residual_comparable = _residual_comparable(headline)
     current_debt, plan_debt = number(current_annual_debt_service), number(plan_annual_debt_service)
     current_debt = current_debt if current_debt is not None and current_debt >= 0 else None
     plan_debt = plan_debt if plan_debt is not None and plan_debt >= 0 else None
-    adjustments, used_adjustments = [], set()
-    for item in operating_adjustments or []:
-        if not isinstance(item, dict):
-            continue
-        amount = number(item.get("amount_annual"))
-        identity = str(item.get("id") or f"{item.get('kind')}:{item.get('label')}:{amount}:{item.get('source')}")
-        if (amount is not None and amount > 0 and item.get("kind") in {"owner_salary", "one_time_expense", "rent_to_owner"}
-                and item.get("status") == "hypothetical_unverified" and usd and headline.get("complete")
-                and not headline.get("provisional") and not headline.get("reconciliation_required")
-                and all(str(item.get(key) or "").strip() for key in ("label", "note", "source"))
-                and identity not in used_adjustments):
-            used_adjustments.add(identity)
-            adjustments.append({key: item.get(key) for key in ("id", "kind", "label", "note", "source", "status")}
-                               | {"amount_annual": amount})
+    adjustments = _operating_adjustments(headline, operating_adjustments)
     new_operating = number(additional_operating_expense_annual)
     planned = round(annual + sum(item["amount_annual"] for item in adjustments) - new_operating, 2) if annual is not None and new_operating is not None and (usd or new_operating == 0) else None
     scenario_notes = ["Refinancing changes debt service, not business operating income. Loan proceeds, principal payments and interest savings are not operating-income addbacks.",
@@ -332,10 +467,13 @@ def build_noi(analyses, *, statement=None, entity=None, metric_review=None,
         scenario_notes.append("The plan's operating adjustments are explicit staff hypotheses, not verified NOI or lender-accepted facts. The historical operating result stays unchanged.")
     if new_operating is None or new_operating:
         scenario_notes.append("New recurring budget rows classified as operating expenses reduce projected operating income once. Financing charges, capitalized fees and escrow do not alter historical NOI.")
-    return {"definition": dict(DEFINITION), "headline": headline, "candidates": candidates, "years": years,
+    if governance["status"] == "provisional":
+        scenario_notes.append("Provisional operating-income illustration only. The NOI review status and source limitations also apply to every after-debt-service amount; this does not establish program qualification.")
+    return {**governance, "definition": dict(DEFINITION), "headline": headline, "candidates": candidates, "years": years,
             "trend": _trend(years), "reason": reason, "source_headline": source_headline,
-            "source_reason": source_reason, "review": review,
+            "source_reason": source_reason, "pnl_headline": pnl_headline, "review": review,
             "scenario": {"current": annual, "plan": planned, "operating_adjustments": adjustments,
+                         **{key: governance[key] for key in ("policy_version", "status", "review_needed", "status_reason", "reason_codes", "authority_stamp")},
                          "annual_new_operating_expenses": new_operating,
                          "annual_debt_service_current": current_debt, "annual_debt_service_plan": plan_debt,
                          "after_debt_service_current": round(annual - current_debt, 2) if residual_comparable and annual is not None and current_debt is not None else None,

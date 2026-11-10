@@ -119,20 +119,22 @@ def test_latest_printed_calendar_year_tax_label_prevents_older_pl_noi_fallback()
 
 def test_printed_year_without_pl_dates_does_not_invent_an_annual_noi_period():
     result = build([source(tax_year="Calendar year 2025", period_start=None, period_end=None)])
-    assert result["headline"] is None
+    assert result["headline"]["value"] == 50000
+    assert result["status"] == "provisional" and result["review_needed"]
     assert result["candidates"][0]["months_covered"] is None
     assert result["candidates"][0]["annualized_value"] is None
     assert result["years"] == []
 
 
-def test_latest_excluded_pl_does_not_substitute_an_older_period():
+def test_ebitda_exclusions_do_not_change_independent_latest_noi():
     result = build([source(2024), source(2025)], source_selection={"excluded_file_ids": ["pnl-2025"]})
-    assert result["headline"] is None and "excluded" in result["reason"]
+    assert result["headline"]["source_refs"][0]["file_id"] == "pnl-2025"
 
 
-def test_stale_source_review_blocks_current_noi_until_review():
+def test_stale_ebitda_source_review_does_not_block_independent_noi():
     result = build([source()], source_selection={"stale": True})
-    assert result["headline"] is None and "evidence changed" in result["reason"]
+    assert result["headline"]["value"] == 50000
+    assert result["status"] == "source_supported"
 
 
 @pytest.mark.parametrize("status", ["denied", "stale"])

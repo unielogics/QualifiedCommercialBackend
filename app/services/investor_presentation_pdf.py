@@ -415,8 +415,11 @@ def _open_conditions(financials, improvement, terms, *, requested_amount=None):
         if not reason and historical_noi.get("value") is not None:
             reason = "Review the reporting period and annual NOI in Financials > NOI > Calculate / override NOI."
         missing.append("NOI: " + str(reason or "Select a P&L or business tax return, or save a reviewed manual annual NOI in Financials."))
-    elif historical_noi.get("provisional") or historical_noi.get("reconciliation_required"):
-        missing.append("NOI is provisional. Review its source, reporting period and operating expenses before relying on the figure.")
+    elif noi.get("review_needed") or ("review_needed" not in noi and (historical_noi.get("provisional") or historical_noi.get("reconciliation_required"))):
+        if noi.get("status_reason"):
+            missing.append("NOI review: " + str(noi["status_reason"]))
+        else:
+            missing.append("NOI is provisional. Review its source, reporting period and operating expenses before relying on the figure.")
     if metrics.get("annual_ebitda") is None:
         missing.append("Validated P&L EBITDA is unavailable. " + str(earnings.get("historical_unavailable_reason") or "Review the latest P&L inputs; tax-derived coverage earnings remain a separate estimate."))
     requested = _number(requested_amount if requested_amount is not None else _record(financials.get("use_of_funds")).get("requested_amount"))
@@ -605,16 +608,18 @@ def render_investor_presentation_pdf(*, intake: Any, financials: dict, generated
     page = _slide(doc, "Earnings, coverage and operating actions", business, stamp, 3)
     snapshot = _record(improvement.get("snapshot"))
     snapshot_note = snapshot.get("label") or "Published financial evidence; operating plan not included or unavailable"
-    if noi_basis.get("staff_reviewed"):
+    if noi_basis:
         noi_sources = list(dict.fromkeys(str(row.get("file_name")) for row in _records(noi_basis.get("source_refs")) if row.get("file_name")))
-        snapshot_note += " | NOI basis: " + str(noi_basis.get("period") or noi_basis.get("year") or "period unknown") + "; " + ("; ".join(noi_sources) if noi_sources else "manual staff review")
-    _text(page, (35, 94, 925, 121), snapshot_note, size=10 if noi_basis.get("staff_reviewed") else 11, bold=True, color=TEAL)
+        snapshot_note += " | NOI basis: " + str(noi_basis.get("period") or noi_basis.get("year") or "period unknown") + "; " + ("; ".join(noi_sources) if noi_sources else "manual staff review" if noi_basis.get("staff_reviewed") else "source review")
+        if _record(earnings.get("noi")).get("status"):
+            snapshot_note += "; status " + str(earnings["noi"]["status"]).replace("_", " ")
+    _text(page, (35, 94, 925, 121), snapshot_note, size=10 if noi_basis else 11, bold=True, color=TEAL)
     headings = [(40, 333, "ANNUAL / MONTHLY BASIS"), (345, 530, "CURRENT"), (546, 730, "REFINANCE"), (745, 922, "OPERATING PROPOSALS")]
     for x0, x1, label in headings:
         _text(page, (x0, 131, x1, 152), label, size=9, bold=True, color=MUTE)
     earnings_value = metrics.get("dscr_earnings") if metrics.get("dscr_earnings") is not None else historical.get("annualized_value")
     rows = [
-        (("NOI - reviewed tax estimate" if noi_basis.get("tax_derived_estimate") else "NOI - staff-reviewed" if noi_basis.get("staff_reviewed") else "NOI / operating income") + (f" ({noi_basis['year']})" if noi_basis.get("staff_reviewed") and noi_basis.get("year") else ""), metrics.get("annual_noi"), _record(_record(earnings.get("noi")).get("scenario")).get("plan") if plan.get("active") else None, proposed.get("noi"), lambda value: _money(value, noi_currency)),
+        (("NOI - reviewed assumption" if noi_basis.get("forecast_assumption") else "NOI - reviewed tax estimate" if noi_basis.get("tax_derived_estimate") and noi_basis.get("staff_reviewed") else "NOI - tax estimate" if noi_basis.get("tax_derived_estimate") else "NOI - staff-reviewed" if noi_basis.get("staff_reviewed") else "NOI / operating income") + (f" ({noi_basis['year']})" if noi_basis.get("year") else ""), metrics.get("annual_noi"), _record(_record(earnings.get("noi")).get("scenario")).get("plan") if plan.get("active") else None, proposed.get("noi"), lambda value: _money(value, noi_currency)),
         ("Annual EBITDA (validated P&L)", metrics.get("annual_ebitda"), _record(impact.get("ebitda")).get("annual_after") if metrics.get("annual_ebitda") is not None else None, operating_ebitda_projection(financials), _money),
         ("Coverage earnings basis", earnings_value, _record(impact.get("income_annual")).get("after"), proposed.get("earnings"), lambda value: _money(value, source_currency)),
         ("Signed DSCR / with new costs" if cost_budget else "Signed DSCR", metrics.get("dscr"), _record(impact.get("dscr")).get("after"), proposed.get("dscr_current"), _ratio),

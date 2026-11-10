@@ -427,6 +427,8 @@ def redact_for_external(cockpit, actor):
     result["operating_evidence"] = {}
     noi = result.get("noi") or {}
     noi.pop("review", None)
+    noi.pop("authority_stamp", None)
+    (noi.get("scenario") or {}).pop("authority_stamp", None)
     for calculation in [noi.get("headline"), *((result.get("metric_review") or {}).get("calculations") or [])]:
         if isinstance(calculation, dict):
             calculation.pop("review_receipt", None)

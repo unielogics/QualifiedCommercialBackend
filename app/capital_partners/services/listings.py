@@ -196,12 +196,20 @@ def partner_operating_earnings(value: Any) -> dict[str, Any] | None:
     """Published figures without access to the file's private source inventory."""
     if not isinstance(value, dict):
         return None
+    from app.services.financial_metric_reporting import noi_governance_brief
 
     def fields(row, keys):
         return {key: row[key] for key in keys if key in row} if isinstance(row, dict) else {}
 
     trend = value.get("revenue_trend") or {}
     noi = value.get("noi") or {}
+    noi_governance = noi_governance_brief(noi, internal=False)
+    if noi and not noi.get("policy_version"):
+        previous = noi.get("historical") or {}
+        noi_governance.update(policy_version="legacy-unversioned",
+            status="provisional" if previous.get("annualized_value") is not None or previous.get("value") is not None else "unavailable",
+            review_needed=True, status_reason="This published NOI snapshot predates the current calculation policy. Refresh the financial package to review its NOI basis.",
+            reason_codes=["legacy_noi_snapshot"])
     potential = value.get("potential") or {}
     improvement = value.get("improvement_plan") or {}
 
@@ -222,7 +230,8 @@ def partner_operating_earnings(value: Any) -> dict[str, Any] | None:
     safe_improvement = None
     if improvement:
         safe_improvement = {
-            "baseline": fields(improvement.get("baseline"), ("period", "currency", "basis", "revenue", "earnings", "earnings_kind", "noi", "dscr", "annual_debt_service", "provisional")),
+            "baseline": {**fields(improvement.get("baseline"), ("period", "currency", "basis", "revenue", "earnings", "earnings_kind", "noi", "noi_kind", "noi_label", "noi_year", "noi_period", "noi_currency", "noi_basis", "noi_staff_reviewed", "noi_provisional", "dscr", "annual_debt_service", "provisional")),
+                "noi_governance": noi_governance_brief((improvement.get("baseline") or {}).get("noi_governance"), internal=False)},
             "projection": {key: plan_projection((improvement.get("projection") or {}).get(key)) for key in ("proposed", "approved")},
             "totals": {key: fields((improvement.get("totals") or {}).get(key), ("annual_impact", "monthly_impact", "first_year_impact", "one_time_cost", "complete", "count")) for key in ("proposed", "approved")},
             "adjustments": [plan_adjustment(row) for row in improvement.get("adjustments", []) if isinstance(row, dict)],
@@ -256,6 +265,8 @@ def partner_operating_earnings(value: Any) -> dict[str, Any] | None:
             "forecast": fields(potential.get("forecast"), ("status", "earnings", "revenue", "kind", "dscr_current", "dscr_plan")) or None,
         } if potential else None,
         "noi": {
+            **noi_governance,
+            "reason": noi.get("reason"),
             "definition": fields(noi.get("definition"), ("key", "label", "formula", "includes_depreciation_and_amortization")),
             "historical": fields(noi.get("historical"), ("value", "annualized_value", "label", "kind", "period", "year", "months_covered", "currency", "basis", "complete", "provisional", "staff_reviewed", "tax_derived_estimate", "source_accepted")) or None,
             "source_historical": fields(noi.get("source_historical"), ("value", "annualized_value", "label", "kind", "period", "year", "currency", "basis", "complete", "provisional")) or None,

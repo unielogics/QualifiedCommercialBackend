@@ -1272,6 +1272,9 @@ class IntelligenceMetric(BaseModel):
     period: str | None = None
     source: str | None = None
     action: str | None = None
+    calculation_status: str | None = None
+    review_needed: bool = False
+    status_reason: str | None = None
 
 
 class ApplicationIntelligenceRead(BaseModel):
