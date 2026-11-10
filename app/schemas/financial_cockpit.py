@@ -222,7 +222,7 @@ class DebtRowPatch(BaseModel):
     secured: Literal["secured", "unsecured"] | None = None
     collateral: str | None = Field(default=None, max_length=500)
     notes: str | None = Field(default=None, max_length=2000)
-    #: Asked of an advance and nothing else: modified for lower sales, and what changed.
+    #: Asked of an advance: whether its terms or payments were modified, and what changed.
     mca_modified: bool | None = None
     mca_modification_note: str | None = Field(default=None, max_length=1000)
     count_in_dscr: bool | None = None

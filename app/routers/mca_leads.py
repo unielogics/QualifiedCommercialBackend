@@ -11,7 +11,7 @@ from typing import Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,18 +20,21 @@ from app.db import get_db
 from app.models.activity import Activity
 from app.models.client import Client
 from app.schemas.phone import RequiredPhone
+from app.services import mca_funding_policy
 from app.services.payment_authorization import primary_super_admin
 
 router = APIRouter(prefix="/public/mca", tags=["public-mca"])
-CONSENT_VERSION = "mca-funding-review-v1"
+CONSENT_VERSION = "mca-funding-review-v2"
 CONSENT_TEXT = (
     "I authorize Qualified Commercial to contact me by phone or email about this funding review. "
-    "I confirm that my business has no more than 2 active MCAs. "
+    "I confirm that my business has no more than 2 existing active MCAs, no modified active MCA, "
+    "and nonnegative reported ordinary business income on its prior-year business tax return before addbacks. "
     "I have read the Privacy Policy and Terms."
 )
 CONSENT_TEXT_ES = (
     "Autorizo a Qualified Commercial a contactarme por teléfono o correo sobre esta revisión. "
-    "Confirmo que mi negocio no tiene más de 2 MCA vigentes. "
+    "Confirmo que mi negocio tiene como máximo 2 MCA vigentes existentes, ningún MCA vigente modificado "
+    "e ingresos ordinarios reportados no negativos en su declaración de impuestos del año anterior, antes de ajustes. "
     "He leído la Política de Privacidad y los Términos."
 )
 _LAST_SUBMIT: dict[str, float] = {}
@@ -62,6 +65,9 @@ class McaLeadRequest(BaseModel):
     phone: RequiredPhone
     # Strict rejects booleans, decimal counts, and string-based gate bypasses.
     active_mca_count: int = Field(strict=True, ge=0, le=2)
+    has_modified_mca: bool = Field(strict=True)
+    last_year_tax_earnings: Literal["nonnegative", "negative", "unknown"]
+    tax_year: int = Field(strict=True)
     requested_amount: Range | Literal["not_sure"]
     monthly_revenue: Range
     time_in_business: Literal["under_6_months", "6_12_months", "1_2_years", "2_plus_years"]
@@ -69,6 +75,27 @@ class McaLeadRequest(BaseModel):
     locale: Literal["en", "es"] = "en"
     attribution: Attribution
     website: str = Field(default="", max_length=0)
+
+    @field_validator("has_modified_mca")
+    @classmethod
+    def unmodified_active_mcas(cls, value: bool) -> bool:
+        if value:
+            raise ValueError("This product requires no modified active MCA.")
+        return value
+
+    @field_validator("last_year_tax_earnings")
+    @classmethod
+    def nonnegative_reported_income(cls, value: str) -> str:
+        if value != "nonnegative":
+            raise ValueError("Confirm nonnegative reported ordinary business tax income before addbacks.")
+        return value
+
+    @field_validator("tax_year")
+    @classmethod
+    def prior_calendar_tax_year(cls, value: int) -> int:
+        if value != mca_funding_policy.required_tax_year():
+            raise ValueError(f"Use the {mca_funding_policy.required_tax_year()} business tax return.")
+        return value
 
 
 class McaLeadResult(BaseModel):
@@ -84,6 +111,12 @@ def _lead_id(key: UUID) -> UUID:
 def _check_replay(client: Client, payload: McaLeadRequest) -> None:
     if client.source_channel != "mca_funding" or (client.email or "").casefold() != str(payload.email).casefold():
         raise HTTPException(status.HTTP_409_CONFLICT, "Start a new request for these contact details.")
+    saved = client.lead_intake if isinstance(getattr(client, "lead_intake", None), dict) else {}
+    if (saved.get("consent_version") != CONSENT_VERSION
+            or (saved.get("mca_product_policy") or {}).get("policy_version") != mca_funding_policy.POLICY_VERSION
+            or any(saved.get(key) != getattr(payload, key) for key in (
+                "active_mca_count", "has_modified_mca", "last_year_tax_earnings", "tax_year"))):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Start a new request for the updated MCA policy answers.")
 
 
 @router.post("/leads", status_code=status.HTTP_201_CREATED, response_model=McaLeadResult)
@@ -119,6 +152,7 @@ async def capture_mca_lead(
         "allowed_contact_channels": ["phone", "email"],
         "preferred_contact_channel": "email",
         "review_status": "pending_review",
+        "mca_product_policy": mca_funding_policy.declaration_metadata(),
     })
     client = Client(
         id=client_id,

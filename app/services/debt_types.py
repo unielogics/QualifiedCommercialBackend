@@ -48,7 +48,7 @@ CATEGORY_WIDTH = 24
 assert all(len(slug) <= CATEGORY_WIDTH for slug in DEBT_TYPE_SLUGS)
 
 #: The kinds the schedule asks its follow-up question of — whether the funder
-#: modified the advance because sales or revenue fell. The owner asked for the
+#: modified the advance's terms or payments. The owner asked for the
 #: question on an MCA; revenue-based financing is the same product under the
 #: name most daily-pull funders now sell it by, and the cockpit already reads
 #: both as advances (`financial_cockpit.MCA_CATEGORIES`), so both are asked.

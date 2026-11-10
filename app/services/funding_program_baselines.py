@@ -1095,6 +1095,8 @@ def suggested_baseline(
     program_key: str, *, name: str | None = None, current_scopes: list[dict] | None = None
 ) -> dict[str, Any]:
     """Return a new detached suggestion, including a safe custom-product fallback."""
+    if program_key == "merchant_cash_advance":
+        return mca_funding_baseline(name=name)
     spec = deepcopy(CATALOG.get(program_key, {}))
     known = bool(spec)
     program_name = name or spec.get("name") or program_key.replace("_", " ").title()
@@ -1255,3 +1257,52 @@ def suggested_baseline(
         # them; a draft made from this baseline carries it as its description.
         "description": spec.get("description"),
     }
+
+
+def mca_funding_baseline(*, name: str | None = None) -> dict[str, Any]:
+    """Reviewed QC standard-MCA facts, without other products' defaults.
+
+    A detached definition only. Publishing catalog, criteria, commercial terms
+    and the dedicated evidence policy remains the normal reviewed workflow.
+    """
+    from app.services import mca_funding_policy as policy
+
+    source = "policy://qc/merchant-cash-advance/2026-11-09"
+    requirements = [
+        {**banks(6), "collection_config": {"document_type": "bank_statement", "required_months": 6,
+                                          "reporting_period": "last_six_complete_months", "evidence_classes": ["bank_statement"]}},
+        {**deepcopy(DEBT), "label": "Business debt schedule",
+         "requirement_kind": "form", "collection_config": {"form_kind": "debt_schedule",
+             "document_type": "debt_schedule", "quantity": 1, "unit": "files", "evidence_classes": ["debt_schedule"]},
+         "review_checks": [check("custom_mca_positions", "At most 2 existing active MCAs; none modified",
+             "Review separate active loans in the completed published schedule. Exclude removed/duplicate rows, never count vendor names or weekly payments as MCAs. Confirm no more than 2 existing MCAs BEFORE this new advance. Each existing active MCA must explicitly have no modified terms/remittance; unknown needs review.", "block")]},
+        {**document("business_tax_returns_1_years", "Prior calendar year business tax return",
+            "Obtain the complete prior calendar-year business return for the same business. Review its reported ordinary business income before interest, depreciation and amortization addbacks. Zero is allowed; negative ordinary income is ineligible. Do not substitute EBITDA, P&L, personal income, an older return or an unknown income measure.",
+            checks=[check("custom_mca_prior_year_income", "Nonnegative reported ordinary business income before addbacks",
+                "Compare the explicit prior calendar-year ordinary business income on the accepted entity-scoped business return to zero. Preserve year, form, measure, signed amount and source citation. Unknown/conflicting evidence needs information.", "block")]),
+         "collection_config": {"document_type": "tax_return", "required_years": 1,
+                               "reporting_period": "prior_calendar_year", "evidence_classes": ["tax_return"]}},
+    ]
+    for index, requirement in enumerate(requirements):
+        requirement["display_order"] = index
+    rules = {"fit": {"all": [
+        rule("mca_funding_active_count", 0, "gte"),
+        rule("mca_funding_active_count", policy.MAX_EXISTING_MCAS, "lte"),
+        rule("mca_funding_has_modified_mca", False, "eq"),
+        rule("mca_funding_prior_year_ordinary_income", 0, "gte"),
+        rule("mca_funding_last_six_months_complete", True, "eq"),
+    ]}, "mca_funding_policy": policy.declaration_metadata(),
+        "baseline": {"version": policy.POLICY_VERSION, "source_urls": [source],
+                     "source_notes": ["QC policy confirmed November 9, 2026. This standard advance is separate from MCA refinance and revenue-based financing. Declarations require evidence verification."]}}
+    return {"program_key": policy.PROGRAM_KEY, "name": name or "Merchant Cash Advance",
+            "version": policy.POLICY_VERSION, "source_urls": [source],
+            "source_notes": rules["baseline"]["source_notes"], "rules": rules, "financial_limits": None,
+            "requirements": requirements, "scopes": [{"vertical": "main_street", "scope_key": "standard_mca",
+                "intake_variants": ["main_street_v1"], "intent_keys": [policy.PROGRAM_KEY],
+                "naics_prefixes": [], "excluded_naics_prefixes": [], "industry_keys": [], "required_fact_keys": []}],
+            "needs_review": True,
+            "description": "Factor pricing 1.22–1.38x. At most two existing active MCAs before funding, none modified; nonnegative prior-year reported ordinary business tax income before addbacks.",
+            "commercial_terms": {"pricing_basis": "factor_rate", "minimum_pricing": float(policy.MIN_FACTOR),
+                                 "maximum_pricing": float(policy.MAX_FACTOR), "source_reference": source,
+                                 "disclosures": ["A factor rate is not an APR. Final terms require underwriting review."]},
+            "evidence_policy_key": policy.EVIDENCE_POLICY_KEY}

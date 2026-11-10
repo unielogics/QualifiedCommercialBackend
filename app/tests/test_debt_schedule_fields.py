@@ -351,7 +351,7 @@ def test_an_advance_must_also_say_whether_it_was_modified():
     assert fs.debt_row_problems(rows) == [
         {"index": 1, "lender": "Newtek", "missing": ["mca_modified"]}
     ]
-    assert "whether the advance was modified for lower sales" in fs.describe_debt_problems(
+    assert "whether the advance terms or payments were modified" in fs.describe_debt_problems(
         fs.debt_row_problems(rows)
     )
     rows = fs.debt_rows_from_body({"debts": [_row(debt_type="mca", mca_modified="no")]})

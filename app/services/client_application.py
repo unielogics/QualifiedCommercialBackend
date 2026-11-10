@@ -11,6 +11,15 @@ from app.schemas.client_application import ClientApplicationFields, ClientApplic
 from app.services import business_profile, funding_requests
 
 
+def funding_need_editable(intake, profile) -> bool:
+    from app.services.mca_funding_policy import PROGRAM_KEY
+
+    state = intake.intake_state or {}
+    return not (getattr(profile, "funding_category", None) == PROGRAM_KEY
+                or state.get("funding_intent") == PROGRAM_KEY
+                or (state.get("main_street_details") or {}).get("intent") == PROGRAM_KEY)
+
+
 def requested_amount_editable(intake, profile) -> bool:
     if funding_requests.current_for_profile(profile) or funding_requests.current_for_intake_snapshot(intake):
         return False
@@ -36,6 +45,7 @@ def read_application(intake, profile) -> ClientApplicationRead:
         loan_purpose=intake.loan_purpose,
         requested_loan_amount=float(amount) if amount is not None else None,
         requested_amount_editable=requested_amount_editable(intake, profile),
+        funding_need_editable=funding_need_editable(intake, profile),
         years_in_business=state.get("years_in_business"),
         business_website="N/A" if declared["website_none"] else declared["website"],
         business_description=declared["description"],
@@ -77,6 +87,8 @@ def validate_submission(values: ClientApplicationFields, vertical: str) -> None:
 
 def apply_application(intake, profile, link, client, values: ClientApplicationFields, *, submit: bool) -> None:
     """Keep the intake, CRM identity and room recipient on the same answers."""
+    if not funding_need_editable(intake, profile) and values.funding_need != "merchant_cash_advance":
+        raise HTTPException(403, "Ask your advisor to review a change from this MCA product.")
     if not requested_amount_editable(intake, profile):
         # A profile-first row lock in the route keeps a reviewed correction
         # stable while these borrower answers are saved. Only an initial draft

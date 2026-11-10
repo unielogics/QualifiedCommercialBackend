@@ -353,7 +353,7 @@ DEBT_COLUMN_LABELS = (
     "Secured or unsecured",
     "Payment status",
     "Collateral",
-    "MCA modified for lower sales?",
+    "MCA terms or payments modified?",
     "How the advance was modified",
     "Notes",
     "Factor rate (×)",
@@ -374,7 +374,7 @@ debt_type_label = debt_types.debt_type_label
 #: mandatory, but lender name, type of debt, original amount, balance, interest
 #: rate, monthly payment, current or delinquent we need it." The dates, whether
 #: it is secured, the collateral and the note may stay blank. An advance also
-#: has to say whether the funder modified it for lower sales.
+#: has to say whether the funder modified its terms or payments.
 REQUIRED_DEBT_FIELDS: tuple[str, ...] = (
     "lender",
     "debt_type",
@@ -396,7 +396,7 @@ _DEBT_FIELD_WORDS: dict[str, str] = {
     "rate": "interest rate",
     "monthly_payment": "monthly payment",
     "payment_status": "current or delinquent",
-    "mca_modified": "whether the advance was modified for lower sales",
+    "mca_modified": "whether the advance terms or payments were modified",
 }
 
 #: What the row's two choice fields accept. Anything else is discarded rather

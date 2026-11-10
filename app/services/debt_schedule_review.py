@@ -811,7 +811,7 @@ def _payment_changes(line: Any) -> dict[str, Any]:
 def _changes(line: Any, row: Any | None = None) -> dict[str, Any]:
     """The patch a kept line makes on its row, from only the fields it sent.
 
-    The advance answers (modified for lower sales, and what changed) go only
+    The advance answers (modified terms or payments, and what changed) go only
     onto an advance: a row whose type is anything else has nobody asking them.
     """
     sent = line.model_fields_set

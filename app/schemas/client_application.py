@@ -55,6 +55,7 @@ class ClientApplicationRead(ClientApplicationFields):
     vertical: Literal["real_estate", "main_street", "dealer", "mca"]
     submitted_at: datetime | None = None
     requested_amount_editable: bool = True
+    funding_need_editable: bool = True
 
 
 class ClientApplicationPatch(ClientApplicationFields, ApplicationRoomAccess):

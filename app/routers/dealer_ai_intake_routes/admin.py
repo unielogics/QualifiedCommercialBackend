@@ -1055,11 +1055,18 @@ async def create_admin_ai_lead(
 ) -> core.DealerIntakeResponse:
     """Super-admin creates an AI-underwriter lead on behalf of a client."""
     core._require_governance_admin(user)
+    from app.services.admin_client_adoption import client_for_admin_mca_application
+
+    client = await client_for_admin_mca_application(
+        db, user, payload, intake_variant=core._ADMIN_VARIANT_CONSTANTS.get(payload.variant, "")
+    )
+    adoption = {"client_override": client} if client is not None else {}
     return await core._create_admin_ai_lead_core(
         payload,
         request=request,
         user=user,
         db=db,
+        **adoption,
     )
 
 @core.admin_router.post("/{intake_id}/messages/seen", response_model=core.ChannelSeenResponse)
