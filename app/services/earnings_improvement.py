@@ -529,7 +529,12 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
         risks.append("Legacy financing-plan income overrides and addbacks are not stacked into this operating plan; reconcile overlapping assumptions before presenting a combined case.")
     if (evaluation.get("ebitda") or {}).get("replacement_payment_missing"):
         risks.append("A replacement payment is missing; after-refinance coverage is incomplete.")
+    from app.services.released_cash_flow import evaluate as evaluate_released_cash_flow
+
+    released = evaluate_released_cash_flow(body, cockpit)
+    missing.extend(released["missing"])
     return {"schema_version": "earnings-improvement-v1", "context_stamp": context_stamp(cockpit), "disclosure": _disclosure(body),
+        "released_cash_flow": released,
         "actions": results, "totals": sums, "baseline": baseline, "recommendation": recommendation,
         "projection": {"proposed": projection(sums["proposed"], False), "approved": projection(sums["approved"], True)},
         "targets": {"current": [{"ratio": ratio, "earnings_required": _money(current_service * ratio)} for ratio in (1.0, 1.1, 1.25) if current_service is not None and current_service > 0],
@@ -575,6 +580,7 @@ def review_actions(raw, cockpit, action_ids, decision, reason, actor, *, baselin
 def package_summary(evaluation):
     """Shareable explanations, never private review reasons, actors or hashes."""
     return {"baseline": deepcopy(evaluation["baseline"]), "disclosure": deepcopy(evaluation["disclosure"]),
+        "released_cash_flow": deepcopy(evaluation.get("released_cash_flow")),
         "projection": deepcopy(evaluation["projection"]), "totals": deepcopy(evaluation["totals"]),
         "targets": deepcopy(evaluation["targets"]), "missing": list(evaluation["missing"]),
         "risk_flags": list(evaluation["risk_flags"]), "notes": list(evaluation["notes"]),

@@ -60,6 +60,19 @@ def _before_after(summary, currency):
         "<h3>Adjustment totals</h3><table><thead><tr><th>Impact</th><th>All proposals</th><th>Staff-reviewed adjustments</th></tr></thead><tbody>" + impacts + "</tbody></table>" + warning_html
 
 
+def _released_cash_flow(summary, body):
+    cash = summary.get("released_cash_flow") or {}
+    rows = cash.get("allocations") or (body.get("released_cash_flow") or {}).get("allocations") or []
+    if not cash.get("required") and not rows:
+        return ""
+    details = "".join(f"<tr><td>{_text(row.get('label'))}</td><td class='num'>{_money(row.get('amount_monthly'), 'USD')}</td><td>{_text(row.get('notes'))}</td></tr>" for row in rows)
+    return ("<h2>Recurring released-cash-flow allocation</h2>"
+        "<p>Uses of recurring debt-service relief from the saved coverage plan. These amounts do not increase historical earnings, EBITDA or NOI and are separate from one-time loan proceeds.</p>"
+        f"<p>Monthly released cash flow: {_money(cash.get('amount_monthly'), 'USD')}; allocated: {_money(cash.get('allocated_monthly'), 'USD')}; remaining: {_money(cash.get('unallocated_monthly'), 'USD')}. Status: {_text(cash.get('status'))}.</p>"
+        "<table><thead><tr><th>Monthly use</th><th>Monthly amount</th><th>Explanation</th></tr></thead><tbody>"
+        + (details or "<tr><td colspan='3'>No monthly allocation entered.</td></tr>") + "</tbody></table>")
+
+
 def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
     facts = financial_totals or {}
     summary = facts.get("improvement_plan") or {}
@@ -117,6 +130,7 @@ def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
         f"<p>{_text(body.get('period_start'))} to {_text(body.get('period_end'))} | {_text(currency)} | {_text(body.get('basis'))} basis</p>" + \
         "<div class='notice'>Expense disclosures and proposed earnings improvements. These are separate from historical P&amp;L, NOI, EBITDA, current debt coverage and program qualification. Client submissions await staff review; improvements are conditional and require baseline reconciliation and supporting evidence.</div>" + \
         _before_after(summary, currency) + \
+        _released_cash_flow(summary, body) + \
         f"<h2>Operating expense disclosure</h2><p class='muted'>Loan payments, transfers, income taxes, owner draws and noncash depreciation are disclosed separately from operating cash costs.</p><table><thead><tr><th>Expense</th><th>Payee</th><th>Current amount</th><th>Cadence</th><th>Essential</th></tr></thead><tbody>{expense_rows}</tbody></table>{expense_notes}" + \
         f"<h2>Earnings adjustments and explanation</h2>{''.join(adjustment_html) or '<p>No improvements proposed.</p>'}" + \
         f"<p class='muted'>{excluded} excluded or duplicate rows remain in the immutable version history.</p><h2>Plan notes</h2><p>{_text(body.get('notes'))}</p></body></html>"

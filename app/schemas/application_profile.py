@@ -152,8 +152,8 @@ class ApplicationProgramSelectionRead(BaseModel):
     id: UUID
     program_key: str
     program_name: str
-    playbook_id: UUID
-    playbook_version: int
+    playbook_id: UUID | None
+    playbook_version: int | None
     source: Literal["ai_auto", "operator"]
     fit_score: float | None = None
     fit_confidence: float | None = None

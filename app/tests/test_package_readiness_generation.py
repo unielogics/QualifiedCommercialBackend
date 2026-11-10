@@ -683,7 +683,8 @@ async def test_out_of_scope_published_program_remains_available_for_manual_overr
 
 
 @pytest.mark.asyncio
-async def test_manual_program_override_requires_reason_and_pins_published_version() -> None:
+@pytest.mark.parametrize("reason", [None, "", "Optional operator note"])
+async def test_manual_program_choice_is_independent_of_fit_and_pins_published_version(reason) -> None:
     candidate = ProgramFitCandidate(
         program_key="business_heloc",
         program_name="Business-purpose HELOC",
@@ -713,25 +714,13 @@ async def test_manual_program_override_requires_reason_and_pins_published_versio
             AsyncMock(return_value=[candidate]),
         ),
     ):
-        with pytest.raises(Exception) as exc:
-            await application_programs.set_programs(
-                db,
-                profile,
-                ApplicationProgramsPatch(
-                    program_keys=[candidate.program_key],
-                    confirmed=True,
-                ),
-                user,
-            )
-        assert "reviewed reason" in str(exc.value.detail)
-
         await application_programs.set_programs(
             db,
             profile,
             ApplicationProgramsPatch(
                 program_keys=[candidate.program_key],
                 confirmed=True,
-                reason="Underwriter approved this exception for manual review.",
+                reason=reason,
             ),
             user,
         )

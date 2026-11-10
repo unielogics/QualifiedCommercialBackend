@@ -6661,6 +6661,9 @@ def _client_form_response(snapshot: dict, link, token: str) -> dict:
         "permission": getattr(link, "permission", "edit"), "can_edit": can_edit}
     if link.kind == "debt_schedule":
         result["completion"] = snapshot.get("completion")
+    if link.kind == "operating_plan":
+        result["completion"] = snapshot.get("completion")
+        result["released_cash_flow"] = (snapshot.get("completion") or {}).get("released_cash_flow")
     if snapshot.get("saved_version"):
         result["saved_version"] = next((row for row in result["workspace"]["versions"]
             if row["id"] == snapshot["saved_version"]["id"]), snapshot["saved_version"])

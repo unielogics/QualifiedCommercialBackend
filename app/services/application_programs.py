@@ -1596,6 +1596,9 @@ async def _auto_select(
     return [row for row, _ in pinned]
 
 
+_UNAVAILABLE_CRITERIA_REASON = "Criteria were unavailable when selected; remove and reselect this program to adopt corrected published criteria before qualification."
+
+
 async def set_programs(
     db: AsyncSession,
     profile: ApplicationProfile,
@@ -1629,24 +1632,6 @@ async def set_programs(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             f"Published program not found: {', '.join(missing)}",
         )
-    unavailable = [
-        key
-        for key in wanted
-        if candidates[key].playbook_id is None
-        or candidates[key].playbook_version is None
-        or candidates[key].recommendation_status == "criteria_unavailable"
-    ]
-    if unavailable:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            f"Published criteria are unavailable for: {', '.join(unavailable)}",
-        )
-    ineligible = [key for key in wanted if not candidates[key].eligible]
-    if ineligible and len((payload.reason or "").strip()) < 8:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "A reviewed reason is required to select an AI-ineligible program",
-        )
     current = {selection.program_key: selection for selection in active}
     for key, selection in current.items():
         if key not in wanted:
@@ -1654,9 +1639,19 @@ async def set_programs(
             selection.removed_by_user_id = user.id
     for key in wanted:
         candidate = candidates[key]
-        if candidate.playbook_id is None or candidate.playbook_version is None:
-            continue
         if key in current:
+            retained = current[key]
+            if (retained.playbook_id is None and candidate.playbook_id is not None
+                    and candidate.playbook_version is not None
+                    and candidate.recommendation_status != "criteria_unavailable"):
+                # A subsequent explicit save can adopt the first real criteria;
+                # ordinary readiness reads never mutate an unbound choice.
+                retained.playbook_id = candidate.playbook_id
+                retained.playbook_version = candidate.playbook_version
+                retained.needs_scope_review = not candidate.eligible
+                retained.fit_score = candidate.fit_score
+                retained.fit_confidence = candidate.confidence
+                retained.fit_reasons = candidate.reasons
             # An active selection pins an immutable published playbook version.
             # Adding/removing another program must never silently upgrade that
             # retained selection or rewrite its historical requirements.
@@ -1671,7 +1666,8 @@ async def set_programs(
                 source="operator",
                 fit_score=candidate.fit_score,
                 fit_confidence=candidate.confidence,
-                fit_reasons=candidate.reasons,
+                fit_reasons=[*candidate.reasons, *([_UNAVAILABLE_CRITERIA_REASON]
+                    if candidate.recommendation_status == "criteria_unavailable" else [])],
                 selected_by_user_id=user.id,
                 selected_at=timestamp,
                 needs_scope_review=not candidate.eligible,
@@ -1683,12 +1679,25 @@ async def set_programs(
     await db.flush()
 
 
+def _selection_criteria_blockers(selection, candidate):
+    if selection.playbook_id is None or selection.playbook_version is None:
+        return ["This program was selected without published criteria. Publish and explicitly select its reviewed criteria before program qualification can complete."]
+    if _UNAVAILABLE_CRITERIA_REASON in (getattr(selection, "fit_reasons", None) or []):
+        return [_UNAVAILABLE_CRITERIA_REASON]
+    if (candidate is not None and candidate.playbook_id == selection.playbook_id
+            and candidate.playbook_version == selection.playbook_version
+            and candidate.recommendation_status == "criteria_unavailable"):
+        return ["Published program criteria are unavailable or invalid; manual selection does not establish eligibility."]
+    return []
+
+
 async def _selection_requirements(
     db: AsyncSession,
     selections: list[ApplicationProgramSelection],
     context: dict[str, Any],
 ) -> dict[uuid.UUID, list[AICollectionRequirement]]:
-    if not selections:
+    playbook_ids = [item.playbook_id for item in selections if item.playbook_id is not None]
+    if not playbook_ids:
         return {}
     rows = list(
         (
@@ -1696,7 +1705,7 @@ async def _selection_requirements(
                 select(AICollectionRequirement)
                 .where(
                     AICollectionRequirement.playbook_id.in_(
-                        [item.playbook_id for item in selections]
+                        playbook_ids
                     )
                 )
                 .order_by(
@@ -3218,13 +3227,14 @@ async def _materialize_requirements(
     )
     corroborated_entities.update(await _accepted_entity_aliases(db, profile.id, associations))
     criteria_versions = {
-        item.playbook_id: item.playbook_version for item in [*selections, *policies]
+        item.playbook_id: item.playbook_version for item in [*selections, *policies] if item.playbook_id is not None
     }
     # Requirements the desk added to this file keep the version of the playbook
     # they were copied from; a program's own pinned version wins a shared playbook.
     for extra in extra_requirements or []:
         criteria_versions.setdefault(extra.requirement.playbook_id, extra.version)
-    extra_by_key = {extra.requirement.requirement_key: extra for extra in extra_requirements or []}
+    extra_by_key = {extra.requirement.requirement_key: extra for extra in extra_requirements or []
+                    if extra.entry.get("source_policy_key") != "coverage_plan"}
     existing = {
         item.requirement_key: item
         for item in (
@@ -3286,8 +3296,9 @@ async def _materialize_requirements(
     # program or the policy already requires keeps that definition.
     for extra in extra_requirements or []:
         if (extra.requirement.requirement_key not in merged
+                or extra.entry.get("source_policy_key") == "coverage_plan"
                 or requirement_lifecycle.debt_identity(extra.requirement.requirement_key, getattr(extra.requirement, "collection_config", None), getattr(extra.requirement, "canonical_key", None))):
-            merge_requirement(extra.requirement, policy_key=requirement_library.STAFF_POLICY_KEY)
+            merge_requirement(extra.requirement, policy_key=extra.entry.get("source_policy_key") or requirement_library.STAFF_POLICY_KEY)
 
     # Lender checklist definitions use the same evidence engine as program
     # requirements, but remain independently versioned by their offering.
@@ -3608,6 +3619,9 @@ async def _materialize_requirements(
 
         await use_of_proceeds.materialize(db, profile, requirement, state, requested, files,
             qualification=state.provenance["qualification_review"])
+        from app.services import released_cash_flow
+
+        await released_cash_flow.materialize(db, profile, requirement, state, requested)
         if state.provenance["qualification_review"]["blocking"]:
             state.provenance = {**state.provenance, "review_checks_status": "pending"}
     await db.flush()
@@ -3956,6 +3970,12 @@ async def get_program_readiness(
     extra_requirements = (
         await requirement_library.extra_definitions(db, profile) if lending_applicable else []
     )
+    if lending_applicable:
+        from app.services.released_cash_flow import derived_requirement
+
+        coverage_requirement = await derived_requirement(db, profile)
+        if coverage_requirement is not None:
+            extra_requirements.append(coverage_requirement)
     subjects = await requirement_lifecycle.profile_subjects(db, profile)
     grouped = {key: [requirement_lifecycle.normalize_definition(row, subjects) for row in rows] for key, rows in grouped.items()}
     grouped_policies = {key: [requirement_lifecycle.normalize_definition(row, subjects) for row in rows] for key, rows in grouped_policies.items()}
@@ -4039,8 +4059,10 @@ async def get_program_readiness(
                 blocking.append(key)
             if not _requirement_is_effectively_accepted(state, override):
                 loading_blockers.append(key)
-        qualification_blocking = []
-        qualification_warnings = []
+        criteria_blockers = _selection_criteria_blockers(selection, next((
+            row for row in candidates if row.program_key == selection.program_key), None))
+        qualification_blocking = ["published_program_criteria"] if criteria_blockers else []
+        qualification_warnings = list(criteria_blockers)
         for key in required_keys:
             state = requirement_map[key]
             override = overrides.get((selection.id, key))

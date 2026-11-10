@@ -330,6 +330,14 @@ class ApplicationProgramSelection(TimestampMixin, Base):
             "source IN ('ai_auto', 'operator')",
             name="ck_application_program_selection_source",
         ),
+        CheckConstraint(
+            "(playbook_id IS NULL) = (playbook_version IS NULL)",
+            name="ck_application_program_criteria_pair",
+        ),
+        CheckConstraint(
+            "source = 'operator' OR playbook_id IS NOT NULL",
+            name="ck_application_program_auto_criteria",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -340,12 +348,12 @@ class ApplicationProgramSelection(TimestampMixin, Base):
         ForeignKey("application_profiles.id", ondelete="CASCADE"),
         nullable=False,
     )
-    playbook_id: Mapped[uuid.UUID] = mapped_column(
+    playbook_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True),
         ForeignKey("ai_playbook_templates.id", ondelete="RESTRICT"),
-        nullable=False,
+        nullable=True,
     )
-    playbook_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    playbook_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     program_key: Mapped[str] = mapped_column(String(64), nullable=False)
     program_name: Mapped[str] = mapped_column(String(160), nullable=False)
     source: Mapped[str] = mapped_column(

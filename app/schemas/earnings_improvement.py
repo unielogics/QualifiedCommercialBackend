@@ -123,6 +123,25 @@ class AdjustmentRow(_Form):
         return value
 
 
+class ReleasedCashFlowAllocation(_Form):
+    id: UUID = Field(default_factory=uuid4)
+    label: str = Field(default="", max_length=240)
+    amount_monthly: float | None = Field(default=None, ge=0, le=1e15)
+    expense_row_id: UUID | None = None
+    notes: str = Field(default="", max_length=4000)
+
+
+class ReleasedCashFlow(_Form):
+    source_fingerprint: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    allocations: list[ReleasedCashFlowAllocation] = Field(default_factory=list, max_length=500)
+
+    @model_validator(mode="after")
+    def distinct_rows(self):
+        if len({row.id for row in self.allocations}) != len(self.allocations):
+            raise ValueError("Each cash-flow allocation must have its own stable ID")
+        return self
+
+
 class OperatingPlanBody(_Form):
     schema_version: Literal["operating-plan-v1"] = SCHEMA_VERSION
     business_name: str = Field(default="", max_length=255)
@@ -136,6 +155,7 @@ class OperatingPlanBody(_Form):
     notes: str = Field(default="", max_length=10000)
     expenses: list[ExpenseRow] = Field(default_factory=list, max_length=500)
     adjustments: list[AdjustmentRow] = Field(default_factory=list, max_length=300)
+    released_cash_flow: ReleasedCashFlow = Field(default_factory=ReleasedCashFlow)
     field_sources: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("period_start", "period_end", "projection_start", mode="before")
@@ -167,6 +187,8 @@ class OperatingPlanBody(_Form):
         known_expenses = {row.id for row in self.expenses}
         if any(row.expense_row_id and row.expense_row_id not in known_expenses for row in self.adjustments):
             raise ValueError("An adjustment must refer to an expense in this operating plan")
+        if any(row.expense_row_id and row.expense_row_id not in known_expenses for row in self.released_cash_flow.allocations):
+            raise ValueError("A cash-flow allocation must refer to an expense in this operating plan")
         return self
 
 

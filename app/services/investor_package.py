@@ -14,6 +14,18 @@ def options(value=None):
             "include_working_operating_plan": value.get("include_working_operating_plan", False) is True}
 
 
+def _unstarted_allocation(cockpit):
+    from app.services.released_cash_flow import evaluate
+
+    allocation = evaluate(empty_body(), cockpit)
+    if not allocation["required"]:
+        return None
+    return {"released_cash_flow": allocation, "missing": allocation["missing"], "currency": "USD",
+        "risk_flags": [], "notes": [allocation["note"]], "expenses": [], "adjustments": [],
+        "snapshot": {"state": "not_started", "label": "Recurring released-cash-flow allocation not started",
+                     "historical_figures_unchanged": True}}
+
+
 async def operating_snapshot(db, profile, cockpit, choices):
     """Never creates a family, publishes a draft or promotes an approval."""
     choices = options(choices)
@@ -23,12 +35,12 @@ async def operating_snapshot(db, profile, cockpit, choices):
 
     family = await existing_family(db, profile.id, "operating_plan")
     if family is None:
-        return None
+        return _unstarted_allocation(cockpit)
     working = choices["include_working_operating_plan"]
     record = await db.get(FinancialFormDraft, family.id) if working else (
         await db.get(FinancialFormVersion, family.current_version_id) if family.current_version_id else None)
     if record is None or not record.body:
-        return None
+        return _unstarted_allocation(cockpit)
     body = deepcopy(record.body)
     if working or getattr(record, "status", None) == "client_submitted":
         body = operating_plan_service.protect_reviews(body, empty_body())

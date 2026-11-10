@@ -106,8 +106,14 @@ async def status(db, profile):
 
     slot = await requested_slot(db, profile)
     _family, version, draft = await current(db, profile)
+    allocation_complete = True
+    if version and (getattr(profile, "financial_plan", None) or {}).get("updated_at"):
+        from app.services.financial_cockpit import load_cockpit
+        from app.services.released_cash_flow import evaluate
+
+        allocation_complete = evaluate(version.body, await load_cockpit(db, profile))["complete"]
     return FinancialFormStatus(kind=KIND, label=LABEL, requested=slot is not None,
-        satisfied=bool(slot and slot.status == "uploaded"),
+        satisfied=bool(slot and slot.status == "uploaded" and allocation_complete),
         source="filled" if version else "none", figures_from="form" if version else None,
         updated_at=version.created_at if version else draft.updated_at if draft else None,
         filled_by_staff=bool(version and version.actor_user_id))
