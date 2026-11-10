@@ -11,8 +11,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException
-from sqlalchemy import func, literal, select, update
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.bucket import (
@@ -23,6 +22,7 @@ from app.models.bucket import (
 )
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.schemas.bucket import BucketDocumentHistoryRead, BucketDocumentVersionRead
+from app.services.financial_snapshot_objects import snapshot_object, sql_mark_snapshot
 
 
 def family_id(file: Any) -> UUID:
@@ -135,21 +135,20 @@ async def mark_received(db: AsyncSession, file: BucketFile) -> None:
                 previous.document_version_status = "superseded"
     marker = {"document_versions_stale": True}
     await db.execute(update(BucketAIReview).where(BucketAIReview.bucket_id == file.bucket_id).values(
-        context_snapshot=func.coalesce(BucketAIReview.context_snapshot, literal({}, type_=JSONB)).op("||")(literal(marker, type_=JSONB)),
+        context_snapshot=sql_mark_snapshot(BucketAIReview.context_snapshot, marker),
     ).execution_options(synchronize_session=False))
     await db.execute(update(PublicUnderwritingIntake).where(PublicUnderwritingIntake.bucket_id == file.bucket_id).values(
         latest_review_id=None,
-        result_snapshot=PublicUnderwritingIntake.result_snapshot.op("||")(literal({"_document_versions_stale": True}, type_=JSONB)),
+        result_snapshot=sql_mark_snapshot(PublicUnderwritingIntake.result_snapshot, {"_document_versions_stale": True}),
     ).execution_options(synchronize_session=False))
     for row in getattr(db, "identity_map", {}).values():
         if isinstance(row, BucketAIReview) and row.bucket_id == file.bucket_id:
-            row.context_snapshot = {**(row.context_snapshot or {}), **marker}
+            row.context_snapshot = {**snapshot_object(row.context_snapshot), **marker}
         elif isinstance(row, PublicUnderwritingIntake) and row.bucket_id == file.bucket_id:
             row.latest_review_id = None
             row.latest_review = None
             row.intake_state = {key: value for key, value in (row.intake_state or {}).items() if key != "loan_program_fit"}
-            if row.result_snapshot:
-                row.result_snapshot = {**row.result_snapshot, "_document_versions_stale": True}
+            row.result_snapshot = {**snapshot_object(row.result_snapshot), "_document_versions_stale": True}
 
 
 async def complete_analysis(
