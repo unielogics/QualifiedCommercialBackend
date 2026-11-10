@@ -136,6 +136,15 @@ def test_the_proposed_terms_carry_the_schedule_and_the_risk_but_never_a_fee() ->
     assert terms["risk"]["coverage_during_interest_only"] == 5.0
     member = partner_terms(terms)
     assert set(member) <= {
+        "active_proposal",
+        "program_key",
+        "program_name",
+        "terms_state",
+        "recorded_terms_ref",
+        "collateral_revision",
+        "current_collateral_revision",
+        "collateral_stale",
+        "collateral",
         "source",
         "label",
         "amount",

@@ -338,8 +338,11 @@ def partner_terms(terms: dict[str, Any]) -> dict[str, Any]:
     """The proposed terms a member sees: the structure, the schedule and the
     principal at risk, key by key. No fee lives here, and none is added."""
     result = {k: terms.get(k) for k in PARTNER_TERMS_KEYS if terms.get(k) is not None}
-    result["collateral"] = partner_collateral(terms.get("collateral_snapshot"),
-        recorded=bool(terms.get("recorded_terms_ref")) or terms.get("source") == "term_sheet")
+    # Partial/legacy schedule callers have supplied no security disclosure.
+    # Do not turn that absence into a claim that collateral was disabled.
+    if "collateral_snapshot" in terms or terms.get("recorded_terms_ref"):
+        result["collateral"] = partner_collateral(terms.get("collateral_snapshot"),
+            recorded=bool(terms.get("recorded_terms_ref")) or terms.get("source") == "term_sheet")
     return result
 
 
