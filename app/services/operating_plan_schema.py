@@ -37,10 +37,11 @@ HEADER = (
 
 def _spec(key):
     options = {"category": CATEGORIES, "cadence": CADENCES, "kind": ACTION_KINDS,
+               "cost_basis": ("total", "per_unit"),
                "implementation_cost_cadence": ("one_time", "monthly", "annual"),
                "current_processing_rate_basis": ("all_in", "processor_markup", "unknown"),
                "proposed_processing_rate_basis": ("all_in", "processor_markup", "unknown")}.get(key)
-    kind = "select" if options else "boolean" if key in {"essential", "excluded"} else "date" if key == "effective_date" else "percent" if key.endswith("_pct") else "number" if key in {"units_per_period", "processing_volume", "processing_transaction_count"} else "money" if key.endswith(("_amount", "_price", "_cost", "_fee")) or key == "implementation_cost" else "text"
+    kind = "select" if options else "boolean" if key in {"essential", "excluded"} else "date" if key == "effective_date" else "percent" if key.endswith("_pct") else "number" if key in {"units_per_period", "current_units_per_period", "proposed_units_per_period", "processing_volume", "processing_transaction_count"} else "money" if key.endswith(("_amount", "_price", "_cost", "_fee")) or key == "implementation_cost" else "text"
     return field(key, input=kind, options=options)
 
 

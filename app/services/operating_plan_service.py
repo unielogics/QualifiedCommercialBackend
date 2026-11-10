@@ -6,7 +6,11 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.models.file_event import NOTICE_NONE, VISIBILITY_DESK, FileEvent
-from app.models.financial_form_version import FinancialFormVersion
+from app.models.financial_form_version import (
+    FinancialFormDraft,
+    FinancialFormFamily,
+    FinancialFormVersion,
+)
 from app.schemas.earnings_improvement import REVIEW_FIELDS, validate_body
 from app.services import earnings_improvement as math
 
@@ -77,6 +81,38 @@ async def preview(db, profile, body):
     evidence = cockpit.get("operating_evidence") or {}
     evaluation = math.evaluate(body, cockpit, source_file_ids=[row["file_id"] for row in evidence.get("files", [])])
     return {"evaluation": evaluation, "evidence": evidence, "context_stamp": math.context_stamp(cockpit)}
+
+
+async def summary(db, profile, *, family_id=None):
+    """Inspect the saved draft without creating a family, request or publication."""
+    from app.schemas.earnings_improvement import completion, empty_body
+    from app.services.financial_cockpit import load_cockpit
+    from app.services.financial_workspace import existing_family
+
+    family = await db.get(FinancialFormFamily, family_id) if family_id else await existing_family(db, profile.id, "operating_plan")
+    if family is not None and (family.profile_id != profile.id or family.kind != "operating_plan"):
+        raise HTTPException(404, "Operating plan not found")
+    if family_id and family is None:
+        raise HTTPException(404, "Operating plan not found")
+    draft = await db.get(FinancialFormDraft, family.id) if family else None
+    version = await db.get(FinancialFormVersion, family.current_version_id) if family and family.current_version_id else None
+    body = validate_body(draft.body if draft else version.body if version else empty_body())
+    cockpit = await load_cockpit(db, profile)
+    evaluation = math.evaluate(body, cockpit)
+    progress = completion(body)
+    disclosure = evaluation["disclosure"]
+    stamp = draft.updated_at if draft else version.created_at if version else None
+    return {"has_plan": bool(family), "state": "working_draft" if draft and (version is None or body != validate_body(version.body)) else "published" if version else "not_started",
+        "family_id": str(family.id) if family else None,
+        "expense_count": progress["active_expenses"], "action_count": progress["active_adjustments"],
+        "reviewed_action_count": sum(row["review_state"] in {"approved", "rejected"} for row in evaluation["actions"] if not row["excluded"]),
+        "missing_count": progress["missing_count"], "complete": progress["complete"],
+        "cost_mix": disclosure["cost_mix"], "disclosure": disclosure, "evaluation": evaluation,
+        "version_number": version.version_number if version else None,
+        "version_id": str(version.id) if version else None,
+        "pdf_file_id": str(version.pdf_file_id) if version and version.pdf_file_id else None,
+        "updated_at": stamp.isoformat() if stamp else None,
+        "recommendation": evaluation["recommendation"]}
 
 
 async def review(db, profile, actor, *, family_id, expected_revision, action_ids, decision, reason,

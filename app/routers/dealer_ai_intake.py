@@ -1601,9 +1601,15 @@ class PackageReadinessGenerationRead(BaseModel):
     generated_at: datetime
     executive_summary: PublicUnderwritingArtifactRead
     lender_packet: PublicUnderwritingArtifactRead
+    investor_presentation: PublicUnderwritingArtifactRead | None = None
     bucket_files: list[PackageReadinessBucketFileRead]
     superseded_bucket_file_ids: list[UUID] = Field(default_factory=list)
     artifact_history: list[PublicUnderwritingArtifactRead] = Field(default_factory=list)
+
+
+class PackageReadinessGenerateRequest(BaseModel):
+    include_operating_plan: bool = True
+    include_working_operating_plan: bool = False
 
 
 YEARS_IN_BUSINESS_KEYS = ("years_in_business", "time_in_business_years", "business_age_years")
@@ -6487,8 +6493,35 @@ async def _ensure_lender_packet_artifact(
     return existing or await _create_lender_packet_artifact(db, intake, user)
 
 
+async def _create_investor_presentation_artifact(
+    db: AsyncSession, intake: PublicUnderwritingIntake, user: CurrentUser, *,
+    financials: dict[str, Any], source_snapshot_metadata: dict[str, Any],
+    cleanup_s3_keys: list[str], generated_at: datetime,
+) -> PublicUnderwritingIntakeArtifact:
+    from app.services.investor_presentation_pdf import (
+        investment_metrics,
+        render_investor_presentation_pdf,
+    )
+
+    title = f"{intake.business_name or intake.full_name or 'Business'} investor presentation"
+    pdf = await asyncio.to_thread(render_investor_presentation_pdf, intake=intake,
+                                  financials=financials, generated_at=generated_at)
+    key = await _store_underwriting_pdf(intake, pdf, title, "investor-presentation")
+    cleanup_s3_keys.append(key)
+    artifact = PublicUnderwritingIntakeArtifact(intake_id=intake.id, artifact_type="investor_presentation",
+        title=title[:240], body_text="Source-bound investor presentation: investment, contractual return, client impact and open evidence.",
+        body_json={"investment": investment_metrics(financials.get("proposed_terms")),
+            "operating_plan_snapshot": ((financials.get("operating_earnings") or {}).get("improvement_plan") or {}).get("snapshot"),
+            "_pdf": {"size_bytes": len(pdf), "sha256": hashlib.sha256(pdf).hexdigest(),
+                     "content_type": "application/pdf", **source_snapshot_metadata}},
+        s3_key=key, created_by_user_id=user.id)
+    db.add(artifact)
+    await db.flush()
+    return artifact
+
+
 _PACKAGE_READINESS_SOURCE_PREFIX = provenance.PACKAGE_READINESS_SOURCE_PREFIX
-_PACKAGE_READINESS_TYPES = ("executive_summary", "lender_packet")
+_PACKAGE_READINESS_TYPES = ("executive_summary", "lender_packet", "investor_presentation")
 
 
 def _is_package_readiness_output(file: Any) -> bool:
@@ -6670,6 +6703,7 @@ def _package_input_fingerprint(
 async def _package_generation_inputs(
     db: AsyncSession,
     intake: PublicUnderwritingIntake,
+    package_options: dict[str, bool] | None = None,
 ) -> tuple[
     list[BucketFile],
     dict[str, Any],
@@ -6714,6 +6748,14 @@ async def _package_generation_inputs(
     from app.services.application_programs import get_program_readiness
 
     readiness = await get_program_readiness(db, profile)
+    # Readiness refreshes this ORM identity with populate_existing, expiring its
+    # originally eager-loaded bucket/requests/review. Rehydrate explicitly in
+    # async code before context rendering; implicit lazy IO raises MissingGreenlet.
+    from sqlalchemy import inspect as sa_inspect
+    if sa_inspect(intake, raiseerr=False) is not None:
+        intake = await _load_admin_dealer_lead(db, intake.id)
+    from app.services.investor_package import operating_snapshot, options
+    choices = options(package_options)
     readiness_snapshot = _normalized_package_readiness(readiness)
     from app.services.use_of_funds import ai_context, source_funding_data, summarize
 
@@ -6736,6 +6778,7 @@ async def _package_generation_inputs(
         **context_snapshot,
         "package_readiness": readiness_snapshot,
         "use_of_funds": budget_snapshot,
+        **({"requested_loan_amount": float(requested_amount)} if requested_amount is not None else {}),
     }
     financials = await _collect_packet_financials(
         db,
@@ -6762,7 +6805,14 @@ async def _package_generation_inputs(
         cockpit = await cockpit_svc.load_cockpit(db, profile)
         plan_block = cockpit_svc.plan_summary(cockpit)
         proposed_terms = marketplace_sync.proposed_terms(cockpit)
-        operating_earnings = operating_earnings_brief(cockpit)
+        operating_earnings = operating_earnings_brief(cockpit) or {}
+        # The need for a plan is greatest when no supported baseline exists.
+        # Its disclosure and unresolved actions still belong in an explicit
+        # draft package; no historical earnings value is invented to include it.
+        improvement_plan = await operating_snapshot(db, profile, cockpit, choices)
+        if improvement_plan is not None:
+            operating_earnings["improvement_plan"] = improvement_plan
+        operating_earnings = operating_earnings or None
         current_key_metrics = current_review_projection({}, cockpit)["key_metrics"]
         current_tax_years = (cockpit.get("tax") or {}).get("years") or []
         current_p_and_l = cockpit.get("profit_and_loss")
@@ -6780,6 +6830,8 @@ async def _package_generation_inputs(
         "current_key_metrics": current_key_metrics,
         "tax_years": current_tax_years,
         "p_and_l": current_p_and_l,
+        "package_options": choices,
+        "package_document_types": list(_PACKAGE_READINESS_TYPES),
     }
     context_snapshot["operating_earnings"] = operating_earnings
     input_fingerprint = _package_input_fingerprint(
@@ -6796,6 +6848,8 @@ async def _package_generation_inputs(
             readiness_payload
         ).hexdigest(),
         "package_input_sha256": input_fingerprint,
+        "package_options": choices,
+        "package_document_types": list(_PACKAGE_READINESS_TYPES),
     }
     return (
         source_files,
@@ -6809,8 +6863,9 @@ async def _package_generation_inputs(
 async def _current_package_input_fingerprint(
     db: AsyncSession,
     intake: PublicUnderwritingIntake,
+    package_options: dict[str, bool] | None = None,
 ) -> str:
-    *_, input_fingerprint = await _package_generation_inputs(db, intake)
+    *_, input_fingerprint = await _package_generation_inputs(db, intake, package_options)
     return input_fingerprint
 
 
@@ -6852,12 +6907,24 @@ async def _fresh_package_artifact_pair(
             status.HTTP_409_CONFLICT,
             "Refresh Package Readiness to restore both current bucket PDFs.",
         ) from None
+    expected_artifacts = {summary_bucket_file_id: summary, packet_bucket_file_id: packet}
+    if "investor_presentation" in (_artifact_pdf_metadata(summary).get("package_document_types") or []):
+        presentation = await _latest_artifact(db, intake.id, "investor_presentation")
+        metadata = _artifact_package_metadata(presentation) if presentation is not None else {}
+        try:
+            presentation_file_id = UUID(str(metadata.get("bucket_file_id")))
+        except (TypeError, ValueError):
+            raise HTTPException(409, "Regenerate the package to restore its investor presentation.") from None
+        if (metadata.get("status") != "current" or metadata.get("generation_id") != summary_generation
+                or _artifact_pdf_metadata(presentation).get("package_input_sha256") != _artifact_pdf_metadata(summary).get("package_input_sha256")):
+            raise HTTPException(409, "Regenerate the package so its presentation uses the same evidence snapshot.")
+        expected_artifacts[presentation_file_id] = presentation
     bucket_files = list(
         (
             await db.execute(
                 select(BucketFile).where(
                     BucketFile.id.in_(
-                        [summary_bucket_file_id, packet_bucket_file_id]
+                        list(expected_artifacts)
                     ),
                     BucketFile.bucket_id == intake.bucket_id,
                     BucketFile.deleted_at.is_(None),
@@ -6870,15 +6937,15 @@ async def _fresh_package_artifact_pair(
     )
     by_id = {file.id: file for file in bucket_files}
     if (
-        set(by_id) != {summary_bucket_file_id, packet_bucket_file_id}
-        or by_id[summary_bucket_file_id].s3_key != summary.s3_key
-        or by_id[packet_bucket_file_id].s3_key != packet.s3_key
+        set(by_id) != set(expected_artifacts)
+        or any(by_id[key].s3_key != artifact.s3_key for key, artifact in expected_artifacts.items())
     ):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "A current package PDF was removed from the bucket. Refresh before delivery.",
         )
-    current_fingerprint = await _current_package_input_fingerprint(db, intake)
+    current_fingerprint = await _current_package_input_fingerprint(
+        db, intake, _artifact_pdf_metadata(summary).get("package_options"))
     summary_fingerprint = str(
         _artifact_pdf_metadata(summary).get("package_input_sha256") or ""
     )
@@ -7025,11 +7092,8 @@ async def _publish_package_artifact_to_bucket(
     version = next_version
     pdf_meta = _artifact_pdf_metadata(artifact)
     label = intake.business_name or intake.full_name or "Underwriting file"
-    document_label = (
-        "Executive Summary"
-        if artifact.artifact_type == "executive_summary"
-        else "Lender Package"
-    )
+    document_label = {"executive_summary": "Executive Summary", "lender_packet": "Lender Package",
+                      "investor_presentation": "Investor Presentation"}[artifact.artifact_type]
     bucket_file = BucketFile(
         bucket_id=intake.bucket_id,
         requested_document_id=None,
@@ -7349,6 +7413,7 @@ async def _response(
             current_package_fingerprint = await _current_package_input_fingerprint(
                 db,
                 intake,
+                _artifact_pdf_metadata(next((row for row in artifacts if row.artifact_type == "executive_summary"), artifacts[0])).get("package_options"),
             )
         except Exception:
             # Artifact history must remain readable even if readiness refresh is
@@ -10017,6 +10082,14 @@ async def build_package_zip_bytes(
         db,
         intake,
     )
+    presentation_artifact = (await _latest_artifact(db, intake.id, "investor_presentation")
+        if "investor_presentation" in (_artifact_pdf_metadata(summary_artifact).get("package_document_types") or []) else None)
+    if presentation_artifact and (
+        _artifact_package_metadata(presentation_artifact).get("generation_id")
+        != _artifact_package_metadata(summary_artifact).get("generation_id")
+        or _artifact_package_metadata(presentation_artifact).get("status") != "current"
+    ):
+        presentation_artifact = None
     email_draft = await _generate_management_json(
         db,
         intake,
@@ -10058,6 +10131,7 @@ async def build_package_zip_bytes(
         "Contents:",
         "  executive-summary.pdf  — concise underwriter executive summary",
         "  lender-packet.pdf       — formatted lender/vendor packet",
+        *( ["  investor-presentation.pdf — investment, contractual return and borrower impact"] if presentation_artifact else []),
         "  email-template.txt      — ready-to-edit vendor outreach email",
         "  debt-evidence.html/json/txt — documents linked to each accepted obligation",
         f"  documents/              — {len(files)} uploaded file(s)",
@@ -10090,6 +10164,8 @@ async def build_package_zip_bytes(
             except Exception:  # noqa: BLE001
                 log.exception("package.zip: lender packet fetch failed intake=%s", intake.id)
         # Vendor email template.
+        if presentation_artifact and presentation_artifact.s3_key:
+            zf.writestr("investor-presentation.pdf", await _s3_bytes(presentation_artifact.s3_key))
         subject = str(email_draft.get("subject") or f"Qualified Commercial review: {intake.business_name or intake.full_name}")
         body = str(email_draft.get("body") or summary_artifact.body_text or "")
         zf.writestr("email-template.txt", f"Subject: {subject}\n\n{body}\n")

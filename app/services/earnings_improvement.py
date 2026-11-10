@@ -17,7 +17,13 @@ from uuid import UUID
 from fastapi import HTTPException
 
 from app.enums import Role
-from app.schemas.earnings_improvement import REVIEW_FIELDS, action_missing, validate_body
+from app.schemas.earnings_improvement import (
+    REVIEW_FIELDS,
+    action_missing,
+    cost_amount,
+    expense_missing,
+    validate_body,
+)
 from app.services.financial_metric_review import number
 
 FACTORS = {"weekly": 52, "biweekly": 26, "semi_monthly": 24, "monthly": 12, "quarterly": 4, "annual": 1, "one_time": 0}
@@ -56,8 +62,21 @@ def context_stamp(cockpit):
 
 
 def proposal_stamp(action, linked_expense=None, body=None):
-    return _stamp({"proposal": {key: value for key, value in action.items() if key not in REVIEW_FIELDS},
-        "expense": linked_expense,
+    proposal = {key: value for key, value in action.items() if key not in REVIEW_FIELDS}
+    expense = deepcopy(linked_expense)
+    # Adding optional unit controls must not stale a previously reviewed total
+    # solely because schema validation materialized their empty defaults.
+    action_defaults = {"cost_basis": "total", "unit_label": "", "current_units_per_period": None,
+        "proposed_units_per_period": None, "current_fixed_amount": None, "proposed_fixed_amount": None}
+    expense_defaults = {"cost_basis": "total", "unit_label": "", "current_units_per_period": None,
+        "current_unit_cost": None, "current_fixed_amount": None}
+    for row, defaults in ((proposal, action_defaults), (expense, expense_defaults)):
+        if row is not None:
+            for key, default in defaults.items():
+                if row.get(key) == default:
+                    row.pop(key, None)
+    return _stamp({"proposal": proposal,
+        "expense": expense,
         "scope": {key: (body or {}).get(key) for key in ("business_name", "period_start", "period_end", "projection_start", "currency", "basis")}})
 
 
@@ -86,6 +105,17 @@ def _scope_files(cockpit, allowed):
 def _near(first, second, tolerance=0.01):
     first, second = number(first), number(second)
     return first is not None and second is not None and abs(first - second) <= tolerance
+
+
+def _cost_issues(row, side="current"):
+    if row.get("cost_basis") != "per_unit":
+        return []
+    total, reference = cost_amount(row, side), row.get(f"{side}_amount")
+    if total is None:
+        return [f"Complete {side} quantity, unit cost and fixed amount; unknown fixed charges are not zero."]
+    if reference is not None and not _near(total, reference):
+        return [f"The {side} unit calculation does not reconcile to its recorded total. Keep one reconciled cost basis before review."]
+    return []
 
 
 def _merchant_approval_issues(action, cockpit, files):
@@ -206,6 +236,8 @@ def _impact(action, body, expenses, cockpit, allowed_files, now):
     if not action["source_file_ids"]:
         risks.append("No supporting file is linked; this remains a disclosed operating assumption.")
     kind = action["kind"]
+    if action["cost_basis"] == "per_unit" and kind not in {"expense_reduction", "expense_increase"}:
+        issues.append("Use the per-unit cost basis with an expense reduction or increase; price, product and processor actions have their own drivers.")
     gross = None
     if not action_missing(action):
         if kind == "price_change":
@@ -223,21 +255,34 @@ def _impact(action, body, expenses, cockpit, allowed_files, now):
             if linked and linked["category"] != "merchant_processing":
                 issues.append("Link processor savings to a merchant-processing expense rather than another operating category.")
             if linked and gross is not None and action["current_processing_rate_basis"] == "all_in":
-                declared = _annual(linked["current_amount"], linked["cadence"])
+                declared = _annual(cost_amount(linked), linked["cadence"])
                 current = _annual(action["processing_volume"] * action["current_processing_rate_pct"] / 100, action["cadence"])
                 if declared is None or current is None or not _near(declared, current, .05):
                     issues.append("Current processing fees must reconcile to the linked merchant-processing expense disclosure.")
         else:
-            gross = action["current_amount"] - action["proposed_amount"]
+            current, proposed = cost_amount(action), cost_amount(action, "proposed")
+            issues.extend(_cost_issues(action))
+            issues.extend(_cost_issues(action, "proposed"))
+            gross = current - proposed if current is not None and proposed is not None else None
             if kind in {"expense_reduction", "expense_increase"}:
                 if linked is None:
                     issues.append("Link this expense adjustment to a disclosed expense row.")
                 else:
-                    declared, reference = _annual(linked["current_amount"], linked["cadence"]), _annual(action["current_amount"], action["cadence"])
+                    issues.extend(_cost_issues(linked))
+                    declared, reference = _annual(cost_amount(linked), linked["cadence"]), _annual(current, action["cadence"])
                     if declared is None or reference is None or abs(declared - reference) > 0.01:
                         issues.append("The adjustment's current amount and cadence must reconcile to its linked expense disclosure.")
-                if kind == "expense_reduction" and gross < 0 or kind == "expense_increase" and gross > 0:
+                    if action["cost_basis"] == linked["cost_basis"] == "per_unit":
+                        same_unit = action["unit_label"].strip().casefold() == linked["unit_label"].strip().casefold()
+                        same_rate = _near(action["current_unit_cost"], linked["current_unit_cost"])
+                        same_quantity = _near(_annual(action["current_units_per_period"], action["cadence"]), _annual(linked["current_units_per_period"], linked["cadence"]))
+                        same_fixed = _near(_annual(action["current_fixed_amount"], action["cadence"]), _annual(linked["current_fixed_amount"], linked["cadence"]))
+                        if not all((same_unit, same_rate, same_quantity, same_fixed)):
+                            issues.append("The current unit label, quantity, rate and fixed charges must reconcile to the linked unit-cost disclosure, not just to the same total.")
+                if gross is not None and (kind == "expense_reduction" and gross < 0 or kind == "expense_increase" and gross > 0):
                     issues.append("Choose the expense action type matching the direction of the proposed change.")
+                if action["cost_basis"] == "per_unit":
+                    risks.append("Quantity, unit rates and fixed charges are modeled separately. Validate any effect of volume or usage changes on revenue, capacity and service quality.")
     if body["currency"] != "USD":
         issues.append("Reconcile plan currency with USD debt-service and implementation amounts before projecting coverage.")
     recurring = None if gross is None else 0 if action["cadence"] == "one_time" or kind == "one_time_adjustment" else gross * FACTORS[action["cadence"]]
@@ -264,7 +309,8 @@ def _impact(action, body, expenses, cockpit, allowed_files, now):
         "explanation": action["explanation"], "source_note": action["source_note"], "owner_name": action["owner_name"],
         "driver_key": action["driver_key"], "expense_row_id": action["expense_row_id"], "excluded": action["excluded"],
         "merchant_source_key": action.get("merchant_source_key"), "merchant_offer_id": action.get("merchant_offer_id"),
-        "calculation": {key: action.get(key) for key in ("cadence", "units_per_period", "current_amount", "proposed_amount",
+        "calculation": {key: action.get(key) for key in ("cadence", "cost_basis", "unit_label", "current_units_per_period", "proposed_units_per_period",
+            "current_fixed_amount", "proposed_fixed_amount", "units_per_period", "current_amount", "proposed_amount",
             "current_unit_price", "proposed_unit_price", "current_unit_cost", "proposed_unit_cost", "contribution_margin_pct",
             "processing_volume", "processing_transaction_count", "current_processing_rate_pct", "proposed_processing_rate_pct",
             "current_processing_rate_basis", "proposed_processing_rate_basis", "current_processing_fixed_fee", "proposed_processing_fixed_fee",
@@ -322,16 +368,26 @@ def _disclosure(body):
     active = [row for row in body["expenses"] if not row["excluded"]]
     result = {"operating_monthly": 0.0, "cogs_monthly": 0.0, "operating_cash_monthly": 0.0,
               "non_operating_monthly": 0.0, "one_time_total": 0.0, "active_count": len(active),
-              "excluded_count": len(body["expenses"]) - len(active), "missing_inputs": []}
+              "excluded_count": len(body["expenses"]) - len(active), "missing_inputs": [], "cost_issues": [], "cost_mix": []}
+    categories = {}
     for row in active:
-        value = row["current_amount"]
+        category = categories.setdefault(row["category"], {"category": row["category"], "annual_amount": 0.0, "missing_count": 0, "count": 0, "quantified_count": 0})
+        category["count"] += 1
+        value = cost_amount(row)
+        missing = expense_missing(row)
+        issues = _cost_issues(row)
+        result["missing_inputs"].extend(f"expenses.{row['id']}.{key}" for key in missing)
+        result["cost_issues"].extend({"id": row["id"], "label": row["label"], "message": issue} for issue in issues)
+        if missing or issues:
+            category["missing_count"] += 1
         if value is None:
-            result["missing_inputs"].append(f"expenses.{row['id']}.current_amount")
             continue
+        category["quantified_count"] += 1
         if row["cadence"] == "one_time":
             result["one_time_total"] += value
             continue
         monthly = _annual(value, row["cadence"]) / 12
+        category["annual_amount"] += monthly * 12
         if row["category"] in NON_OPERATING:
             result["non_operating_monthly"] += monthly
         elif row["category"] == "cogs":
@@ -341,7 +397,8 @@ def _disclosure(body):
             result["operating_monthly"] += monthly
             if row["category"] not in NON_CASH:
                 result["operating_cash_monthly"] += monthly
-    result["complete"] = not result["missing_inputs"] and bool(active or body["no_operating_expenses_confirmed"])
+    result["complete"] = not result["missing_inputs"] and not result["cost_issues"] and bool(active or body["no_operating_expenses_confirmed"])
+    result["cost_mix"] = [{**row, "annual_amount": _money(row["annual_amount"]) if row["quantified_count"] else None} for row in categories.values()]
     return {key: _money(value) if isinstance(value, float) else value for key, value in result.items()}
 
 
@@ -402,6 +459,16 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
     sums = {"proposed": totals(proposed_rows), "approved": totals(approved_rows)}
     sums["proposed"]["complete"] &= len(proposed_rows) == len(active)
     sums["approved"]["complete"] &= len(approved_rows) == len(approved_candidates)
+    for key, expected in (("proposed", len(active)), ("approved", len(approved_candidates))):
+        total = sums[key]
+        total["expected_count"] = expected
+        total["known_annual_subtotal"] = total["annual_impact"] if total["count"] else None
+        total["known_first_year_subtotal"] = total["first_year_impact"] if total["count"] else None
+        if expected and not total["complete"]:
+            # A partial or wholly unquantified plan cannot be represented as a
+            # zero savings figure. Known rows remain an explicitly named subtotal.
+            for field in ("annual_impact", "monthly_impact", "first_year_impact", "one_time_cost"):
+                total[field] = None
     earnings = (cockpit.get("ebitda") or {}).get("headline") or {}
     potential = (cockpit.get("ebitda") or {}).get("potential") or {}
     source_baseline = potential.get("baseline") or {}
@@ -427,6 +494,11 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
         "noi": annual_noi, "dscr": ((cockpit.get("dscr") or {}).get("headline") or {}).get("value"),
         "annual_debt_service": current_service, "provisional": bool(earnings.get("provisional", True)),
         "noi_provisional": bool(noi.get("provisional", True))}
+    ratio = number(baseline["dscr"])
+    recommended = annual_earnings < 0 if annual_earnings is not None and annual_earnings < 0 else ratio < 1.1 if ratio is not None else None
+    recommendation = {"threshold": 1.1, "recommended": recommended,
+        "reason": "Current earnings are negative." if annual_earnings is not None and annual_earnings < 0 else "Current DSCR is below 1.10x." if recommended else "Current DSCR meets the 1.10x planning threshold." if recommended is False else "Current earnings and coverage must be established before checking the planning threshold.",
+        "earnings_gap_annual": _money(max(0, current_service * 1.1 - annual_earnings)) if annual_earnings is not None and current_service is not None and current_service > 0 else None}
 
     def projection(total, reviewed):
         available = comparable and annual_earnings is not None and total["complete"]
@@ -458,10 +530,10 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
     if (evaluation.get("ebitda") or {}).get("replacement_payment_missing"):
         risks.append("A replacement payment is missing; after-refinance coverage is incomplete.")
     return {"schema_version": "earnings-improvement-v1", "context_stamp": context_stamp(cockpit), "disclosure": _disclosure(body),
-        "actions": results, "totals": sums, "baseline": baseline,
+        "actions": results, "totals": sums, "baseline": baseline, "recommendation": recommendation,
         "projection": {"proposed": projection(sums["proposed"], False), "approved": projection(sums["approved"], True)},
-        "targets": {"current": [{"ratio": ratio, "earnings_required": _money(current_service * ratio)} for ratio in (1.0, 1.25) if current_service is not None and current_service > 0],
-                    "refinance": [{"ratio": ratio, "earnings_required": _money(after_service * ratio)} for ratio in (1.0, 1.25) if after_service is not None and after_service > 0]},
+        "targets": {"current": [{"ratio": ratio, "earnings_required": _money(current_service * ratio)} for ratio in (1.0, 1.1, 1.25) if current_service is not None and current_service > 0],
+                    "refinance": [{"ratio": ratio, "earnings_required": _money(after_service * ratio)} for ratio in (1.0, 1.1, 1.25) if after_service is not None and after_service > 0]},
         "missing": missing, "risk_flags": risks,
         "all_actions_reviewed": bool(active) and all(row["review_state"] in {"approved", "rejected", "excluded"} for row in results),
         "notes": ["Historical earnings, NOI and current DSCR remain unchanged. Every improvement is a conditional operating illustration, not lender-approved income or a funding guarantee.",
@@ -506,7 +578,7 @@ def package_summary(evaluation):
         "projection": deepcopy(evaluation["projection"]), "totals": deepcopy(evaluation["totals"]),
         "targets": deepcopy(evaluation["targets"]), "missing": list(evaluation["missing"]),
         "risk_flags": list(evaluation["risk_flags"]), "notes": list(evaluation["notes"]),
-        "all_actions_reviewed": evaluation["all_actions_reviewed"],
+        "all_actions_reviewed": evaluation["all_actions_reviewed"], "recommendation": deepcopy(evaluation.get("recommendation")),
         "adjustments": [{key: deepcopy(row.get(key)) for key in ("id", "label", "kind", "review_state", "gross_annual_impact",
             "net_annual_impact", "first_year_impact", "implementation_recurring_annual", "implementation_one_time",
             "included_in_approved_projection", "effective_date", "explanation", "source_note", "owner_name", "issues", "risk_flags", "source_file_ids", "calculation")}

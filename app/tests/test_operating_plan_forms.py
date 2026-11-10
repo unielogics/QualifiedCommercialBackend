@@ -85,6 +85,31 @@ def test_client_cannot_forge_or_read_staff_review_or_reconciliation_fields():
     assert not any(any(field in key for field in operating_plan_schema.STAFF_FIELDS) for key in shape.by_key)
 
 
+def test_unit_cost_drivers_survive_client_edit_worksheet_and_dated_pdf_body():
+    body = example()
+    expense = body["expenses"][0]
+    expense.update(cost_basis="per_unit", unit_label="staff seat", current_units_per_period=10,
+        current_unit_cost=100, current_fixed_amount=200)
+    action = body["adjustments"][0]
+    action.update(cost_basis="per_unit", unit_label="staff seat", expense_row_id=expense["id"],
+        current_units_per_period=10, proposed_units_per_period=8, current_unit_cost=100,
+        proposed_unit_cost=90, current_fixed_amount=200, proposed_fixed_amount=200,
+        current_amount=None, proposed_amount=None)
+    merged = client_financial_forms.merge_client_body(KIND, body, deepcopy(body))
+    assert merged["expenses"][0]["current_units_per_period"] == 10
+    assert merged["adjustments"][0]["proposed_units_per_period"] == 8
+    shape = sheet_layout.layout_for_body(KIND, merged)
+    _, quantity = shape.by_key[f"expenses.{expense['id']}.current_units_per_period"]
+    assert quantity.type == "number"
+    assert shape.by_key[f"expenses.{expense['id']}.cost_basis"][1].options == ("total", "per_unit")
+    values = sheet_layout.flatten(KIND, merged)
+    assert values[quantity.key] == "10"
+    html = operating_plan_pdf.build_html(body=merged)
+    assert "Quantity: 10" in html and "staff seat" in html
+    assert "$1,200.00" in html and "$920.00" in html
+    assert "proposed units per period: 8" in html
+
+
 def test_request_catalog_and_batch_use_one_reviewed_online_form():
     definition = requirement_library.baseline_definitions()[KEY]
     assert definition["requirement_kind"] == "form"

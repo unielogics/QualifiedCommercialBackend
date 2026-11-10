@@ -19,6 +19,7 @@ ActionKind = Literal["price_change", "product_cost_change", "revenue_change", "e
 ReviewDecision = Literal["proposed", "approved", "rejected"]
 BaselineTreatment = Literal["unreconciled", "included_in_baseline", "incremental_to_baseline", "outside_operating_earnings"]
 RateBasis = Literal["all_in", "processor_markup", "unknown"]
+CostBasis = Literal["total", "per_unit"]
 
 REVIEW_FIELDS = ("status", "reviewed_by_user_id", "reviewed_at", "review_reason", "review_source_stamp",
                  "baseline_treatment", "baseline_reconciliation_note")
@@ -45,6 +46,11 @@ class ExpenseRow(_Form):
     label: str = Field(default="", max_length=240)
     payee: str = Field(default="", max_length=240)
     current_amount: float | None = Field(default=None, ge=0, le=1e15)
+    cost_basis: CostBasis = "total"
+    unit_label: str = Field(default="", max_length=120)
+    current_units_per_period: float | None = Field(default=None, ge=0, le=1e15)
+    current_unit_cost: float | None = Field(default=None, ge=0, le=1e15)
+    current_fixed_amount: float | None = Field(default=None, ge=0, le=1e15)
     cadence: Cadence = "monthly"
     essential: bool = True
     source_file_ids: list[UUID] = Field(default_factory=list, max_length=100)
@@ -62,6 +68,12 @@ class AdjustmentRow(_Form):
     expense_row_id: UUID | None = None
     current_amount: float | None = Field(default=None, ge=0, le=1e15)
     proposed_amount: float | None = Field(default=None, ge=0, le=1e15)
+    cost_basis: CostBasis = "total"
+    unit_label: str = Field(default="", max_length=120)
+    current_units_per_period: float | None = Field(default=None, ge=0, le=1e15)
+    proposed_units_per_period: float | None = Field(default=None, ge=0, le=1e15)
+    current_fixed_amount: float | None = Field(default=None, ge=0, le=1e15)
+    proposed_fixed_amount: float | None = Field(default=None, ge=0, le=1e15)
     cadence: Cadence = "monthly"
     units_per_period: float | None = Field(default=None, gt=0, le=1e15)
     current_unit_price: float | None = Field(default=None, ge=0, le=1e15)
@@ -183,11 +195,38 @@ def action_missing(row):
         required += ["units_per_period", "current_unit_cost", "proposed_unit_cost"]
     elif kind == "processing_cost_change":
         required += ["processing_volume", "current_processing_rate_pct", "proposed_processing_rate_pct"]
+    elif kind in {"expense_reduction", "expense_increase"} and row.get("cost_basis") == "per_unit":
+        required += ["unit_label", "current_units_per_period", "proposed_units_per_period", "current_unit_cost",
+                     "proposed_unit_cost", "current_fixed_amount", "proposed_fixed_amount"]
     else:
         required += ["current_amount", "proposed_amount"]
         if kind == "revenue_change":
             required.append("contribution_margin_pct")
     return [key for key in required if row.get(key) is None or row.get(key) == ""]
+
+
+def expense_missing(row):
+    fields = ["label"]
+    fields += ["unit_label", "current_units_per_period", "current_unit_cost", "current_fixed_amount"] if row.get("cost_basis") == "per_unit" else ["current_amount"]
+    missing = [key for key in fields if row.get(key) is None or row.get(key) == ""]
+    if row.get("cost_basis") == "per_unit" and not missing:
+        amount = cost_amount(row)
+        if amount is None:
+            missing.append("computed_total")
+        elif row.get("current_amount") is not None and abs(amount - row["current_amount"]) > .01:
+            missing.append("reconcile_current_amount")
+    return missing
+
+
+def cost_amount(row, side="current"):
+    """One selected cost basis, never a scalar total plus its unit components."""
+    if row.get("cost_basis") != "per_unit":
+        return row.get(f"{side}_amount")
+    values = [row.get(f"{side}_units_per_period"), row.get(f"{side}_unit_cost"), row.get(f"{side}_fixed_amount")]
+    if any(value is None for value in values):
+        return None
+    total = values[0] * values[1] + values[2]
+    return total if total <= 1e15 else None
 
 
 def completion(raw):
@@ -199,7 +238,7 @@ def completion(raw):
     if not active and not body["no_operating_expenses_confirmed"]:
         missing.append("expenses_or_no_expenses_confirmation")
     for row in active:
-        missing.extend(f"expenses.{row['id']}.{key}" for key in ("label", "current_amount") if row[key] is None or row[key] == "")
+        missing.extend(f"expenses.{row['id']}.{key}" for key in expense_missing(row))
     for row in body["adjustments"]:
         if not row["excluded"]:
             missing.extend(f"adjustments.{row['id']}.{key}" for key in action_missing(row))

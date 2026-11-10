@@ -51,6 +51,13 @@ async def evidence(profile_id: UUID, user: CurrentUser, db: Db):
     return (await load_cockpit(db, profile)).get("operating_evidence") or {}
 
 
+@router.get("/summary")
+async def summary(profile_id: UUID, user: CurrentUser, db: Db, family_id: UUID | None = None):
+    staff(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    return await operating_plan_service.summary(db, profile, family_id=family_id)
+
+
 @router.post("/evaluate")
 async def evaluate(profile_id: UUID, payload: Evaluate, user: CurrentUser, db: Db):
     staff(user)
