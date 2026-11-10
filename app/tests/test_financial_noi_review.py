@@ -49,20 +49,22 @@ def test_empty_file_can_save_manual_annual_noi_without_creating_a_source_stateme
     assert current["noi"]["scenario"]["after_debt_service_current"] == 30000
 
 
-def test_tax_calculation_suggests_income_plus_interest_without_da_addback_or_automatic_noi():
+def test_tax_calculation_is_provisional_then_staff_reviewed_without_da_addback():
     source = business_tax(ordinary_business_income=-54369, interest=6552, depreciation=99000)
     original = deepcopy(source)
     first = build([source])
     candidate = first["noi"]["review"]["sources"][0]
     assert candidate["eligible"] and candidate["year"] == 2025
     assert candidate["proposed_annual_value"] == -47817
-    assert first["noi"]["headline"] is None
+    assert first["noi"]["headline"]["value"] == -47817
+    assert first["noi"]["status"] == "provisional" and first["noi"]["review_needed"]
     state, _ = save(first, mode="source", selected_file_id="tax", annual_value=-47817)
     current = build([source], state=state)
     headline = current["noi"]["headline"]
     assert headline["kind"] == "tax_derived_noi" and headline["tax_derived_estimate"]
     assert "Tax-derived" in headline["label"] and headline["source_value"] == -47817
     assert headline["value"] == -47817 and current["noi"]["scenario"]["current"] == -47817
+    assert current["noi"]["status"] == "reviewed" and not current["noi"]["review_needed"]
     assert current["noi"]["years"] == [] and source == original
     assert current["ebitda"]["headline"] == first["ebitda"]["headline"]
     assert current["dscr"]["headline"] == first["dscr"]["headline"]

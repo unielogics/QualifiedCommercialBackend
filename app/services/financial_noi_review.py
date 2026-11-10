@@ -28,13 +28,53 @@ def _money(value):
     return float(Decimal(str(value)).quantize(Decimal("0.01")))
 
 
-def catalog(analyses, candidates, *, entity=None):
+def _identity_dependency(association):
+    return {key: (association or {}).get(key) for key in (
+        "status", "allows_financial_use", "expected_entity", "observed_entity", "observed_entities")}
+
+
+def _reviewed_tax_input(review, file_id, field, original):
+    target = next((item for item in (review or {}).get("inputs", [])
+        if item.get("key", "").startswith(f"tax_return:{file_id}:") and item["key"].endswith(f".{field}")), None)
+    if not target or not target.get("correction"):
+        return original
+    if field == "income" and not any(ref.get("fact_key") == "ordinary_business_income" for ref in target.get("source_refs", [])):
+        return original
+    return number(target.get("value"))
+
+
+def period_key(source):
+    """Ordering only; a printed year never invents actual reporting dates."""
+    return source.get("period_end") or (f"{source['year']:04d}-12-31" if source.get("year") else "")
+
+
+def _as_of(now=None):
+    return now.date() if isinstance(now, datetime) else now if isinstance(now, date) else datetime.now(UTC).date()
+
+
+def _automatic_exclusion(facts, first, last, year, today):
+    forecast = any(facts.get(key) is True for key in ("is_forecast", "is_projection", "forecast", "projected"))
+    forecast = forecast or any(re.search(r"\b(?:forecast|projection|projected|budget|budgeted|pro forma)\b",
+        str(facts.get(key) or "").strip().casefold().replace("_", " "))
+        for key in ("statement_type", "report_type", "period_type", "reporting_type", "statement_basis"))
+    if forecast:
+        return "forecast_source"
+    for value in (first, last):
+        try:
+            if date.fromisoformat(str(value)) > today:
+                return "future_reporting_period"
+        except ValueError:
+            pass
+    return "future_reporting_period" if year and year > today.year else None
+
+
+def catalog(analyses, candidates, *, entity=None, metric_review=None, now=None):
     from app.services.document_associations import identity_matches, source_excluded
     from app.services.financial_fact_citations import (
         financial_analysis_citation_status,
         validated_fact_citations_for_analysis,
     )
-    from app.services.financial_noi import PL_CLASSES, TAX_CLASSES, _entity, _source_refs
+    from app.services.financial_noi import PL_CLASSES, TAX_CLASSES, _entity, _period, _source_refs
     from app.services.financial_tax_earnings import (
         _first,
         normalize_tax_earnings,
@@ -56,8 +96,8 @@ def catalog(analyses, candidates, *, entity=None):
                   "This source does not establish the file's business identity." if not entity or not identity_matches(entity, observed, row.get("identity_association")) else None)
         candidate = pnl.get(str(row.get("file_id")))
         tax = normalize_tax_earnings(facts) if is_tax and business_tax else {}
-        first = tax.get("period_start") if is_tax else (candidate or {}).get("period_start")
-        last = tax.get("period_end") if is_tax else (candidate or {}).get("period_end")
+        first = tax.get("period_start") if is_tax else (candidate or {}).get("period_start") or facts.get("period_start")
+        last = tax.get("period_end") if is_tax else (candidate or {}).get("period_end") or facts.get("period_end")
         year = _year(last) or _year(facts.get("tax_year") or facts.get("fiscal_year") or facts.get("return_year"))
         notes = []
         if is_tax:
@@ -75,6 +115,25 @@ def catalog(analyses, candidates, *, entity=None):
             proposed = number((candidate or {}).get("annualized_value"))
             operands = {"candidate": candidate}
             notes.extend((candidate or {}).get("notes", []))
+        # Preserve the old catalog stamp byte-for-byte for legacy receipts.
+        # New reviews bind only their relevant operands/identity/period below.
+        legacy_stamp = stamp({"file_id": row.get("file_id"), "analysis": row.get("analysis_id"),
+            "hash": row.get("content_hash"), "facts": facts, "accepted": row.get("accepted"),
+            "association": row.get("identity_association"), "entity": entity, "operands": operands,
+            "citation_manifest": row.get("financial_fact_citations")})
+        if is_tax:
+            income = _reviewed_tax_input(metric_review, row.get("file_id"), "income", income)
+            interest = _reviewed_tax_input(metric_review, row.get("file_id"), "interest", interest)
+            proposed = _money(income + interest) if income is not None and interest is not None else None
+            relevant_values = {"income": income, "interest": interest,
+                "non_operating": {key: facts.get(key) for key in (
+                    "other_income", "non_operating_income", "rental_income", "capital_gains", "tax_form", "form_type")}}
+        else:
+            relevant_values = {key: (candidate or {}).get(key) for key in (
+                "value", "annualized_value", "reported_value", "computed_value", "gross_revenue",
+                "cost_of_goods_sold", "total_operating_expenses", "reconciliation_required", "months_covered")}
+            relevant_values["fundamentals"] = [{"key": item.get("key"), "value": item.get("value")}
+                for item in (candidate or {}).get("fundamentals", [])]
         analysis = SimpleNamespace(id=row.get("analysis_id"), bucket_file_id=row.get("file_id"),
             content_hash=row.get("content_hash"), status="completed",
             analysis={"key_facts": facts, "financial_fact_citations": row.get("financial_fact_citations")})
@@ -86,30 +145,67 @@ def catalog(analyses, candidates, *, entity=None):
             notes.append("The source document is not accepted. Saving this staff NOI review does not accept the document.")
         currency = tax.get("currency") if is_tax else (candidate or {}).get("currency")
         basis = tax.get("basis") if is_tax else (candidate or {}).get("basis")
+        months = _period({"period_start": first, "period_end": last})[2]
+        automatic_reason = _automatic_exclusion(facts, first, last, year, _as_of(now))
+        if automatic_reason:
+            notes.append("Forecast or future-period evidence is excluded from automatic current NOI. An explicit review remains a disclosed annual assumption, not historical actual income.")
+        belongs = bool((not is_tax or business_tax) and (reason is None or not observed or not entity or identity_matches(entity, observed)))
+        financial_stamp = stamp({"file_id": str(row.get("file_id")), "analysis": row.get("analysis_id"),
+            "hash": row.get("content_hash"), "entity": entity, "identity": _identity_dependency(row.get("identity_association")),
+            "values": relevant_values, "currency": currency, "basis": basis, "year": year,
+            "period_start": first, "period_end": last,
+            "forecast_markers": {key: facts.get(key) for key in ("is_forecast", "is_projection", "forecast", "projected",
+                "statement_type", "report_type", "period_type", "reporting_type", "statement_basis")}})
         sources.append({"file_id": str(row.get("file_id")), "file_name": row.get("file_name"),
             "kind": "business_tax_return" if is_tax else "profit_and_loss", "year": year,
             "currency": currency, "basis": basis, "period_start": first, "period_end": last,
             "proposed_annual_value": proposed, "eligible": reason is None, "reason": reason,
+            "automatic_eligible": reason is None and automatic_reason is None, "automatic_reason": automatic_reason,
+            "belongs_to_business": belongs, "months_covered": months, "financial_stamp": financial_stamp,
+            **({"tax_operands": {"income": income, "interest": interest}} if is_tax else {}),
             "accepted": bool(row.get("accepted")), "notes": notes, "citation_status": citation_status,
             "source_refs": [{**ref, "citations": citations,
                 "pages": sorted({citation["page"] for citation in citations if isinstance(citation.get("page"), int)})}
                 for ref in _source_refs(row, facts)],
-            "source_stamp": stamp({"file_id": row.get("file_id"), "analysis": row.get("analysis_id"),
-                "hash": row.get("content_hash"), "facts": facts, "accepted": row.get("accepted"),
-                "association": row.get("identity_association"), "entity": entity, "operands": operands,
-                "citation_manifest": row.get("financial_fact_citations")})})
+            "source_stamp": legacy_stamp})
     return sorted(sources, key=lambda row: (row.get("year") or 0, row["file_id"]), reverse=True)
 
 
-def prepare(analyses, candidates, *, state=None, entity=None):
+def prepare(analyses, candidates, *, state=None, entity=None, metric_review=None, now=None):
     state = state or {}
-    sources = catalog(analyses, candidates, entity=entity)
+    sources = catalog(analyses, candidates, entity=entity, metric_review=metric_review, now=now)
     source_stamp = stamp([{key: row[key] for key in ("file_id", "source_stamp", "eligible")} for row in sorted(sources, key=lambda row: row["file_id"])])
     history = [event for event in state.get("events", []) if event.get("source_metric") == "noi"]
     current = history[-1] if history else None
+    latest_period = max((period_key(row) for row in sources if row["belongs_to_business"] and not row["automatic_reason"]), default="")
+    entity_stamp = stamp({"entity": entity})
+    stale, stale_reason = False, None
+    if current and current.get("mode") != "automatic":
+        dependency = current.get("source_dependency")
+        if isinstance(dependency, dict) and dependency.get("version") == 2:
+            source = next((row for row in sources if row["file_id"] == current.get("selected_file_id")), None)
+            stale = (dependency.get("entity_stamp") != entity_stamp
+                     or bool(current.get("selected_file_id") and (not source or not source["eligible"]
+                         or source["financial_stamp"] != dependency.get("financial_stamp"))))
+            if stale:
+                stale_reason = "The reviewed NOI source, business identity or financial operands changed. Review and save its annual basis again."
+            elif latest_period > (dependency.get("latest_period") or ""):
+                stale, stale_reason = True, "A newer business reporting period is available. Review the pinned annual NOI basis against that period."
+        else:
+            # Old receipts lack scoped operand/identity snapshots. Retain their
+            # original guard until an explicit review upgrades the receipt.
+            stale = current.get("source_stamp") != source_stamp
+            selected = current.get("selected_file_id")
+            if selected and any(event.get("revision", 0) > current.get("revision", 0)
+                and event.get("input_key", "").startswith(f"tax_return:{selected}:")
+                and event["input_key"].endswith((".income", ".interest")) for event in state.get("events", [])):
+                stale = True
+            if stale:
+                stale_reason = "Earlier NOI review uses the legacy evidence catalog; re-review to bind current NOI dependencies."
     return {"revision": state.get("revision", 0), "source_stamp": source_stamp,
             "mode": current.get("mode", "automatic") if current else "automatic",
-            "stale": bool(current and current.get("mode") != "automatic" and current.get("source_stamp") != source_stamp),
+            "stale": stale, "stale_reason": stale_reason, "entity_stamp": entity_stamp,
+            "latest_period": latest_period, "as_of_date": _as_of(now).isoformat(),
             "sources": sources, "current": current, "history": history}
 
 
@@ -120,11 +216,16 @@ def effective(review):
         return None
     source = next((row for row in review["sources"] if row["file_id"] == current.get("selected_file_id")), None)
     tax = bool(source and source["kind"] == "business_tax_return")
+    assumption = bool((source or {}).get("automatic_reason") or (current.get("source_dependency") or {}).get("assumption"))
     kind = "tax_derived_noi" if tax else "staff_reviewed_noi"
     label = "Tax-derived NOI estimate (staff reviewed)" if tax else "Staff-reviewed business NOI"
+    if assumption:
+        label = "Staff-reviewed NOI assumption" if not tax else "Tax-derived NOI assumption (staff reviewed)"
     first, last = current.get("period_start"), current.get("period_end")
     period = f"{first} – {last} (annual staff review)" if first and last else f"Year {current['year']} (annual staff review)"
     notes = ["Explicit annual staff NOI review. Source documents, P&L history, EBITDA and program qualification remain independent."]
+    if assumption:
+        notes.append("This explicit review uses forecast or future-period information. It is an annual assumption, not historical actual operating income.")
     if tax:
         notes.append("Tax-derived operating-income estimate; not a historical P&L result. Tax/book differences and non-operating items were subject to staff review; D&A is not automatically added back.")
     if not source:
@@ -139,6 +240,7 @@ def effective(review):
         "entity_comparable": True, "entity_mismatch": False, "reconciliation_required": False,
         "formula": "staff-reviewed annual NOI", "staff_adjusted": True, "staff_reviewed": True,
         "tax_derived_estimate": tax, "source_accepted": bool(source and source["accepted"]),
+        "forecast_assumption": assumption,
         "source_value": source.get("proposed_annual_value") if source else None,
         "reviewed_value": current["annual_value"], "input_keys": [], "active_input_keys": [],
         "fundamentals": [], "missing_inputs": [], "notes": notes,
@@ -160,7 +262,7 @@ def change(state, review, *, actor, mode, selected_file_id=None, annual_value=No
     request_stamp = stamp(request)
     for event in state.get("events", []):
         if event.get("idempotency_key") == idempotency_key:
-            if event.get("request_stamp") != request_stamp:
+            if event.get("request_stamp") != request_stamp or event.get("actor_id") != str(actor.id):
                 raise HTTPException(409, "Idempotency key already used for a different NOI review")
             return state, False
     if state.get("revision", 0) != expected_revision:
@@ -203,6 +305,12 @@ def change(state, review, *, actor, mode, selected_file_id=None, annual_value=No
         request["annual_value"] = _money(value)
     revision = expected_revision + 1
     event = {**request, "id": str(uuid.uuid4()), "revision": revision, "source_metric": "noi",
+        "source_dependency": {"version": 2, "entity_stamp": review["entity_stamp"],
+            "latest_period": max(review["latest_period"], request.get("period_end") or (f"{year:04d}-12-31" if year else "")),
+            "assumption": bool((source or {}).get("automatic_reason") or
+                _automatic_exclusion({}, request.get("period_start"), request.get("period_end"), year,
+                    date.fromisoformat(review["as_of_date"]))),
+            "financial_stamp": source.get("financial_stamp") if source else None},
         "source_refs": deepcopy(source["source_refs"]) if source else [],
         "actor_id": str(actor.id), "actor_name": getattr(actor, "full_name", None) or getattr(actor, "name", None),
         "at": (now or datetime.now(UTC)).isoformat(), "idempotency_key": idempotency_key, "request_stamp": request_stamp}

@@ -17,6 +17,17 @@ RESULT_KEYS = ("key", "label", "kind", "value", "annualized_value", "period", "m
                "computed_value", "reported_value", "currency", "basis", "numerator", "denominator", "selected", "basis_status", "debt_version_id", "notes",
                "source_value", "reviewed_value", "reviewed_label", "staff_adjusted", "staff_reviewed", "tax_derived_estimate",
                "source_accepted", "active_input_keys", "year", "period_start", "period_end", *CURRENCY_KEYS)
+NOI_GOVERNANCE_KEYS = ("policy_version", "status", "review_needed", "status_reason", "reason_codes", "source_limitations")
+
+
+def noi_governance_brief(noi, *, internal=True):
+    """Canonical NOI status and its own reporting basis, without review receipts."""
+    noi = noi if isinstance(noi, dict) else {}
+    source = noi.get("headline") or noi.get("historical") or noi
+    keys = (*NOI_GOVERNANCE_KEYS, *(("authority_stamp",) if internal else ()))
+    result = {key: deepcopy(noi[key]) for key in keys if key in noi}
+    result.update({key: source[key] for key in ("kind", "label", "year", "period", "currency") if key in source})
+    return result
 
 
 def _number(value):
@@ -99,6 +110,7 @@ def operating_earnings_brief(cockpit):
         "potential": deepcopy(ebitda.get("potential")),
         "improvement_plan": deepcopy((cockpit.get("operating_plan") or {}).get("package")),
         "noi": {
+            **noi_governance_brief(noi),
             "definition": fields(noi.get("definition"), ("key", "label", "formula", "includes_depreciation_and_amortization")),
             "historical": noi_historical, "reason": noi.get("reason"),
             "source_historical": _result(noi.get("source_headline")),
@@ -245,6 +257,7 @@ def current_review_projection(result, cockpit):
     service = ((cockpit or {}).get("debt") or {}).get("service") or {}
     strict_ebitda = annual.get("ebitda_annual") if annual.get("currency") == "USD" else None
     operating = (brief or {}).get("noi", {}).get("historical") or {}
+    noi_governance = (brief or {}).get("noi") or {}
     revenue_baseline = (((cockpit or {}).get("ebitda") or {}).get("potential") or {}).get("baseline") or {}
     current_revenue = revenue_baseline.get("revenue") if revenue_baseline.get("currency") == "USD" else None
     metrics.update({"estimated_dscr": primary.get("value"), "dscr": primary.get("value"),
@@ -255,9 +268,13 @@ def current_review_projection(result, cockpit):
                     "ebitda_source": "profit_and_loss" if strict_ebitda is not None else None,
                     "annual_revenue": current_revenue, "annualized_revenue": current_revenue,
                     "revenue_period": revenue_baseline.get("period"),
-                    "noi": operating.get("value"), "annual_noi": operating.get("annualized_value"),
+                    "noi": operating.get("annualized_value"), "annual_noi": operating.get("annualized_value"),
+                    "noi_source_period_value": operating.get("value"),
                     "noi_period": operating.get("period"), "noi_definition": "business_operating_income",
                     "noi_kind": operating.get("kind"), "noi_label": operating.get("label"), "noi_currency": operating.get("currency"),
+                    "noi_policy_version": noi_governance.get("policy_version"), "noi_status": noi_governance.get("status"),
+                    "noi_review_needed": noi_governance.get("review_needed"), "noi_status_reason": noi_governance.get("status_reason"),
+                    "noi_reason_codes": noi_governance.get("reason_codes") or [],
                     "dscr_basis": primary.get("key"), "dscr_earnings": primary.get("numerator"),
                     "dscr_earnings_label": primary.get("numerator_label"),
                     "dscr_source_refs": primary.get("source_refs") or [],

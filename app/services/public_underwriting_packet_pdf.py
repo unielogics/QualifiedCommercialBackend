@@ -1356,16 +1356,22 @@ def _operating_earnings_lines(financials: dict[str, Any], *, compact: bool = Fal
     if noi:
         operating = _record(noi.get("historical"))
         lines.append("Business NOI = revenue - COGS - operating expenses, including expensed depreciation and amortization; before financing costs and income taxes.")
+        if noi.get("status"):
+            lines.append("NOI status: " + str(noi["status"]).replace("_", " ") + ". " + str(noi.get("status_reason") or ""))
         if operating:
-            lines.append(f"{operating.get('label') or 'Business NOI'}: {_earnings_money(operating.get('value'), operating.get('currency'))}; {operating.get('period') or 'period unknown'}." + (" Provisional source figure." if operating.get("provisional") else ""))
+            annual = operating.get("annualized_value")
+            lines.append(f"{operating.get('label') or 'Business NOI'}: {_earnings_money(annual, operating.get('currency'))}; {operating.get('period') or 'period unknown'}; annual basis." + (" Provisional source figure." if operating.get("provisional") else ""))
+            if annual is None or operating.get("annualization_factor") not in (None, 1):
+                lines.append("Source-period operating result: " + _earnings_money(operating.get("value"), operating.get("currency")) + ". " + ("Annual NOI needs review." if annual is None else "The annual figure is an annualized run-rate illustration."))
             if operating.get("staff_reviewed"):
                 lines.append("Staff-reviewed annual basis. " + ("Tax-derived estimate; operating classifications require review." if operating.get("tax_derived_estimate") else "Manually reviewed operating income; source documents are unchanged."))
             names = list(dict.fromkeys(str(row.get("file_name")) for row in _records(operating.get("source_refs")) if row.get("file_name")))
             if names:
                 lines.append("NOI source: " + "; ".join(names[:2 if compact else 4]) + ".")
             if not compact and operating.get("fundamentals"):
-                values = {row.get("key"): row.get("value") for row in _records(operating.get("fundamentals"))}
-                lines.append(f"NOI inputs: revenue {_earnings_money(values.get('gross_revenue'), operating.get('currency'))}; COGS {_earnings_money(values.get('cost_of_goods_sold'), operating.get('currency'))}; operating expenses {_earnings_money(values.get('total_operating_expenses'), operating.get('currency'))}.")
+                inputs = [str(row.get("label") or row.get("key")) + " " + _earnings_money(row.get("value"), operating.get("currency"))
+                          for row in _records(operating.get("fundamentals"))]
+                lines.append("NOI inputs: " + "; ".join(inputs) + ".")
         else:
             lines.append("NOI unavailable: " + str(noi.get("reason") or "Current operating-income evidence is incomplete."))
     lines.append("A refinance changes debt service and cash retained; it does not itself change EBITDA. Forecasts are conditional illustrations and do not establish current program eligibility.")
@@ -1384,6 +1390,9 @@ def _operating_plan_lines(earnings):
     snapshot = _record(plan.get("snapshot"))
     if snapshot.get("label"):
         lines.append(str(snapshot["label"]) + ". Current historical financial figures are unchanged.")
+    noi_basis = _record(baseline.get("noi_governance"))
+    if noi_basis:
+        lines.append("Operating-plan NOI basis: " + str(noi_basis.get("label") or "Business operating income") + "; " + str(noi_basis.get("period") or "period unknown") + "; " + str(noi_basis.get("currency") or "currency unconfirmed") + "; " + str(noi_basis.get("status") or "review status unavailable").replace("_", " ") + ". " + str(noi_basis.get("status_reason") or ""))
     for expense in _records(plan.get("expenses")):
         value = expense.get("effective_period_amount") if "effective_period_amount" in expense else expense.get("current_amount")
         detail = f"Expense: {expense.get('label') or 'Operating cost'}; {_earnings_money(value, currency)} per {expense.get('cadence') or 'unknown period'}."
@@ -1407,7 +1416,8 @@ def _operating_plan_lines(earnings):
         current_ratio, projected_ratio = _num(baseline.get("dscr")), _num(result.get("dscr_current"))
         coverage = f"{current_ratio:.2f}x" if current_ratio is not None else "unavailable"
         coverage += " to " + (f"{projected_ratio:.2f}x" if projected_ratio is not None else "unavailable")
-        lines.append(f"{label}: annual earnings {_earnings_money(baseline.get('earnings'), currency)} to {_earnings_money(result.get('earnings'), currency)}; NOI {_earnings_money(baseline.get('noi'), currency)} to {_earnings_money(result.get('noi'), currency)}; current-debt coverage {coverage}; coverage with refinance {ratio_text}; recurring improvement {_earnings_money(totals.get('annual_impact'), currency)} per year; first-year improvement {_earnings_money(totals.get('first_year_impact'), currency)}; implementation costs {_earnings_money(totals.get('one_time_cost'), currency)}.")
+        noi_currency = baseline.get("noi_currency", currency)
+        lines.append(f"{label}: annual earnings {_earnings_money(baseline.get('earnings'), currency)} to {_earnings_money(result.get('earnings'), currency)}; NOI {_earnings_money(baseline.get('noi'), noi_currency)} to {_earnings_money(result.get('noi'), noi_currency)}; current-debt coverage {coverage}; coverage with refinance {ratio_text}; recurring improvement {_earnings_money(totals.get('annual_impact'), currency)} per year; first-year improvement {_earnings_money(totals.get('first_year_impact'), currency)}; implementation costs {_earnings_money(totals.get('one_time_cost'), currency)}.")
     for index, action in enumerate(_records(plan.get("adjustments")), 1):
         lines.append(f"{index}. {action.get('label') or 'Operating adjustment'} ({str(action.get('kind') or '').replace('_', ' ')}; {action.get('review_state') or 'proposed'}). Recurring annual effect {_earnings_money(action.get('net_annual_impact'), currency)}; first-year {_earnings_money(action.get('first_year_impact'), currency)}; effective {action.get('effective_date') or 'not supplied'}; responsible: {action.get('owner_name') or 'not assigned'}.")
         calculation = _record(action.get("calculation"))
@@ -2384,9 +2394,9 @@ def render_underwriting_packet_pdf(
             key_text = str(key)
             # Provenance stamps (*_source / *_basis) label other rows; the
             # statement figures (pl_* / balance_sheet_*) have their own section.
-            if _is_request_metric(key_text) or current_earnings_metric(key_text) or key_text.endswith(("_source", "_basis")) or key_text.startswith(("pl_", "balance_sheet_")):
+            if _is_request_metric(key_text) or current_earnings_metric(key_text) or key_text.endswith(("_source", "_basis")) or key_text.startswith(("pl_", "balance_sheet_", "financial_calculation_")):
                 continue
-            metric_rows.append({"metric": key_text.replace("_", " ").title(), "value": _text(value), "source": "AI extraction"})
+            metric_rows.append({"metric": key_text.replace("_", " ").title(), "value": _text(value), "source": "Current financial review" if key in _record(financials.get("current_key_metrics")) else "AI extraction"})
 
     # Executive summary as one or more real <p> paragraphs (prose, not JSON).
     exec_paras = [p.strip() for p in re.split(r"\n{2,}|\r\n\r\n", summary_text) if p.strip()]

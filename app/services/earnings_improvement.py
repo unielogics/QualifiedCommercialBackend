@@ -42,6 +42,8 @@ def _money(value):
 
 
 def _context_values(cockpit):
+    from app.services.financial_metric_reporting import noi_governance_brief
+
     earnings = cockpit.get("ebitda") or {}
     source = earnings.get("headline") or {}
     noi = (cockpit.get("noi") or {}).get("headline") or {}
@@ -52,6 +54,7 @@ def _context_values(cockpit):
     return {
         "earnings": {key: source.get(key) for key in ("key", "value", "annualized_value", "period", "currency", "basis", "source_refs")},
         "noi": {key: noi.get(key) for key in ("key", "value", "annualized_value", "period", "currency", "basis", "source_refs")},
+        "noi_governance": noi_governance_brief(cockpit.get("noi")),
         "selection": {key: (earnings.get("source_selection") or {}).get(key) for key in ("selected_file_id", "source_stamp", "stale")},
         "debt": {key: service.get(key) for key in ("source", "version_id", "annual", "currency", "identity_association_conflict")},
         "financing": {key: evaluation.get(key) for key in ("active", "debt_service_after_annual", "coverage_unavailable_reason", "loan_terms", "schedule")},
@@ -507,6 +510,9 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
     potential = (cockpit.get("ebitda") or {}).get("potential") or {}
     source_baseline = potential.get("baseline") or {}
     noi = (cockpit.get("noi") or {}).get("headline") or {}
+    from app.services.financial_metric_reporting import noi_governance_brief
+
+    noi_governance = noi_governance_brief(cockpit.get("noi"))
     debt = (cockpit.get("debt") or {}).get("service") or {}
     plan = cockpit.get("plan") or {}
     evaluation = plan.get("evaluation") or {}
@@ -529,6 +535,7 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
         "revenue": source_baseline.get("revenue"), "earnings": annual_earnings, "earnings_kind": earnings.get("kind"),
         "noi": annual_noi, "noi_kind": noi.get("kind"), "noi_label": noi.get("label"),
         "noi_year": noi.get("year"), "noi_basis": noi.get("basis"), "noi_staff_reviewed": reviewed_noi,
+        "noi_governance": noi_governance, "noi_period": noi.get("period"), "noi_currency": noi.get("currency"),
         "dscr": ((cockpit.get("dscr") or {}).get("headline") or {}).get("value"),
         "annual_debt_service": current_service, "provisional": bool(earnings.get("provisional", True)),
         "noi_provisional": bool(noi.get("provisional", True))}
@@ -570,11 +577,15 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
         missing.append("A latest-period annual earnings baseline is needed to translate operating changes into coverage.")
     if annual_noi is None:
         missing.append("A supported operating-income statement or an explicit annual staff NOI review is needed for a projected NOI figure.")
+    elif not noi_comparable:
+        missing.append("Reconcile the NOI business, currency and accounting basis with this operating plan before showing projected NOI. The current NOI keeps its own reporting basis.")
     if current_service is None:
         missing.append("Current annual debt service is not established.")
     if not comparable:
         missing.append("Reconcile the disclosure and current earnings business, currency, accounting basis and period before relying on projected coverage.")
     risks = []
+    if noi_governance.get("review_needed"):
+        risks.append("NOI basis requires review: " + str(noi_governance.get("status_reason") or "Review the current source, period and operating-income calculation."))
     if reviewed_noi:
         risks.append("Projected NOI starts from an explicit annual staff review; its tax-derived or manual basis is separate from the historical P&L and does not establish program eligibility.")
     if baseline["provisional"]:
