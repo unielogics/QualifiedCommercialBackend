@@ -135,6 +135,7 @@ class DocumentKind(StrEnum):
     #: brief and the lender packet, as members may read them once cleared.
     EXECUTIVE_SUMMARY = "executive_summary"
     UNDERWRITING_PACKAGE = "underwriting_package"
+    INVESTOR_PRESENTATION = "investor_presentation"
     OTHER = "other"
 
 
@@ -147,6 +148,7 @@ DOCUMENT_KIND_LABELS: dict[str, str] = {
     DocumentKind.SERVICING_SUMMARY: "Servicing agreement summary",
     DocumentKind.EXECUTIVE_SUMMARY: "Executive credit brief",
     DocumentKind.UNDERWRITING_PACKAGE: "Underwriting package",
+    DocumentKind.INVESTOR_PRESENTATION: "Investor presentation",
     DocumentKind.OTHER: "Other document",
 }
 

@@ -2306,6 +2306,7 @@ async def generate_package_readiness_documents(
     intake_id: UUID,
     user: core.CurrentUser,
     db: AsyncSession = Depends(core.get_db),
+    payload: core.PackageReadinessGenerateRequest | None = None,
 ) -> core.PackageReadinessGenerationRead:
     """Regenerate the two current underwriting PDFs as one audited action.
 
@@ -2327,6 +2328,7 @@ async def generate_package_readiness_documents(
     )
     previous_summary = await core._latest_artifact(db, intake.id, "executive_summary")
     previous_packet = await core._latest_artifact(db, intake.id, "lender_packet")
+    previous_presentation = await core._latest_artifact(db, intake.id, "investor_presentation")
     generation_id = uuid4()
     generated_at = core._now()
     created_s3_keys: list[str] = []
@@ -2341,6 +2343,7 @@ async def generate_package_readiness_documents(
         ) = await core._package_generation_inputs(
             db,
             intake,
+            payload.model_dump() if payload is not None else None,
         )
         summary = await core._create_executive_summary_artifact(
             db,
@@ -2361,6 +2364,10 @@ async def generate_package_readiness_documents(
             source_snapshot_metadata=source_metadata,
             cleanup_s3_keys=created_s3_keys,
         )
+        presentation = await core._create_investor_presentation_artifact(
+            db, intake, user, financials=financials, source_snapshot_metadata=source_metadata,
+            cleanup_s3_keys=created_s3_keys, generated_at=generated_at,
+        )
 
         summary_file, superseded_summary_ids = await core._publish_package_artifact_to_bucket(
             db,
@@ -2380,6 +2387,10 @@ async def generate_package_readiness_documents(
             generated_at=generated_at,
             user=user,
         )
+        presentation_file, superseded_presentation_ids = await core._publish_package_artifact_to_bucket(
+            db, intake=intake, artifact=presentation, previous_artifact=previous_presentation,
+            generation_id=generation_id, generated_at=generated_at, user=user,
+        )
         await core._log(
             db,
             intake.bucket_id,
@@ -2389,7 +2400,7 @@ async def generate_package_readiness_documents(
             target_type="public_underwriting_intake",
             target_id=str(intake.id),
             detail=(
-                "Generated executive summary and lender package PDFs "
+                "Generated executive summary, lender package and investor presentation PDFs "
                 f"as package version {generation_id}"
             ),
         )
@@ -2405,32 +2416,38 @@ async def generate_package_readiness_documents(
         current = {item.id: item for item in artifacts}
         summary = current.get(summary.id, summary)
         packet = current.get(packet.id, packet)
+        presentation = current.get(presentation.id, presentation)
+        active_file_ids = {summary_file.id, packet_file.id, presentation_file.id}
         response = core.PackageReadinessGenerationRead(
             generation_id=generation_id,
             generated_at=generated_at,
             executive_summary=core._artifact_read(
                 summary,
                 current_input_fingerprint=input_fingerprint,
-                active_bucket_file_ids={summary_file.id, packet_file.id},
+                active_bucket_file_ids=active_file_ids,
             ),
             lender_packet=core._artifact_read(
                 packet,
                 current_input_fingerprint=input_fingerprint,
-                active_bucket_file_ids={summary_file.id, packet_file.id},
+                active_bucket_file_ids=active_file_ids,
             ),
+            investor_presentation=core._artifact_read(presentation, current_input_fingerprint=input_fingerprint,
+                                                     active_bucket_file_ids=active_file_ids),
             bucket_files=[
                 core._package_bucket_file_read(summary_file),
                 core._package_bucket_file_read(packet_file),
+                core._package_bucket_file_read(presentation_file),
             ],
             superseded_bucket_file_ids=[
                 *superseded_summary_ids,
                 *superseded_packet_ids,
+                *superseded_presentation_ids,
             ],
             artifact_history=[
                 core._artifact_read(
                     item,
                     current_input_fingerprint=input_fingerprint,
-                    active_bucket_file_ids={summary_file.id, packet_file.id},
+                    active_bucket_file_ids=active_file_ids,
                 )
                 for item in artifacts
             ],

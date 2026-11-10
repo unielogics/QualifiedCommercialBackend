@@ -45,6 +45,90 @@ def test_numeric_zero_remains_explicit_and_invalid_amounts_still_fail():
     assert error.value.status_code == 422
 
 
+@pytest.mark.parametrize("category", ["cogs", "marketing", "software", "salaries", "professional_fees", "insurance"])
+def test_unit_costs_work_for_every_operating_category_and_do_not_add_source_total(category):
+    disclosed = expense(category=category, cost_basis="per_unit", unit_label="seat", current_units_per_period=20,
+        current_unit_cost=50, current_fixed_amount=0)
+    proposed = action(cost_basis="per_unit", unit_label="seat", current_units_per_period=20,
+        proposed_units_per_period=15, current_unit_cost=50, proposed_unit_cost=40,
+        current_fixed_amount=0, proposed_fixed_amount=100, current_amount=None, proposed_amount=None)
+    result = plan.evaluate(body(proposed, expenses=[disclosed]), context(), now=NOW)
+    assert result["disclosure"]["operating_cash_monthly"] == 1000
+    assert result["disclosure"]["cost_mix"][0]["annual_amount"] == 12000
+    assert result["totals"]["proposed"]["annual_impact"] == 3600
+    assert result["actions"][0]["calculation"]["proposed_units_per_period"] == 15
+    assert result["projection"]["proposed"]["earnings"] == -6400
+
+
+def test_unit_unknown_fixed_amount_is_unknown_and_explicit_zero_is_supported():
+    disclosed = expense(cost_basis="per_unit", unit_label="hour", current_units_per_period=10,
+        current_unit_cost=100, current_fixed_amount=None)
+    result = plan.evaluate(body(expenses=[disclosed]), context(), now=NOW)
+    assert not result["disclosure"]["complete"]
+    assert result["disclosure"]["cost_mix"][0]["missing_count"] == 1
+    assert "current_fixed_amount" in str(result["disclosure"]["missing_inputs"])
+    assert not completion(body(expenses=[disclosed]))["complete"]
+    disclosed.update(current_units_per_period=0, current_unit_cost=100, current_fixed_amount=0, current_amount=None)
+    result = plan.evaluate(body(expenses=[disclosed]), context(), now=NOW)
+    assert result["disclosure"]["operating_monthly"] == 0
+    assert result["disclosure"]["complete"]
+
+
+def test_unit_source_total_mismatch_and_increase_direction_cannot_be_approved():
+    disclosed = expense(cost_basis="per_unit", unit_label="item", current_units_per_period=10,
+        current_unit_cost=100, current_fixed_amount=50)
+    proposed = action(cost_basis="per_unit", unit_label="item", current_units_per_period=10,
+        proposed_units_per_period=10, current_unit_cost=100, proposed_unit_cost=120,
+        current_fixed_amount=50, proposed_fixed_amount=50, current_amount=None, proposed_amount=None)
+    result = plan.evaluate(body(proposed, expenses=[disclosed]), context(), now=NOW)
+    assert not result["disclosure"]["complete"]
+    assert any("recorded total" in message for message in result["actions"][0]["issues"])
+    assert any("direction" in message for message in result["actions"][0]["issues"])
+    assert result["projection"]["proposed"]["earnings"] is None
+    disclosed["current_amount"] = 1050
+    proposed["kind"] = "expense_increase"
+    result = plan.evaluate(body(proposed, expenses=[disclosed]), context(), now=NOW)
+    assert result["totals"]["proposed"]["annual_impact"] == -2400
+
+
+def test_matching_total_cannot_hide_mismatched_current_unit_drivers():
+    disclosed = expense(cost_basis="per_unit", unit_label="seat", current_units_per_period=20,
+        current_unit_cost=50, current_fixed_amount=0)
+    proposed = action(cost_basis="per_unit", unit_label="seat", current_units_per_period=10,
+        proposed_units_per_period=10, current_unit_cost=100, proposed_unit_cost=90,
+        current_fixed_amount=0, proposed_fixed_amount=0, current_amount=None, proposed_amount=None)
+    result = plan.evaluate(body(proposed, expenses=[disclosed]), context(), now=NOW)
+    assert any("not just to the same total" in issue for issue in result["actions"][0]["issues"])
+    assert not result["totals"]["proposed"]["complete"]
+
+
+def test_granular_defaults_preserve_total_basis_review_stamps_but_driver_edits_stale_them():
+    legacy = body()
+    for row in legacy["expenses"]:
+        for key in ("cost_basis", "unit_label", "current_units_per_period", "current_unit_cost", "current_fixed_amount"):
+            row.pop(key, None)
+    for row in legacy["adjustments"]:
+        for key in ("cost_basis", "unit_label", "current_units_per_period", "proposed_units_per_period", "current_fixed_amount", "proposed_fixed_amount"):
+            row.pop(key, None)
+    normalized = validate_body(legacy)
+    assert plan.proposal_stamp(legacy["adjustments"][0], legacy["expenses"][0], legacy) == plan.proposal_stamp(normalized["adjustments"][0], normalized["expenses"][0], normalized)
+    accepted = approve(normalized)
+    accepted["expenses"][0].update(cost_basis="per_unit", unit_label="seat", current_units_per_period=20,
+        current_unit_cost=50, current_fixed_amount=0)
+    assert plan.evaluate(accepted, context(), now=NOW)["actions"][0]["review_state"] == "stale"
+
+
+@pytest.mark.parametrize("ratio,earnings,recommended", [(1.09, 13080, True), (1.1, 13200, False), (1.2, -10, True), (None, None, None)])
+def test_earnings_plan_recommendation_uses_signed_income_and_110_threshold(ratio, earnings, recommended):
+    cockpit = context()
+    cockpit["ebitda"]["headline"]["annualized_value"] = earnings
+    cockpit["dscr"]["headline"]["value"] = ratio
+    result = plan.evaluate(body(), cockpit, now=NOW)
+    assert result["recommendation"]["recommended"] is recommended
+    assert result["recommendation"]["threshold"] == 1.1
+    assert any(target["ratio"] == 1.1 for target in result["targets"]["current"])
+
+
 def context():
     headline = {"key": "tax_return", "kind": "tax_estimate", "value": -10000,
         "annualized_value": -10000, "period": "2025", "currency": "USD", "basis": "cash",
@@ -189,6 +273,39 @@ def test_unknown_implementation_cost_does_not_become_zero():
     assert result["actions"][0]["net_annual_impact"] is None
     assert not result["totals"]["proposed"]["complete"]
     assert result["projection"]["proposed"]["earnings"] is None
+    assert result["totals"]["proposed"]["annual_impact"] is None
+
+
+def test_unquantified_actions_and_categories_never_claim_zero_savings_or_costs():
+    unknown = expense(current_amount=None)
+    raw = body(action(proposed_amount=None, implementation_cost=None), expenses=[unknown])
+    result = plan.evaluate(raw, context(), now=NOW)
+    totals = result["totals"]["proposed"]
+    assert totals["expected_count"] == 1 and totals["count"] == 0
+    assert totals["annual_impact"] is totals["monthly_impact"] is totals["first_year_impact"] is totals["one_time_cost"] is None
+    assert totals["known_annual_subtotal"] is None
+    category = result["disclosure"]["cost_mix"][0]
+    assert category["annual_amount"] is None and category["quantified_count"] == 0
+    assert category["missing_count"] == 1
+    summary = plan.package_summary(result)
+    assert summary["totals"]["proposed"]["annual_impact"] is None
+
+
+def test_partial_plan_exposes_known_subtotal_but_no_complete_projection_total():
+    second_expense, second_action = str(uuid4()), str(uuid4())
+    raw = body(action(), action(id=second_action, driver_key="software", expense_row_id=second_expense,
+        current_amount=100, proposed_amount=None), expenses=[expense(), expense(id=second_expense, category="software", current_amount=100)])
+    result = plan.evaluate(raw, context(), now=NOW)
+    totals = result["totals"]["proposed"]
+    assert totals["known_annual_subtotal"] == 2400
+    assert totals["annual_impact"] is None and not totals["complete"]
+    assert result["projection"]["proposed"]["earnings"] is None
+    raw["adjustments"] = []
+    result = plan.evaluate(raw, context(), now=NOW)
+    assert result["totals"]["proposed"]["annual_impact"] == 0
+    raw["expenses"][0]["current_amount"] = 0
+    result = plan.evaluate(raw, context(), now=NOW)
+    assert result["disclosure"]["cost_mix"][0]["annual_amount"] == 0
 
 
 @pytest.mark.parametrize("category", ["loan_payments", "income_taxes", "owner_draws", "transfers", "depreciation_amortization"])

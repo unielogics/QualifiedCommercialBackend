@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from app.enums import Role
 from app.models.bucket import BucketFile
 from app.models.file_event import FileEvent
+from app.models.financial_form_version import FinancialFormDraft, FinancialFormFamily
 from app.schemas.earnings_improvement import empty_body, validate_body
 from app.services import earnings_improvement as math
 from app.services import financial_workspace as ws
@@ -71,6 +72,57 @@ def test_removing_survivor_preserves_excluded_rows_and_resolves_duplicate_refere
     result = service.protect_reviews(incoming, old)
     assert len(result["expenses"]) == 2
     assert all(row["excluded"] and row["duplicate_of"] is None for row in result["expenses"])
+
+
+@pytest.mark.asyncio
+async def test_summary_reads_saved_draft_cost_mix_without_creating_or_publishing():
+    db = Memory()
+    profile, family, draft = context("operating_plan")
+    draft.body = proposal()
+    draft.body["expenses"][0].update(cost_basis="per_unit", unit_label="seat", current_units_per_period=20,
+        current_unit_cost=100, current_fixed_amount=0)
+    db.objects[(FinancialFormDraft, family.id)] = draft
+    with patch.object(ws, "existing_family", AsyncMock(return_value=family)), \
+         patch("app.services.financial_cockpit.load_cockpit", AsyncMock(return_value=cockpit())):
+        result = await service.summary(db, profile)
+    assert result["has_plan"] and result["state"] == "working_draft"
+    assert result["expense_count"] == result["action_count"] == 1
+    assert result["cost_mix"] == [{"category": "rent", "annual_amount": 24000, "missing_count": 0, "count": 1, "quantified_count": 1}]
+    assert result["recommendation"]["recommended"] is True
+    assert result["version_id"] is None and result["updated_at"] == draft.updated_at.isoformat()
+    assert db.added == db.versions == []
+
+
+@pytest.mark.asyncio
+async def test_summary_does_not_create_empty_family_and_rejects_cross_file_selection():
+    db = Memory()
+    profile, family, _ = context("operating_plan")
+    with patch.object(ws, "existing_family", AsyncMock(return_value=None)), \
+         patch("app.services.financial_cockpit.load_cockpit", AsyncMock(return_value=cockpit())):
+        result = await service.summary(db, profile)
+    assert not result["has_plan"] and result["state"] == "not_started"
+    assert result["expense_count"] == result["action_count"] == 0
+    assert db.added == []
+    family.profile_id = uuid4()
+    db.objects[(FinancialFormFamily, family.id)] = family
+    with pytest.raises(HTTPException) as error:
+        await service.summary(db, profile, family_id=family.id)
+    assert error.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_summary_route_enforces_existing_profile_access_and_staff_boundary():
+    from app.routers import operating_plan as routes
+    profile_id, actor = uuid4(), SimpleNamespace(role=Role.LOAN_EXEC)
+    profile = SimpleNamespace(id=profile_id)
+    with patch.object(routes.profiles, "load_profile", AsyncMock(return_value=profile)) as load, \
+         patch.object(service, "summary", AsyncMock(return_value={"has_plan": False})) as summarize:
+        assert await routes.summary(profile_id, actor, Memory()) == {"has_plan": False}
+        load.assert_awaited_once()
+        summarize.assert_awaited_once()
+    with pytest.raises(HTTPException) as error:
+        await routes.summary(profile_id, SimpleNamespace(role=Role.CLIENT), Memory())
+    assert error.value.status_code == 403
 
 
 @pytest.mark.asyncio

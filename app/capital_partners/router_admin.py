@@ -488,7 +488,7 @@ async def refresh_listing_snapshot(listing_id: uuid.UUID, admin: CpAdmin, db: Db
 @router.post("/listings/{listing_id}/publish-package", response_model=S.ListingAdminOut)
 async def publish_listing_package(listing_id: uuid.UUID, admin: CpAdmin, db: Db) -> S.ListingAdminOut:
     """Push the file's package onto the listing: the current, in-sync
-    executive credit brief and lender packet become listing documents (the
+    executive credit brief, lender packet and investor presentation become listing documents (the
     prior ones superseded), the snapshot is re-read, and the listing is
     stamped with what was pushed so unpublished changes can be named later.
     Members see the documents once the listing itself is published."""
@@ -499,7 +499,12 @@ async def publish_listing_package(listing_id: uuid.UUID, admin: CpAdmin, db: Db)
         raise HTTPException(status.HTTP_409_CONFLICT, "This listing is closed.")
     from app.models.application_profile import ApplicationProfile
     from app.models.public_underwriting_intake import PublicUnderwritingIntake
-    from app.routers.dealer_ai_intake import _fresh_package_artifact_pair
+    from app.routers.dealer_ai_intake import (
+        _artifact_package_metadata,
+        _artifact_pdf_metadata,
+        _fresh_package_artifact_pair,
+        _latest_artifact,
+    )
 
     profile = await db.get(ApplicationProfile, listing.profile_id)
     if profile is None or profile.intake_id is None:
@@ -509,14 +514,22 @@ async def publish_listing_package(listing_id: uuid.UUID, admin: CpAdmin, db: Db)
         raise HTTPException(status.HTTP_404_NOT_FOUND, "The file behind this listing was not found.")
     # 409 with the desk's own words when the pair is missing, split or stale.
     summary, packet = await _fresh_package_artifact_pair(db, intake)
+    artifacts = [(summary, E.DocumentKind.EXECUTIVE_SUMMARY, "Executive credit brief"),
+                 (packet, E.DocumentKind.UNDERWRITING_PACKAGE, "Underwriting package")]
+    summary_pdf = _artifact_pdf_metadata(summary)
+    if "investor_presentation" in (summary_pdf.get("package_document_types") or []):
+        presentation = await _latest_artifact(db, intake.id, "investor_presentation")
+        source = _artifact_package_metadata(presentation)
+        if (presentation is None or source.get("status") != "current"
+                or source.get("generation_id") != _artifact_package_metadata(summary).get("generation_id")
+                or _artifact_pdf_metadata(presentation).get("package_input_sha256") != summary_pdf.get("package_input_sha256")):
+            raise HTTPException(status.HTTP_409_CONFLICT, "Regenerate the package so the investor presentation uses the same current evidence snapshot.")
+        artifacts.append((presentation, E.DocumentKind.INVESTOR_PRESENTATION, "Investor presentation"))
     if not storage.configured():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Document storage is not available right now.")
     now = datetime.now(UTC)
     pushed: list[dict[str, Any]] = []
-    for artifact, kind, name in (
-        (summary, E.DocumentKind.EXECUTIVE_SUMMARY, "Executive credit brief"),
-        (packet, E.DocumentKind.UNDERWRITING_PACKAGE, "Underwriting package"),
-    ):
+    for artifact, kind, name in artifacts:
         if not artifact.s3_key:
             raise HTTPException(status.HTTP_409_CONFLICT, f"The {name.lower()} has no stored PDF; refresh Package Readiness first.")
         previous = [d for d in listing.documents if d.kind == kind and d.status != E.DocumentStatus.SUPERSEDED]
@@ -536,6 +549,13 @@ async def publish_listing_package(listing_id: uuid.UUID, admin: CpAdmin, db: Db)
         db.add(document)
         await db.flush()
         pushed.append({"kind": str(kind), "document_id": str(document.id), "artifact_id": str(artifact.id), "version": version})
+    if not any(kind == E.DocumentKind.INVESTOR_PRESENTATION for _artifact, kind, _name in artifacts):
+        # A valid legacy two-document generation cannot leave a presentation
+        # from another generation marked current beside its new PDFs.
+        for document in listing.documents:
+            if document.kind == E.DocumentKind.INVESTOR_PRESENTATION and document.status != E.DocumentStatus.SUPERSEDED:
+                document.status = E.DocumentStatus.SUPERSEDED
+                document.superseded_at = now
     fresh = await P.readiness_snapshot(db, profile)
     listing.source_snapshot = {**(listing.source_snapshot or {}), **fresh, "refreshed_at": now.isoformat()}
     current, _sections, _cockpit = await SYNC.current_fingerprints(db, profile)

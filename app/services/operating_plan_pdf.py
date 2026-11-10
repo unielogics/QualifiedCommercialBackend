@@ -5,6 +5,8 @@ import html
 import io
 import logging
 
+from app.schemas.earnings_improvement import cost_amount
+
 log = logging.getLogger(__name__)
 
 
@@ -21,6 +23,12 @@ def _money(value, currency):
 
 def _ratio(value):
     return "Not available" if value is None else f"{float(value):.2f}x"
+
+
+def _unit_breakdown(row, currency):
+    if row.get("cost_basis") != "per_unit":
+        return ""
+    return f"Quantity: {_text(row.get('current_units_per_period'))} {_text(row.get('unit_label'))}; unit cost: {_money(row.get('current_unit_cost'), currency)}; fixed cost: {_money(row.get('current_fixed_amount'), currency)} / {_text(row.get('cadence'))}. Recorded source total: {_money(row.get('current_amount'), currency)}. The derived total uses quantity times unit cost plus fixed cost; the source total is not added again."
 
 
 def _before_after(summary, currency):
@@ -66,7 +74,7 @@ def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
     active_expenses = [row for row in expenses if not row.get("excluded")]
     expense_rows = "".join(
         f"<tr><td>{index}. {_text(row.get('label') or row.get('category'))}<br><small>{_text(row.get('category')).replace('_', ' ')}</small></td>"
-        f"<td>{_text(row.get('payee'))}</td><td class='num'>{_money(row.get('current_amount'), currency)}</td>"
+        f"<td>{_text(row.get('payee'))}</td><td class='num'>{_money(cost_amount(row), currency)}</td>"
         f"<td>{_text(row.get('cadence')).replace('_', ' ')}</td><td>{'Yes' if row.get('essential') else 'No'}</td></tr>"
         for index, row in enumerate(active_expenses, 1))
     if not expense_rows:
@@ -75,14 +83,16 @@ def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
     # so both PDF engines can paginate every paragraph without clipping a row.
     expense_notes = "".join(
         f"<div class='expense-note'><h3>{index}. {_text(row.get('label') or row.get('category'))} - notes and evidence</h3>"
+        + (f"<p>{_unit_breakdown(row, currency)}</p>" if row.get("cost_basis") == "per_unit" else "")
         + (f"<p>{_text(row['notes'])}</p>" if row.get("notes") else "")
         + (f"<p class='muted'><b>Evidence:</b> {_text(evidence_names(row))}</p>" if row.get("source_file_ids") else "") + "</div>"
-        for index, row in enumerate(active_expenses, 1) if row.get("notes") or row.get("source_file_ids"))
+        for index, row in enumerate(active_expenses, 1) if row.get("notes") or row.get("source_file_ids") or row.get("cost_basis") == "per_unit")
     adjustment_html = []
     for index, row in enumerate((row for row in actions if not row.get("excluded")), 1):
         impact = impacts.get(str(row.get("id"))) or {}
-        proposal = f"{_money(row.get('current_amount'), currency)} to {_money(row.get('proposed_amount'), currency)} / {_text(row.get('cadence')).replace('_', ' ')}"
+        proposal = f"{_money(cost_amount(row), currency)} to {_money(cost_amount(row, 'proposed'), currency)} / {_text(row.get('cadence')).replace('_', ' ')}"
         drivers = [(key.replace("_", " "), row[key]) for key in (
+            "cost_basis", "unit_label", "current_units_per_period", "proposed_units_per_period", "current_fixed_amount", "proposed_fixed_amount",
             "units_per_period", "current_unit_price", "proposed_unit_price", "current_unit_cost", "proposed_unit_cost", "contribution_margin_pct",
             "processing_volume", "processing_transaction_count", "current_processing_rate_pct", "proposed_processing_rate_pct",
             "current_processing_fixed_fee", "proposed_processing_fixed_fee", "current_processing_per_transaction_fee", "proposed_processing_per_transaction_fee",

@@ -130,10 +130,14 @@ def mark_published(
 
 
 async def current_package(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any] | None:
-    """The file's current package pair, by generation, or None."""
+    """Artifact identities and selected plan revision, free of generated timestamps."""
     if not getattr(profile, "intake_id", None):
         return None
-    from app.routers.dealer_ai_intake import _artifact_package_metadata, _latest_artifact
+    from app.routers.dealer_ai_intake import (
+        _artifact_package_metadata,
+        _artifact_pdf_metadata,
+        _latest_artifact,
+    )
 
     summary = await _latest_artifact(db, profile.intake_id, "executive_summary")
     packet = await _latest_artifact(db, profile.intake_id, "lender_packet")
@@ -144,11 +148,36 @@ async def current_package(db: AsyncSession, profile: ApplicationProfile) -> dict
         "generation_id"
     ):
         return None
-    return {
+    result = {
         "generation_id": str(s_meta.get("generation_id")),
         "summary_artifact_id": str(summary.id),
         "packet_artifact_id": str(packet.id),
     }
+    pdf = _artifact_pdf_metadata(summary)
+    if "investor_presentation" in (pdf.get("package_document_types") or []):
+        presentation = await _latest_artifact(db, profile.intake_id, "investor_presentation")
+        metadata = _artifact_package_metadata(presentation)
+        valid = presentation is not None and metadata.get("status") == "current" and metadata.get("generation_id") == s_meta.get("generation_id") and _artifact_pdf_metadata(presentation).get("package_input_sha256") == pdf.get("package_input_sha256")
+        result["presentation_artifact_id"] = str(presentation.id) if valid else None
+        result["presentation_state"] = "current" if valid else "missing_or_stale"
+    if isinstance(pdf.get("package_options"), dict):
+        from app.models.financial_form_version import FinancialFormDraft
+        from app.services.financial_workspace import existing_family
+        from app.services.investor_package import options
+
+        choices = options(pdf["package_options"])
+        result["package_options"] = choices
+        result["input_sha256"] = pdf.get("package_input_sha256")
+        result["operating_plan"] = None
+        if choices["include_operating_plan"]:
+            family = await existing_family(db, profile.id, "operating_plan")
+            if family:
+                if choices["include_working_operating_plan"]:
+                    draft = await db.get(FinancialFormDraft, family.id)
+                    result["operating_plan"] = {"family_id": str(family.id), "revision": draft.revision if draft else None}
+                else:
+                    result["operating_plan"] = {"family_id": str(family.id), "version_id": str(family.current_version_id) if family.current_version_id else None}
+    return result
 
 
 async def current_fingerprints(

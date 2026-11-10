@@ -329,7 +329,7 @@ async def test_bucket_publication_versions_snapshot_and_supersedes_prior_rows() 
 
 
 @pytest.mark.asyncio
-async def test_combined_generation_builds_and_publishes_both_pdfs_once() -> None:
+async def test_combined_generation_builds_and_publishes_all_three_pdfs_once() -> None:
     now = datetime.now(UTC)
     intake = SimpleNamespace(
         id=uuid4(),
@@ -368,8 +368,10 @@ async def test_combined_generation_builds_and_publishes_both_pdfs_once() -> None
 
     summary = _artifact("executive_summary")
     packet = _artifact("lender_packet")
+    presentation = _artifact("investor_presentation")
     summary_file = SimpleNamespace(id=uuid4())
     packet_file = SimpleNamespace(id=uuid4())
+    presentation_file = SimpleNamespace(id=uuid4())
     db = SimpleNamespace(
         execute=AsyncMock(
             return_value=SimpleNamespace(
@@ -413,7 +415,7 @@ async def test_combined_generation_builds_and_publishes_both_pdfs_once() -> None
 
     create_packet = AsyncMock(return_value=packet)
     publish = AsyncMock(
-        side_effect=[(summary_file, [uuid4()]), (packet_file, [uuid4()])]
+        side_effect=[(summary_file, [uuid4()]), (packet_file, [uuid4()]), (presentation_file, [uuid4()])]
     )
     with (
         patch.object(
@@ -424,7 +426,7 @@ async def test_combined_generation_builds_and_publishes_both_pdfs_once() -> None
         patch.object(
             dealer_ai_intake,
             "_latest_artifact",
-            AsyncMock(side_effect=[None, None]),
+            AsyncMock(side_effect=[None, None, None]),
         ),
         patch.object(
             dealer_ai_intake,
@@ -466,6 +468,7 @@ async def test_combined_generation_builds_and_publishes_both_pdfs_once() -> None
             "_create_lender_packet_artifact",
             create_packet,
         ),
+        patch.object(dealer_ai_intake, "_create_investor_presentation_artifact", AsyncMock(return_value=presentation)) as create_presentation,
         patch.object(
             dealer_ai_intake,
             "_publish_package_artifact_to_bucket",
@@ -475,7 +478,7 @@ async def test_combined_generation_builds_and_publishes_both_pdfs_once() -> None
         patch.object(
             dealer_ai_intake,
             "_management_artifacts",
-            AsyncMock(return_value=[packet, summary]),
+            AsyncMock(return_value=[packet, summary, presentation]),
         ),
         patch.object(dealer_ai_intake, "_artifact_read", side_effect=_artifact_read),
         patch.object(
@@ -492,6 +495,8 @@ async def test_combined_generation_builds_and_publishes_both_pdfs_once() -> None
 
     create_summary.assert_awaited_once()
     create_packet.assert_awaited_once()
+    create_presentation.assert_awaited_once()
+    assert create_presentation.await_args.kwargs["financials"] is create_packet.await_args.kwargs["financials"]
     assert create_summary.await_args.kwargs["financials"]["bank_months"] == []
     assert create_packet.await_args.kwargs["financials"]["bank_months"] == []
     assert create_summary.await_args.kwargs["financials"]["selected_programs"] == []
@@ -510,13 +515,14 @@ async def test_combined_generation_builds_and_publishes_both_pdfs_once() -> None
         create_summary.await_args.kwargs["source_snapshot_metadata"]
         == create_packet.await_args.kwargs["source_snapshot_metadata"]
     )
-    assert publish.await_count == 2
+    assert publish.await_count == 3
     db.commit.assert_awaited_once()
     db.rollback.assert_not_awaited()
     assert result.executive_summary.id == summary.id
     assert result.lender_packet.id == packet.id
-    assert [item.id for item in result.bucket_files] == [summary_file.id, packet_file.id]
-    assert len(result.artifact_history) == 2
+    assert result.investor_presentation.id == presentation.id
+    assert [item.id for item in result.bucket_files] == [summary_file.id, packet_file.id, presentation_file.id]
+    assert len(result.artifact_history) == 3
 
 
 @pytest.mark.asyncio

@@ -35,6 +35,11 @@ def _record(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _current_requested_amount(intake, financials):
+    budget = _record(financials.get("use_of_funds"))
+    return budget.get("requested_amount") if budget.get("requested_amount") is not None else intake_requested_amount(intake)
+
+
 def _request_source(intake: Any) -> str:
     return "Current file request" if current_for_intake_snapshot(intake) is not None else "Intake"
 
@@ -1264,7 +1269,7 @@ def _executive_metric_tiles(
         annual_revenue_currency = latest_period.get("currency")
         cash_flow_currency = historical.get("currency")
     dscr = _num(key_metrics.get("estimated_dscr")) or _num(key_metrics.get("dscr"))
-    requested = _num(intake_requested_amount(intake)) or _num(key_metrics.get("requested_amount"))
+    requested = _num(_current_requested_amount(intake, financials)) or _num(key_metrics.get("requested_amount"))
     current_ratio = _num(balance_sheet.get("current_ratio"))
 
     candidates: list[tuple[str, str, str]] = [
@@ -1371,6 +1376,21 @@ def _operating_plan_lines(earnings):
     currency = baseline.get("currency")
     projection = _record(plan.get("projection"))
     lines = ["Operating expenses and earnings improvement plan - conditional operating changes; current source figures remain unchanged."]
+    snapshot = _record(plan.get("snapshot"))
+    if snapshot.get("label"):
+        lines.append(str(snapshot["label"]) + ". Current historical financial figures are unchanged.")
+    for expense in _records(plan.get("expenses")):
+        value = expense.get("effective_period_amount") if "effective_period_amount" in expense else expense.get("current_amount")
+        detail = f"Expense: {expense.get('label') or 'Operating cost'}; {_earnings_money(value, currency)} per {expense.get('cadence') or 'unknown period'}."
+        if expense.get("cost_basis") == "per_unit":
+            detail += (f" Cost drivers: {expense.get('current_units_per_period')} {expense.get('unit_label') or 'units'}"
+                       f" at {_earnings_money(expense.get('current_unit_cost'), currency)} per unit;"
+                       f" fixed amount {_earnings_money(expense.get('current_fixed_amount'), currency)}.")
+        if expense.get("notes"):
+            detail += " " + str(expense["notes"])
+        if expense.get("source_names"):
+            detail += " Evidence: " + "; ".join(_strings(expense["source_names"]))
+        lines.append(detail)
     for key, label in (("proposed", "Proposed"), ("approved", "Staff-reviewed")):
         result = _record(projection.get(key))
         totals = _record(_record(plan.get("totals")).get(key))
@@ -1387,7 +1407,8 @@ def _operating_plan_lines(earnings):
         lines.append(f"{index}. {action.get('label') or 'Operating adjustment'} ({str(action.get('kind') or '').replace('_', ' ')}; {action.get('review_state') or 'proposed'}). Recurring annual effect {_earnings_money(action.get('net_annual_impact'), currency)}; first-year {_earnings_money(action.get('first_year_impact'), currency)}; effective {action.get('effective_date') or 'not supplied'}; responsible: {action.get('owner_name') or 'not assigned'}.")
         calculation = _record(action.get("calculation"))
         drivers = [f"{key.replace('_', ' ')}: {calculation[key]}" for key in (
-            "cadence", "units_per_period", "current_amount", "proposed_amount", "current_unit_price", "proposed_unit_price",
+            "cadence", "cost_basis", "unit_label", "current_units_per_period", "proposed_units_per_period",
+            "current_fixed_amount", "proposed_fixed_amount", "units_per_period", "current_amount", "proposed_amount", "current_unit_price", "proposed_unit_price",
             "current_unit_cost", "proposed_unit_cost", "contribution_margin_pct", "processing_volume", "processing_transaction_count",
             "current_processing_rate_pct", "proposed_processing_rate_pct", "current_processing_rate_basis", "proposed_processing_rate_basis",
             "current_processing_fixed_fee", "proposed_processing_fixed_fee", "current_processing_per_transaction_fee", "proposed_processing_per_transaction_fee"
@@ -1404,6 +1425,8 @@ def _operating_plan_lines(earnings):
         lines.extend("Assumption: " + item for item in _strings(action.get("risk_flags")))
     lines.extend("Missing: " + item for item in _strings(plan.get("missing")))
     lines.extend("Plan condition: " + item for item in _strings(plan.get("risk_flags")))
+    if plan.get("plan_notes"):
+        lines.append("Plan notes and sensitivities: " + str(plan["plan_notes"]))
     return lines
 
 
@@ -1982,7 +2005,7 @@ def render_executive_summary_pdf(
 
     borrower = getattr(intake, "full_name", None)
     business = getattr(intake, "business_name", None)
-    requested = _money(intake_requested_amount(intake))
+    requested = _money(_current_requested_amount(intake, financials))
     purpose = getattr(intake, "loan_purpose", None)
     status = _text(
         result.get("probability_status")
@@ -2259,7 +2282,7 @@ def render_underwriting_packet_pdf(
         subtitle = "Dealer capital funding review"
     borrower_name = getattr(intake, "full_name", None)
     business_name = getattr(intake, "business_name", None)
-    requested_amount = _money(intake_requested_amount(intake))
+    requested_amount = _money(_current_requested_amount(intake, financials))
     purpose = getattr(intake, "loan_purpose", None)
     status = result.get("probability_status") or result.get("fundability_status") or bankability.get("status")
     application_types = (
