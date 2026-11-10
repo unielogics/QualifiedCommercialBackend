@@ -21,6 +21,30 @@ ACTOR = SimpleNamespace(id=uuid4(), role=Role.LOAN_EXEC)
 SOURCE, QUOTE, EXPENSE, ACTION, OFFER = [str(uuid4()) for _ in range(5)]
 
 
+@pytest.mark.parametrize("blank", ["", " ", "\t"])
+def test_cleared_worksheet_amounts_and_optional_links_stay_unknown(blank):
+    raw = body()
+    raw["expenses"][0].update(current_amount=blank, excluded="false", essential="true")
+    raw["adjustments"][0].update(current_amount=blank, proposed_amount=blank,
+        implementation_cost=blank, merchant_offer_id=blank, expense_row_id=blank)
+    normalized = validate_body(raw)
+    assert normalized["expenses"][0]["current_amount"] is None
+    assert normalized["expenses"][0]["excluded"] is False
+    assert normalized["expenses"][0]["essential"] is True
+    for key in ("current_amount", "proposed_amount", "implementation_cost", "merchant_offer_id", "expense_row_id"):
+        assert normalized["adjustments"][0][key] is None
+
+
+def test_numeric_zero_remains_explicit_and_invalid_amounts_still_fail():
+    raw = body()
+    raw["expenses"][0]["current_amount"] = "0"
+    assert validate_body(raw)["expenses"][0]["current_amount"] == 0
+    raw["expenses"][0]["current_amount"] = "not a number"
+    with pytest.raises(HTTPException) as error:
+        validate_body(raw)
+    assert error.value.status_code == 422
+
+
 def context():
     headline = {"key": "tax_return", "kind": "tax_estimate", "value": -10000,
         "annualized_value": -10000, "period": "2025", "currency": "USD", "basis": "cash",

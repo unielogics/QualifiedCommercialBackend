@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
@@ -32,6 +32,10 @@ class _Form(BaseModel):
     def no_boolean_numbers(cls, value, info):
         if isinstance(value, bool) and info.field_name not in {"essential", "excluded", "no_operating_expenses_confirmed", "client_attestation"}:
             raise ValueError("Use a number or an explicit unknown, not a boolean")
+        # A cleared worksheet amount or optional link is unknown, never zero.
+        # Required text and boolean fields retain their normal validation.
+        if isinstance(value, str) and not value.strip() and type(None) in get_args(cls.model_fields[info.field_name].annotation):
+            return None
         return value
 
 
