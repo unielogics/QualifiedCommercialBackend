@@ -98,9 +98,12 @@ def firm_today() -> date:
 def listing_dates(listing: Any) -> dict[str, Any]:
     snapshot = getattr(listing, "source_snapshot", None) or {}
     meta = snapshot.get("loan_dates") or (snapshot.get("financials") or {}).get("proposed_terms") or {}
+    # A backfilled version estimate must not overwrite a legacy listing's
+    # deliberately saved maturity. Infer its mode from the saved date instead.
+    mode = meta.get("maturity_date_mode") if meta.get("expected_funding_date") and meta.get("dates_recorded") is not False else None
     try:
         return loan_dates(meta.get("expected_funding_date"), getattr(listing, "term_months", None),
-                          getattr(listing, "maturity_date", None), meta.get("maturity_date_mode") if meta.get("expected_funding_date") else None)
+                          getattr(listing, "maturity_date", None), mode)
     except (ValueError, TypeError, OverflowError):
         return {**loan_dates(None, None, getattr(listing, "maturity_date", None)),
                 "date_note": "Review the estimated funding and maturity dates before publishing."}

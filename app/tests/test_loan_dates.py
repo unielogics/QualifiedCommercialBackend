@@ -62,3 +62,12 @@ def test_malformed_old_listing_metadata_does_not_break_listing_read():
     row = SimpleNamespace(source_snapshot={"loan_dates": {"expected_funding_date": "broken"}}, term_months=24, maturity_date=date(2028, 1, 1))
     assert listing_dates(row)["maturity_date"] == "2028-01-01"
     assert "Review" in listing_dates(row)["date_note"]
+
+
+def test_legacy_derived_terms_do_not_replace_a_listings_saved_manual_maturity():
+    row = SimpleNamespace(source_snapshot={"financials": {"proposed_terms": {
+        **loan_dates("2026-01-31", 12), "dates_recorded": False}}},
+        term_months=12, maturity_date=date(2028, 6, 15))
+    result = listing_dates(row)
+    assert result["maturity_date"] == "2028-06-15"
+    assert result["maturity_date_mode"] == "manual"
