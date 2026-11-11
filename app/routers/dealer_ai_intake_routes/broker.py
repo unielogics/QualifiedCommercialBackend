@@ -265,10 +265,11 @@ async def get_broker_dealer_lead(
     intake_id: UUID,
     user: core.CurrentUser,
     db: AsyncSession = Depends(core.get_db),
+    include_derived: bool = True,
 ) -> core.DealerIntakeResponse:
     await core._require_dealer_partner(user, db)
     intake = await core._load_broker_dealer_lead(db, user, intake_id)
-    return await core._response(db, intake, token=None, include_management=False, admin_thread=True, thread_user=user)
+    return await core._response(db, intake, token=None, include_management=False, include_derived=include_derived, admin_thread=True, thread_user=user)
 
 @core.broker_router.post("/{intake_id}/request-deletion", response_model=core.DealerIntakeResponse)
 async def broker_request_lead_deletion(

@@ -14,8 +14,10 @@ import secrets
 import struct
 import time
 import zipfile
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from functools import cache
 from io import BytesIO
 from pathlib import PurePosixPath
 from typing import Any, Literal
@@ -1797,6 +1799,11 @@ async def _secure_room_handoff(
 
 class DealerIntakeResponse(BaseModel):
     application_source: dict[str, Any] | None = None
+    # Internal file opening can return factual metadata before the expensive
+    # current-financial/readiness projections. Never confuse pending with a
+    # completed analysis that found no evidence.
+    application_profile_id: UUID | None = None
+    derived_pending: bool = False
     intake: DealerIntakeRead
     mca_refinance_policy: dict[str, Any] | None = None
     communication_locale: Literal["en", "es"] = "en"
@@ -5385,13 +5392,17 @@ def _artifact_download_url(
     artifact: PublicUnderwritingIntakeArtifact,
     *,
     disposition: Literal["inline", "attachment"] = "attachment",
+    storage_client_factory: Callable[[], Any] | None = None,
 ) -> str | None:
     if not artifact.s3_key:
         return None
     try:
         bucket, _prefix, _kms = _bucket_storage_config()
         filename = _safe_filename(f"{artifact.title or artifact.artifact_type}.pdf")
-        return _s3_client().generate_presigned_url(
+        storage_client = (storage_client_factory or _s3_client)()
+        if storage_client is None:
+            return None
+        return storage_client.generate_presigned_url(
             "get_object",
             Params={
                 "Bucket": bucket,
@@ -5411,6 +5422,7 @@ def _artifact_read(
     *,
     current_input_fingerprint: str | None = None,
     active_bucket_file_ids: set[UUID] | None = None,
+    storage_client_factory: Callable[[], Any] | None = None,
 ) -> PublicUnderwritingArtifactRead:
     body = artifact.body_json if isinstance(artifact.body_json, dict) else {}
     package = body.get("_package") if isinstance(body.get("_package"), dict) else {}
@@ -5440,8 +5452,8 @@ def _artifact_read(
     return PublicUnderwritingArtifactRead.model_validate(artifact).model_copy(
         update={
             "body_json": public_body,
-            "download_url": _artifact_download_url(artifact),
-            "preview_url": _artifact_download_url(artifact, disposition="inline"),
+            "download_url": _artifact_download_url(artifact, storage_client_factory=storage_client_factory),
+            "preview_url": _artifact_download_url(artifact, disposition="inline", storage_client_factory=storage_client_factory),
             "version": _version(package.get("version")),
             "status": (
                 "superseded" if package.get("status") == "superseded" else "current"
@@ -5462,6 +5474,29 @@ def _artifact_read(
             ),
         }
     )
+
+
+def _artifact_reads(
+    artifacts: list[PublicUnderwritingIntakeArtifact],
+    *,
+    current_input_fingerprint: str | None = None,
+    active_bucket_file_ids: set[UUID] | None = None,
+) -> list[PublicUnderwritingArtifactRead]:
+    # boto3 client construction repeats credential/endpoint/session setup.
+    # Cache that client only for this one response, not its URLs or facts.
+    @cache
+    def storage_client():
+        try:
+            return _s3_client()
+        except Exception:
+            # A storage outage should not repeat a provider timeout for every
+            # link in the history, or prevent the factual file from opening.
+            log.exception("Unable to initialize artifact storage for file response")
+            return None
+
+    return [_artifact_read(artifact, current_input_fingerprint=current_input_fingerprint,
+        active_bucket_file_ids=active_bucket_file_ids, storage_client_factory=storage_client)
+        for artifact in artifacts]
 
 
 def _email_send_read(row: PublicUnderwritingIntakeEmailSend) -> PublicUnderwritingEmailSendRead:
@@ -7379,6 +7414,7 @@ async def _response(
     public_path: str | None = "/dealer-ai-underwriter",
     empty_message: str | None = None,
     include_management: bool = False,
+    include_derived: bool = True,
     admin_thread: bool = False,
     thread_user: User | None = None,
     prequalification_widget: dict[str, Any] | None = None,
@@ -7387,6 +7423,9 @@ async def _response(
     room_delivery_detail: str | None = None,
     room_deliveries: list[RoomDeliveryReceipt] | None = None,
 ) -> DealerIntakeResponse:
+    # Lightweight opening is an operator-only opt-in. Public room and uploader
+    # workflows retain their full existing response and authorization behavior.
+    derived_pending = not include_derived and (include_management or admin_thread)
     if public_path == "/dealer-ai-underwriter" and _is_main_street_equipment_intake(intake):
         public_path = EQUIPMENT_PUBLIC_PATH
     # Hydrate the existing profile without creating one or running extraction.
@@ -7404,7 +7443,7 @@ async def _response(
     ).scalar_one_or_none()
     readiness_snapshot = (
         await capital_readiness_service.advisory_current_snapshot(db, readiness_profile)
-        if readiness_profile is not None
+        if readiness_profile is not None and not derived_pending
         else None
     )
     mca_policy = mca_refinance_policy.evaluate(intake, bucket=intake.bucket) if mca_refinance_policy.is_mca_refinance(intake, intake.bucket) else None
@@ -7416,7 +7455,14 @@ async def _response(
         review = None  # Historical AI screening is not a current eligibility decision.
     latest_result = _lead_result(intake) or None
     current_result_projection = None
-    if readiness_profile is not None and (include_management or admin_thread) and not (mca_policy is not None and not mca_policy["auto_underwriting_allowed"]):
+    if derived_pending:
+        from app.services.financial_metric_reporting import current_review_projection
+
+        # Stored AI prose is historical. Do not expose its cached numbers as
+        # current operands while the separate live analysis is still loading.
+        current_result_projection = current_review_projection(latest_result, None)
+        latest_result = current_result_projection
+    elif readiness_profile is not None and (include_management or admin_thread) and not (mca_policy is not None and not mca_policy["auto_underwriting_allowed"]):
         from app.services import financial_cockpit
         from app.services.financial_metric_reporting import current_review_projection
 
@@ -7428,7 +7474,7 @@ async def _response(
         current_result_projection = current_review_projection(latest_result, current_cockpit)
         latest_result = current_result_projection
     widget = prequalification_widget
-    if widget is None and latest_result and latest_result.get("booking_recommended") is True and not _call_booked(intake):
+    if not derived_pending and widget is None and latest_result and latest_result.get("booking_recommended") is True and not _call_booked(intake):
         widget = await _decorate_widget(
             db,
             intake,
@@ -7450,7 +7496,7 @@ async def _response(
         key=lambda file: file.created_at,
         reverse=True,
     )
-    summary = upload_link_visible_summary(review, intake.bucket)
+    summary = None if derived_pending else upload_link_visible_summary(review, intake.bucket)
     if messages is None:
         # The admin cockpit reads the PRIVATE internal thread (audience='admin');
         # the public/uploader surfaces read the client-visible 'uploader' thread.
@@ -7490,7 +7536,7 @@ async def _response(
         for file in _active_files(intake.bucket)
         if _is_package_readiness_output(file)
     }
-    if include_management and any(
+    if include_management and not derived_pending and any(
         artifact.artifact_type in _PACKAGE_READINESS_TYPES for artifact in artifacts
     ):
         try:
@@ -7523,7 +7569,7 @@ async def _response(
     intake_read.intake_state = _client_safe_intake_state(intake.intake_state)
     intake_read.result_snapshot = _client_safe_result(current_result_projection if current_result_projection is not None else _latest_result_for_intake(intake))
     review_read = None
-    if review:
+    if review and not derived_pending:
         review_read = BucketAIReviewRead.model_validate(review)
         review_read.result = _client_safe_result(current_result_projection if current_result_projection is not None else review_read.result)
         review_read.context_snapshot = None
@@ -7550,6 +7596,8 @@ async def _response(
 
     return DealerIntakeResponse(
         application_source=source_for_intake(intake) if include_management or admin_thread else None,
+        application_profile_id=readiness_profile.id if readiness_profile is not None and (include_management or admin_thread) else None,
+        derived_pending=derived_pending,
         intake=intake_read,
         mca_refinance_policy=mca_policy,
         communication_locale=(
@@ -7580,7 +7628,7 @@ async def _response(
             f"/buckets/request/{intake.bucket_upload_link.token}"
             + ("?tab=application" if _intake_state(intake).get("application_completion") == "client" else "")
         ) if intake.bucket_upload_link else None,
-        assistant_message=assistant_message or (mca_refinance_policy.message(mca_policy, intake.preferred_language) if mca_policy is not None and not mca_policy["auto_underwriting_allowed"] else _format_review_update(latest_result) if latest_result else empty_message or _message_for_widget(widget, intake)),
+        assistant_message=assistant_message or ("File opened. Financial analysis and package freshness load separately." if derived_pending else mca_refinance_policy.message(mca_policy, intake.preferred_language) if mca_policy is not None and not mca_policy["auto_underwriting_allowed"] else _format_review_update(latest_result) if latest_result else empty_message or _message_for_widget(widget, intake)),
         widget=widget,
         requested_documents=[
             _requested_document_read(doc, file_reads)
@@ -7594,14 +7642,8 @@ async def _response(
         latest_review=review_read,
         messages=await _client_message_reads(db, list(messages or [])),
         chat_actions=await actions_for_messages(db, list(messages or [])),
-        artifacts=[
-            _artifact_read(
-                artifact,
-                current_input_fingerprint=current_package_fingerprint,
-                active_bucket_file_ids=active_package_bucket_file_ids,
-            )
-            for artifact in artifacts
-        ],
+        artifacts=_artifact_reads(artifacts, current_input_fingerprint=current_package_fingerprint,
+            active_bucket_file_ids=active_package_bucket_file_ids),
         email_sends=[_email_send_read(row) for row in email_sends],
         notes=[
             BucketNoteRead.model_validate(n).model_copy(

@@ -139,38 +139,55 @@ class RequestContextMiddleware:
             # correlation context as audit rows and provider effects. Import
             # lazily to avoid making the context primitive depend on services
             # during application startup.
-            from app.services import booking_metrics
+            from app.services import booking_metrics, file_loading_metrics
 
             route = booking_metrics.route_name(str(scope.get("path") or ""))
-            if route is None:
+            file_route = file_loading_metrics.route_name(str(scope.get("path") or ""), str(scope.get("method") or ""))
+            if route is None and file_route is None:
                 await self.app(scope, receive, send)
                 return
 
             started = perf_counter()
             response_status = 500
+            ttfb_ms = None
+            response_bytes = 0
 
             async def observe(message):
-                nonlocal response_status
+                nonlocal response_status, ttfb_ms, response_bytes
                 if message.get("type") == "http.response.start":
                     response_status = int(message.get("status") or 500)
+                    ttfb_ms = round((perf_counter() - started) * 1000, 2)
+                    if file_route is not None:
+                        # Endpoint/auth/query/serialization time before the first
+                        # byte; Caddy still owns compression and network delivery.
+                        headers = list(message.get("headers") or [])
+                        headers.append((b"server-timing", f'api;dur={ttfb_ms:.2f};desc="Application response"'.encode("ascii")))
+                        message = {**message, "headers": headers}
+                elif message.get("type") == "http.response.body":
+                    response_bytes += len(message.get("body") or b"")
                 await send(message)
 
             try:
                 await self.app(scope, receive, observe)
             finally:
                 duration_ms = round((perf_counter() - started) * 1000, 2)
-                booking_metrics.emit(
-                    "booking.http.duration",
-                    duration_ms,
-                    unit="milliseconds",
-                    route=route,
-                    method=str(scope.get("method") or ""),
-                    status_code=response_status,
-                )
-                if response_status >= 400:
+                if file_route is not None:
+                    file_loading_metrics.emit(route=file_route, method=str(scope.get("method") or ""),
+                        status_code=response_status, duration_ms=duration_ms, ttfb_ms=ttfb_ms,
+                        response_bytes=response_bytes)
+                if route is not None:
                     booking_metrics.emit(
-                        "booking.http.error",
+                        "booking.http.duration",
+                        duration_ms,
+                        unit="milliseconds",
                         route=route,
                         method=str(scope.get("method") or ""),
                         status_code=response_status,
                     )
+                    if response_status >= 400:
+                        booking_metrics.emit(
+                            "booking.http.error",
+                            route=route,
+                            method=str(scope.get("method") or ""),
+                            status_code=response_status,
+                        )

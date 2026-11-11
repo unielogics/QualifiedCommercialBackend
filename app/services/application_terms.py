@@ -470,6 +470,8 @@ async def read_terms(
     db: AsyncSession,
     profile: ApplicationProfile,
     row: ApplicationTermSheet | None = None,
+    *,
+    include_current_plan: bool = True,
 ) -> ClientTermsRead:
     row = row if row is not None else await current_term_sheet(db, profile.id)
     options = await loan_type_options(db, profile)
@@ -486,8 +488,7 @@ async def read_terms(
             ),
         )
     client_email, suppressed = await _recipient_state(db, profile)
-    context = await _dscr_context(db, profile)
-    plan_block = await _plan_block(db, profile)
+    plan_block = await _plan_block(db, profile) if include_current_plan else None
     current_collateral = investor_collateral.snapshot(profile)
     recorded_collateral = getattr(row, "collateral_snapshot", None) or {}
     collateral_revision = getattr(row, "collateral_revision", None)
@@ -505,6 +506,10 @@ async def read_terms(
         "deal_budget_stale": bool(row is not None and getattr(row, "deal_budget_revision", None) != deal_budget.snapshot(profile)["revision"]),
     }
     if row is None:
+        # A new form needs live defaults. A saved terms version already owns
+        # immutable calculation operands, so rebuilding the whole financial
+        # cockpit here was unused work (the current plan above stays live).
+        context = await _dscr_context(db, profile)
         intake = (
             await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
         )
