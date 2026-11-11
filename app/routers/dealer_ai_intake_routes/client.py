@@ -25,6 +25,8 @@ __all__ = [
     "claim_capital_readiness_diagnostic",
     "list_my_dealer_intakes",
     "get_my_dealer_intake",
+    "my_dealer_room_status",
+    "my_dealer_secure_room",
     "my_dealer_intake_chat",
     "execute_my_intake_chat_action",
     "download_my_intake_chat_template",
@@ -35,6 +37,27 @@ __all__ = [
     "read_client_financial_statement",
     "save_client_financial_statement"
 ]
+
+
+async def _claim_room_pin(db, intake, new_passcode: str | None):
+    """Accept the owned client's initial choice; retries never rotate it."""
+    link = await db.get(core.BucketUploadLink, intake.bucket_upload_link_id)
+    if new_passcode is None:
+        return link
+    core.client_room.require_room_access(link)
+    link = (await db.execute(select(core.BucketUploadLink).where(
+        core.BucketUploadLink.id == link.id,
+    ).with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+    core.client_room.require_room_access(link)
+    if not core.client_room.passcode_needs_setup(link):
+        if not core.client_room.verify_passcode(new_passcode, link.passcode_hash):
+            raise HTTPException(409, {"code": "room_pin_already_configured",
+                "message": "Your existing application's room PIN is already configured. Use your existing PIN; contact your team if it needs to be reset."})
+        return link
+    if problem := core.client_room.passcode_problem(new_passcode):
+        raise HTTPException(422, problem)
+    await core.client_room.set_passcode(db, link, new_passcode)
+    return link
 
 
 @core.client_router.post(
@@ -98,7 +121,7 @@ async def claim_capital_readiness_diagnostic(
 
     claim_hash = hashlib.sha256(
         json.dumps(
-            payload.model_dump(mode="json"),
+            payload.model_dump(mode="json", exclude={"secure_room_pin"}),
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -126,6 +149,7 @@ async def claim_capital_readiness_diagnostic(
                 status.HTTP_409_CONFLICT,
                 "That idempotency key was already used with different answers.",
             )
+        room_link = await _claim_room_pin(db, existing, payload.secure_room_pin)
         profile = await core.profiles_service.provision_profile_for_intake(db, existing)
         snapshot = await core.capital_readiness_service.recompute(
             db,
@@ -142,6 +166,7 @@ async def claim_capital_readiness_diagnostic(
             readiness=core.capital_readiness_service.read_snapshot(
                 snapshot, client_safe=True
             ),
+            room_pin_setup_required=core.client_room.passcode_needs_setup(room_link),
         )
 
     purpose = diagnostic.answers.funding_purpose
@@ -161,7 +186,7 @@ async def claim_capital_readiness_diagnostic(
         intent=intent,
         preferred_language=core.Language(diagnostic.locale),
         capital_readiness_diagnostic=diagnostic,
-        secure_room_pin=core._generate_passcode(),
+        secure_room_pin=payload.secure_room_pin or core._generate_passcode(),
         notify_client=False,
         force_new=False,
     )
@@ -176,6 +201,7 @@ async def claim_capital_readiness_diagnostic(
     intake = await db.get(core.PublicUnderwritingIntake, created_response.intake.id)
     if intake is None:  # pragma: no cover - defensive transactional invariant
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Intake creation failed")
+    room_link = await _claim_room_pin(db, intake, payload.secure_room_pin)
     state = dict(intake.intake_state or {})
     state["capital_readiness_claim"] = {
         "idempotency_key": str(payload.idempotency_key),
@@ -217,6 +243,7 @@ async def claim_capital_readiness_diagnostic(
         created=True,
         communication_locale=profile.communication_locale,
         readiness=core.capital_readiness_service.read_snapshot(snapshot, client_safe=True),
+        room_pin_setup_required=core.client_room.passcode_needs_setup(room_link),
     )
 
 @core.client_router.get("", response_model=list[core.DealerIntakeRead])
@@ -236,6 +263,36 @@ async def list_my_dealer_intakes(user: core.CurrentUser, db: AsyncSession = Depe
 async def get_my_dealer_intake(intake_id: UUID, user: core.CurrentUser, db: AsyncSession = Depends(core.get_db)) -> core.DealerIntakeResponse:
     intake = await core._load_client_intake(db, user, intake_id, allow_pending_signing=True)
     return await core._response(db, intake, token=None)
+
+
+@core.client_router.get("/{intake_id}/secure-room", response_model=core.SecureRoomStatusResponse)
+async def my_dealer_room_status(
+    intake_id: UUID,
+    user: core.CurrentUser,
+    db: AsyncSession = Depends(core.get_db),
+) -> core.SecureRoomStatusResponse:
+    """Read only the owned room's setup state; never return its credential."""
+    intake = await core._load_client_intake(db, user, intake_id, allow_pending_signing=True)
+    link = intake.bucket_upload_link
+    return core.SecureRoomStatusResponse(
+        room_pin_setup_required=core.client_room.passcode_needs_setup(link),
+        room_url=core.client_room.room_url(link.token) if link is not None else None,
+    )
+
+
+@core.client_router.post("/{intake_id}/secure-room", response_model=core.SecureRoomHandoffResponse)
+async def my_dealer_secure_room(
+    intake_id: UUID,
+    request: Request,
+    user: core.CurrentUser,
+    db: AsyncSession = Depends(core.get_db),
+    payload: core.SecureRoomHandoffRequest | None = None,
+) -> core.SecureRoomHandoffResponse:
+    """Set up the signed-in client's existing room without another application."""
+    intake = await core._load_client_intake(db, user, intake_id, allow_pending_signing=True)
+    return await core._secure_room_handoff(db, intake, request, tab="todo",
+        **({"new_passcode": payload.new_passcode} if payload and payload.new_passcode else {}))
+
 
 @core.client_router.post("/{intake_id}/chat", response_model=core.DealerIntakeResponse)
 async def my_dealer_intake_chat(
@@ -343,6 +400,7 @@ async def my_dealer_upload_init(
     db: AsyncSession = Depends(core.get_db),
 ) -> core.BucketFileUploadInitResponse:
     intake = await core._load_client_intake(db, user, intake_id)
+    core.client_room.require_passcode_setup(intake.bucket_upload_link)
     return await core._start_upload(db, intake, payload, request, actor_name=user.name or intake.full_name, actor_email=user.email,
                                source_kind="client_room", actor=None)
 
@@ -366,6 +424,7 @@ async def my_dealer_submit_pfs(
     db: AsyncSession = Depends(core.get_db),
 ) -> core.BucketFile:
     intake = await core._load_client_intake(db, user, intake_id)
+    core.client_room.require_passcode_setup(intake.bucket_upload_link)
     return await core._submit_pfs_form(db, intake, payload, request, actor_name=user.name or intake.full_name, actor_email=user.email)
 
 @core.client_router.post("/{intake_id}/requested-documents/debt-schedule", response_model=core.BucketFileRead)
@@ -377,6 +436,7 @@ async def my_dealer_submit_debt_schedule(
     db: AsyncSession = Depends(core.get_db),
 ) -> core.BucketFile:
     intake = await core._load_client_intake(db, user, intake_id)
+    core.client_room.require_passcode_setup(intake.bucket_upload_link)
     return await core._submit_debt_schedule_form(db, intake, payload, request, actor_name=user.name or intake.full_name, actor_email=user.email)
 
 @core.client_router.get("/{intake_id}/financial-statement")
@@ -404,6 +464,7 @@ async def read_client_financial_statement(
     await db.commit()
     return {
         "schema": pfs_schema.describe(),
+        "room_pin_setup_required": core.client_room.passcode_needs_setup(intake.bucket_upload_link),
         "statement_id": str(statement.id) if statement else None,
         "status": statement.status if statement else None,
         "body": managed["body"] if managed else (statement.body if statement else None) or pfs_schema.empty_body(),
@@ -426,6 +487,8 @@ async def save_client_financial_statement(
     from app.services import financial_statements
 
     intake = await core._load_client_intake(db, user, intake_id)
+    if payload.submit:
+        core.client_room.require_passcode_setup(intake.bucket_upload_link)
     profile = await profile_service.provision_profile_for_intake(db, intake)
     from app.services.financial_workspace_legacy import managed_snapshot, stage_legacy_body
 

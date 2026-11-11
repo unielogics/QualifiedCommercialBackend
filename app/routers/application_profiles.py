@@ -4134,6 +4134,7 @@ async def public_room_update_application(
     if not values.full_name:
         raise HTTPException(422, "Your full name is required to save the application.")
     if payload.submit:
+        client_room.require_passcode_setup(link)
         validate_submission(values, profile.vertical)
     client = await db.get(Client, profile.client_id) if profile.client_id else None
     apply_application(intake, profile, link, client, values, submit=payload.submit)

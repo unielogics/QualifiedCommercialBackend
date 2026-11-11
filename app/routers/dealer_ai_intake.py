@@ -707,7 +707,20 @@ class CapitalReadinessDiagnostic(BaseModel):
     result: CapitalReadinessDiagnosticResult
 
 
-class CapitalReadinessClaimRequest(RequiredBusinessProfileFields):
+class ClientRoomPinChoice(BaseModel):
+    # Optional for older clients to retain a saved draft. Uploads and final
+    # submissions still require completion of the shared room setup gate.
+    secure_room_pin: str | None = Field(default=None, pattern=r"^[0-9]{6}$", repr=False)
+
+    @field_validator("secure_room_pin")
+    @classmethod
+    def validate_room_pin(cls, value: str | None) -> str | None:
+        if value is not None and (problem := client_room.passcode_problem(value)):
+            raise ValueError(problem)
+        return value
+
+
+class CapitalReadinessClaimRequest(RequiredBusinessProfileFields, ClientRoomPinChoice):
     """Consent-bound handoff from the public diagnostic after authentication."""
 
     idempotency_key: UUID
@@ -731,9 +744,10 @@ class CapitalReadinessClaimResponse(BaseModel):
     created: bool
     communication_locale: Literal["en", "es"]
     readiness: CapitalReadinessRead
+    room_pin_setup_required: bool = False
 
 
-class DealerIntakeStart(PublicIntakeAttribution, RequiredBusinessProfileFields):
+class DealerIntakeStart(PublicIntakeAttribution, RequiredBusinessProfileFields, ClientRoomPinChoice):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
     phone: RequiredPhone
@@ -756,7 +770,7 @@ class DealerIntakeStart(PublicIntakeAttribution, RequiredBusinessProfileFields):
         return None if value == "" else value
 
 
-class FundingReviewStart(PublicIntakeAttribution, RequiredBusinessProfileFields):
+class FundingReviewStart(PublicIntakeAttribution, RequiredBusinessProfileFields, ClientRoomPinChoice):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
     phone: RequiredPhone
@@ -1727,6 +1741,15 @@ class DealerIntakeRead(ORMModel):
     ] = "unclassified"
 
 
+class SecureRoomHandoffRequest(BaseModel):
+    new_passcode: str | None = Field(default=None, pattern=r"^[0-9]{6}$", repr=False)
+
+
+class SecureRoomStatusResponse(BaseModel):
+    room_pin_setup_required: bool
+    room_url: str | None = None
+
+
 class SecureRoomHandoffResponse(BaseModel):
     """Everything the browser needs to walk the client into their room.
 
@@ -1740,10 +1763,12 @@ class SecureRoomHandoffResponse(BaseModel):
     #: recovered | minted | client_chosen
     code_source: str
     tab: str = "todo"
+    room_pin_setup_required: bool = False
 
 
 async def _secure_room_handoff(
-    db: AsyncSession, intake: PublicUnderwritingIntake, request: Request, *, tab: str
+    db: AsyncSession, intake: PublicUnderwritingIntake, request: Request, *, tab: str,
+    new_passcode: str | None = None,
 ) -> SecureRoomHandoffResponse:
     """Hand a client from their intake into their secure room.
 
@@ -1764,8 +1789,26 @@ async def _secure_room_handoff(
         "One moment — your secure room is opening.",
     )
     link = intake.bucket_upload_link
-    if link is None:
-        raise HTTPException(status.HTTP_409_CONFLICT, "This file has no secure room yet")
+    client_room.require_room_access(link)
+
+    if new_passcode is not None:
+        # Serialize first choice. A second tab must not replace a PIN the
+        # client has already chosen, and a scoped intake token is not a reset.
+        link = (await db.execute(select(BucketUploadLink).where(
+            BucketUploadLink.id == link.id,
+        ).with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+        client_room.require_room_access(link)
+        if not client_room.passcode_needs_setup(link):
+            # A lost successful response is safe to retry with the exact PIN
+            # just chosen, without rotating it or changing the choice date.
+            if not client_room.verify_passcode(new_passcode, link.passcode_hash):
+                raise HTTPException(409, {"code": "room_pin_already_configured",
+                    "message": "Your room PIN is already configured. Sign in with your existing PIN; contact your team if you need it reset."})
+        else:
+            problem = client_room.passcode_problem(new_passcode)
+            if problem or client_room.verify_passcode(new_passcode, link.passcode_hash):
+                raise HTTPException(422, problem or "Choose a PIN that is different from the one we sent you.")
+            await client_room.set_passcode(db, link, new_passcode)
 
     await profiles_service.provision_profile_for_intake(db, intake)
 
@@ -1793,7 +1836,8 @@ async def _secure_room_handoff(
     )
     await db.commit()
     return SecureRoomHandoffResponse(
-        room_url=client_room.room_url(link.token), room_code=code, code_source=source, tab=tab
+        room_url=client_room.room_url(link.token), room_code=code, code_source=source, tab=tab,
+        room_pin_setup_required=client_room.passcode_needs_setup(link),
     )
 
 
@@ -1804,6 +1848,7 @@ class DealerIntakeResponse(BaseModel):
     # completed analysis that found no evidence.
     application_profile_id: UUID | None = None
     derived_pending: bool = False
+    room_pin_setup_required: bool = False
     intake: DealerIntakeRead
     mca_refinance_policy: dict[str, Any] | None = None
     communication_locale: Literal["en", "es"] = "en"
@@ -7598,6 +7643,7 @@ async def _response(
         application_source=source_for_intake(intake) if include_management or admin_thread else None,
         application_profile_id=readiness_profile.id if readiness_profile is not None and (include_management or admin_thread) else None,
         derived_pending=derived_pending,
+        room_pin_setup_required=client_room.passcode_needs_setup(intake.bucket_upload_link),
         intake=intake_read,
         mca_refinance_policy=mca_policy,
         communication_locale=(
@@ -10537,7 +10583,7 @@ async def _load_mca_intake_by_session(db: AsyncSession, request: Request) -> tup
     return intake, challenge, session_token
 
 
-class McaRefiStart(PublicIntakeAttribution, RequiredBusinessProfileFields):
+class McaRefiStart(PublicIntakeAttribution, RequiredBusinessProfileFields, ClientRoomPinChoice):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
     phone: RequiredPhone

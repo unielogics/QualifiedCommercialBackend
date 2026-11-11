@@ -1782,6 +1782,7 @@ async def test_upload_init_rejects_an_obsolete_unlocked_copy_target() -> None:
         passcode_hash="hash",
         recipient_name="Client",
         recipient_email="client@example.com",
+        status="active", expires_at=None, passcode_set_by_client_at=datetime.now(UTC),
     )
     document = SimpleNamespace(id=uuid4(), bucket_id=bucket_id, status="requested")
     db = SimpleNamespace(
@@ -1839,6 +1840,7 @@ async def test_upload_init_treats_an_inactive_normal_request_as_stale() -> None:
         passcode_hash="hash",
         recipient_name="Client",
         recipient_email="client@example.com",
+        status="active", expires_at=None, passcode_set_by_client_at=datetime.now(UTC),
     )
     document = SimpleNamespace(
         id=uuid4(), bucket_id=bucket_id, status="not_applicable"

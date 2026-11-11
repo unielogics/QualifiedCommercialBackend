@@ -32,6 +32,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -55,6 +56,9 @@ __all__ = [
     "get_room",
     "initialize_room",
     "passcode_problem",
+    "passcode_needs_setup",
+    "require_room_access",
+    "require_passcode_setup",
     "active_link",
     "read_passcode",
     "request_document",
@@ -96,6 +100,10 @@ def _store_passcode(link: BucketUploadLink, passcode: str) -> None:
         raise ValueError("The secure client-room PIN must contain six digits.")
     settings = get_settings()
     link.passcode_hash = _hash_passcode(code)
+    # A writer issuing/replacing an invitation cannot retain a previous
+    # client's completion marker. The explicit client-choice path stamps it
+    # again only after the new credential has actually been chosen.
+    link.passcode_set_by_client_at = None
     if settings.provider_secrets_kms_key_id:
         link.encrypted_passcode = _encrypt_kms(code)
         link.passcode_encryption_provider = "aws_kms"
@@ -349,6 +357,30 @@ def passcode_problem(new_passcode: str, current_passcode: str | None = None) -> 
     if current_passcode is not None and code == current_passcode.strip():
         return "Choose a PIN that is different from the one we sent you."
     return None
+
+
+def passcode_needs_setup(link: BucketUploadLink | None) -> bool:
+    """A staff/generated invitation is not the client's own saved credential."""
+    return link is None or not link_is_usable(link) or getattr(link, "passcode_set_by_client_at", None) is None
+
+
+def require_room_access(link: BucketUploadLink | None) -> None:
+    """An old session must never silently revive a missing/revoked invitation."""
+    if link is None or not link_is_usable(link):
+        raise HTTPException(409, {
+            "code": "room_access_unavailable",
+            "message": "Your existing file's room access needs to be restored by your team. Contact your representative; your saved application and files are kept.",
+        })
+
+
+def require_passcode_setup(link: BucketUploadLink | None) -> None:
+    """Keep verified draft access available, but finish credential setup first."""
+    require_room_access(link)
+    if passcode_needs_setup(link):
+        raise HTTPException(409, {
+            "code": "room_pin_setup_required",
+            "message": "Create and confirm your own six-digit room PIN before continuing. Your saved application and files are kept.",
+        })
 
 
 async def set_passcode(db: AsyncSession, link: BucketUploadLink, new_passcode: str) -> None:

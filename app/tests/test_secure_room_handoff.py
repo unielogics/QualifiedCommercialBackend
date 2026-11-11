@@ -25,6 +25,7 @@ def _link(**over):
     row = SimpleNamespace(
         id=uuid4(), token="room-token", passcode_set_by_client_at=None,
         passcode_hash=None, encrypted_passcode=None, passcode_encryption_provider=None,
+        status="active", expires_at=None,
     )
     for k, v in over.items():
         setattr(row, k, v)

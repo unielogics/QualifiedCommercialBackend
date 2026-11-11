@@ -66,7 +66,10 @@ async def start_funding_review(
             "A secure funding review already exists for this email. We sent a short access code so you can continue that file.",
         )
     client = await core._find_or_create_funding_client(db, payload)
-    bucket, link = await core._create_bucket_for_funding_review(db, client, payload, request)
+    bucket, link = await core._create_bucket_for_funding_review(db, client, payload, request,
+        **({"room_pin": payload.secure_room_pin} if payload.secure_room_pin else {}))
+    if payload.secure_room_pin:
+        link.passcode_set_by_client_at = core._now()
     token = core._new_public_token()
     attribution = core._public_intake_attribution(payload)
     basics = {
@@ -376,6 +379,7 @@ async def funding_review_upload_init(
 ) -> core.BucketFileUploadInitResponse:
     intake = await core._load_public_intake(db, token)
     core._require_funding_intake(intake)
+    core.client_room.require_passcode_setup(intake.bucket_upload_link)
     return await core._start_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email,
                                source_kind="client_room")
 
@@ -446,11 +450,13 @@ async def funding_router_secure_room(
     token: str,
     request: Request,
     db: AsyncSession = Depends(core.get_db),
+    payload: core.SecureRoomHandoffRequest | None = None,
 ) -> core.SecureRoomHandoffResponse:
     """Open this file's secure room, where the bank connection and the
     agreements live. The client is already verified on this intake."""
-    intake = await core._load_public_intake(db, token)
-    return await core._secure_room_handoff(db, intake, request, tab="todo")
+    intake = await core._load_public_intake(db, token, allow_pending_signing=True)
+    return await core._secure_room_handoff(db, intake, request, tab="todo",
+        **({"new_passcode": payload.new_passcode} if payload and payload.new_passcode else {}))
 
 @core.funding_router.post("/{token}/book-call", response_model=core.DealerIntakeResponse)
 async def book_funding_review_call(

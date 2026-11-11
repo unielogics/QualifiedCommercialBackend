@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -275,7 +276,8 @@ def test_reviewed_request_is_projected_without_rewriting_original_submission(mir
 async def test_failed_submission_keeps_saved_draft_unsubmitted_and_amount_editable(monkeypatch):
     row = intake()
     application_profile = profile(row)
-    link = SimpleNamespace(bucket_id=row.bucket_id)
+    link = SimpleNamespace(bucket_id=row.bucket_id, status="active", expires_at=None,
+        passcode_set_by_client_at=datetime.now(UTC))
     db = SimpleNamespace(get=AsyncMock(), refresh=AsyncMock(), commit=AsyncMock())
     monkeypatch.setattr(rooms, "_public_application_room", AsyncMock(return_value=(link, application_profile)))
     monkeypatch.setattr(rooms, "_room_application_intake", AsyncMock(return_value=row))
