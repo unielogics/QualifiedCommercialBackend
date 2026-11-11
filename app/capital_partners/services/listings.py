@@ -412,48 +412,68 @@ def ready_documents(listing: CpListing) -> list[CpListingDocument]:
     return [d for d in listing.documents if d.status == E.DocumentStatus.READY]
 
 
-def publish_blockers(listing: CpListing) -> list[str]:
-    missing: list[str] = []
+def publish_issues(listing: CpListing) -> list[dict[str, str]]:
+    """Publish requirements with their actual editor, without changing the rules."""
+    issues: list[dict[str, str]] = []
+
+    def add(code: str, message: str, section: str, *, field: str | None = None, document_kind: str | None = None) -> None:
+        issue = {"code": code, "message": message, "section": section}
+        if field is not None:
+            issue["field"] = field
+        if document_kind is not None:
+            issue["document_kind"] = document_kind
+        issues.append(issue)
+
+    def financial(code: str, message: str, field: str, owner: str) -> None:
+        if listing.profile_id:
+            add(code, message, owner)
+        else:
+            add(code, message, "terms", field=field)
+
     if not listing.name:
-        missing.append("name")
+        add("name_required", "name", "terms", field="name")
     if listing.note_rate_pct is None:
-        missing.append("note_rate_pct")
+        financial("note_rate_required", "note_rate_pct", "note_rate_pct", "coverage_plan")
     if not listing.term_months:
-        missing.append("term_months")
+        financial("term_required", "term_months", "term_months", "coverage_plan")
     if _d(listing.offered_amount) <= 0:
-        missing.append("offered_amount")
+        financial("offered_amount_required", "offered_amount", "offered_amount", "budget")
     if _d(listing.minimum_investment) <= 0:
-        missing.append("minimum_investment")
+        financial("minimum_investment_required", "minimum_investment", "minimum_investment", "budget")
     if _d(listing.minimum_investment) > _d(listing.offered_amount) > 0:
-        missing.append("minimum_investment exceeds offered_amount")
+        financial("minimum_exceeds_offered", "minimum_investment exceeds offered_amount", "minimum_investment", "budget")
     snapshot = listing.source_snapshot if isinstance(listing.source_snapshot, dict) else {}
     financials = snapshot.get("financials") if isinstance(snapshot.get("financials"), dict) else {}
     terms = financials.get("proposed_terms") if isinstance(financials.get("proposed_terms"), dict) else {}
     if terms.get("active_proposal") is False:
-        missing.append("Restore or synchronize the working financing proposal before publishing; issued terms are a historical reference")
+        add("proposal_inactive", "Restore or synchronize the working financing proposal before publishing; issued terms are a historical reference", "coverage_plan")
     if terms.get("recorded_terms_ref") and (terms.get("collateral_stale") or terms.get("terms_state") == "differs"):
-        missing.append("Save an updated terms version for the changed financing or collateral before publishing")
+        add("terms_outdated", "Save an updated terms version for the changed financing or collateral before publishing", "client_terms")
     budget = financials.get("deal_budget")
     if isinstance(budget, dict):
         if budget.get("stale") or terms.get("deal_budget_stale"):
-            missing.append("Save an updated terms version for the changed cost budget before publishing")
+            add("terms_budget_outdated", "Save an updated terms version for the changed cost budget before publishing", "client_terms")
         if (budget.get("calculation") or {}).get("status") != "ready":
-            missing.append("Confirm the closing cost budget, funding mode and investor charges before publishing")
+            add("budget_incomplete", "Confirm the closing cost budget, funding mode and investor charges before publishing", "budget")
         principal = (budget.get("calculation") or {}).get("principal_solution") or {}
         if principal and (principal.get("status") != "calculated" or principal.get("requires_apply")):
-            missing.append("Apply the solved gross principal to the shared loan before publishing")
+            add("principal_not_applied", "Apply the solved gross principal to the shared loan before publishing", "budget")
         allocation = budget.get("current_allocation_reconciliation") or (budget.get("calculation") or {}).get("allocation_reconciliation") or {}
         if allocation.get("status") in {"overallocated", "unallocated"}:
-            missing.append("Reconcile the current use-of-funds allocations with net loan proceeds at funding before publishing")
+            add("allocation_unreconciled", "Reconcile the current use-of-funds allocations with net loan proceeds at funding before publishing", "use_of_funds")
     if terms.get("amount") is not None:
         if _d(listing.offered_amount) > _d(terms["amount"]):
-            missing.append("offered_amount exceeds the canonical financing amount")
+            financial("offered_exceeds_financing", "offered_amount exceeds the canonical financing amount", "offered_amount", "budget")
         if any(_d(getattr(listing, field, None)) != _d(terms.get(key)) for field, key in (("loan_amount", "amount"), ("note_rate_pct", "rate_pct"), ("term_months", "term_months"))):
-            missing.append("Refresh financing from the file before publishing")
+            add("financing_outdated", "Refresh financing from the file before publishing", "snapshot")
     kinds = {d.kind for d in ready_documents(listing)}
     if E.DocumentKind.PPM not in kinds:
-        missing.append("private placement memorandum not uploaded")
-    return missing
+        add("ppm_required", "private placement memorandum not uploaded", "documents", document_kind="ppm")
+    return issues
+
+
+def publish_blockers(listing: CpListing) -> list[str]:
+    return [issue["message"] for issue in publish_issues(listing)]
 
 
 @dataclass

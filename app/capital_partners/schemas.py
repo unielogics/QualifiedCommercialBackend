@@ -664,6 +664,14 @@ class ParticipationAdminOut(ParticipationOut):
     subscription_id: UUID
 
 
+class PublishIssue(BaseModel):
+    code: str
+    message: str
+    section: Literal["terms", "documents", "budget", "coverage_plan", "client_terms", "use_of_funds", "snapshot"]
+    field: str | None = None
+    document_kind: Literal["ppm"] | None = None
+
+
 class ListingAdminOut(ListingDetail):
     source_kind: str
     loan_id: UUID | None
@@ -683,6 +691,7 @@ class ListingAdminOut(ListingDetail):
     participations: list[ParticipationAdminOut]
     events: list[ListingEventOut]
     publish_blockers: list[str]
+    publish_issues: list[PublishIssue] = Field(default_factory=list)
 
 
 class PublishIn(BaseModel):
