@@ -31,6 +31,7 @@ from ..schemas import PpmDraftIn, PpmGenerateIn, PpmReviewIn
 from . import membership_policy, ppm_presets, prefill, storage, sync
 
 POLICY_VERSION = "saved-ppm-v2"
+APPROVAL_AUDIT_STATEMENT = "Staff approved the current saved PPM against its bound offering facts."
 LEGAL_FIELDS = [
     {"key": key, "label": label, "required": True}
     for key, label in (
@@ -405,7 +406,8 @@ async def read_state(db, listing, *, context=None, events=None):
         "missing": _missing(context, legal, (current or {}).get("legal_presets")), "warnings": list(dict.fromkeys([*context["warnings"], *((current or {}).get("document", {}).get("warnings") or [])])),
         "legal_fields": ppm_presets.catalog(context, LEGAL_FIELDS), "narrative_fields": NARRATIVE_FIELDS,
         "membership_policy": context.get("membership_policy") or membership_policy.describe(),
-        "legal_defaults": default_values, "legal_default_presets": default_keys}
+        "legal_defaults": default_values, "legal_default_presets": default_keys,
+        "draft_upgrade_available": ppm_presets.draft_upgrade_available(context, LEGAL_FIELDS, versions[-1].detail if versions else {})}
 
 
 async def _version(db, listing, context, legal, narrative, actor_id, *, generation_status, source="generated_ppm", document=None, existing_doc=None, request=None, ai_sections=None, render_status="draft", reviewed_at=None, legal_presets=None):
@@ -449,7 +451,7 @@ async def generate(db, listing, actor_id, payload: PpmGenerateIn):
     versions = _receipt_versions(events)
     latest = versions[-1].detail if versions else {}
     latest_doc = next((doc for doc in listing.documents if str(doc.id) == latest.get("document_id")), None)
-    if latest.get("source_fingerprint") == context["fingerprint"] and latest_doc is not None and latest_doc.status != E.DocumentStatus.SUPERSEDED and not payload.force:
+    if latest.get("source_fingerprint") == context["fingerprint"] and latest_doc is not None and latest_doc.status != E.DocumentStatus.SUPERSEDED and not payload.force and not ppm_presets.draft_upgrade_available(context, LEGAL_FIELDS, latest):
         await _event(db, listing, "ppm.action", actor_id, {"idempotency_key": payload.idempotency_key, "operation": "generate", "intent": intent})
         return await read_state(db, listing, context=context, events=events)
     legal, legal_presets = ppm_presets.upgrade(context, LEGAL_FIELDS, latest)
@@ -553,12 +555,15 @@ async def save_draft(db, listing, actor_id, payload: PpmDraftIn):
 
 
 async def review(db, listing, actor_id, payload: PpmReviewIn):
-    if not payload.confirmed or len(payload.reason.strip()) < 3:
-        raise _error("ppm_review_confirmation", "Confirm review and provide a review reason.", 422)
+    if not payload.confirmed:
+        raise _error("ppm_review_confirmation", "Confirm review of the current saved PPM.", 422)
     await _lock(db, listing)
     _writable(listing)
     events = await _events(db, listing.id)
-    intent = sync._fingerprint(payload.model_dump())
+    intent_body = payload.model_dump()
+    if "decision" not in payload.model_fields_set:
+        intent_body.pop("decision")  # preserve replay of earlier review requests
+    intent = sync._fingerprint(intent_body)
     if _request_replay(events, payload.idempotency_key, "review", actor_id, intent):
         return await read_state(db, listing, events=events)
     versions = _receipt_versions(events)
@@ -568,6 +573,8 @@ async def review(db, listing, actor_id, payload: PpmReviewIn):
     context = await saved_context(db, listing)
     if latest["source_fingerprint"] != context["fingerprint"] or context["fingerprint"] != payload.expected_source_fingerprint:
         raise _error("ppm_source_changed", "The PPM no longer matches the saved listing and file. Generate and review a current draft.")
+    if ppm_presets.draft_upgrade_available(context, LEGAL_FIELDS, latest):
+        raise _error("ppm_draft_upgrade_required", "Refresh the PPM draft to include current disclosure defaults before approving.")
     missing = _missing(context, latest["legal_inputs"], latest.get("legal_presets"))
     if missing:
         raise HTTPException(409, {"code": "ppm_incomplete", "message": "Complete the PPM's required inputs before approving.", "missing": missing})
@@ -587,7 +594,10 @@ async def review(db, listing, actor_id, payload: PpmReviewIn):
             previous.status, previous.superseded_at = E.DocumentStatus.SUPERSEDED, now
     doc.status = E.DocumentStatus.READY
     await _event(db, listing, "ppm.reviewed", actor_id, {"document_id": str(doc.id), "version": doc.version,
-        "source_fingerprint": context["fingerprint"], "reason": payload.reason.strip(), "idempotency_key": payload.idempotency_key,
+        "source_fingerprint": context["fingerprint"], "decision": "approve",
+        "reason": (payload.reason or "").strip() or APPROVAL_AUDIT_STATEMENT,
+        "reason_source": "staff_note" if (payload.reason or "").strip() else "approval_action",
+        "idempotency_key": payload.idempotency_key,
         "operation": "review", "intent": intent, "content_fingerprint": latest["content_fingerprint"], "reviewed_from_document_id": latest["document_id"]})
     return await read_state(db, listing, context=context)
 
@@ -666,9 +676,10 @@ async def refresh_managed_listing(db, listing_id, actor_id=None):
     state = await read_state(db, listing)
     if not state["managed"] or not state["auto_refresh"]:
         return {"status": "skipped"}
-    if state["status"] != "stale":
+    if state["status"] != "stale" and not state["draft_upgrade_available"]:
         return {"status": "unchanged"}
     latest_version = state["history"][0]["version"] if state["history"] else 0
+    upgrade_key = ":upgrade:" + ppm_presets.PRESET_SCHEMA if state["draft_upgrade_available"] else ""
     result = await generate(db, listing, actor_id, PpmGenerateIn(expected_source_fingerprint=state["source_fingerprint"],
-        idempotency_key="auto:" + hashlib.sha256((POLICY_VERSION + state["source_fingerprint"] + str(latest_version)).encode()).hexdigest()))
+        idempotency_key="auto:" + hashlib.sha256((POLICY_VERSION + state["source_fingerprint"] + str(latest_version) + upgrade_key).encode()).hexdigest()))
     return {"status": "refreshed", "version": result["current_draft"]["version"] if result["current_draft"] else None}

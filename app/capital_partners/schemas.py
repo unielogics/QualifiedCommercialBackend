@@ -187,7 +187,8 @@ class PpmReviewIn(BaseModel):
     expected_source_fingerprint: str = Field(min_length=1, max_length=128)
     idempotency_key: str = Field(min_length=1, max_length=128)
     confirmed: bool
-    reason: str = Field(min_length=3, max_length=2000)
+    decision: Literal["approve"] = "approve"
+    reason: str | None = Field(default=None, max_length=2000)
 
     model_config = {"extra": "forbid"}
 
@@ -270,6 +271,7 @@ class PpmRead(BaseModel):
     membership_policy: MembershipPolicyOut
     legal_defaults: dict[str, str] = Field(default_factory=dict)
     legal_default_presets: dict[str, str] = Field(default_factory=dict)
+    draft_upgrade_available: bool = False
 
 
 class DocumentGrantIn(BaseModel):
