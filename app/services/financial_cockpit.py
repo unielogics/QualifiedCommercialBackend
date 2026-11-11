@@ -2981,8 +2981,8 @@ def term_sheet_terms(sheet: ProductionTermSheet | None) -> dict[str, Any] | None
     return {
         "source": "term_sheet",
         "label": f"Term sheet v{sheet.version}: {sheet.funding_party_name}",
-        **loan_dates(sheet.expected_funding_date, sheet.term_months,
-            sheet.maturity_date, extra.get("maturity_date_mode")),
+        **loan_dates(getattr(sheet, "expected_funding_date", None), sheet.term_months,
+            getattr(sheet, "maturity_date", None), extra.get("maturity_date_mode")),
         "proposal_use_of_funds": getattr(sheet, "use_of_funds", None),
         "proposal_use_of_funds_amount": advanced["payment_basis_amount"] if advanced else sheet.approved_amount,
         "collateral_snapshot": extra.get("collateral_snapshot") or {},
