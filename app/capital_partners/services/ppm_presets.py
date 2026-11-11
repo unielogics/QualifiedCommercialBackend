@@ -101,6 +101,18 @@ def upgrade(context, fields, previous):
     return legal, selected
 
 
+def draft_upgrade_available(context, fields, previous):
+    """Only legacy, unpinned blanks can acquire new draft defaults."""
+    if previous.get("source") != "generated_ppm" or previous.get("preset_schema") == PRESET_SCHEMA:
+        return False
+    original = previous.get("legal_inputs") or {}
+    selected = previous.get("legal_presets") or {}
+    upgraded, _ = upgrade(context, fields, previous)
+    return any(not original.get(row["key"], "").strip()
+        and selected.get(row["key"]) != CUSTOM
+        and bool(upgraded.get(row["key"], "").strip()) for row in fields)
+
+
 def for_save(context, fields, values, explicit, previous):
     choices = _options(context, fields)
     if explicit is not None and set(explicit) - set(choices):
