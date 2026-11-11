@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
@@ -208,6 +209,7 @@ async def test_start_saves_out_of_scope_application_instead_of_rejecting_it():
 @pytest.mark.asyncio
 async def test_three_typed_advances_are_saved_and_tighten_a_two_advance_declaration():
     intake = make_intake(count=2, amount=300_000)
+    intake.bucket_upload_link = SimpleNamespace(status="active", expires_at=None, passcode_set_by_client_at=datetime.now(UTC))
     intake.bucket.requested_documents = [SimpleNamespace(category="Debts", status="requested")]
     row = {"funder": "Example", "remaining_payback": 150_000, "payment_amount": 1000, "payment_frequency": "weekly"}
     payload = routes.McaTermsSubmission(business_name="Test Business", advances=[row] * 3, acknowledgment=True)

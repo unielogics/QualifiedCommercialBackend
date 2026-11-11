@@ -228,10 +228,19 @@ class McaIntakeStart(McaLeadRequest):
     time_in_business: Literal["under_6_months", "6_12_months", "1_2_years", "2_plus_years"] | None = None
     active_mca_count: int | None = Field(default=None, strict=True, ge=0, le=2)
     has_modified_mca: bool | None = Field(default=None, strict=True)
-    secure_room_pin: str = Field(pattern=r"^[0-9]{6}$")
+    secure_room_pin: str = Field(pattern=r"^[0-9]{6}$", repr=False)
     terms_accepted: Literal[True]
     privacy_accepted: Literal[True]
     consent_version: Literal["mca-ai-intake-v3"] = "mca-ai-intake-v3"
+
+    @field_validator("secure_room_pin")
+    @classmethod
+    def validate_room_pin(cls, value: str) -> str:
+        from app.dealer_os.services.client_room import passcode_problem
+
+        if problem := passcode_problem(value):
+            raise ValueError(problem)
+        return value
 
     @field_validator("has_modified_mca")
     @classmethod

@@ -156,7 +156,10 @@ async def start_mca_refinance(
             "A secure MCA refinance review already exists for this email. We sent a short access code so you can continue that file.",
         )
     client = await core._find_or_create_mca_client(db, payload)
-    bucket, link = await core._create_bucket_for_mca_refi(db, client, payload, request)
+    bucket, link = await core._create_bucket_for_mca_refi(db, client, payload, request,
+        **({"room_pin": payload.secure_room_pin} if payload.secure_room_pin else {}))
+    if payload.secure_room_pin:
+        link.passcode_set_by_client_at = core._now()
     token = core._new_public_token()
     attribution = core._public_intake_attribution(payload)
     seeded: dict[str, Any] = {}
@@ -434,6 +437,7 @@ async def mca_refinance_upload_init(
 ) -> core.BucketFileUploadInitResponse:
     intake = await core._load_public_intake(db, token)
     core._require_mca_intake(intake)
+    core.client_room.require_passcode_setup(intake.bucket_upload_link)
     return await core._start_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email,
                                source_kind="client_room")
 
@@ -473,6 +477,7 @@ async def submit_mca_refinance_terms(
     upload — monthly payments are normalized from each advance's remittance
     frequency."""
     intake = await core._load_public_intake(db, token)
+    core.client_room.require_passcode_setup(intake.bucket_upload_link)
     core._require_mca_intake(intake)
     if not payload.acknowledgment:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "You must acknowledge the disclaimer to submit this form")
@@ -687,13 +692,15 @@ async def mca_router_secure_room(
     token: str,
     request: Request,
     db: AsyncSession = Depends(core.get_db),
+    payload: core.SecureRoomHandoffRequest | None = None,
 ) -> core.SecureRoomHandoffResponse:
     """Open this file's secure room, where the bank connection and the
     agreements live. The client is already verified on this intake."""
-    intake = await core._load_public_intake(db, token)
+    intake = await core._load_public_intake(db, token, allow_pending_signing=True)
     # The card this answers is titled "Connect your bank account": the room
     # opens on banking, where Plaid is first, not on the general to-do list.
-    return await core._secure_room_handoff(db, intake, request, tab="banking")
+    return await core._secure_room_handoff(db, intake, request, tab="banking",
+        **({"new_passcode": payload.new_passcode} if payload and payload.new_passcode else {}))
 
 @core.mca_router.post("/{token}/book-call", response_model=core.DealerIntakeResponse)
 async def book_mca_refinance_call(

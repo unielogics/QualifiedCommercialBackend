@@ -3999,6 +3999,16 @@ async def request_link_choose_passcode(
     one they can come back with.
     """
     link = await _load_upload_link_or_404(db, token)
+    # Serialize the current credential proof with its replacement. A second
+    # tab must not authenticate against the invitation that the first tab
+    # already replaced with the client's own PIN.
+    await db.refresh(link, with_for_update=True)
+    client_room.require_room_access(link)
+    if not client_room.passcode_needs_setup(link) and _verify_passcode(
+        payload.new_passcode, link.passcode_hash, attempt_scope=_client_ip(request) or "unknown",
+    ):
+        await db.commit()
+        return BucketRequestPasscodeChanged(ok=True, passcode_needs_setup=False)
     await _require_request_access_passcode(db, link, payload, request)
     problem = client_room.passcode_problem(payload.new_passcode, payload.passcode)
     if problem:
@@ -4025,6 +4035,7 @@ async def request_upload_init(
         await _log(db, link.bucket_id, "upload_passcode_failed", request=request, actor_name=payload.uploader_name or link.recipient_name, actor_email=str(payload.uploader_email) if payload.uploader_email else link.recipient_email, actor_role="uploader", target_type="upload_link", target_id=str(link.id), detail=payload.file_name)
         await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
+    client_room.require_passcode_setup(link)
     if payload.requested_document_id:
         req = await db.get(BucketRequestedDocument, payload.requested_document_id)
         if (

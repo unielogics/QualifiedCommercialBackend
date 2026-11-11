@@ -475,6 +475,12 @@
   ],
   [
     "client_router",
+    "GET",
+    "/buckets/client/intakes/{intake_id}/secure-room",
+    "my_dealer_room_status"
+  ],
+  [
+    "client_router",
     "POST",
     "/buckets/client/intakes/capital-readiness/claim",
     "claim_capital_readiness_diagnostic"
@@ -514,6 +520,12 @@
     "POST",
     "/buckets/client/intakes/{intake_id}/requested-documents/pfs",
     "my_dealer_submit_pfs"
+  ],
+  [
+    "client_router",
+    "POST",
+    "/buckets/client/intakes/{intake_id}/secure-room",
+    "my_dealer_secure_room"
   ],
   [
     "client_router",

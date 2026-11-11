@@ -23,7 +23,7 @@ def test_every_interactive_ai_creation_requires_all_business_profile_answers(mod
         if model is core.AdminLeadCreate:
             # Operator completion still requires every business answer; the
             # invitation mode intentionally defers them to the applicant.
-            values = {**values, "full_name": "Example Owner", "email": "owner@example.com", "phone": "2025550123", "secure_room_pin": "123456"}
+            values = {**values, "full_name": "Example Owner", "email": "owner@example.com", "phone": "2025550123", "secure_room_pin": "729518"}
         with pytest.raises(ValidationError) as error:
             model.model_validate(values)
         errors = {item["loc"][0] for item in error.value.errors()}
@@ -32,7 +32,7 @@ def test_every_interactive_ai_creation_requires_all_business_profile_answers(mod
 
 @pytest.mark.parametrize("key", PROFILE_FIELDS)
 def test_operator_boundary_cannot_be_bypassed_by_omitting_a_single_business_fact(key):
-    values = {**BUSINESS_PROFILE, "full_name": "Owner", "email": "owner@example.com", "phone": "2025550123", "secure_room_pin": "123456"}
+    values = {**BUSINESS_PROFILE, "full_name": "Owner", "email": "owner@example.com", "phone": "2025550123", "secure_room_pin": "729518"}
     values.pop(key)
     with pytest.raises(ValidationError):
         core.AdminLeadCreate.model_validate(values)
@@ -44,7 +44,7 @@ def test_operator_boundary_cannot_be_bypassed_by_omitting_a_single_business_fact
 def test_complete_explicit_profile_is_accepted_by_all_create_variants(model):
     row = model.model_validate({
         **BUSINESS_PROFILE, "full_name": "Example Owner", "business_name": "Example Services LLC",
-        "email": "owner@example.com", "phone": "2025550123", "secure_room_pin": "123456",
+        "email": "owner@example.com", "phone": "2025550123", "secure_room_pin": "729518",
         "terms_accepted": True, "privacy_accepted": True, "idempotency_key": uuid4(),
         "capital_readiness_diagnostic": {
             "version": 1, "source": "capital_readiness_diagnostic", "verification_status": "self_reported_unverified",

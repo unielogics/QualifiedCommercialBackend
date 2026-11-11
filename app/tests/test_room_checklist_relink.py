@@ -262,13 +262,14 @@ def _link():
         recipient_name="Linda Louis",
         recipient_email="linda@example.com",
         passcode_set_by_client_at=None,
+        status="active", expires_at=None,
     )
 
 
 @pytest.mark.asyncio
 async def test_a_client_replaces_the_generated_pin_with_their_own() -> None:
     link = _link()
-    db = SimpleNamespace(commit=AsyncMock())
+    db = SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock())
     with (
         patch("app.routers.buckets._load_upload_link_or_404", AsyncMock(return_value=link)),
         patch("app.routers.buckets._client_ip", return_value="203.0.113.6"),
@@ -292,7 +293,7 @@ async def test_a_client_replaces_the_generated_pin_with_their_own() -> None:
 @pytest.mark.asyncio
 async def test_a_trivial_or_unchanged_pin_is_refused_before_anything_is_stored() -> None:
     link = _link()
-    db = SimpleNamespace(commit=AsyncMock())
+    db = SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock())
     for new_passcode in ("111111", "123456", "402913"):
         with (
             patch("app.routers.buckets._load_upload_link_or_404", AsyncMock(return_value=link)),
