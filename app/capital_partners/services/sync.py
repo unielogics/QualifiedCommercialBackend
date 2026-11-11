@@ -39,6 +39,32 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def saved_source_fingerprint(value: Any) -> str:
+    """Canonical saved facts, preserving numbers without ORM/JSON type churn.
+
+    This is deliberately separate from action, idempotency and content hashes.
+    Numeric strings remain strings; numeric values are never rounded here.
+    """
+    def encode(item: Any) -> str:
+        if item is None or isinstance(item, (str, bool)):
+            return json.dumps(item, separators=(",", ":"))
+        if isinstance(item, (int, float, Decimal)):
+            number = Decimal(str(item))
+            if not number.is_finite():
+                raise ValueError("Saved financial source numbers must be finite")
+            if number.is_zero():
+                return "0"
+            token = format(number, "f")
+            return token.rstrip("0").rstrip(".") if "." in token else token
+        if isinstance(item, dict):
+            return "{" + ",".join(json.dumps(str(key)) + ":" + encode(item[key]) for key in sorted(item)) + "}"
+        if isinstance(item, (list, tuple)):
+            return "[" + ",".join(encode(child) for child in item) + "]"
+        return json.dumps(str(item))
+
+    return hashlib.sha256(encode(value).encode("utf-8")).hexdigest()
+
+
 def proposed_terms(cockpit: dict[str, Any]) -> dict[str, Any] | None:
     """The terms the package and the listing speak of: the recorded term
     sheet first, else the loan in the desk's plan, with the schedule and the
@@ -216,7 +242,7 @@ def budget_economics(value: Any) -> dict[str, Any]:
 
 
 def fingerprints(sections: dict[str, Any]) -> dict[str, str]:
-    return {key: _fingerprint(value) for key, value in sections.items()}
+    return {key: saved_source_fingerprint(value) for key, value in sections.items()}
 
 
 def sync_state(listing: CpListing, current: dict[str, str]) -> dict[str, Any]:

@@ -8,12 +8,13 @@ import re
 from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -113,45 +114,63 @@ def _writable(listing):
         raise _error("closed", "A repaid or withdrawn listing is read-only.")
 
 
+async def _saved_listing_fields(db, listing):
+    keys = ("ref", "name", "summary", "vertical", "city", "state", "program_label", "loan_amount",
+        "offered_amount", "minimum_investment", "note_rate_pct", "term_months", "payment_frequency",
+        "collateral_type", "lien_position", "ltv_pct", "personal_guarantee", "guarantee_text",
+        "borrower_track_record", "exit_plan", "servicer_label", "valuation_amount", "valuation_source",
+        "title_status", "maturity_date", "products")
+    state = inspect(listing, raiseerr=False)
+    if isinstance(db, AsyncSession) and state is not None and state.persistent:
+        # Scalar columns use the actual persisted Numeric precision, rather than
+        # a float still cached after canonical financing was assigned/flushed.
+        row = (await db.execute(select(*(getattr(CpListing, key) for key in (*keys, "profile_id", "source_snapshot")))
+            .where(CpListing.id == listing.id))).mappings().one()
+        fields = {key: row[key] for key in keys}
+        profile_id, snapshot = row["profile_id"], row["source_snapshot"]
+    else:
+        fields = {key: getattr(listing, key, None) for key in keys}
+        profile_id, snapshot = listing.profile_id, listing.source_snapshot
+    from app.services.loan_dates import listing_dates
+
+    fields["loan_dates"] = listing_dates(SimpleNamespace(**fields, source_snapshot=snapshot))
+    return fields, profile_id, snapshot
+
+
 async def saved_context(db: AsyncSession, listing: CpListing) -> dict[str, Any]:
     """Current persisted facts only; no generation, materialization or writes."""
     issuer = (await db.execute(select(CpIssuerSettings).where(CpIssuerSettings.key == "default"))).scalar_one_or_none()
+    fields, profile_id, listing_snapshot = await _saved_listing_fields(db, listing)
     fresh = {}
-    if listing.profile_id:
-        profile = await db.get(ApplicationProfile, listing.profile_id, populate_existing=True)
+    if profile_id:
+        profile = await db.get(ApplicationProfile, profile_id, populate_existing=True)
         if profile is None:
             raise _error("source_missing", "The file behind this listing was not found.", 404)
         fresh = await prefill.readiness_snapshot(db, profile)
     financials = fresh.get("financials") or {}
-    if listing.profile_id:
+    if profile_id:
         from app.services import use_of_funds
         financials = {**financials, "use_of_funds": use_of_funds.ai_context(await use_of_funds.read_budget(db, profile))}
     terms = financials.get("proposed_terms") or {}
     budget = public_budget(financials.get("deal_budget")) if financials.get("deal_budget") else {}
-    fields = {key: getattr(listing, key, None) for key in (
-        "ref", "name", "summary", "vertical", "city", "state", "program_label", "loan_amount",
-        "offered_amount", "minimum_investment", "note_rate_pct", "term_months", "payment_frequency",
-        "collateral_type", "lien_position", "ltv_pct", "personal_guarantee", "guarantee_text",
-        "borrower_track_record", "exit_plan", "servicer_label", "valuation_amount", "valuation_source",
-        "title_status", "maturity_date", "products")}
-    from app.services.loan_dates import listing_dates
-    fields["loan_dates"] = listing_dates(listing)
     issuer_name = _text(getattr(issuer, "issuer_name", None)) or membership_policy.CONFIRMED_ISSUER_NAME
     member_policy = membership_policy.describe(issuer)
-    industry = _text(getattr(profile, "naics_label", None) or getattr(profile, "industry", None))[:180] if listing.profile_id else ""
-    bound = {"policy": POLICY_VERSION, "listing": fields, "issuer_name": issuer_name,
+    industry = _text(getattr(profile, "naics_label", None) or getattr(profile, "industry", None))[:180] if profile_id else ""
+    bound = {"policy": POLICY_VERSION, "profile_id": profile_id, "listing": fields, "issuer_name": issuer_name,
         "industry": industry,
         "membership_policy": member_policy,
         "use_of_funds": financials.get("use_of_funds"),
         "file": {key: value for key, value in (fresh.get("file_fingerprints") or {}).items() if key != "package"}}
     missing = []
     from .listings import publish_issues
-    for issue in publish_issues(listing):
+    saved_listing = SimpleNamespace(**fields, profile_id=profile_id, source_snapshot=listing_snapshot,
+        documents=listing.documents, _ppm_access=getattr(listing, "_ppm_access", {}))
+    for issue in publish_issues(saved_listing):
         if issue["code"].startswith("ppm_"):
             continue
         missing.append({"key": issue["code"], "label": issue["message"], "section": issue["section"], "required": True})
     if fresh:
-        previous = (listing.source_snapshot or {}).get("file_fingerprints") or {}
+        previous = (listing_snapshot or {}).get("file_fingerprints") or {}
         if any(previous.get(key) != value for key, value in (fresh.get("file_fingerprints") or {}).items() if key != "package"):
             missing.append({"key": "listing_snapshot", "label": "Refresh the listing from the latest saved file before approving the PPM.", "section": "snapshot", "required": True})
     if not (budget.get("currency") or terms.get("currency")):
@@ -172,7 +191,7 @@ async def saved_context(db: AsyncSession, listing: CpListing) -> dict[str, Any]:
         ai_facts["use_of_proceeds"] = "Saved allocations require reconciliation with net financing proceeds."
     if financials.get("dscr") is not None and Decimal(str(financials["dscr"])) < 1:
         ai_facts["coverage_risk"] = "Saved debt service coverage is below full coverage and requires review."
-    return {"fingerprint": sync._fingerprint(bound), "listing": _json(fields), "financials": financials,
+    return {"fingerprint": sync.saved_source_fingerprint(bound), "listing": _json(fields), "financials": financials,
         "budget": budget, "issuer": issuer_name, "missing": missing, "membership_policy": member_policy,
         "ai_facts": ai_facts,
         "warnings": ["AI drafting is an aid to staff review; it does not establish legal compliance or approve an offering."]}
