@@ -28,9 +28,9 @@ from app.services.investor_report import safe_text
 from .. import enums as E
 from ..models import CpIssuerSettings, CpListing, CpListingDocument, CpListingEvent
 from ..schemas import PpmDraftIn, PpmGenerateIn, PpmReviewIn
-from . import prefill, storage, sync
+from . import membership_policy, ppm_presets, prefill, storage, sync
 
-POLICY_VERSION = "saved-ppm-v1"
+POLICY_VERSION = "saved-ppm-v2"
 LEGAL_FIELDS = [
     {"key": key, "label": label, "required": True}
     for key, label in (
@@ -44,7 +44,7 @@ LEGAL_FIELDS = [
         ("conflicts_of_interest", "Conflicts of interest and compensation disclosures"),
     )
 ]
-LEGAL_FIELDS.append({"key": "offering_currency", "label": "Offering currency (only if saved currency is unknown)", "required": False})
+LEGAL_FIELDS.append({"key": "offering_currency", "label": "Offering currency", "required": False})
 NARRATIVE_FIELDS = [
     {"key": key, "label": label, "required": False}
     for key, label in (
@@ -135,10 +135,12 @@ async def saved_context(db: AsyncSession, listing: CpListing) -> dict[str, Any]:
         "title_status", "maturity_date", "products")}
     from app.services.loan_dates import listing_dates
     fields["loan_dates"] = listing_dates(listing)
-    issuer_name = _text(getattr(issuer, "issuer_name", None))
+    issuer_name = _text(getattr(issuer, "issuer_name", None)) or membership_policy.CONFIRMED_ISSUER_NAME
+    member_policy = membership_policy.describe(issuer)
     industry = _text(getattr(profile, "naics_label", None) or getattr(profile, "industry", None))[:180] if listing.profile_id else ""
     bound = {"policy": POLICY_VERSION, "listing": fields, "issuer_name": issuer_name,
         "industry": industry,
+        "membership_policy": member_policy,
         "use_of_funds": financials.get("use_of_funds"),
         "file": {key: value for key, value in (fresh.get("file_fingerprints") or {}).items() if key != "package"}}
     missing = []
@@ -170,7 +172,7 @@ async def saved_context(db: AsyncSession, listing: CpListing) -> dict[str, Any]:
     if financials.get("dscr") is not None and Decimal(str(financials["dscr"])) < 1:
         ai_facts["coverage_risk"] = "Saved debt service coverage is below full coverage and requires review."
     return {"fingerprint": sync._fingerprint(bound), "listing": _json(fields), "financials": financials,
-        "budget": budget, "issuer": issuer_name, "missing": missing,
+        "budget": budget, "issuer": issuer_name, "missing": missing, "membership_policy": member_policy,
         "ai_facts": ai_facts,
         "warnings": ["AI drafting is an aid to staff review; it does not establish legal compliance or approve an offering."]}
 
@@ -187,18 +189,19 @@ def _inputs(values: dict[str, str], fields: list[dict]) -> dict[str, str]:
     return result
 
 
-def _missing(context, legal):
+def _missing(context, legal, legal_presets=None):
     current = context.get("budget", {}).get("currency") or (context.get("financials", {}).get("proposed_terms") or {}).get("currency")
     missing = [row for row in deepcopy(context["missing"]) if not (row["key"] == "currency" and legal.get("offering_currency"))]
     if current and legal.get("offering_currency") and current != legal["offering_currency"]:
         missing.append({"key": "offering_currency", "label": "The supplied offering currency conflicts with the saved financing currency.", "section": "legal", "required": True})
+    unresolved = ppm_presets.unresolved_fields(context, LEGAL_FIELDS, legal, legal_presets)
     return [*missing, *[
         {"key": row["key"], "label": row["label"], "section": "legal", "required": True}
-        for row in LEGAL_FIELDS if row["required"] and not legal.get(row["key"], "").strip()
+        for row in LEGAL_FIELDS if row["required"] and (not legal.get(row["key"], "").strip() or row["key"] in unresolved)
     ]]
 
 
-def _document(context, legal, narrative, selection=None, ai_sections=None):
+def _document(context, legal, narrative, selection=None, ai_sections=None, legal_presets=None):
     fields, financials, budget = context["listing"], context["financials"], context["budget"]
     terms, calculation = financials.get("proposed_terms") or {}, budget.get("calculation") or {}
     currency = str(budget.get("currency") or terms.get("currency") or legal.get("offering_currency") or "(currency unconfirmed)")
@@ -225,10 +228,13 @@ def _document(context, legal, narrative, selection=None, ai_sections=None):
         {"key": "servicing", "title": "Servicing arrangements", "paragraphs": [narrative["servicing"]] if narrative.get("servicing") else [],
          "facts": [fact("Recorded servicer", _text(fields.get("servicer_label")) or "Unknown"), fact("Servicing arrangement", {"company_managed": "Company managed", "transferred": "Servicing transferred"}.get(budget.get("servicing_mode"), "Not confirmed"), "Staff recorded; no external integration verified.")]},
         {"key": "exit", "title": "Repayment and exit assumptions", "paragraphs": [value for value in (narrative.get("exit"), _text(fields.get("exit_plan"))) if value], "facts": []},
-        {"key": "legal", "title": "Staff-supplied offering provisions", "paragraphs": [], "facts": [fact(row["label"], legal.get(row["key"]) or "Required — not supplied") for row in LEGAL_FIELDS if row["required"] or legal.get(row["key"])]},
+        {"key": "legal", "title": "Offering provisions", "paragraphs": [], "facts": [fact("Additional offering-specific eligibility requirements" if row["key"] == "investor_eligibility" else row["label"], legal.get(row["key"]) or "Required — not supplied") for row in LEGAL_FIELDS if (row["required"] or legal.get(row["key"])) and not (row["key"] == "investor_eligibility" and (legal_presets or {}).get(row["key"]) == "marketplace_membership_policy")]},
         {"key": "risk_factors", "title": "Risk factors", "paragraphs": [*RISK_FACTS.values(), *([narrative["risk_factors"]] if narrative.get("risk_factors") else [])], "facts": []},
         {"key": "additional_disclosures", "title": "Additional disclosures", "paragraphs": [narrative["additional_disclosures"]] if narrative.get("additional_disclosures") else [], "facts": []},
     ]
+    member_policy = context.get("membership_policy") or membership_policy.describe()
+    sections.append({"key": "membership_requirements", "title": "Marketplace investor requirements",
+        "paragraphs": [member_policy["summary"], membership_policy.investor_disclosure(member_policy)], "facts": []})
     scenarios = calculation.get("investor_scenarios") or {}
     returns = next(row for row in sections if row["key"] == "returns")
     for key, label in (("six_month_payoff", "Payoff at six months, capped at maturity"), ("full_term", "Full note term")):
@@ -255,7 +261,7 @@ def _document(context, legal, narrative, selection=None, ai_sections=None):
             section["paragraphs"].insert(0, prose)
     return {"title": "Private placement memorandum", "listing_ref": fields.get("ref"), "issuer": legal.get("issuer_legal_name") or context["issuer"] or "Issuer not confirmed",
         "source_fingerprint": context["fingerprint"], "sections": sections,
-        "missing": _missing(context, legal), "warnings": list(context["warnings"])}
+        "missing": _missing(context, legal, legal_presets), "warnings": list(context["warnings"])}
 
 
 class AiParagraph(BaseModel):
@@ -371,7 +377,7 @@ async def read_state(db, listing, *, context=None, events=None):
         rows.append({key: value[key] for key in ("document_id", "version", "source", "source_fingerprint", "document", "legal_inputs", "narrative_sections")} | {
             "status": "superseded" if doc.status == E.DocumentStatus.SUPERSEDED else "approved" if document_id == approved_id else "superseded" if reviewed or event is not versions[-1] else "draft",
             "stale": value["source_fingerprint"] != context["fingerprint"] or doc.status == E.DocumentStatus.SUPERSEDED, "created_at": event.occurred_at.isoformat(),
-            "reviewed_at": reviewed.occurred_at.isoformat() if reviewed else None, "ai_sections": value.get("ai_sections") or {}})
+            "reviewed_at": reviewed.occurred_at.isoformat() if reviewed else None, "ai_sections": value.get("ai_sections") or {}, "legal_presets": value.get("legal_presets") or {}})
     current = rows[0] if rows else None
     approved = next((row for row in rows if str(row["document_id"]) == approved_id), None)
     draft = current if current and current["status"] == "draft" else None
@@ -384,24 +390,28 @@ async def read_state(db, listing, *, context=None, events=None):
             historical = {"document_id": str(doc.id), "version": doc.version, "source": "uploaded", "status": "approved" if doc.status == E.DocumentStatus.READY else "superseded", "source_fingerprint": "",
                 "stale": adopted is not None, "created_at": created.isoformat(), "reviewed_at": None,
                 "document": {"title": doc.name, "sections": [], "missing": [], "warnings": ["Previously uploaded PPM; not adopted into managed drafting."]},
-                "legal_inputs": {}, "narrative_sections": {}, "ai_sections": {}}
+                "legal_inputs": {}, "narrative_sections": {}, "ai_sections": {}, "legal_presets": {}}
             rows.append(historical)
             if approved is None and doc.status == E.DocumentStatus.READY:
                 approved = historical
     rows.sort(key=lambda row: row["version"], reverse=True)
-    legal = (current or {}).get("legal_inputs") or ({"issuer_legal_name": context["issuer"]} if context["issuer"] else {})
+    default_values, default_keys = ppm_presets.defaults(context, LEGAL_FIELDS)
+    legal = (current or {}).get("legal_inputs") if current else default_values
     stale = bool(current and current["stale"])
     return {"managed": adopted is not None, "auto_refresh": bool(adopted and adopted.detail.get("auto_refresh", True)),
         "status": "stale" if stale else "draft" if draft else "approved" if approved else "not_started",
         "generation_status": next((event.detail.get("generation_status", "source_based") for event in reversed(versions)), "not_generated"),
         "source_fingerprint": context["fingerprint"], "current_draft": draft, "current_approved": approved, "history": rows,
-        "missing": _missing(context, legal), "warnings": list(dict.fromkeys([*context["warnings"], *((current or {}).get("document", {}).get("warnings") or [])])), "legal_fields": LEGAL_FIELDS, "narrative_fields": NARRATIVE_FIELDS}
+        "missing": _missing(context, legal, (current or {}).get("legal_presets")), "warnings": list(dict.fromkeys([*context["warnings"], *((current or {}).get("document", {}).get("warnings") or [])])),
+        "legal_fields": ppm_presets.catalog(context, LEGAL_FIELDS), "narrative_fields": NARRATIVE_FIELDS,
+        "membership_policy": context.get("membership_policy") or membership_policy.describe(),
+        "legal_defaults": default_values, "legal_default_presets": default_keys}
 
 
-async def _version(db, listing, context, legal, narrative, actor_id, *, generation_status, source="generated_ppm", document=None, existing_doc=None, request=None, ai_sections=None, render_status="draft", reviewed_at=None):
+async def _version(db, listing, context, legal, narrative, actor_id, *, generation_status, source="generated_ppm", document=None, existing_doc=None, request=None, ai_sections=None, render_status="draft", reviewed_at=None, legal_presets=None):
     now = datetime.now(UTC)
     version = existing_doc.version if existing_doc else max((doc.version for doc in listing.documents if doc.kind == E.DocumentKind.PPM), default=0) + 1
-    document = document or _document(context, legal, narrative, ai_sections=ai_sections)
+    document = document or _document(context, legal, narrative, ai_sections=ai_sections, legal_presets=legal_presets)
     if existing_doc is None:
         pdf = await asyncio.to_thread(render_pdf, document, version=version, status=render_status, generated_at=now, reviewed_at=reviewed_at)
         if not pdf.startswith(b"%PDF"):
@@ -417,7 +427,8 @@ async def _version(db, listing, context, legal, narrative, actor_id, *, generati
         await db.flush()
     detail = {"document_id": str(existing_doc.id), "version": version, "source": source, "source_fingerprint": context["fingerprint"],
         "document": document, "legal_inputs": legal, "narrative_sections": narrative, "ai_sections": ai_sections or {}, "generation_status": generation_status,
-        "content_fingerprint": sync._fingerprint({"legal": legal, "narrative": narrative, "document": document}), **(request or {})}
+        "legal_presets": legal_presets or {key: "custom" for key in legal}, "preset_schema": ppm_presets.PRESET_SCHEMA,
+        "content_fingerprint": sync._fingerprint({"legal": legal, "presets": legal_presets or {}, "narrative": narrative, "document": document}), **(request or {})}
     if (await saved_context(db, listing))["fingerprint"] != context["fingerprint"]:
         raise _error("ppm_source_changed", "The saved file changed before the PPM could be recorded. Retry with current facts.")
     await _event(db, listing, "ppm.version", actor_id, detail)
@@ -441,12 +452,10 @@ async def generate(db, listing, actor_id, payload: PpmGenerateIn):
     if latest.get("source_fingerprint") == context["fingerprint"] and latest_doc is not None and latest_doc.status != E.DocumentStatus.SUPERSEDED and not payload.force:
         await _event(db, listing, "ppm.action", actor_id, {"idempotency_key": payload.idempotency_key, "operation": "generate", "intent": intent})
         return await read_state(db, listing, context=context, events=events)
-    legal = deepcopy(latest.get("legal_inputs") or {})
-    if not legal.get("issuer_legal_name") and context["issuer"]:
-        legal["issuer_legal_name"] = context["issuer"]
+    legal, legal_presets = ppm_presets.upgrade(context, LEGAL_FIELDS, latest)
     narrative = deepcopy(latest.get("narrative_sections") or {})
     start_revision = (latest.get("document_id"), latest.get("content_fingerprint"))
-    document = _document(context, legal, narrative)
+    document = _document(context, legal, narrative, legal_presets=legal_presets)
     status = "source_based"
     ai_sections = {}
     ai_citations = []
@@ -458,7 +467,7 @@ async def generate(db, listing, actor_id, payload: PpmGenerateIn):
             order = selected["section_order"] if isinstance(selected, dict) else selected
             ai_sections = selected.get("ai_sections", {}) if isinstance(selected, dict) else {}
             ai_citations = selected.get("citations", []) if isinstance(selected, dict) else []
-            document = _document(context, legal, narrative, order, ai_sections)
+            document = _document(context, legal, narrative, order, ai_sections, legal_presets)
             status = "ai_draft"
         except SQLAlchemyError:
             raise
@@ -485,13 +494,13 @@ async def generate(db, listing, actor_id, payload: PpmGenerateIn):
     current_versions = _receipt_versions(events)
     current = current_versions[-1].detail if current_versions else {}
     if (current.get("document_id"), current.get("content_fingerprint")) != start_revision:
-        if current.get("source") == "generated_ppm" and current.get("source_fingerprint") == context["fingerprint"] and current.get("legal_inputs") == legal and current.get("narrative_sections") == narrative:
+        if current.get("source") == "generated_ppm" and current.get("source_fingerprint") == context["fingerprint"] and current.get("legal_inputs") == legal and current.get("narrative_sections") == narrative and current.get("legal_presets") == legal_presets:
             await _event(db, listing, "ppm.action", actor_id, {"idempotency_key": payload.idempotency_key, "operation": "generate", "intent": intent})
             return await read_state(db, listing, context=context, events=events)
         raise _error("ppm_version_changed", "The PPM was edited while AI was drafting. The newer saved edits were preserved; reload before regenerating.")
     if not any(event.kind == "ppm.adopted" for event in events):
         await _event(db, listing, "ppm.adopted", actor_id, {"auto_refresh": payload.auto_refresh, "policy": POLICY_VERSION})
-    await _version(db, listing, context, legal, narrative, actor_id, generation_status=status, document=document, ai_sections=ai_sections,
+    await _version(db, listing, context, legal, narrative, actor_id, generation_status=status, document=document, ai_sections=ai_sections, legal_presets=legal_presets,
         request={"idempotency_key": payload.idempotency_key, "operation": "generate", "intent": intent, "ai_citations": ai_citations, "ai_facts": context.get("ai_facts", {})})
     return await read_state(db, listing, context=context)
 
@@ -500,7 +509,10 @@ async def save_draft(db, listing, actor_id, payload: PpmDraftIn):
     await _lock(db, listing)
     _writable(listing)
     events = await _events(db, listing.id)
-    intent = sync._fingerprint(payload.model_dump())
+    intent_body = payload.model_dump()
+    if "legal_presets" not in payload.model_fields_set:
+        intent_body.pop("legal_presets")  # preserve replay of pre-preset requests
+    intent = sync._fingerprint(intent_body)
     if _request_replay(events, payload.idempotency_key, "save", actor_id, intent):
         return await read_state(db, listing, events=events)
     versions = _receipt_versions(events)
@@ -512,6 +524,11 @@ async def save_draft(db, listing, actor_id, payload: PpmDraftIn):
     legal, narrative = _inputs(payload.legal_inputs, LEGAL_FIELDS), _inputs(payload.narrative_sections, NARRATIVE_FIELDS)
     narrative = {key: value for key, value in narrative.items() if value}
     latest = versions[-1].detail
+    try:
+        legal, legal_presets = ppm_presets.for_save(context, LEGAL_FIELDS, legal,
+            payload.legal_presets if "legal_presets" in payload.model_fields_set else None, latest)
+    except ValueError as error:
+        raise _error("invalid_ppm_preset", str(error), 422) from error
     uploaded = None
     if latest["source"] == "uploaded":
         previous = next((doc for doc in listing.documents if str(doc.id) == latest["document_id"]), None)
@@ -529,6 +546,7 @@ async def save_draft(db, listing, actor_id, payload: PpmDraftIn):
     await _version(db, listing, context, legal, narrative, actor_id,
         generation_status="manual_upload" if uploaded else latest.get("generation_status", "source_based"),
         source="uploaded" if uploaded else "generated_ppm", existing_doc=uploaded, ai_sections=latest.get("ai_sections"),
+        legal_presets=legal_presets,
         request={"idempotency_key": payload.idempotency_key, "operation": "save", "intent": intent,
             "ai_citations": latest.get("ai_citations", []), "ai_facts": latest.get("ai_facts", {})})
     return await read_state(db, listing, context=context)
@@ -550,7 +568,7 @@ async def review(db, listing, actor_id, payload: PpmReviewIn):
     context = await saved_context(db, listing)
     if latest["source_fingerprint"] != context["fingerprint"] or context["fingerprint"] != payload.expected_source_fingerprint:
         raise _error("ppm_source_changed", "The PPM no longer matches the saved listing and file. Generate and review a current draft.")
-    missing = _missing(context, latest["legal_inputs"])
+    missing = _missing(context, latest["legal_inputs"], latest.get("legal_presets"))
     if missing:
         raise HTTPException(409, {"code": "ppm_incomplete", "message": "Complete the PPM's required inputs before approving.", "missing": missing})
     doc = next((doc for doc in listing.documents if str(doc.id) == latest["document_id"]), None)
@@ -562,6 +580,7 @@ async def review(db, listing, actor_id, payload: PpmReviewIn):
         doc = await _version(db, listing, context, latest["legal_inputs"], latest["narrative_sections"], actor_id,
             generation_status=latest.get("generation_status", "source_based"), document=deepcopy(latest["document"]),
             ai_sections=latest.get("ai_sections"), render_status="reviewed", reviewed_at=now,
+            legal_presets=latest.get("legal_presets"),
             request={"ai_citations": latest.get("ai_citations", []), "ai_facts": latest.get("ai_facts", {})})
     for previous in listing.documents:
         if previous.kind == E.DocumentKind.PPM and previous.id != doc.id and previous.status == E.DocumentStatus.READY:
@@ -617,14 +636,12 @@ async def adopt_upload(db, listing, doc, actor_id):
     context = await saved_context(db, listing)
     latest = _receipt_versions(events)
     previous = latest[-1].detail if latest else {}
-    legal = deepcopy(previous.get("legal_inputs") or {})
-    if not legal.get("issuer_legal_name") and context["issuer"]:
-        legal["issuer_legal_name"] = context["issuer"]
+    legal, legal_presets = ppm_presets.upgrade(context, LEGAL_FIELDS, previous)
     if not any(event.kind == "ppm.adopted" for event in events):
         await _event(db, listing, "ppm.adopted", actor_id, {"auto_refresh": True, "policy": POLICY_VERSION})
     doc.status = E.DocumentStatus.PENDING
     await _version(db, listing, context, legal, deepcopy(previous.get("narrative_sections") or {}), actor_id,
-        generation_status="manual_upload", source="uploaded", existing_doc=doc)
+        generation_status="manual_upload", source="uploaded", existing_doc=doc, legal_presets=legal_presets)
 
 
 async def _copy_pdf(source, target):

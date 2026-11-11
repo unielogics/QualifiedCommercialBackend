@@ -78,6 +78,14 @@ async def list_access_requests(admin: CpAdmin, db: Db, status_filter: str | None
     return [S.AccessRequestOut.model_validate(r) for r in rows]
 
 
+@router.get("/membership-policy", response_model=S.MembershipPolicyOut)
+async def get_membership_policy(admin: CpAdmin, db: Db) -> S.MembershipPolicyOut:
+    from .models import CpIssuerSettings
+    from .services import membership_policy
+    settings = (await db.execute(select(CpIssuerSettings).where(CpIssuerSettings.key == "default"))).scalar_one_or_none()
+    return S.MembershipPolicyOut(**membership_policy.describe(settings))
+
+
 @router.get("/access-requests/{request_id}", response_model=S.AccessRequestOut)
 async def get_access_request(request_id: uuid.UUID, admin: CpAdmin, db: Db) -> S.AccessRequestOut:
     row = await db.get(CpAccessRequest, request_id)

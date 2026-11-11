@@ -25,6 +25,7 @@ from app.models.user import User
 
 from .. import enums as E
 from ..models import CpAccessRequest, CpIssuerSettings, CpMember, CpMemberEntity, CpQuestionnaire
+from . import membership_policy
 
 
 async def issuer_settings(db: AsyncSession) -> CpIssuerSettings:
@@ -101,11 +102,7 @@ def aware(value: datetime | None) -> datetime | None:
 
 def is_cleared(member: CpMember | None, *, now: datetime | None = None) -> bool:
     """Approved and past the waiting period: offerings may be shown."""
-    if member is None or member.status != E.MemberStatus.APPROVED:
-        return False
-    now = now or datetime.now(UTC)
-    ends = aware(member.waiting_period_ends_at)
-    return ends is None or ends <= now
+    return membership_policy.is_cleared(member, now=now)
 
 
 def refresh_status(member: CpMember, *, now: datetime | None = None) -> None:

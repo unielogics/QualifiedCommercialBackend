@@ -693,7 +693,8 @@ async def create_subscription(
         raise RuleError("not_open", "This offering is not open to subscribe.")
     from .ppm import require_current_review
     await require_current_review(db, listing)
-    if not (ack_ppm and ack_accredited):
+    from .membership_policy import acknowledgements_satisfied
+    if not acknowledgements_satisfied(ack_ppm=ack_ppm, ack_accredited=ack_accredited):
         raise RuleError("acknowledgements_required", "Both acknowledgements are required.")
     if entity_id is not None and not any(e.id == entity_id for e in member.entities):
         raise RuleError("entity_not_yours", "That investing entity does not belong to this membership.")
