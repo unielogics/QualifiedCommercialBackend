@@ -12,7 +12,7 @@ from app.capital_partners.models import CpListing, CpListingDocument
 from app.capital_partners.schemas import PublishIssue
 from app.capital_partners.services import emails, listings, storage
 from app.enums import Role
-from app.tests.test_capital_partners import Scenario, harness
+from app.tests.test_capital_partners import Scenario, approve_uploaded_ppm, harness
 
 
 def listing(**changes):
@@ -108,6 +108,7 @@ async def test_real_routes_return_matching_guidance_and_require_ready_upload_the
         scenario = Scenario(h)
         admin = await scenario.admin()
         with patch.multiple(storage, configured=lambda: True,
+                            copy_object=lambda *_args, **_kwargs: True,
                             presign_put=lambda key, **_kwargs: {"upload_url": "https://example.com/upload", "headers": {}, "s3_key": key},
                             head_object=lambda _key: {"size_bytes": 123, "content_type": "application/pdf"}), \
                 patch.object(emails, "_send", AsyncMock()) as send:
@@ -133,6 +134,10 @@ async def test_real_routes_return_matching_guidance_and_require_ready_upload_the
             assert (await h.client.get(path)).json()["publish_issues"]
             done = await h.client.post(path + "/documents/upload-complete", json={"document_id": init.json()["document_id"]})
             assert done.status_code == 200
+            assert done.json()["status"] == "pending"
+            pending = (await h.client.get(path)).json()
+            assert pending["publish_issues"][0]["code"] == "ppm_review_required"
+            await approve_uploaded_ppm(h, path)
             ready = (await h.client.get(path)).json()
             assert ready["publish_issues"] == ready["publish_blockers"] == []
             assert row.status == "draft" and row.published_at is None

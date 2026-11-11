@@ -71,6 +71,15 @@ async def job_credit_report_imports() -> None:
         log.info("Existing credit report imports: %s", result)
 
 
+async def job_marketplace_ppm_refresh() -> None:
+    """Refresh opted-in PPM drafts after saved source changes; never publish."""
+    from app.capital_partners.services.ppm_refresh import drain_pending
+
+    result = await drain_pending(limit=5)
+    if result["refreshed"] or result["failed"]:
+        log.info("Marketplace PPM refresh: %s", result)
+
+
 def start_scheduler() -> None:
     """Idempotent — safe to call from FastAPI startup hooks (which fire
     on every uvicorn reload in dev). `replace_existing=True` collapses
@@ -88,6 +97,16 @@ def start_scheduler() -> None:
     from app.config import get_settings
 
     gmail_push_configured = bool(get_settings().gmail_pubsub_topic)
+
+    scheduler.add_job(
+        _wrap(job_marketplace_ppm_refresh),
+        "interval",
+        seconds=60,
+        id="marketplace_ppm_refresh",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
 
     scheduler.add_job(
         _wrap(job_lender_submission_delivery),

@@ -154,12 +154,84 @@ class DocumentOut(_Out):
     size_bytes: int | None
     version: int
     status: str
-    source: Literal["generated_package", "uploaded"] = "uploaded"
+    source: Literal["generated_package", "generated_ppm", "uploaded"] = "uploaded"
 
 
 class DocumentUrlOut(BaseModel):
     url: str
     expires_in_seconds: int
+
+
+class PpmGenerateIn(BaseModel):
+    expected_source_fingerprint: str = Field(min_length=1, max_length=128)
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    force: bool = False
+    auto_refresh: bool = True
+
+    model_config = {"extra": "forbid"}
+
+
+class PpmDraftIn(BaseModel):
+    expected_version: int = Field(ge=1)
+    expected_source_fingerprint: str = Field(min_length=1, max_length=128)
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    legal_inputs: dict[str, str] = Field(default_factory=dict, max_length=20)
+    narrative_sections: dict[str, str] = Field(default_factory=dict, max_length=20)
+
+    model_config = {"extra": "forbid"}
+
+
+class PpmReviewIn(BaseModel):
+    expected_version: int = Field(ge=1)
+    expected_source_fingerprint: str = Field(min_length=1, max_length=128)
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    confirmed: bool
+    reason: str = Field(min_length=3, max_length=2000)
+
+    model_config = {"extra": "forbid"}
+
+
+class PpmMissing(BaseModel):
+    key: str
+    label: str
+    section: str
+    required: bool = True
+
+
+class PpmField(BaseModel):
+    key: str
+    label: str
+    required: bool = False
+
+
+class PpmVersion(BaseModel):
+    document_id: UUID
+    version: int
+    source: Literal["generated_ppm", "uploaded"]
+    status: Literal["draft", "approved", "superseded"]
+    source_fingerprint: str
+    stale: bool
+    created_at: datetime
+    reviewed_at: datetime | None = None
+    document: dict[str, Any]
+    legal_inputs: dict[str, str]
+    narrative_sections: dict[str, str]
+    ai_sections: dict[str, str] = Field(default_factory=dict)
+
+
+class PpmRead(BaseModel):
+    managed: bool
+    auto_refresh: bool
+    status: Literal["not_started", "draft", "approved", "stale"]
+    generation_status: Literal["not_generated", "source_based", "ai_draft", "manual_upload"]
+    source_fingerprint: str
+    current_draft: PpmVersion | None
+    current_approved: PpmVersion | None
+    history: list[PpmVersion]
+    missing: list[PpmMissing]
+    warnings: list[str]
+    legal_fields: list[PpmField]
+    narrative_fields: list[PpmField]
 
 
 class DocumentGrantIn(BaseModel):

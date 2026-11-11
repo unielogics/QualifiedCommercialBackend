@@ -208,6 +208,8 @@ async def _listing_or_404(db: AsyncSession, ref: str) -> CpListing:
 @router.get("/listings/{ref}", response_model=S.ListingDetail)
 async def listing_detail(ref: str, ctx: ClearedMember, db: Db) -> S.ListingDetail:
     listing = await _listing_or_404(db, ref)
+    from .services.ppm import bind_access_state
+    ppm_access = await bind_access_state(db, listing)
     committed = (await L.committed_amounts(db, [listing.id])).get(listing.id, L.ZERO)
     mine: list[dict[str, Any]] = []
     if ctx.member is not None:
@@ -227,7 +229,7 @@ async def listing_detail(ref: str, ctx: ClearedMember, db: Db) -> S.ListingDetai
         title_status=listing.title_status, servicer_label=listing.servicer_label,
         documents=[S.DocumentOut(**L.document_out(d)) for d in L.ready_documents(listing)],
         my_subscriptions=[S.SubscriptionOut(**s) for s in mine],
-        can_subscribe=(not ctx.preview) and listing.status in E.SUBSCRIBABLE_STATUSES and L.remaining_amount(listing, committed) > 0,
+        can_subscribe=(not ctx.preview) and listing.status in E.SUBSCRIBABLE_STATUSES and L.remaining_amount(listing, committed) > 0 and (not ppm_access["managed"] or ppm_access["current"]),
         financials=L.partner_financials(listing),
     )
 
@@ -235,6 +237,8 @@ async def listing_detail(ref: str, ctx: ClearedMember, db: Db) -> S.ListingDetai
 @router.post("/listings/{ref}/documents/{document_id}/url", response_model=S.DocumentUrlOut)
 async def document_url(ref: str, document_id: uuid.UUID, ctx: ClearedMember, request: Request, db: Db) -> S.DocumentUrlOut:
     listing = await _listing_or_404(db, ref)
+    from .services.ppm import bind_access_state
+    await bind_access_state(db, listing)
     doc = next((d for d in L.ready_documents(listing) if d.id == document_id), None)
     if doc is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found.")

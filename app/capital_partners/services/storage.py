@@ -38,6 +38,22 @@ def configured() -> bool:
     return bool(get_settings().s3_bucket)
 
 
+def put_pdf(key: str, content: bytes) -> bool:
+    """Store a new immutable offering PDF; callers always allocate a new key."""
+    cfg = get_settings()
+    if not cfg.s3_bucket:
+        return False
+    params = {"Bucket": cfg.s3_bucket, "Key": key, "Body": content, "ContentType": "application/pdf"}
+    params.update({"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": cfg.buckets_kms_key_id}
+        if cfg.buckets_kms_key_id else {"ServerSideEncryption": "AES256"})
+    try:
+        _s3_client().put_object(**params)
+        return True
+    except Exception:
+        logger.exception("capital: generated PDF storage failed")
+        return False
+
+
 def safe_filename(name: str | None) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", name or "").strip(" .")
     return cleaned[:180] or "document.pdf"

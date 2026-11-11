@@ -361,6 +361,8 @@ async def _listing_admin_out(db: AsyncSession, listing: CpListing) -> S.ListingA
         await db.refresh(ev, attribute_names=["occurred_at"])
     investor_count = (await F.investor_counts(db)).get(listing.id, 0)
     sync = await SYNC.sync_for_listing(db, listing)
+    from .services.ppm import bind_access_state
+    await bind_access_state(db, listing)
     publish_issues = L.publish_issues(listing) if listing.status == E.ListingStatus.DRAFT else []
     return S.ListingAdminOut(
         **L.card(listing, committed),
@@ -712,6 +714,51 @@ async def withdraw_listing(listing_id: uuid.UUID, payload: S.WithdrawIn, admin: 
 # ---------------------------------------------------------------------------
 
 
+@router.get("/listings/{listing_id}/ppm", response_model=S.PpmRead)
+async def get_ppm(listing_id: uuid.UUID, admin: CpAdmin, db: Db) -> S.PpmRead:
+    from .services import ppm
+    return S.PpmRead(**await ppm.read_state(db, await _load_admin_listing(db, listing_id)))
+
+
+@router.post("/listings/{listing_id}/ppm/generate", response_model=S.PpmRead)
+async def generate_ppm(listing_id: uuid.UUID, payload: S.PpmGenerateIn, admin: CpAdmin, db: Db) -> S.PpmRead:
+    from .services import ppm
+    return S.PpmRead(**await ppm.generate(db, await _load_admin_listing(db, listing_id), admin.id, payload))
+
+
+@router.patch("/listings/{listing_id}/ppm/draft", response_model=S.PpmRead)
+async def save_ppm_draft(listing_id: uuid.UUID, payload: S.PpmDraftIn, admin: CpAdmin, db: Db) -> S.PpmRead:
+    from .services import ppm
+    return S.PpmRead(**await ppm.save_draft(db, await _load_admin_listing(db, listing_id), admin.id, payload))
+
+
+@router.post("/listings/{listing_id}/ppm/review", response_model=S.PpmRead)
+async def review_ppm(listing_id: uuid.UUID, payload: S.PpmReviewIn, admin: CpAdmin, db: Db) -> S.PpmRead:
+    from .services import ppm
+    return S.PpmRead(**await ppm.review(db, await _load_admin_listing(db, listing_id), admin.id, payload))
+
+
+@router.post("/listings/{listing_id}/ppm/versions/{document_id}/url", response_model=S.DocumentUrlOut)
+async def ppm_version_url(listing_id: uuid.UUID, document_id: uuid.UUID, request: Request, admin: CpAdmin, db: Db, download: bool = False) -> S.DocumentUrlOut:
+    from .services import ppm
+    listing = await _load_admin_listing(db, listing_id)
+    state = await ppm.read_state(db, listing)
+    allowed = {str(row["document_id"]) for row in state["history"]}
+    if state["current_approved"]:
+        allowed.add(str(state["current_approved"]["document_id"]))
+    document = next((doc for doc in listing.documents if doc.id == document_id and str(doc.id) in allowed), None)
+    if document is None:
+        raise HTTPException(404, "PPM version not found.")
+    url = storage.presign_get(document.s3_key, content_type="application/pdf", download_filename=document.name,
+        disposition="attachment" if download else "inline")
+    if url is None:
+        raise HTTPException(503, "Document storage is not available right now.")
+    await L.log_event(db, listing.id, "ppm.accessed", actor_user_id=admin.id,
+        detail={"document_id": str(document.id), "version": document.version, "download": download,
+            "ip_address": (client_ip(request) or "")[:64], "user_agent": (request.headers.get("user-agent") or "")[:400]})
+    return S.DocumentUrlOut(url=url, expires_in_seconds=storage.DOCUMENT_URL_TTL_SECONDS)
+
+
 @router.get("/listings/{listing_id}/file-documents")
 async def admin_file_documents(listing_id: uuid.UUID, admin: CpAdmin, db: Db) -> dict[str, Any]:
     from .services import document_catalog
@@ -759,6 +806,8 @@ async def admin_original_url(listing_id: uuid.UUID, file_id: uuid.UUID, request:
 async def admin_document_url(listing_id: uuid.UUID, document_id: uuid.UUID, request: Request, admin: CpAdmin, db: Db, download: bool = False) -> S.DocumentUrlOut:
     """Short-lived, audited access to an attached READY listing document."""
     listing = await _load_admin_listing(db, listing_id)
+    from .services.ppm import bind_access_state
+    await bind_access_state(db, listing)
     document = next((row for row in L.ready_documents(listing) if row.id == document_id), None)
     if document is None:
         raise HTTPException(404, "Document not found.")
@@ -776,6 +825,10 @@ async def admin_document_url(listing_id: uuid.UUID, document_id: uuid.UUID, requ
 @router.post("/listings/{listing_id}/documents/upload-init", response_model=S.DocumentInitOut)
 async def document_upload_init(listing_id: uuid.UUID, payload: S.DocumentInitIn, admin: CpAdmin, db: Db) -> S.DocumentInitOut:
     listing = await _load_admin_listing(db, listing_id)
+    if payload.kind == E.DocumentKind.PPM:
+        from .services import ppm
+        await ppm._lock(db, listing)
+        ppm._writable(listing)
     if not storage.configured():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Document storage is not configured.")
     key = storage.build_key(listing.id, payload.name)
@@ -798,11 +851,27 @@ async def document_upload_complete(listing_id: uuid.UUID, payload: S.DocumentCom
     doc = next((d for d in listing.documents if d.id == payload.document_id), None)
     if doc is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found.")
+    if doc.kind == E.DocumentKind.PPM:
+        from .services import ppm
+        # Uploaded PPMs must be explicitly reviewed against the saved offering.
+        # Previously completed READY uploads keep their historical approval.
+        if doc.status == E.DocumentStatus.READY:
+            return S.DocumentOut(**L.document_out(doc))
+        await ppm._lock(db, listing)
+        doc = next(d for d in listing.documents if d.id == payload.document_id)
     head = storage.head_object(doc.s3_key)
     if head is None:
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "not_uploaded", "message": "The file has not arrived in storage yet."})
     doc.size_bytes = head.get("size_bytes") or doc.size_bytes
     doc.content_type = head.get("content_type") or doc.content_type
+    if doc.kind == E.DocumentKind.PPM:
+        if str(doc.content_type or "").split(";")[0].strip().lower() != "application/pdf":
+            raise HTTPException(422, "A PPM must be a PDF document.")
+        from .services import ppm
+        await ppm.adopt_upload(db, listing, doc, admin.id)
+        doc.uploaded_at = _now()
+        await db.flush()
+        return S.DocumentOut(**L.document_out(doc))
     doc.status = E.DocumentStatus.READY
     doc.uploaded_at = _now()
     for other in listing.documents:
