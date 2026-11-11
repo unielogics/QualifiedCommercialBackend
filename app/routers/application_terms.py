@@ -83,10 +83,11 @@ async def get_client_terms(
     profile_id: UUID,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
+    include_current_plan: bool = True,
 ) -> ClientTermsRead:
     _require_terms_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
-    return await application_terms.read_terms(db, profile)
+    return await application_terms.read_terms(db, profile, include_current_plan=include_current_plan)
 
 
 @router.put("/{profile_id}/client-terms", response_model=ClientTermsRead)

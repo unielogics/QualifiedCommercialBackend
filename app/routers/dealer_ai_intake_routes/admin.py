@@ -478,11 +478,12 @@ async def get_dealer_ai_lead(
     intake_id: UUID,
     user: core.CurrentUser,
     db: AsyncSession = Depends(core.get_db),
+    include_derived: bool = True,
 ) -> core.DealerIntakeResponse:
     core._require_super_admin(user)
     intake = await core._load_admin_dealer_lead(db, intake_id)
     await core._mark_lead_seen(db, user, intake.id)
-    return await core._response(db, intake, token=None, include_management=True, admin_thread=True, thread_user=user)
+    return await core._response(db, intake, token=None, include_management=True, include_derived=include_derived, admin_thread=True, thread_user=user)
 
 @core.admin_router.post("/{intake_id}/request-deletion", response_model=core.DealerIntakeResponse)
 async def admin_request_lead_deletion(

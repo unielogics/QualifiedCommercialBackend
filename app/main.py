@@ -152,7 +152,7 @@ app.add_middleware(
     # Let browser fetch() read the download filename the server sets (dealer-named
     # package.zip / intelligence.pdf); without this the header is hidden cross-origin.
     # Retry-After rides along so a browser client can pace its own retry.
-    expose_headers=["Content-Disposition", "Retry-After"],
+    expose_headers=["Content-Disposition", "Retry-After", "Server-Timing"],
 )
 
 

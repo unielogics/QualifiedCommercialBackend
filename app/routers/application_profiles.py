@@ -1021,13 +1021,17 @@ async def get_application_underwriting(
     profile_id: UUID,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
+    include_financing: bool = True,
 ) -> ApplicationUnderwritingRead:
     _require_underwriting_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
     fee_cap_review = await funding_programs.qc_fee_cap_review_for_profile(db, profile)
     from app.services.financing_projection import read as read_financing
 
-    return _underwriting_read(profile, fee_cap_review=fee_cap_review, financing_projection=await read_financing(db, profile))
+    # The file cockpit already owns the live financial query. Its lifecycle
+    # header can opt out of rebuilding the same full cockpit in this request.
+    financing = await read_financing(db, profile) if include_financing else None
+    return _underwriting_read(profile, fee_cap_review=fee_cap_review, financing_projection=financing)
 
 
 @router.get("/{profile_id}/marketplace-publication", response_model=MarketplacePublicationRead)
