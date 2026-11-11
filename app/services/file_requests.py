@@ -267,6 +267,11 @@ async def create_batch(
             requirement_source={"kind": source_kind, "file_request_id": str(request_id), "collection_config": config},
         )
         db.add(requested)
+        # The requirement maps this FK as a scalar, without an ORM relationship
+        # to the destination. Persist its parent before adding the child so a
+        # unit-of-work flush cannot insert requirement states first. This is a
+        # flush only: the caller still commits the complete batch atomically.
+        await db.flush()
         state = ApplicationRequirementState(
             id=uuid5(namespace, f"requirement:{index}"), profile_id=profile.id,
             requirement_key=key, label=label, category="Other", required_level="required",
