@@ -206,7 +206,9 @@ def test_current_use_allocations_are_reconciled_without_rewriting_frozen_term_ma
     assert report["current_allocation_reconciliation"]["variance"] == -7500
     assert report["current_allocation_reconciliation"]["status"] == "overallocated"
     assert report["current_allocation_issues"]
-    assert report["calculation"] == frozen and terms["deal_budget_calculation"]["status"] == "ready"
+    assert {key: report["calculation"][key] for key in frozen} == frozen
+    assert terms["deal_budget_calculation"] == frozen
+    assert "investor_scenarios" in report["calculation"] and "setup_readiness" in report["calculation"]
 
 
 def test_current_earnings_fee_coverage_is_separate_from_frozen_quote_costs_and_roi():

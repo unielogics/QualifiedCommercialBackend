@@ -2675,6 +2675,8 @@ async def put_financial_plan(
     financial_plan_budget.validate_write(deal_budget.snapshot(profile), payload.expected_deal_budget_revision,
         financial_plan_budget.loan_from_plan(payload.model_dump()))
     record = payload.model_dump(exclude={"expected_updated_at", "expected_deal_budget_revision"})
+    from app.services.loan_dates import preserve_plan_dates
+    record = preserve_plan_dates(record, profile.financial_plan, payload.model_fields_set)
     record["updated_at"] = datetime.now(UTC).isoformat()
     record["updated_by"] = str(user.id)
     profile.financial_plan = record

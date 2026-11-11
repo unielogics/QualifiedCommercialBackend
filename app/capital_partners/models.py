@@ -21,6 +21,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -284,6 +285,28 @@ class CpListingDocument(TimestampMixin, Base):
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     listing: Mapped[CpListing] = relationship("CpListing", back_populates="documents")
+
+
+class CpListingDocumentGrant(TimestampMixin, Base):
+    """A staff-approved, revocable snapshot of originals for one investor."""
+
+    __tablename__ = "cp_listing_document_grants"
+    __table_args__ = (
+        UniqueConstraint("listing_id", "member_id", name="uq_cp_document_grant_listing_member"),
+        CheckConstraint("status IN ('active', 'revoked')", name="ck_cp_document_grant_status"),
+    )
+    id: Mapped[uuid.UUID] = _pk()
+    listing_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("cp_listings.id", ondelete="CASCADE"), nullable=False, index=True)
+    member_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("cp_members.id", ondelete="CASCADE"), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    file_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    file_stamps: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    granted_by_id: Mapped[uuid.UUID | None] = _user_fk()
+    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    revoked_by_id: Mapped[uuid.UUID | None] = _user_fk()
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revocation_reason: Mapped[str | None] = mapped_column(Text)
 
 
 class CpListingEvent(Base):

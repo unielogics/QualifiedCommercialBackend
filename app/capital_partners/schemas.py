@@ -154,11 +154,42 @@ class DocumentOut(_Out):
     size_bytes: int | None
     version: int
     status: str
+    source: Literal["generated_package", "uploaded"] = "uploaded"
 
 
 class DocumentUrlOut(BaseModel):
     url: str
     expires_in_seconds: int
+
+
+class DocumentGrantIn(BaseModel):
+    status: Literal["active", "revoked"]
+    reason: str = Field(min_length=3, max_length=2000)
+    engagement_confirmed: bool = False
+    file_ids: list[UUID] | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def confirm_engagement(self):
+        if self.status == "active" and not self.engagement_confirmed:
+            raise ValueError("Confirm engagement before approving access to sensitive originals.")
+        self.reason = self.reason.strip()
+        if len(self.reason) < 3:
+            raise ValueError("Record a reason for this access decision.")
+        return self
+
+
+class DocumentGrantOut(_Out):
+    id: UUID
+    listing_id: UUID
+    member_id: UUID
+    status: Literal["active", "revoked"]
+    file_count: int
+    granted_by_id: UUID | None
+    granted_at: datetime
+    reason: str
+    revoked_by_id: UUID | None
+    revoked_at: datetime | None
+    revocation_reason: str | None
 
 
 class ListingCard(BaseModel):
@@ -193,6 +224,9 @@ class ListingCard(BaseModel):
     funded_at: datetime | None
     repaid_at: datetime | None
     maturity_date: date | None
+    expected_funding_date: date | None = None
+    maturity_date_mode: Literal["automatic", "manual"] = "automatic"
+    date_note: str | None = None
     published_at: datetime | None
     products: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -620,6 +654,8 @@ class ListingIn(BaseModel):
     title_status: str | None = Field(default=None, max_length=120)
     servicer_label: str | None = Field(default=None, max_length=120)
     maturity_date: date | None = None
+    expected_funding_date: date | None = None
+    maturity_date_mode: Literal["automatic", "manual"] | None = None
     closes_at: datetime | None = None
     source_snapshot: dict[str, Any] | None = None
     products: list[ListingProductIn] | None = Field(default=None, max_length=9)

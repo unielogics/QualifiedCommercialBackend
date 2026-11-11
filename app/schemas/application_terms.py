@@ -54,6 +54,9 @@ class ClientTermsWrite(BaseModel):
     repayment_config: LoanRepaymentConfig | None = None
     expiration_days: int = Field(ge=1, le=180)
     closing_estimate_days: int = Field(ge=0, le=180)
+    expected_funding_date: date | None = None
+    maturity_date: date | None = None
+    maturity_date_mode: Literal["automatic", "manual"] | None = None
     co_brand_enabled: bool = True
     sponsor_name: str | None = Field(default="UrChoice", max_length=160)
     client_note: str | None = Field(default=None, max_length=1200)
@@ -96,6 +99,8 @@ class ClientTermsWrite(BaseModel):
 
     @model_validator(mode="after")
     def validate_custom_schedule(self) -> ClientTermsWrite:
+        from app.services.loan_dates import loan_dates
+        loan_dates(self.expected_funding_date, self.term_months, self.maturity_date, self.maturity_date_mode)
         if self.deal_budget is not None:
             if not self.idempotency_key:
                 raise ValueError("An atomic budget and terms save requires an idempotency key")
@@ -189,6 +194,10 @@ class ClientTermsRead(BaseModel):
     repayment_config: dict | None = None
     expiration_days: int | None = None
     closing_estimate_days: int | None = None
+    expected_funding_date: date | None = None
+    maturity_date: date | None = None
+    maturity_date_mode: Literal["automatic", "manual"] = "automatic"
+    date_note: str | None = None
     co_brand_enabled: bool = True
     sponsor_name: str | None = "UrChoice"
     client_note: str | None = None

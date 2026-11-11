@@ -70,12 +70,15 @@ def presign_get(
     disposition: str = "inline",
     content_type: str | None = None,
     download_filename: str | None = None,
+    version_id: str | None = None,
 ) -> str | None:
     """Presigned GET, or None when S3 is unconfigured or presigning fails."""
     cfg = get_settings()
     if not cfg.s3_bucket:
         return None
     params: dict = {"Bucket": cfg.s3_bucket, "Key": key}
+    if version_id:
+        params["VersionId"] = version_id
     if disposition == "inline" and _sanitize_content_type(content_type) not in _INLINE_SAFE_CONTENT_TYPES:
         disposition = "attachment"
         params["ResponseContentType"] = "application/octet-stream"

@@ -24,6 +24,7 @@ from app.db import get_db
 from app.enums import Role
 from app.models.user import User
 from app.services import clerk as clerk_service
+from app.services.payment_authorization import client_ip
 from app.services.user_access import console_keys
 
 from . import enums as E
@@ -31,9 +32,11 @@ from . import schemas as S
 from .deps import CpAdmin
 from .models import (
     CpAccessRequest,
+    CpDocumentAccess,
     CpFiling,
     CpListing,
     CpListingDocument,
+    CpListingDocumentGrant,
     CpListingEvent,
     CpMember,
     CpParticipation,
@@ -418,6 +421,22 @@ def _apply(listing: CpListing, payload: S.ListingIn) -> None:
                 value = products
             setattr(listing, key, value)
 
+    if listing.profile_id is None:
+        from app.services.loan_dates import as_date, loan_dates
+        snapshot = listing.source_snapshot if isinstance(listing.source_snapshot, dict) else {}
+        previous_dates = snapshot.get("loan_dates") if isinstance(snapshot.get("loan_dates"), dict) else {}
+        funding = data.get("expected_funding_date") if "expected_funding_date" in data else previous_dates.get("expected_funding_date")
+        mode = data.get("maturity_date_mode") if "maturity_date_mode" in data else previous_dates.get("maturity_date_mode")
+        if "maturity_date" in data and "maturity_date_mode" not in data and (not previous_dates.get("maturity_date_mode") or str(data["maturity_date"]) != str(previous_dates.get("maturity_date"))):
+            mode = "manual" if data["maturity_date"] else "automatic"
+        try:
+            dates = loan_dates(funding, listing.term_months, listing.maturity_date, mode)
+        except (ValueError, OverflowError) as exc:
+            field = "maturity_date" if "maturity" in str(exc).lower() else "expected_funding_date"
+            raise HTTPException(422, detail=[{"loc": ["body", field], "msg": str(exc), "type": "value_error"}]) from exc
+        listing.source_snapshot = {**snapshot, "loan_dates": dates}
+        listing.maturity_date = as_date(dates["maturity_date"])
+
 
 async def _apply_file_financing(db: AsyncSession, listing: CpListing, *, prior: Any = None, payload: S.ListingIn | None = None) -> None:
     """Staff saves inherit the file's loan rather than creating another copy."""
@@ -459,15 +478,19 @@ async def _guard_financing_change(db: AsyncSession, listing: CpListing, fresh: d
 
 async def _guard_committed_listing_edit(db: AsyncSession, listing: CpListing, payload: S.ListingIn) -> None:
     protected = {"loan_id", "profile_id", "loan_amount", "offered_amount", "minimum_investment", "note_rate_pct", "term_months", "products",
-        "collateral_type", "lien_position", "ltv_pct", "ltv_kind", "payment_frequency", "maturity_date", "personal_guarantee"}
+        "collateral_type", "lien_position", "ltv_pct", "ltv_kind", "payment_frequency", "maturity_date", "personal_guarantee", "expected_funding_date", "maturity_date_mode"}
     values = payload.model_dump(exclude_unset=True)
+    from app.services.loan_dates import listing_dates
+    existing_dates = listing_dates(listing)
     def comparable(key, value):
+        if key in {"expected_funding_date", "maturity_date"}:
+            return str(value) if value is not None else None
         if key == "products":
             return SYNC.economic_products(value)
         if key in {"loan_amount", "offered_amount", "minimum_investment", "note_rate_pct", "term_months", "ltv_pct"}:
             return SYNC.economic_number(value)
         return SYNC.normalized_financing(value)
-    if not any(comparable(key, getattr(listing, key, None)) != comparable(key, values[key]) for key in protected & values.keys()):
+    if not any(comparable(key, existing_dates.get(key) if key in {"expected_funding_date", "maturity_date_mode"} else getattr(listing, key, None)) != comparable(key, values[key]) for key in protected & values.keys()):
         return
     committed = (await L.committed_amounts(db, [listing.id])).get(listing.id, Decimal(0))
     if listing.status in {E.ListingStatus.FUNDED, E.ListingStatus.REPAID, E.ListingStatus.WORKOUT} or committed > 0:
@@ -601,6 +624,9 @@ async def publish_listing_package(listing_id: uuid.UUID, admin: CpAdmin, db: Db)
     stamped with what was pushed so unpublished changes can be named later.
     Members see the documents once the listing itself is published."""
     listing = await _load_admin_listing(db, listing_id)
+    # Serialize retries/concurrent package updates and reload the attachment
+    # receipt and rows after acquiring the lock, before choosing versions.
+    await db.refresh(listing, attribute_names=["source_snapshot", "documents", "status"], with_for_update=True)
     if listing.profile_id is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "This listing was not cut from a file, so there is no package to push.")
     if listing.status in {E.ListingStatus.REPAID, E.ListingStatus.WITHDRAWN}:
@@ -638,27 +664,9 @@ async def publish_listing_package(listing_id: uuid.UUID, admin: CpAdmin, db: Db)
     if not storage.configured():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Document storage is not available right now.")
     now = datetime.now(UTC)
-    pushed: list[dict[str, Any]] = []
-    for artifact, kind, name in artifacts:
-        if not artifact.s3_key:
-            raise HTTPException(status.HTTP_409_CONFLICT, f"The {name.lower()} has no stored PDF; refresh Package Readiness first.")
-        previous = [d for d in listing.documents if d.kind == kind and d.status != E.DocumentStatus.SUPERSEDED]
-        version = max((d.version for d in listing.documents if d.kind == kind), default=0) + 1
-        key = storage.build_key(listing.id, f"{kind}-v{version}.pdf")
-        if not storage.copy_object(artifact.s3_key, key, content_type="application/pdf"):
-            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "The package PDF could not be copied onto the listing.")
-        head = storage.head_object(key) or {}
-        for doc in previous:
-            doc.status = E.DocumentStatus.SUPERSEDED
-            doc.superseded_at = now
-        document = CpListingDocument(
-            listing_id=listing.id, kind=kind, name=f"{name} v{version}.pdf", s3_key=key, content_type="application/pdf",
-            size_bytes=int(head.get("ContentLength") or 0) or None, version=version, status=E.DocumentStatus.READY,
-            uploaded_by_id=admin.id, uploaded_at=now,
-        )
-        db.add(document)
-        await db.flush()
-        pushed.append({"kind": str(kind), "document_id": str(document.id), "artifact_id": str(artifact.id), "version": version})
+    from .services.package_documents import attach_generated_documents
+
+    pushed = await attach_generated_documents(db, listing, artifacts, actor_id=admin.id, now=now)
     if not any(kind == E.DocumentKind.INVESTOR_PRESENTATION for _artifact, kind, _name in artifacts):
         # A valid legacy two-document generation cannot leave a presentation
         # from another generation marked current beside its new PDFs.
@@ -702,6 +710,67 @@ async def withdraw_listing(listing_id: uuid.UUID, payload: S.WithdrawIn, admin: 
 # ---------------------------------------------------------------------------
 # Documents
 # ---------------------------------------------------------------------------
+
+
+@router.get("/listings/{listing_id}/file-documents")
+async def admin_file_documents(listing_id: uuid.UUID, admin: CpAdmin, db: Db) -> dict[str, Any]:
+    from .services import document_catalog
+
+    listing = await _load_admin_listing(db, listing_id)
+    return await document_catalog.catalog(db, listing, staff=True)
+
+
+@router.get("/listings/{listing_id}/document-grants", response_model=list[S.DocumentGrantOut])
+async def admin_document_grants(listing_id: uuid.UUID, admin: CpAdmin, db: Db) -> list[S.DocumentGrantOut]:
+    from .services.document_catalog import grant_out
+
+    await _load_admin_listing(db, listing_id)
+    grants = (await db.execute(select(CpListingDocumentGrant).where(CpListingDocumentGrant.listing_id == listing_id).order_by(CpListingDocumentGrant.granted_at.desc()))).scalars().all()
+    return [grant_out(grant) for grant in grants]
+
+
+@router.put("/listings/{listing_id}/document-grants/{member_id}", response_model=S.DocumentGrantOut)
+async def admin_set_document_grant(listing_id: uuid.UUID, member_id: uuid.UUID, payload: S.DocumentGrantIn, admin: CpAdmin, db: Db) -> S.DocumentGrantOut:
+    from .services import document_catalog
+
+    listing = await _load_admin_listing(db, listing_id)
+    grant = await document_catalog.set_grant(db, listing, member_id, payload, admin.id)
+    await db.commit()
+    return document_catalog.grant_out(grant)
+
+
+@router.post("/listings/{listing_id}/file-documents/{file_id}/url", response_model=S.DocumentUrlOut)
+async def admin_original_url(listing_id: uuid.UUID, file_id: uuid.UUID, request: Request, admin: CpAdmin, db: Db, download: bool = False) -> S.DocumentUrlOut:
+    from .services import document_catalog
+
+    listing = await _load_admin_listing(db, listing_id)
+    file = await document_catalog.authorized_original(db, listing, file_id, staff=True)
+    url = storage.presign_get(file.s3_key, content_type=file.content_type, download_filename=file.file_name,
+        disposition="attachment" if download else "inline", version_id=file.s3_version_id)
+    if url is None:
+        raise HTTPException(503, "Document storage is not available right now.")
+    await L.log_event(db, listing.id, "source_document.accessed", actor_user_id=admin.id,
+        detail={"file_id": str(file.id), "member_id": None, "staff_preview": True, "download": download,
+            "ip_address": (client_ip(request) or "")[:64], "user_agent": (request.headers.get("user-agent") or "")[:400]})
+    return S.DocumentUrlOut(url=url, expires_in_seconds=storage.DOCUMENT_URL_TTL_SECONDS)
+
+
+@router.post("/listings/{listing_id}/documents/{document_id}/url", response_model=S.DocumentUrlOut)
+async def admin_document_url(listing_id: uuid.UUID, document_id: uuid.UUID, request: Request, admin: CpAdmin, db: Db, download: bool = False) -> S.DocumentUrlOut:
+    """Short-lived, audited access to an attached READY listing document."""
+    listing = await _load_admin_listing(db, listing_id)
+    document = next((row for row in L.ready_documents(listing) if row.id == document_id), None)
+    if document is None:
+        raise HTTPException(404, "Document not found.")
+    url = storage.presign_get(document.s3_key, content_type=document.content_type, download_filename=document.name,
+        disposition="attachment" if download else "inline")
+    if url is None:
+        raise HTTPException(503, "Document storage is not available right now.")
+    db.add(CpDocumentAccess(member_id=None, actor_user_id=admin.id, listing_id=listing.id, document_id=document.id,
+        accessed_at=L.now_utc(), ip_address=(client_ip(request) or "")[:64] or None,
+        user_agent=(request.headers.get("user-agent") or "")[:400] or None))
+    await db.flush()
+    return S.DocumentUrlOut(url=url, expires_in_seconds=storage.DOCUMENT_URL_TTL_SECONDS)
 
 
 @router.post("/listings/{listing_id}/documents/upload-init", response_model=S.DocumentInitOut)

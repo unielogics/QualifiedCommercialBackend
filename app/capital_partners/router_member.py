@@ -251,6 +251,30 @@ async def document_url(ref: str, document_id: uuid.UUID, ctx: ClearedMember, req
     return S.DocumentUrlOut(url=url, expires_in_seconds=storage.DOCUMENT_URL_TTL_SECONDS)
 
 
+@router.get("/listings/{ref}/file-documents")
+async def file_documents(ref: str, ctx: ClearedMember, db: Db) -> dict[str, Any]:
+    from .services import document_catalog
+
+    listing = await _listing_or_404(db, ref)
+    return await document_catalog.catalog(db, listing, member_id=ctx.member.id if ctx.member else None)
+
+
+@router.post("/listings/{ref}/file-documents/{file_id}/url", response_model=S.DocumentUrlOut)
+async def original_document_url(ref: str, file_id: uuid.UUID, ctx: ClearedMember, request: Request, db: Db, download: bool = False) -> S.DocumentUrlOut:
+    from .services import document_catalog
+
+    listing = await _listing_or_404(db, ref)
+    file = await document_catalog.authorized_original(db, listing, file_id, member_id=ctx.member.id if ctx.member else None)
+    url = storage.presign_get(file.s3_key, content_type=file.content_type, download_filename=file.file_name,
+        disposition="attachment" if download else "inline", version_id=file.s3_version_id)
+    if url is None:
+        raise HTTPException(503, "Document storage is not available right now.")
+    await L.log_event(db, listing.id, "source_document.accessed", actor_user_id=ctx.user.id,
+        detail={"file_id": str(file.id), "member_id": str(ctx.member.id), "download": download,
+            "ip_address": (client_ip(request) or "")[:64], "user_agent": (request.headers.get("user-agent") or "")[:400]})
+    return S.DocumentUrlOut(url=url, expires_in_seconds=storage.DOCUMENT_URL_TTL_SECONDS)
+
+
 @router.post("/listings/{ref}/subscriptions", response_model=S.SubscriptionOut, status_code=status.HTTP_201_CREATED)
 async def subscribe(ref: str, payload: S.SubscriptionIn, ctx: SubscribingMember, request: Request, db: Db) -> S.SubscriptionOut:
     listing = await _listing_or_404(db, ref)

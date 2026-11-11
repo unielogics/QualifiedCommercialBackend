@@ -40,7 +40,7 @@ def _sqlite_json_type(_type, _compiler, **_kwargs):
 
 MODELS = [
     User, UserProductAccess, Activity, cp.CpIssuerSettings, cp.CpAccessRequest, cp.CpMember, cp.CpMemberEntity, cp.CpQuestionnaire,
-    cp.CpListing, cp.CpListingDocument, cp.CpListingEvent, cp.CpSubscription, cp.CpParticipation, cp.CpTransfer,
+    cp.CpListing, cp.CpListingDocument, cp.CpListingDocumentGrant, cp.CpListingEvent, cp.CpSubscription, cp.CpParticipation, cp.CpTransfer,
     cp.CpFiling, cp.CpDocumentAccess,
 ]
 

@@ -169,6 +169,7 @@ def _io_months_of(raw: dict[str, Any]) -> int:
 
 def normalize_plan(raw: Any) -> dict[str, Any]:
     raw = raw if isinstance(raw, dict) else {}
+    from app.services.loan_dates import plan_date_fields
     from app.services.loan_schedule import normalize_repayment_config
 
     repayment_config = normalize_repayment_config(raw.get("new_loan_repayment_config"), raw.get("new_loan_term_months"),
@@ -187,6 +188,7 @@ def normalize_plan(raw: Any) -> dict[str, Any]:
         if _num(raw.get("new_loan_term_months"))
         else None,
         "new_loan_interest_only": bool(raw.get("new_loan_interest_only")),
+        **plan_date_fields(raw),
         # Structure: simple interest under three years, amortizing from three
         # years, or interest-only; and how many of the term's months are
         # interest-only before principal starts.
@@ -436,6 +438,7 @@ def evaluate_plan(
     loan_terms: dict[str, Any] | None = None
     schedule: dict[str, Any] | None = None
     if plan.get("new_loan_amount") and plan.get("new_loan_rate_pct") is not None and (plan.get("new_loan_term_months") or interest_only):
+        from app.services.loan_dates import dates_from_plan
         from app.services.loan_schedule import build_schedule, describe
 
         schedule = build_schedule(
@@ -449,6 +452,7 @@ def evaluate_plan(
         )
         loan_terms = {
             "amount": float(plan["new_loan_amount"]),
+            **dates_from_plan(plan),
             "rate_pct": float(plan["new_loan_rate_pct"]),
             "term_months": int(plan["new_loan_term_months"])
             if plan.get("new_loan_term_months")
