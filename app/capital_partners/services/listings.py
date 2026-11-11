@@ -18,6 +18,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.services.loan_dates import listing_dates
+
 from .. import enums as E
 from ..models import (
     CpListing,
@@ -136,7 +138,7 @@ def card(listing: CpListing, committed: Decimal, *, now: datetime | None = None)
         "days_left": days_left(listing, now),
         "funded_at": listing.funded_at,
         "repaid_at": listing.repaid_at,
-        "maturity_date": listing.maturity_date,
+        **listing_dates(listing),
         "published_at": listing.published_at,
     }
 
@@ -295,6 +297,10 @@ def partner_financials(listing: CpListing) -> dict[str, Any] | None:
     earnings = partner_operating_earnings(financials.get("operating_earnings"))
     if earnings is not None:
         out["operating_earnings"] = earnings
+    if "document_summaries" in financials:
+        from .document_catalog import safe_document_summaries
+
+        out["document_summaries"] = safe_document_summaries(financials["document_summaries"])
     plan = financials.get("plan") if isinstance(financials.get("plan"), dict) else {}
     if plan.get("active"):
         out["plan"] = {
@@ -396,6 +402,8 @@ def partner_collateral(value: Any, *, recorded: bool) -> dict[str, Any]:
 
 
 def document_out(doc: CpListingDocument) -> dict[str, Any]:
+    from .package_documents import document_source
+
     return {
         "id": doc.id,
         "kind": doc.kind,
@@ -405,6 +413,7 @@ def document_out(doc: CpListingDocument) -> dict[str, Any]:
         "size_bytes": doc.size_bytes,
         "version": doc.version,
         "status": doc.status,
+        "source": document_source(doc.kind),
     }
 
 

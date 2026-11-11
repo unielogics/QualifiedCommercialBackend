@@ -50,6 +50,7 @@ from app.services.bucket_evidence import (
 )
 from app.services.capital_readiness import classify_dscr
 from app.services.debt_terms import normalize_terms
+from app.services.loan_dates import loan_dates
 from app.services.loan_progress import loan_progress_fields
 from app.services.payee_classification import (
     CARD_KINDS,
@@ -2605,6 +2606,7 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
     if proposed and proposed.get("amount") and not use_working:
         base = {
             "source": "term_sheet",
+            **{key: proposed.get(key) for key in ("expected_funding_date", "maturity_date", "maturity_date_mode", "date_note", "dates_recorded")},
             "label": proposed.get("label"),
             "amount": proposed.get("amount"),
             "rate_pct": proposed.get("rate_pct"),
@@ -2624,6 +2626,7 @@ def proposed_terms_block(cockpit: dict[str, Any]) -> dict[str, Any] | None:
         if loan and loan.get("amount"):
             base = {
                 "source": "plan",
+                **{key: loan.get(key) for key in ("expected_funding_date", "maturity_date", "maturity_date_mode", "date_note", "dates_recorded")},
                 "label": "The desk's plan",
                 "amount": loan.get("amount"),
                 "rate_pct": loan.get("rate_pct"),
@@ -2941,6 +2944,7 @@ async def recorded_terms_for_profile(
         return None, None
     proposed = {
         "source": "term_sheet",
+        **{key: recorded.get(key) for key in ("expected_funding_date", "maturity_date", "maturity_date_mode", "date_note", "dates_recorded")},
         "program_key": recorded.get("program_key"),
         "program_name": recorded.get("program_name"),
         "recorded_terms_ref": {key: recorded.get(key) for key in ("kind", "id", "version", "label")},
@@ -2977,6 +2981,8 @@ def term_sheet_terms(sheet: ProductionTermSheet | None) -> dict[str, Any] | None
     return {
         "source": "term_sheet",
         "label": f"Term sheet v{sheet.version}: {sheet.funding_party_name}",
+        **loan_dates(sheet.expected_funding_date, sheet.term_months,
+            sheet.maturity_date, extra.get("maturity_date_mode")),
         "proposal_use_of_funds": getattr(sheet, "use_of_funds", None),
         "proposal_use_of_funds_amount": advanced["payment_basis_amount"] if advanced else sheet.approved_amount,
         "collateral_snapshot": extra.get("collateral_snapshot") or {},

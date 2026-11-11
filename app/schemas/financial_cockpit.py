@@ -168,6 +168,9 @@ class FinancialPlanWrite(BaseModel):
     new_loan_amount: float | None = Field(default=None, ge=0)
     new_loan_rate_pct: float | None = Field(default=None, ge=0, le=100)
     new_loan_term_months: int | None = Field(default=None, ge=1, le=600)
+    new_loan_expected_funding_date: date | None = None
+    new_loan_maturity_date: date | None = None
+    new_loan_maturity_mode: Literal["automatic", "manual"] | None = None
     new_loan_interest_only: bool = False
     #: amortizing | simple_interest | interest_only; defaults by term (simple
     #: interest under three years, amortizing from three years).
@@ -185,6 +188,9 @@ class FinancialPlanWrite(BaseModel):
 
     @model_validator(mode="after")
     def _repayment_schedule(self):
+        from app.services.loan_dates import loan_dates
+        loan_dates(self.new_loan_expected_funding_date, self.new_loan_term_months,
+                   self.new_loan_maturity_date, self.new_loan_maturity_mode)
         if self.new_loan_repayment_config is not None and (not self.new_loan_amount or self.new_loan_rate_pct is None):
             raise ValueError("Flexible repayment requires the new loan amount, rate and maturity")
         if self.new_loan_repayment_config is not None:

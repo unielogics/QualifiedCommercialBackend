@@ -85,6 +85,15 @@ def facts_for_draft(profile, draft):
         facts["funding"] = f"Other funding required: {_money(calculation['other_funding_required'])}; this additional capital is unconfirmed."
     if calculation.get("investor_net_roi_pct") is not None:
         facts["return"] = f"Illustrative investor return after the recorded charges: {float(calculation['investor_net_roi_pct']):.2f}% over the full term, before taxes, losses and unrecorded costs."
+    early = (calculation.get("investor_scenarios") or {}).get("six_month_payoff") or {}
+    if early.get("net_roi_pct") is not None:
+        comparison = f"Illustrative payoff at {early.get('horizon_months')} months: net profit {_money(early['net_income'])} / {float(early['net_roi_pct']):.2f}% cumulative net ROI; principal returned {_money(early.get('principal_returned'))} is not profit. Assumes full collection and the explicitly recorded payoff terms."
+    elif early:
+        comparison = "Six-month payoff net return is unconfirmed until its interest, charges and reserve treatment are reviewed; no future interest or fee refund is assumed."
+    else:
+        comparison = ""
+    if comparison:
+        facts["return"] = " ".join(value for value in (facts.get("return"), comparison) if value)
     if calculation.get("status") != "ready":
         facts["costs"] = "Closing charges, reserves and investor costs require review; a net return is not established where inputs are unknown."
         missing.extend(str(value) for value in calculation.get("issues") or [] if value)

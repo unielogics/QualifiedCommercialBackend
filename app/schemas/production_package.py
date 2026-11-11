@@ -322,6 +322,7 @@ class ProductionTermSheetBody(BaseModel):
     debt_service_treatment: ProductionDebtServiceTreatment | None = None
     retained_annual_debt_service: float | None = Field(default=None, ge=0)
     expected_funding_date: date | None = None
+    maturity_date_mode: Literal["automatic", "manual"] | None = None
     activation_date: date | None = None
     commencement_date: date | None = None
     maturity_date: date | None = None
@@ -365,6 +366,7 @@ class ProductionTermSheetBody(BaseModel):
 
 
 class ProductionTermSheetRead(BaseModel):
+    date_note: str | None = None
     id: UUID
     version: int
     status: str
@@ -438,6 +440,7 @@ class ProductionTermSheetRead(BaseModel):
     dscr_explanation: str | None = None
     dscr_source: str | None = None
     expected_funding_date: date | None = None
+    maturity_date_mode: Literal["automatic", "manual"] | None = None
     activation_date: date | None = None
     commencement_date: date | None = None
     maturity_date: date | None = None

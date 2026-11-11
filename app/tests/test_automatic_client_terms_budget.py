@@ -221,7 +221,9 @@ def test_recorded_net_target_uses_reconciliation_and_explicit_proposal_scope_are
     profile = type("Profile", (), {"id": uuid4(), "deal_budget": budget,
         "use_of_funds": [{"category": "working_capital", "amount": 100000}]})()
     report = deal_budget.reporting(profile, terms)
-    assert report["calculation"] == frozen
+    assert {key: report["calculation"][key] for key in frozen} == frozen
+    assert terms["deal_budget_calculation"] == frozen
+    assert "investor_scenarios" in report["calculation"]
     assert report["current_allocation_reconciliation"]["scope"] == "requested_net_budget"
     assert report["current_allocation_issues"] == []
     # A partial draw / independent dealer allocation keeps its exact scope;

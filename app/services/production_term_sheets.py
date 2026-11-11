@@ -4,7 +4,6 @@ drafted. Append-only versions; one `current` row per profile."""
 
 from __future__ import annotations
 
-from calendar import monthrange
 from copy import deepcopy
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -23,6 +22,8 @@ from app.models.user import User
 from app.services import application_profiles as profiles
 from app.services import production_arrangement as pa
 from app.services import production_term_structure as term_structure
+from app.services.loan_dates import add_months as loan_add_months
+from app.services.loan_dates import firm_today, loan_dates, preserve_plan_dates
 from app.services.payment_authorization import client_ip
 
 TERM_ROLES: frozenset[Role] = frozenset({Role.SUPER_ADMIN, Role.LOAN_EXEC})
@@ -38,8 +39,7 @@ def _now() -> datetime:
 
 
 def add_months(d: date, months: int) -> date:
-    y, m = d.year + (d.month - 1 + months) // 12, (d.month - 1 + months) % 12 + 1
-    return date(y, m, min(d.day, monthrange(y, m)[1]))
+    return loan_add_months(d, months)
 
 
 def require_term_role(user: User) -> None:
@@ -74,13 +74,16 @@ def sheet_terms(sheet: ProductionTermSheet) -> dict[str, Any]:
     }
     # Promote the versioned JSON structure for downstream callers while still
     # returning ``extra`` intact for old integrations.
-    raw.update(term_structure.public_values(raw))
+    raw.update(sheet_structure(sheet))
     return pa.jsonable(raw)
 
 
 def sheet_structure(sheet: ProductionTermSheet) -> dict[str, Any]:
     """Typed repayment/rate fields for API reads, PDFs, and offer summaries."""
-    return term_structure.public_values({f: getattr(sheet, f, None) for f in TERM_FIELDS})
+    raw = {f: getattr(sheet, f, None) for f in TERM_FIELDS}
+    return {**term_structure.public_values(raw), **loan_dates(
+        getattr(sheet, "expected_funding_date", None), sheet.term_months, getattr(sheet, "maturity_date", None),
+        (getattr(sheet, "extra", None) or {}).get("maturity_date_mode"))}
 
 
 async def defaults(db: AsyncSession, profile: ApplicationProfile, parent: ProductionPackage | None) -> dict[str, Any]:
@@ -161,14 +164,20 @@ async def defaults(db: AsyncSession, profile: ApplicationProfile, parent: Produc
     dealer = await db.get(DealerBusiness, profile.dealer_id) if profile.dealer_id else None
     if dealer is not None and dealer.use_of_proceeds:
         put("use_of_funds_note", " · ".join(str(u) for u in dealer.use_of_proceeds) + (f" — {dealer.use_of_proceeds_note}" if dealer.use_of_proceeds_note else ""), "dealer")
-    today = date.today()
-    funding = today
-    put("expected_funding_date", funding.isoformat(), "today")
+    from app.services.loan_dates import as_date, dates_from_plan
+    planned_dates = dates_from_plan(plan) if plan.get("new_loan_amount") else {}
+    if not planned_dates.get("dates_recorded"):
+        planned_dates = {}
+    funding = as_date(planned_dates.get("expected_funding_date")) or as_date(arrangement.get("funding_date")) or firm_today()
+    put("expected_funding_date", funding.isoformat(), "financial_plan" if planned_dates.get("expected_funding_date") else "today")
     put("activation_date", funding.isoformat(), "funding")
     first_next = (funding.replace(day=1) + timedelta(days=32)).replace(day=1)
     put("commencement_date", first_next.isoformat(), "funding")
     if out.get("term_months"):
-        put("maturity_date", add_months(funding, int(out["term_months"])).isoformat(), "funding")
+        proposed_dates = loan_dates(funding, int(out["term_months"]), planned_dates.get("maturity_date") or arrangement.get("maturity"), planned_dates.get("maturity_date_mode"))
+        put("maturity_date", proposed_dates["maturity_date"], "financial_plan" if planned_dates.get("expected_funding_date") else "funding")
+        out["maturity_date_mode"] = proposed_dates["maturity_date_mode"]
+        out["date_note"] = proposed_dates["date_note"]
     if out.get("repayment_config") is not None:
         calculated = term_structure.calculate(out)
         for key in ("repayment_config", "periodic_payment", "post_io_payment", "monthly_equivalent_payment", "monthly_program_coverage_amount", "monthly_program_coverage_basis", "balloon_amount", "schedule"):
@@ -332,6 +341,20 @@ async def record_sheet(
         if not body.get("funding_party_name"):
             body["funding_party_name"] = lender.name
     now = _now()
+    prior_extra = getattr(previous, "extra", None) or {}
+    funding = body.get("expected_funding_date") or getattr(previous, "expected_funding_date", None) or firm_today()
+    mode = body.get("maturity_date_mode") or (body.get("extra") or {}).get("maturity_date_mode") or prior_extra.get("maturity_date_mode")
+    maturity = body.get("maturity_date") if "maturity_date" in body else getattr(previous, "maturity_date", None)
+    if "maturity_date_mode" not in body and "maturity_date_mode" not in (body.get("extra") or {}) and "maturity_date" in body and str(maturity) != str(getattr(previous, "maturity_date", None)):
+        # Legacy callers already exposed a manually editable maturity field.
+        # A changed date must not be silently replaced by the prior auto mode.
+        mode = None
+    try:
+        date_values = loan_dates(funding, body.get("term_months"), maturity, mode)
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "term_sheet_invalid", "errors": [str(exc)]}) from exc
+    body.update(expected_funding_date=date_values["expected_funding_date"], maturity_date=date_values["maturity_date"])
+    body["extra"] = {**(body.get("extra") or {}), "maturity_date_mode": date_values["maturity_date_mode"], "date_note": date_values["date_note"]}
     try:
         structure = term_structure.calculate(body, entered_on=now.date())
     except ValueError as exc:
@@ -351,6 +374,7 @@ async def record_sheet(
             raise HTTPException(422, detail={"code": "term_sheet_invalid", "errors": [str(exc)]}) from exc
         expected_budget = frozen_budget["revision"]
         record = draft.model_dump(mode="json", exclude={"expected_updated_at", "expected_deal_budget_revision"})
+        record = preserve_plan_dates(record, profile.financial_plan, draft.model_fields_set)
         overrides = dict(record.get("overrides") or {})
         if structure.get("debt_service_treatment") != "refinance" and (overrides.get("debt_service_note") or "").startswith("Refinance per "):
             overrides.pop("debt_service_monthly", None)

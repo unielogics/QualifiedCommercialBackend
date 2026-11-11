@@ -1469,7 +1469,7 @@ def _term_sheet_read(sheet: ProductionTermSheet, names: dict[UUID, str]) -> Prod
     structure_fields = {
         key: structure.get(key)
         for key in (
-            "structure_version", "facility_kind", "facility_catalog_key", "funder_type",
+            "structure_version", "facility_kind", "facility_catalog_key", "funder_type", "maturity_date_mode", "date_note",
             "repayment_structure", "payment_frequency", "payments_per_year", "custom_payment_frequency", "rate_structure",
             "rate_index", "rate_index_rate_pct", "rate_margin_pct", "rate_floor_pct", "rate_cap_pct",
             "rate_as_of", "apr_pct", "custom_rate_description", "initial_draw_amount", "payment_basis_amount", "draw_period_months",

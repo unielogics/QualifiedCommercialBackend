@@ -10,6 +10,7 @@ from typing import Any
 
 from app.models.application_terms import ApplicationTermSheet
 from app.services.financing_budget_disclosure import BUDGET_CSS, frozen_budget, render_budget_html
+from app.services.loan_dates import as_date, client_terms_dates
 from app.services.loan_repayment_display import repayment_lines
 from app.services.loan_terms_visuals import (
     LOAN_VISUALS_CSS,
@@ -136,6 +137,7 @@ def render_terms_html(
     payment = float(row.periodic_payment)
     amount = float(row.amount)
     summary = _stored_schedule(row)
+    dates = client_terms_dates(row)
     budget = frozen_budget(getattr(row, "deal_budget_snapshot", None), getattr(row, "deal_budget_revision", None), {
         "amount": amount, "rate_pct": float(row.apr_pct), "term_months": row.term_months,
         "structure": getattr(row, "loan_structure", None), "interest_only_months": getattr(row, "interest_only_months", None) or 0,
@@ -247,6 +249,12 @@ def render_terms_html(
       <div><span class="label">Valid through</span><strong>{_date(row.expires_on)}</strong></div>
       <div><span class="label">Estimated closing</span><strong>{row.closing_estimate_days} business day{'s' if row.closing_estimate_days != 1 else ''} after approval</strong></div>
     </div>
+    <div class="validity">
+      <div><span class="label">Estimated funding</span><strong>{_date(as_date(dates['expected_funding_date']))}</strong></div>
+      <div><span class="label">Estimated maturity</span><strong>{_date(as_date(dates['maturity_date']))}</strong></div>
+      <div><span class="label">Maturity calculation</span><strong>{'Staff date override' if dates['maturity_date_mode'] == 'manual' else 'Funding date + loan term'}</strong></div>
+    </div>
+    <p class="method">{escape(dates['date_note'])}</p>
     <h2>Proposed financing</h2>
     <div class="terms-grid">
       <div class="term"><span class="label">Amount</span><strong>{_money(amount)}</strong></div>

@@ -50,7 +50,7 @@ class PackageDB:
 def fixture(*, presentation=True):
     intake = SimpleNamespace(id=uuid4())
     profile = SimpleNamespace(id=uuid4(), intake_id=intake.id)
-    documents = [SimpleNamespace(kind=kind, version=version, status=E.DocumentStatus.READY, superseded_at=None)
+    documents = [SimpleNamespace(id=uuid4(), s3_key=f"old/{kind}.pdf", kind=kind, version=version, status=E.DocumentStatus.READY, superseded_at=None)
                  for kind, version in ((E.DocumentKind.EXECUTIVE_SUMMARY, 3), (E.DocumentKind.UNDERWRITING_PACKAGE, 4),
                                       (E.DocumentKind.INVESTOR_PRESENTATION, 2), (E.DocumentKind.OTHER, 7))]
     listing = SimpleNamespace(id=uuid4(), profile_id=profile.id, status=E.ListingStatus.DRAFT,
@@ -76,7 +76,7 @@ async def test_marketplace_push_versions_the_complete_generation_and_preserves_o
          patch.object(routes.storage, "configured", return_value=True), \
          patch.object(routes.storage, "build_key", side_effect=lambda _listing, name: "listing/" + name), \
          patch.object(routes.storage, "copy_object", copy), \
-         patch.object(routes.storage, "head_object", return_value={"ContentLength": 1200}), \
+         patch.object(routes.storage, "head_object", return_value={"size_bytes": 1200, "content_type": "application/pdf"}), \
          patch.object(routes.P, "readiness_snapshot", AsyncMock(return_value={})), \
          patch.object(sync, "current_fingerprints", AsyncMock(return_value=(fingerprints, {}, {}))), \
          patch.object(sync, "current_package", AsyncMock(return_value=generation)), \

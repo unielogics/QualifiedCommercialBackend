@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.models.application_profile import ApplicationProfile
+from app.services.loan_dates import client_terms_dates, loan_dates
 
 DIFFERENCE_LABELS = {
     "amount": "amount",
@@ -26,6 +27,9 @@ DIFFERENCE_LABELS = {
     "repayment_config": "repayment schedule",
     "payments_per_year": "payment cadence",
     "structure": "structure",
+    "expected_funding_date": "expected funding date",
+    "maturity_date": "maturity date",
+    "maturity_date_mode": "maturity date calculation",
 }
 
 
@@ -66,6 +70,7 @@ def recorded_from_client_terms(row: Any) -> dict[str, Any] | None:
     repayment_config = deepcopy(getattr(row, "repayment_config", None))
     return {
         "kind": "client_terms",
+        **client_terms_dates(row),
         "id": str(row.id),
         "version": int(row.version),
         "label": f"Client terms v{row.version}: {row.program_name}",
@@ -114,6 +119,8 @@ def recorded_from_production_sheet(sheet: Any) -> dict[str, Any] | None:
         advanced = sheet_structure(sheet)
     return {
         "kind": "production_term_sheet",
+        **loan_dates(getattr(sheet, "expected_funding_date", None), term,
+                     getattr(sheet, "maturity_date", None), extra.get("maturity_date_mode")),
         "id": str(sheet.id),
         "version": int(sheet.version),
         "label": f"Term sheet v{sheet.version}: {sheet.funding_party_name}",
@@ -158,6 +165,9 @@ def adopt(
             "new_loan_amount": recorded.get("amount"),
             "new_loan_rate_pct": recorded.get("rate_pct"),
             "new_loan_term_months": recorded.get("term_months"),
+            "new_loan_expected_funding_date": recorded.get("expected_funding_date"),
+            "new_loan_maturity_date": recorded.get("maturity_date"),
+            "new_loan_maturity_mode": recorded.get("maturity_date_mode"),
             "new_loan_interest_only": bool(recorded.get("interest_only")),
             "new_loan_structure": recorded.get("structure")
             or ("interest_only" if recorded.get("interest_only") else "amortizing"),
@@ -210,6 +220,9 @@ def release(plan: dict[str, Any] | None, recorded_id: str | None = None) -> dict
         "new_loan_term_months",
         "new_loan_repayment_config",
         "new_loan_payments_per_year",
+        "new_loan_expected_funding_date",
+        "new_loan_maturity_date",
+        "new_loan_maturity_mode",
     ):
         out[key] = None
     out["new_payment_source"] = None
@@ -237,6 +250,9 @@ def terms_link(
             "amount": _num(loan.get("amount")),
             "rate_pct": _num(loan.get("rate_pct")),
             "term_months": loan.get("term_months"),
+            "expected_funding_date": loan.get("expected_funding_date"),
+            "maturity_date": loan.get("maturity_date"),
+            "maturity_date_mode": loan.get("maturity_date_mode"),
             "interest_only": bool(loan.get("interest_only")),
             "structure": loan.get("structure"),
             "payment_monthly": _num(payment),
@@ -256,9 +272,10 @@ def terms_link(
     else:
         differences = []
         advanced_keys = ("structure",) if loan.get("repayment_config") is not None or recorded.get("repayment_config") is not None else ()
-        for key in ("amount", "rate_pct", "term_months", "interest_only", "payment_monthly", "repayment_config", "payments_per_year", *advanced_keys):
+        date_keys = ("expected_funding_date", "maturity_date", "maturity_date_mode") if loan.get("expected_funding_date") or loan.get("maturity_date") else ()
+        for key in ("amount", "rate_pct", "term_months", "interest_only", "payment_monthly", "repayment_config", "payments_per_year", *date_keys, *advanced_keys):
             a, b = plan_loan.get(key), recorded.get(key)
-            if key == "repayment_config":
+            if key in {"repayment_config", "expected_funding_date", "maturity_date", "maturity_date_mode"}:
                 same = a == b
             elif key == "structure":
                 same = a == b

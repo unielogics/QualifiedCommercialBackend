@@ -119,6 +119,9 @@ def canonical_financing_fields(financials: dict[str, Any], existing: dict[str, A
         if row.get("financing_source") != "canonical_financing" and not (row.get("primary") and row.get("program_key") == key)]
     result = {"loan_amount": terms["amount"], "note_rate_pct": terms.get("rate_pct"),
         "term_months": terms.get("term_months"), "program_label": label, "products": [primary, *alternatives]}
+    if terms.get("dates_recorded") or not existing.get("maturity_date"):
+        from app.services.loan_dates import as_date
+        result["maturity_date"] = as_date(terms.get("maturity_date"))
     # Offered capital may be an intentional participation, separate from total
     # financing. A full-loan offering follows changes in that total.
     if existing.get("offered_amount") is None or existing.get("offered_amount") == existing.get("loan_amount"):
@@ -138,7 +141,7 @@ def canonical_financing_fields(financials: dict[str, Any], existing: dict[str, A
 
 
 def apply_canonical_financing(listing: CpListing, fresh: dict[str, Any]) -> None:
-    existing = {key: getattr(listing, key, None) for key in ("products", "loan_amount", "offered_amount", "minimum_investment")}
+    existing = {key: getattr(listing, key, None) for key in ("products", "loan_amount", "offered_amount", "minimum_investment", "maturity_date")}
     for key, value in canonical_financing_fields(fresh.get("financials") or {}, existing, is_new=getattr(listing, "id", None) is None).items():
         setattr(listing, key, value)
 
@@ -188,6 +191,8 @@ def financing_changed(listing: CpListing, fresh: dict[str, Any]) -> bool:
         return True
     old = ((getattr(listing, "source_snapshot", None) or {}).get("financials") or {}).get("proposed_terms") or {}
     new = (fresh.get("financials") or {}).get("proposed_terms") or {}
+    if new.get("dates_recorded") and any(old.get(key) != new.get(key) for key in ("expected_funding_date", "maturity_date", "maturity_date_mode")):
+        return True
     if normalized(old.get("collateral_snapshot")) != normalized(new.get("collateral_snapshot")):
         return True
     old_financials = (getattr(listing, "source_snapshot", None) or {}).get("financials") or {}

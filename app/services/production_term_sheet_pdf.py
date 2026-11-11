@@ -361,6 +361,7 @@ def render_term_sheet_html(
     {closing_preparation_html(version=sheet.version, prepared=_date(sheet.entered_at), expires=_date(structure.get("expires_on")) if structure.get("expires_on") else None, collateral_revision=extra.get("collateral_revision"), budget_revision=extra.get("deal_budget_revision"), collateral_snapshot=extra.get("collateral_snapshot"), budget=budget, conditions=_condition_lines(sheet.conditions))}
     <h2>Estimated timing</h2>
     <div class="schedule">{schedule}</div>
+    <p class="fine">Estimated dates may change with funding timing and final closing terms.</p>
     <div class="two">
       <section class="card"><h2>Approved use of funds</h2>{_use_of_funds_rows(sheet.use_of_funds)}</section>
       <section class="card"><h2>Conditions</h2><ul>{_condition_items(sheet.conditions)}</ul></section>

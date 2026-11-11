@@ -222,6 +222,7 @@ async def readiness_snapshot(db: AsyncSession, profile: ApplicationProfile) -> d
     from app.services.financial_metric_reporting import operating_earnings_brief
 
     from . import sync as SYNC
+    from .document_catalog import safe_document_summaries
 
     selections = await programs.active_selections(db, profile.id)
     candidates = {c.program_key: c for c in await programs.published_candidates(db, profile)}
@@ -264,6 +265,7 @@ async def readiness_snapshot(db: AsyncSession, profile: ApplicationProfile) -> d
             "files_accepted": coverage["files_accepted"],
         },
         "financials": {**financial_cockpit.listing_summary(cockpit), "operating_earnings": operating_earnings_brief(cockpit),
+            "document_summaries": safe_document_summaries(cockpit),
             "proposed_terms": SYNC.proposed_terms(cockpit), "collateral": cockpit.get("collateral"),
             "deal_budget": deal_budget.reporting(profile, SYNC.proposed_terms(cockpit))},
         "production_package": {"stage": package.stage, "status": package.status, "version": package.version} if package else None,

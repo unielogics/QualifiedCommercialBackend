@@ -9,11 +9,37 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 Money = Annotated[Decimal, Field(ge=0, le=999_999_999_999, decimal_places=2, allow_inf_nan=False)]
 
 
+class SoftwareMonitoring(BaseModel):
+    """Staff-recorded setup tracking; no external connection is implied."""
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    software_status: Literal["not_set", "planned", "in_progress", "configured"] = "not_set"
+    monitoring_status: Literal["not_set", "planned", "in_progress", "configured"] = "not_set"
+    provider: str | None = Field(default=None, max_length=180)
+    notes: str | None = Field(default=None, max_length=2000)
+
+
+class PayoffTerms(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    interest_policy: Literal["unknown", "accrued_only", "minimum_months"] = "unknown"
+    minimum_interest_months: int | None = Field(default=None, ge=1, le=480)
+    charge_amount: Money | None = None
+    charge_recipient: Literal["unknown", "investor", "company", "third_party"] = "unknown"
+    reserve_release: Literal["unknown", "at_payoff", "contract_maturity"] = "unknown"
+
+    @field_validator("charge_amount", mode="before")
+    @classmethod
+    def not_boolean(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("Enter a monetary payoff charge; use zero only when no charge is confirmed")
+        return value
+
+
 class DealCostRow(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     id: UUID
     label: str = Field(min_length=1, max_length=180)
-    category: Literal["closing_cost", "escrow_reserve", "referral", "origination", "consulting", "servicing", "management", "other"]
+    category: Literal["closing_cost", "escrow_reserve", "referral", "origination", "consulting", "servicing", "management", "maintenance", "reporting", "software", "monitoring", "other"]
+    applicability: Literal["all", "company_managed", "transferred"] = "all"
     payer: Literal["borrower", "investor", "sponsor"] = "borrower"
     method: Literal["fixed", "percent"] = "fixed"
     value: Annotated[Decimal, Field(ge=0, le=999_999_999_999, decimal_places=4, allow_inf_nan=False)] | None = None
@@ -41,7 +67,7 @@ class DealCostRow(BaseModel):
     @model_validator(mode="after")
     def valid_cost(self):
         if self.recipient_role is None:
-            self.recipient_role = "escrow" if self.category == "escrow_reserve" else "platform" if self.category in {"origination", "consulting", "servicing", "management"} else "third_party"
+            self.recipient_role = "escrow" if self.category == "escrow_reserve" else "platform" if self.category in {"origination", "consulting", "servicing", "management", "maintenance", "reporting", "software", "monitoring"} else "third_party"
         if self.category == "origination" and self.timing != "closing":
             raise ValueError("Origination costs are one-time closing charges")
         if self.category == "origination" and self.payer == "borrower" and self.recipient_role == "platform" and self.method == "percent" and self.basis != "loan_amount":
@@ -68,6 +94,9 @@ class DealCostRow(BaseModel):
 class DealBudgetPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_revision: int = Field(ge=0)
+    servicing_mode: Literal["not_set", "company_managed", "transferred"] = "not_set"
+    software_monitoring: SoftwareMonitoring = Field(default_factory=SoftwareMonitoring)
+    payoff_terms: PayoffTerms = Field(default_factory=PayoffTerms)
     loan_amount_mode: Literal["gross_loan", "base_loan", "target_net"] = "gross_loan"
     base_loan_amount: Money | None = None
     target_net_amount: Money | None = None
@@ -155,6 +184,9 @@ class DealBudgetApply(DealBudgetPatch):
 class DealBudgetRead(BaseModel):
     profile_id: UUID
     revision: int = 0
+    servicing_mode: Literal["not_set", "company_managed", "transferred"] = "not_set"
+    software_monitoring: SoftwareMonitoring = Field(default_factory=SoftwareMonitoring)
+    payoff_terms: PayoffTerms = Field(default_factory=PayoffTerms)
     loan_amount_mode: Literal["gross_loan", "base_loan", "target_net"] = "gross_loan"
     base_loan_amount: Money | None = None
     target_net_amount: Money | None = None

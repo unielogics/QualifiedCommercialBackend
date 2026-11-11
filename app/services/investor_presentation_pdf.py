@@ -462,12 +462,16 @@ def _budget_overview(page, report, terms, use_of_funds, requested, disclosure):
     calc = _record(disclosure.get("calculation"))
     allocation = _record(disclosure.get("current_allocation_reconciliation")) or _record(calc.get("allocation_reconciliation"))
     currency = calc.get("loan_currency") or terms.get("currency") or "USD"
-    gross_roi, net_roi = calc.get("investor_gross_roi_pct"), calc.get("investor_net_roi_pct")
+    net_roi = calc.get("investor_net_roi_pct")
+    scenarios = _record(calc.get("investor_scenarios"))
+    early, full = _record(scenarios.get("six_month_payoff")), _record(scenarios.get("full_term"))
     minimum = calc.get("minimum_investor_contribution")
     mode = "Single investor" if disclosure.get("funding_mode") == "single_investor" else "Multiple investors"
     _card(page, (34, 197, 319, 316), *_financing_card(requested, calc.get("gross_loan_amount"), currency))
     _card(page, (337, 197, 622, 316), "Investment capital to raise", _money(calc.get("investor_funding_amount"), currency), f"{mode}; minimum {_money(minimum, currency)}")
-    _card(page, (640, 197, 925, 316), "Gross contractual return", f"{gross_roi:.2f}%" if gross_roi is not None else "Unknown", f"Net after charges: {net_roi:.2f}% on {_money(calc.get('investor_initial_outlay'), currency)} initial outlay" if net_roi is not None else "Net return unknown; confirm all costs")
+    early_roi = early.get("net_roi_pct")
+    _card(page, (640, 197, 925, 316), "Net investor return - full term", f"{net_roi:.2f}%" if net_roi is not None else "Unknown",
+          f"6-month payoff: {float(early_roi):.2f}% net; principal is not profit" if early_roi is not None else "Net return unknown; confirm all costs and payoff terms" if net_roi is None else "Early net needs confirmed payoff terms; no future interest is assumed")
     principal = _record(calc.get("principal_solution"))
     target_label = f" (target {_money(principal.get('target_net_amount'), currency)})" if principal.get("mode") == "target_net" else ""
     _text(page, (35, 329, 468, 350), f"Net proceeds: {_money(calc.get('net_client_cash'), currency)}{target_label}", size=10.5, bold=True, color=TEAL)
@@ -484,8 +488,12 @@ def _budget_overview(page, report, terms, use_of_funds, requested, disclosure):
     uses_label = {"requested_reference": "Requested-budget reference", "proposed_reference": "Prior-proposal uses reference",
         "proposed_gross_budget": "Gross-facility uses; net allocation pending", "proposed_loan": "Proposed-loan uses"}.get(allocation.get("scope"), "Uses")
     _text(page, (36, 352, 468, 390), f"{uses_label}: {uses or 'Awaiting confirmation'}. Separate borrower closing cash {_money(calc.get('borrower_paid_separately'), currency)}. Other funding required {_money(calc.get('other_funding_required'), currency)} (unconfirmed). Reserves are not fee income.", size=9)
-    _text(page, (486, 329, 922, 350), "Terms and return basis", size=12, bold=True)
-    _text(page, (488, 352, 922, 390), _plain_terms(terms).replace("\n", " ").replace("APR ", "Stated note rate ") + " Full-term return before losses/taxes. All-in borrower APR including fees has not been calculated.", size=9)
+    _text(page, (486, 329, 922, 350), "Payoff comparison - after investor fees", size=12, bold=True)
+    comparison = []
+    for label, scenario in (("Six months (capped)", early), ("Full note term", full)):
+        comparison.append(f"{label}: principal {_money(scenario.get('principal_returned'), currency)}; interest {_money(scenario.get('gross_interest'), currency)}; fees {_money(scenario.get('total_fees'), currency)}; net profit {_money(scenario.get('net_income'), currency)}.")
+    comparison.append("Full collection illustration, before taxes/losses. Principal/reserves are assets, not profit; early terms and setup require staff confirmation.")
+    _text(page, (488, 352, 922, 390), " ".join(comparison), size=8)
     rows = _records(disclosure.get("rows"))
     status = "New proposal requires updated terms" if disclosure.get("stale") else "Use-of-funds gap; review required" if allocation.get("status") == "overallocated" else "Review required" if calc.get("status") != "ready" else "Recorded cost disclosure"
     _text(page, (36, 392, 923, 406), f"CLOSING / INVESTOR COSTS  |  {status}  |  {min(8, len(rows))} of {len(rows)} rows; full schedule in file  " + _citations(report, "deal_budget"), size=9, bold=True, color=TEAL)
@@ -496,6 +504,8 @@ def _budget_overview(page, report, terms, use_of_funds, requested, disclosure):
         label = row.get("label") or "Cost"
         if row.get("category") == "escrow_reserve":
             label += " [reserve]"
+        if row.get("applies") is False:
+            label += " [not applicable]"
         _text(page, (x + 2, y, x + 326, y + 12), f"{label} / {str(row.get('payer') or 'Unknown').title()}", size=8.5, bold=True)
         _text(page, (x + 329, y, x + 437, y + 12), _money(row.get("total_amount"), currency), size=8.5, bold=True)
         treatment = "; financed in principal" if row.get("settlement") == "financed" else "; already in baseline" if row.get("coverage_treatment") == "already_in_baseline" and row.get("timing") != "closing" else "; new operating cost" if row.get("earnings_treatment") == "operating_expense" else ""
@@ -537,6 +547,7 @@ def render_investor_presentation_pdf(*, intake: Any, financials: dict, generated
     _text(page, (35, 139, 925, 162), _company_address(company), size=10, color=MUTE)
     profile = "  |  ".join(str(value) for value in (company.get("website"), company.get("industry"), "NAICS " + str(company["naics"]) if company.get("naics") else None) if value)
     _text(page, (35, 165, 925, 185), profile or "Business website / industry details awaiting confirmation", size=9, color=MUTE)
+    _text(page, (35, 185, 925, 196), f"Estimated funding: {terms.get('expected_funding_date') or 'not recorded'} | Estimated maturity: {terms.get('maturity_date') or 'not recorded'} | Dates may change with funding timing and final closing terms.", size=7.3, color=MUTE)
     cost_budget = _record(report.get("deal_budget"))
     if cost_budget:
         _budget_overview(page, report, terms, budget, requested, cost_budget)

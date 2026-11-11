@@ -26,6 +26,13 @@ from app.schemas.application_terms import (
 from app.services import application_profiles as profiles
 from app.services import deal_budget, file_contacts, funding_programs, investor_collateral
 from app.services.funding_requests import current_for_profile, intake_requested_amount
+from app.services.loan_dates import (
+    add_business_days,
+    client_terms_dates,
+    dates_from_plan,
+    firm_today,
+    loan_dates,
+)
 
 CADENCE_PERIODS_PER_YEAR: dict[str, float] = {
     # Existing refinance math treats "daily" as business-day repayment:
@@ -522,6 +529,10 @@ async def read_terms(
             amount=float(initial_amount) if initial_amount is not None else None,
             expiration_days=7,
             closing_estimate_days=5,
+            expected_funding_date=dates_from_plan(getattr(profile, "financial_plan", None))["expected_funding_date"],
+            maturity_date=dates_from_plan(getattr(profile, "financial_plan", None))["maturity_date"],
+            maturity_date_mode=dates_from_plan(getattr(profile, "financial_plan", None))["maturity_date_mode"],
+            date_note=dates_from_plan(getattr(profile, "financial_plan", None))["date_note"],
             client_email=client_email,
             direct_client_contact_suppressed=suppressed,
             loan_type_options=options,
@@ -607,6 +618,7 @@ async def read_terms(
         repayment_config=repayment_config,
         expiration_days=row.expiration_days,
         closing_estimate_days=row.closing_estimate_days,
+        **{key: value for key, value in client_terms_dates(row).items() if key not in {"maturity_is_estimate", "dates_recorded"}},
         co_brand_enabled=row.co_brand_enabled,
         sponsor_name=row.sponsor_name,
         client_note=row.client_note,
@@ -740,6 +752,13 @@ async def save_terms(
             "new_loan_annual_debt_service": annual, "base_dscr": calc.dscr_after, "basis": calc.cash_flow_label}}
     validate_write(budget, payload.expected_deal_budget_revision, budget_terms)
     budget_calculation = deal_budget.calculate(budget, budget_terms, getattr(profile, "use_of_funds", None))
+    prior_dates = client_terms_dates(current) if current is not None else dates_from_plan(getattr(profile, "financial_plan", None))
+    funding = payload.expected_funding_date if "expected_funding_date" in payload.model_fields_set else prior_dates.get("expected_funding_date")
+    if funding is None:
+        funding = add_business_days(firm_today(), payload.closing_estimate_days)
+    maturity = payload.maturity_date if "maturity_date" in payload.model_fields_set else prior_dates.get("maturity_date")
+    mode = payload.maturity_date_mode if "maturity_date_mode" in payload.model_fields_set else prior_dates.get("maturity_date_mode")
+    budget_calculation["loan_dates"] = loan_dates(funding, payload.term_months, maturity, mode)
     if getattr(context, "operating_plan", None):
         budget_calculation["operating_plan"] = dict(context.operating_plan)
     calc = apply_to_terms_calculation(calc, budget, budget_calculation)
