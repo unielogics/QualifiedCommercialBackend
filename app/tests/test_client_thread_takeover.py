@@ -278,7 +278,14 @@ def test_the_signed_in_loader_gates_writes_and_lets_reads_render_the_gate():
     # statement read, room setup status and the initial room credential setup.
     # The handlers live in one module per router beside the core; the gate is
     # applied wherever the loader is called, so every module is scanned.
-    from app.routers.dealer_ai_intake_routes import admin, broker, client, funding_review, mca_refinance, public_intake
+    from app.routers.dealer_ai_intake_routes import (
+        admin,
+        broker,
+        client,
+        funding_review,
+        mca_refinance,
+        public_intake,
+    )
 
     body = "\n".join(inspect.getsource(module) for module in (router, admin, broker, client, funding_review, mca_refinance, public_intake))
     calls = [line for line in body.splitlines() if "_load_client_intake(db, user, intake_id" in line]
