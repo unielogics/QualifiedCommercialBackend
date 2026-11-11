@@ -16,7 +16,7 @@ from app.capital_partners.services import document_catalog as catalog
 from app.capital_partners.services import listings, storage, sync
 from app.capital_partners.services.package_documents import attach_generated_documents
 from app.enums import Role
-from app.tests.test_capital_partners import Scenario, _patches, harness
+from app.tests.test_capital_partners import Scenario, _patches, approve_uploaded_ppm, harness
 
 
 @asynccontextmanager
@@ -110,6 +110,8 @@ async def test_generated_documents_are_idempotent_visible_and_never_satisfy_ppm(
             )
             assert done.status_code == 200, done.text
             assert done.json()["source"] == "uploaded"
+            assert done.json()["status"] == "pending"
+            await approve_uploaded_ppm(h, f"/api/v1/capital/admin/listings/{listing.id}")
             assert (
                 await h.client.post(
                     f"/api/v1/capital/admin/listings/{listing.id}/publish",
@@ -127,10 +129,11 @@ async def test_generated_documents_are_idempotent_visible_and_never_satisfy_ppm(
             ).json()["expires_in_seconds"] == 60
             h.current = admin
             artifacts[0][0].id = uuid4()
+            previous_copy_count = copy.call_count
             third = await attach_generated_documents(
                 h.db, listing, artifacts, actor_id=admin.id, now=datetime.now(UTC)
             )
-            assert third[0]["version"] == 2 and third[1:] == first[1:] and copy.call_count == 4
+            assert third[0]["version"] == 2 and third[1:] == first[1:] and copy.call_count == previous_copy_count + 1
             assert len(listings.ready_documents(listing)) == 4  # three generated + actual PPM
 
 

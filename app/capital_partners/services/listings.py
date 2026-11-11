@@ -413,12 +413,15 @@ def document_out(doc: CpListingDocument) -> dict[str, Any]:
         "size_bytes": doc.size_bytes,
         "version": doc.version,
         "status": doc.status,
-        "source": document_source(doc.kind),
+        "source": getattr(doc, "_ppm_source", None) or document_source(doc.kind),
     }
 
 
 def ready_documents(listing: CpListing) -> list[CpListingDocument]:
-    return [d for d in listing.documents if d.status == E.DocumentStatus.READY]
+    access = getattr(listing, "_ppm_access", {})
+    return [d for d in listing.documents if d.status == E.DocumentStatus.READY and (
+        d.kind != E.DocumentKind.PPM or not access.get("managed") or (
+            access.get("current") and str(d.id) == access.get("document_id")))]
 
 
 def publish_issues(listing: CpListing) -> list[dict[str, str]]:
@@ -476,7 +479,10 @@ def publish_issues(listing: CpListing) -> list[dict[str, str]]:
         if any(_d(getattr(listing, field, None)) != _d(terms.get(key)) for field, key in (("loan_amount", "amount"), ("note_rate_pct", "rate_pct"), ("term_months", "term_months"))):
             add("financing_outdated", "Refresh financing from the file before publishing", "snapshot")
     kinds = {d.kind for d in ready_documents(listing)}
-    if E.DocumentKind.PPM not in kinds:
+    ppm_access = getattr(listing, "_ppm_access", {})
+    if ppm_access.get("managed") and not ppm_access.get("current"):
+        add("ppm_review_required", "Review the current PPM draft against the saved offering before publishing", "documents", document_kind="ppm")
+    elif E.DocumentKind.PPM not in kinds:
         add("ppm_required", "private placement memorandum not uploaded", "documents", document_kind="ppm")
     return issues
 
@@ -685,6 +691,8 @@ async def create_subscription(
 ) -> CpSubscription:
     if listing.status not in E.SUBSCRIBABLE_STATUSES:
         raise RuleError("not_open", "This offering is not open to subscribe.")
+    from .ppm import require_current_review
+    await require_current_review(db, listing)
     if not (ack_ppm and ack_accredited):
         raise RuleError("acknowledgements_required", "Both acknowledgements are required.")
     if entity_id is not None and not any(e.id == entity_id for e in member.entities):
@@ -829,6 +837,8 @@ async def cancel_subscription(db: AsyncSession, sub: CpSubscription, listing: Cp
 async def publish(db: AsyncSession, listing: CpListing, *, actor_user_id: uuid.UUID, reason: str) -> None:
     if listing.status != E.ListingStatus.DRAFT:
         raise RuleError("not_draft", "Only a draft can be published.")
+    from .ppm import bind_access_state
+    await bind_access_state(db, listing)
     blockers = publish_blockers(listing)
     if blockers:
         raise RuleError("incomplete", "Fill in: " + "; ".join(blockers))

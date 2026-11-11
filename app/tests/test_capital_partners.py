@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from uuid import UUID, uuid4
 
 import pytest
 import sqlalchemy as sa
@@ -146,14 +147,38 @@ class Scenario:
         assert r.status_code == 201, r.text
         lid = r.json()["id"]
         if publish:
-            init = await self.h.client.post(f"/api/v1/capital/admin/listings/{lid}/documents/upload-init", json={"kind": "ppm", "name": "PPM.pdf"})
-            assert init.status_code == 200, init.text
-            done = await self.h.client.post(f"/api/v1/capital/admin/listings/{lid}/documents/upload-complete", json={"document_id": init.json()["document_id"]})
-            assert done.status_code == 200, done.text
+            # These lifecycle tests exercise grandfathered offerings. New uploads
+            # have their own explicit, source-bound review lifecycle tests.
+            listing = await self.h.db.get(cp.CpListing, UUID(lid))
+            await self.h.db.refresh(listing, attribute_names=["documents"])
+            legacy = cp.CpListingDocument(id=uuid4(), listing_id=listing.id, kind=E.DocumentKind.PPM,
+                name="Previously reviewed PPM.pdf", s3_key="synthetic/legacy-ppm.pdf", content_type="application/pdf",
+                size_bytes=1234, version=1, status=E.DocumentStatus.READY, uploaded_by_id=admin.id, uploaded_at=datetime.now(UTC))
+            listing.documents.append(legacy)
+            self.h.db.add(legacy)
+            await self.h.db.flush()
             pub = await self.h.client.post(f"/api/v1/capital/admin/listings/{lid}/publish", json={"reason": "Desk approved", "confirmed": True})
             assert pub.status_code == 200, pub.text
             assert pub.json()["status"] == "open"
         return await self.h.db.get(cp.CpListing, __import__("uuid").UUID(lid))
+
+
+async def approve_uploaded_ppm(h: Harness, path: str) -> dict:
+    """Explicitly bind synthetic upload metadata and review its frozen bytes."""
+    state = (await h.client.get(path + "/ppm")).json()
+    assert state["current_draft"]["source"] == "uploaded"
+    legal = {row["key"]: f"Staff supplied {row['label']}" for row in state["legal_fields"] if row["required"]}
+    legal["offering_currency"] = "USD"
+    saved = await h.client.patch(path + "/ppm/draft", json={"expected_version": state["current_draft"]["version"],
+        "expected_source_fingerprint": state["source_fingerprint"], "idempotency_key": str(uuid4()),
+        "legal_inputs": legal, "narrative_sections": {}})
+    assert saved.status_code == 200, saved.text
+    state = saved.json()
+    reviewed = await h.client.post(path + "/ppm/review", json={"expected_version": state["current_draft"]["version"],
+        "expected_source_fingerprint": state["source_fingerprint"], "idempotency_key": str(uuid4()),
+        "confirmed": True, "reason": "Reviewed synthetic offering provisions and uploaded PDF"})
+    assert reviewed.status_code == 200, reviewed.text
+    return reviewed.json()
 
 
 @pytest.mark.asyncio
