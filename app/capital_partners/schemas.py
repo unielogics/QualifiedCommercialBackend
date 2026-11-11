@@ -177,6 +177,7 @@ class PpmDraftIn(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=128)
     legal_inputs: dict[str, str] = Field(default_factory=dict, max_length=20)
     narrative_sections: dict[str, str] = Field(default_factory=dict, max_length=20)
+    legal_presets: dict[str, str] = Field(default_factory=dict, max_length=20)
 
     model_config = {"extra": "forbid"}
 
@@ -198,10 +199,43 @@ class PpmMissing(BaseModel):
     required: bool = True
 
 
+class PpmPresetOption(BaseModel):
+    key: str
+    label: str
+    text: str
+    unresolved: bool = False
+
+
 class PpmField(BaseModel):
     key: str
     label: str
     required: bool = False
+    options: list[PpmPresetOption] = Field(default_factory=list)
+    default_value: str | None = None
+    default_preset: str | None = None
+    help: str | None = None
+    read_only: bool = False
+
+
+class MembershipPolicyRequirement(BaseModel):
+    key: str
+    label: str
+    detail: str
+
+
+class MembershipPolicyOut(BaseModel):
+    policy_version: str
+    label: str
+    summary: str
+    requirements: list[MembershipPolicyRequirement]
+    waiting_period_days: int
+    limitations: list[str]
+    approved_status: str
+    waiting_end_must_have_passed_if_set: bool
+    requires_accreditation_acknowledgement: bool
+    requires_ppm_acknowledgement: bool
+    independent_accreditation_verification: bool
+    operator_subscriptions_allowed: bool
 
 
 class PpmVersion(BaseModel):
@@ -217,6 +251,7 @@ class PpmVersion(BaseModel):
     legal_inputs: dict[str, str]
     narrative_sections: dict[str, str]
     ai_sections: dict[str, str] = Field(default_factory=dict)
+    legal_presets: dict[str, str] = Field(default_factory=dict)
 
 
 class PpmRead(BaseModel):
@@ -232,6 +267,9 @@ class PpmRead(BaseModel):
     warnings: list[str]
     legal_fields: list[PpmField]
     narrative_fields: list[PpmField]
+    membership_policy: MembershipPolicyOut
+    legal_defaults: dict[str, str] = Field(default_factory=dict)
+    legal_default_presets: dict[str, str] = Field(default_factory=dict)
 
 
 class DocumentGrantIn(BaseModel):

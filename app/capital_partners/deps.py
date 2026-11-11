@@ -29,8 +29,9 @@ from app.models.user import User
 from . import enums as E
 from .models import CpMember
 from .services import members as member_svc
+from .services import membership_policy
 
-PREVIEW_ROLES = frozenset({Role.SUPER_ADMIN, Role.LOAN_EXEC})
+PREVIEW_ROLES = membership_policy.PREVIEW_ROLES
 
 
 @dataclass
@@ -50,7 +51,7 @@ async def require_member(
 ) -> MemberCtx:
     if user.role in PREVIEW_ROLES:
         return MemberCtx(user=user, member=None, preview=True)
-    if user.role != Role.CAPITAL_PARTNER:
+    if user.role != membership_policy.MEMBER_ROLE:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             detail={"code": "not_a_member", "message": "This login does not open the Capital Partners portal."},
@@ -87,7 +88,7 @@ async def require_cleared_member(ctx: Annotated[MemberCtx, Depends(require_membe
 
 
 async def require_subscribing_member(ctx: Annotated[MemberCtx, Depends(require_cleared_member)]) -> MemberCtx:
-    if ctx.preview:
+    if not membership_policy.subscription_context_allowed(preview=ctx.preview):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             detail={"code": "preview_only", "message": "Operators preview the portal; only members subscribe."},
