@@ -100,14 +100,22 @@ def test_pro_forma_dscr_is_computed_from_two_annual_figures_or_not_at_all():
 # ── the client's view ───────────────────────────────────────────────────────
 
 
-def test_client_view_is_the_allowlist_and_never_the_desk_terms():
-    offer = _offer(status=mp.STATUS_SENT, desk_terms={"agent_residual_pct": 40.0, "signing_bonus": 500.0, "savings_warning": "x"})
+@pytest.mark.parametrize("offer_id", [
+    uuid.UUID("00000000-0000-4000-8000-000000000001"),
+    uuid.UUID("00000500-0000-4000-8000-000000000001"),
+])
+def test_client_view_is_the_allowlist_and_never_the_desk_terms(offer_id):
+    offer = _offer(id=offer_id, status=mp.STATUS_SENT, desk_terms={"agent_residual_pct": 40.0, "signing_bonus": 500.0, "savings_warning": "x"})
     view = mp.client_view(offer, partner_name="Acme Pay")
+    assert view["id"] == str(offer_id)
     assert set(view["terms"]) == set(mp.TERM_KEYS)
     flat = repr(view)
     for key in mp.DESK_ONLY_KEYS:
         assert key not in flat
-    assert "40.0" not in flat and "500" not in flat
+    # A public UUID may contain "500"; private values must stay out of every
+    # other client field, including nested terms and free-text disclosures.
+    client_fields = repr({key: value for key, value in view.items() if key != "id"})
+    assert "40.0" not in client_fields and "500" not in client_fields
     assert view["estimated_annual_savings"] == 4200.0
     assert view["disclaimer_version"] == mp.DISCLAIMER_VERSION and view["terms_version"] == 1
 
