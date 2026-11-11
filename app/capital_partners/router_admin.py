@@ -358,6 +358,7 @@ async def _listing_admin_out(db: AsyncSession, listing: CpListing) -> S.ListingA
         await db.refresh(ev, attribute_names=["occurred_at"])
     investor_count = (await F.investor_counts(db)).get(listing.id, 0)
     sync = await SYNC.sync_for_listing(db, listing)
+    publish_issues = L.publish_issues(listing) if listing.status == E.ListingStatus.DRAFT else []
     return S.ListingAdminOut(
         **L.card(listing, committed),
         sync=sync,
@@ -370,7 +371,7 @@ async def _listing_admin_out(db: AsyncSession, listing: CpListing) -> S.ListingA
         withdrawn_at=listing.withdrawn_at, withdrawn_reason=listing.withdrawn_reason, source_snapshot=listing.source_snapshot or {},
         created_by_id=listing.created_by_id, created_at=listing.created_at, updated_at=listing.updated_at, investor_count=investor_count,
         subscriptions=subs, participations=parts, events=[S.ListingEventOut.model_validate(e) for e in events],
-        publish_blockers=L.publish_blockers(listing) if listing.status == E.ListingStatus.DRAFT else [],
+        publish_blockers=[issue["message"] for issue in publish_issues], publish_issues=publish_issues,
     )
 
 
@@ -546,7 +547,10 @@ async def publish_listing(listing_id: uuid.UUID, payload: S.PublishIn, admin: Cp
     try:
         await L.publish(db, listing, actor_user_id=admin.id, reason=payload.reason)
     except L.RuleError as exc:
-        raise _rule(exc) from exc
+        error = _rule(exc)
+        if exc.code == "incomplete":
+            error.detail["publish_issues"] = L.publish_issues(listing)
+        raise error from exc
     return await _listing_admin_out(db, listing)
 
 
