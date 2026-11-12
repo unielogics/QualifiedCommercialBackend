@@ -343,7 +343,8 @@ async def test_actual_public_route_returns_commands_unknowns_and_rejects_forged_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("submit", [False, True])
 @pytest.mark.parametrize("correction", [False, True, "partial_reason", "partial_evidence"])
-async def test_actual_version_publish_gate_keeps_unresolved_split_in_draft_or_captures_preparer_exception(submit, correction):
+@pytest.mark.parametrize("last_child_removed", [False, True])
+async def test_actual_version_publish_gate_keeps_unresolved_split_in_draft_or_captures_preparer_exception(submit, correction, last_child_removed):
     from types import SimpleNamespace
 
     from app.services import financial_workspace as workspace
@@ -353,6 +354,10 @@ async def test_actual_version_publish_gate_keeps_unresolved_split_in_draft_or_ca
     db = Memory()
     profile, family, draft = workspace_context("operating_plan")
     raw = split_plan(True)
+    if last_child_removed:
+        for row in raw["expenses"]:
+            row["excluded"] = True
+        raw["no_operating_expenses_confirmed"] = True
     if correction:
         raw["historical_corrections"] = [{"source_group_key": "source:rent", "reason": "Unresolved allocation for preparer", "source_file_ids": [SOURCE], "evidence_note": "Review ledger"}]
         if correction == "partial_reason":
@@ -375,13 +380,16 @@ async def test_actual_version_publish_gate_keeps_unresolved_split_in_draft_or_ca
             await workspace.publish_version(db, profile, kind="operating_plan", expected_revision=4, idempotency_key="synthetic-split", submit=submit)
             assert len(db.versions) == 1 and storage.call_count == 1
             handoff = render.call_args.args[2]["improvement_plan"]["preparer_handoff"]
-            assert handoff["historical"]["itemization"][0]["status"] == "unknown"
+            assert handoff["historical"]["itemization"][0]["status"] == ("unallocated" if last_child_removed else "unknown")
+            if last_child_removed:
+                assert handoff["historical"]["itemization"][0]["children_annual_amount"] == 0
+                assert handoff["historical"]["itemization"][0]["remainder_annual_amount"] == 12000
             assert handoff["historical"]["corrections_for_preparer_review"][0]["status"] == "unresolved_preparer_review"
         else:
             with pytest.raises(HTTPException) as error:
                 await workspace.publish_version(db, profile, kind="operating_plan", expected_revision=4, idempotency_key="synthetic-split", submit=submit)
             assert error.value.status_code == 422 and error.value.detail["code"] == "operating_itemization_incomplete"
-            assert error.value.detail["missing"][0].endswith("itemization.unknown")
+            assert error.value.detail["missing"][0].endswith("itemization.unallocated" if last_child_removed else "itemization.unknown")
             if correction:
                 suffix = ".reason" if correction == "partial_reason" else ".evidence"
                 assert "historical_corrections.source:rent" + suffix in error.value.detail["missing"]
@@ -403,3 +411,57 @@ def test_partial_historical_correction_is_a_valid_draft_without_premature_except
     assert any(path.endswith("itemization.unknown") for path in missing)
     assert any(path.startswith("historical_corrections.source:rent.") for path in missing)
     assert commands.itemization_missing(protected, source_context(protected))
+
+
+@pytest.mark.parametrize("reference", [12000, None])
+def test_last_child_removal_retains_ledger_without_a_no_expenses_bypass(reference):
+    raw = split_plan()
+    for row in raw["expenses"]:
+        row["excluded"] = True
+    raw["no_operating_expenses_confirmed"] = True
+    cockpit = source_context(raw, amount=reference)
+    ledger = commands.resolve(raw, cockpit)["itemization"][0]
+    assert ledger["children_annual_amount"] == 0
+    assert ledger["remainder_annual_amount"] == reference
+    assert ledger["status"] == ("unallocated" if reference is not None else "unknown")
+    assert commands.itemization_missing(raw, cockpit)
+    assert not operating_plan_service.completion(raw, cockpit)["complete"]
+    raw["expenses"][0]["excluded"] = False
+    raw["no_operating_expenses_confirmed"] = False
+    assert commands.resolve(raw, cockpit)["itemization"] == []
+
+
+def test_legacy_excluded_expense_without_itemization_history_is_unchanged():
+    raw = body(expenses=[expense(excluded=True)], adjustments=[], no_operating_expenses_confirmed=True)
+    assert commands.itemization(raw, context()) == []
+    assert commands.itemization_missing(raw, context()) == []
+    assert completion(raw)["complete"]
+
+
+@pytest.mark.asyncio
+async def test_actual_public_preview_preserves_last_child_remainder_and_retained_history():
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from app.routers import application_profiles as routes
+    from app.tests.test_operating_client_preview import TOKEN, ReadOnlyMemory
+
+    db = ReadOnlyMemory()
+    before = split_plan()
+    db.draft.body = before
+    removed = deepcopy(before)
+    for row in removed["expenses"]:
+        row["excluded"] = True
+    removed["no_operating_expenses_confirmed"] = True
+    app = FastAPI()
+    app.include_router(routes.router, prefix="/api/v1")
+    app.dependency_overrides[routes.get_db] = lambda: db
+    with patch("app.services.financial_cockpit.load_cockpit", AsyncMock(return_value=source_context(removed))):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(f"/api/v1/application-profiles/public/financial-forms/{TOKEN}/evaluate", json={"body": removed})
+    assert response.status_code == 200, response.text
+    ledger = response.json()["evaluation"]["itemization"][0]
+    assert ledger["child_expense_row_ids"] == []
+    assert ledger["children_annual_amount"] == 0 and ledger["remainder_annual_amount"] == 12000
+    assert ledger["status"] == "unallocated"
+    db.assert_unchanged(before)

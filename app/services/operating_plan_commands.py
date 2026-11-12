@@ -59,9 +59,10 @@ def itemization(body, cockpit=None):
     references = {row["key"]: row for row in (evidence.get("guidance") or {}).get("expense_groups", [])}
     files = {row.get("file_id"): row for row in evidence.get("files", [])}
     for parent in body.get("expenses", []):
-        children = sorted([row for row in body["expenses"] if row.get("itemization_parent_id") == parent["id"] and not row["excluded"]], key=lambda row: row["id"])
-        if not children:
+        lineage = [row for row in body["expenses"] if row.get("itemization_parent_id") == parent["id"]]
+        if not lineage or not parent["excluded"]:
             continue
+        children = sorted([row for row in lineage if not row["excluded"]], key=lambda row: row["id"])
         source = references.get(parent["source_group_key"])
         recorded = _annual(parent)
         reference = _d(source.get("baseline_annual_amount")) if source else recorded
