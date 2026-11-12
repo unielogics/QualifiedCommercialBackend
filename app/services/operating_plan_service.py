@@ -90,7 +90,7 @@ async def preview(db, profile, body):
 
     cockpit = await load_cockpit(db, profile)
     evidence = cockpit.get("operating_evidence") or {}
-    evaluation = math.evaluate(body, cockpit, source_file_ids=[row["file_id"] for row in evidence.get("files", [])])
+    evaluation = math.evaluate(body, cockpit, source_file_ids=[row["file_id"] for row in evidence.get("files", [])], include_expense_changes=True)
     return {"evaluation": evaluation, "evidence": evidence, "guidance": evidence.get("guidance") or {},
             "context_stamp": math.context_stamp(cockpit)}
 

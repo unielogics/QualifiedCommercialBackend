@@ -72,6 +72,8 @@ class AdjustmentRow(_Form):
     driver_key: str = Field(default="", max_length=200)
     product_name: str = Field(default="", max_length=240)
     expense_row_id: UUID | None = None
+    expense_category: ExpenseCategory | None = None
+    source_group_key: str = Field(default="", max_length=240)
     current_amount: float | None = Field(default=None, ge=0, le=1e15)
     proposed_amount: float | None = Field(default=None, ge=0, le=1e15)
     cost_basis: CostBasis = "total"
@@ -206,6 +208,13 @@ class OperatingPlanBody(_Form):
         known_expenses = {row.id for row in self.expenses}
         if any(row.expense_row_id and row.expense_row_id not in known_expenses for row in self.adjustments):
             raise ValueError("An adjustment must refer to an expense in this operating plan")
+        expense_rows = {row.id: row for row in self.expenses}
+        for row in self.adjustments:
+            # Empty legacy defaults do not acquire new source claims on read.
+            # Explicit placement on a linked action follows its actual owner.
+            if row.expense_row_id and (row.expense_category is not None or row.source_group_key):
+                linked = expense_rows[row.expense_row_id]
+                row.expense_category, row.source_group_key = linked.category, linked.source_group_key
         if any(row.expense_row_id and row.expense_row_id not in known_expenses for row in self.released_cash_flow.allocations):
             raise ValueError("A cash-flow allocation must refer to an expense in this operating plan")
         return self
@@ -306,7 +315,8 @@ def completion(raw):
 
 def key_facts(raw):
     body = validate_body(raw)
-    safe = {**body, "adjustments": [{key: value for key, value in row.items() if key not in REVIEW_FIELDS}
+    safe = {**body, "adjustments": [{key: value for key, value in row.items() if key not in REVIEW_FIELDS
+                                     and not (key == "expense_category" and value is None or key == "source_group_key" and not value)}
                                      for row in body["adjustments"]]}
     return {"source_form": "operating_plan", "document_type": "operating_expenses_and_earnings_plan",
             "business_name": body["business_name"], "period_start": body["period_start"], "period_end": body["period_end"],

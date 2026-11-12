@@ -228,6 +228,11 @@ def partner_operating_earnings(value: Any) -> dict[str, Any] | None:
             "processing_volume", "processing_transaction_count", "current_processing_rate_pct", "proposed_processing_rate_pct",
             "current_processing_rate_basis", "proposed_processing_rate_basis", "current_processing_fixed_fee", "proposed_processing_fixed_fee",
             "current_processing_per_transaction_fee", "proposed_processing_per_transaction_fee"))
+        if row.get("expense_category") is not None:
+            safe["expense_category"] = row["expense_category"]
+        if row.get("source_group_key"):
+            group = next((item for item in improvement.get("expense_groups", []) if item.get("key") == row["source_group_key"]), None)
+            safe["source_group_label"] = group.get("label") if group else "Selected expense group"
         return safe
 
     safe_improvement = None

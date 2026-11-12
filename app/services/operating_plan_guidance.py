@@ -216,6 +216,12 @@ def client_evaluation(evaluation):
     baseline = safe.get("baseline") or {}
     baseline["noi_governance"] = noi_governance_brief(baseline.get("noi_governance"), internal=False)
     safe["actions"] = safe.pop("adjustments")
+    results = {row["id"]: row for row in evaluation.get("actions", [])}
+    for row in safe["actions"]:
+        if "proposed_math_valid" in results.get(row["id"], {}):
+            row["proposed_math_valid"] = bool(results[row["id"]]["proposed_math_valid"])
+    if "expense_changes" in evaluation:
+        safe["expense_changes"] = deepcopy(evaluation["expense_changes"])
     safe["schema_version"] = evaluation.get("schema_version")
     return safe
 
