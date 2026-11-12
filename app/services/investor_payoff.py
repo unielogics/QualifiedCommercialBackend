@@ -98,12 +98,12 @@ def _summary(calculation, budget, horizon, *, missing=None, minimum_charge=ZERO,
             "Losses, taxes, reinvestment and unrecorded charges are excluded; ROI is cumulative, not annualized."]}
 
 
-def scenarios(budget, terms, schedule, full_calculation, use_of_funds=None):
+def scenarios(budget, terms, schedule, full_calculation, use_of_funds=None, *, _horizon_months=None):
     from app.services.deal_budget import calculate
 
     term = dec(terms.get("term_months"))
     full = _summary(full_calculation, budget, term)
-    horizon = min(Decimal(6), term)
+    horizon = min(Decimal(6), term) if _horizon_months is None else dec(_horizon_months)
     if not schedule or not schedule.get("rows"):
         return {"six_month_payoff": _summary(full_calculation, budget, horizon, missing=["repayment_schedule"]), "full_term": full}
     last_due = dec(schedule["rows"][-1]["period"]) * 12 / dec(schedule["periods_per_year"])
@@ -111,7 +111,7 @@ def scenarios(budget, terms, schedule, full_calculation, use_of_funds=None):
                 cadence_adjustment_note=schedule.get("cadence_adjustment_note"))
     if last_due <= horizon:
         early = deepcopy(full)
-        early.update(horizon_months=amount(horizon), payoff_month=amount(last_due), capped_at_maturity=True)
+        early.update(horizon_months=amount(horizon if _horizon_months is None else last_due), payoff_month=amount(last_due), capped_at_maturity=True)
         return {"six_month_payoff": early, "full_term": full}
     policy = budget.get("payoff_terms") or {}
     missing = []

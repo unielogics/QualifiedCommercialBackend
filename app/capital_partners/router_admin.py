@@ -23,6 +23,7 @@ from app.config import get_settings
 from app.db import get_db
 from app.enums import Role
 from app.models.user import User
+from app.schemas.investor_returns import InvestorReturnsQuery, InvestorReturnsRead
 from app.services import clerk as clerk_service
 from app.services.payment_authorization import client_ip
 from app.services.user_access import console_keys
@@ -728,6 +729,14 @@ async def withdraw_listing(listing_id: uuid.UUID, payload: S.WithdrawIn, admin: 
 async def get_ppm(listing_id: uuid.UUID, admin: CpAdmin, db: Db) -> S.PpmRead:
     from .services import ppm
     return S.PpmRead(**await ppm.read_state(db, await _load_admin_listing(db, listing_id)))
+
+
+@router.get("/listings/{listing_id}/investor-returns", response_model=InvestorReturnsRead)
+async def listing_investor_returns(listing_id: uuid.UUID, admin: CpAdmin, db: Db,
+    query: Annotated[InvestorReturnsQuery, Depends()]) -> InvestorReturnsRead:
+    from app.services.investor_returns import read_listing_projection
+    listing = await _load_admin_listing(db, listing_id)
+    return InvestorReturnsRead(**await read_listing_projection(listing, query=query))
 
 
 @router.post("/listings/{listing_id}/ppm/generate", response_model=S.PpmRead)

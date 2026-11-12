@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.db import get_db
+from app.schemas.investor_returns import InvestorReturnsQuery, InvestorReturnsRead
 from app.services.payment_authorization import client_ip
 
 from . import enums as E
@@ -232,6 +233,21 @@ async def listing_detail(ref: str, ctx: ClearedMember, db: Db) -> S.ListingDetai
         can_subscribe=(not ctx.preview) and listing.status in E.SUBSCRIBABLE_STATUSES and L.remaining_amount(listing, committed) > 0 and (not ppm_access["managed"] or ppm_access["current"]),
         financials=L.partner_financials(listing),
     )
+
+
+@router.get("/listings/{ref}/investor-returns", response_model=InvestorReturnsRead)
+async def listing_investor_returns(ref: str, ctx: ClearedMember, db: Db,
+    query: Annotated[InvestorReturnsQuery, Depends()]) -> InvestorReturnsRead:
+    from app.services.investor_returns import read_listing_projection
+
+    from .services.ppm import bind_access_state
+
+    listing = await _listing_or_404(db, ref)
+    access = await bind_access_state(db, listing)
+    if access["managed"] and not access["current"]:
+        raise HTTPException(409, {"code": "offering_update_pending_publication",
+            "message": "The offering update awaits publication. Retry after the desk publishes its reviewed update."})
+    return InvestorReturnsRead(**await read_listing_projection(listing, query=query, member=True))
 
 
 @router.post("/listings/{ref}/documents/{document_id}/url", response_model=S.DocumentUrlOut)
