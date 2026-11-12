@@ -76,16 +76,9 @@ class ChangeCommand(_Form):
 
 class HistoricalCorrection(_Form):
     source_group_key: str = Field(min_length=1, max_length=240)
-    reason: str = Field(min_length=3, max_length=4000)
+    reason: str = Field(default="", max_length=4000)
     source_file_ids: list[UUID] = Field(default_factory=list, max_length=100)
     evidence_note: str = Field(default="", max_length=4000)
-
-    @model_validator(mode="after")
-    def evidence(self):
-        if not self.source_file_ids and not self.evidence_note:
-            raise ValueError("Link evidence or describe the evidence for preparer review")
-        return self
-
 
 class AdjustmentRow(_Form):
     id: UUID = Field(default_factory=uuid4)
@@ -355,9 +348,10 @@ def completion(raw):
 
         active_ids = {row["id"] for row in body["adjustments"] if not row["excluded"] and row["status"] != "rejected"}
         missing.extend(f"adjustments.{row['action_id']}.command" for row in resolve(body)["commands"] if row["issues"] and row["action_id"] in active_ids)
-    from app.services.operating_plan_commands import itemization_missing
+    from app.services.operating_plan_commands import correction_missing, itemization_missing
 
     missing.extend(itemization_missing(body))
+    missing.extend(correction_missing(body))
     from app.services.operating_unit_economics import evaluate as unit_economics
 
     units = unit_economics(body)

@@ -85,9 +85,22 @@ def itemization(body, cockpit=None):
 
 def itemization_missing(body, cockpit=None):
     """A documented correction permits handoff, never source confirmation."""
-    corrections = {row["source_group_key"] for row in body.get("historical_corrections") or []}
+    corrections = {row["source_group_key"] for row in body.get("historical_corrections") or []
+        if len(row.get("reason", "").strip()) >= 3 and (row.get("source_file_ids") or row.get("evidence_note", "").strip())}
     return [f"expenses.{row['parent_expense_row_id']}.itemization.{row['status']}" for row in itemization(body, cockpit)
         if row["status"] != "balanced" and row["source_group_key"] not in corrections]
+
+
+def correction_missing(body):
+    """Incomplete optional notes may autosave, but cannot finalize a handoff."""
+    missing = []
+    for row in body.get("historical_corrections") or []:
+        prefix = f"historical_corrections.{row['source_group_key']}"
+        if len(row.get("reason", "").strip()) < 3:
+            missing.append(prefix + ".reason")
+        if not row.get("source_file_ids") and not row.get("evidence_note", "").strip():
+            missing.append(prefix + ".evidence")
+    return missing
 
 
 def _allocate(rows, weights, proposed):

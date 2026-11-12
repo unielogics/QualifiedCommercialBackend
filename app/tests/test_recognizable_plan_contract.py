@@ -342,7 +342,7 @@ async def test_actual_public_route_returns_commands_unknowns_and_rejects_forged_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("submit", [False, True])
-@pytest.mark.parametrize("correction", [False, True])
+@pytest.mark.parametrize("correction", [False, True, "partial_reason", "partial_evidence"])
 async def test_actual_version_publish_gate_keeps_unresolved_split_in_draft_or_captures_preparer_exception(submit, correction):
     from types import SimpleNamespace
 
@@ -355,6 +355,10 @@ async def test_actual_version_publish_gate_keeps_unresolved_split_in_draft_or_ca
     raw = split_plan(True)
     if correction:
         raw["historical_corrections"] = [{"source_group_key": "source:rent", "reason": "Unresolved allocation for preparer", "source_file_ids": [SOURCE], "evidence_note": "Review ledger"}]
+        if correction == "partial_reason":
+            raw["historical_corrections"][0]["reason"] = "R"
+        elif correction == "partial_evidence":
+            raw["historical_corrections"][0].update(source_file_ids=[], evidence_note="")
     draft.body = raw
     before = deepcopy(raw)
     with patch.object(workspace, "resolve_family", AsyncMock(return_value=(family, draft))), \
@@ -367,7 +371,7 @@ async def test_actual_version_publish_gate_keeps_unresolved_split_in_draft_or_ca
          patch("app.routers.application_profiles._requested_slot", AsyncMock(return_value=SimpleNamespace(id=uuid4(), status="requested"))), \
          patch("app.services.financial_publication.after_publication", AsyncMock()), \
          patch("app.services.financial_cockpit.load_cockpit", AsyncMock(return_value=source_context(raw))):
-        if correction:
+        if correction is True:
             await workspace.publish_version(db, profile, kind="operating_plan", expected_revision=4, idempotency_key="synthetic-split", submit=submit)
             assert len(db.versions) == 1 and storage.call_count == 1
             handoff = render.call_args.args[2]["improvement_plan"]["preparer_handoff"]
@@ -378,7 +382,24 @@ async def test_actual_version_publish_gate_keeps_unresolved_split_in_draft_or_ca
                 await workspace.publish_version(db, profile, kind="operating_plan", expected_revision=4, idempotency_key="synthetic-split", submit=submit)
             assert error.value.status_code == 422 and error.value.detail["code"] == "operating_itemization_incomplete"
             assert error.value.detail["missing"][0].endswith("itemization.unknown")
+            if correction:
+                suffix = ".reason" if correction == "partial_reason" else ".evidence"
+                assert "historical_corrections.source:rent" + suffix in error.value.detail["missing"]
             assert not db.versions and family.current_version_id is None
             storage.assert_not_called()
             render.assert_not_called()
             assert draft.body == before
+
+
+@pytest.mark.parametrize("reason,evidence", [("", ""), ("R", ""), ("R", "Ledger"), ("Review this", "")])
+def test_partial_historical_correction_is_a_valid_draft_without_premature_exception(reason, evidence):
+    raw = split_plan(True)
+    raw["historical_corrections"] = [{"source_group_key": "source:rent", "reason": reason, "source_file_ids": [], "evidence_note": evidence}]
+    validated = validate_body(raw)
+    assert validated["historical_corrections"][0]["reason"] == reason
+    protected = operating_plan_service.protect_reviews(validated, split_plan(True))
+    assert protected["historical_corrections"] == validated["historical_corrections"]
+    missing = completion(protected)["missing"]
+    assert any(path.endswith("itemization.unknown") for path in missing)
+    assert any(path.startswith("historical_corrections.source:rent.") for path in missing)
+    assert commands.itemization_missing(protected, source_context(protected))

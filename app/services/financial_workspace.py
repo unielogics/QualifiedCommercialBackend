@@ -848,9 +848,9 @@ async def publish_version(db: AsyncSession, profile: ApplicationProfile, *, kind
             body = operating_plan_service.protect_reviews(body, empty_operating_body())
         body = await operating_plan_service.prepare_draft(db, profile, incoming=body, current=body, actor=actor)
         operating_context = await load_cockpit(db, profile)
-        from app.services.operating_plan_commands import itemization_missing
+        from app.services.operating_plan_commands import correction_missing, itemization_missing
 
-        split_missing = itemization_missing(body, operating_context)
+        split_missing = [*itemization_missing(body, operating_context), *correction_missing(body)]
         if split_missing:
             raise HTTPException(422, {"code": "operating_itemization_incomplete",
                 "message": "Reconcile each source split or record a historical correction with evidence for preparer review. Your working draft is retained.",
