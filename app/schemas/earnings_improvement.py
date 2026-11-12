@@ -15,7 +15,7 @@ ExpenseCategory = Literal["rent", "salaries", "payroll_taxes", "insurance", "uti
     "professional_fees", "supplies", "repairs", "transportation", "cogs", "merchant_processing", "other",
     "loan_payments", "income_taxes", "owner_draws", "transfers", "depreciation_amortization"]
 ActionKind = Literal["price_change", "product_cost_change", "revenue_change", "expense_reduction", "expense_increase",
-                     "processing_cost_change", "marketing_investment", "unit_volume", "one_time_adjustment"]
+                     "processing_cost_change", "marketing_investment", "unit_volume", "one_time_adjustment", "expense_group_change"]
 CategoryConfirmation = Literal["confirmed", "not_applicable", "needs_help"]
 ReviewDecision = Literal["proposed", "approved", "rejected"]
 BaselineTreatment = Literal["unreconciled", "included_in_baseline", "incremental_to_baseline", "outside_operating_earnings"]
@@ -59,11 +59,26 @@ class ExpenseRow(_Form):
     source_file_ids: list[UUID] = Field(default_factory=list, max_length=100)
     source_group_key: str = Field(default="", max_length=240)
     source_candidate_key: str = Field(default="", max_length=240)
+    itemization_parent_id: UUID | None = None
     bank_vendor_key: str | None = Field(default=None, max_length=200)
     notes: str = Field(default="", max_length=4000)
     excluded: bool = False
     duplicate_of: UUID | None = None
 
+
+class ChangeCommand(_Form):
+    target: Literal["total_cost", "unit_cost", "unit_quantity", "unit_price", "annual_price_revenue"]
+    mode: Literal["amount", "percent"]
+    direction: Literal["increase", "decrease"]
+    value: float | None = Field(default=None, ge=0, le=1e15)
+    allocation: Literal["none", "proportional"] = "none"
+
+
+class HistoricalCorrection(_Form):
+    source_group_key: str = Field(min_length=1, max_length=240)
+    reason: str = Field(default="", max_length=4000)
+    source_file_ids: list[UUID] = Field(default_factory=list, max_length=100)
+    evidence_note: str = Field(default="", max_length=4000)
 
 class AdjustmentRow(_Form):
     id: UUID = Field(default_factory=uuid4)
@@ -74,6 +89,8 @@ class AdjustmentRow(_Form):
     expense_row_id: UUID | None = None
     expense_category: ExpenseCategory | None = None
     source_group_key: str = Field(default="", max_length=240)
+    command: ChangeCommand | None = None
+    price_basis: Literal["per_unit", "annual_revenue"] = "per_unit"
     current_amount: float | None = Field(default=None, ge=0, le=1e15)
     proposed_amount: float | None = Field(default=None, ge=0, le=1e15)
     cost_basis: CostBasis = "total"
@@ -171,6 +188,7 @@ class OperatingPlanBody(_Form):
     notes: str = Field(default="", max_length=10000)
     expenses: list[ExpenseRow] = Field(default_factory=list, max_length=500)
     category_confirmations: dict[ExpenseCategory, CategoryConfirmation] = Field(default_factory=dict)
+    historical_corrections: list[HistoricalCorrection] = Field(default_factory=list, max_length=500)
     adjustments: list[AdjustmentRow] = Field(default_factory=list, max_length=300)
     released_cash_flow: ReleasedCashFlow = Field(default_factory=ReleasedCashFlow)
     field_sources: dict[str, Any] = Field(default_factory=dict)
@@ -209,6 +227,19 @@ class OperatingPlanBody(_Form):
         if any(row.expense_row_id and row.expense_row_id not in known_expenses for row in self.adjustments):
             raise ValueError("An adjustment must refer to an expense in this operating plan")
         expense_rows = {row.id: row for row in self.expenses}
+        for row in self.expenses:
+            if row.itemization_parent_id is None:
+                continue
+            parent = expense_rows.get(row.itemization_parent_id)
+            if parent is None or parent.id == row.id or parent.itemization_parent_id is not None:
+                raise ValueError("An itemization must link one retained top-level expense reference")
+            if not parent.excluded:
+                raise ValueError("Exclude the aggregate reference before counting its itemized children")
+            if row.category != parent.category or row.source_group_key != parent.source_group_key:
+                raise ValueError("Itemized children must retain their parent's category and source group")
+        correction_keys = [row.source_group_key for row in self.historical_corrections]
+        if len(correction_keys) != len(set(correction_keys)):
+            raise ValueError("Keep one historical correction record per source group")
         for row in self.adjustments:
             # Empty legacy defaults do not acquire new source claims on read.
             # Explicit placement on a linked action follows its actual owner.
@@ -239,7 +270,16 @@ def validate_body(raw):
 def action_missing(row):
     required = ["label", "driver_key", "effective_date", "explanation", "source_note", "implementation_cost"]
     kind = row["kind"]
-    if kind == "price_change":
+    if row.get("command"):
+        if row["command"].get("value") is None:
+            required += ["command.value"]
+        if kind == "expense_group_change":
+            required += ["expense_category"]
+    elif kind == "expense_group_change":
+        required += ["command"]
+    elif kind == "price_change" and row.get("price_basis") == "annual_revenue":
+        required += ["command"]
+    elif kind == "price_change":
         required += ["units_per_period", "current_unit_price", "proposed_unit_price"]
     elif kind == "product_cost_change":
         required += ["units_per_period", "current_unit_cost", "proposed_unit_cost"]
@@ -303,6 +343,15 @@ def completion(raw):
     for row in body["adjustments"]:
         if not row["excluded"]:
             missing.extend(f"adjustments.{row['id']}.{key}" for key in action_missing(row))
+    if any(row.get("command") for row in body["adjustments"]):
+        from app.services.operating_plan_commands import resolve
+
+        active_ids = {row["id"] for row in body["adjustments"] if not row["excluded"] and row["status"] != "rejected"}
+        missing.extend(f"adjustments.{row['action_id']}.command" for row in resolve(body)["commands"] if row["issues"] and row["action_id"] in active_ids)
+    from app.services.operating_plan_commands import correction_missing, itemization_missing
+
+    missing.extend(itemization_missing(body))
+    missing.extend(correction_missing(body))
     from app.services.operating_unit_economics import evaluate as unit_economics
 
     units = unit_economics(body)
@@ -315,9 +364,13 @@ def completion(raw):
 
 def key_facts(raw):
     body = validate_body(raw)
-    safe = {**body, "adjustments": [{key: value for key, value in row.items() if key not in REVIEW_FIELDS
-                                     and not (key == "expense_category" and value is None or key == "source_group_key" and not value)}
+    safe = {**body, "expenses": [{key: value for key, value in row.items() if key != "itemization_parent_id" or value is not None} for row in body["expenses"]],
+            "adjustments": [{key: value for key, value in row.items() if key not in REVIEW_FIELDS
+                                     and not (key == "expense_category" and value is None or key == "source_group_key" and not value
+                                              or key == "command" and value is None or key == "price_basis" and value == "per_unit")}
                                      for row in body["adjustments"]]}
+    if not safe["historical_corrections"]:
+        safe.pop("historical_corrections")
     return {"source_form": "operating_plan", "document_type": "operating_expenses_and_earnings_plan",
             "business_name": body["business_name"], "period_start": body["period_start"], "period_end": body["period_end"],
             "currency": body["currency"], "basis": body["basis"], "operating_plan": safe,

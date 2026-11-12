@@ -101,15 +101,34 @@ def proposal_stamp(action, linked_expense=None, body=None):
     action_defaults = {"cost_basis": "total", "unit_label": "", "current_units_per_period": None,
         "proposed_units_per_period": None, "current_fixed_amount": None, "proposed_fixed_amount": None,
         "product_name": "", "revenue_return_multiple": None, "unit_change_mode": "absolute", "unit_change_value": None,
-        "expense_category": None, "source_group_key": ""}
+        "expense_category": None, "source_group_key": "", "command": None, "price_basis": "per_unit"}
     expense_defaults = {"cost_basis": "total", "unit_label": "", "current_units_per_period": None,
-        "current_unit_cost": None, "current_fixed_amount": None, "source_group_key": "", "source_candidate_key": "", "volume_behavior": "unknown"}
+        "current_unit_cost": None, "current_fixed_amount": None, "source_group_key": "", "source_candidate_key": "", "volume_behavior": "unknown", "itemization_parent_id": None}
+    if action.get("command"):
+        if action.get("kind") in {"expense_reduction", "expense_increase"}:
+            proposal["kind"] = "expense_command"
+        derived = {"current_amount", "proposed_amount", "proposed_unit_price", "proposed_unit_cost", "proposed_units_per_period", "proposed_fixed_amount"}
+        if action["command"]["target"] != "unit_price":
+            derived.update({"cadence", "cost_basis", "unit_label", "current_unit_cost", "current_units_per_period", "current_fixed_amount"})
+        for key in derived:
+            proposal.pop(key, None)
     for row, defaults in ((proposal, action_defaults), (expense, expense_defaults)):
         if row is not None:
             for key, default in defaults.items():
                 if row.get(key) == default:
                     row.pop(key, None)
     extra = {}
+    if action.get("command"):
+        from app.services.operating_plan_commands import participants
+
+        rows = participants(action, body or {})
+        parent_ids = {row.get("itemization_parent_id") for row in rows if row.get("itemization_parent_id")}
+        extra["command_expenses"] = sorted([deepcopy(row) for row in rows], key=lambda row: str(row["id"]))
+        extra["itemization_references"] = sorted([deepcopy(row) for row in (body or {}).get("expenses", []) if row["id"] in parent_ids], key=lambda row: str(row["id"]))
+        keys = {row.get("source_group_key") for row in rows}
+        extra["historical_corrections"] = [row for row in (body or {}).get("historical_corrections", []) if row["source_group_key"] in keys]
+        if action["command"]["target"] == "annual_price_revenue":
+            extra["historical_revenue_annual"] = (body or {}).get("historical_revenue_annual")
     if action.get("kind") == "unit_volume":
         extra["unit_inputs"] = {key: (body or {}).get(key) for key in ("unit_label", "historical_units_annual",
             "historical_revenue_annual", "historical_units_period_start", "historical_units_period_end")}
@@ -302,8 +321,10 @@ def _processing(action, cockpit, issues, risks):
     return current - proposed
 
 
-def _impact(action, body, expenses, cockpit, allowed_files, now):
+def _impact(action, body, expenses, cockpit, allowed_files, now, command_result=None):
     issues = [f"Missing {key.replace('_', ' ')}" for key in action_missing(action)]
+    if command_result:
+        issues.extend(command_result["issues"])
     risks = []
     marketing_calculation = {}
     unit_calculation = {}
@@ -352,8 +373,15 @@ def _impact(action, body, expenses, cockpit, allowed_files, now):
                 gross = None
             risks.append("The volume illustration holds selling price and variable cost per business unit constant. Confirm capacity, demand and collection assumptions; fixed costs do not scale automatically.")
         elif kind == "price_change":
-            gross = (action["proposed_unit_price"] - action["current_unit_price"]) * action["units_per_period"]
+            if action.get("price_basis") == "annual_revenue":
+                gross = action["proposed_amount"] - action["current_amount"] if action["proposed_amount"] is not None and action["current_amount"] is not None else None
+                risks.append("Annual pricing holds sales volume, product mix and current variable-cost dollars constant; review demand, capacity and any revenue-linked fees separately.")
+            else:
+                gross = (action["proposed_unit_price"] - action["current_unit_price"]) * action["units_per_period"] if all(action.get(key) is not None for key in ("proposed_unit_price", "current_unit_price", "units_per_period")) else None
             risks.append("Unit volume is held constant. Validate demand, customer retention and any price-sensitive volume loss.")
+        elif kind == "expense_group_change":
+            gross = command_result["gross_annual_effect"] if command_result and not command_result["issues"] else None
+            risks.append("Proportional annual budget targets do not establish new quantities, unit rates or supplier agreements.")
         elif kind == "product_cost_change":
             gross = (action["current_unit_cost"] - action["proposed_unit_cost"]) * action["units_per_period"]
             risks.append("Unit volume is held constant. Confirm supplier pricing, quality, capacity and contract availability.")
@@ -450,11 +478,13 @@ def _impact(action, body, expenses, cockpit, allowed_files, now):
             "processing_volume", "processing_transaction_count", "current_processing_rate_pct", "proposed_processing_rate_pct",
             "current_processing_rate_basis", "proposed_processing_rate_basis", "current_processing_fixed_fee", "proposed_processing_fixed_fee",
             "current_processing_per_transaction_fee", "proposed_processing_per_transaction_fee")}, **marketing_calculation,
+            **({"command": deepcopy(command_result)} if command_result else {}),
+            **({"price_basis": "annual_revenue"} if action.get("price_basis") == "annual_revenue" else {}),
             **({"unit_change_mode": action["unit_change_mode"], "unit_change_value": action["unit_change_value"],
                 "unit_economics": unit_calculation} if kind == "unit_volume" else {})}}
 
 
-def _conflicts(actions, expenses):
+def _conflicts(actions, expenses, body=None):
     conflicts = defaultdict(list)
     by_driver, by_expense, merchant = defaultdict(list), defaultdict(list), defaultdict(list)
     for row in actions:
@@ -502,7 +532,27 @@ def _conflicts(actions, expenses):
     if aggregate and marketing:
         for row in [*aggregate, *marketing]:
             conflicts[row["id"]].append("Choose aggregate revenue/contribution-margin modeling or the marketing-return model; the marketing model already includes its incremental revenue and spend.")
+    annual_prices = [row for row in actions if row["kind"] == "price_change" and row.get("price_basis") == "annual_revenue"]
+    for price in annual_prices:
+        for row in actions:
+            if row["id"] != price["id"] and row["kind"] in {"price_change", "revenue_change", "unit_volume", "marketing_investment"}:
+                issue = f"Annual pricing action {price['id']} overlaps revenue or price action {row['id']}; use one price/volume/revenue scope. Ordinary cost changes may be modeled separately."
+                conflicts[price["id"]].append(issue)
+                conflicts[row["id"]].append(issue)
     volumes = [row for row in actions if row["kind"] == "unit_volume"]
+    from app.services.operating_plan_commands import group_rows
+
+    groups = [row for row in actions if row["kind"] == "expense_group_change"]
+    for group in groups:
+        ids = {row["id"] for row in group_rows(group, body or {"expenses": list(expenses.values())})}
+        for row in actions:
+            if row["id"] == group["id"]:
+                continue
+            other_ids = {item["id"] for item in group_rows(row, body or {"expenses": list(expenses.values())})} if row["kind"] == "expense_group_change" else {row.get("expense_row_id")}
+            if ids & other_ids or row["kind"] == "unit_volume" and any(expenses[key].get("volume_behavior") in {"variable", "mixed"} for key in ids):
+                issue = f"Group command {group['id']} overlaps action {row['id']}; keep one group or item treatment before modeling the same costs."
+                conflicts[group["id"]].append(issue)
+                conflicts[row["id"]].append(issue)
     for volume in volumes:
         for row in actions:
             if row["id"] == volume["id"]:
@@ -556,18 +606,44 @@ def _disclosure(body):
 
 def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_changes=False):
     body = validate_body(raw)
+    original = deepcopy(body)
+    from app.services.operating_plan_commands import resolve
+
+    resolved = resolve(body, cockpit)
+    body = resolved["body"]
+    original_actions = {row["id"]: row for row in original["adjustments"]}
+    commands = {row["action_id"]: row for row in resolved["commands"]}
     now = now or datetime.now(UTC)
     if isinstance(now, date) and not isinstance(now, datetime):
         now = datetime.combine(now, datetime.min.time(), UTC)
     expenses = {row["id"]: row for row in body["expenses"]}
     files, allowed = _scope_files(cockpit, source_file_ids)
     active = [row for row in body["adjustments"] if not row["excluded"] and row["status"] != "rejected"]
-    conflicts = _conflicts(active, expenses)
+    conflicts = _conflicts(active, expenses, body)
     approved_candidates = [row for row in active if row["status"] == "approved"]
-    approved_conflicts = _conflicts(approved_candidates, expenses)
+    approved_conflicts = _conflicts(approved_candidates, expenses, body)
     results = []
     for action in body["adjustments"]:
-        result = _impact(action, body, expenses, cockpit, allowed, now)
+        result = _impact(action, body, expenses, cockpit, allowed, now, commands.get(action["id"]))
+        intent = original_actions[action["id"]]
+        from app.services.operating_plan_commands import participants
+
+        participant_ids = {row["id"] for row in participants(intent, original)}
+        for split in resolved["itemization"]:
+            if participant_ids & set(split["child_expense_row_ids"]) and (split["status"] != "balanced" or split["source_group_key"] and not split["source_comparable"]):
+                result["issues"].append(f"Reconcile source itemization for parent {split['parent_expense_row_id']} before applying these costs to earnings; a historical correction remains unresolved for preparer review.")
+        if intent.get("command") and participant_ids:
+            from app.services.operating_plan_guidance import reconcile_groups
+
+            source_groups = {row["key"]: row for row in reconcile_groups(original, cockpit.get("operating_evidence") or {})}
+            references = {row["key"]: row for row in ((cockpit.get("operating_evidence") or {}).get("guidance") or {}).get("expense_groups", [])}
+            keys = {expenses[row_id].get("source_group_key") for row_id in participant_ids if expenses[row_id].get("source_group_key")}
+            for key in keys:
+                reference = references.get(key) or {}
+                same_scope = all(reference.get(field) == original.get(field) for field in ("period_start", "period_end", "currency", "basis"))
+                same_category = all(expenses[row_id]["category"] == reference.get("category") for row_id in participant_ids if expenses[row_id].get("source_group_key") == key)
+                if source_groups.get(key, {}).get("status") != "matches_source" or not same_scope or not same_category:
+                    result["issues"].append("Reconcile the command's current source group, category, reporting period, currency and basis before applying its cost change to source earnings or NOI.")
         if action["excluded"]:
             result["review_state"] = "excluded"
         elif action["status"] == "rejected":
@@ -580,6 +656,10 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
             support_ids = {*action["source_file_ids"], *((expenses.get(action.get("expense_row_id")) or {}).get("source_file_ids") or [])}
             if action["kind"] == "unit_volume":
                 support_ids.update(fid for row in body["expenses"] if not row["excluded"] for fid in row["source_file_ids"])
+            if action["kind"] == "expense_group_change":
+                from app.services.operating_plan_commands import group_rows
+
+                support_ids.update(fid for row in group_rows(action, body) for fid in row["source_file_ids"])
             if not support_ids or not any(files.get(str(file_id), {}).get("eligible_for_review") for file_id in support_ids):
                 own_issues.append("Staff review requires linked, current evidence with an accepted business association; an unsupported disclosure remains a proposal.")
             if any(str(file_id) not in allowed or not files.get(str(file_id), {}).get("eligible_for_review") for file_id in support_ids):
@@ -590,10 +670,10 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
             if action["status"] == "approved":
                 fresh = bool(action["reviewed_by_user_id"] and action["reviewed_at"] and action["review_reason"]
                              and action["review_source_stamp"] in {
-                                 review_stamp(action, cockpit, expenses.get(action.get("expense_row_id")), body),
-                                 _prior_v2_review_stamp(action, cockpit, expenses.get(action.get("expense_row_id")), body),
-                                 _legacy_review_stamp(action, cockpit, expenses.get(action.get("expense_row_id")), body),
-                                 _legacy_review_stamp(action, cockpit, expenses.get(action.get("expense_row_id")), body, before_guidance=True)})
+                                 review_stamp(intent, cockpit, expenses.get(action.get("expense_row_id")), original),
+                                 _prior_v2_review_stamp(intent, cockpit, expenses.get(action.get("expense_row_id")), original),
+                                 _legacy_review_stamp(intent, cockpit, expenses.get(action.get("expense_row_id")), original),
+                                 _legacy_review_stamp(intent, cockpit, expenses.get(action.get("expense_row_id")), original, before_guidance=True)})
                 if not fresh:
                     result["review_state"] = "stale"
                     result["risk_flags"].append("The proposal, linked expense or financial evidence changed. Staff must review the action again.")
@@ -604,6 +684,13 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
                     result["included_in_approved_projection"] = not own_issues
                     result["review_state"] = "approved" if not own_issues else "blocked"
         results.append(result)
+
+    for command in resolved["commands"]:
+        result = next(row for row in results if row["id"] == command["action_id"])
+        command.update(included_in_proposed_projection=bool(result.get("proposed_math_valid")),
+            included_in_approved_projection=bool(result.get("included_in_approved_projection")),
+            projection_issues=list(result.get("issues") or []))
+        result["calculation"]["command"] = deepcopy(command)
 
     def totals(rows):
         return {"annual_impact": _money(sum(row["net_annual_impact"] or 0 for row in rows)),
@@ -752,6 +839,17 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
             earnings_comparable=comparable, noi_comparable=noi_comparable,
             refinance_annual_debt_service=after_service, new_operating_annual=number(evaluation.get("annual_new_operating_expenses", 0)),
             source_groups=result["expense_groups"])
+        for key in ("commands", "itemization", "historical_corrections"):
+            if resolved[key]:
+                result[key] = resolved[key]
+    if resolved["commands"] or resolved["itemization"] or resolved["historical_corrections"]:
+        result["preparer_handoff"] = {"scope": "saved_version_only_when_attached_to_a_saved_version",
+            "historical": {"baseline_unchanged": True, "source_groups": deepcopy(result["expense_groups"]),
+                "itemization": resolved["itemization"], "corrections_for_preparer_review": resolved["historical_corrections"]},
+            "future": {"commands": [row for row in resolved["commands"] if not original_actions[row["action_id"]]["excluded"] and original_actions[row["action_id"]]["status"] != "rejected"],
+                "assumptions": list(dict.fromkeys(note for row in resolved["commands"] if not original_actions[row["action_id"]]["excluded"] and original_actions[row["action_id"]]["status"] != "rejected" for note in row["assumptions"]))},
+            "notes": ["Historical disclosure variances need preparer review; they do not amend a tax return or replace verified earnings.",
+                "Future operating changes are conditional proposals. This package does not file or amend tax returns."]}
     return result
 
 
@@ -789,6 +887,7 @@ def review_actions(raw, cockpit, action_ids, decision, reason, actor, *, baselin
 def package_summary(evaluation):
     """Shareable explanations, never private review reasons, actors or hashes."""
     return {"baseline": deepcopy(evaluation["baseline"]), "disclosure": deepcopy(evaluation["disclosure"]),
+        **({"preparer_handoff": deepcopy(evaluation["preparer_handoff"])} if "preparer_handoff" in evaluation else {}),
         **({"unit_economics": deepcopy(evaluation["unit_economics"])} if "unit_economics" in evaluation else {}),
         "expense_groups": deepcopy(evaluation.get("expense_groups") or []),
         "released_cash_flow": deepcopy(evaluation.get("released_cash_flow")),

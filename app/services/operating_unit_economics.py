@@ -30,8 +30,10 @@ def _annual(value, cadence):
 
 
 def enabled(body):
+    annual_pricing = any(row.get("kind") == "price_change" and row.get("price_basis") == "annual_revenue"
+        for row in body.get("adjustments", []) if not row.get("excluded"))
     return bool(body.get("unit_label") or body.get("historical_units_annual") is not None
-        or body.get("historical_revenue_annual") is not None
+        or body.get("historical_revenue_annual") is not None and not annual_pricing
         or any(row.get("volume_behavior", "unknown") != "unknown" for row in body.get("expenses", []) if not row.get("excluded"))
         or any(row.get("kind") == "unit_volume" for row in body.get("adjustments", []) if not row.get("excluded")))
 
