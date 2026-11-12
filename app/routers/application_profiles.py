@@ -210,6 +210,7 @@ from app.schemas.financial_cockpit import (
 from app.schemas.form_answers import FormAnswerFile, FormAnswersRead
 from app.schemas.funding_request import FundingRequestPatch, FundingRequestRead
 from app.schemas.investor_collateral import CollateralPatch, CollateralRead
+from app.schemas.investor_returns import InvestorReturnsQuery, InvestorReturnsRead
 from app.schemas.requirement_library import RequirementAddWrite, RequirementLibraryRead
 from app.schemas.retention import LegalHoldChange, RetentionStatusRead
 from app.schemas.use_of_funds import (
@@ -929,6 +930,24 @@ async def get_application_deal_budget(profile_id: UUID, user: CurrentUser, db: A
     from app.services import deal_budget
     deal_budget.require_staff(user)
     return await deal_budget.read(db, await profiles.load_profile(db, profile_id, user), user)
+
+
+@router.get("/{profile_id}/investor-returns", response_model=InvestorReturnsRead)
+async def get_investor_returns(profile_id: UUID, user: CurrentUser, query: InvestorReturnsQuery = Depends(),
+    db: AsyncSession = Depends(get_db)) -> InvestorReturnsRead:
+    from app.services import deal_budget, investor_returns
+    deal_budget.require_staff(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    return InvestorReturnsRead(**await investor_returns.staff_projection(db, profile, query=query))
+
+
+@router.post("/{profile_id}/investor-returns/preview", response_model=InvestorReturnsRead)
+async def preview_investor_returns(profile_id: UUID, payload: DealBudgetPreview, user: CurrentUser,
+    query: InvestorReturnsQuery = Depends(), db: AsyncSession = Depends(get_db)) -> InvestorReturnsRead:
+    from app.services import deal_budget, investor_returns
+    deal_budget.require_staff(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    return InvestorReturnsRead(**await investor_returns.staff_projection(db, profile, query=query, preview=payload))
 
 
 @router.patch("/{profile_id}/deal-budget", response_model=DealBudgetRead)
