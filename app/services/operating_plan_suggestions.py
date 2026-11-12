@@ -84,7 +84,7 @@ def _seed(body, row, key, **fields):
         "current_fixed_amount": row["current_fixed_amount"], "implementation_cost": None,
         "effective_date": body.get("projection_start"), "source_file_ids": row["source_file_ids"],
         "source_note": "Source-backed proposed comparison; validate implementation and feasibility before relying on it.",
-        "explanation": "Compare the confirmed current cost with the linked proposed terms.", "status": "proposed", **fields}
+        "explanation": "Compare the disclosed current cost with the linked proposed terms.", "status": "proposed", **fields}
 
 
 def _candidate(body, cockpit, goal, row, files, key, title, why, action=None, assumptions=None, missing=None, calculation=None):
@@ -114,7 +114,7 @@ def _candidate(body, cockpit, goal, row, files, key, title, why, action=None, as
             action = None
         else:
             missing.extend(issue.removeprefix("Missing ") for issue in result.get("issues", []) if issue.startswith("Missing "))
-        calculation = {"formula": "Confirmed current cost minus documented proposed cost; annualized once at the stated cadence.",
+        calculation = {"formula": "Disclosed current cost minus documented proposed cost; annualized once at the stated cadence.",
             "current_annual_cost": _annual(row), "annual_effect_before_setup": gross,
             "net_annual_effect": result.get("net_annual_impact") if result.get("proposed_math_valid") else None,
             "basis": "conditional_before_implementation", **(calculation or {})}
@@ -153,7 +153,8 @@ def _choices(body, cockpit, goal, row, files, safe):
             if before is None or after is None or after >= before or target == "unit_cost" and quote.get("unit_label") != row["unit_label"]:
                 continue
             key = "quote:" + str(quote.get("id") or quote["file_id"])
-            proposal = _seed(body, row, key, command={"target": target, "mode": "amount", "direction": "decrease", "value": before - after, "allocation": "none"},
+            difference = float(Decimal(str(before)) - Decimal(str(after)))
+            proposal = _seed(body, row, key, command={"target": target, "mode": "amount", "direction": "decrease", "value": difference, "allocation": "none"},
                 source_file_ids=sorted(set([*row["source_file_ids"], str(quote["file_id"])])), implementation_cost=_n(quote.get("implementation_cost")))
             choices.append(_candidate(body, cockpit, goal, row, files, key, "Use the documented lower cost", "The linked quote supplies a comparable proposed rate for this item.", proposal,
                 ["Quantity and service level are held constant.", "Confirm supplier capacity and any implementation costs."]))
@@ -177,7 +178,7 @@ def _choices(body, cockpit, goal, row, files, safe):
     review = {"rent": "Review renewal or premises costs", "salaries": "Review staffing against delivered units",
         "cogs": "Review delivery cost and pricing per unit", "marketing": "Connect marketing spend to measured sales and margin"}.get(row["category"], "Compare a supported alternative cost")
     choices.append(_candidate(body, cockpit, goal, row, files, "review:" + row["category"], review,
-        "Start with this item's confirmed cost and a comparable source for the proposed change.",
+        "Start with this item's disclosed cost and a comparable source for the proposed change.",
         missing=["Document the proposed amount or rate and confirm service/delivery capacity."],
         calculation={"current_annual_cost": _annual(row), "annual_noi_goal_gap": gap, "annual_effect_before_setup": None},
         assumptions=["A current expense is not evidence of a cheaper future price or additional demand."]))

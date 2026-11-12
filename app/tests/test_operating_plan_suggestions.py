@@ -62,6 +62,17 @@ def test_unknown_setup_is_not_zero_or_a_completed_net_projection():
     assert proposed["evaluation"]["projection"]["proposed"]["noi"] is None
 
 
+def test_documented_unit_quote_preserves_decimal_command_intent():
+    raw, cockpit = quoted()
+    row = raw["expenses"][0]
+    row.update(cost_basis="per_unit", unit_label="consultation", current_amount=800,
+        current_units_per_period=100, current_unit_cost=8, current_fixed_amount=0)
+    cockpit["operating_evidence"]["cost_quotes"][0].update(unit_cost=7.2, unit_label="consultation")
+    _, choice = ready(raw, cockpit)
+    assert choice["command"]["value"] == 0.8
+    assert choice["calculation"]["annual_effect_before_setup"] == 960
+
+
 @pytest.mark.parametrize("fault", ["association", "currency", "cadence", "other_item", "withdrawn", "boolean"])
 def test_noncomparable_or_unaccepted_quote_cannot_be_applied(fault):
     raw, cockpit = quoted()

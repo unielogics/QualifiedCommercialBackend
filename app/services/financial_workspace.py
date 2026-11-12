@@ -860,17 +860,22 @@ async def publish_version(db: AsyncSession, profile: ApplicationProfile, *, kind
         from app.services.operating_plan_commands import correction_missing, itemization_missing
 
         duplicate_missing = source_duplicate_missing(body)
+        documented_groups = {row["source_group_key"] for row in body["historical_corrections"]
+            if len(row["reason"].strip()) >= 3 and (row["source_file_ids"] or row["evidence_note"].strip())}
         expense_details = [f"expenses.{row['id']}.{key}" for row in body["expenses"] if not row["excluded"]
-                           for key in expense_missing(row)] if goal["status"] == "set" else []
-        if duplicate_missing or expense_details:
-            raise HTTPException(422, {"code": "operating_expenses_incomplete",
-                "message": "Complete the current expense details and resolve duplicate imported rows before saving a version. Your working draft is retained.",
-                "missing": [*expense_details, *duplicate_missing]})
+            for key in expense_missing(row) if not (
+                row.get("itemization_parent_id") and row["label"].strip() and row["source_group_key"] in documented_groups
+                and key in {"current_amount", "current_units_per_period", "current_unit_cost", "current_fixed_amount"}
+                and row.get(key) is None)] if goal["status"] == "set" else []
         split_missing = [*itemization_missing(body, operating_context), *correction_missing(body)]
         if split_missing:
             raise HTTPException(422, {"code": "operating_itemization_incomplete",
                 "message": "Reconcile each source split or record a historical correction with evidence for preparer review. Your working draft is retained.",
                 "missing": split_missing})
+        if duplicate_missing or expense_details:
+            raise HTTPException(422, {"code": "operating_expenses_incomplete",
+                "message": "Complete the current expense details and resolve duplicate imported rows before saving a version. Your working draft is retained.",
+                "missing": [*expense_details, *duplicate_missing]})
         assessment = earnings_improvement.evaluate(body, operating_context)
         allocation = assessment.get("cash_bridge") or assessment["released_cash_flow"]
         if (submit or goal["status"] == "set") and allocation["required"] and not allocation["complete"]:

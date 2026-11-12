@@ -466,3 +466,64 @@ async def test_profile_goal_snapshot_cannot_be_replaced_by_an_old_family_goal_or
     assert "private-audit-hash" not in str(saved) and str(event.actor_user_id) not in str(saved)
     event.meta["amount"] = "20000"
     assert saved["operating_goal"]["amount"] == 18000  # Immutable saved snapshot, not a live reference.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["name", "unscoped_cost"])
+async def test_documented_correction_does_not_hide_unnamed_or_unscoped_incomplete_expenses(missing):
+    from app.services import financial_workspace as workspace
+    from app.tests.test_financial_workspace import Memory, context
+    from app.tests.test_recognizable_plan_contract import SOURCE, source_context, split_plan
+
+    db = Memory()
+    owner, family, draft = context("operating_plan")
+    raw = split_plan(True)
+    raw["historical_corrections"] = [{"source_group_key": "source:rent", "reason": "Check source allocation",
+        "source_file_ids": [SOURCE], "evidence_note": "Disclosed ledger for preparer review"}]
+    if missing == "name":
+        raw["expenses"][-1]["label"] = ""
+    else:
+        raw["expenses"][-1]["itemization_parent_id"] = None
+    draft.body = raw
+    db.add(FileEvent(profile_id=owner.id, kind=goals.KIND, meta={"amount": "18000", "currency": "USD", "revision": 1}))
+    with patch.object(workspace, "resolve_family", AsyncMock(return_value=(family, draft))), \
+         patch.object(workspace, "source_files_for_profile", AsyncMock(return_value=[])), \
+         patch.object(workspace, "filter_current_files", AsyncMock(return_value=[])), \
+         patch("app.services.financial_cockpit.load_cockpit", AsyncMock(return_value=source_context(raw))), \
+         patch.object(workspace, "_render") as render:
+        with pytest.raises(HTTPException) as blocked:
+            await workspace.publish_version(db, owner, kind="operating_plan", expected_revision=4,
+                idempotency_key="invalid-correction-cost", actor=actor())
+    assert blocked.value.status_code == 422 and blocked.value.detail["code"] == "operating_expenses_incomplete"
+    assert any(path.endswith("label" if missing == "name" else "current_amount") for path in blocked.value.detail["missing"])
+    assert not db.versions
+    render.assert_not_called()
+
+
+def test_unknown_documented_lineage_cost_never_becomes_known_earnings_or_cash_capacity():
+    from app.services import earnings_improvement as engine
+    from app.services import operating_plan_tracking as tracking
+    from app.tests.test_earnings_improvement import action
+    from app.tests.test_plan_goals_independent import assigned, assignment, saved_loan
+    from app.tests.test_recognizable_plan_contract import (
+        NOW,
+        SOURCE,
+        command,
+        source_context,
+        split_plan,
+    )
+
+    raw = split_plan(True)
+    unknown = raw["expenses"][-1]
+    raw["adjustments"] = [action(expense_row_id=unknown["id"], current_amount=None, command=command())]
+    raw["historical_corrections"] = [{"source_group_key": "source:rent", "reason": "Check source allocation",
+        "source_file_ids": [SOURCE], "evidence_note": "Disclosed ledger for preparer review"}]
+    current = source_context(raw)
+    current.update({key: value for key, value in saved_loan().items() if key in {"plan", "debt"}})
+    current["_operating_goal"] = {"status": "set", "amount": 18000, "currency": "USD", "revision": 1}
+    raw = assigned(raw, current, [assignment(1000, "existing_cost", expense_row_id=unknown["id"])])
+    result = engine.evaluate(raw, current, now=NOW, include_expense_changes=True)
+    assert result["projection"]["proposed"]["noi"] is None
+    assert result["projection"]["approved"]["noi"] is None
+    assert result["goal_progress"]["draft_noi_before_implementation"] is None
+    assert tracking.cash_bridge(raw, current, result)["allocations"][0]["capacity_monthly"] is None
