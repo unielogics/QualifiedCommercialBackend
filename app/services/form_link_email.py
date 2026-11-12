@@ -128,6 +128,10 @@ async def email_form_link(
     user: Any,
 ) -> ApplicationRoomDelivery:
     """Mint the form's link and email it. Raises 409 when there is nobody to email."""
+    if kind == "operating_plan":
+        from app.services.operating_plan_goals import require_goal
+
+        await require_goal(db, profile)
     room_link = (
         await client_room.active_link(db, profile.primary_bucket_id) if profile.primary_bucket_id else None
     )

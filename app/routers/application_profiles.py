@@ -6686,6 +6686,18 @@ async def _open_link_or_404(db: AsyncSession, token: str):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "This link is no longer available")
     if link.kind in {"real_estate_schedule", "operating_plan"} and not getattr(link, "financial_family_id", None):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "This link is no longer available")
+    if link.kind == "operating_plan":
+        from app.models.financial_form_version import FinancialFormFamily, FinancialFormVersion
+        from app.services.operating_plan_goals import require_goal
+
+        profile = await db.get(ApplicationProfile, link.profile_id)
+        family = await db.get(FinancialFormFamily, link.financial_family_id)
+        if profile is None or family is None or family.profile_id != profile.id or family.kind != "operating_plan":
+            raise HTTPException(404, "This link is no longer available")
+        version = await db.get(FinancialFormVersion, family.current_version_id) if family.current_version_id else None
+        if version is not None and version.family_id != family.id:
+            raise HTTPException(404, "This link is no longer available")
+        await require_goal(db, profile)
     return link
 
 
@@ -6720,6 +6732,7 @@ def _client_form_response(snapshot: dict, link, token: str) -> dict:
     if link.kind == "operating_plan":
         result["completion"] = snapshot.get("completion")
         result["released_cash_flow"] = (snapshot.get("completion") or {}).get("released_cash_flow")
+        result["goal"] = snapshot.get("goal")
     if snapshot.get("saved_version"):
         result["saved_version"] = next((row for row in result["workspace"]["versions"]
             if row["id"] == snapshot["saved_version"]["id"]), snapshot["saved_version"])
@@ -6816,6 +6829,15 @@ class PublicOperatingPlanEvaluate(BaseModel):
     body: dict
 
 
+class PublicOperatingPlanSuggest(PublicOperatingPlanEvaluate):
+    expense_row_id: UUID
+
+
+class PublicOperatingPlanApplySuggestion(PublicOperatingPlanSuggest):
+    suggestion_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    context_stamp: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
 async def _public_operating_scope(db, token, *, require_edit=False):
     from app.models.financial_form_version import (
         FinancialFormDraft,
@@ -6848,6 +6870,25 @@ async def public_operating_plan_evaluate(token: str, payload: PublicOperatingPla
 
     profile, current = await _public_operating_scope(db, token, require_edit=True)
     return await client_preview(db, profile, payload.body, current=current)
+
+
+@router.post("/public/financial-forms/{token}/suggestions")
+async def public_operating_plan_suggestions(token: str, payload: PublicOperatingPlanSuggest,
+                                            db: AsyncSession = Depends(get_db)) -> dict:
+    from app.services.operating_plan_service import suggest
+
+    profile, current = await _public_operating_scope(db, token, require_edit=True)
+    return await suggest(db, profile, payload.body, current=current, expense_row_id=payload.expense_row_id, client=True)
+
+
+@router.post("/public/financial-forms/{token}/suggestions/apply")
+async def public_operating_plan_apply_suggestion(token: str, payload: PublicOperatingPlanApplySuggestion,
+                                                db: AsyncSession = Depends(get_db)) -> dict:
+    from app.services.operating_plan_service import suggest
+
+    profile, current = await _public_operating_scope(db, token, require_edit=True)
+    return await suggest(db, profile, payload.body, current=current, expense_row_id=payload.expense_row_id, client=True,
+        suggestion_id=payload.suggestion_id, context_stamp=payload.context_stamp)
 
 
 @router.get("/public/financial-forms/{token}/evidence/{file_id}")
@@ -7647,7 +7688,9 @@ async def mint_financial_form_link(
     statement_id = None
     if kind == "operating_plan":
         from app.services.operating_plan_forms import ensure_workspace
+        from app.services.operating_plan_goals import require_goal
 
+        await require_goal(db, profile)
         await ensure_workspace(db, profile, actor=user)
     if kind == "real_estate_schedule":
         from app.services.real_estate_forms import ensure_workspace

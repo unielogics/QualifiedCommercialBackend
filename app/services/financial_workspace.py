@@ -552,16 +552,20 @@ async def load_workspace(db: AsyncSession, profile: ApplicationProfile, *, kind:
             if cell.get("key") in shape.by_key:
                 cell["path"] = list(shape.by_key[cell["key"]][1].path or ())
     progress = debt_schedule_completion(body) if kind == "debt_schedule" else None
+    goal = None
     if kind == "operating_plan":
         from app.services.financial_cockpit import load_cockpit
+        from app.services.operating_plan_goals import read_goal
         from app.services.operating_plan_service import completion as operating_completion
 
+        goal = await read_goal(db, profile)
         cash = body.get("released_cash_flow") or {}
         needs_context = ((getattr(profile, "financial_plan", None) or {}).get("updated_at")
                          or cash.get("source_fingerprint") or cash.get("allocations")
-                         or any(row.get("itemization_parent_id") for row in body.get("expenses", [])))
+                         or any(row.get("itemization_parent_id") for row in body.get("expenses", []))
+                         or goal["status"] == "set")
         progress = operating_completion(body, await load_cockpit(db, profile) if needs_context else {})
-    return {"kind": kind, "family_id": str(family.id), "label": family.label, "body": body, "schema": sheets._schema_for(kind), "worksheet": {"layout": layout, "values": sheet_layout.flatten(kind, visible), "computed": computed}, "draft": {"revision": draft.revision, "base_version_id": str(draft.base_version_id) if draft.base_version_id else None, "updated_at": draft.updated_at.isoformat(), "dirty": current is None or body_hash(body) != current.body_sha256}, "completion": progress, "accepted_completion": debt_schedule_completion(accepted.body) if accepted else None, "accepted_version_id": str(accepted.id) if accepted else None, "current_version_id": str(family.current_version_id) if family.current_version_id else None, "versions": [_version_read(version) for version in versions], "families": [{"id": str(item.id), "kind": item.kind, "label": item.label, "current_version_id": str(item.current_version_id) if item.current_version_id else None} for item in await _families(db, profile.id)], "evidence": evidence}
+    return {"kind": kind, **({"goal": goal} if kind == "operating_plan" else {}), "family_id": str(family.id), "label": family.label, "body": body, "schema": sheets._schema_for(kind), "worksheet": {"layout": layout, "values": sheet_layout.flatten(kind, visible), "computed": computed}, "draft": {"revision": draft.revision, "base_version_id": str(draft.base_version_id) if draft.base_version_id else None, "updated_at": draft.updated_at.isoformat(), "dirty": current is None or body_hash(body) != current.body_sha256}, "completion": progress, "accepted_completion": debt_schedule_completion(accepted.body) if accepted else None, "accepted_version_id": str(accepted.id) if accepted else None, "current_version_id": str(family.current_version_id) if family.current_version_id else None, "versions": [_version_read(version) for version in versions], "families": [{"id": str(item.id), "kind": item.kind, "label": item.label, "current_version_id": str(item.current_version_id) if item.current_version_id else None} for item in await _families(db, profile.id)], "evidence": evidence}
 
 
 def _check_revision(draft: FinancialFormDraft, expected_revision: int) -> None:
@@ -848,15 +852,28 @@ async def publish_version(db: AsyncSession, profile: ApplicationProfile, *, kind
             body = operating_plan_service.protect_reviews(body, empty_operating_body())
         body = await operating_plan_service.prepare_draft(db, profile, incoming=body, current=body, actor=actor)
         operating_context = await load_cockpit(db, profile)
+        from app.services.operating_plan_goals import read_goal, require_goal
+
+        goal = await require_goal(db, profile) if operating_client_submission else await read_goal(db, profile)
+        operating_context["_operating_goal"] = goal
+        from app.schemas.earnings_improvement import expense_missing, source_duplicate_missing
         from app.services.operating_plan_commands import correction_missing, itemization_missing
 
+        duplicate_missing = source_duplicate_missing(body)
+        expense_details = [f"expenses.{row['id']}.{key}" for row in body["expenses"] if not row["excluded"]
+                           for key in expense_missing(row)] if goal["status"] == "set" else []
+        if duplicate_missing or expense_details:
+            raise HTTPException(422, {"code": "operating_expenses_incomplete",
+                "message": "Complete the current expense details and resolve duplicate imported rows before saving a version. Your working draft is retained.",
+                "missing": [*expense_details, *duplicate_missing]})
         split_missing = [*itemization_missing(body, operating_context), *correction_missing(body)]
         if split_missing:
             raise HTTPException(422, {"code": "operating_itemization_incomplete",
                 "message": "Reconcile each source split or record a historical correction with evidence for preparer review. Your working draft is retained.",
                 "missing": split_missing})
-        allocation = earnings_improvement.evaluate(body, operating_context)["released_cash_flow"]
-        if submit and allocation["required"] and not allocation["complete"]:
+        assessment = earnings_improvement.evaluate(body, operating_context)
+        allocation = assessment.get("cash_bridge") or assessment["released_cash_flow"]
+        if (submit or goal["status"] == "set") and allocation["required"] and not allocation["complete"]:
             raise HTTPException(422, {"code": "released_cash_flow_incomplete",
                 "message": "Reconcile the recurring released-cash-flow allocation before submitting. Your draft is retained.",
                 "missing": allocation["missing"], "released_cash_flow": allocation})
@@ -878,6 +895,10 @@ async def publish_version(db: AsyncSession, profile: ApplicationProfile, *, kind
         facts["evidence_sources"] = [{key: row.get(key) for key in ("file_id", "file_name", "classification")}
                                      for row in (operating_context.get("operating_evidence") or {}).get("files", [])]
         facts["proposal_status"] = "client_submitted" if operating_client_submission else "staff_saved"
+        if goal["status"] == "set":
+            facts["operating_goal"] = goal
+            facts["goal_progress"] = evaluation.get("goal_progress")
+            facts["cash_bridge"] = evaluation.get("cash_bridge")
     versions = list((await db.execute(select(FinancialFormVersion).where(FinancialFormVersion.family_id == family.id))).scalars().all())
     if kind == "debt_schedule":
         completion = debt_schedule_completion(body)

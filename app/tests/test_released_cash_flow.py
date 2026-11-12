@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 from app.enums import Role
 from app.models.application_profile import ApplicationRequirementState
+from app.models.file_event import FileEvent
 from app.routers.application_profiles import _client_form_response
 from app.schemas.earnings_improvement import empty_body, validate_body
 from app.services import (
@@ -190,6 +191,9 @@ async def test_submit_rejects_unallocated_cash_before_pdf_storage_or_publication
     db = Memory()
     profile, family, draft = context("operating_plan")
     draft.body = operating_body()
+    goal = FileEvent(profile_id=profile.id, kind="operating_plan.goal_set",
+        meta={"amount": "18000", "currency": "USD", "revision": 1})
+    db.add(goal)
     original = deepcopy(draft.body)
     with patch.object(financial_workspace, "resolve_family", AsyncMock(return_value=(family, draft))), \
          patch("app.services.financial_cockpit.load_cockpit", AsyncMock(return_value=cockpit())), \
@@ -199,7 +203,7 @@ async def test_submit_rejects_unallocated_cash_before_pdf_storage_or_publication
             idempotency_key="unallocated-submit", submit=True, actor=SimpleNamespace(role=Role.CLIENT, id=None))
     assert error.value.status_code == 422 and error.value.detail["code"] == "released_cash_flow_incomplete"
     render.assert_not_called()
-    assert not db.versions and not db.added and family.current_version_id is None and draft.body == original
+    assert not db.versions and db.added == [goal] and family.current_version_id is None and draft.body == original
 
 
 @pytest.mark.asyncio

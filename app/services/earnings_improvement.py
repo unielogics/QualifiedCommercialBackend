@@ -850,6 +850,12 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
                 "assumptions": list(dict.fromkeys(note for row in resolved["commands"] if not original_actions[row["action_id"]]["excluded"] and original_actions[row["action_id"]]["status"] != "rejected" for note in row["assumptions"]))},
             "notes": ["Historical disclosure variances need preparer review; they do not amend a tax return or replace verified earnings.",
                 "Future operating changes are conditional proposals. This package does not file or amend tax returns."]}
+    goal = cockpit.get("_operating_goal") or {}
+    if goal.get("status") == "set":
+        from app.services.operating_plan_tracking import cash_bridge, goal_progress
+
+        result["goal_progress"] = goal_progress(goal, result)
+        result["cash_bridge"] = cash_bridge(original, cockpit, result)
     return result
 
 
@@ -886,11 +892,19 @@ def review_actions(raw, cockpit, action_ids, decision, reason, actor, *, baselin
 
 def package_summary(evaluation):
     """Shareable explanations, never private review reasons, actors or hashes."""
+    from app.services.operating_plan_tracking import public_summary
+
+    released = deepcopy(evaluation.get("released_cash_flow"))
+    if released is not None:
+        released["allocations"] = [{key: value for key, value in row.items()
+                                    if key not in {"purpose", "action_id"} or value is not None}
+                                   for row in released.get("allocations", [])]
     return {"baseline": deepcopy(evaluation["baseline"]), "disclosure": deepcopy(evaluation["disclosure"]),
+        **public_summary(evaluation),
         **({"preparer_handoff": deepcopy(evaluation["preparer_handoff"])} if "preparer_handoff" in evaluation else {}),
         **({"unit_economics": deepcopy(evaluation["unit_economics"])} if "unit_economics" in evaluation else {}),
         "expense_groups": deepcopy(evaluation.get("expense_groups") or []),
-        "released_cash_flow": deepcopy(evaluation.get("released_cash_flow")),
+        "released_cash_flow": released,
         "projection": deepcopy(evaluation["projection"]), "totals": deepcopy(evaluation["totals"]),
         "targets": deepcopy(evaluation["targets"]), "missing": list(evaluation["missing"]),
         "risk_flags": list(evaluation["risk_flags"]), "notes": list(evaluation["notes"]),

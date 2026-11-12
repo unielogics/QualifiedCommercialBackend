@@ -56,6 +56,10 @@ class Memory:
         return self.objects.get((model, key))
 
     async def execute(self, statement):
+        from app.models.file_event import FileEvent
+
+        if statement.column_descriptions[0].get("entity") is FileEvent:
+            return Result(row for row in self.added if isinstance(row, FileEvent))
         if str(statement).startswith("SELECT bucket_files.id"):
             # These publication fixtures contain independent baseline sources;
             # material replacement SQL is exercised by its own selector tests.

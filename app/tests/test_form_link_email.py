@@ -18,6 +18,7 @@ from fastapi import HTTPException
 
 from app.enums import Role
 from app.models.application_profile import ApplicationRoomDelivery
+from app.models.file_event import FileEvent
 from app.services import form_link_email as fle
 
 
@@ -26,6 +27,7 @@ class _Result:
     def scalars(self): return self
     def first(self): return self._value
     def scalar_one_or_none(self): return self._value
+    def all(self): return [self._value] if self._value is not None else []
 
 
 class _DB:
@@ -35,6 +37,7 @@ class _DB:
         self.intake, self.client, self.recent, self.state = intake, client, recent, state
         self.added: list = []
         self.flushed = 0
+        self.goal = None
 
     async def get(self, model, _id):
         return self.intake if model.__name__ == "PublicUnderwritingIntake" else self.client
@@ -45,6 +48,8 @@ class _DB:
             return _Result(self.recent)
         if "application_requirement_states" in text:
             return _Result(self.state)
+        if "file_events" in text:
+            return _Result(self.goal)
         raise AssertionError(f"unexpected query: {text[:80]}")
 
     def add(self, row): self.added.append(row)
@@ -277,6 +282,7 @@ async def test_operating_plan_email_binds_the_shared_versioned_family_and_requir
     monkeypatch.setattr(fle.financial_statements, "mint_link", AsyncMock(return_value=(held, "operating-form-token")))
     state = SimpleNamespace(last_requested_at=None, first_requested_at=None, status="missing")
     db = _DB(intake=_intake(), state=state)
+    db.goal = FileEvent(profile_id=profile.id, kind="operating_plan.goal_set", meta={"amount": "18000", "currency": "USD", "revision": 1})
     delivery = await fle.email_form_link(db, profile=profile, kind="operating_plan",
         label="Operating expenses and earnings plan", slot=None, user=user)
     prepare.assert_awaited_once_with(db, profile, actor=user)

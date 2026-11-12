@@ -156,6 +156,8 @@ class ReleasedCashFlowAllocation(_Form):
     label: str = Field(default="", max_length=240)
     amount_monthly: float | None = Field(default=None, ge=0, le=1e15)
     expense_row_id: UUID | None = None
+    action_id: UUID | None = None
+    purpose: Literal["existing_cost", "planned_increment", "reserve", "other"] | None = None
     notes: str = Field(default="", max_length=4000)
 
 
@@ -340,6 +342,7 @@ def completion(raw):
                    if decision == "confirmed" and category not in active_categories)
     for row in active:
         missing.extend(f"expenses.{row['id']}.{key}" for key in expense_missing(row))
+    missing.extend(source_duplicate_missing(body))
     for row in body["adjustments"]:
         if not row["excluded"]:
             missing.extend(f"adjustments.{row['id']}.{key}" for key in action_missing(row))
@@ -362,6 +365,17 @@ def completion(raw):
             "active_adjustments": sum(not row["excluded"] for row in body["adjustments"])}
 
 
+def source_duplicate_missing(body):
+    """Exact import identity only; equal labels, amounts or categories prove nothing."""
+    candidates = {}
+    for row in body.get("expenses", []):
+        if row.get("excluded") or row.get("itemization_parent_id") or not row.get("source_candidate_key"):
+            continue
+        candidates.setdefault(row["source_candidate_key"], []).append(row["id"])
+    return [f"expenses.{identifier}.source_candidate_duplicate"
+            for ids in candidates.values() if len(ids) > 1 for identifier in ids]
+
+
 def key_facts(raw):
     body = validate_body(raw)
     safe = {**body, "expenses": [{key: value for key, value in row.items() if key != "itemization_parent_id" or value is not None} for row in body["expenses"]],
@@ -371,6 +385,9 @@ def key_facts(raw):
                                      for row in body["adjustments"]]}
     if not safe["historical_corrections"]:
         safe.pop("historical_corrections")
+    safe["released_cash_flow"] = {**safe["released_cash_flow"], "allocations": [
+        {key: value for key, value in row.items() if key not in {"action_id", "purpose"} or value is not None}
+        for row in safe["released_cash_flow"]["allocations"]]}
     return {"source_form": "operating_plan", "document_type": "operating_expenses_and_earnings_plan",
             "business_name": body["business_name"], "period_start": body["period_start"], "period_end": body["period_end"],
             "currency": body["currency"], "basis": body["basis"], "operating_plan": safe,

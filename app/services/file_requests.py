@@ -176,6 +176,10 @@ async def create_batch(
         raise ValueError("A valid canonical identity is required for each file request")
     if source_contexts is not None and len(source_contexts) != len(items):
         raise ValueError("A source context is required for each file request")
+    if any(item.document_type == "operating_plan" for item in items):
+        from app.services.operating_plan_goals import require_goal
+
+        await require_goal(db, profile)
     if profile.primary_bucket_id is None:
         raise HTTPException(409, "This file has no document room")
     await lock_profile(db, profile)

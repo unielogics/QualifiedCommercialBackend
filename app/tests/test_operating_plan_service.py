@@ -142,6 +142,9 @@ async def test_publication_creates_immutable_proposal_pdf_without_actual_project
     db = Memory()
     profile, family, draft = context("operating_plan")
     draft.body = proposal()
+    if client:
+        db.add(FileEvent(profile_id=profile.id, kind="operating_plan.goal_set",
+            meta={"amount": "18000", "currency": "USD", "revision": 1}))
     actor = SimpleNamespace(id=None if client else uuid4(), name="Client" if client else "Desk", role=Role.CLIENT if client else Role.LOAN_EXEC)
     slot = SimpleNamespace(id=uuid4(), status="requested")
     async def project(*args, **kwargs):

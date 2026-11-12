@@ -22,6 +22,7 @@ from app.models.application_profile import (
     ApplicationRoomDelivery,
 )
 from app.models.bucket import BucketRequestedDocument
+from app.models.file_event import FileEvent
 from app.routers import file_requests as routes
 from app.schemas.file_request import FileRequestItem
 from app.services import collection_tasks, file_requests
@@ -33,7 +34,7 @@ def sqlite_json(_type, _compiler, **_kwargs):
 
 
 @asynccontextmanager
-async def database(tmp_path):
+async def database(tmp_path, *, goal_set=True):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'requests.db'}")
 
     @sa.event.listens_for(engine.sync_engine, "connect")
@@ -43,7 +44,7 @@ async def database(tmp_path):
     metadata = sa.MetaData()
     for name in ("buckets", "application_profiles", "users", "bucket_files", "bucket_document_templates"):
         sa.Table(name, metadata, sa.Column("id", sa.Uuid(), primary_key=True))
-    for model in (BucketRequestedDocument, ApplicationRequirementState, ApplicationCollectionTask, ApplicationRoomDelivery):
+    for model in (BucketRequestedDocument, ApplicationRequirementState, ApplicationCollectionTask, ApplicationRoomDelivery, FileEvent):
         table = model.__table__.to_metadata(metadata)
         for column in table.columns:
             if column.server_default is not None:
@@ -62,6 +63,10 @@ async def database(tmp_path):
         await connection.run_sync(metadata.create_all)
         for name, identifier in (("application_profiles", owner.id), ("buckets", owner.primary_bucket_id), ("users", actor.id)):
             await connection.execute(metadata.tables[name].insert().values(id=identifier))
+        if goal_set:
+            await connection.execute(metadata.tables["file_events"].insert().values(id=uuid4(), profile_id=owner.id,
+                kind="operating_plan.goal_set", visibility="desk", actor_user_id=actor.id, title="Synthetic staff goal",
+                notice_status="none", notice_recipients=[], meta={"amount": "18000", "currency": "USD", "revision": 1}))
     try:
         async with AsyncSession(engine, expire_on_commit=False) as db:
             yield db, engine, owner, actor
@@ -171,3 +176,40 @@ async def test_real_notify_post_commits_requests_before_provider_and_replays_one
             assert repeated.json()["notification"]["id"] == output["notification"]["id"]
             assert await counts(db) == (2, 2, 1)
         sender.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_goalless_mixed_request_batch_is_rejected_before_any_destination_or_notification(tmp_path, monkeypatch):
+    async with database(tmp_path, goal_set=False) as (db, engine, owner, actor):
+        mock_external_work(monkeypatch, owner)
+        sender = AsyncMock()
+        monkeypatch.setattr(file_requests.missing_item_automation, "send_requirements_email", sender)
+        async with AsyncClient(transport=ASGITransport(app=app_for(db, actor)), base_url="http://test") as client:
+            response = await client.post(f"/api/v1/application-profiles/{owner.id}/file-requests", json={
+                "request_id": str(uuid4()), "notify": True, "items": [
+                    {"document_type": "bank_statement", "name": "Statements"},
+                    {"document_type": "operating_plan", "name": "Operating plan"}]})
+        assert response.status_code == 409 and response.json()["detail"]["state"] == "goal_awaiting_staff"
+        assert await counts(db) == (0, 0, 0)
+        await db.rollback()
+        async with AsyncSession(engine) as observer:
+            assert await counts(observer) == (0, 0, 0)
+        sender.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_goal_receipt_survives_real_orm_roundtrip_and_noop_has_no_extra_revision(tmp_path):
+    from app.services import operating_plan_goals
+
+    async with database(tmp_path, goal_set=False) as (db, engine, owner, actor):
+        first = await operating_plan_goals.set_goal(db, owner, amount="18000.01", currency="USD",
+            expected_revision=0, idempotency_key="real-synthetic-goal", actor=actor)
+        await db.commit()
+        async with AsyncSession(engine) as observer:
+            assert await operating_plan_goals.read_goal(observer, owner) == first
+        repeated = await operating_plan_goals.set_goal(db, owner, amount="18000.01", currency="USD",
+            expected_revision=1, idempotency_key="real-synthetic-noop", actor=actor)
+        assert repeated == first
+        receipts = (await db.execute(sa.select(FileEvent))).scalars().all()
+        assert len(receipts) == 1 and receipts[0].meta["amount"] == "18000.01"
+        assert receipts[0].actor_user_id == actor.id and receipts[0].notice_status == "none"
