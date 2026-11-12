@@ -370,8 +370,8 @@ async def _listing_admin_out(db: AsyncSession, listing: CpListing) -> S.ListingA
     investor_count = (await F.investor_counts(db)).get(listing.id, 0)
     sync = await SYNC.sync_for_listing(db, listing)
     from .services.ppm import bind_access_state
-    await bind_access_state(db, listing)
-    publish_issues = L.publish_issues(listing) if listing.status == E.ListingStatus.DRAFT else []
+    await bind_access_state(db, listing, for_publication=True)
+    publish_issues = L.publish_issues(listing) if listing.status in {E.ListingStatus.DRAFT, E.ListingStatus.OPEN} else []
     return S.ListingAdminOut(
         **L.card(listing, committed),
         sync=sync,
@@ -578,7 +578,9 @@ async def publish_listing(listing_id: uuid.UUID, payload: S.PublishIn, admin: Cp
     listing = await _load_admin_listing(db, listing_id)
     await _require_current_file_snapshot(db, listing)
     try:
-        await L.publish(db, listing, actor_user_id=admin.id, reason=payload.reason)
+        await L.publish(db, listing, actor_user_id=admin.id, reason=payload.reason,
+            expected_ppm_document_id=payload.expected_ppm_document_id,
+            expected_ppm_source_fingerprint=payload.expected_ppm_source_fingerprint)
     except L.RuleError as exc:
         error = _rule(exc)
         if exc.code == "incomplete":
@@ -765,6 +767,12 @@ async def ppm_version_url(listing_id: uuid.UUID, document_id: uuid.UUID, request
         detail={"document_id": str(document.id), "version": document.version, "download": download,
             "ip_address": (client_ip(request) or "")[:64], "user_agent": (request.headers.get("user-agent") or "")[:400]})
     return S.DocumentUrlOut(url=url, expires_in_seconds=storage.DOCUMENT_URL_TTL_SECONDS)
+
+
+@router.post("/listings/{listing_id}/ppm/versions/{document_id}/reinstate", response_model=S.PpmRead)
+async def reinstate_ppm(listing_id: uuid.UUID, document_id: uuid.UUID, payload: S.PpmReinstateIn, admin: CpAdmin, db: Db) -> S.PpmRead:
+    from .services import ppm
+    return S.PpmRead(**await ppm.reinstate(db, await _load_admin_listing(db, listing_id), document_id, admin.id, payload))
 
 
 @router.get("/listings/{listing_id}/file-documents")

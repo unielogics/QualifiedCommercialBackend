@@ -193,6 +193,14 @@ class PpmReviewIn(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class PpmReinstateIn(BaseModel):
+    expected_version: int = Field(ge=1)
+    expected_source_fingerprint: str = Field(min_length=1, max_length=128)
+    idempotency_key: str = Field(min_length=1, max_length=128)
+
+    model_config = {"extra": "forbid"}
+
+
 class PpmMissing(BaseModel):
     key: str
     label: str
@@ -263,6 +271,9 @@ class PpmRead(BaseModel):
     source_fingerprint: str
     current_draft: PpmVersion | None
     current_approved: PpmVersion | None
+    active_version: PpmVersion | None = None
+    working_draft_document_id: UUID | None = None
+    latest_version: int | None = None
     history: list[PpmVersion]
     missing: list[PpmMissing]
     warnings: list[str]
@@ -845,6 +856,8 @@ class ListingAdminOut(ListingDetail):
 class PublishIn(BaseModel):
     reason: str = Field(min_length=3, max_length=2000)
     confirmed: bool
+    expected_ppm_document_id: UUID | None = None
+    expected_ppm_source_fingerprint: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class StatusIn(BaseModel):

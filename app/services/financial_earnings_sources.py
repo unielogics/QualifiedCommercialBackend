@@ -30,13 +30,23 @@ def _file(candidate):
     return str(next((ref.get("file_id") for ref in candidate.get("source_refs", []) if ref.get("file_id")), ""))
 
 
+def provenance_order(row):
+    """Stable oldest-to-newest evidence order before period extraction/ties."""
+    return (str(row.get("document_created_at") or ""), str(row.get("analyzed_at") or ""),
+            int(row.get("document_version_number") or 0), int(row.get("analysis_version") or 0),
+            str(row.get("file_id") or ""), str(row.get("analysis_id") or ""))
+
+
 def _source_order(row):
+    # Equal reporting periods need persisted provenance tie-breaks. Database
+    # retrieval order is not a financial source-selection decision.
+    provenance = provenance_order(row)
     try:
         end = date.fromisoformat(str(row.get("period_end")))
-        return (end.year, end.month, end.day, row["kind"] == "profit_and_loss")
+        return (end.year, end.month, end.day, row["kind"] == "profit_and_loss", *provenance)
     except (TypeError, ValueError):
         year = str(row.get("tax_year") or "")
-        return (int(year) if len(year) == 4 and year.isdigit() else 0, 0, 0, False)
+        return (int(year) if len(year) == 4 and year.isdigit() else 0, 0, 0, False, *provenance)
 
 
 def attach(ebitda, review, analyses, years, statement, bank, *, state=None, entity=None, now=None):
@@ -76,6 +86,9 @@ def attach(ebitda, review, analyses, years, statement, bank, *, state=None, enti
         sources.append({
             "file_id": str(row.get("file_id")), "file_name": row.get("file_name"),
             "analysis_id": row.get("analysis_id"), "content_hash": row.get("content_hash"),
+            "analyzed_at": row.get("analyzed_at"),
+            "document_created_at": row.get("document_created_at"),
+            "document_version_number": row.get("document_version_number"), "analysis_version": row.get("analysis_version"),
             "entity": identity, "period": candidate.get("period") if candidate else str(facts.get("tax_year") or facts.get("period_end") or "Unknown period"),
             "period_end": (candidate or {}).get("period_end") or next((ref.get("period_end") for ref in source_refs if ref.get("period_end")), None) or facts.get("period_end") or tax_period.get("period_end"),
             "tax_year": tax_year_by_file.get(str(row.get("file_id"))) or (str(tax_period["period_end"])[:4] if tax_period.get("period_end") else facts.get("tax_year")),
@@ -95,7 +108,10 @@ def attach(ebitda, review, analyses, years, statement, bank, *, state=None, enti
             # the latest period when financial inputs or its association need
             # review. A known different business never displaces this one.
             business_periods.append(sources[-1])
-    catalog_stamp = stamp([{key: row.get(key) for key in ("file_id", "source_stamp", "eligible")} for row in sorted(sources, key=lambda item: item["file_id"])])
+    # Preserve every source and its flags in one deterministic catalog. The
+    # reporting snapshot is bound by PPM/package freshness guards.
+    sources.sort(key=lambda row: (row["file_id"], str(row.get("analysis_id") or "")))
+    catalog_stamp = stamp([{key: row.get(key) for key in ("file_id", "source_stamp", "eligible")} for row in sources])
     history = [event for event in state.get("events", []) if event.get("source_metric") == "ebitda"]
     event = history[-1] if history else None
     stale = bool(event and event.get("source_stamp") != catalog_stamp)
