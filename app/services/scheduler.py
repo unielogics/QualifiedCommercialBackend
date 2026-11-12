@@ -98,6 +98,13 @@ def start_scheduler() -> None:
 
     gmail_push_configured = bool(get_settings().gmail_pubsub_topic)
 
+    from app.services.chatgpt_product_feed import drain_pending as drain_chatgpt_feed
+
+    scheduler.add_job(
+        _wrap(drain_chatgpt_feed), "interval", seconds=60,
+        id="chatgpt_product_feed", replace_existing=True, coalesce=True, max_instances=1,
+    )
+
     scheduler.add_job(
         _wrap(job_marketplace_ppm_refresh),
         "interval",

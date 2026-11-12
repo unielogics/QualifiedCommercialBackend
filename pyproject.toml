@@ -15,6 +15,7 @@ dependencies = [
     "pydantic-settings>=2.6.0",
     "httpx>=0.28.0",
     "boto3>=1.35.0",
+    "paramiko>=3.5.1,<5",
     "pyjwt[crypto]>=2.10.0",
     "python-multipart>=0.0.20",
     "websockets>=14.0",

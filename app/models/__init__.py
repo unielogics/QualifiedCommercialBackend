@@ -258,3 +258,5 @@ from app.models.sms_opt_out import SmsOptOut  # noqa: F401
 from app.models.user import User  # noqa: F401
 from app.models.user_access import UserAccessEvent, UserProductAccess  # noqa: F401
 from app.models.vector_log import VectorLog  # noqa: F401
+
+from app.models.chatgpt_product_feed import ChatGPTFeedConfig, ChatGPTFeedRun  # noqa: F401
