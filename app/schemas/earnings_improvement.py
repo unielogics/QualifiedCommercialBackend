@@ -15,12 +15,13 @@ ExpenseCategory = Literal["rent", "salaries", "payroll_taxes", "insurance", "uti
     "professional_fees", "supplies", "repairs", "transportation", "cogs", "merchant_processing", "other",
     "loan_payments", "income_taxes", "owner_draws", "transfers", "depreciation_amortization"]
 ActionKind = Literal["price_change", "product_cost_change", "revenue_change", "expense_reduction", "expense_increase",
-                     "processing_cost_change", "marketing_investment", "one_time_adjustment"]
+                     "processing_cost_change", "marketing_investment", "unit_volume", "one_time_adjustment"]
 CategoryConfirmation = Literal["confirmed", "not_applicable", "needs_help"]
 ReviewDecision = Literal["proposed", "approved", "rejected"]
 BaselineTreatment = Literal["unreconciled", "included_in_baseline", "incremental_to_baseline", "outside_operating_earnings"]
 RateBasis = Literal["all_in", "processor_markup", "unknown"]
 CostBasis = Literal["total", "per_unit"]
+VolumeBehavior = Literal["unknown", "fixed", "variable", "mixed"]
 
 REVIEW_FIELDS = ("status", "reviewed_by_user_id", "reviewed_at", "review_reason", "review_source_stamp",
                  "baseline_treatment", "baseline_reconciliation_note")
@@ -48,6 +49,7 @@ class ExpenseRow(_Form):
     payee: str = Field(default="", max_length=240)
     current_amount: float | None = Field(default=None, ge=0, le=1e15)
     cost_basis: CostBasis = "total"
+    volume_behavior: VolumeBehavior = "unknown"
     unit_label: str = Field(default="", max_length=120)
     current_units_per_period: float | None = Field(default=None, ge=0, le=1e15)
     current_unit_cost: float | None = Field(default=None, ge=0, le=1e15)
@@ -86,6 +88,8 @@ class AdjustmentRow(_Form):
     proposed_unit_cost: float | None = Field(default=None, ge=0, le=1e15)
     contribution_margin_pct: float | None = Field(default=None, ge=0, le=100)
     revenue_return_multiple: float | None = Field(default=None, ge=0, le=1e15)
+    unit_change_mode: Literal["absolute", "percent"] = "absolute"
+    unit_change_value: float | None = Field(default=None, ge=-1e15, le=1e15)
     implementation_cost: float | None = Field(default=None, ge=0, le=1e15)
     implementation_cost_cadence: Literal["one_time", "monthly", "annual"] = "one_time"
     effective_date: date | None = None
@@ -155,6 +159,11 @@ class OperatingPlanBody(_Form):
     projection_start: date | None = None
     currency: str = Field(default="USD", pattern=r"^(?:[A-Z]{3})?$")
     basis: Literal["cash", "accrual", "unknown"] = "unknown"
+    unit_label: str = Field(default="", max_length=120)
+    historical_units_annual: float | None = Field(default=None, ge=0, le=1e15)
+    historical_revenue_annual: float | None = Field(default=None, ge=0, le=1e15)
+    historical_units_period_start: date | None = None
+    historical_units_period_end: date | None = None
     no_operating_expenses_confirmed: bool = False
     client_attestation: bool = False
     notes: str = Field(default="", max_length=10000)
@@ -164,7 +173,7 @@ class OperatingPlanBody(_Form):
     released_cash_flow: ReleasedCashFlow = Field(default_factory=ReleasedCashFlow)
     field_sources: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("period_start", "period_end", "projection_start", mode="before")
+    @field_validator("period_start", "period_end", "projection_start", "historical_units_period_start", "historical_units_period_end", mode="before")
     @classmethod
     def empty_dates(cls, value):
         return None if value == "" else value
@@ -230,6 +239,8 @@ def action_missing(row):
     elif kind == "marketing_investment":
         required += ["product_name", "expense_row_id", "current_amount", "proposed_amount",
                      "revenue_return_multiple", "contribution_margin_pct"]
+    elif kind == "unit_volume":
+        required += ["unit_change_value"]
     elif kind in {"expense_reduction", "expense_increase"} and row.get("cost_basis") == "per_unit":
         required += ["unit_label", "current_units_per_period", "proposed_units_per_period", "current_unit_cost",
                      "proposed_unit_cost", "current_fixed_amount", "proposed_fixed_amount"]
@@ -283,6 +294,12 @@ def completion(raw):
     for row in body["adjustments"]:
         if not row["excluded"]:
             missing.extend(f"adjustments.{row['id']}.{key}" for key in action_missing(row))
+    from app.services.operating_unit_economics import evaluate as unit_economics
+
+    units = unit_economics(body)
+    if units is not None:
+        missing.extend(units["missing"])
+    missing = list(dict.fromkeys(missing))
     return {"complete": not missing, "missing": missing, "missing_count": len(missing), "active_expenses": len(active),
             "active_adjustments": sum(not row["excluded"] for row in body["adjustments"])}
 

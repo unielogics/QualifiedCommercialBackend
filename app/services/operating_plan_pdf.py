@@ -32,6 +32,31 @@ def _unit_breakdown(row, currency):
     return f"Quantity: {_text(row.get('current_units_per_period'))} {_text(row.get('unit_label'))}; unit cost: {_money(row.get('current_unit_cost'), currency)}; fixed cost: {_money(row.get('current_fixed_amount'), currency)} / {_text(row.get('cadence'))}. Recorded source total: {_money(row.get('current_amount'), currency)}. The derived total uses quantity times unit cost plus fixed cost; the source total is not added again."
 
 
+def _business_units(summary, body, currency):
+    from app.services.operating_unit_economics import evaluate
+
+    value = summary.get("unit_economics") or evaluate(body)
+    if value is None:
+        return ""
+    rows = "".join(f"<tr><td>{_text(row.get('label'))}<br><small>{_text(row.get('scope_note')) if row.get('scope_note') else _text(row.get('volume_behavior')).title()}</small></td>"
+        f"<td class='num'>{_money(row.get('current_annual_amount'), currency)}</td>"
+        f"<td class='num'>{_money(row.get('current_average_cost_per_unit'), currency)}</td>"
+        f"<td class='num'>{_money(row.get('current_variable_cost_per_unit'), currency)}</td>"
+        f"<td class='num'>{_money(row.get('proposed_annual_amount'), currency)}</td></tr>" for row in value.get("rows", []))
+    one_time = "".join(f"<p>{_text(row.get('label'))}: one-time disclosure {_money(row.get('one_time_amount'), currency)}. {_text(row.get('scope_note'))}</p>"
+        for row in value.get("rows", []) if not row.get("recurring", True))
+    missing = "<ul>" + "".join(f"<li>{_text(path)}</li>" for path in value["missing"]) + "</ul>" if value.get("missing") else ""
+    return (f"<h2>Annual business-unit economics</h2><p><b>Unit definition:</b> {_text(value.get('unit_label'))}. "
+        f"<b>Units reporting period:</b> {_text(value.get('historical_units_period_start'))} to {_text(value.get('historical_units_period_end'))}. "
+        f"<b>Historical units:</b> {_text(value.get('historical_units_annual'))}; <b>Disclosed annual revenue:</b> {_money(value.get('historical_revenue_annual'), currency)}; "
+        f"<b>Revenue per business unit:</b> {_money(value.get('current_revenue_per_unit'), currency)}.</p>"
+        "<table><thead><tr><th>Expense / behavior</th><th>Current annual cost</th><th>Average / business unit</th><th>Variable / business unit</th><th>Proposed annual cost</th></tr></thead><tbody>" + rows + "</tbody></table>" + one_time +
+        f"<p><b>Proposed annual units:</b> {_text(value.get('proposed_units_annual'))}; <b>Proposed annual revenue:</b> {_money(value.get('proposed_revenue_annual'), currency)}; "
+        f"<b>Added revenue:</b> {_money(value.get('revenue_change_annual'), currency)}; <b>Added variable costs:</b> {_money(value.get('variable_cost_change_annual'), currency)}; "
+        f"<b>Net recurring impact before implementation costs:</b> {_money(value.get('net_annual_impact'), currency)}.</p>" + missing +
+        "<p class='muted'>Business volume holds historical selling price and variable rates constant. Fixed expenses stay fixed; average cost per unit is descriptive. Local expense units are not scaled twice. These disclosures and proposals do not replace verified historical earnings or source NOI.</p>")
+
+
 def _before_after(summary, currency):
     if not summary:
         return "<p class='muted'>Save a version to capture the financial evidence and reviewed projection. Historical figures remain unchanged.</p>"
@@ -165,6 +190,8 @@ def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
             "processing_volume", "processing_transaction_count", "current_processing_rate_pct", "proposed_processing_rate_pct",
             "current_processing_fixed_fee", "proposed_processing_fixed_fee", "current_processing_per_transaction_fee", "proposed_processing_per_transaction_fee",
             "current_processing_rate_basis", "proposed_processing_rate_basis") if row.get(key) not in (None, "", "unknown")]
+        if row.get("kind") == "unit_volume":
+            proposal = f"{_text(row.get('unit_change_value'))}{'%' if row.get('unit_change_mode') == 'percent' else ' units'} change in annual business volume"
         driver_html = "<br>".join(f"{_text(key)}: {_text(value)}" for key, value in drivers)
         issues = "<br>".join(_text(value) for value in [*(impact.get("issues") or []), *(impact.get("risk_flags") or [])])
         adjustment_html.append(f"<section><h3>{index}. {_text(row.get('label'))} <small>{_text(impact.get('review_state') or row.get('status') or 'proposed').upper().replace('_', ' ')}</small></h3>"
@@ -186,6 +213,7 @@ def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
         f"<p>{_text(body.get('period_start'))} to {_text(body.get('period_end'))} | {_text(currency)} | {_text(body.get('basis'))} basis</p>" + \
         "<div class='notice'>Expense disclosures and proposed earnings improvements. These are separate from historical P&amp;L, NOI, EBITDA, current debt coverage and program qualification. Client submissions await staff review; improvements are conditional and require baseline reconciliation and supporting evidence.</div>" + \
         _before_after(summary, currency) + \
+        _business_units(summary, body, currency) + \
         _released_cash_flow(summary, body) + \
         _expense_groups(summary, body, currency) + \
         f"<h2>Operating expense disclosure</h2><p class='muted'>Loan payments, transfers, income taxes, owner draws and noncash depreciation are disclosed separately from operating cash costs.</p><table><thead><tr><th>Expense</th><th>Payee</th><th>Current amount</th><th>Cadence</th><th>Essential</th></tr></thead><tbody>{expense_rows}</tbody></table>{expense_notes}" + \
