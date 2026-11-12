@@ -239,6 +239,67 @@ def test_approval_without_a_positive_effective_amount_is_rejected_before_writes(
     db.commit.assert_not_awaited()
 
 
+def test_pipeline_conflict_reports_current_status_without_applying_stale_move():
+    profile = _profile(loan_id=None, intake_id=uuid.uuid4())
+    db = SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock(), get=AsyncMock())
+
+    with (
+        patch.object(files_router.profiles, "resolve_profile", AsyncMock(return_value=profile)),
+        patch.object(files_router, "promote_intake_to_funding", AsyncMock()) as promote,
+        patch.object(files_router, "_sync_pipeline_loan_stage", AsyncMock()) as sync_stage,
+        patch.object(files_router.profiles, "log_profile_action", AsyncMock()) as log_action,
+        patch.object(file_events, "emit", AsyncMock()) as emit,
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        _run(
+            files_router.move_operator_file_pipeline(
+                "intake",
+                profile.intake_id,
+                PipelineMoveRequest(
+                    target_status="approved",
+                    expected_status="collecting_docs",
+                    approved_amount=250_000,
+                ),
+                SimpleNamespace(),
+                _user(),
+                db,
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == {
+        "code": "pipeline_status_conflict",
+        "message": "File moved from collecting_docs to in_underwriting; refresh and try again",
+        "expected_status": "collecting_docs",
+        "current_status": "in_underwriting",
+        "profile_id": str(profile.id),
+    }
+    assert profile.underwriting_status == "in_underwriting"
+    assert profile.underwriting_approved_amount is None
+    promote.assert_not_awaited()
+    sync_stage.assert_not_awaited()
+    log_action.assert_not_awaited()
+    emit.assert_not_awaited()
+    db.commit.assert_not_awaited()
+
+
+def test_pipeline_move_accepts_authoritative_expected_status():
+    profile = _profile()
+
+    result, db, _log_action, _emit = _move_to_approved(
+        profile,
+        PipelineMoveRequest(
+            target_status="approved",
+            expected_status="in_underwriting",
+            approved_amount=250_000,
+        ),
+    )
+
+    assert result.underwriting_status == "approved"
+    assert profile.underwriting_approved_amount == 250_000
+    db.commit.assert_awaited_once()
+
+
 def test_pipeline_move_approval_fields_validate_the_api_contract():
     valid = PipelineMoveRequest(
         target_status="approved",

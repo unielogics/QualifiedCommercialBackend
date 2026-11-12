@@ -1739,7 +1739,16 @@ async def move_operator_file_pipeline(
     if payload.expected_status and payload.expected_status != current_status:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"File moved from {payload.expected_status} to {current_status}; refresh and try again",
+            detail={
+                "code": "pipeline_status_conflict",
+                "message": (
+                    f"File moved from {payload.expected_status} to {current_status}; "
+                    "refresh and try again"
+                ),
+                "expected_status": payload.expected_status,
+                "current_status": current_status,
+                "profile_id": str(profile.id),
+            },
         )
 
     approval_note: str | None = None
