@@ -420,7 +420,7 @@ def document_out(doc: CpListingDocument) -> dict[str, Any]:
 def ready_documents(listing: CpListing) -> list[CpListingDocument]:
     access = getattr(listing, "_ppm_access", {})
     return [d for d in listing.documents if d.status == E.DocumentStatus.READY and (
-        d.kind != E.DocumentKind.PPM or not access.get("managed") or (
+        d.kind != E.DocumentKind.PPM or not access.get("publication_bound") or (
             access.get("current") and str(d.id) == access.get("document_id")))]
 
 
@@ -835,11 +835,20 @@ async def cancel_subscription(db: AsyncSession, sub: CpSubscription, listing: Cp
 # ---------------------------------------------------------------------------
 
 
-async def publish(db: AsyncSession, listing: CpListing, *, actor_user_id: uuid.UUID, reason: str) -> None:
-    if listing.status != E.ListingStatus.DRAFT:
-        raise RuleError("not_draft", "Only a draft can be published.")
-    from .ppm import bind_access_state
-    await bind_access_state(db, listing)
+async def publish(db: AsyncSession, listing: CpListing, *, actor_user_id: uuid.UUID, reason: str,
+                  expected_ppm_document_id: uuid.UUID | None = None, expected_ppm_source_fingerprint: str | None = None) -> None:
+    from .ppm import _lock, bind_access_state, record_publication, saved_context
+    await _lock(db, listing)
+    if listing.status not in {E.ListingStatus.DRAFT, E.ListingStatus.OPEN}:
+        raise RuleError("not_draft", "Only a draft or open offer can publish a reviewed update.")
+    updating = listing.status == E.ListingStatus.OPEN
+    candidate = await bind_access_state(db, listing, for_publication=True)
+    if expected_ppm_document_id is not None and str(expected_ppm_document_id) != candidate.get("document_id"):
+        raise RuleError("ppm_version_changed", "The reviewed PPM changed. Review the current version before publishing.")
+    if expected_ppm_source_fingerprint is not None:
+        current_source = candidate.get("source_fingerprint") or (await saved_context(db, listing))["fingerprint"]
+        if expected_ppm_source_fingerprint != current_source:
+            raise RuleError("ppm_source_changed", "The saved offering facts changed. Review the current PPM before publishing.")
     blockers = publish_blockers(listing)
     if blockers:
         raise RuleError("incomplete", "Fill in: " + "; ".join(blockers))
@@ -847,11 +856,13 @@ async def publish(db: AsyncSession, listing: CpListing, *, actor_user_id: uuid.U
         listing.ref = await ref_svc.next_listing_ref(db, listing.vertical)
     now = now_utc()
     listing.status = E.ListingStatus.OPEN
-    listing.published_at = now
-    listing.published_by_id = actor_user_id
-    listing.publish_reason = reason
-    listing.opens_at = listing.opens_at or now
-    await log_event(db, listing.id, "listing.published", actor_user_id=actor_user_id, detail={"reason": reason})
+    if not updating:
+        listing.published_at = now
+        listing.published_by_id = actor_user_id
+        listing.publish_reason = reason
+        listing.opens_at = listing.opens_at or now
+    await record_publication(db, listing, actor_user_id)
+    await log_event(db, listing.id, "listing.publication_updated" if updating else "listing.published", actor_user_id=actor_user_id, detail={"reason": reason})
 
 
 _LISTING_TRANSITIONS: dict[str, set[str]] = {

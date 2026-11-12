@@ -2220,8 +2220,11 @@ def build_cockpit(
     `schedule_set_aside`: ids of debt-schedule files the desk unlinked from the
     schedule requirement; their lines are not read as the schedule.
     """
-    from app.services import document_associations
+    from app.services import document_associations, financial_earnings_sources
 
+    # Current evidence arrives from unordered SQL inventories. Resolve equal
+    # source periods using persisted provenance before extractors select facts.
+    analyses = sorted(analyses, key=financial_earnings_sources.provenance_order)
     all_sources = document_associations.attach_rows(analyses, profile_id=profile_id, expected_entity=business_entity,
                                                    state=metric_review_state, owner=association_owner)
     associations = {str(item["file_id"]): item["identity_association"] for item in all_sources}
@@ -2355,8 +2358,6 @@ def build_cockpit(
     from app.services import financial_metric_composition
 
     financial_metric_composition.attach_and_apply(metric_review, dscr, metric_review_state)
-    from app.services import financial_earnings_sources
-
     financial_earnings_sources.attach(metric_review["ebitda"], metric_review, all_sources, years, statement, effective_bank,
                                      state=metric_review_state, entity=business_entity, now=now)
     financial_earnings_sources.align_coverage(metric_review["ebitda"], dscr, metric_review)

@@ -28,7 +28,7 @@ from app.services.investor_report import safe_text
 
 from .. import enums as E
 from ..models import CpIssuerSettings, CpListing, CpListingDocument, CpListingEvent
-from ..schemas import PpmDraftIn, PpmGenerateIn, PpmReviewIn
+from ..schemas import PpmDraftIn, PpmGenerateIn, PpmReinstateIn, PpmReviewIn
 from . import membership_policy, ppm_presets, prefill, storage, sync
 
 POLICY_VERSION = "saved-ppm-v2"
@@ -364,6 +364,14 @@ def _receipt_versions(events):
     return sorted([event for event in events if event.kind == "ppm.version"], key=lambda event: int(event.detail["version"]))
 
 
+def _latest_version(events, listing):
+    versions = _receipt_versions(events)
+    if versions:
+        return int(versions[-1].detail["version"])
+    return max((doc.version for doc in listing.documents if doc.kind == E.DocumentKind.PPM and
+                doc.status in {E.DocumentStatus.READY, E.DocumentStatus.SUPERSEDED}), default=None)
+
+
 def _request_replay(events, key, operation, actor_id, intent):
     for event in events:
         if event.detail.get("idempotency_key") != key:
@@ -372,6 +380,31 @@ def _request_replay(events, key, operation, actor_id, intent):
             raise _error("ppm_idempotency_conflict", "This save key belongs to a different PPM action. Reload and retry the intended action.")
         return True
     return False
+
+
+def _publication(events, listing):
+    """An immutable explicit selection, with a conservative pre-workflow fallback."""
+    published = next((event.detail for event in reversed(events) if event.kind == "ppm.published"), None)
+    if published is not None:
+        return published
+    if not listing.published_at:
+        return None
+    published_at = listing.published_at.replace(tzinfo=UTC) if listing.published_at.tzinfo is None else listing.published_at
+    reviews = {str(event.detail.get("document_id")): event for event in events if event.kind == "ppm.reviewed"}
+    eligible = []
+    for doc in listing.documents:
+        if doc.kind != E.DocumentKind.PPM or doc.status != E.DocumentStatus.READY:
+            continue
+        review = reviews.get(str(doc.id))
+        recorded = review.occurred_at if review else doc.uploaded_at
+        recorded = recorded.replace(tzinfo=UTC) if recorded and recorded.tzinfo is None else recorded
+        if recorded and recorded <= published_at:
+            eligible.append((doc.version, doc, review))
+    if not eligible:
+        return None
+    _, doc, review = max(eligible, key=lambda row: row[0])
+    return {"document_id": str(doc.id), "version": doc.version,
+            "source_fingerprint": review.detail.get("source_fingerprint") if review else None, "legacy": True}
 
 
 async def read_state(db, listing, *, context=None, events=None):
@@ -385,6 +418,8 @@ async def read_state(db, listing, *, context=None, events=None):
     reviews = {str(event.detail.get("document_id")): event for event in events if event.kind == "ppm.reviewed"}
     approved_event = next((event for event in reversed(events) if event.kind == "ppm.reviewed"), None)
     approved_id = str(approved_event.detail["document_id"]) if approved_event else None
+    publication = _publication(events, listing)
+    active_id = str(publication["document_id"]) if publication else None
     rows = []
     docs = {str(doc.id): doc for doc in listing.documents}
     for event in reversed(versions):
@@ -395,7 +430,7 @@ async def read_state(db, listing, *, context=None, events=None):
             continue
         reviewed = reviews.get(document_id)
         rows.append({key: value[key] for key in ("document_id", "version", "source", "source_fingerprint", "document", "legal_inputs", "narrative_sections")} | {
-            "status": "superseded" if doc.status == E.DocumentStatus.SUPERSEDED else "approved" if document_id == approved_id else "superseded" if reviewed or event is not versions[-1] else "draft",
+            "status": "superseded" if doc.status == E.DocumentStatus.SUPERSEDED else "approved" if document_id in {approved_id, active_id} else "superseded" if reviewed or event is not versions[-1] else "draft",
             "stale": value["source_fingerprint"] != context["fingerprint"] or doc.status == E.DocumentStatus.SUPERSEDED, "created_at": event.occurred_at.isoformat(),
             "reviewed_at": reviewed.occurred_at.isoformat() if reviewed else None, "ai_sections": value.get("ai_sections") or {}, "legal_presets": value.get("legal_presets") or {}})
     current = rows[0] if rows else None
@@ -422,6 +457,9 @@ async def read_state(db, listing, *, context=None, events=None):
         "status": "stale" if stale else "draft" if draft else "approved" if approved else "not_started",
         "generation_status": next((event.detail.get("generation_status", "source_based") for event in reversed(versions)), "not_generated"),
         "source_fingerprint": context["fingerprint"], "current_draft": draft, "current_approved": approved, "history": rows,
+        "active_version": next((row for row in rows if row["document_id"] == active_id), None),
+        "working_draft_document_id": draft["document_id"] if draft else None,
+        "latest_version": _latest_version(events, listing),
         "missing": _missing(context, legal, (current or {}).get("legal_presets")), "warnings": list(dict.fromkeys([*context["warnings"], *((current or {}).get("document", {}).get("warnings") or [])])),
         "legal_fields": ppm_presets.catalog(context, LEGAL_FIELDS), "narrative_fields": NARRATIVE_FIELDS,
         "membership_policy": context.get("membership_policy") or membership_policy.describe(),
@@ -452,6 +490,10 @@ async def _version(db, listing, context, legal, narrative, actor_id, *, generati
         "content_fingerprint": sync._fingerprint({"legal": legal, "presets": legal_presets or {}, "narrative": narrative, "document": document}), **(request or {})}
     if (await saved_context(db, listing))["fingerprint"] != context["fingerprint"]:
         raise _error("ppm_source_changed", "The saved file changed before the PPM could be recorded. Retry with current facts.")
+    saved_ids = {event.detail["document_id"] for event in _receipt_versions(await _events(db, listing.id))}
+    for previous in listing.documents:
+        if previous.kind == E.DocumentKind.PPM and str(previous.id) in saved_ids and previous.id != existing_doc.id and previous.status == E.DocumentStatus.PENDING:
+            previous.status, previous.superseded_at = E.DocumentStatus.SUPERSEDED, now
     await _event(db, listing, "ppm.version", actor_id, detail)
     existing_doc._ppm_source = source
     return existing_doc
@@ -608,8 +650,10 @@ async def review(db, listing, actor_id, payload: PpmReviewIn):
             ai_sections=latest.get("ai_sections"), render_status="reviewed", reviewed_at=now,
             legal_presets=latest.get("legal_presets"),
             request={"ai_citations": latest.get("ai_citations", []), "ai_facts": latest.get("ai_facts", {})})
+    publication = _publication(events, listing)
+    active_id = publication.get("document_id") if publication else None
     for previous in listing.documents:
-        if previous.kind == E.DocumentKind.PPM and previous.id != doc.id and previous.status == E.DocumentStatus.READY:
+        if previous.kind == E.DocumentKind.PPM and previous.id != doc.id and str(previous.id) != active_id and previous.status == E.DocumentStatus.READY:
             previous.status, previous.superseded_at = E.DocumentStatus.SUPERSEDED, now
     doc.status = E.DocumentStatus.READY
     await _event(db, listing, "ppm.reviewed", actor_id, {"document_id": str(doc.id), "version": doc.version,
@@ -621,24 +665,93 @@ async def review(db, listing, actor_id, payload: PpmReviewIn):
     return await read_state(db, listing, context=context)
 
 
-async def bind_access_state(db, listing):
+async def reinstate(db, listing, document_id, actor_id, payload: PpmReinstateIn):
+    """Restore historical intent as a new unapproved, current-source draft."""
+    await _lock(db, listing)
+    _writable(listing)
+    events = await _events(db, listing.id)
+    intent = sync._fingerprint({"document_id": str(document_id), **payload.model_dump()})
+    if _request_replay(events, payload.idempotency_key, "reinstate", actor_id, intent):
+        return await read_state(db, listing, events=events)
+    if _latest_version(events, listing) != payload.expected_version:
+        raise _error("ppm_version_changed", "A newer PPM version exists. Reload before reinstating history.")
+    context = await saved_context(db, listing)
+    if context["fingerprint"] != payload.expected_source_fingerprint:
+        raise _error("ppm_source_changed", "The saved offering changed. Reload before reinstating history.")
+    previous_doc = next((doc for doc in listing.documents if doc.id == document_id and doc.kind == E.DocumentKind.PPM), None)
+    previous = next((event.detail for event in _receipt_versions(events) if event.detail["document_id"] == str(document_id)), None)
+    if previous_doc is None or (previous is None and previous_doc.status not in {E.DocumentStatus.READY, E.DocumentStatus.SUPERSEDED}):
+        raise _error("ppm_version_missing", "The historical PPM version was not found.", 404)
+    if not await asyncio.to_thread(storage.head_object, previous_doc.s3_key):
+        raise _error("ppm_pdf_missing", "The historical PPM PDF is unavailable.")
+    legal, presets = ppm_presets.upgrade(context, LEGAL_FIELDS, previous or {})
+    narrative = deepcopy((previous or {}).get("narrative_sections") or {})
+    uploaded = None
+    source = (previous or {}).get("source", "uploaded")
+    document = _document(context, legal, narrative, legal_presets=presets)
+    if source == "uploaded":
+        version = max(doc.version for doc in listing.documents if doc.kind == E.DocumentKind.PPM) + 1
+        key = storage.build_key(listing.id, f"PPM-v{version}-reinstated-upload.pdf")
+        await _copy_pdf(previous_doc.s3_key, key)
+        uploaded = CpListingDocument(id=uuid4(), listing_id=listing.id, kind=E.DocumentKind.PPM,
+            name=f"PPM v{version} reinstated upload.pdf", s3_key=key, content_type="application/pdf", size_bytes=previous_doc.size_bytes,
+            version=version, status=E.DocumentStatus.PENDING, uploaded_by_id=actor_id, uploaded_at=datetime.now(UTC))
+        listing.documents.append(uploaded)
+        db.add(uploaded)
+        await db.flush()
+        document["warnings"].append("The historical uploaded PDF was copied unchanged. Check its original contents against the current offering facts before approval.")
+    if not any(event.kind == "ppm.adopted" for event in events):
+        await _event(db, listing, "ppm.adopted", actor_id, {"auto_refresh": True, "policy": POLICY_VERSION})
+    await _version(db, listing, context, legal, narrative, actor_id, document=document, source=source,
+        generation_status="manual_upload" if uploaded else "source_based", existing_doc=uploaded, legal_presets=presets,
+        request={"idempotency_key": payload.idempotency_key, "operation": "reinstate", "intent": intent,
+                 "reinstated_from_document_id": str(previous_doc.id)})
+    return await read_state(db, listing, context=context)
+
+
+async def bind_access_state(db, listing, *, for_publication=False):
     events = await _events(db, listing.id)
     managed = any(event.kind == "ppm.adopted" for event in events)
-    result = {"managed": managed, "current": True, "document_id": None}
+    result = {"managed": managed, "current": True, "document_id": None, "publication_bound": True}
+    publication = _publication(events, listing)
+    if publication:
+        result["document_id"] = publication.get("document_id")
+    if for_publication and not managed:
+        ready = [doc for doc in listing.documents if doc.kind == E.DocumentKind.PPM and doc.status == E.DocumentStatus.READY]
+        result["document_id"] = str(max(ready, key=lambda doc: doc.version).id) if ready else None
     if managed:
         context = await saved_context(db, listing)
+        result["source_fingerprint"] = context["fingerprint"]
         reviews = [event for event in events if event.kind == "ppm.reviewed"]
         last = reviews[-1].detail if reviews else {}
         versions = _receipt_versions(events)
         latest_id = versions[-1].detail["document_id"] if versions else None
-        result.update(current=last.get("source_fingerprint") == context["fingerprint"] and last.get("document_id") == latest_id, document_id=last.get("document_id"))
-        result["current"] = result["current"] and any(str(doc.id) == last.get("document_id") and doc.status == E.DocumentStatus.READY for doc in listing.documents)
+        selected = last if for_publication else publication or {}
+        result.update(current=selected.get("source_fingerprint") == context["fingerprint"], document_id=selected.get("document_id"))
+        if for_publication:
+            result["current"] = result["current"] and last.get("document_id") == latest_id
+        result["current"] = result["current"] and any(str(doc.id) == selected.get("document_id") and doc.status == E.DocumentStatus.READY for doc in listing.documents)
     for event in _receipt_versions(events):
         for doc in listing.documents:
             if str(doc.id) == event.detail["document_id"]:
                 doc._ppm_source = event.detail["source"]
     listing._ppm_access = result
     return result
+
+
+async def record_publication(db, listing, actor_id):
+    state = await bind_access_state(db, listing, for_publication=True)
+    if not state["document_id"] or not state["current"]:
+        raise _error("ppm_review_required", "A current reviewed PPM is required before publication.")
+    events = await _events(db, listing.id)
+    review = next((event.detail for event in reversed(events) if event.kind == "ppm.reviewed" and event.detail.get("document_id") == state["document_id"]), {})
+    doc = next(doc for doc in listing.documents if str(doc.id) == state["document_id"])
+    now = datetime.now(UTC)
+    for previous in listing.documents:
+        if previous.kind == E.DocumentKind.PPM and previous.id != doc.id and previous.status == E.DocumentStatus.READY:
+            previous.status, previous.superseded_at = E.DocumentStatus.SUPERSEDED, now
+    await _event(db, listing, "ppm.published", actor_id, {"document_id": str(doc.id), "version": doc.version,
+        "source_fingerprint": review.get("source_fingerprint"), "content_fingerprint": review.get("content_fingerprint")})
 
 
 async def require_current_review(db, listing):
