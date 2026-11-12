@@ -100,7 +100,8 @@ def proposal_stamp(action, linked_expense=None, body=None):
     # solely because schema validation materialized their empty defaults.
     action_defaults = {"cost_basis": "total", "unit_label": "", "current_units_per_period": None,
         "proposed_units_per_period": None, "current_fixed_amount": None, "proposed_fixed_amount": None,
-        "product_name": "", "revenue_return_multiple": None, "unit_change_mode": "absolute", "unit_change_value": None}
+        "product_name": "", "revenue_return_multiple": None, "unit_change_mode": "absolute", "unit_change_value": None,
+        "expense_category": None, "source_group_key": ""}
     expense_defaults = {"cost_basis": "total", "unit_label": "", "current_units_per_period": None,
         "current_unit_cost": None, "current_fixed_amount": None, "source_group_key": "", "source_candidate_key": "", "volume_behavior": "unknown"}
     for row, defaults in ((proposal, action_defaults), (expense, expense_defaults)):
@@ -439,6 +440,9 @@ def _impact(action, body, expenses, cockpit, allowed_files, now):
         "driver_key": action["driver_key"], "product_name": action["product_name"],
         "expense_row_id": action["expense_row_id"], "excluded": action["excluded"],
         "merchant_source_key": action.get("merchant_source_key"), "merchant_offer_id": action.get("merchant_offer_id"),
+        **({"expense_category": linked["category"] if linked else action["expense_category"],
+            "source_group_key": linked["source_group_key"] if linked else action["source_group_key"]}
+            if action["expense_category"] is not None or action["source_group_key"] else {}),
         "calculation": {**{key: action.get(key) for key in ("cadence", "cost_basis", "unit_label", "current_units_per_period", "proposed_units_per_period",
             "current_fixed_amount", "proposed_fixed_amount", "units_per_period", "current_amount", "proposed_amount",
             "current_unit_price", "proposed_unit_price", "current_unit_cost", "proposed_unit_cost", "contribution_margin_pct",
@@ -550,7 +554,7 @@ def _disclosure(body):
     return {key: _money(value) if isinstance(value, float) else value for key, value in result.items()}
 
 
-def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
+def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_changes=False):
     body = validate_body(raw)
     now = now or datetime.now(UTC)
     if isinstance(now, date) and not isinstance(now, datetime):
@@ -728,7 +732,7 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
         volume = next((row for row in results if row["kind"] == "unit_volume" and not row["excluded"] and row.get("calculation", {}).get("unit_economics")), None)
         if volume is not None:
             units = volume["calculation"]["unit_economics"]
-    return {"schema_version": "earnings-improvement-v1", "context_stamp": context_stamp(cockpit), "disclosure": _disclosure(body),
+    result = {"schema_version": "earnings-improvement-v1", "context_stamp": context_stamp(cockpit), "disclosure": _disclosure(body),
         **({"unit_economics": units} if units is not None else {}),
         "expense_groups": reconcile_groups(body, cockpit.get("operating_evidence") or {}),
         "released_cash_flow": released,
@@ -741,6 +745,14 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None):
         "notes": ["Historical earnings, NOI and current DSCR remain unchanged. Every improvement is a conditional operating illustration, not lender-approved income or a funding guarantee.",
                   "Recurring annual coverage excludes one-time benefits. First-year illustrations prorate recurring changes by days active in the twelve-month horizon and deduct implementation costs.",
                   "A refinance changes the debt-service denominator; principal, interest and financing proceeds are not operating earnings improvements."]}
+    if include_expense_changes:
+        from app.services.operating_expense_changes import evaluate as expense_changes
+
+        result["expense_changes"] = expense_changes(body, results, baseline,
+            earnings_comparable=comparable, noi_comparable=noi_comparable,
+            refinance_annual_debt_service=after_service, new_operating_annual=number(evaluation.get("annual_new_operating_expenses", 0)),
+            source_groups=result["expense_groups"])
+    return result
 
 
 def review_actions(raw, cockpit, action_ids, decision, reason, actor, *, baseline_treatment="unreconciled",
@@ -784,7 +796,8 @@ def package_summary(evaluation):
         "targets": deepcopy(evaluation["targets"]), "missing": list(evaluation["missing"]),
         "risk_flags": list(evaluation["risk_flags"]), "notes": list(evaluation["notes"]),
         "all_actions_reviewed": evaluation["all_actions_reviewed"], "recommendation": deepcopy(evaluation.get("recommendation")),
-        "adjustments": [{key: deepcopy(row.get(key)) for key in ("id", "label", "kind", "product_name", "review_state", "gross_annual_impact",
+        "adjustments": [{**{key: deepcopy(row.get(key)) for key in ("id", "label", "kind", "product_name", "review_state", "gross_annual_impact",
             "net_annual_impact", "first_year_impact", "implementation_recurring_annual", "implementation_one_time",
-            "included_in_approved_projection", "effective_date", "explanation", "source_note", "owner_name", "issues", "risk_flags", "source_file_ids", "calculation")}
+            "included_in_approved_projection", "effective_date", "explanation", "source_note", "owner_name", "issues", "risk_flags", "source_file_ids", "calculation")},
+            **{key: deepcopy(row[key]) for key in ("expense_category", "source_group_key") if row.get(key) not in (None, "")}}
             for row in evaluation["actions"] if not row["excluded"]]}

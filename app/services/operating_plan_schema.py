@@ -42,6 +42,7 @@ HEADER = (
 
 def _spec(key):
     options = {"category": CATEGORIES, "cadence": CADENCES, "kind": ACTION_KINDS,
+               "expense_category": CATEGORIES,
                "cost_basis": ("total", "per_unit"),
                "volume_behavior": ("unknown", "fixed", "variable", "mixed"),
                "unit_change_mode": ("absolute", "percent"),
@@ -57,7 +58,7 @@ def _spec(key):
 _NO_GRID_FIELDS = STAFF_FIELDS | {"id", "source_file_ids", "expense_row_id", "duplicate_of", "bank_vendor_key", "source_group_key", "source_candidate_key"}
 COLLECTIONS = {
     "expenses": tuple(_spec(key) for key in CLIENT_EXPENSE_FIELDS if key not in _NO_GRID_FIELDS),
-    "adjustments": tuple(_spec(key) for key in CLIENT_ADJUSTMENT_FIELDS if key not in _NO_GRID_FIELDS),
+    "adjustments": tuple(_spec(key) for key in CLIENT_ADJUSTMENT_FIELDS if key not in _NO_GRID_FIELDS or key == "source_group_key"),
 }
 
 

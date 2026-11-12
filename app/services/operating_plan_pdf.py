@@ -194,9 +194,18 @@ def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
             proposal = f"{_text(row.get('unit_change_value'))}{'%' if row.get('unit_change_mode') == 'percent' else ' units'} change in annual business volume"
         driver_html = "<br>".join(f"{_text(key)}: {_text(value)}" for key, value in drivers)
         issues = "<br>".join(_text(value) for value in [*(impact.get("issues") or []), *(impact.get("risk_flags") or [])])
+        placement = ""
+        if row.get("expense_category") is not None or row.get("source_group_key"):
+            owner = next((expense for expense in expenses if str(expense.get("id")) == str(row.get("expense_row_id"))), None)
+            category = owner.get("category") if owner else row.get("expense_category")
+            group_key = owner.get("source_group_key") if owner else row.get("source_group_key")
+            group = next((item for item in summary.get("expense_groups", []) if item.get("key") == group_key), None)
+            placement = (f"<p><b>Activity placement:</b> {_text(category).replace('_', ' ')}"
+                + (f"; source expense group: {_text(group.get('label') if group else 'Selected group (current source reference unavailable)')}" if group_key else "")
+                + ". Placement organizes the plan; it is not financial source evidence.</p>")
         adjustment_html.append(f"<section><h3>{index}. {_text(row.get('label'))} <small>{_text(impact.get('review_state') or row.get('status') or 'proposed').upper().replace('_', ' ')}</small></h3>"
             f"<p><b>Change:</b> {_text(row.get('kind')).replace('_', ' ')} - {proposal}</p>"
-            f"<p>{_text(row.get('explanation'))}</p>" + (f"<p>{driver_html}</p>" if driver_html else "") +
+            f"<p>{_text(row.get('explanation'))}</p>" + placement + (f"<p>{driver_html}</p>" if driver_html else "") +
             _marketing_assumptions(row, impact, currency) +
             f"<p><b>Net annual impact:</b> {_money(impact.get('net_annual_impact'), currency)}; <b>Monthly:</b> {_money(impact['net_annual_impact'] / 12 if impact.get('net_annual_impact') is not None else None, currency)}; <b>First year:</b> {_money(impact.get('first_year_impact'), currency)}</p>"
             f"<p><b>Implementation cost:</b> {_money(row.get('implementation_cost'), currency)} / {_text(row.get('implementation_cost_cadence')).replace('_', ' ')}"
