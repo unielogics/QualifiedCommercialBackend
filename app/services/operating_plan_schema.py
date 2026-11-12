@@ -14,9 +14,9 @@ completion = domain.completion
 
 CADENCES = ("weekly", "biweekly", "semi_monthly", "monthly", "quarterly", "annual", "one_time")
 CATEGORIES = ("rent", "salaries", "payroll_taxes", "insurance", "utilities", "marketing", "software", "professional_fees", "supplies", "repairs", "transportation", "cogs", "merchant_processing", "loan_payments", "income_taxes", "owner_draws", "transfers", "depreciation_amortization", "other")
-ACTION_KINDS = ("price_change", "product_cost_change", "processing_cost_change", "revenue_change", "marketing_investment", "expense_reduction", "expense_increase", "one_time_adjustment")
+ACTION_KINDS = ("price_change", "product_cost_change", "processing_cost_change", "revenue_change", "marketing_investment", "unit_volume", "expense_reduction", "expense_increase", "one_time_adjustment")
 STAFF_FIELDS = frozenset(domain.REVIEW_FIELDS)
-CLIENT_HEADER_FIELDS = ("business_name", "period_start", "period_end", "currency", "basis", "projection_start", "no_operating_expenses_confirmed", "client_attestation", "notes", "released_cash_flow", "category_confirmations")
+CLIENT_HEADER_FIELDS = ("business_name", "period_start", "period_end", "currency", "basis", "projection_start", "no_operating_expenses_confirmed", "client_attestation", "notes", "released_cash_flow", "category_confirmations", "unit_label", "historical_units_annual", "historical_revenue_annual", "historical_units_period_start", "historical_units_period_end")
 CLIENT_EXPENSE_FIELDS = tuple(key for key in domain.EXPENSE_FIELDS if key not in STAFF_FIELDS and key != "id")
 CLIENT_ADJUSTMENT_FIELDS = tuple(key for key in domain.ADJUSTMENT_FIELDS if key not in STAFF_FIELDS and key != "id")
 
@@ -30,6 +30,11 @@ HEADER = (
     field("period_end", "Reporting period end", "date"), field("currency", "Currency"),
     field("projection_start", "Projection start", "date"),
     field("basis", "Accounting basis", "select", ("cash", "accrual", "unknown")),
+    field("unit_label", "Business unit definition"),
+    field("historical_units_annual", "Historical annual business units", "number"),
+    field("historical_revenue_annual", "Historical annual revenue", "money"),
+    field("historical_units_period_start", "Business units reporting start", "date"),
+    field("historical_units_period_end", "Business units reporting end", "date"),
     field("no_operating_expenses_confirmed", "No operating expenses to disclose", "boolean"),
     field("client_attestation", "I confirm these disclosures and proposals", "boolean"), field("notes", "Plan notes"),
 )
@@ -38,10 +43,12 @@ HEADER = (
 def _spec(key):
     options = {"category": CATEGORIES, "cadence": CADENCES, "kind": ACTION_KINDS,
                "cost_basis": ("total", "per_unit"),
+               "volume_behavior": ("unknown", "fixed", "variable", "mixed"),
+               "unit_change_mode": ("absolute", "percent"),
                "implementation_cost_cadence": ("one_time", "monthly", "annual"),
                "current_processing_rate_basis": ("all_in", "processor_markup", "unknown"),
                "proposed_processing_rate_basis": ("all_in", "processor_markup", "unknown")}.get(key)
-    kind = "select" if options else "boolean" if key in {"essential", "excluded"} else "date" if key == "effective_date" else "percent" if key.endswith("_pct") else "number" if key in {"units_per_period", "current_units_per_period", "proposed_units_per_period", "processing_volume", "processing_transaction_count"} else "money" if key.endswith(("_amount", "_price", "_cost", "_fee")) or key == "implementation_cost" else "text"
+    kind = "select" if options else "boolean" if key in {"essential", "excluded"} else "date" if key == "effective_date" else "percent" if key.endswith("_pct") else "number" if key in {"units_per_period", "current_units_per_period", "proposed_units_per_period", "unit_change_value", "processing_volume", "processing_transaction_count"} else "money" if key.endswith(("_amount", "_price", "_cost", "_fee")) or key == "implementation_cost" else "text"
     return field(key, input=kind, options=options)
 
 

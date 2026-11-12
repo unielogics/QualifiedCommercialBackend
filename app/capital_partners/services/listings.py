@@ -232,7 +232,10 @@ def partner_operating_earnings(value: Any) -> dict[str, Any] | None:
 
     safe_improvement = None
     if improvement:
+        from app.services.operating_unit_economics import public_summary as public_unit_economics
+
         safe_improvement = {
+            **({"unit_economics": public_unit_economics(improvement["unit_economics"])} if "unit_economics" in improvement else {}),
             "baseline": {**fields(improvement.get("baseline"), ("period", "currency", "plan_currency", "basis", "revenue", "earnings", "earnings_kind", "noi", "noi_kind", "noi_label", "noi_year", "noi_period", "noi_currency", "noi_basis", "noi_staff_reviewed", "noi_provisional", "dscr", "annual_debt_service", "provisional")),
                 "noi_governance": noi_governance_brief((improvement.get("baseline") or {}).get("noi_governance"), internal=False)},
             "projection": {key: plan_projection((improvement.get("projection") or {}).get(key)) for key in ("proposed", "approved")},
