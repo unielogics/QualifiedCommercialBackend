@@ -152,6 +152,49 @@ def _marketing_assumptions(row, impact, currency):
         "<p class='muted'>Net effect = added spend times (revenue return multiple times contribution margin / 100 - 1), before separately disclosed implementation costs. Added marketing spend is deducted once. These are assumptions, not guaranteed sales or historical income.</p>")
 
 
+def _command_value(row, value, currency):
+    return _text(value) if row.get("target") == "unit_quantity" else _money(value, currency)
+
+
+def _preparer_handoff(summary, currency, body):
+    """Only a captured version summary supplies this handoff, never live inputs."""
+    value = summary.get("preparer_handoff")
+    if not value:
+        return ""
+    historical = value.get("historical") or {}
+    groups = {row["key"]: row for row in historical.get("source_groups", [])}
+    splits = []
+    for row in historical.get("itemization", []):
+        group = groups.get(row["source_group_key"], {})
+        splits.append(f"<tr><td>{_text(group.get('label') or row.get('expense_category'))}</td><td>{_text(row.get('year'))}</td>"
+            f"<td class='num'>{_money(row.get('reference_annual_amount'), currency)}</td>"
+            f"<td class='num'>{_money(row.get('children_annual_amount'), currency)}</td>"
+            f"<td class='num'>{_money(row.get('remainder_annual_amount'), currency)}</td><td>{_text(row.get('status'))}; {_text(row.get('reference_authority')).replace('_', ' ')}</td></tr>")
+    corrections = []
+    for row in historical.get("corrections_for_preparer_review", []):
+        group = groups.get(row["source_group_key"], {})
+        corrections.append(f"<p><b>{_text(group.get('label') or 'Historical source variance')} - {_text(row.get('year'))}:</b> {_text(row.get('reason'))}. "
+            f"Evidence: {_text(row.get('evidence_note') or 'Linked supporting documents')}. Status: unresolved preparer review.</p>")
+    commands = []
+    labels = {row["id"]: row.get("label") for row in body.get("expenses", [])}
+    target_labels = {"total_cost": "Current-period total budget", "unit_cost": "Cost per local unit", "unit_quantity": "Local units per period",
+        "unit_price": "Selling price per product/service unit", "annual_price_revenue": "Annual revenue at the proposed selling prices"}
+    for row in (value.get("future") or {}).get("commands", []):
+        command = row.get("command") or {}
+        unit = "%" if command.get("mode") == "percent" else " per year" if row.get("target") == "annual_price_revenue" or command.get("allocation") == "proportional" else " in the stated item/unit period"
+        amount = _text(command.get("value")) if command.get("mode") == "percent" else _command_value(row, command.get("value"), currency)
+        commands.append(f"<p><b>{_text(row.get('expense_category') or 'Pricing').replace('_', ' ')}:</b> {_text(command.get('direction'))} {amount}{unit}; "
+            f"target {_text(target_labels.get(row.get('target'), row.get('target')))}. Current {_command_value(row, row.get('current_value'), currency)}; proposed {_command_value(row, row.get('proposed_value'), currency)}; "
+            f"annual recurring effect before implementation {_money(row.get('gross_annual_effect'), currency)}. Status: {_text(row.get('status'))}.</p>"
+            + "<ul>" + "".join(f"<li>{_text(note)}</li>" for note in [*row.get("assumptions", []), *row.get("issues", [])]) + "</ul>"
+            + ("<ul>" + "".join(f"<li>{_text(labels.get(item['expense_row_id']) or 'Expense item')}: annual budget {_money(item['current_annual_cost'], currency)} to {_money(item['proposed_annual_cost'], currency)}</li>" for item in row.get("allocations", [])) + "</ul>" if row.get("allocations") else ""))
+    return ("<h2>Tax-preparer handoff - saved version</h2><h3>Historical records and unresolved corrections</h3>"
+        "<p>Source income and expense records remain historical references. Itemization does not replace verified NOI, amend a return or establish deductibility. Tax form and line classification require the preparer's confirmation when not documented.</p>"
+        + ("<table><thead><tr><th>Source group</th><th>Year</th><th>Reference annual</th><th>Detail annual</th><th>Remainder</th><th>Reconciliation</th></tr></thead><tbody>" + "".join(splits) + "</tbody></table>" if splits else "")
+        + "".join(corrections) + "<h3>Future operating proposals - separate from historical tax records</h3>" + "".join(commands)
+        + "<p class='muted'>These are conditional future plans, not filed deductions or approved tax adjustments. No return is filed or amended by this handoff.</p>")
+
+
 def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
     facts = financial_totals or {}
     summary = facts.get("improvement_plan") or {}
@@ -192,6 +235,12 @@ def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
             "current_processing_rate_basis", "proposed_processing_rate_basis") if row.get(key) not in (None, "", "unknown")]
         if row.get("kind") == "unit_volume":
             proposal = f"{_text(row.get('unit_change_value'))}{'%' if row.get('unit_change_mode') == 'percent' else ' units'} change in annual business volume"
+        if row.get("command"):
+            command = row["command"]
+            resolved = (impact.get("calculation") or {}).get("command") or {}
+            proposal = (f"{_text(command.get('direction'))} {_text(command.get('value'))}{'%' if command.get('mode') == 'percent' else ''} "
+                f"{_text(command.get('target')).replace('_', ' ')}; resolved current {_text(resolved.get('current_value'))} to {_text(resolved.get('proposed_value'))}. "
+                + ("Annual dollars." if command.get("target") == "annual_price_revenue" or row.get("kind") == "expense_group_change" else "Amounts use the stated item/unit period."))
         driver_html = "<br>".join(f"{_text(key)}: {_text(value)}" for key, value in drivers)
         issues = "<br>".join(_text(value) for value in [*(impact.get("issues") or []), *(impact.get("risk_flags") or [])])
         placement = ""
@@ -225,6 +274,7 @@ def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
         _business_units(summary, body, currency) + \
         _released_cash_flow(summary, body) + \
         _expense_groups(summary, body, currency) + \
+        _preparer_handoff(summary, currency, body) + \
         f"<h2>Operating expense disclosure</h2><p class='muted'>Loan payments, transfers, income taxes, owner draws and noncash depreciation are disclosed separately from operating cash costs.</p><table><thead><tr><th>Expense</th><th>Payee</th><th>Current amount</th><th>Cadence</th><th>Essential</th></tr></thead><tbody>{expense_rows}</tbody></table>{expense_notes}" + \
         f"<h2>Earnings adjustments and explanation</h2>{''.join(adjustment_html) or '<p>No improvements proposed.</p>'}" + \
         f"<p class='muted'>{excluded} excluded or duplicate rows remain in the immutable version history.</p><h2>Plan notes</h2><p>{_text(body.get('notes'))}</p></body></html>"

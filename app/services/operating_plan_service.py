@@ -22,6 +22,9 @@ def completion(body, cockpit):
     from app.services.released_cash_flow import evaluate
 
     progress = disclosure_completion(body)
+    from app.services.operating_plan_commands import itemization_missing
+
+    progress["missing"] = list(dict.fromkeys([*progress["missing"], *itemization_missing(validate_body(body), cockpit)]))
     allocation = evaluate(body, cockpit)
     missing = [*progress["missing"], *allocation["missing"]]
     return {**progress, "complete": not missing, "missing": missing, "missing_count": len(missing),
@@ -76,10 +79,10 @@ async def prepare_draft(db, profile, *, incoming, current, actor=None):
     from app.services.financial_workspace import filter_current_files, source_files_for_profile
 
     body = protect_reviews(incoming, current, trusted=bool(db.info.get("operating_plan_review_write")))
-    ids = {str(fid) for block in ("expenses", "adjustments") for row in body[block] for fid in row["source_file_ids"]}
+    ids = {str(fid) for block in ("expenses", "adjustments", "historical_corrections") for row in body[block] for fid in row["source_file_ids"]}
     files = await filter_current_files(db, await source_files_for_profile(db, profile)) if ids else []
     permitted = {str(file.id) for file in files}
-    previous_ids = {str(fid) for block in ("expenses", "adjustments") for row in (current or {}).get(block, []) for fid in row.get("source_file_ids", [])}
+    previous_ids = {str(fid) for block in ("expenses", "adjustments", "historical_corrections") for row in (current or {}).get(block, []) for fid in row.get("source_file_ids", [])}
     if ids - permitted - previous_ids:
         raise HTTPException(422, "Link only current supporting files belonging to this application")
     return body
@@ -103,9 +106,9 @@ async def client_preview(db, profile, body, *, current):
     result = await preview(db, profile, protected)
     evidence = client_evidence(result["evidence"])
     permitted = {row["file_id"] for row in evidence["files"]}
-    retained = {str(fid) for block in ("expenses", "adjustments") for row in (current or {}).get(block, [])
+    retained = {str(fid) for block in ("expenses", "adjustments", "historical_corrections") for row in (current or {}).get(block, [])
                 for fid in row.get("source_file_ids", [])}
-    supplied = {str(fid) for block in ("expenses", "adjustments") for row in protected[block]
+    supplied = {str(fid) for block in ("expenses", "adjustments", "historical_corrections") for row in protected[block]
                 for fid in row.get("source_file_ids", [])}
     if supplied - permitted - retained:
         raise HTTPException(422, "Use supporting sources available to this operating form")

@@ -45,7 +45,19 @@ def evaluate(body, action_results=None, baseline=None, *, earnings_comparable=Fa
     for action in active:
         if action.get("expense_row_id") in expenses:
             linked[action["expense_row_id"]].append(action)
-    conflicts = engine._conflicts(active, expenses)
+        if action["kind"] == "expense_group_change":
+            command = (results.get(action["id"], {}).get("calculation") or {}).get("command") or {}
+            for allocation in command.get("allocations", []):
+                gross = allocation["gross_annual_effect"]
+                linked[allocation["expense_row_id"]].append({**action, "kind": "expense_reduction" if gross >= 0 else "expense_increase",
+                    "expense_row_id": allocation["expense_row_id"], "cost_basis": "total", "cadence": "annual",
+                    "current_amount": allocation["current_annual_cost"], "proposed_amount": allocation["proposed_annual_cost"]})
+            if not command.get("allocations"):
+                from app.services.operating_plan_commands import group_rows
+
+                for expense in group_rows(action, body):
+                    linked[expense["id"]].append(action)
+    conflicts = engine._conflicts(active, expenses, body)
     rows, used = [], set()
     for expense in expenses.values():
         attached = linked[expense["id"]]

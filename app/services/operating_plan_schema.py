@@ -14,9 +14,9 @@ completion = domain.completion
 
 CADENCES = ("weekly", "biweekly", "semi_monthly", "monthly", "quarterly", "annual", "one_time")
 CATEGORIES = ("rent", "salaries", "payroll_taxes", "insurance", "utilities", "marketing", "software", "professional_fees", "supplies", "repairs", "transportation", "cogs", "merchant_processing", "loan_payments", "income_taxes", "owner_draws", "transfers", "depreciation_amortization", "other")
-ACTION_KINDS = ("price_change", "product_cost_change", "processing_cost_change", "revenue_change", "marketing_investment", "unit_volume", "expense_reduction", "expense_increase", "one_time_adjustment")
+ACTION_KINDS = ("price_change", "product_cost_change", "processing_cost_change", "revenue_change", "marketing_investment", "unit_volume", "expense_reduction", "expense_increase", "one_time_adjustment", "expense_group_change")
 STAFF_FIELDS = frozenset(domain.REVIEW_FIELDS)
-CLIENT_HEADER_FIELDS = ("business_name", "period_start", "period_end", "currency", "basis", "projection_start", "no_operating_expenses_confirmed", "client_attestation", "notes", "released_cash_flow", "category_confirmations", "unit_label", "historical_units_annual", "historical_revenue_annual", "historical_units_period_start", "historical_units_period_end")
+CLIENT_HEADER_FIELDS = ("business_name", "period_start", "period_end", "currency", "basis", "projection_start", "no_operating_expenses_confirmed", "client_attestation", "notes", "released_cash_flow", "category_confirmations", "unit_label", "historical_units_annual", "historical_revenue_annual", "historical_units_period_start", "historical_units_period_end", "historical_corrections")
 CLIENT_EXPENSE_FIELDS = tuple(key for key in domain.EXPENSE_FIELDS if key not in STAFF_FIELDS and key != "id")
 CLIENT_ADJUSTMENT_FIELDS = tuple(key for key in domain.ADJUSTMENT_FIELDS if key not in STAFF_FIELDS and key != "id")
 
@@ -44,6 +44,7 @@ def _spec(key):
     options = {"category": CATEGORIES, "cadence": CADENCES, "kind": ACTION_KINDS,
                "expense_category": CATEGORIES,
                "cost_basis": ("total", "per_unit"),
+               "price_basis": ("per_unit", "annual_revenue"),
                "volume_behavior": ("unknown", "fixed", "variable", "mixed"),
                "unit_change_mode": ("absolute", "percent"),
                "implementation_cost_cadence": ("one_time", "monthly", "annual"),
@@ -55,7 +56,7 @@ def _spec(key):
 
 # Evidence arrays, relationship IDs and staff decisions use scoped controls in
 # the editor. They are never free-text worksheet cells.
-_NO_GRID_FIELDS = STAFF_FIELDS | {"id", "source_file_ids", "expense_row_id", "duplicate_of", "bank_vendor_key", "source_group_key", "source_candidate_key"}
+_NO_GRID_FIELDS = STAFF_FIELDS | {"id", "source_file_ids", "expense_row_id", "duplicate_of", "bank_vendor_key", "source_group_key", "source_candidate_key", "itemization_parent_id", "command"}
 COLLECTIONS = {
     "expenses": tuple(_spec(key) for key in CLIENT_EXPENSE_FIELDS if key not in _NO_GRID_FIELDS),
     "adjustments": tuple(_spec(key) for key in CLIENT_ADJUSTMENT_FIELDS if key not in _NO_GRID_FIELDS or key == "source_group_key"),
