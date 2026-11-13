@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -78,11 +79,16 @@ async def read_state(db, listing):
     return result
 
 
-async def _load(db, listing_id, *, lock=False):
+async def _load(db, listing_id, *, lock=False, nonblocking=False):
     query = select(CpListing).where(CpListing.id == listing_id).options(selectinload(CpListing.documents))
     if lock:
-        query = query.with_for_update().execution_options(populate_existing=True)
+        query = query.with_for_update(nowait=nonblocking).execution_options(populate_existing=True)
     return (await db.execute(query)).scalar_one_or_none()
+
+
+def _lock_busy(exc):
+    return isinstance(exc, DBAPIError) and (
+        getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)) == "55P03"
 
 
 def _enqueue(listing, *, actor_id=None, source_fingerprint=None, immediate=False, reason="saved_file"):
@@ -103,7 +109,7 @@ def _enqueue(listing, *, actor_id=None, source_fingerprint=None, immediate=False
 async def queue_profile(db, profile_id, *, actor_id=None, reason="saved_file"):
     """Called in a real saved-source transaction; no browser or GET needed."""
     rows = (await db.execute(select(CpListing).where(CpListing.profile_id == profile_id,
-        CpListing.status.in_(LIVE)).with_for_update())).scalars().all()
+        CpListing.status.in_(LIVE)).with_for_update(skip_locked=True))).scalars().all()
     for listing in rows:
         _enqueue(listing, actor_id=actor_id, reason=reason)
     return len(rows)
@@ -157,7 +163,12 @@ async def request(db, listing, *, actor_id=None, idempotency_key=None):
     if profile is None or not profile.intake_id:
         raise HTTPException(422, {"code": "refresh_source_missing", "message": "The linked file needs an underwriting package source."})
     source, _fresh = await _source(db, profile)
-    listing = await _load(db, listing.id, lock=True)
+    try:
+        listing = await _load(db, listing.id, lock=True, nonblocking=True)
+    except DBAPIError as exc:
+        if not _lock_busy(exc):
+            raise
+        raise HTTPException(409, {"code": "refresh_busy", "message": "This offering is being reviewed. Retry the saved-file refresh shortly."}) from exc
     if listing.status not in LIVE:
         raise HTTPException(409, {"code": "refresh_closed", "message": "The offering closed before its refresh was queued."})
     job = _job(listing)
@@ -206,6 +217,13 @@ async def _finish_failure(session_factory, listing_id, claimed, exc):
         job = _job(listing)
         if job.get("status") != "running":
             return job.get("status")
+        if _lock_busy(exc) and listing.status in LIVE:
+            job.update(status="queued", due_at=(_now() + timedelta(seconds=DEBOUNCE_SECONDS)).isoformat(),
+                lease_until=None, claim_token=None, error_code=None, completed_at=None,
+                message="The offering is being reviewed. The saved-file update will retry shortly.")
+            _put(listing, job)
+            await db.commit()
+            return "queued"
         detail = exc.detail if isinstance(exc, HTTPException) else None
         code = detail.get("code") if isinstance(detail, dict) else None
         blocked = isinstance(exc, HTTPException) and exc.status_code in {404, 409, 422}
@@ -238,7 +256,7 @@ async def run_one(session_factory, listing_id):
             source, fresh = await _source(db, profile)
             # Source intent is established before rendering, not by a read time.
             prepared = await packages.prepare(db, profile, actor_id=UUID(claimed["actor_id"]) if claimed.get("actor_id") else None)
-            listing = await _load(db, listing_id, lock=True)
+            listing = await _load(db, listing_id, lock=True, nonblocking=True)
             job = _job(listing) if listing else {}
             if listing is None or any(job.get(key) != claimed.get(key) for key in ("job_id", "claim_token")) or job.get("status") != "running":
                 raise HTTPException(409, {"code": "refresh_superseded"})
@@ -294,6 +312,8 @@ async def run_one(session_factory, listing_id):
         outcome = await _finish_failure(session_factory, listing_id, claimed, exc)
         if outcome == "succeeded":
             return "succeeded"
+        if outcome == "queued":
+            return "skipped"
         log.warning("Marketplace preparation failed listing=%s error=%s", listing_id, type(exc).__name__)
         return "failed"
 
@@ -323,7 +343,7 @@ async def recover_sources(session_factory, *, limit=3):
                     continue
                 source, _fresh = await _source(db, profile)
                 if source != job.get("applied_source") or job.get("status") == "failed":
-                    listing = await _load(db, listing_id, lock=True)
+                    listing = await _load(db, listing_id, lock=True, nonblocking=True)
                     # A source save may have queued newer intent while reading.
                     if _job(listing).get("job_id") == job.get("job_id"):
                         _enqueue(listing, source_fingerprint=source, reason="recovery")
