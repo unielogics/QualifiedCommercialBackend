@@ -87,10 +87,15 @@ async def test_actual_start_constructs_one_main_street_file_and_defers_full_appl
     monkeypatch.setattr(core, "send_email", mail)
     db = Mock(get=AsyncMock(side_effect=[None, None]), execute=AsyncMock(side_effect=[scalar(None), scalar(None)]),
               flush=AsyncMock(), commit=AsyncMock())
+    record_consent = AsyncMock()
+    monkeypatch.setattr("app.services.onboarding_consent.record_for_start", record_consent)
     result = await service.start(db, payload, request())
     saved = [call.args[0] for call in db.add.call_args_list]
     identity = next(row for row in saved if isinstance(row, Client))
     intake = next(row for row in saved if isinstance(row, PublicUnderwritingIntake))
+    record_consent.assert_awaited_once()
+    assert record_consent.await_args.args[:3] == (db, intake, payload)
+    assert record_consent.await_args.kwargs == {"entry": "mca_funding"}
     assert intake.client_id == identity.id
     assert intake.variant == "main_street_v1" and intake.intake_state["funding_intent"] == "merchant_cash_advance"
     assert intake.intake_state["application_completion"] == "client"
