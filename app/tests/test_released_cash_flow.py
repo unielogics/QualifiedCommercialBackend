@@ -49,9 +49,9 @@ def allocated(current, amount=1000):
 def test_only_saved_regular_debt_reduction_is_allocatable_not_balloon_replay_or_cash_kept():
     current = cockpit()
     snapshot = released_cash_flow.evaluate(empty_body(), current)
-    assert snapshot["required"] and snapshot["available"] and snapshot["amount_monthly"] == 1000
+    assert not snapshot["required"] and snapshot["available"] and snapshot["amount_monthly"] == 1000
     assert snapshot["source"]["after_monthly"] == 3000
-    assert snapshot["status"] == "incomplete" and not snapshot["complete"]
+    assert snapshot["status"] == "not_required" and snapshot["complete"] and not snapshot["missing"]
     current["plan"]["record"].pop("updated_at")
     unsaved = released_cash_flow.evaluate(empty_body(), current)
     assert not unsaved["required"] and not unsaved["available"] and unsaved["amount_monthly"] is None
@@ -81,11 +81,19 @@ def test_unknown_or_hypothetical_relief_is_not_reported_as_zero_or_allocatable(i
     assert blank["required"] and not blank["complete"]
 
 
-@pytest.mark.parametrize("amount", [0, 500, 999.99, 1000.01, 1001, 2000])
-def test_partial_overallocated_or_zero_monthly_uses_block_completion(amount):
+@pytest.mark.parametrize("amount", [0, 1000.01, 1001, 2000])
+def test_overallocated_or_zero_monthly_uses_block_completion(amount):
     current = cockpit()
     result = released_cash_flow.evaluate(allocated(current, amount), current)
     assert not result["complete"] and result["missing"]
+
+
+@pytest.mark.parametrize("amount", [500, 999.99])
+def test_optional_partial_assignments_leave_positive_cash_retained(amount):
+    current = cockpit()
+    result = released_cash_flow.evaluate(allocated(current, amount), current)
+    assert result["complete"] and result["missing"] == []
+    assert result["unallocated_monthly"] == round(1000 - amount, 2)
 
 
 def test_balanced_allocation_changes_no_earnings_noi_or_operating_improvement_totals():
@@ -187,16 +195,18 @@ def test_current_allocation_controls_exact_requirement_without_overriding_staff_
 
 
 @pytest.mark.asyncio
-async def test_submit_rejects_unallocated_cash_before_pdf_storage_or_publication_and_keeps_draft():
+async def test_submit_rejects_overallocated_cash_before_pdf_storage_or_publication_and_keeps_draft():
     db = Memory()
     profile, family, draft = context("operating_plan")
-    draft.body = operating_body()
+    current = cockpit()
+    draft.body = allocated(current, 2000)
+    draft.body["released_cash_flow"]["allocations"][0]["purpose"] = "reserve"
     goal = FileEvent(profile_id=profile.id, kind="operating_plan.goal_set",
         meta={"amount": "18000", "currency": "USD", "revision": 1})
     db.add(goal)
     original = deepcopy(draft.body)
     with patch.object(financial_workspace, "resolve_family", AsyncMock(return_value=(family, draft))), \
-         patch("app.services.financial_cockpit.load_cockpit", AsyncMock(return_value=cockpit())), \
+         patch("app.services.financial_cockpit.load_cockpit", AsyncMock(return_value=current)), \
          patch.object(financial_workspace, "_render") as render, \
          pytest.raises(HTTPException) as error:
         await financial_workspace.publish_version(db, profile, kind="operating_plan", expected_revision=4,
@@ -208,7 +218,10 @@ async def test_submit_rejects_unallocated_cash_before_pdf_storage_or_publication
 
 @pytest.mark.asyncio
 async def test_old_pdf_collection_action_cannot_bypass_the_current_monthly_allocation():
-    allocation = released_cash_flow.evaluate(empty_body(), cockpit())
+    current = cockpit()
+    raw = allocated(current)
+    current["plan"]["record"]["updated_at"] = "2026-11-11T12:00:00+00:00"
+    allocation = released_cash_flow.evaluate(raw, current)
     state = ApplicationRequirementState(id=uuid4(), requirement_key=released_cash_flow.REQUIREMENT_KEY,
         status="stale", provenance={"released_cash_flow": allocation})
     old_pdf_id = uuid4()
@@ -256,7 +269,7 @@ async def test_balanced_submission_publishes_allocation_in_immutable_proposal_wi
 
 
 @pytest.mark.asyncio
-async def test_no_operating_plan_yet_exposes_released_cash_obligation_to_summary_and_packages():
+async def test_no_operating_plan_yet_exposes_optional_cash_retention_without_allocation_obligation():
     current = cockpit()
     with patch.object(financial_workspace, "existing_family", AsyncMock(return_value=None)), \
          patch("app.services.financial_cockpit.load_cockpit", AsyncMock(return_value=current)):
@@ -265,12 +278,10 @@ async def test_no_operating_plan_yet_exposes_released_cash_obligation_to_summary
         package = await investor_package.operating_snapshot(Memory(), SimpleNamespace(id=uuid4()), current, {})
         hidden = await investor_package.operating_snapshot(Memory(), SimpleNamespace(id=uuid4()), current,
             {"include_operating_plan": False})
-    assert not summary["has_plan"] and summary["evaluation"]["released_cash_flow"]["required"]
-    assert not published["available"] and published["evaluation"]["released_cash_flow"]["required"]
-    assert any("Allocate" in message for message in published["package"]["missing"])
-    assert package["released_cash_flow"]["required"] and package["snapshot"]["state"] == "not_started"
-    assert any("Allocate" in message for message in package["missing"])
-    assert hidden is None
+    assert not summary["has_plan"] and not summary["evaluation"]["released_cash_flow"]["required"]
+    assert not published["available"] and not published["evaluation"]["released_cash_flow"]["required"]
+    assert not any("Allocate" in message for message in published["package"]["missing"])
+    assert package is None and hidden is None
 
 
 def test_public_response_exposes_current_allocation_source_without_private_staff_context():

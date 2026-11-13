@@ -382,7 +382,7 @@ async def test_actual_version_publish_gate_keeps_unresolved_split_in_draft_or_ca
          patch("app.routers.application_profiles._requested_slot", AsyncMock(return_value=SimpleNamespace(id=uuid4(), status="requested"))), \
          patch("app.services.financial_publication.after_publication", AsyncMock()), \
          patch("app.services.financial_cockpit.load_cockpit", AsyncMock(return_value=source_context(raw))):
-        if correction is True:
+        if correction is True or correction == "partial_evidence":
             await workspace.publish_version(db, profile, kind="operating_plan", expected_revision=4, idempotency_key="synthetic-split", submit=submit)
             assert len(db.versions) == 1 and storage.call_count == 1
             handoff = render.call_args.args[2]["improvement_plan"]["preparer_handoff"]
@@ -397,8 +397,7 @@ async def test_actual_version_publish_gate_keeps_unresolved_split_in_draft_or_ca
             assert error.value.status_code == 422 and error.value.detail["code"] == "operating_itemization_incomplete"
             assert error.value.detail["missing"][0].endswith("itemization.unallocated" if last_child_removed else "itemization.unknown")
             if correction:
-                suffix = ".reason" if correction == "partial_reason" else ".evidence"
-                assert "historical_corrections.source:rent" + suffix in error.value.detail["missing"]
+                assert "historical_corrections.source:rent.reason" in error.value.detail["missing"]
             assert not db.versions and family.current_version_id is None
             storage.assert_not_called()
             render.assert_not_called()
@@ -414,9 +413,16 @@ def test_partial_historical_correction_is_a_valid_draft_without_premature_except
     protected = operating_plan_service.protect_reviews(validated, split_plan(True))
     assert protected["historical_corrections"] == validated["historical_corrections"]
     missing = completion(protected)["missing"]
-    assert any(path.endswith("itemization.unknown") for path in missing)
-    assert any(path.startswith("historical_corrections.source:rent.") for path in missing)
-    assert commands.itemization_missing(protected, source_context(protected))
+    if len(reason.strip()) < 3:
+        assert any(path.endswith("itemization.unknown") for path in missing)
+        assert "historical_corrections.source:rent.reason" in missing
+        assert commands.itemization_missing(protected, source_context(protected))
+    else:
+        assert not any(path.endswith("itemization.unknown") for path in missing)
+        assert not any(path.startswith("historical_corrections.source:rent.") for path in missing)
+        assert commands.itemization_missing(protected, source_context(protected)) == []
+        handoff = engine.evaluate(protected, source_context(protected))["preparer_handoff"]
+        assert handoff["historical"]["corrections_for_preparer_review"][0]["status"] == "unresolved_preparer_review"
 
 
 @pytest.mark.parametrize("reference", [12000, None])

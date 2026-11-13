@@ -16,7 +16,7 @@ CADENCES = ("weekly", "biweekly", "semi_monthly", "monthly", "quarterly", "annua
 CATEGORIES = ("rent", "salaries", "payroll_taxes", "insurance", "utilities", "marketing", "software", "professional_fees", "supplies", "repairs", "transportation", "cogs", "merchant_processing", "loan_payments", "income_taxes", "owner_draws", "transfers", "depreciation_amortization", "other")
 ACTION_KINDS = ("price_change", "product_cost_change", "processing_cost_change", "revenue_change", "marketing_investment", "unit_volume", "expense_reduction", "expense_increase", "one_time_adjustment", "expense_group_change")
 STAFF_FIELDS = frozenset(domain.REVIEW_FIELDS)
-CLIENT_HEADER_FIELDS = ("business_name", "period_start", "period_end", "currency", "basis", "projection_start", "no_operating_expenses_confirmed", "client_attestation", "notes", "released_cash_flow", "category_confirmations", "unit_label", "historical_units_annual", "historical_revenue_annual", "historical_units_period_start", "historical_units_period_end", "historical_corrections")
+CLIENT_HEADER_FIELDS = ("business_name", "period_start", "period_end", "currency", "basis", "projection_start", "no_operating_expenses_confirmed", "client_attestation", "notes", "released_cash_flow", "category_confirmations", "unit_label", "historical_units_annual", "historical_revenue_annual", "historical_units_period_start", "historical_units_period_end", "historical_corrections", "source_group_confirmations", "source_group_confirmation_stamp")
 CLIENT_EXPENSE_FIELDS = tuple(key for key in domain.EXPENSE_FIELDS if key not in STAFF_FIELDS and key != "id")
 CLIENT_ADJUSTMENT_FIELDS = tuple(key for key in domain.ADJUSTMENT_FIELDS if key not in STAFF_FIELDS and key != "id")
 

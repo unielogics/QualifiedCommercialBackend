@@ -5,7 +5,7 @@ from uuid import uuid4
 import pytest
 
 from app.schemas.earnings_improvement import empty_body
-from app.services import financial_plan, plan_terms_link, released_cash_flow
+from app.services import earnings_improvement, financial_plan, plan_terms_link, released_cash_flow
 from app.services.loan_schedule import build_schedule
 
 
@@ -60,8 +60,26 @@ def test_eight_current_debts_reconcile_remaining_sba_service_without_editing_sou
     assert current == original
     assert current["plan"]["record"]["overrides"]["debt_service_monthly"] == 5071.59
     allocation = released_cash_flow.evaluate(empty_body(), current)
-    assert allocation["required"] and not allocation["complete"]
+    assert not allocation["required"] and allocation["complete"] and not allocation["missing"]
+    assert allocation["allocated_monthly"] == 0 and allocation["unallocated_monthly"] == 65479.68
     assert allocation["source"]["reconciled_retained_override"]
+    scoped = {**deepcopy(current), "_operating_goal": {"status": "set", "amount": 18000, "currency": "USD", "revision": 1}}
+    raw = empty_body()
+    cash = earnings_improvement.evaluate(raw, scoped)["cash_bridge"]
+    assert cash["funding_complete"] and not cash["funding_required"] and not cash["funding_missing"]
+    assert cash["funding_retained_monthly"] == 65479.68 and cash["funding_retained_annual"] == 785756.16
+    assert cash["funding_reinvested_monthly"] == 0 and cash["funding_reinvested_annual"] == 0
+    assert raw["released_cash_flow"] == {"source_fingerprint": None, "allocations": []}
+    raw["released_cash_flow"] = {"source_fingerprint": cash["funding_source_fingerprint"], "allocations": [
+        {"id": str(uuid4()), "label": "Optional use", "purpose": "other", "amount_monthly": 100}]}
+    cash = earnings_improvement.evaluate(raw, scoped)["cash_bridge"]
+    assert cash["funding_complete"] and cash["funding_retained_monthly"] == 65379.68
+    assert cash["funding_reinvested_monthly"] == 100 and cash["funding_reinvested_annual"] == 1200
+    raw["released_cash_flow"]["allocations"][0]["amount_monthly"] = 65479.69
+    cash = earnings_improvement.evaluate(raw, scoped)["cash_bridge"]
+    assert not cash["funding_complete"] and cash["funding_unallocated_monthly"] == -.01
+    assert "released_cash_flow.allocations.capacity_exceeded" in cash["funding_missing"]
+    assert current == original
 
 
 @pytest.mark.parametrize("change", ["ordinary_schedule", "non_authoritative", "no_version", "service_total",

@@ -1,6 +1,6 @@
 """Recurring uses of a saved coverage plan's debt-service relief.
 
-This allocation is a cash-management obligation. It never adds financing
+Unassigned positive cash is retained; reinvestment is optional. This never adds financing
 proceeds or principal/interest savings to historical operating earnings.
 """
 from __future__ import annotations
@@ -126,19 +126,16 @@ def evaluate(body, cockpit):
     current = source(cockpit)
     allocation = body.get("released_cash_flow") or {}
     rows = allocation.get("allocations") or []
-    retained = bool(rows or allocation.get("source_fingerprint"))
-    required = current["positive"] or current["requires_reconciliation"] or retained
-    stale = retained and allocation.get("source_fingerprint") != current["fingerprint"]
+    required = bool(rows or current["requires_reconciliation"])
+    stale = bool(rows and allocation.get("source_fingerprint") != current["fingerprint"])
     missing = []
     if required:
         if not current["available"]:
             missing.extend(current["reasons"])
         if stale:
             missing.append("The saved coverage plan or debt inputs changed. Reconcile and acknowledge the current released cash flow.")
-        if not allocation.get("source_fingerprint"):
+        if rows and not allocation.get("source_fingerprint"):
             missing.append("Acknowledge the saved coverage plan as the allocation source.")
-        if not rows and current["positive"]:
-            missing.append("Allocate the full recurring released cash flow to described monthly uses.")
     active_expenses = {row["id"]: row for row in body.get("expenses") or [] if not row.get("excluded")}
     for row in rows:
         if not row.get("label") or row.get("amount_monthly") is None or row["amount_monthly"] <= 0:
@@ -148,8 +145,8 @@ def evaluate(body, cockpit):
     allocated = round(sum(number(row.get("amount_monthly")) or 0 for row in rows), 2)
     amount = current["amount_monthly"]
     remaining = round(amount - allocated, 2) if amount is not None else None
-    if required and current["available"] and (remaining is None or remaining != 0):
-        missing.append("Monthly allocations must reconcile exactly to the saved plan's recurring debt-service relief.")
+    if rows and current["available"] and (remaining is None or remaining < 0):
+        missing.append("Monthly allocations cannot exceed the saved plan's recurring debt-service relief.")
     if required and body.get("currency") != "USD":
         missing.append("Released cash flow is denominated in USD; reconcile the operating plan currency before allocating it.")
     complete = not missing if required else True
@@ -160,7 +157,7 @@ def evaluate(body, cockpit):
         "missing": list(dict.fromkeys(missing)), "allocations": rows,
         "source": {key: current[key] for key in ("updated_at", "before_monthly", "after_monthly",
             "new_operating_expenses_monthly", "new_financing_fees_monthly", "reconciled_retained_override")},
-        "note": "Recurring cash allocation only. Debt-service relief does not increase historical earnings, EBITDA or NOI."}
+        "note": "Unassigned positive cash is kept as cash; reinvestment is optional. Debt-service relief does not increase historical earnings, EBITDA or NOI."}
 
 
 async def derived_requirement(db, profile):

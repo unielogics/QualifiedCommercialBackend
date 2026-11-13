@@ -118,7 +118,7 @@ def test_net_runrate_and_firstyear_timing_require_real_inputs_and_never_use_the_
     value = preview(raw)["draft_feedback"]
     assert value["actions"][0]["first_year_delta"] is None
     assert value["summary"]["qualified_first_year_noi_delta"] is None
-    assert "projection_start" in value["actions"][0]["qualification_missing"]
+    assert "projection_start" not in value["actions"][0]["qualification_missing"]
 
 
 def test_annual_price_and_cost_compose_from_canonical_math_without_qualified_metadata():

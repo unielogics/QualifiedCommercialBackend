@@ -23,22 +23,28 @@ def coverage_adjustment(context, plan, dscr):
     # A one-time benefit is not recurring operating earnings. Implementation
     # costs on a recurring action are already deducted in first_year_impact.
     recurring = [row for row in rows if row.get("kind") != "one_time_adjustment" and (row.get("calculation") or {}).get("cadence") != "one_time"]
-    impact = round(sum(number(row.get("first_year_impact")) or 0 for row in recurring), 2)
+    dated = bool(recurring and all(number(row.get("first_year_impact")) is not None for row in recurring))
+    first_impact = round(sum(number(row.get("first_year_impact")) for row in recurring), 2) if dated else None
     run_rate = round(sum(number(row.get("net_annual_impact")) or 0 for row in recurring), 2)
+    impact = first_impact if dated else run_rate
     result = {"status": "none", "applied": False, "source": "published_operating_plan",
         "version_number": context.get("version_number"), "version_id": context.get("version_id"),
         "baseline_annual": baseline, "annual_impact": run_rate if recurring else None,
-        "first_year_impact": impact if recurring else None, "applied_annual_impact": 0.0,
+        "first_year_impact": first_impact, "applied_annual_impact": 0.0,
         "applied_count": 0, "candidate_impacts": {}, "projected_dscr": None,
         "pending_count": sum(row.get("review_state") not in {"approved", "rejected", "excluded"} for row in evaluated.get("actions") or []),
         "proposed_first_year_impact": ((evaluated.get("projection") or {}).get("proposed") or {}).get("first_year_coverage_impact"),
         "proposed_annual_impact": proposed.get("annual_impact") if proposed.get("complete") else None,
         "proposed_dscr": None, "reason": None, "noi_eligible": projection.get("noi") is not None,
         "basis": "First 12 months of net operating improvements, after effective-date proration and implementation costs; compared with the loan's selected annual debt-service stress window."}
+    if recurring and not dated:
+        result.update(timing_basis="undated_run_rate",
+                      basis="Undated stabilized annual run-rate after recurring implementation costs, compared with the selected annual debt-service coverage window. No dated first-year benefit is assumed.")
     if any(row.get("effect_type") == "noncash_da" for row in evaluated.get("actions") or []):
         from app.services.operating_metric_effects import metric_value
 
-        noi_values = [number(metric_value(row, "noi", "first_year")) for row in recurring]
+        noi_first = [number(metric_value(row, "noi", "first_year")) for row in recurring]
+        noi_values = noi_first if noi_first and all(value is not None for value in noi_first) else [number(metric_value(row, "noi", "net_annual")) for row in recurring]
         noi_ready = bool(context.get("available") and context.get("state") != "client_submitted"
                          and approved.get("noi_complete") and projection.get("noi") is not None
                          and noi_values and all(value is not None for value in noi_values))
@@ -60,8 +66,8 @@ def coverage_adjustment(context, plan, dscr):
     if projection.get("status") != "reviewed_illustration" or not approved.get("complete") or baseline is None:
         result.update(status="blocked", reason="The reviewed plan's earnings, business, period, currency or evidence needs reconciliation.")
         return result
-    if not recurring or any(number(row.get("first_year_impact")) is None for row in recurring):
-        result.update(status="blocked", reason="Recurring improvements with complete timing and implementation costs are required for projected coverage.")
+    if not recurring or any(number(row.get("net_annual_impact")) is None for row in recurring):
+        result.update(status="blocked", reason="Recurring improvements with known implementation costs are required for projected coverage.")
         return result
     overrides = plan.get("overrides") or {}
     from app.services.financial_plan import DOUBLE_COUNTED_ADD_BACK_KINDS
@@ -97,8 +103,12 @@ def finish_evaluation(result, operating, context, dscr):
     # This is a client proposal preview, not the primary reviewed projection.
     if not (evaluated.get("baseline") or {}).get("dscr_unavailable_reason") and proposed.get("complete") and projection.get("status") == "unreviewed_illustration" and baseline is not None and denominator is not None and denominator > 0:
         proposed_delta = number(projection.get("first_year_coverage_impact"))
-        if proposed_delta is not None:
-            operating["proposed_dscr"] = round((baseline + proposed_delta - (number(result.get("annual_new_operating_expenses")) or 0)) / denominator, 2)
+        if proposed_delta is None:
+            proposed_delta = number(proposed.get("annual_impact"))
+            operating["proposed_timing_basis"] = "undated_run_rate"
+        operating_costs = number(result.get("annual_new_operating_expenses", 0))
+        if proposed_delta is not None and operating_costs is not None:
+            operating["proposed_dscr"] = round((baseline + proposed_delta - operating_costs) / denominator, 2)
     if not operating["applied"]:
         return
     ebitda = result.get("ebitda") or {}

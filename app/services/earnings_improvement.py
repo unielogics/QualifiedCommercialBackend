@@ -26,12 +26,13 @@ from app.schemas.earnings_improvement import (
     validate_body,
 )
 from app.services.financial_metric_review import number
+from app.services.operating_new_activity import explicit_new_zero
 
 FACTORS = {"weekly": 52, "biweekly": 26, "semi_monthly": 24, "monthly": 12, "quarterly": 4, "annual": 1, "one_time": 0}
 NON_OPERATING = {"loan_payments", "income_taxes", "owner_draws", "transfers"}
 NON_CASH = {"depreciation_amortization"}
 PRODUCT_KINDS = {"price_change", "product_cost_change"}
-QUALIFICATION_FIELDS = {"label", "driver_key", "effective_date", "explanation", "source_note", "implementation_cost"}
+QUALIFICATION_FIELDS = {"label", "driver_key", "explanation", "implementation_cost"}
 
 
 def _stamp(value):
@@ -267,6 +268,8 @@ def _merchant_approval_issues(action, cockpit, files):
             issues.append("The current all-in rate and volume do not reconcile to the statement's processing fees.")
     if action["current_processing_rate_basis"] == "processor_markup":
         for field, source_key in (("current_processing_fixed_fee", "fixed_fee"), ("current_processing_per_transaction_fee", "per_transaction_fee"), ("processing_transaction_count", "transactions")):
+            if field == "processing_transaction_count" and not any(action.get(key) for key in ("current_processing_per_transaction_fee", "proposed_processing_per_transaction_fee")):
+                continue
             if not _near(action.get(field), source.get(source_key)):
                 issues.append("Current processor markup, fixed fees, item fees and transaction count must each be documented; unknown fees are not zero.")
                 break
@@ -329,11 +332,14 @@ def _processing(action, cockpit, issues, risks):
             issues.append("Itemize both current and proposed fixed and per-transaction processor fees, including explicit zeros.")
             return None
         count = action["processing_transaction_count"]
-        if count is None:
+        item_fees = (action["current_processing_per_transaction_fee"], action["proposed_processing_per_transaction_fee"])
+        if count is None and any(item_fees):
             issues.append("Document the transaction count when comparing per-transaction processor fees.")
             return None
-        current = volume * action["current_processing_rate_pct"] / 100 + action["current_processing_fixed_fee"] + count * action["current_processing_per_transaction_fee"]
-        proposed = volume * action["proposed_processing_rate_pct"] / 100 + action["proposed_processing_fixed_fee"] + count * action["proposed_processing_per_transaction_fee"]
+        current_items = count * item_fees[0] if item_fees[0] else 0
+        proposed_items = count * item_fees[1] if item_fees[1] else 0
+        current = volume * action["current_processing_rate_pct"] / 100 + action["current_processing_fixed_fee"] + current_items
+        proposed = volume * action["proposed_processing_rate_pct"] / 100 + action["proposed_processing_fixed_fee"] + proposed_items
         risks.append("Only comparable processor markup and fees are modeled. Unchanged pass-through interchange is excluded from both sides.")
     risks.extend(["Card volume and mix are held constant; a quote is not a client-accepted processing offer.",
                   "Confirm terminal leases, termination charges and switching costs in implementation costs."])
@@ -342,12 +348,18 @@ def _processing(action, cockpit, issues, risks):
 
 def _impact(action, body, expenses, cockpit, allowed_files, now, command_result=None, *, arithmetic_only=False):
     issues = [f"Missing {key.replace('_', ' ')}" for key in action_missing(action)]
+    if (action["kind"] == "processing_cost_change" and action["current_processing_rate_basis"] != "unknown"
+            and action["proposed_processing_rate_basis"] != "unknown" and action["current_processing_rate_basis"] != action["proposed_processing_rate_basis"]):
+        issues.insert(0, "Compare the same documented all-in or processor-markup basis for current and proposed fees.")
     if command_result:
         issues.extend(command_result["issues"])
     risks = []
     marketing_calculation = {}
     unit_calculation = {}
     linked = expenses.get(action.get("expense_row_id"))
+    new_activity = explicit_new_zero(action, linked)
+    if new_activity:
+        risks.append("New activity starts from a user-disclosed zero, not an extracted historical expense. Sales, demand and margin remain explicit planning assumptions.")
     if linked and linked["excluded"]:
         issues.append("The linked expense is excluded or marked duplicate; restore or relink it before using this action.")
     from app.services.operating_metric_effects import effects, noncash_da
@@ -475,16 +487,16 @@ def _impact(action, body, expenses, cockpit, allowed_files, now, command_result=
     implementation = action["implementation_cost"]
     recurring_cost = implementation * (12 if action["implementation_cost_cadence"] == "monthly" else 1) if implementation is not None and action["implementation_cost_cadence"] != "one_time" else 0
     one_time_cost = implementation if implementation is not None and action["implementation_cost_cadence"] == "one_time" else 0
-    horizon = date.fromisoformat(body["projection_start"]) if body.get("projection_start") else now.date()
-    effective = date.fromisoformat(action["effective_date"]) if action.get("effective_date") else None
-    fraction = _active_days(effective, horizon) if effective else None
+    horizon = date.fromisoformat(body["projection_start"]) if body.get("projection_start") else None
+    effective = date.fromisoformat(action["effective_date"]) if action.get("effective_date") else horizon
+    fraction = _active_days(effective, horizon) if effective and horizon else None
     metric_effects = effects(cockpit, recurring, implementation, recurring_cost, one_time_cost, fraction, action=action, body=body) if noncash else {}
     if noncash:
         recurring = metric_effects["earnings_gross_annual_impact"]
         risks.append("A depreciation/amortization proposal changes accounting NOI only where that expense is included in its source. It does not release cash or improve EBITDA before actual implementation costs; tax treatment remains subject to preparer review.")
     net_annual = recurring - recurring_cost if recurring is not None and implementation is not None else None
     first_year = (net_annual * fraction + one_time_benefit - one_time_cost if fraction and net_annual is not None else 0 if fraction == 0 and net_annual is not None else None)
-    if effective and effective < horizon:
+    if effective and horizon and effective < horizon:
         risks.append("The effective date precedes the projection horizon; verify realized savings are not already included in the current source baseline.")
     if one_time_benefit:
         risks.append("One-time effects are shown in the first-year illustration and are not multiplied into recurring annual coverage.")
@@ -513,7 +525,8 @@ def _impact(action, body, expenses, cockpit, allowed_files, now, command_result=
             **({"command": deepcopy(command_result)} if command_result else {}),
             **({"price_basis": "annual_revenue"} if action.get("price_basis") == "annual_revenue" else {}),
             **({"unit_change_mode": action["unit_change_mode"], "unit_change_value": action["unit_change_value"],
-                "unit_economics": unit_calculation} if kind == "unit_volume" else {})}}
+                "unit_economics": unit_calculation} if kind == "unit_volume" else {}),
+            **({"baseline_classification": "new_planning_assumption"} if new_activity else {})}}
 
 
 def _conflicts(actions, expenses, body=None):
@@ -681,6 +694,9 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
         from app.services.operating_plan_commands import participants
 
         participant_ids = {row["id"] for row in participants(intent, original)}
+        correction_keys = {key for key, decision in original.get("source_group_confirmations", {}).items() if decision == "needs_correction"}
+        if any(expenses[row_id].get("source_group_key") in correction_keys for row_id in participant_ids):
+            result["issues"].append("The affected source line has a pending correction. Resolve and confirm its original source before using this change in an earnings or cash projection.")
         for split in resolved["itemization"]:
             if participant_ids & set(split["child_expense_row_ids"]) and (split["status"] != "balanced" or split["source_group_key"] and not split["source_comparable"]):
                 result["issues"].append(f"Reconcile source itemization for parent {split['parent_expense_row_id']} before applying these costs to earnings; a historical correction remains unresolved for preparer review.")
@@ -706,6 +722,13 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
             own_issues = [issue for issue in result["issues"] if issue not in conflicts.get(action["id"], [])]
             own_issues.extend(approved_conflicts.get(action["id"], []))
             support_ids = {*action["source_file_ids"], *((expenses.get(action.get("expense_row_id")) or {}).get("source_file_ids") or [])}
+            if (not support_ids and explicit_new_zero(action, expenses.get(action.get("expense_row_id")))
+                    and action.get("baseline_treatment") == "incremental_to_baseline" and action.get("baseline_reconciliation_note")):
+                from app.services.operating_new_activity import baseline_context
+
+                support_ids = baseline_context(original, cockpit, files)
+                if support_ids:
+                    result["calculation"]["baseline_context_only"] = True
             if action["kind"] == "unit_volume":
                 support_ids.update(fid for row in body["expenses"] if not row["excluded"] for fid in row["source_file_ids"])
             if action["kind"] == "expense_group_change":
@@ -743,9 +766,9 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
     def totals(rows):
         return {"annual_impact": _money(sum(row["net_annual_impact"] or 0 for row in rows)),
                 "monthly_impact": _money(sum(row["net_annual_impact"] or 0 for row in rows) / 12),
-                "first_year_impact": _money(sum(row["first_year_impact"] or 0 for row in rows)),
+                "first_year_impact": _money(sum(row["first_year_impact"] or 0 for row in rows)) if all(row["first_year_impact"] is not None for row in rows) else None,
                 "one_time_cost": _money(sum(row["implementation_one_time"] or 0 for row in rows)),
-                "complete": bool(rows) and all(row["net_annual_impact"] is not None and row["first_year_impact"] is not None for row in rows), "count": len(rows)}
+                "complete": bool(rows) and all(row["net_annual_impact"] is not None for row in rows), "count": len(rows)}
 
     proposed_rows = [row for row in results if row.get("proposed_math_valid")]
     approved_rows = [row for row in results if row["included_in_approved_projection"]]
@@ -771,10 +794,10 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
             for metric in ("noi", "cash"):
                 annuals = [metric_value(row, metric, "net_annual") for row in selected]
                 firsts = [metric_value(row, metric, "first_year") for row in selected]
-                metric_complete = bool(selected) and len(selected) == expected and all(value is not None for value in [*annuals, *firsts])
+                metric_complete = bool(selected) and len(selected) == expected and all(value is not None for value in annuals)
                 total[metric + "_complete"] = metric_complete
                 total[metric + "_annual_impact"] = _money(sum(annuals)) if metric_complete else None
-                total[metric + "_first_year_impact"] = _money(sum(firsts)) if metric_complete else None
+                total[metric + "_first_year_impact"] = _money(sum(firsts)) if metric_complete and all(value is not None for value in firsts) else None
     earnings = (cockpit.get("ebitda") or {}).get("headline") or {}
     potential = (cockpit.get("ebitda") or {}).get("potential") or {}
     source_baseline = potential.get("baseline") or {}
@@ -814,16 +837,17 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
         available = comparable and annual_earnings is not None and total["complete"]
         noi_available = noi_comparable and annual_noi is not None and total.get("noi_complete", total["complete"])
         after = annual_earnings + total["annual_impact"] if available else None
-        first_year = annual_earnings + total["first_year_impact"] if available else None
+        first_year = annual_earnings + total["first_year_impact"] if available and total["first_year_impact"] is not None else None
         coverage_rows = approved_rows if reviewed else proposed_rows
         coverage_impact = sum(row["first_year_impact"] or 0 for row in coverage_rows
-            if row["kind"] != "one_time_adjustment" and (row.get("calculation") or {}).get("cadence") != "one_time") if available else None
+            if row["kind"] != "one_time_adjustment" and (row.get("calculation") or {}).get("cadence") != "one_time") if available and all(row["first_year_impact"] is not None for row in coverage_rows) else None
         first_year_coverage = annual_earnings + coverage_impact if coverage_impact is not None else None
         new_operating = number(evaluation.get("annual_new_operating_expenses", 0))
         refinance_after = after - new_operating if after is not None and new_operating is not None else None
         refinance_first_year = first_year_coverage - new_operating if first_year_coverage is not None and new_operating is not None else None
         after_noi = annual_noi + total.get("noi_annual_impact", total["annual_impact"]) if noi_available else None
-        first_year_noi = annual_noi + total.get("noi_first_year_impact", total["first_year_impact"]) if noi_available else None
+        noi_first_delta = total.get("noi_first_year_impact", total["first_year_impact"])
+        first_year_noi = annual_noi + noi_first_delta if noi_available and noi_first_delta is not None else None
         return {"status": "awaiting_review" if reviewed and total["count"] == 0 else "no_actions" if not reviewed and not active else "reviewed_illustration" if reviewed and available else "unreviewed_illustration" if available else "unavailable",
             "earnings": _money(after), "noi": _money(after_noi),
             "noi_status": "awaiting_review" if reviewed and total["count"] == 0 else "no_actions" if not reviewed and not active else "reviewed_illustration" if reviewed and noi_available else "unreviewed_illustration" if noi_available else "unavailable",
@@ -914,10 +938,40 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
 
         result["goal_progress"] = goal_progress(goal, result)
         result["cash_bridge"] = cash_bridge(original, cockpit, result)
-    if include_expense_changes:
+    feedback = None
+    if include_expense_changes or goal.get("status") == "set":
         from app.services.operating_draft_feedback import evaluate as draft_feedback
 
-        result["draft_feedback"] = draft_feedback(original, cockpit, result, source_file_ids=source_file_ids, now=now)
+        feedback = draft_feedback(original, cockpit, result, source_file_ids=source_file_ids, now=now)
+    if goal.get("status") == "set":
+        from app.services.operating_funding import evaluate as funding
+
+        funded = funding(original, cockpit, result, feedback=feedback)
+        result["cash_bridge"].update(funded)
+        bridge = result["cash_bridge"]
+        legacy_allocation = {**released, "available": bridge["available"], "required": bridge["required"], "complete": bridge["complete"],
+            "status": bridge["status"], "source_fingerprint": bridge["source_fingerprint"],
+            "amount_monthly": bridge["recurring_cash_released_monthly"], "allocated_monthly": bridge["allocated_monthly"],
+            "unallocated_monthly": bridge["unallocated_monthly"], "missing": bridge["missing"]}
+        result["released_cash_flow"] = legacy_allocation
+        if funded["funding_uses_operating_savings"]:
+            result["missing"] = [value for value in result["missing"] if value not in released["missing"]]
+            if funded["funding_required"]:
+                result["missing"].extend(funded["funding_missing"])
+            funded_release = {**released, "available": funded["funding_available"], "required": funded["funding_required"],
+                "complete": funded["funding_complete"], "status": "stale" if funded["funding_stale"] else "unavailable" if not funded["funding_available"] else "complete" if funded["funding_complete"] else "incomplete",
+                "source_fingerprint": funded["funding_source_fingerprint"], "amount_monthly": funded["funding_capacity_monthly"],
+                "allocated_monthly": funded["funding_allocated_monthly"], "unallocated_monthly": funded["funding_unallocated_monthly"],
+                "missing": funded["funding_missing"], "note": funded["funding_note"]}
+            # An unquantified proposal remains a NeedsInputs snapshot. It does
+            # not manufacture new funds or revoke a reconciled existing pool.
+            # Any actually quantified positive savings must use the new pool.
+            result["released_cash_flow"] = legacy_allocation if (funded["operating_known_savings_annual"] == 0 and legacy_allocation["complete"] and not funded["funding_available"]) else funded_release
+    if include_expense_changes:
+        from app.services.operating_source_review import evaluate as source_review
+
+        result["draft_feedback"] = feedback
+        result["source_review"] = source_review(original, cockpit)
     return result
 
 

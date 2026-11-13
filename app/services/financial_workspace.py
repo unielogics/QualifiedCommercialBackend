@@ -856,12 +856,17 @@ async def publish_version(db: AsyncSession, profile: ApplicationProfile, *, kind
 
         goal = await require_goal(db, profile) if operating_client_submission else await read_goal(db, profile)
         operating_context["_operating_goal"] = goal
+        why_missing = [f"adjustments.{row['id']}.explanation" for row in body["adjustments"]
+                       if not row["excluded"] and row["status"] != "rejected" and not row["explanation"].strip()]
+        if why_missing:
+            raise HTTPException(422, {"code": "operating_change_reason_required", "message": "Explain why each planned change is reasonable before saving a version. Your working draft is retained.",
+                                      "missing": why_missing})
         from app.schemas.earnings_improvement import expense_missing, source_duplicate_missing
         from app.services.operating_plan_commands import correction_missing, itemization_missing
 
         duplicate_missing = source_duplicate_missing(body)
         documented_groups = {row["source_group_key"] for row in body["historical_corrections"]
-            if len(row["reason"].strip()) >= 3 and (row["source_file_ids"] or row["evidence_note"].strip())}
+            if len(row["reason"].strip()) >= 3}
         expense_details = [f"expenses.{row['id']}.{key}" for row in body["expenses"] if not row["excluded"]
             for key in expense_missing(row) if not (
                 row.get("itemization_parent_id") and row["label"].strip() and row["source_group_key"] in documented_groups
@@ -870,14 +875,20 @@ async def publish_version(db: AsyncSession, profile: ApplicationProfile, *, kind
         split_missing = [*itemization_missing(body, operating_context), *correction_missing(body)]
         if split_missing:
             raise HTTPException(422, {"code": "operating_itemization_incomplete",
-                "message": "Reconcile each source split or record a historical correction with evidence for preparer review. Your working draft is retained.",
+                "message": "Reconcile each source split or explain the historical correction for preparer review. Supporting uploads are optional. Your working draft is retained.",
                 "missing": split_missing})
         if duplicate_missing or expense_details:
             raise HTTPException(422, {"code": "operating_expenses_incomplete",
                 "message": "Complete the current expense details and resolve duplicate imported rows before saving a version. Your working draft is retained.",
                 "missing": [*expense_details, *duplicate_missing]})
         assessment = earnings_improvement.evaluate(body, operating_context)
-        allocation = assessment.get("cash_bridge") or assessment["released_cash_flow"]
+        from app.services.operating_source_review import evaluate as source_review
+
+        source_progress = source_review(body, operating_context)
+        if source_progress["active"] and not source_progress["complete"]:
+            raise HTTPException(422, {"code": "operating_source_review_incomplete", "message": "Review the selected source figures or explain the corrections that need review. Your draft is retained.",
+                                      "missing": source_progress["missing"]})
+        allocation = assessment["released_cash_flow"]
         if (submit or goal["status"] == "set") and allocation["required"] and not allocation["complete"]:
             raise HTTPException(422, {"code": "released_cash_flow_incomplete",
                 "message": "Reconcile the recurring released-cash-flow allocation before submitting. Your draft is retained.",

@@ -96,16 +96,15 @@ def cash_bridge(body, cockpit, evaluation=None):
     capacity = max(Decimal(0), net).quantize(CENT, rounding=ROUND_HALF_UP) if available and net is not None else None
     allocations = (body.get("released_cash_flow") or {}).get("allocations") or []
     acknowledgement = (body.get("released_cash_flow") or {}).get("source_fingerprint")
-    retained = bool(allocations or acknowledgement)
-    stale = bool(retained and acknowledgement != current["fingerprint"])
-    required = bool(current["positive"] or current["requires_reconciliation"] or retained)
+    stale = bool(allocations and acknowledgement != current["fingerprint"])
+    required = bool(current["requires_reconciliation"] or allocations)
     missing = []
     if required:
         if not available:
             missing.extend(reasons)
         if stale:
             missing.append("released_cash_flow.source_fingerprint.stale")
-        if not acknowledgement:
+        if allocations and not acknowledgement:
             missing.append("released_cash_flow.source_fingerprint")
     expenses = {row["id"]: row for row in body.get("expenses", []) if not row.get("excluded")}
     duplicate_ids = {path.split(".")[1] for path in source_duplicate_missing(body)}
@@ -163,8 +162,8 @@ def cash_bridge(body, cockpit, evaluation=None):
     allocated = sum(amounts, Decimal(0)) if all(value is not None for value in amounts) else None
     remaining = capacity - allocated if capacity is not None and allocated is not None else None
     missing.extend(issue for row in linked for issue in row["issues"])
-    if required and available and remaining != 0:
-        missing.append("released_cash_flow.allocations.full_release")
+    if allocations and available and (remaining is None or remaining < 0):
+        missing.append("released_cash_flow.allocations.capacity_exceeded")
     if required and body.get("currency") != "USD":
         missing.append("released_cash_flow.currency")
     active = [row for row in body.get("adjustments", []) if not row.get("excluded") and row.get("status") != "rejected"]
@@ -191,7 +190,7 @@ def cash_bridge(body, cockpit, evaluation=None):
     observed_complete = all(value is not None for value in (before, after, operating, financing)) and currency == "USD"
     loan_status = "not_saved" if not current["saved"] else "calculated" if available else "source_blocked" if observed_complete else "incomplete"
     operations_missing = [f"adjustments.{row['id']}.qualified_cash_effect" for row in active] if recurring is None else []
-    explicit_window = bool(body.get("projection_start") and all(row.get("effective_date") and row.get("implementation_cost") is not None for row in active))
+    explicit_window = bool(body.get("projection_start") and all(row.get("implementation_cost") is not None for row in active))
     modeled_first_year = first_year if explicit_window or not active else None
     complete = not missing
     return {"status": "stale" if stale else "not_saved" if not current["saved"] else "unavailable" if not available else "not_required" if not required else "complete" if complete else "incomplete",
@@ -245,4 +244,11 @@ def public_summary(evaluation):
         rows = [{key: deepcopy(row.get(key)) for key in ("id", "purpose", "expense_row_id", "action_id", "amount_monthly", "capacity_monthly", "status", "issues")}
                 for row in value.get("allocations", [])]
         result["cash_bridge"].update(allocations=rows, linked_allocations=deepcopy(rows))
+        if "funding_available" in value:
+            fields = ("funding_available", "funding_required", "funding_complete", "funding_stale", "funding_currency", "funding_capacity_monthly", "funding_capacity_annual",
+                      "funding_known_capacity_monthly", "funding_known_capacity_annual", "operating_savings_monthly", "operating_savings_annual",
+                      "operating_known_savings_monthly", "operating_known_savings_annual", "funding_allocated_monthly", "funding_allocated_annual",
+                      "funding_unallocated_monthly", "funding_unallocated_annual", "funding_retained_monthly", "funding_retained_annual",
+                      "funding_reinvested_monthly", "funding_reinvested_annual", "funding_missing", "funding_note")
+            result["cash_bridge"].update({key: deepcopy(value.get(key)) for key in fields})
     return result

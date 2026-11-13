@@ -165,7 +165,7 @@ def test_overallocation_is_explicit_and_does_not_invent_an_extra_expense():
     result = evaluate(raw, current)
     assert result["cash_bridge"]["unallocated_monthly"] == -1
     assert result["cash_bridge"]["complete"] is False
-    assert "released_cash_flow.allocations.full_release" in result["cash_bridge"]["missing"]
+    assert "released_cash_flow.allocations.capacity_exceeded" in result["cash_bridge"]["missing"]
     assert result["baseline"]["noi"] == 18000
     assert result["disclosure"]["active_count"] == 0
 
@@ -261,6 +261,8 @@ def test_saved_loan_monthly_and_annual_values_remain_independent_of_stale_alloca
     current = saved_loan()
     raw = acknowledge(accounting_change(None), current)
     raw["released_cash_flow"]["source_fingerprint"] = "a" * 64
+    raw["released_cash_flow"]["allocations"] = [{"id": "70000000-0000-4000-8000-000000000002",
+        "label": "Retain cash", "purpose": "reserve", "amount_monthly": 100}]
     cash = evaluate(raw, current)["cash_bridge"]
     assert cash["stale"] is True
     assert cash["loan_status"] == "calculated"
@@ -374,6 +376,7 @@ def test_actual_accepted_first_party_schedule_propagates_its_denomination_into_t
 def test_working_after_setup_is_known_before_prose_or_dates_without_claiming_a_qualified_forecast():
     raw = accounting_change(6000, implementation_cost=25, implementation_cost_cadence="monthly",
         effective_date=None, explanation="", source_note="")
+    raw["projection_start"] = None
     result = evaluate(raw)
     working = result["draft_feedback"]["summary"]["working"]
     assert working["basis"] == "after_setup_before_timing"

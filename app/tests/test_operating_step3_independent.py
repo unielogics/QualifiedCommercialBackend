@@ -153,7 +153,7 @@ def test_preview_opt_in_does_not_change_saved_summary_or_existing_projection_res
     raw = body()
     regular, interactive = engine.evaluate(raw, source_context(), now=NOW), preview(raw)
     assert "expense_changes" not in regular
-    assert {key: value for key, value in interactive.items() if key not in {"expense_changes", "draft_feedback"}} == regular
+    assert {key: value for key, value in interactive.items() if key not in {"expense_changes", "draft_feedback", "source_review"}} == regular
     assert engine.package_summary(interactive) == engine.package_summary(regular)
 
 

@@ -190,6 +190,8 @@ class OperatingPlanBody(_Form):
     notes: str = Field(default="", max_length=10000)
     expenses: list[ExpenseRow] = Field(default_factory=list, max_length=500)
     category_confirmations: dict[ExpenseCategory, CategoryConfirmation] = Field(default_factory=dict)
+    source_group_confirmations: dict[str, Literal["confirmed", "needs_correction"]] = Field(default_factory=dict, max_length=100)
+    source_group_confirmation_stamp: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     historical_corrections: list[HistoricalCorrection] = Field(default_factory=list, max_length=500)
     adjustments: list[AdjustmentRow] = Field(default_factory=list, max_length=300)
     released_cash_flow: ReleasedCashFlow = Field(default_factory=ReleasedCashFlow)
@@ -270,7 +272,7 @@ def validate_body(raw):
 
 
 def action_missing(row):
-    required = ["label", "driver_key", "effective_date", "explanation", "source_note", "implementation_cost"]
+    required = ["label", "driver_key", "explanation", "implementation_cost"]
     kind = row["kind"]
     if row.get("command"):
         if row["command"].get("value") is None:
@@ -287,6 +289,11 @@ def action_missing(row):
         required += ["units_per_period", "current_unit_cost", "proposed_unit_cost"]
     elif kind == "processing_cost_change":
         required += ["processing_volume", "current_processing_rate_pct", "proposed_processing_rate_pct"]
+        if row.get("current_processing_rate_basis") == "processor_markup" or row.get("proposed_processing_rate_basis") == "processor_markup":
+            required += ["current_processing_fixed_fee", "proposed_processing_fixed_fee", "current_processing_per_transaction_fee",
+                         "proposed_processing_per_transaction_fee"]
+            if any(row.get(key) is not None and row[key] > 0 for key in ("current_processing_per_transaction_fee", "proposed_processing_per_transaction_fee")):
+                required.append("processing_transaction_count")
     elif kind == "marketing_investment":
         required += ["product_name", "expense_row_id", "current_amount", "proposed_amount",
                      "revenue_return_multiple", "contribution_margin_pct"]
@@ -299,7 +306,10 @@ def action_missing(row):
         required += ["current_amount", "proposed_amount"]
         if kind == "revenue_change":
             required.append("contribution_margin_pct")
-    return [key for key in required if row.get(key) is None or row.get(key) == ""]
+    missing = [key for key in required if row.get(key) is None or row.get(key) == ""]
+    if kind == "processing_cost_change":
+        missing += [key for key in ("current_processing_rate_basis", "proposed_processing_rate_basis") if row.get(key) in {None, "", "unknown"}]
+    return list(dict.fromkeys(missing))
 
 
 def expense_missing(row):
@@ -332,14 +342,13 @@ def completion(raw):
     if body["basis"] == "unknown":
         missing.append("basis")
     active = [row for row in body["expenses"] if not row["excluded"]]
-    if not active and not body["no_operating_expenses_confirmed"]:
+    source_review_active = bool(body["source_group_confirmation_stamp"] or body["source_group_confirmations"])
+    if not active and not body["no_operating_expenses_confirmed"] and not source_review_active:
         missing.append("expenses_or_no_expenses_confirmation")
-    missing.extend(f"category_confirmations.{category}" for category, decision in body["category_confirmations"].items()
-                   if decision == "needs_help")
     active_categories = {row["category"] for row in active}
-    missing.extend(f"category_confirmations.{category}.expense_detail"
-                   for category, decision in body["category_confirmations"].items()
-                   if decision == "confirmed" and category not in active_categories)
+    if not source_review_active:
+        missing.extend(f"category_confirmations.{category}" for category, decision in body["category_confirmations"].items()
+                       if decision == "needs_help" and category in active_categories)
     for row in active:
         missing.extend(f"expenses.{row['id']}.{key}" for key in expense_missing(row))
     missing.extend(source_duplicate_missing(body))
@@ -385,6 +394,10 @@ def key_facts(raw):
                                      for row in body["adjustments"]]}
     if not safe["historical_corrections"]:
         safe.pop("historical_corrections")
+    if not safe["source_group_confirmations"]:
+        safe.pop("source_group_confirmations")
+    if safe["source_group_confirmation_stamp"] is None:
+        safe.pop("source_group_confirmation_stamp")
     safe["released_cash_flow"] = {**safe["released_cash_flow"], "allocations": [
         {key: value for key, value in row.items() if key not in {"action_id", "purpose"} or value is not None}
         for row in safe["released_cash_flow"]["allocations"]]}

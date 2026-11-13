@@ -229,6 +229,8 @@ def client_evaluation(evaluation):
         from app.services.operating_draft_feedback import public
 
         safe["draft_feedback"] = public(evaluation["draft_feedback"])
+    if "source_review" in evaluation:
+        safe["source_review"] = deepcopy(evaluation["source_review"])
     safe["schema_version"] = evaluation.get("schema_version")
     return safe
 
