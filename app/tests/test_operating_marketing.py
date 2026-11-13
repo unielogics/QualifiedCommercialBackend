@@ -156,6 +156,9 @@ def test_refinance_cash_and_coverage_use_their_own_payment_windows_without_a_goa
     read = plan.evaluate(raw, cockpit, now=NOW, include_expense_changes=True)["comparison"]
     assert read["loan_basis"] == "saved_terms"
     assert read["loan_cash_monthly"] == 3500
+    assert read["payment_breakdown"]["regular_after_monthly"] == 6000
+    assert read["payment_breakdown"]["regular_after_annual"] == 72000
+    assert read["payment_breakdown"]["coverage_after_annual"] == 90000
     assert read["proposed"]["earnings"] == read["baseline"]["earnings"] == 30000
     assert read["proposed"]["noi"] == read["baseline"]["noi"] == 18000
     assert read["proposed"]["debt_service"] == 90000

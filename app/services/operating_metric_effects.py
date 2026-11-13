@@ -69,7 +69,7 @@ def metric_value(row, metric, period):
     return row.get(key) if key in row else row.get(fallback)
 
 
-def plan_comparison(evaluation, loan, *, comparable, noi_comparable, same_basis, debt_currency_ok):
+def plan_comparison(evaluation, loan, *, comparable, noi_comparable, same_basis, debt_currency_ok, loan_evaluation=None):
     """Present the same annual scenarios in the file summary and the live editor."""
     base = evaluation["baseline"]
     feedback = evaluation["draft_feedback"]
@@ -107,8 +107,34 @@ def plan_comparison(evaluation, loan, *, comparable, noi_comparable, same_basis,
         return round(max(0, 1.25 * plan_debt - (earnings - charges)), 2)
 
     charges = reviewed.get("annual_new_operating_expenses") if has_terms else 0
+    loan_evaluation = loan_evaluation or {}
+    schedule = loan_evaluation.get("schedule") or {}
+    repayment = schedule.get("repayment_config") or {}
+    terms = loan_evaluation.get("loan_terms") or {}
+    maturity = schedule.get("maturity_balloon") if "maturity_balloon" in schedule else terms.get("balloon", schedule.get("balloon"))
+    coverage_basis = ("annualized_recorded_payment" if loan_evaluation.get("new_loan_annual_debt_service_basis") == "annualized_recorded_payment"
+                      else schedule.get("coverage_basis"))
+    regular_before = loan.get("before_debt_service_annual") if has_terms else current_debt
+    regular_after = loan.get("after_debt_service_annual") if has_terms else current_debt
+    payment_breakdown = {
+        "regular_before_monthly": loan.get("before_debt_service_monthly") if debt_currency_ok else None,
+        "regular_after_monthly": loan.get("after_debt_service_monthly") if debt_currency_ok and has_terms else None,
+        "regular_before_annual": regular_before if debt_currency_ok else None,
+        "regular_after_annual": regular_after if debt_currency_ok else None,
+        "coverage_before_annual": current_debt,
+        "coverage_after_annual": plan_debt,
+        "new_loan_regular_monthly": number(loan_evaluation.get("new_regular_payment_monthly")) if debt_currency_ok else None,
+        "retained_debt_monthly": number(loan_evaluation.get("debt_service_before_new_payment_monthly")) if debt_currency_ok else None,
+        "financing_fees_monthly": loan.get("new_financing_fees_monthly") if debt_currency_ok else None,
+        "maturity_balance": number(maturity) if debt_currency_ok else None,
+        "coverage_basis": coverage_basis,
+        "term_months": number(terms.get("term_months")),
+        "amortization_months": number(repayment.get("amortization_months")),
+        "payments_per_year": number(schedule.get("periods_per_year")),
+    }
     return {
         "loan_basis": "saved_terms" if ready_terms else "incomplete_terms" if has_terms else "current_debt",
+        "payment_breakdown": payment_breakdown,
         "loan_cash_monthly": loan_cash if has_terms else None,
         "target_gap": {"proposed": coverage_gap(working["earnings"], charges),
             "approved": coverage_gap(reviewed["earnings"], charges)},

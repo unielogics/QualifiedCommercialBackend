@@ -1033,7 +1033,8 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
         from app.services.operating_metric_effects import plan_comparison
 
         result["comparison"] = plan_comparison(result, bridge, comparable=comparable, noi_comparable=noi_comparable,
-            same_basis=earnings.get("basis") == noi.get("basis"), debt_currency_ok=debt_currency_ok and debt.get("currency") == "USD")
+            same_basis=earnings.get("basis") == noi.get("basis"), debt_currency_ok=debt_currency_ok and debt.get("currency") == "USD",
+            loan_evaluation=(cockpit.get("plan") or {}).get("evaluation"))
     return result
 
 

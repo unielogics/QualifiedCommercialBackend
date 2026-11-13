@@ -99,6 +99,55 @@ def test_group_and_item_command_overlap_blocks_both_treatments():
     assert result["commands"][0]["allocations"] == []
 
 
+@pytest.mark.parametrize("kind", ["expense_increase", "marketing_investment"])
+def test_historical_group_change_composes_with_new_zero_baseline_activity(kind):
+    historical, incremental = str(uuid4()), str(uuid4())
+    category = action(id=str(uuid4()), kind="expense_group_change", label="Marketing budget",
+        driver_key="marketing-budget", expense_row_id=None, expense_category="marketing", source_group_key="",
+        command=command(mode="amount", value=7364, allocation="proportional"))
+    campaign = action(id=str(uuid4()), kind=kind, label="Parent targeting", driver_key="parent-targeting",
+        expense_row_id=incremental, expense_category="marketing", current_amount=0, proposed_amount=20000,
+        cadence="annual", source_file_ids=[], product_name="Family service",
+        revenue_return_multiple=3, contribution_margin_pct=50)
+    raw = body(category, campaign, expenses=[
+        expense(id=historical, category="marketing", current_amount=20000, cadence="annual"),
+        expense(id=incremental, category="marketing", current_amount=0, cadence="annual", source_file_ids=[]),
+    ])
+    original = deepcopy(raw)
+    result = engine.evaluate(raw, context(), now=NOW, include_expense_changes=True)
+    group = result["commands"][0]
+    assert group["status"] == "calculated"
+    assert group["participant_expense_row_ids"] == [historical]
+    assert group["current_annual_cost"] == 20000
+    assert group["proposed_annual_cost"] == 12636
+    assert group["gross_annual_effect"] == 7364
+    assert all(not any("overlap" in issue.lower() for issue in row["issues"]) for row in result["actions"])
+    campaign_result = next(row for row in result["actions"] if row["id"] == campaign["id"])
+    assert campaign_result["net_annual_impact"] == (10000 if kind == "marketing_investment" else -20000)
+    assert raw == original
+
+
+@pytest.mark.parametrize("provenance", ["source_group_key", "source_candidate_key", "source_file_ids", "itemization_parent_id"])
+def test_sourced_zero_current_cost_still_participates_in_group_and_overlap_checks(provenance):
+    historical, zero = str(uuid4()), str(uuid4())
+    metadata = {provenance: [SOURCE] if provenance == "source_file_ids" else historical}
+    category = action(id=str(uuid4()), kind="expense_group_change", driver_key="category",
+        expense_row_id=None, expense_category="rent", source_group_key=metadata.get("source_group_key", ""),
+        command=command(allocation="proportional"))
+    rows = [expense(id=historical, source_group_key=metadata.get("source_group_key", "")),
+        expense(id=zero, current_amount=0, **{"source_file_ids": [], **metadata})]
+    if provenance == "itemization_parent_id":
+        rows[0]["excluded"] = True
+        rows.append(expense(id=str(uuid4()), itemization_parent_id=historical))
+    raw = body(category, action(id=str(uuid4()), driver_key="individual-zero", kind="expense_increase",
+        expense_row_id=zero, current_amount=0, proposed_amount=100), expenses=rows)
+    result = engine.evaluate(raw, context(), now=NOW, include_expense_changes=True)
+    assert zero in result["commands"][0]["participant_expense_row_ids"]
+    assert result["commands"][0]["status"] == "incomplete"
+    assert result["commands"][0]["allocations"] == []
+    assert all(any("overlap" in issue.lower() for issue in row["issues"]) for row in result["actions"])
+
+
 def test_unit_quantity_command_retains_rate_and_fixed_charge_once():
     row = expense(cost_basis="per_unit", unit_label="consultation", current_amount=1000,
         current_units_per_period=100, current_unit_cost=8, current_fixed_amount=200)

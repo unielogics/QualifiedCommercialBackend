@@ -35,6 +35,116 @@ def _confirmed_obligations():
     ], "service": CONFIRMED_SERVICE}, RECURRING)
 
 
+@pytest.mark.parametrize(("months", "rate", "structure", "cadence"), [
+    (6, 20, "simple_interest", 12),
+    (6, 0, "amortizing", 12),
+    (6, 12, "amortizing", 52),
+    (12, 0, "amortizing", 12),
+    (60, 12, "amortizing", 12),
+])
+def test_coverage_plan_uses_the_same_annual_contract_as_client_terms(months, rate, structure, cadence):
+    from app.services.application_terms import repayment_math
+    from app.services.loan_schedule import build_schedule
+
+    schedule = build_schedule(100000, rate, months, structure=structure, periods_per_year=cadence)
+    quoted = repayment_math(amount=100000, apr_pct=rate, term_months=months,
+        frequency="custom", custom_payments_per_year=cadence, loan_structure=structure)
+    plan = fp.normalize_plan({"new_loan_amount": 100000, "new_loan_rate_pct": rate,
+        "new_loan_term_months": months, "new_loan_structure": structure, "new_loan_payments_per_year": cadence})
+    result = fp.evaluate_plan(plan, obligations_list=[], recurring={"payees": [], "months_read": []},
+        months=[], dscr=DSCR, service={"monthly": 0, "annual": 0}, proposed=None, requested_amount=None)
+
+    assert result["new_payment_monthly"] == schedule["coverage_payment_monthly"]
+    assert result["new_loan_annual_debt_service_basis"] == "canonical_schedule"
+    assert result["debt_service_after_annual"] == schedule["coverage_annual_debt_service"] == quoted[3]
+    assert result["headline_after"] == round(DSCR["headline"]["numerator"] / quoted[3], 2)
+
+
+def test_short_contract_retires_existing_payments_and_preserves_retained_annual_cents():
+    from app.services.loan_schedule import build_schedule
+
+    retained = 30180.05
+    plan = fp.normalize_plan({"retire": ["row:ondeck"], "new_loan_amount": 100000,
+        "new_loan_rate_pct": 20, "new_loan_term_months": 6, "new_loan_structure": "simple_interest",
+        "new_payment_source": "recorded_terms", "terms_ref": {"kind": "client_terms", "id": "terms-1",
+            "version": 1, "treatment": "refinance", "retained_annual_debt_service": retained},
+        "overrides": {"debt_service_monthly": round(retained / 12, 2), "debt_service_note": "Refinance per client terms v1"}})
+    result = fp.evaluate_plan(plan, obligations_list=_confirmed_obligations(), recurring=RECURRING,
+        months=[], dscr=DSCR, service=CONFIRMED_SERVICE, proposed=None, requested_amount=None)
+    canonical = build_schedule(100000, 20, 6, structure="simple_interest")
+
+    assert result["retired_monthly"] == 6750
+    assert result["debt_service_before_new_payment_monthly"] == round(retained / 12, 2)
+    assert result["debt_service_after_annual"] == round(retained + canonical["coverage_annual_debt_service"], 2)
+
+
+def test_short_contract_preserves_a_distinct_reviewed_manual_payment():
+    plan = fp.normalize_plan({"new_loan_amount": 100000, "new_loan_rate_pct": 20,
+        "new_loan_term_months": 6, "new_payment_monthly": 20000, "new_payment_source": "manual"})
+    result = fp.evaluate_plan(plan, obligations_list=[], recurring={"payees": [], "months_read": []},
+        months=[], dscr=DSCR, service={"monthly": 1000, "annual": 12000}, proposed=None, requested_amount=None)
+
+    assert result["new_payment_monthly"] == 20000
+    assert result["new_loan_annual_debt_service_basis"] == "annualized_monthly_payment"
+    assert result["debt_service_after_annual"] == 252000
+
+
+def test_long_recorded_legacy_payment_preserves_its_accepted_annualization():
+    from app.services.loan_schedule import build_schedule
+
+    schedule = build_schedule(100000, 29.99, 24, structure="amortizing", periods_per_year=51.96)
+    monthly = schedule["coverage_payment_monthly"]
+    plan = fp.normalize_plan({"new_loan_amount": 100000, "new_loan_rate_pct": 29.99,
+        "new_loan_term_months": 24, "new_loan_structure": "amortizing", "new_loan_payments_per_year": 51.96,
+        "new_payment_monthly": monthly, "new_payment_source": "recorded_terms"})
+    result = fp.evaluate_plan(plan, obligations_list=[], recurring={"payees": [], "months_read": []},
+        months=[], dscr=DSCR, service={"monthly": 1000, "annual": 12000}, proposed=None, requested_amount=None)
+
+    assert result["new_loan_annual_debt_service_basis"] == "annualized_recorded_payment"
+    assert result["new_loan_annual_debt_service"] == round(monthly * 12, 2)
+    assert result["debt_service_after_annual"] == round((1000 + monthly) * 12, 2)
+    assert result["schedule"]["coverage_annual_debt_service"] == schedule["coverage_annual_debt_service"]
+
+
+def test_legacy_schedule_without_an_annual_quote_keeps_the_known_payment_basis(monkeypatch):
+    from app.services import loan_schedule
+
+    build = loan_schedule.build_schedule
+
+    def legacy_schedule(*args, **kwargs):
+        schedule = build(*args, **kwargs)
+        schedule.pop("coverage_annual_debt_service")
+        return schedule
+
+    monkeypatch.setattr(loan_schedule, "build_schedule", legacy_schedule)
+    plan = fp.normalize_plan({"new_loan_amount": 100000, "new_loan_rate_pct": 20, "new_loan_term_months": 6})
+    result = fp.evaluate_plan(plan, obligations_list=[], recurring={"payees": [], "months_read": []},
+        months=[], dscr=DSCR, service={"monthly": 1000, "annual": 12000}, proposed=None, requested_amount=None)
+
+    assert result["debt_service_after_annual"] == round((1000 + result["new_payment_monthly"]) * 12, 2)
+
+
+def test_short_contract_with_recurring_fees_keeps_all_retained_debt_in_coverage():
+    from app.services.loan_schedule import build_schedule
+    from app.tests.test_deal_budget_independent_math import budget, cost
+
+    costs = budget([cost(payer="borrower", value=100, timing="monthly",
+        earnings_treatment="financing_cost", coverage_treatment="new_cost")])
+    plan = fp.normalize_plan({"new_loan_amount": 100000, "new_loan_rate_pct": 20,
+        "new_loan_term_months": 6, "new_loan_structure": "simple_interest"})
+    schedule = build_schedule(100000, 20, 6, structure="simple_interest")
+    result = fp.evaluate_plan(plan, obligations_list=[], recurring={"payees": [], "months_read": []},
+        months=[], dscr=DSCR, service={"monthly": 10000, "annual": 120000},
+        proposed=None, requested_amount=None, financing_budget=costs)
+
+    assert result["new_loan_annual_debt_service"] == schedule["coverage_annual_debt_service"]
+    assert result["debt_service_after_annual_before_financing_fees"] == round(120000 + schedule["coverage_annual_debt_service"], 2)
+    assert result["annual_new_financing_fees"] == 600
+    expected_annual = round(120000 + schedule["annual_debt_service"] + 600, 2)
+    assert result["debt_service_after_annual"] == expected_annual
+    assert result["headline_after"] == round(DSCR["headline"]["numerator"] / expected_annual, 2)
+
+
 def test_obligations_link_explicit_rows_without_promoting_unmatched_payees() -> None:
     debt = {"rows": [_row("r1", "On Deck Capital", 6700.0, 40000.0, vendor_key="ondeck"),
                      _row("r2", "Kapitus", 2000.0, 9000.0, is_mca=False)],
