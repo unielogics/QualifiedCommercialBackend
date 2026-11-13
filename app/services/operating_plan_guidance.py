@@ -225,6 +225,10 @@ def client_evaluation(evaluation):
     for key in ("commands", "itemization", "historical_corrections", "goal_progress", "cash_bridge"):
         if key in evaluation:
             safe[key] = deepcopy(evaluation[key])
+    if "draft_feedback" in evaluation:
+        from app.services.operating_draft_feedback import public
+
+        safe["draft_feedback"] = public(evaluation["draft_feedback"])
     safe["schema_version"] = evaluation.get("schema_version")
     return safe
 
