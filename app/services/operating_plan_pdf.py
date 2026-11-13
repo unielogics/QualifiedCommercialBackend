@@ -99,6 +99,8 @@ def _before_after(summary, currency):
 
 
 def _released_cash_flow(summary, body):
+    if summary.get("cash_bridge"):
+        return ""  # The captured net cash bridge below replaces the legacy gross relief.
     cash = summary.get("released_cash_flow") or {}
     rows = cash.get("allocations") or (body.get("released_cash_flow") or {}).get("allocations") or []
     if not cash.get("required") and not rows:
@@ -109,6 +111,45 @@ def _released_cash_flow(summary, body):
         f"<p>Monthly released cash flow: {_money(cash.get('amount_monthly'), 'USD')}; allocated: {_money(cash.get('allocated_monthly'), 'USD')}; remaining: {_money(cash.get('unallocated_monthly'), 'USD')}. Status: {_text(cash.get('status'))}.</p>"
         "<table><thead><tr><th>Monthly use</th><th>Monthly amount</th><th>Explanation</th></tr></thead><tbody>"
         + (details or "<tr><td colspan='3'>No monthly allocation entered.</td></tr>") + "</tbody></table>")
+
+
+def _goal_tracking(summary, body):
+    """Render only the immutable saved-version snapshot; never infer a goal."""
+    goal, cash = summary.get("goal_progress") or {}, summary.get("cash_bridge") or {}
+    if not goal:
+        return ""
+    currency = goal.get("currency")
+    rows = "".join(f"<tr><td>{label}</td><td class='num'>{_money(goal.get(key), currency)}</td></tr>"
+        for label, key in (("Current annual NOI", "current_noi"), ("Zero / break-even", "zero"),
+            ("Proposed annual NOI", "proposed_noi"), ("Staff annual NOI goal", "target"),
+            ("Remaining annual gap with proposals", "proposed_gap")))
+    result = (f"<h2>Annual NOI goal - saved revision {_text(goal.get('goal_revision'))}</h2>"
+        "<table><thead><tr><th>Measure</th><th>Annual amount</th></tr></thead><tbody>" + rows + "</tbody></table>"
+        "<p class='muted'>Operating-plan NOI is shown before additional loan operating charges; those charges appear in the cash bridge. A source loss remains negative and missing figures stay unavailable. Loan payment relief does not improve NOI.</p>")
+    if not cash:
+        return result
+    rows = "".join(f"<tr><td>{label}</td><td class='num'>{_money(cash.get(key), cash.get('currency'))}</td></tr>"
+        for label, key in (("Current regular debt service", "before_debt_service_monthly"),
+            ("Saved-plan regular debt service (includes financing charges)", "after_debt_service_monthly"),
+            ("New recurring operating charges", "new_operating_charges_monthly"),
+            ("Net loan cash change", "net_loan_cash_change_monthly"),
+            ("Conditional operations change", "modeled_operations_monthly"),
+            ("Combined incremental change", "combined_incremental_monthly"),
+            ("Assigned loan cash relief", "allocated_monthly"), ("Still to assign", "unallocated_monthly")))
+    result += ("<h2>Loan and operations cash bridge</h2><table><thead><tr><th>Measure</th><th>Monthly amount</th></tr></thead><tbody>"
+        + rows + "</tbody></table><p class='muted'>Incremental illustration, not a cash-flow statement or bank balance. Financing charges included in debt service are not deducted twice. Operations timing and setup costs are separate; assignments do not create additional expenses or earnings.</p>")
+    allocations = {row["id"]: row for row in (body.get("released_cash_flow") or {}).get("allocations", [])}
+    expenses = {row["id"]: row for row in body.get("expenses", [])}
+    links = []
+    for link in cash.get("linked_allocations", []):
+        row, expense = allocations.get(link["id"], {}), expenses.get(link.get("expense_row_id"), {})
+        links.append(f"<tr><td>{_text(row.get('label'))}<br><small>{_text(link.get('purpose')).replace('_', ' ')}"
+            + (f"; {_text(expense.get('label'))}" if expense else "") + "</small></td>"
+            f"<td class='num'>{_money(link.get('amount_monthly'), cash.get('currency'))}</td>"
+            f"<td>{_text(link.get('status'))}</td></tr>")
+    if links:
+        result += "<h3>Monthly cash assignments</h3><table><thead><tr><th>Use and linked item</th><th>Amount</th><th>Status</th></tr></thead><tbody>" + "".join(links) + "</tbody></table>"
+    return result
 
 
 def _expense_groups(summary, body, currency):
@@ -271,6 +312,7 @@ def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
         f"<p>{_text(body.get('period_start'))} to {_text(body.get('period_end'))} | {_text(currency)} | {_text(body.get('basis'))} basis</p>" + \
         "<div class='notice'>Expense disclosures and proposed earnings improvements. These are separate from historical P&amp;L, NOI, EBITDA, current debt coverage and program qualification. Client submissions await staff review; improvements are conditional and require baseline reconciliation and supporting evidence.</div>" + \
         _before_after(summary, currency) + \
+        _goal_tracking(summary, body) + \
         _business_units(summary, body, currency) + \
         _released_cash_flow(summary, body) + \
         _expense_groups(summary, body, currency) + \

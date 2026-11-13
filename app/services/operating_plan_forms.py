@@ -36,7 +36,9 @@ async def ensure_request(db, profile, *, actor=None):
     """Pin the existing library requirement so readiness keeps the form task."""
     from app.models.application_profile import ApplicationRequirementState
     from app.services import application_programs, requirement_library
+    from app.services.operating_plan_goals import require_goal
 
+    await require_goal(db, profile)
     await financial_workspace.lock_financial_profile(db, profile)
     previous = await requested_slot(db, profile)
     states = (await db.execute(select(ApplicationRequirementState).where(

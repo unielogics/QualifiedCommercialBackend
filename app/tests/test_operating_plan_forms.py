@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from app.enums import Role
 from app.models.application_profile import ApplicationRequirementState
 from app.models.bucket import BucketRequestedDocument
+from app.models.file_event import FileEvent
 from app.routers import application_profiles
 from app.schemas.application_profile import FinancialStatementWrite
 from app.schemas.file_request import FileRequestItem
@@ -28,7 +29,7 @@ from app.services import (
     sheet_layout,
     sheets,
 )
-from app.tests.test_real_estate_request_adoption import MemoryDB
+from app.tests.test_real_estate_request_adoption import MemoryDB, Result
 
 KIND = "operating_plan"
 KEY = "operating_expenses_and_earnings_plan"
@@ -130,13 +131,14 @@ async def test_existing_batch_form_request_is_reused_without_second_requirement_
     state = ApplicationRequirementState(id=uuid4(), profile_id=profile.id, requested_document_id=slot.id,
         requirement_key=slot.requirement_key, label=slot.name, category="financials", required_level="required", status="requested",
         provenance={"requirement_kind": "form", "collection_config": {"form_kind": KIND}})
-    db = MemoryDB([slot, state])
+    goal = FileEvent(profile_id=profile.id, kind="operating_plan.goal_set", meta={"amount": "18000", "currency": "USD", "revision": 1})
+    db = MemoryDB([slot, state, goal])
     with patch.object(financial_workspace, "lock_financial_profile", AsyncMock()), patch.object(requirement_library, "plan_add", AsyncMock()) as add, patch.object(application_programs, "get_program_readiness", AsyncMock()) as refresh:
         result = await operating_plan_forms.ensure_request(db, profile, actor=SimpleNamespace(id=uuid4()))
     assert result == (slot, True)
     add.assert_not_awaited()
     refresh.assert_not_awaited()
-    assert len(db.rows) == 2
+    assert len(db.rows) == 3
 
 
 @pytest.mark.asyncio
@@ -163,7 +165,8 @@ async def test_staff_share_and_client_submission_keep_the_exact_family_and_revis
     profile = SimpleNamespace(id=held.profile_id)
     user = SimpleNamespace(id=uuid4(), role=Role.LOAN_EXEC)
     snapshot = {"kind": KIND, "family_id": str(family_id), "body": example(), "draft": {"revision": 4, "base_version_id": None}, "versions": []}
-    db = SimpleNamespace(get=AsyncMock(return_value=profile), commit=AsyncMock())
+    goal = FileEvent(profile_id=profile.id, kind="operating_plan.goal_set", meta={"amount": "18000", "currency": "USD", "revision": 1})
+    db = SimpleNamespace(get=AsyncMock(return_value=profile), commit=AsyncMock(), execute=AsyncMock(return_value=Result([goal])))
     with patch.object(application_profiles.profiles, "load_profile", AsyncMock(return_value=profile)), patch.object(operating_plan_forms, "ensure_workspace", AsyncMock(return_value=snapshot)), patch.object(application_profiles, "managed_snapshot", AsyncMock(return_value=snapshot)), patch.object(financial_statements, "mint_link", AsyncMock(return_value=(held, "credential"))), patch.object(application_profiles.profiles, "log_profile_action", AsyncMock()):
         result = await application_profiles.mint_financial_form_link(profile.id, KIND, user, db)
     assert f"/forms/{KIND}/credential" in result["url"]
@@ -231,6 +234,7 @@ async def test_email_batch_adopts_existing_library_form_request_and_keeps_differ
     from app.tests.test_file_requests import profile as batch_profile
 
     owner, db = batch_profile(), BatchMemoryDB()
+    db.add(FileEvent(profile_id=owner.id, kind="operating_plan.goal_set", meta={"amount": "18000", "currency": "USD", "revision": 1}))
     slot = BucketRequestedDocument(id=uuid4(), bucket_id=owner.primary_bucket_id, name=operating_plan_forms.LABEL,
         category="Financials", status="requested", requirement_key=KEY,
         requirement_source={"collection_config": {"form_kind": KIND}})

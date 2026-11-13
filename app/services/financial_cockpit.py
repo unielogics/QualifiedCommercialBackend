@@ -3148,6 +3148,9 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
         analyses, cockpit, files=supporting_files, offer=await current_offer(db, profile.id),
         business_name=expected_entity, naics_code=getattr(profile, "naics_code", None), industry=getattr(profile, "industry", None))
     cockpit["operating_evidence"]["business_name"] = expected_entity
+    from app.services.operating_plan_goals import read_goal
+
+    cockpit["_operating_goal"] = await read_goal(db, profile)
     cockpit["operating_plan"] = await operating_plan_service.published_context(db, profile, cockpit)
     from app.services.deal_budget import snapshot as operating_budget_snapshot
     from app.services.financial_plan_operating import refresh_cockpit

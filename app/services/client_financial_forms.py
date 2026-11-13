@@ -24,6 +24,10 @@ from app.services.financial_workspace_legacy import merge_source_debts
 
 async def ensure_snapshot(db, profile, kind: str, *, family_id: UUID | None = None,
                           statement_id: UUID | None = None, actor: Any = None) -> dict:
+    if kind == "operating_plan":
+        from app.services.operating_plan_goals import require_goal
+
+        await require_goal(db, profile)
     await workspace.lock_financial_profile(db, profile)
     if kind == "pfs" and family_id is None and statement_id is None and len(await workspace._families(db, profile.id, kind)) > 1:
         raise HTTPException(409, "Choose the intended owner's personal financial statement before sharing this form")
@@ -102,6 +106,9 @@ def merge_client_body(kind: str, current: dict, incoming: dict) -> dict:
         return merged
     result = copy.deepcopy(current)
     if kind == "operating_plan":
+        from app.services.operating_plan_goals import reject_client_goal
+
+        reject_client_goal(incoming)
         result = _copy_fields(result, incoming, operating_plan_schema.CLIENT_HEADER_FIELDS)
         for block, fields in (("expenses", operating_plan_schema.CLIENT_EXPENSE_FIELDS), ("adjustments", operating_plan_schema.CLIENT_ADJUSTMENT_FIELDS)):
             if block in incoming:
@@ -166,6 +173,10 @@ def require_revision(snapshot: dict, expected_revision: int | None) -> None:
 
 
 async def stage_client_draft(db, profile, snapshot: dict, *, body: dict, expected_revision: int | None, actor=None) -> dict:
+    if snapshot["kind"] == "operating_plan":
+        from app.services.operating_plan_goals import require_goal
+
+        await require_goal(db, profile)
     require_revision(snapshot, expected_revision)
     merged = merge_client_body(snapshot["kind"], snapshot["body"], body)
     if workspace.body_hash(merged) == workspace.body_hash(snapshot["body"]):
@@ -178,6 +189,11 @@ async def save_submission(db, profile, snapshot: dict, *, body: dict, expected_r
                           base_version_id: UUID | None, idempotency_key: str, actor=None) -> dict:
     """Retry before staging; a lost response must not mint another version."""
     family_id, kind = UUID(snapshot["family_id"]), snapshot["kind"]
+    if kind == "operating_plan":
+        from app.services.operating_plan_goals import reject_client_goal, require_goal
+
+        await require_goal(db, profile)
+        reject_client_goal(body)
     prior = (await db.execute(select(FinancialFormVersion).where(FinancialFormVersion.family_id == family_id,
         FinancialFormVersion.idempotency_key == idempotency_key))).scalar_one_or_none()
     if prior is not None:

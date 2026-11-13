@@ -23,7 +23,7 @@ CHAT_FEATURES = {
     "doc_collection_chat",
     "orchestrator_chat",
 }
-SUMMARY_FEATURES = {"loan_summary", "client_summary", "pipeline_digest"}
+SUMMARY_FEATURES = {"loan_summary", "client_summary", "pipeline_digest", "operating_plan_suggestions"}
 DOCUMENT_FEATURES = {"document_scan"}
 LENDER_FEATURES = {
     "lender_extract",

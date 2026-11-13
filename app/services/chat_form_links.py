@@ -152,7 +152,9 @@ async def mint_form_link(
     real_estate_workspace = None
     if kind == "operating_plan":
         from app.services.operating_plan_forms import ensure_workspace
+        from app.services.operating_plan_goals import require_goal
 
+        await require_goal(db, profile)
         real_estate_workspace = await ensure_workspace(db, profile)
     if kind == "real_estate_schedule":
         from app.services.real_estate_forms import ensure_workspace
@@ -348,6 +350,10 @@ async def link_for_action(
     target = target_for(action.action_type, action.requirement_key)
     if target is None:
         raise ValueError(f"{action.action_type} opens no form")
+    if target[0] == "operating_plan":
+        from app.services.operating_plan_goals import require_goal
+
+        await require_goal(db, profile)
     retired = await retire_chat_links(db, profile_id=profile.id, target=target)
     kind, wanted_sheets = target
     if kind == "worksheet":

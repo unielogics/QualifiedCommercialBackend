@@ -272,6 +272,10 @@ async def mint_link(
     packet derives four child tokens from one base so a single link opens all
     four forms. Storage is unchanged: the hash, never the token.
     """
+    if kind == "operating_plan":
+        from app.services.operating_plan_goals import require_goal
+
+        await require_goal(db, profile)
     import secrets
     from datetime import timedelta
 

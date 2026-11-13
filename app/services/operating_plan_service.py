@@ -26,9 +26,10 @@ def completion(body, cockpit):
 
     progress["missing"] = list(dict.fromkeys([*progress["missing"], *itemization_missing(validate_body(body), cockpit)]))
     allocation = evaluate(body, cockpit)
-    missing = [*progress["missing"], *allocation["missing"]]
+    tracking = math.evaluate(body, cockpit).get("cash_bridge") if (cockpit.get("_operating_goal") or {}).get("status") == "set" else None
+    missing = [*progress["missing"], *(tracking["missing"] if tracking else allocation["missing"])]
     return {**progress, "complete": not missing, "missing": missing, "missing_count": len(missing),
-            "released_cash_flow": allocation}
+            "released_cash_flow": allocation, **({"cash_bridge": tracking} if tracking else {})}
 
 
 def shareable_package(evaluation, evidence):
@@ -88,22 +89,27 @@ async def prepare_draft(db, profile, *, incoming, current, actor=None):
     return body
 
 
-async def preview(db, profile, body):
+async def preview(db, profile, body, *, goal=None):
     from app.services.financial_cockpit import load_cockpit
 
     cockpit = await load_cockpit(db, profile)
+    if goal is not None:
+        cockpit = {**cockpit, "_operating_goal": goal}
     evidence = cockpit.get("operating_evidence") or {}
     evaluation = math.evaluate(body, cockpit, source_file_ids=[row["file_id"] for row in evidence.get("files", [])], include_expense_changes=True)
     return {"evaluation": evaluation, "evidence": evidence, "guidance": evidence.get("guidance") or {},
-            "context_stamp": math.context_stamp(cockpit)}
+            "goal": cockpit.get("_operating_goal"), "context_stamp": math.context_stamp(cockpit)}
 
 
 async def client_preview(db, profile, body, *, current):
     """Read-only scenario for the token's form, with server-owned review state."""
+    from app.services.operating_plan_goals import reject_client_goal, require_goal
     from app.services.operating_plan_guidance import client_evaluation, client_evidence
 
+    goal = await require_goal(db, profile)
+    reject_client_goal(body)
     protected = protect_reviews(body, current)
-    result = await preview(db, profile, protected)
+    result = await preview(db, profile, protected, goal=goal)
     evidence = client_evidence(result["evidence"])
     permitted = {row["file_id"] for row in evidence["files"]}
     retained = {str(fid) for block in ("expenses", "adjustments", "historical_corrections") for row in (current or {}).get(block, [])
@@ -113,7 +119,65 @@ async def client_preview(db, profile, body, *, current):
     if supplied - permitted - retained:
         raise HTTPException(422, "Use supporting sources available to this operating form")
     return {"evaluation": client_evaluation(result["evaluation"]), "evidence": evidence,
-            "guidance": evidence.get("guidance") or {}}
+            "guidance": evidence.get("guidance") or {}, "goal": result.get("goal")}
+
+
+async def current_body(db, profile, family_id=None):
+    """Read the selected saved draft without materializing another workspace."""
+    from app.schemas.earnings_improvement import empty_body
+    from app.services.financial_workspace import existing_family
+
+    family = await db.get(FinancialFormFamily, family_id) if family_id else await existing_family(db, profile.id, "operating_plan")
+    if family is None:
+        if family_id:
+            raise HTTPException(404, "Operating plan not found")
+        return empty_body()
+    if family.profile_id != profile.id or family.kind != "operating_plan":
+        raise HTTPException(404, "Operating plan not found")
+    draft = await db.get(FinancialFormDraft, family.id)
+    version = await db.get(FinancialFormVersion, family.current_version_id) if family.current_version_id else None
+    return draft.body if draft else version.body if version else empty_body()
+
+
+async def suggest(db, profile, body, *, current, expense_row_id, actor_id=None,
+                  client=False, suggestion_id=None, context_stamp=None):
+    """A scoped proposed-body response; applying never saves or approves it."""
+    from app.services import operating_plan_suggestions
+    from app.services.financial_cockpit import load_cockpit
+    from app.services.operating_plan_goals import reject_client_goal, require_goal
+    from app.services.operating_plan_guidance import client_evaluation, client_evidence
+
+    goal = await require_goal(db, profile)
+    if client:
+        reject_client_goal(body)
+    protected = protect_reviews(body, current)
+    cockpit = await load_cockpit(db, profile)
+    cockpit = {**cockpit, "_operating_goal": goal}
+    if client:
+        # Public links retain the same source boundary as their preview. A
+        # private quote or offer must not become a new recommendation channel.
+        evidence = client_evidence(cockpit.get("operating_evidence"))
+        allowed = {row["file_id"] for row in evidence["files"]}
+        retained = {str(fid) for block in ("expenses", "adjustments", "historical_corrections")
+                    for row in (current or {}).get(block, []) for fid in row.get("source_file_ids", [])}
+        supplied = {str(fid) for block in ("expenses", "adjustments", "historical_corrections")
+                    for row in protected[block] for fid in row.get("source_file_ids", [])}
+        if supplied - allowed - retained:
+            raise HTTPException(422, "Use supporting sources available to this operating form")
+        original = cockpit.get("operating_evidence") or {}
+        visible = {**original, **evidence, "files": [row for row in original.get("files", []) if row["file_id"] in allowed],
+                   "cost_quotes": [row for row in original.get("cost_quotes", []) if str(row.get("file_id")) in allowed]}
+        cockpit["operating_evidence"] = visible
+    if suggestion_id is None:
+        return await operating_plan_suggestions.prepare(db, body=protected, cockpit=cockpit, goal=goal,
+            expense_row_id=expense_row_id, actor_id=actor_id)
+    result = operating_plan_suggestions.apply(protected, cockpit, goal, expense_row_id, suggestion_id, context_stamp)
+    if client:
+        from app.services.client_financial_forms import client_body
+
+        result = {**result, "body": client_body("operating_plan", result["body"]),
+                  "evaluation": client_evaluation(result["evaluation"])}
+    return result
 
 
 async def summary(db, profile, *, family_id=None):
@@ -141,6 +205,7 @@ async def summary(db, profile, *, family_id=None):
         "reviewed_action_count": sum(row["review_state"] in {"approved", "rejected"} for row in evaluation["actions"] if not row["excluded"]),
         "missing_count": progress["missing_count"], "complete": progress["complete"],
         "cost_mix": disclosure["cost_mix"], "disclosure": disclosure, "evaluation": evaluation,
+        "goal": cockpit.get("_operating_goal"),
         "version_number": version.version_number if version else None,
         "version_id": str(version.id) if version else None,
         "pdf_file_id": str(version.pdf_file_id) if version and version.pdf_file_id else None,

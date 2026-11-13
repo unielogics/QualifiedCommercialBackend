@@ -12,6 +12,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.models.application_profile import ApplicationProfile
 from app.models.bucket import PROTECTED_RETENTION_CLASSES, BucketFile
+from app.models.file_event import FileEvent
 from app.models.financial_form_link import FinancialFormLink
 from app.models.financial_form_version import (
     FinancialFormDraft,
@@ -42,11 +43,15 @@ class ReadOnlyMemory:
             (FinancialFormDraft, self.family.id): self.draft}
         self.commit, self.flush, self.add = AsyncMock(), AsyncMock(), Mock()
         self.info = {}
+        self.goal = FileEvent(profile_id=self.profile.id, kind="operating_plan.goal_set",
+            meta={"amount": "18000", "currency": "USD", "revision": 1})
 
     async def get(self, model, key):
         return self.objects.get((model, key))
 
     async def execute(self, statement):
+        if statement.column_descriptions[0]["entity"] is FileEvent:
+            return Result([self.goal] if self.goal is not None else [])
         assert financial_statements.hash_token(TOKEN) in statement.compile().params.values()
         return Result(scalar=self.link)
 
@@ -175,7 +180,7 @@ async def test_preview_discards_forged_approval_strips_private_context_and_never
     assert not action["included_in_approved_projection"]
     assert result["evaluation"]["totals"]["approved"]["count"] == 0
     assert result["evaluation"]["projection"]["approved"]["status"] == "awaiting_review"
-    assert set(result) == {"evaluation", "evidence", "guidance"}
+    assert set(result) == {"evaluation", "evidence", "guidance", "goal"}
     assert [row["file_id"] for row in result["evidence"]["files"]] == [source]
     assert result["evidence"]["merchant_offers"] == []
     exposed = repr(result)

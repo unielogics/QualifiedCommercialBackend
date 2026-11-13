@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from app.enums import Role
 from app.models.application_profile import ApplicationRequirementState, ApplicationRoomDelivery
 from app.models.bucket import BucketRequestedDocument
+from app.models.file_event import FileEvent
 from app.routers import file_requests as routes
 from app.schemas.file_request import FileRequestBatchCreate, FileRequestItem
 from app.services import application_programs, collection_tasks, file_requests
@@ -67,6 +68,8 @@ async def test_empty_history_get_succeeds_without_first_use_readiness_materializ
 async def test_operating_form_creation_materializes_destination_and_returns_batch_even_if_readiness_unavailable(monkeypatch):
     db, owner = RequestDB(), profile()
     actor = SimpleNamespace(id=uuid4(), role=Role.LOAN_EXEC)
+    db.add(FileEvent(id=uuid4(), profile_id=owner.id, kind="operating_plan.goal_set", actor_user_id=actor.id,
+        meta={"amount": "18000", "currency": "USD", "revision": 1}))
     payload = FileRequestBatchCreate(request_id=uuid4(), notify=False, items=[
         FileRequestItem(document_type="operating_plan", name="Operating expenses and earnings",
                         instructions="Enter current expenses and proposed operating improvements")])

@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 
+from app.models.file_event import FileEvent
 from app.schemas.earnings_improvement import completion, key_facts, validate_body
 from app.services import earnings_improvement as engine
 from app.services import operating_plan_commands as commands
@@ -295,16 +296,18 @@ def test_marketplace_omits_detailed_handoff_and_nested_source_participants():
 
 @pytest.mark.asyncio
 async def test_client_preview_preserves_command_but_strips_forged_review_and_rejects_other_file_evidence():
+    from app.tests.test_operating_client_preview import ReadOnlyMemory
+
     raw = cost_plan(status="approved", review_reason="FORGED")
     cockpit = context()
-    db = AsyncMock()
+    db = ReadOnlyMemory()
     with patch("app.services.financial_cockpit.load_cockpit", AsyncMock(return_value=cockpit)):
-        result = await operating_plan_service.client_preview(db, object(), raw, current=body())
+        result = await operating_plan_service.client_preview(db, db.profile, raw, current=body())
         assert result["evaluation"]["commands"][0]["gross_annual_effect"] == 1200
         assert not result["evaluation"]["commands"][0]["included_in_approved_projection"]
         raw["historical_corrections"] = [{"source_group_key": "source:rent", "reason": "Check this source", "source_file_ids": [str(uuid4())], "evidence_note": ""}]
         with pytest.raises(HTTPException) as error:
-            await operating_plan_service.client_preview(db, object(), raw, current=body())
+            await operating_plan_service.client_preview(db, db.profile, raw, current=body())
         assert error.value.status_code == 422
     db.commit.assert_not_called()
     db.flush.assert_not_called()
@@ -353,6 +356,9 @@ async def test_actual_version_publish_gate_keeps_unresolved_split_in_draft_or_ca
 
     db = Memory()
     profile, family, draft = workspace_context("operating_plan")
+    if submit:
+        db.add(FileEvent(profile_id=profile.id, kind="operating_plan.goal_set",
+            meta={"amount": "18000", "currency": "USD", "revision": 1}))
     raw = split_plan(True)
     if last_child_removed:
         for row in raw["expenses"]:

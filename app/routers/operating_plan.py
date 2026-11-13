@@ -11,6 +11,7 @@ from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import Role
 from app.schemas.earnings_improvement import BaselineTreatment, OperatingPlanBody
+from app.schemas.operating_plan_goal import GoalWrite
 from app.services import application_profiles as profiles
 from app.services import operating_plan_service
 
@@ -29,6 +30,15 @@ class Evaluate(BaseModel):
     family_id: UUID | None = None
 
 
+class Suggest(Evaluate):
+    expense_row_id: UUID
+
+
+class ApplySuggestion(Suggest):
+    suggestion_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    context_stamp: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
 class Review(BaseModel):
     model_config = ConfigDict(extra="forbid")
     family_id: UUID
@@ -42,13 +52,35 @@ class Review(BaseModel):
     baseline_reconciliation_note: str = Field(default="", max_length=2000)
 
 
+@router.get("/goal")
+async def goal(profile_id: UUID, user: CurrentUser, db: Db):
+    staff(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    from app.services.operating_plan_goals import read_goal
+
+    return await read_goal(db, profile)
+
+
+@router.put("/goal")
+async def configure_goal(profile_id: UUID, payload: GoalWrite, user: CurrentUser, db: Db):
+    from app.services.operating_plan_goals import WRITE_ROLES, set_goal
+
+    if user.role not in WRITE_ROLES:
+        raise HTTPException(403, "Underwriting role required to configure the operating-plan goal")
+    profile = await profiles.load_profile(db, profile_id, user)
+    result = await set_goal(db, profile, **payload.model_dump(), actor=user)
+    await db.commit()
+    return result
+
+
 @router.get("/evidence")
 async def evidence(profile_id: UUID, user: CurrentUser, db: Db):
     staff(user)
     profile = await profiles.load_profile(db, profile_id, user)
     from app.services.financial_cockpit import load_cockpit
 
-    return (await load_cockpit(db, profile)).get("operating_evidence") or {}
+    cockpit = await load_cockpit(db, profile)
+    return {**(cockpit.get("operating_evidence") or {}), "goal": cockpit.get("_operating_goal")}
 
 
 @router.get("/summary")
@@ -87,3 +119,22 @@ async def review(profile_id: UUID, payload: Review, user: CurrentUser, db: Db):
     result = await operating_plan_service.review(db, profile, user, **payload.model_dump())
     await db.commit()
     return result
+
+
+@router.post("/suggestions")
+async def suggestions(profile_id: UUID, payload: Suggest, user: CurrentUser, db: Db):
+    staff(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    current = await operating_plan_service.current_body(db, profile, payload.family_id)
+    return await operating_plan_service.suggest(db, profile, payload.body.model_dump(mode="json"), current=current,
+        expense_row_id=payload.expense_row_id, actor_id=user.id)
+
+
+@router.post("/suggestions/apply")
+async def apply_suggestion(profile_id: UUID, payload: ApplySuggestion, user: CurrentUser, db: Db):
+    staff(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    current = await operating_plan_service.current_body(db, profile, payload.family_id)
+    return await operating_plan_service.suggest(db, profile, payload.body.model_dump(mode="json"), current=current,
+        expense_row_id=payload.expense_row_id, actor_id=user.id, suggestion_id=payload.suggestion_id,
+        context_stamp=payload.context_stamp)

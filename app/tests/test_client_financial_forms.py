@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi import HTTPException
 
+from app.models.file_event import FileEvent
 from app.routers import application_profiles as routes
 from app.schemas.application_profile import FinancialStatementWrite
 from app.services import client_financial_forms as clients
@@ -161,9 +162,13 @@ async def test_stale_or_unversioned_whole_body_saves_cannot_overwrite_the_workin
 async def test_all_fillable_forms_publish_through_the_same_version_pipeline(kind):
     original = snapshot(kind)
     staged = {**original, "draft": {**original["draft"], "revision": 5}}
-    db = SimpleNamespace(execute=AsyncMock(return_value=result(None)), get=AsyncMock(return_value=None))
+    owner = SimpleNamespace(id=uuid4())
+    goal = FileEvent(profile_id=owner.id, kind="operating_plan.goal_set", meta={"amount": "18000", "currency": "USD", "revision": 1})
+    from app.tests.test_financial_workspace import Result
+
+    db = SimpleNamespace(execute=AsyncMock(side_effect=lambda query: Result([goal]) if "file_events" in str(query) else result(None)), get=AsyncMock(return_value=None))
     with patch.object(clients, "stage_client_draft", AsyncMock(return_value=staged)), patch.object(workspace, "publish_version", AsyncMock(return_value={"saved_version": {"version_number": 2}})) as publish:
-        accepted = await clients.save_submission(db, None, original, body=original["body"], expected_revision=4,
+        accepted = await clients.save_submission(db, owner, original, body=original["body"], expected_revision=4,
             base_version_id=None, idempotency_key="client:scoped:retry-1")
     assert accepted["saved_version"]["version_number"] == 2
     assert publish.await_args.kwargs == {"kind": kind, "family_id": UUID(original["family_id"]),
