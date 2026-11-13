@@ -248,6 +248,8 @@ def _preparer_handoff(summary, currency, body):
 
 
 def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
+    from app.services.operating_plan_report import build_html as review_report
+
     facts = financial_totals or {}
     summary = facts.get("improvement_plan") or {}
     sources = {str(row.get("file_id")): row.get("file_name") for row in facts.get("evidence_sources") or []}
@@ -317,12 +319,13 @@ def build_html(*, body: dict, financial_totals: dict | None = None) -> str:
     return """<!doctype html><html><head><meta charset='utf-8'><style>
     @page {size:Letter; margin:32px;}
     body{font:11px Arial,sans-serif;color:#172033;line-height:1.4}h1{font-size:22px;margin:0 0 8px}h2{font-size:15px;margin:22px 0 8px}h3{font-size:12px;margin:10px 0 6px}
-    p{margin:5px 0}small,.muted{font-size:9px;color:#64748b}.notice{padding:10px;background:#f1f5f9;border-left:3px solid #38549b;margin:12px 0}
+    p{margin:5px 0}small,.muted{font-size:9px;color:#64748b}.notice{padding:10px;background:#f1f5f9;border-left:3px solid #38549b;margin:12px 0}.positive{color:#287443}.negative{color:#ae342b}
     table{width:100%;border-collapse:collapse;table-layout:fixed}thead{display:table-header-group}th{font-size:9px;text-align:left;background:#f1f5f9}th,td{padding:6px;border-bottom:1px solid #dbe2ec;vertical-align:top;overflow-wrap:anywhere}td.num{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}tr{break-inside:avoid}section{padding:10px 0;border-bottom:1px solid #dbe2ec;break-inside:avoid}section p,.expense-note p{overflow-wrap:anywhere}.expense-note{padding:6px 0}h3{break-after:avoid}
     </style></head><body>""" + f"<h1>Operating expenses and earnings plan</h1><p><b>{_text(body.get('business_name'))}</b></p>" + \
         f"<p>{_text(body.get('period_start'))} to {_text(body.get('period_end'))} | {_text(currency)} | {_text(body.get('basis'))} basis</p>" + \
         "<div class='notice'>Expense disclosures and proposed earnings improvements. These are separate from historical P&amp;L, NOI, EBITDA, current debt coverage and program qualification. Client submissions await staff review; improvements are conditional and require baseline reconciliation and supporting evidence.</div>" + \
-        _before_after(summary, currency) + \
+        review_report(facts.get("operating_review")) + \
+        (_before_after(summary, currency) if not facts.get("operating_review") else "") + \
         _goal_tracking(summary, body) + \
         _business_units(summary, body, currency) + \
         _released_cash_flow(summary, body) + \

@@ -484,7 +484,9 @@ async def create_family(db: AsyncSession, profile: ApplicationProfile, *, kind: 
 
 
 def _version_read(row: FinancialFormVersion) -> dict:
-    return {"id": str(row.id), "version_number": row.version_number, "created_at": row.created_at.isoformat(), "actor_name": row.actor_name, "source": row.source, "source_file_id": str(row.source_file_id) if row.source_file_id else None, "pdf_file_id": str(row.pdf_file_id) if row.pdf_file_id else None, "status": row.status, "source_content_type": (getattr(row, "key_facts", None) or {}).get("_source_content_type")}
+    report = (getattr(row, "key_facts", None) or {}).get("operating_review") or {}
+    report_schema = report.get("schema_version") if report.get("version_id") == str(row.id) and report.get("version_number") == row.version_number else None
+    return {"id": str(row.id), "version_number": row.version_number, "created_at": row.created_at.isoformat(), "actor_name": row.actor_name, "source": row.source, "source_file_id": str(row.source_file_id) if row.source_file_id else None, "pdf_file_id": str(row.pdf_file_id) if row.pdf_file_id else None, "status": row.status, "source_content_type": (getattr(row, "key_facts", None) or {}).get("_source_content_type"), **({"report_schema": report_schema} if report_schema else {})}
 
 
 async def source_files_for_profile(db: AsyncSession, profile: ApplicationProfile) -> list[BucketFile]:
@@ -929,6 +931,15 @@ async def publish_version(db: AsyncSession, profile: ApplicationProfile, *, kind
         )
     number = max((version.version_number for version in versions), default=0) + 1
     version_id, file_id = uuid4(), uuid4()
+    report_stamp = None
+    if kind == "operating_plan":
+        from app.services.operating_plan_report import capture
+
+        report_stamp = now()
+        report_evaluation = earnings_improvement.evaluate(body, operating_context,
+            source_file_ids=[row["file_id"] for row in (operating_context.get("operating_evidence") or {}).get("files", [])],
+            include_expense_changes=True)
+        facts["operating_review"] = capture(report_evaluation, version_id=version_id, version_number=number, saved_at=report_stamp)
     try:
         pdf = await asyncio.to_thread(_render, kind, body, facts)
         pdf_sha = hashlib.sha256(pdf).hexdigest()
@@ -951,7 +962,7 @@ async def publish_version(db: AsyncSession, profile: ApplicationProfile, *, kind
         else:
             await _ensure_legacy_form_slot(db, profile, kind)
             slot = await _requested_slot(db, profile, kind)
-    stamp = now()
+    stamp = report_stamp or now()
     file = BucketFile(id=file_id, bucket_id=profile.primary_bucket_id, requested_document_id=slot.id if slot and filed else None, file_name=f"{family.label} - v{number} - {stamp.strftime('%Y-%m-%d')}.pdf"[:255], s3_key=key, content_type="application/pdf", size_bytes=len(pdf), uploaded_by_name=getattr(actor, "name", None), uploaded_by_email=getattr(actor, "email", None), status="uploaded", content_hash=pdf_sha, source_kind="drafted_form", source_detail=f"financial_version:{version_id}")
     db.add(file)
     await db.flush()
