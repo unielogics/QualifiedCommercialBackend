@@ -138,6 +138,8 @@ def clean_industry(raw: Any) -> str | None:
 class BusinessProfileFields(BaseModel):
     """Optional historical/partial-edit shape and additive rollout contract."""
 
+    business_phone: str | None = Field(default=None, max_length=32)
+    employee_count: int | None = Field(default=None, ge=0, le=2147483647)
     business_website: str | None = Field(default=None, max_length=MAX_WEBSITE)
     business_description: str | None = Field(default=None, max_length=MAX_DESCRIPTION)
     business_street: str | None = Field(default=None, max_length=255)
@@ -186,7 +188,7 @@ class RequiredBusinessProfileFields(BusinessProfileFields):
 
 def payload_fields(payload: Any) -> dict[str, Any]:
     """Pass the same validated answers through internal create adapters."""
-    return {key: getattr(payload, key, None) for key in PROFILE_FIELDS}
+    return {key: getattr(payload, key, None) for key in (*PROFILE_FIELDS, "employee_count", "business_phone")}
 
 
 def _legacy_adapter(model: type[BaseModel], **values: Any) -> BaseModel:
@@ -270,6 +272,8 @@ def record(payload: Any, *, now: datetime | None = None) -> dict[str, Any] | Non
         "description": description,
         **address,
         "industry": industry,
+        "business_phone": getattr(payload, "business_phone", None),
+        "employee_count": getattr(payload, "employee_count", None),
         "captured_at": (now or datetime.now(UTC)).isoformat(),
     }
 
@@ -299,6 +303,8 @@ def of_intake(intake: Any) -> dict[str, Any]:
         else declared.get("description")
     )
     return {
+        "business_phone": declared.get("business_phone"),
+        "employee_count": declared.get("employee_count"),
         "website": website or None,
         "website_none": none and not website,
         "description": (description or None),
@@ -316,6 +322,8 @@ def of_intake(intake: Any) -> dict[str, Any]:
 def apply_read(read: Any, intake: Any) -> Any:
     """Use the same desk-first projection in detail and client-list responses."""
     declared = of_intake(intake)
+    read.business_phone = declared["business_phone"]
+    read.employee_count = declared["employee_count"]
     read.business_website = declared["website"]
     read.business_website_none = declared["website_none"]
     read.business_description = declared["description"]

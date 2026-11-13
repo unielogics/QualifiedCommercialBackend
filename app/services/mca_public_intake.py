@@ -102,7 +102,10 @@ async def start(db, payload, request: Request) -> dict:
         db.add(client)
         await db.flush()
     declaration = payload.model_dump(mode="json", exclude={"secure_room_pin", "idempotency_key", "website"})
-    consent = {"consent_version": CONSENT_VERSION, "consent_text": CONSENT_TEXT_ES if payload.locale == "es" else CONSENT_TEXT,
+    from app.services import business_profile, onboarding_consent
+
+    onboarding_consent.require_application_choices(payload)
+    consent = {**onboarding_consent.choices_record(payload), "consent_version": CONSENT_VERSION, "consent_text": CONSENT_TEXT_ES if payload.locale == "es" else CONSENT_TEXT,
                "consented_at": datetime.now(UTC).isoformat(), "terms_accepted": True, "privacy_accepted": True,
                "terms_version": core.TERMS_VERSION, "privacy_version": core.PRIVACY_VERSION,
                "allowed_contact_channels": ["phone", "email"], "credit_pull_authorized": False,
@@ -120,7 +123,7 @@ async def start(db, payload, request: Request) -> dict:
         bucket_id=bucket.id, bucket_upload_link_id=link.id, token_hash=core._hash_token(secrets.token_urlsafe(48)),
         full_name=payload.full_name, email=email, phone=payload.phone, business_name=payload.business_name,
         loan_purpose="Merchant cash advance", referral_source="mca_funding", preferred_language=Language(payload.locale),
-        intake_state={"messages": [], "source": "mca_funding_intake", "lead_type": "main_street",
+        intake_state={**business_profile.state_entry(payload), "messages": [], "source": "mca_funding_intake", "lead_type": "main_street",
             "funding_intent": policy.PROGRAM_KEY, "application_completion": "client",
             "main_street_details": {"intent": policy.PROGRAM_KEY, "industry": None},
             "signup_attribution": payload.attribution.model_dump(mode="json"),
@@ -132,6 +135,7 @@ async def start(db, payload, request: Request) -> dict:
     db.add(Activity(client_id=client.id, actor_label="public_mca_intake", kind="mca.intake_started",
                     summary="Started secure standard MCA review", payload={"intake_id": str(intake.id), "consent_version": CONSENT_VERSION}))
     await db.commit()
+    await onboarding_consent.record_for_start(db, intake, payload, request, entry="mca_funding")
     return result_for(intake, link)
 
 

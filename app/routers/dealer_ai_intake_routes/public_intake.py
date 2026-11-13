@@ -52,6 +52,7 @@ async def start_dealer_intake(
     db: AsyncSession = Depends(core.get_db),
 ) -> core.DealerIntakeResponse:
     await core._guard_arf_attribution(db, payload)
+    onboarding_consent.require_application_choices(payload)
     if not payload.terms_accepted or not payload.privacy_accepted:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Terms and Privacy Policy acceptance is required.")
     core._throttle_or_429(

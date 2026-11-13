@@ -734,6 +734,7 @@ class CapitalReadinessClaimRequest(RequiredBusinessProfileFields, ClientRoomPinC
     terms_version: str = Field(default=TERMS_VERSION, max_length=32)
     privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
     # Texts are optional (the disclosure says so); declining starts the file just the same.
+    application_email_consent: bool = False
     sms_transactional_consent: bool = False
     sms_marketing_consent: bool = False
 
@@ -757,6 +758,7 @@ class DealerIntakeStart(PublicIntakeAttribution, RequiredBusinessProfileFields, 
     terms_version: str = Field(default=TERMS_VERSION, max_length=32)
     privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
     # Texts are optional (the disclosure says so); declining starts the file just the same.
+    application_email_consent: bool = False
     sms_transactional_consent: bool = False
     sms_marketing_consent: bool = False
     preferred_language: Language = Language.EN
@@ -786,6 +788,7 @@ class FundingReviewStart(PublicIntakeAttribution, RequiredBusinessProfileFields,
     terms_version: str = Field(default=TERMS_VERSION, max_length=32)
     privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
     # Texts are optional (the disclosure says so); declining starts the file just the same.
+    application_email_consent: bool = False
     sms_transactional_consent: bool = False
     sms_marketing_consent: bool = False
     preferred_language: Language = Language.EN
@@ -1715,6 +1718,8 @@ class DealerIntakeRead(ORMModel):
     #: website_none is true when they answered N/A, so "has no website" reads
     #: differently from a file that was never asked.
     business_website: str | None = None
+    business_phone: str | None = None
+    employee_count: int | None = None
     business_website_none: bool = False
     business_description: str | None = None
     business_street: str | None = None
@@ -10608,6 +10613,7 @@ class McaRefiStart(PublicIntakeAttribution, RequiredBusinessProfileFields, Clien
     terms_version: str = Field(default=TERMS_VERSION, max_length=32)
     privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
     # Texts are optional (the disclosure says so); declining starts the file just the same.
+    application_email_consent: bool = False
     sms_transactional_consent: bool = False
     sms_marketing_consent: bool = False
     preferred_language: Language = Language.EN

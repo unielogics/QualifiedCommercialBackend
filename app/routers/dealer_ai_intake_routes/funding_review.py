@@ -46,6 +46,7 @@ async def start_funding_review(
     db: AsyncSession = Depends(core.get_db),
 ) -> core.DealerIntakeResponse:
     await core._guard_arf_attribution(db, payload)
+    onboarding_consent.require_application_choices(payload)
     if not payload.terms_accepted or not payload.privacy_accepted:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Terms and Privacy Policy acceptance is required.")
     existing = await core._latest_active_intake_by_email(db, str(payload.email), variant=core.FUNDING_VARIANT)

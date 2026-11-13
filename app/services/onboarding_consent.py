@@ -50,11 +50,29 @@ def choices_of(payload: Any) -> dict[str, bool]:
     }
 
 
-def choices_record(payload: Any) -> dict[str, Any]:
+def require_application_choices(payload: Any) -> None:
+    from fastapi import HTTPException
+
+    if not consent_delivery.normalize_phone(getattr(payload, "business_phone", None)):
+        raise HTTPException(422, "Enter a valid business phone number.")
+    if getattr(payload, "employee_count", None) is None:
+        raise HTTPException(422, "Enter the number of employees.")
+    if not payload.application_email_consent or not payload.sms_transactional_consent:
+        raise HTTPException(422, "Consent to application text messages and emails is required.")
+
+
+def choices_record(payload: Any, *, email: str | None = None) -> dict[str, Any]:
     """What the client chose, for the intake's `legal_acceptance`: kept whether
     they agreed or not, with the wording's version, so "we asked" is provable."""
     chosen = choices_of(payload)
-    return {"sms_choices": {**chosen, "disclosure_version": sms_consent_svc.SMS_DISCLOSURE_VERSION}}
+    record = {"sms_choices": {**chosen, "disclosure_version": sms_consent_svc.SMS_DISCLOSURE_VERSION}}
+    if getattr(payload, "application_email_consent", False):
+        record["application_email_consent"] = {
+            "granted": True,
+            "version": "application-email-v1",
+            "email": str(email or getattr(payload, "email", None) or getattr(payload, "contact_email", "")),
+        }
+    return record
 
 
 async def record_choices(

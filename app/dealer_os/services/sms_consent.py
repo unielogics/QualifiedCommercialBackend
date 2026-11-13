@@ -73,8 +73,7 @@ SUPPORT_EMAIL = "support@qualifiedcommercial.com"
 TRANSACTIONAL_TEXT = (
     f"I agree to receive account and application text messages from {BRAND} about this "
     "funding file, including appointment reminders, secure links, bank-connection requests, "
-    "document and signature requests, and status updates. Consent is optional and is not a "
-    "condition of purchase, applying for funding, receiving funding, or using the platform. "
+    "document and signature requests, and status updates. I authorize these messages about my application. "
     "Message frequency varies. Message and data rates may apply. Reply STOP to opt out. "
     "Reply HELP for help."
 )
