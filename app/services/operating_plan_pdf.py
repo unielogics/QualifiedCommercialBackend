@@ -125,7 +125,7 @@ def _goal_tracking(summary, body):
             ("Remaining annual gap with proposals", "proposed_gap")))
     result = (f"<h2>Annual NOI goal - saved revision {_text(goal.get('goal_revision'))}</h2>"
         "<table><thead><tr><th>Measure</th><th>Annual amount</th></tr></thead><tbody>" + rows + "</tbody></table>"
-        "<p class='muted'>A negative current result remains a loss. Missing or non-comparable source figures remain unavailable. Loan payment relief does not improve NOI.</p>")
+        "<p class='muted'>Operating-plan NOI is shown before additional loan operating charges; those charges appear in the cash bridge. A source loss remains negative and missing figures stay unavailable. Loan payment relief does not improve NOI.</p>")
     if not cash:
         return result
     rows = "".join(f"<tr><td>{label}</td><td class='num'>{_money(cash.get(key), cash.get('currency'))}</td></tr>"
