@@ -81,6 +81,7 @@ async def claim_capital_readiness_diagnostic(
 
     if user.role != core.Role.CLIENT:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Client account required")
+    onboarding_consent.require_application_choices(payload)
     if not payload.terms_accepted or not payload.privacy_accepted:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -211,7 +212,7 @@ async def claim_capital_readiness_diagnostic(
         "terms_version": payload.terms_version,
         "privacy_version": payload.privacy_version,
     }
-    state["capital_readiness_claim"] = {**state["capital_readiness_claim"], **onboarding_consent.choices_record(payload)}
+    state["capital_readiness_claim"] = {**state["capital_readiness_claim"], **onboarding_consent.choices_record(payload, email=intake.email)}
     state.update(business_profile.state_entry(payload))
     intake.intake_state = state
     intake.source_kind = "client_capital_readiness"

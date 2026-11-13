@@ -222,7 +222,14 @@ class McaIntakeAttribution(Attribution):
         return path
 
 
-class McaIntakeStart(McaLeadRequest):
+from app.services.business_profile import RequiredBusinessProfileFields
+
+
+class McaIntakeStart(McaLeadRequest, RequiredBusinessProfileFields):
+    employee_count: int = Field(ge=0, le=2147483647)
+    sms_transactional_consent: Literal[True]
+    application_email_consent: Literal[True]
+    sms_marketing_consent: bool = False
     attribution: McaIntakeAttribution
     monthly_revenue: Range | None = None
     time_in_business: Literal["under_6_months", "6_12_months", "1_2_years", "2_plus_years"] | None = None

@@ -97,6 +97,7 @@ class ForeclosureRescueIntakeCreate(business_profile.RequiredBusinessProfileFiel
     privacy_accepted: bool
     # Only an owner submitting for themselves can agree to texts; an attorney or
     # broker cannot consent for the client, whose phone number they typed.
+    application_email_consent: bool = False
     sms_transactional_consent: bool = False
     sms_marketing_consent: bool = False
 
@@ -591,6 +592,8 @@ async def create_foreclosure_rescue(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> ForeclosureRescueCreated:
+    if payload.submitter_type == "owner_direct":
+        onboarding_consent.require_application_choices(payload)
     return await _create_foreclosure_rescue(payload, request, db)
 
 

@@ -169,7 +169,7 @@ def test_each_public_start_keeps_the_choice_and_records_it(handler, entry) -> No
 def test_the_signed_in_claim_records_the_choice_inside_its_own_transaction() -> None:
     source = inspect.getsource(client.claim_capital_readiness_diagnostic)
 
-    assert "onboarding_consent.choices_record(payload)" in source
+    assert "onboarding_consent.choices_record(payload, email=intake.email)" in source
     assert "onboarding_consent.record_choices(" in source and "db.begin_nested()" in source
 
 
