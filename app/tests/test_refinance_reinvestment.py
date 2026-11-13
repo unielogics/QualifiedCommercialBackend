@@ -157,7 +157,8 @@ def test_public_preview_allows_only_safe_metric_values_and_preserves_explicit_nu
 
 def test_stale_allocation_never_hides_known_loan_run_rate_or_silently_reacknowledges():
     raw, current = da_body(proposed_amount=None), da_context()
-    raw["released_cash_flow"] = {"source_fingerprint": "f" * 64, "allocations": []}
+    raw["released_cash_flow"] = {"source_fingerprint": "f" * 64, "allocations": [
+        {"id": "70000000-0000-4000-8000-000000000002", "label": "Retain cash", "purpose": "reserve", "amount_monthly": 100}]}
     result = evaluate(raw, current)["cash_bridge"]
     assert result["stale"] and result["loan_status"] == "calculated"
     assert (result["before_debt_service_annual"], result["after_debt_service_annual"], result["gross_loan_relief_annual"], result["net_loan_cash_change_annual"]) == (120000, 72000, 48000, 42000)

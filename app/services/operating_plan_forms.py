@@ -109,11 +109,14 @@ async def status(db, profile):
     slot = await requested_slot(db, profile)
     _family, version, draft = await current(db, profile)
     allocation_complete = True
-    if version and (getattr(profile, "financial_plan", None) or {}).get("updated_at"):
+    cash = (version.body.get("released_cash_flow") or {}) if version else {}
+    saving_actions = any(not row.get("excluded") and row.get("status") != "rejected" and row.get("kind") in {"expense_reduction", "expense_group_change", "product_cost_change", "processing_cost_change"}
+                         for row in version.body.get("adjustments", [])) if version else False
+    if version and ((getattr(profile, "financial_plan", None) or {}).get("updated_at") or cash.get("source_fingerprint") or cash.get("allocations") or saving_actions):
+        from app.services.earnings_improvement import evaluate
         from app.services.financial_cockpit import load_cockpit
-        from app.services.released_cash_flow import evaluate
 
-        allocation_complete = evaluate(version.body, await load_cockpit(db, profile))["complete"]
+        allocation_complete = evaluate(version.body, await load_cockpit(db, profile))["released_cash_flow"]["complete"]
     return FinancialFormStatus(kind=KIND, label=LABEL, requested=slot is not None,
         satisfied=bool(slot and slot.status == "uploaded" and allocation_complete),
         source="filled" if version else "none", figures_from="form" if version else None,

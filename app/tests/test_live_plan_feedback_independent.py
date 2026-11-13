@@ -247,7 +247,7 @@ def test_explicit_timing_and_one_time_setup_separate_run_rate_and_first_year_del
     feedback = evaluate(raw)["draft_feedback"]
     assert feedback["actions"][0]["first_year_delta"] is None
     assert feedback["summary"]["qualified_first_year_noi_delta"] is None
-    assert "projection_start" in feedback["actions"][0]["qualification_missing"]
+    assert "projection_start" not in feedback["actions"][0]["qualification_missing"]
 
 
 def test_increase_is_signed_cost_growth_not_a_positive_profit_gain():

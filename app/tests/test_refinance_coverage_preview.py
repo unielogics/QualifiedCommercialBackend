@@ -22,6 +22,7 @@ def test_coverage_window_and_operating_charges_are_used_once_before_prose_is_com
     current = context()
     raw = da_body(implementation_cost=25, implementation_cost_cadence="monthly",
                   effective_date=None, explanation="", source_note="")
+    raw["projection_start"] = None
     original = deepcopy((raw, current))
     result = evaluate(raw, current)
     working = result["draft_feedback"]["summary"]["working"]

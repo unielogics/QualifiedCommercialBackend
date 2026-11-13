@@ -73,6 +73,17 @@ def _source_checks(action, body, cockpit, resolved, files, groups, *, reviewed_m
             fields.append(f"expenses.{split['parent_expense_row_id']}.itemization.{split['status']}")
     for row in rows:
         key = row["source_group_key"]
+        from app.services.operating_new_activity import baseline_context, explicit_new_zero
+
+        if explicit_new_zero(action, row):
+            if baseline_context(body, cockpit, files):
+                continue
+            issues.append("Confirm a current accepted same-business financial baseline before modeling this new zero-baseline activity.")
+            fields.append("noi_source_comparability")
+            continue
+        if body.get("source_group_confirmations", {}).get(key) == "needs_correction":
+            issues.append("The affected source line has a pending correction; review and confirm the source before projecting its change.")
+            fields.append("source_group_confirmations." + key)
         support = {*action["source_file_ids"], *row["source_file_ids"]}
         manual_support = bool(support and all(files.get(str(fid), {}).get("eligible_for_review") for fid in support))
         if not key and reviewed_manual and manual_support and not row["excluded"] and row["id"] not in duplicate_ids:
@@ -140,16 +151,14 @@ def evaluate(raw, cockpit, evaluation, *, source_file_ids=None, now=None):
         outside = linked.get("category") in engine.NON_OPERATING
         gross = _d(impact.get("accounting_gross_annual_impact", impact.get("gross_annual_impact")))
         one_time = _d(impact.get("gross_one_time_effect"))
-        if gross is None:
+        if gross is None and not math_missing:
             math_missing.append(f"adjustments.{identifier}.current_proposed_math")
         conflict = conflicts.get(identifier) or []
         status = "outside_operating" if outside else "conflict" if conflict else "incomplete" if math_missing else "calculated"
         safe_math = status == "calculated"
         net = _d(impact.get("net_annual_impact")) if safe_math else None
-        explicit_window = bool(body.get("projection_start") and action.get("effective_date") and action.get("implementation_cost") is not None)
+        explicit_window = bool(body.get("projection_start") and action.get("implementation_cost") is not None)
         first_year = _d(impact.get("first_year_impact")) if safe_math and explicit_window else None
-        if not body.get("projection_start"):
-            qualification.append("projection_start")
         metrics = {"effect_type": impact.get("effect_type", "operating_cash"),
                    "metric_issues": deepcopy(impact.get("metric_issues") or {"noi": [], "earnings": [], "cash": []})}
         for metric in ("noi", "earnings", "cash"):
@@ -188,7 +197,7 @@ def evaluate(raw, cockpit, evaluation, *, source_file_ids=None, now=None):
     after_ratio = (earnings + earnings_gross) / debt if complete and source_ok and before_ratio is not None and earnings_gross is not None else None
     qualified = (evaluation.get("projection") or {}).get("proposed") or {}
     qualified_noi = _d(qualified.get("noi"))
-    explicit_windows = bool(body.get("projection_start") and all(row.get("effective_date") and row.get("implementation_cost") is not None for row in active))
+    explicit_windows = bool(body.get("projection_start") and all(row.get("implementation_cost") is not None for row in active))
     qualified_first = _d(qualified.get("first_year_noi")) if explicit_windows else None
     qualified_earnings = _d(qualified.get("earnings"))
     qualified_first_earnings = _d(qualified.get("first_year_earnings")) if explicit_windows else None

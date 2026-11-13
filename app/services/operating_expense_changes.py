@@ -128,8 +128,8 @@ def evaluate(body, action_results=None, baseline=None, *, earnings_comparable=Fa
                     if setup is not None:
                         setup_factor = {"one_time": 0, "monthly": 12, "annual": 1}[action["implementation_cost_cadence"]]
                         net = engine._money(gross - setup * setup_factor)
-                        if body.get("projection_start") and action.get("effective_date"):
-                            fraction = engine._active_days(date.fromisoformat(action["effective_date"]), date.fromisoformat(body["projection_start"]))
+                        if body.get("projection_start"):
+                            fraction = engine._active_days(date.fromisoformat(action.get("effective_date") or body["projection_start"]), date.fromisoformat(body["projection_start"]))
                             first_year = engine._money(net * fraction - (setup if action["implementation_cost_cadence"] == "one_time" else 0)) if fraction else 0
                 else:
                     gross = None

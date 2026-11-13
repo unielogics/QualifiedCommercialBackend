@@ -118,7 +118,7 @@ def test_additive_guidance_fields_preserve_legacy_completion_and_empty_default_r
     assert completion(legacy)["complete"]
     normalized["category_confirmations"] = {"rent": "confirmed", "marketing": "needs_help", "cogs": "not_applicable"}
     assert validate_body(normalized)["category_confirmations"] == normalized["category_confirmations"]
-    assert completion(normalized)["missing"] == ["category_confirmations.marketing"]
+    assert completion(normalized)["missing"] == []  # No forced absent industry category.
     approved = approve(normalized)
     approved["expenses"][0]["source_candidate_key"] = "different-source-group"
     assert plan.evaluate(approved, context(), now=NOW)["actions"][0]["review_state"] == "stale"
@@ -139,14 +139,15 @@ def test_not_applicable_category_cannot_hide_active_expenses_but_excluded_rows_a
     assert raw["category_confirmations"]["rent"] == "not_applicable"
 
 
-def test_confirmed_category_needs_active_expense_detail_while_not_applicable_does_not():
+def test_category_review_never_creates_forced_empty_expense_details():
     raw = body(category_confirmations={"marketing": "confirmed"})
-    assert completion(raw)["missing"] == ["category_confirmations.marketing.expense_detail"]
+    assert completion(raw)["missing"] == []
     raw["category_confirmations"]["marketing"] = "not_applicable"
     assert completion(raw)["complete"]
     raw["category_confirmations"] = {"rent": "confirmed"}
     raw["expenses"][0]["excluded"] = True
-    assert "category_confirmations.rent.expense_detail" in completion(raw)["missing"]
+    assert "category_confirmations.rent.expense_detail" not in completion(raw)["missing"]
+    assert "expenses_or_no_expenses_confirmation" in completion(raw)["missing"]
 
 
 def test_noi_projection_is_independent_of_ebitda_and_includes_first_year_implementation():

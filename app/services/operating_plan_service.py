@@ -22,12 +22,22 @@ def completion(body, cockpit):
     from app.services.released_cash_flow import evaluate
 
     progress = disclosure_completion(body)
+    from app.services.operating_source_review import evaluate as source_review
+
+    source_progress = source_review(validate_body(body), cockpit)
+    if source_progress["active"]:
+        progress["missing"] = list(dict.fromkeys([*progress["missing"], *source_progress["missing"]]))
     from app.services.operating_plan_commands import itemization_missing
 
     progress["missing"] = list(dict.fromkeys([*progress["missing"], *itemization_missing(validate_body(body), cockpit)]))
     allocation = evaluate(body, cockpit)
-    tracking = math.evaluate(body, cockpit).get("cash_bridge") if (cockpit.get("_operating_goal") or {}).get("status") == "set" else None
-    missing = [*progress["missing"], *(tracking["missing"] if tracking else allocation["missing"])]
+    tracked = math.evaluate(body, cockpit) if (cockpit.get("_operating_goal") or {}).get("status") == "set" else None
+    tracking = tracked.get("cash_bridge") if tracked else None
+    if tracked:
+        allocation = tracked["released_cash_flow"]
+    funding_required = tracking.get("funding_required", tracking["required"]) if tracking else allocation["required"]
+    funding_missing = tracking.get("funding_missing", tracking["missing"]) if tracking else allocation["missing"]
+    missing = [*progress["missing"], *(funding_missing if funding_required else [])]
     return {**progress, "complete": not missing, "missing": missing, "missing_count": len(missing),
             "released_cash_flow": allocation, **({"cash_bridge": tracking} if tracking else {})}
 
@@ -61,6 +71,9 @@ def protect_reviews(incoming, current, *, trusted=False):
                 row.update(excluded=True, duplicate_of=None)
         body[block] = rows
     body = validate_body(body)
+    if (old.get("source_group_confirmations") or old.get("source_group_confirmation_stamp")) and not (body.get("source_group_confirmations") or body.get("source_group_confirmation_stamp")):
+        body["source_group_confirmations"] = deepcopy(old["source_group_confirmations"])
+        body["source_group_confirmation_stamp"] = old["source_group_confirmation_stamp"]
     old_actions = {row["id"]: row for row in old["adjustments"]}
     old_expenses = {row["id"]: row for row in old["expenses"]}
     expenses = {row["id"]: row for row in body["expenses"]}

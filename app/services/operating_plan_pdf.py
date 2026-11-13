@@ -128,16 +128,27 @@ def _goal_tracking(summary, body):
         "<p class='muted'>Operating-plan NOI is shown before additional loan operating charges; those charges appear in the cash bridge. A source loss remains negative and missing figures stay unavailable. Loan payment relief does not improve NOI.</p>")
     if not cash:
         return result
-    rows = "".join(f"<tr><td>{label}</td><td class='num'>{_money(cash.get(key), cash.get('currency'))}</td></tr>"
-        for label, key in (("Current regular debt service", "before_debt_service_monthly"),
-            ("Saved-plan regular debt service (includes financing charges)", "after_debt_service_monthly"),
-            ("New recurring operating charges", "new_operating_charges_monthly"),
-            ("Net loan cash change", "net_loan_cash_change_monthly"),
-            ("Conditional operations change", "modeled_operations_monthly"),
-            ("Combined incremental change", "combined_incremental_monthly"),
-            ("Assigned loan cash relief", "allocated_monthly"), ("Still to assign", "unallocated_monthly")))
+    funding = "funding_capacity_monthly" in cash
+    cash_currency = cash.get("funding_currency") if funding and cash.get("funding_currency") else cash.get("currency")
+    cash_rows = [("Current regular debt service", "before_debt_service_monthly"),
+        ("Saved-plan regular debt service (includes financing charges)", "after_debt_service_monthly"),
+        ("New recurring operating charges", "new_operating_charges_monthly"),
+        ("Net loan cash change", "net_loan_cash_change_monthly"),
+        ("Conditional operations change", "modeled_operations_monthly"),
+        ("Combined incremental change", "combined_incremental_monthly")]
+    if funding:
+        cash_rows.extend([("Validated cash expense savings", "operating_savings_monthly"),
+            ("Plan funding pool", "funding_capacity_monthly")])
+        if "funding_retained_monthly" in cash:
+            cash_rows.extend([("Kept as cash", "funding_retained_monthly"), ("Used in the plan", "funding_reinvested_monthly")])
+        else:
+            cash_rows.extend([("Assigned plan funding", "funding_allocated_monthly"), ("Still to assign", "funding_unallocated_monthly")])
+    else:
+        cash_rows.extend([("Assigned loan cash relief", "allocated_monthly"), ("Still to assign", "unallocated_monthly")])
+    rows = "".join(f"<tr><td>{label}</td><td class='num'>{_money(cash.get(key), cash_currency)}</td></tr>"
+                   for label, key in cash_rows)
     result += ("<h2>Loan and operations cash bridge</h2><table><thead><tr><th>Measure</th><th>Monthly amount</th></tr></thead><tbody>"
-        + rows + "</tbody></table><p class='muted'>Incremental illustration, not a cash-flow statement or bank balance. Financing charges included in debt service are not deducted twice. Operations timing and setup costs are separate; assignments do not create additional expenses or earnings.</p>")
+        + rows + "</tbody></table><p class='muted'>Incremental illustration, not a cash-flow statement or bank balance. Financing charges included in debt service are not deducted twice. Freed cash is kept by default; reinvestment is optional. The funding pool includes validated cash expense savings and excludes depreciation and projected new sales. Operations timing and setup costs are separate; assignments do not create additional expenses or earnings.</p>")
     allocations = {row["id"]: row for row in (body.get("released_cash_flow") or {}).get("allocations", [])}
     expenses = {row["id"]: row for row in body.get("expenses", [])}
     links = []
@@ -145,7 +156,7 @@ def _goal_tracking(summary, body):
         row, expense = allocations.get(link["id"], {}), expenses.get(link.get("expense_row_id"), {})
         links.append(f"<tr><td>{_text(row.get('label'))}<br><small>{_text(link.get('purpose')).replace('_', ' ')}"
             + (f"; {_text(expense.get('label'))}" if expense else "") + "</small></td>"
-            f"<td class='num'>{_money(link.get('amount_monthly'), cash.get('currency'))}</td>"
+            f"<td class='num'>{_money(link.get('amount_monthly'), cash_currency)}</td>"
             f"<td>{_text(link.get('status'))}</td></tr>")
     if links:
         result += "<h3>Monthly cash assignments</h3><table><thead><tr><th>Use and linked item</th><th>Amount</th><th>Status</th></tr></thead><tbody>" + "".join(links) + "</tbody></table>"

@@ -312,7 +312,7 @@ def test_captured_shareable_tracking_excludes_private_metadata_hashes_and_legacy
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("client", [False, True])
-@pytest.mark.parametrize("incomplete", ["unknown_cost", "duplicate", "unallocated", "unclassified"])
+@pytest.mark.parametrize("incomplete", ["unknown_cost", "duplicate", "overallocated", "unclassified"])
 async def test_goal_flow_final_save_blocks_incomplete_cost_or_cash_but_keeps_draft(client, incomplete):
     from app.services import financial_workspace as workspace
     from app.tests.test_financial_workspace import Memory, context
@@ -328,11 +328,12 @@ async def test_goal_flow_final_save_blocks_incomplete_cost_or_cash_but_keeps_dra
         draft.body["expenses"][0]["source_candidate_key"] = "same-import"
         draft.body["expenses"].append({**draft.body["expenses"][0], "id": str(uuid4())})
     current = saved_loan()
-    if incomplete == "unclassified":
+    if incomplete in {"unclassified", "overallocated"}:
         from app.services.released_cash_flow import source
 
         draft.body["released_cash_flow"] = {"source_fingerprint": source(current)["fingerprint"],
-            "allocations": [{"id": str(uuid4()), "label": "Unclassified use", "amount_monthly": 3500}]}
+            "allocations": [{"id": str(uuid4()), "label": "Optional cash use", "amount_monthly": 3501 if incomplete == "overallocated" else 3500,
+                **({"purpose": "reserve"} if incomplete == "overallocated" else {})}]}
     original = deepcopy(draft.body)
     db.add(FileEvent(profile_id=owner.id, kind=goals.KIND, meta={"amount": "18000", "currency": "USD", "revision": 1}))
     user = SimpleNamespace(id=None, role=Role.CLIENT) if client else actor()
