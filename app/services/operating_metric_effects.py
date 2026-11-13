@@ -67,3 +67,59 @@ def metric_value(row, metric, period):
     key = f"{metric}_{period}_impact"
     fallback = {"gross_annual": "gross_annual_impact", "net_annual": "net_annual_impact", "first_year": "first_year_impact"}[period]
     return row.get(key) if key in row else row.get(fallback)
+
+
+def plan_comparison(evaluation, loan, *, comparable, noi_comparable, same_basis, debt_currency_ok):
+    """Present the same annual scenarios in the file summary and the live editor."""
+    base = evaluation["baseline"]
+    feedback = evaluation["draft_feedback"]
+    summary = feedback["summary"]
+    working = summary["working"]
+    reviewed = evaluation["projection"]["approved"]
+    approved = [row for row in evaluation["actions"] if row["included_in_approved_projection"]]
+    approved_total = evaluation["totals"]["approved"]
+    has_terms = loan["loan_status"] != "not_saved"
+    ready_terms = has_terms and working["refinance_annual_debt_service"] is not None
+    current_debt = base["annual_debt_service"] if debt_currency_ok else None
+    plan_debt = working["refinance_annual_debt_service"] if has_terms else current_debt
+    current_cash = working["cash_after_debt_before_annual"]
+    cash_delta = approved_total.get("cash_annual_impact", approved_total["annual_impact"])
+    loan_cash = loan["net_loan_cash_change_monthly"] if has_terms else 0
+    reviewed_cash = None
+    if approved_total["complete"] and current_cash is not None and cash_delta is not None and loan_cash is not None:
+        reviewed_cash = round(current_cash + cash_delta + 12 * loan_cash, 2)
+
+    def margin(noi, rows, ready):
+        revenue = number(base["revenue"])
+        changes = [row["revenue_change_annual"] for row in rows]
+        if not (ready and comparable and noi_comparable and same_basis) or noi is None or revenue is None or None in changes:
+            return None
+        revenue += sum(changes)
+        return round(100 * noi / revenue, 2) if revenue > 0 else None
+
+    reviewed_ratio = reviewed["dscr_current"] if current_debt is not None and base["currency"] == "USD" else None
+    if has_terms:
+        reviewed_ratio = reviewed["dscr_with_refinance"] if ready_terms else None
+
+    def coverage_gap(earnings, charges):
+        if base["currency"] != "USD" or plan_debt is None or plan_debt <= 0 or earnings is None or charges is None:
+            return None
+        return round(max(0, 1.25 * plan_debt - (earnings - charges)), 2)
+
+    charges = reviewed.get("annual_new_operating_expenses") if has_terms else 0
+    return {
+        "loan_basis": "saved_terms" if ready_terms else "incomplete_terms" if has_terms else "current_debt",
+        "loan_cash_monthly": loan_cash if has_terms else None,
+        "target_gap": {"proposed": coverage_gap(working["earnings"], charges),
+            "approved": coverage_gap(reviewed["earnings"], charges)},
+        "proposed_basis": working["basis"],
+        "baseline": {"earnings": base["earnings"], "noi": base["noi"], "dscr": working["dscr_current_debt_before"],
+            "cash_after_debt": current_cash, "operating_margin": margin(base["noi"], [], True), "debt_service": current_debt},
+        "proposed": {"earnings": working["earnings"], "noi": working["noi"],
+            "dscr": working["dscr_with_refinance_after"] if has_terms else working["dscr_current_debt_after"],
+            "cash_after_debt": working["cash_after_debt_after_annual"],
+            "operating_margin": margin(working["noi"], feedback["actions"], summary["complete"]), "debt_service": plan_debt},
+        "approved": {"earnings": reviewed["earnings"], "noi": reviewed["noi"], "dscr": reviewed_ratio,
+            "cash_after_debt": reviewed_cash, "operating_margin": margin(reviewed["noi"], approved, approved_total["complete"]),
+            "debt_service": plan_debt},
+    }

@@ -195,6 +195,13 @@ def _marketing_assumptions(row, impact, currency):
     multiple = row.get("revenue_return_multiple")
     margin = row.get("contribution_margin_pct")
     margin_text = f"{float(margin):g}%" if margin is not None else "Not available"
+    if row.get("marketing_return_basis") == "added_units":
+        units = row.get("added_units_per_period")
+        return (f"<p><b>Product or service:</b> {_text(row.get('product_name'))}. "
+            f"Added units per {_text(row.get('cadence'))} period: {units if units is not None else 'Unknown'}. "
+            f"Selling price per unit: {_money(row.get('proposed_unit_price'), currency)}. "
+            f"Modeled added sales: {_money(calculation.get('incremental_revenue'), currency)}. "
+            f"Contribution margin: {margin_text}. Additional campaign spend: {_money(calculation.get('incremental_spend'), currency)}.</p>")
     return (f"<p><b>Product or service:</b> {_text(row.get('product_name'))}. "
         f"<b>Assumed revenue per added marketing dollar:</b> {_ratio(multiple)}; "
         f"<b>Contribution margin:</b> {margin_text}.</p>"

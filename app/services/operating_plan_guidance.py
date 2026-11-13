@@ -222,7 +222,7 @@ def client_evaluation(evaluation):
             row["proposed_math_valid"] = bool(results[row["id"]]["proposed_math_valid"])
     if "expense_changes" in evaluation:
         safe["expense_changes"] = deepcopy(evaluation["expense_changes"])
-    for key in ("commands", "itemization", "historical_corrections", "goal_progress", "cash_bridge"):
+    for key in ("commands", "itemization", "historical_corrections", "goal_progress", "cash_bridge", "comparison"):
         if key in evaluation:
             safe[key] = deepcopy(evaluation[key])
     if "draft_feedback" in evaluation:

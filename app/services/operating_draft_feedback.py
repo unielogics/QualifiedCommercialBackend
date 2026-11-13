@@ -166,7 +166,8 @@ def evaluate(raw, cockpit, evaluation, *, source_file_ids=None, now=None):
                 value = _d(metric_value(impact, metric, period)) if safe_math and (period != "first_year" or explicit_window) else None
                 metrics[metric + "_" + field] = _money(value)
         rows.append({"action_id": identifier, "expense_row_id": action.get("expense_row_id"), "kind": action["kind"],
-            "math_status": status, "gross_annual_delta": _money(gross) if safe_math else None,
+            "math_status": status, "revenue_change_annual": impact["revenue_change_annual"] if safe_math else None,
+            "gross_annual_delta": _money(gross) if safe_math else None,
             "gross_monthly_run_rate_delta": _money(gross / 12) if safe_math and gross is not None else None,
             "gross_one_time_delta": _money(one_time) if safe_math else None,
             "net_annual_delta": _money(net), "first_year_delta": _money(first_year),

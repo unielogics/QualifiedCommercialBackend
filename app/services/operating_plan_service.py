@@ -208,7 +208,7 @@ async def summary(db, profile, *, family_id=None):
     version = await db.get(FinancialFormVersion, family.current_version_id) if family and family.current_version_id else None
     body = validate_body(draft.body if draft else version.body if version else empty_body())
     cockpit = await load_cockpit(db, profile)
-    evaluation = math.evaluate(body, cockpit)
+    evaluation = math.evaluate(body, cockpit, include_expense_changes=True)
     progress = completion(body, cockpit)
     disclosure = evaluation["disclosure"]
     stamp = draft.updated_at if draft else version.created_at if version else None

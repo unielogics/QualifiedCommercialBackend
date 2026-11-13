@@ -103,7 +103,8 @@ def proposal_stamp(action, linked_expense=None, body=None):
     action_defaults = {"cost_basis": "total", "unit_label": "", "current_units_per_period": None,
         "proposed_units_per_period": None, "current_fixed_amount": None, "proposed_fixed_amount": None,
         "product_name": "", "revenue_return_multiple": None, "unit_change_mode": "absolute", "unit_change_value": None,
-        "expense_category": None, "source_group_key": "", "command": None, "price_basis": "per_unit"}
+        "expense_category": None, "source_group_key": "", "command": None, "price_basis": "per_unit",
+        "supporting_action_ids": [], "marketing_return_basis": "spend_multiple", "added_units_per_period": None}
     expense_defaults = {"cost_basis": "total", "unit_label": "", "current_units_per_period": None,
         "current_unit_cost": None, "current_fixed_amount": None, "source_group_key": "", "source_candidate_key": "", "volume_behavior": "unknown", "itemization_parent_id": None}
     if action.get("command"):
@@ -120,6 +121,16 @@ def proposal_stamp(action, linked_expense=None, body=None):
                 if row.get(key) == default:
                     row.pop(key, None)
     extra = {}
+    if action.get("kind") == "marketing_investment" and action.get("supporting_action_ids"):
+        # A campaign review binds the assumptions of the staffing and software
+        # proposals on which it relies. Their own review decisions stay independent.
+        support_ids = set(action["supporting_action_ids"])
+        expenses = {row["id"]: row for row in (body or {}).get("expenses", [])}
+        extra["campaign_costs"] = {
+            row["id"]: proposal_stamp(row, expenses.get(row.get("expense_row_id")), body)
+            for row in (body or {}).get("adjustments", []) if row["id"] in support_ids
+            and row["kind"] in {"expense_increase", "expense_reduction"}
+        }
     if action.get("command"):
         from app.services.operating_plan_commands import participants
 
@@ -429,12 +440,17 @@ def _impact(action, body, expenses, cockpit, allowed_files, now, command_result=
             risks.append("Incremental revenue uses the stated contribution margin after variable costs; it is not dollar-for-dollar earnings.")
         elif kind == "marketing_investment":
             incremental_spend = action["proposed_amount"] - action["current_amount"]
-            incremental_revenue = incremental_spend * action["revenue_return_multiple"]
+            by_units = action["marketing_return_basis"] == "added_units"
+            incremental_revenue = (action["added_units_per_period"] * action["proposed_unit_price"] if by_units
+                                   else incremental_spend * action["revenue_return_multiple"])
             contribution = incremental_revenue * action["contribution_margin_pct"] / 100
             gross = contribution - incremental_spend
             marketing_calculation = {"incremental_spend": _money(incremental_spend),
                 "incremental_revenue": _money(incremental_revenue), "incremental_contribution": _money(contribution),
-                "formula": "(proposed spend - current spend) * (revenue return multiple * contribution margin / 100 - 1)"}
+                "formula": ("added units * selling price * contribution margin / 100 - incremental spend" if by_units
+                            else "(proposed spend - current spend) * (revenue return multiple * contribution margin / 100 - 1)")}
+            if by_units:
+                marketing_calculation.update(marketing_return_basis="added_units", added_units_per_period=action["added_units_per_period"])
             if incremental_spend < 0:
                 issues.append("A marketing investment must keep or increase current spend; use an expense reduction for a lower marketing budget.")
             if linked is None or linked["category"] != "marketing":
@@ -482,7 +498,17 @@ def _impact(action, body, expenses, cockpit, allowed_files, now, command_result=
                     risks.append("Quantity, unit rates and fixed charges are modeled separately. Validate any effect of volume or usage changes on revenue, capacity and service quality.")
     if body["currency"] != "USD":
         issues.append("Reconcile plan currency with USD debt-service and implementation amounts before projecting coverage.")
-    recurring = None if gross is None else 0 if action["cadence"] == "one_time" or kind == "one_time_adjustment" else gross * FACTORS[action["cadence"]]
+    annual_factor = FACTORS[action["cadence"]]
+    revenue_change = 0
+    if kind == "unit_volume":
+        revenue_change = unit_calculation.get("revenue_change_annual")
+    elif kind == "marketing_investment":
+        revenue_change = incremental_revenue * annual_factor if marketing_calculation else None
+    elif kind == "revenue_change":
+        revenue_change = (action["proposed_amount"] - action["current_amount"]) * annual_factor if gross is not None else None
+    elif kind == "price_change":
+        revenue_change = gross * annual_factor if gross is not None else None
+    recurring = None if gross is None else 0 if action["cadence"] == "one_time" or kind == "one_time_adjustment" else gross * annual_factor
     one_time_benefit = gross if gross is not None and (action["cadence"] == "one_time" or kind == "one_time_adjustment") else 0
     implementation = action["implementation_cost"]
     recurring_cost = implementation * (12 if action["implementation_cost_cadence"] == "monthly" else 1) if implementation is not None and action["implementation_cost_cadence"] != "one_time" else 0
@@ -501,7 +527,8 @@ def _impact(action, body, expenses, cockpit, allowed_files, now, command_result=
     if one_time_benefit:
         risks.append("One-time effects are shown in the first-year illustration and are not multiplied into recurring annual coverage.")
     return {"id": action["id"], "label": action["label"], "kind": kind, "status": action["status"],
-        "review_state": action["status"], "gross_annual_impact": _money(recurring), **metric_effects,
+        "review_state": action["status"], "revenue_change_annual": _money(revenue_change),
+        "gross_annual_impact": _money(recurring), **metric_effects,
         "implementation_recurring_annual": _money(recurring_cost), "implementation_one_time": _money(one_time_cost),
         "net_annual_impact": _money(net_annual), "first_year_impact": _money(first_year),
         "monthly_impact": _money(net_annual / 12) if net_annual is not None else None,
@@ -756,6 +783,33 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
                     result["review_state"] = "approved" if not own_issues else "blocked"
         results.append(result)
 
+    by_id = {row["id"]: row for row in results}
+    for result in results:
+        campaign = original_actions[result["id"]]
+        if campaign["kind"] != "marketing_investment" or not campaign.get("supporting_action_ids"):
+            continue
+        support_ids = list(dict.fromkeys(campaign["supporting_action_ids"]))
+        supports = []
+        for identifier in support_ids:
+            target = by_id.get(identifier)
+            source = original_actions.get(identifier, {})
+            category = (expenses.get(source.get("expense_row_id")) or {}).get("category") or source.get("expense_category")
+            if target and target["kind"] in {"expense_increase", "expense_reduction"} and category in {"salaries", "payroll_taxes", "software"}:
+                supports.append(target)
+        complete = len(supports) == len(support_ids) and all(row.get("proposed_math_valid") for row in supports)
+        calculation = result["calculation"]
+        calculation["supporting_action_ids"] = support_ids
+        calculation["with_support_annual_impact"] = _money(result["net_annual_impact"] + sum(row["net_annual_impact"] for row in supports)) if complete and result.get("proposed_math_valid") else None
+        if not result["excluded"] and result["status"] != "rejected":
+            if not complete:
+                result["issues"].append("Restore, complete or unlink the campaign's supporting expense changes.")
+                result["proposed_math_valid"] = False
+            if len(supports) != len(support_ids) or not all(row["included_in_approved_projection"] for row in supports):
+                result["approval_issues"].append("Review the linked staffing and software changes before including this campaign in reviewed earnings.")
+                result["included_in_approved_projection"] = False
+                if result["review_state"] == "approved":
+                    result["review_state"] = "blocked"
+
     for command in resolved["commands"]:
         result = next(row for row in results if row["id"] == command["action_id"])
         command.update(included_in_proposed_projection=bool(result.get("proposed_math_valid")),
@@ -942,7 +996,11 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
     if include_expense_changes or goal.get("status") == "set":
         from app.services.operating_draft_feedback import evaluate as draft_feedback
 
-        feedback = draft_feedback(original, cockpit, result, source_file_ids=source_file_ids, now=now)
+        # Loan cash and coverage are measurable before a staff NOI goal is set.
+        from app.services.operating_plan_tracking import cash_bridge
+
+        bridge = result.get("cash_bridge") or cash_bridge(original, cockpit, result)
+        feedback = draft_feedback(original, cockpit, {**result, "cash_bridge": bridge}, source_file_ids=source_file_ids, now=now)
     if goal.get("status") == "set":
         from app.services.operating_funding import evaluate as funding
 
@@ -972,6 +1030,10 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
 
         result["draft_feedback"] = feedback
         result["source_review"] = source_review(original, cockpit)
+        from app.services.operating_metric_effects import plan_comparison
+
+        result["comparison"] = plan_comparison(result, bridge, comparable=comparable, noi_comparable=noi_comparable,
+            same_basis=earnings.get("basis") == noi.get("basis"), debt_currency_ok=debt_currency_ok and debt.get("currency") == "USD")
     return result
 
 
