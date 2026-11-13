@@ -10,6 +10,7 @@ from datetime import date
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 
 from app.schemas.earnings_improvement import cost_amount
+from app.services.operating_new_activity import explicit_new_zero
 
 FACTORS = {"weekly": 52, "biweekly": 26, "semi_monthly": 24, "monthly": 12, "quarterly": 4, "annual": 1}
 OUTSIDE = {"loan_payments", "income_taxes", "owner_draws", "transfers"}
@@ -41,8 +42,13 @@ def _change(current, command):
 
 
 def group_rows(action, body):
-    """Exact scope, including unscoped manual rows, excluding references/history."""
+    """Current scope excludes explicit new activities with no historical cost."""
+    expenses = {row["id"]: row for row in body.get("expenses", [])}
+    new_activity_rows = {row["expense_row_id"] for row in body.get("adjustments", [])
+        if not row.get("excluded") and not row.get("duplicate_of") and row.get("status") != "rejected"
+        and explicit_new_zero(row, expenses.get(row.get("expense_row_id")))}
     return sorted([row for row in body.get("expenses", []) if not row.get("excluded")
+        and row["id"] not in new_activity_rows
         and row["category"] == action.get("expense_category")
         and row.get("source_group_key", "") == action.get("source_group_key", "")], key=lambda row: str(row["id"]))
 

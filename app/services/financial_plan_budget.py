@@ -73,7 +73,8 @@ def coverage_context(evaluation):
     """Budget calculations always start before new costs, avoiding a second charge."""
     return {"income_annual": evaluation.get("income_after_annual_before_budget", evaluation.get("income_after_annual")),
         "debt_service_annual": evaluation.get("debt_service_after_annual_before_financing_fees", evaluation.get("debt_service_after_annual")),
-        "new_loan_annual_debt_service": evaluation.get("new_payment_monthly") * 12 if evaluation.get("new_payment_monthly") is not None else None,
+        "new_loan_annual_debt_service": evaluation.get("new_loan_annual_debt_service",
+            evaluation.get("new_payment_monthly") * 12 if evaluation.get("new_payment_monthly") is not None else None),
         "base_dscr": evaluation.get("headline_after_before_budget", evaluation.get("headline_after")),
         "basis": evaluation.get("headline_key"),
         "operating_plan": deepcopy(evaluation.get("operating_plan"))}

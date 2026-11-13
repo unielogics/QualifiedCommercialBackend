@@ -543,7 +543,6 @@ def evaluate_plan(
     recorded_refinance_basis = bool(source == "recorded_terms" and ref.get("treatment") == "refinance" and retained is not None
         and (overrides.get("debt_service_note") or "").startswith("Refinance per ")
         and service_override is not None and abs(float(service_override) - round(retained / 12, 2)) < .005)
-    configured_refinance = bool(schedule and schedule.get("repayment_config") is not None and recorded_refinance_basis)
     # Canonical recorded refinance terms already state the debt remaining
     # AFTER these payoffs. Preserve the payoff selections and their evidence,
     # without subtracting their payments from retained debt a second time.
@@ -553,12 +552,32 @@ def evaluate_plan(
                   if service_monthly is not None and (recorded_refinance_basis or not retirement_payment_unknown) else None)
     after_monthly = round(max(0.0, before_new + float(new_payment or 0.0)), 2) if before_new is not None and not new_loan_payment_unknown else None
     after_annual = after_monthly * 12 if after_monthly is not None else None
-    if before_new is not None and schedule and schedule.get("repayment_config") is not None:
-        exact_new_annual = schedule["coverage_annual_debt_service"] if abs(float(new_payment or 0) - schedule["coverage_payment_monthly"]) < .005 else float(new_payment or 0) * 12
+    new_annual_service = float(new_payment) * 12 if new_payment is not None else None
+    new_annual_basis = "annualized_monthly_payment" if new_payment is not None else "unavailable"
+    # Older recorded annual loans established coverage on their accepted monthly
+    # scalar. Keep that basis while correcting shorter contracts and new quotes.
+    legacy_recorded_schedule = bool(source == "recorded_terms" and schedule
+        and schedule.get("repayment_config") is None and (schedule.get("term_months") or 0) >= 12)
+    legacy_recorded_payment = legacy_recorded_schedule and plan.get("new_payment_monthly") is not None
+    if legacy_recorded_payment:
+        new_annual_basis = "annualized_recorded_payment"
+    if schedule:
+        canonical_annual = _num(schedule.get("coverage_annual_debt_service"))
+        canonical_monthly = _num(schedule.get("coverage_payment_monthly"))
+        # A six-month loan has six scheduled payments in the coverage year.
+        # Multiplying its monthly equivalent by twelve overstates the contract.
+        # Preserve a separately entered payment when it differs from the quote.
+        canonical_payment = canonical_monthly is not None and abs(float(new_payment or 0) - canonical_monthly) < .005
+        if canonical_payment and canonical_annual is not None and not legacy_recorded_payment:
+            new_annual_service = canonical_annual
+            new_annual_basis = "canonical_schedule"
+    if before_new is not None and schedule and new_annual_service is not None:
         exact_existing_annual = before_new * 12
-        if configured_refinance:
+        # The retained debt basis belongs to the recorded refinance. Its legacy
+        # monthly annualization survives whether a new payment was stored or priced.
+        if recorded_refinance_basis and not legacy_recorded_schedule:
             exact_existing_annual = retained
-        after_annual = round(exact_existing_annual + exact_new_annual, 2)
+        after_annual = round(exact_existing_annual + new_annual_service, 2)
 
     candidates_after = []
     for candidate in dscr.get("candidates") or []:
@@ -707,6 +726,8 @@ def evaluate_plan(
         "schedule": {k: v for k, v in schedule.items() if k not in {"rows", "cash_flows"}} if schedule else None,
         "schedule_rows": schedule["rows"] if schedule else [],
         "new_payment_monthly": _round(float(new_payment)) if new_payment is not None else None,
+        "new_loan_annual_debt_service": _round(new_annual_service),
+        "new_loan_annual_debt_service_basis": new_annual_basis,
         "new_regular_payment_monthly": _round(regular_payment),
         "new_interest_only_payment_monthly": _round(io_payment),
         "debt_service_after_regular_monthly": ordinary_after,
