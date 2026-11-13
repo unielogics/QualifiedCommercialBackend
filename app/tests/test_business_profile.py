@@ -30,6 +30,7 @@ def _intake(state=None):
 
 
 _EMPTY_ADDRESS = {"street": None, "city": None, "state": None, "zip": None, "industry": None}
+_EMPTY_DETAILS = {**_EMPTY_ADDRESS, "business_phone": None, "employee_count": None}
 
 
 # --- the website --------------------------------------------------------------------------------
@@ -118,7 +119,7 @@ def test_the_record_keeps_the_address_the_none_flag_and_the_words() -> None:
 
 def test_the_file_reads_what_the_client_said_and_the_desks_correction_wins() -> None:
     client_only = _intake({"business_profile": {"website": "https://example.com", "website_none": False, "description": "Coffee shops."}})
-    assert business_profile.of_intake(client_only) == {"website": "https://example.com", "website_none": False, "description": "Coffee shops.", **_EMPTY_ADDRESS}
+    assert business_profile.of_intake(client_only) == {"website": "https://example.com", "website_none": False, "description": "Coffee shops.", **_EMPTY_DETAILS}
 
     corrected = _intake(
         {
@@ -126,13 +127,13 @@ def test_the_file_reads_what_the_client_said_and_the_desks_correction_wins() -> 
             "desk_facts": {"business_website": "https://new.example.com", "business_website_none": False, "business_description": "Two coffee shops and a roastery."},
         }
     )
-    assert business_profile.of_intake(corrected) == {"website": "https://new.example.com", "website_none": False, "description": "Two coffee shops and a roastery.", **_EMPTY_ADDRESS}
+    assert business_profile.of_intake(corrected) == {"website": "https://new.example.com", "website_none": False, "description": "Two coffee shops and a roastery.", **_EMPTY_DETAILS}
 
     desk_na = _intake({"business_profile": {"website": "https://old.example.com"}, "desk_facts": {"business_website": None, "business_website_none": True}})
     assert business_profile.of_intake(desk_na)["website"] is None and business_profile.of_intake(desk_na)["website_none"] is True
 
-    assert business_profile.of_intake(_intake()) == {"website": None, "website_none": False, "description": None, **_EMPTY_ADDRESS}
-    assert business_profile.of_intake(SimpleNamespace(intake_state=None)) == {"website": None, "website_none": False, "description": None, **_EMPTY_ADDRESS}
+    assert business_profile.of_intake(_intake()) == {"website": None, "website_none": False, "description": None, **_EMPTY_DETAILS}
+    assert business_profile.of_intake(SimpleNamespace(intake_state=None)) == {"website": None, "website_none": False, "description": None, **_EMPTY_DETAILS}
 
 
 @pytest.mark.parametrize(

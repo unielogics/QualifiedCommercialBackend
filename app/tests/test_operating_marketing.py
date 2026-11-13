@@ -89,6 +89,86 @@ def test_marketing_reconciles_current_spend_across_cadences():
     assert result["totals"]["proposed"]["complete"]
 
 
+def test_campaign_volume_linked_payroll_and_software_reconcile_across_scenarios():
+    raw = marketing_body()
+    campaign = raw["adjustments"][0]
+    campaign.update(marketing_return_basis="added_units", added_units_per_period=40,
+        proposed_unit_price=100, revenue_return_multiple=999, supporting_action_ids=[])
+    for category, proposed in [("salaries", 1350), ("software", 1100)]:
+        cost = expense(id=str(uuid4()), category=category)
+        supporting = action(id=str(uuid4()), expense_row_id=cost["id"], driver_key=category,
+            kind="expense_increase", proposed_amount=proposed)
+        raw["expenses"].append(cost)
+        raw["adjustments"].append(supporting)
+        campaign["supporting_action_ids"].append(supporting["id"])
+    cockpit = context()
+    reporting = {key: raw[key] for key in ("period_start", "period_end", "currency", "basis")}
+    groups = []
+    for cost in raw["expenses"]:
+        cost["source_group_key"] = "source:" + cost["category"]
+        groups.append({**reporting, "key": cost["source_group_key"], "category": cost["category"],
+            "label": cost["category"], "baseline_annual_amount": 12000, "source_file_ids": cost["source_file_ids"]})
+    cockpit["operating_evidence"]["guidance"] = {"reporting": reporting, "expense_groups": groups}
+    result = plan.evaluate(raw, cockpit, now=NOW, include_expense_changes=True)
+    # Added sales 48k, contribution 24k, campaign spend 12k, supporting costs 5.4k.
+    assert result["actions"][0]["calculation"]["with_support_annual_impact"] == 6600
+    assert result["totals"]["proposed"]["annual_impact"] == 6600
+    comparison = result["comparison"]
+    assert comparison["baseline"]["earnings"] == -10000
+    assert comparison["proposed"] == {"earnings": -3400, "noi": -8400, "dscr": pytest.approx(-3400 / 12000, abs=.0001),
+        "cash_after_debt": -15400, "operating_margin": -5.68, "debt_service": 12000}
+    assert comparison["approved"]["earnings"] is None
+    assert comparison["target_gap"]["proposed"] == 18400
+    saved = approve(raw, cockpit)
+    result = plan.evaluate(saved, cockpit, now=NOW, include_expense_changes=True)
+    assert result["comparison"]["approved"]["earnings"] == -3400
+    saved["adjustments"][1]["proposed_amount"] = 1450
+    edited = plan.evaluate(saved, cockpit, now=NOW, include_expense_changes=True)
+    assert edited["actions"][0]["review_state"] == "stale"
+    assert edited["comparison"]["approved"]["earnings"] is None
+    assert edited["comparison"]["proposed"]["earnings"] == -4600
+    saved["adjustments"][1]["excluded"] = True
+    incomplete = plan.evaluate(saved, cockpit, now=NOW, include_expense_changes=True)
+    assert incomplete["comparison"]["proposed"]["earnings"] is None
+    assert incomplete["comparison"]["baseline"] == comparison["baseline"]
+
+
+def test_volume_assumptions_distinguish_zero_from_missing():
+    raw = marketing_body()
+    raw["adjustments"][0].update(marketing_return_basis="added_units", proposed_unit_price=100, added_units_per_period=0)
+    result = plan.evaluate(raw, context(), now=NOW, include_expense_changes=True)
+    assert result["actions"][0]["revenue_change_annual"] == 0
+    assert result["totals"]["proposed"]["annual_impact"] == -12000
+    raw["adjustments"][0]["added_units_per_period"] = None
+    result = plan.evaluate(raw, context(), now=NOW, include_expense_changes=True)
+    assert result["comparison"]["proposed"]["operating_margin"] is None
+    assert result["comparison"]["proposed"]["earnings"] is None
+
+
+def test_refinance_cash_and_coverage_use_their_own_payment_windows_without_a_goal():
+    from app.tests.test_refinance_reinvestment_independent import saved_loan
+
+    cockpit = saved_loan()
+    cockpit.pop("_operating_goal")
+    cockpit["plan"]["evaluation"]["debt_service_after_annual"] = 90000
+    raw = body()
+    raw["adjustments"] = []
+    read = plan.evaluate(raw, cockpit, now=NOW, include_expense_changes=True)["comparison"]
+    assert read["loan_basis"] == "saved_terms"
+    assert read["loan_cash_monthly"] == 3500
+    assert read["proposed"]["earnings"] == read["baseline"]["earnings"] == 30000
+    assert read["proposed"]["noi"] == read["baseline"]["noi"] == 18000
+    assert read["proposed"]["debt_service"] == 90000
+    assert read["proposed"]["dscr"] == pytest.approx(24000 / 90000, abs=.0001)
+    assert read["target_gap"]["proposed"] == 88500
+    assert read["proposed"]["cash_after_debt"] - read["baseline"]["cash_after_debt"] == 42000
+    cockpit["plan"]["evaluation"]["coverage_unavailable_reason"] = "Incomplete replacement schedule"
+    incomplete = plan.evaluate(raw, cockpit, now=NOW, include_expense_changes=True)["comparison"]
+    assert incomplete["loan_basis"] == "incomplete_terms"
+    assert incomplete["proposed"]["dscr"] is None
+    assert incomplete["proposed"]["earnings"] == 30000
+
+
 @pytest.mark.parametrize("other_kind", ["expense_increase", "revenue_change"])
 def test_marketing_cannot_count_the_same_spend_or_aggregate_return_twice(other_kind):
     raw = marketing_body()

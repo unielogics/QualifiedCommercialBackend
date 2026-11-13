@@ -82,6 +82,9 @@ class HistoricalCorrection(_Form):
 
 class AdjustmentRow(_Form):
     id: UUID = Field(default_factory=uuid4)
+    supporting_action_ids: list[UUID] = Field(default_factory=list, max_length=200)
+    marketing_return_basis: Literal["spend_multiple", "added_units"] = "spend_multiple"
+    added_units_per_period: float | None = Field(default=None, ge=0, le=1e15)
     kind: ActionKind = "expense_reduction"
     label: str = Field(default="", max_length=240)
     driver_key: str = Field(default="", max_length=200)
@@ -298,8 +301,8 @@ def action_missing(row):
             if any(row.get(key) is not None and row[key] > 0 for key in ("current_processing_per_transaction_fee", "proposed_processing_per_transaction_fee")):
                 required.append("processing_transaction_count")
     elif kind == "marketing_investment":
-        required += ["product_name", "expense_row_id", "current_amount", "proposed_amount",
-                     "revenue_return_multiple", "contribution_margin_pct"]
+        required += ["product_name", "expense_row_id", "current_amount", "proposed_amount", "contribution_margin_pct"]
+        required += ["added_units_per_period", "proposed_unit_price"] if row.get("marketing_return_basis") == "added_units" else ["revenue_return_multiple"]
     elif kind == "unit_volume":
         required += ["unit_change_value"]
     elif kind in {"expense_reduction", "expense_increase"} and row.get("cost_basis") == "per_unit":

@@ -42,6 +42,7 @@ HEADER = (
 
 def _spec(key):
     options = {"category": CATEGORIES, "cadence": CADENCES, "kind": ACTION_KINDS,
+               "marketing_return_basis": ("spend_multiple", "added_units"),
                "expense_category": CATEGORIES,
                "cost_basis": ("total", "per_unit"),
                "price_basis": ("per_unit", "annual_revenue"),
@@ -56,7 +57,7 @@ def _spec(key):
 
 # Evidence arrays, relationship IDs and staff decisions use scoped controls in
 # the editor. They are never free-text worksheet cells.
-_NO_GRID_FIELDS = STAFF_FIELDS | {"id", "source_file_ids", "expense_row_id", "duplicate_of", "bank_vendor_key", "source_group_key", "source_candidate_key", "itemization_parent_id", "command"}
+_NO_GRID_FIELDS = STAFF_FIELDS | {"id", "source_file_ids", "supporting_action_ids", "expense_row_id", "duplicate_of", "bank_vendor_key", "source_group_key", "source_candidate_key", "itemization_parent_id", "command"}
 COLLECTIONS = {
     "expenses": tuple(_spec(key) for key in CLIENT_EXPENSE_FIELDS if key not in _NO_GRID_FIELDS),
     "adjustments": tuple(_spec(key) for key in CLIENT_ADJUSTMENT_FIELDS if key not in _NO_GRID_FIELDS or key == "source_group_key"),

@@ -18,6 +18,7 @@ from app.services import business_profile as service
 from app.services import industry_suggestion
 from app.services.application_profiles import _seed_primary_owner
 from app.services.application_programs import _scope_match
+from app.tests._business_profile_fixture import APPLICATION_START_DETAILS
 
 ANSWERS = {
     "business_street": " 123 Business   Avenue Suite 2 ",
@@ -224,7 +225,7 @@ async def test_public_create_persists_the_full_profile_before_provisioning(model
             created.append(row)
 
     db = SimpleNamespace(add=add, flush=AsyncMock(), commit=AsyncMock())
-    payload = model(**ANSWERS, full_name="Owner", email=client.email, phone="2025550123", terms_accepted=True, privacy_accepted=True)
+    payload = model(**ANSWERS, **APPLICATION_START_DETAILS, full_name="Owner", email=client.email, phone="2025550123", terms_accepted=True, privacy_accepted=True)
     request = Request({"type": "http", "headers": [], "client": ("127.0.0.1", 1234)})
     with ExitStack() as stack:
         for name in ("_find_or_create_client", "_find_or_create_funding_client", "_find_or_create_mca_client"):
