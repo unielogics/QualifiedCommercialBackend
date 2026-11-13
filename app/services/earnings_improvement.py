@@ -31,6 +31,7 @@ FACTORS = {"weekly": 52, "biweekly": 26, "semi_monthly": 24, "monthly": 12, "qua
 NON_OPERATING = {"loan_payments", "income_taxes", "owner_draws", "transfers"}
 NON_CASH = {"depreciation_amortization"}
 PRODUCT_KINDS = {"price_change", "product_cost_change"}
+QUALIFICATION_FIELDS = {"label", "driver_key", "effective_date", "explanation", "source_note", "implementation_cost"}
 
 
 def _stamp(value):
@@ -321,7 +322,7 @@ def _processing(action, cockpit, issues, risks):
     return current - proposed
 
 
-def _impact(action, body, expenses, cockpit, allowed_files, now, command_result=None):
+def _impact(action, body, expenses, cockpit, allowed_files, now, command_result=None, *, arithmetic_only=False):
     issues = [f"Missing {key.replace('_', ' ')}" for key in action_missing(action)]
     if command_result:
         issues.extend(command_result["issues"])
@@ -341,7 +342,8 @@ def _impact(action, body, expenses, cockpit, allowed_files, now, command_result=
     if action["cost_basis"] == "per_unit" and kind not in {"expense_reduction", "expense_increase"}:
         issues.append("Use the per-unit cost basis with an expense reduction or increase; price, product and processor actions have their own drivers.")
     gross = None
-    if not action_missing(action):
+    missing = action_missing(action)
+    if not ([key for key in missing if key not in QUALIFICATION_FIELDS] if arithmetic_only else missing):
         if kind == "unit_volume":
             from app.services.operating_unit_economics import evaluate as unit_economics
 
@@ -466,6 +468,7 @@ def _impact(action, body, expenses, cockpit, allowed_files, now, command_result=
         "source_file_ids": list(action["source_file_ids"]), "effective_date": action["effective_date"],
         "explanation": action["explanation"], "source_note": action["source_note"], "owner_name": action["owner_name"],
         "driver_key": action["driver_key"], "product_name": action["product_name"],
+        **({"gross_one_time_effect": _money(gross) if action["cadence"] == "one_time" or kind == "one_time_adjustment" else 0} if arithmetic_only else {}),
         "expense_row_id": action["expense_row_id"], "excluded": action["excluded"],
         "merchant_source_key": action.get("merchant_source_key"), "merchant_offer_id": action.get("merchant_offer_id"),
         **({"expense_category": linked["category"] if linked else action["expense_category"],
@@ -604,6 +607,26 @@ def _disclosure(body):
     return {key: _money(value) if isinstance(value, float) else value for key, value in result.items()}
 
 
+def comparison_scope(body, cockpit):
+    """The same business/source window for qualified and arithmetic previews."""
+    from app.services.document_associations import identity_matches
+
+    earnings = (cockpit.get("ebitda") or {}).get("headline") or {}
+    noi = (cockpit.get("noi") or {}).get("headline") or {}
+    debt = (cockpit.get("debt") or {}).get("service") or {}
+    refs = [*(earnings.get("source_refs") or []), *(noi.get("source_refs") or [])]
+    expected_business = (cockpit.get("operating_evidence") or {}).get("business_name") or next((
+        (ref.get("identity_association") or {}).get("expected_entity") or ref.get("entity") for ref in refs
+        if (ref.get("identity_association") or {}).get("expected_entity") or ref.get("entity")), None)
+    entity_comparable = bool(expected_business and identity_matches(expected_business, body["business_name"]))
+    comparable = bool(entity_comparable and _period_matches(body, earnings) and earnings.get("currency") == body["currency"] == "USD" and earnings.get("basis") == body["basis"] and not (cockpit.get("ebitda") or {}).get("source_selection", {}).get("stale") and not debt.get("identity_association_conflict"))
+    reviewed_noi = bool(noi.get("staff_reviewed") and not (cockpit.get("noi") or {}).get("review", {}).get("stale"))
+    noi_comparable = bool(entity_comparable and _period_matches(body, noi) and noi.get("currency") == body["currency"] == "USD"
+                          and (noi.get("basis") == body["basis"] or reviewed_noi)
+                          and not (cockpit.get("noi") or {}).get("review", {}).get("stale"))
+    return comparable, noi_comparable, reviewed_noi
+
+
 def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_changes=False):
     body = validate_body(raw)
     original = deepcopy(body)
@@ -728,18 +751,7 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
     after_service = number(evaluation.get("debt_service_after_annual")) if evaluation.get("active") and not evaluation.get("coverage_unavailable_reason") else None
     annual_earnings = number(earnings.get("annualized_value"))
     annual_noi = number(noi.get("annualized_value"))
-    from app.services.document_associations import identity_matches
-
-    refs = [*(earnings.get("source_refs") or []), *(noi.get("source_refs") or [])]
-    expected_business = (cockpit.get("operating_evidence") or {}).get("business_name") or next((
-        (ref.get("identity_association") or {}).get("expected_entity") or ref.get("entity") for ref in refs
-        if (ref.get("identity_association") or {}).get("expected_entity") or ref.get("entity")), None)
-    entity_comparable = bool(expected_business and identity_matches(expected_business, body["business_name"]))
-    comparable = bool(entity_comparable and _period_matches(body, earnings) and earnings.get("currency") == body["currency"] == "USD" and earnings.get("basis") == body["basis"] and not (cockpit.get("ebitda") or {}).get("source_selection", {}).get("stale") and not debt.get("identity_association_conflict"))
-    reviewed_noi = bool(noi.get("staff_reviewed") and not (cockpit.get("noi") or {}).get("review", {}).get("stale"))
-    noi_comparable = bool(entity_comparable and _period_matches(body, noi) and noi.get("currency") == body["currency"] == "USD"
-                          and (noi.get("basis") == body["basis"] or reviewed_noi)
-                          and not (cockpit.get("noi") or {}).get("review", {}).get("stale"))
+    comparable, noi_comparable, reviewed_noi = comparison_scope(body, cockpit)
     baseline = {"period": earnings.get("period"), "currency": earnings.get("currency"), "plan_currency": body["currency"], "basis": earnings.get("basis"),
         "revenue": source_baseline.get("revenue"), "earnings": annual_earnings, "earnings_kind": earnings.get("kind"),
         "noi": annual_noi, "noi_kind": noi.get("kind"), "noi_label": noi.get("label"),
@@ -856,6 +868,10 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
 
         result["goal_progress"] = goal_progress(goal, result)
         result["cash_bridge"] = cash_bridge(original, cockpit, result)
+    if include_expense_changes:
+        from app.services.operating_draft_feedback import evaluate as draft_feedback
+
+        result["draft_feedback"] = draft_feedback(original, cockpit, result, source_file_ids=source_file_ids, now=now)
     return result
 
 
