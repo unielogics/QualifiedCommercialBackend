@@ -556,9 +556,9 @@ def evaluate_plan(
     new_annual_basis = "annualized_monthly_payment" if new_payment is not None else "unavailable"
     # Older recorded annual loans established coverage on their accepted monthly
     # scalar. Keep that basis while correcting shorter contracts and new quotes.
-    legacy_recorded_payment = bool(source == "recorded_terms" and schedule
-        and schedule.get("repayment_config") is None and plan.get("new_payment_monthly") is not None
-        and (schedule.get("term_months") or 0) >= 12)
+    legacy_recorded_schedule = bool(source == "recorded_terms" and schedule
+        and schedule.get("repayment_config") is None and (schedule.get("term_months") or 0) >= 12)
+    legacy_recorded_payment = legacy_recorded_schedule and plan.get("new_payment_monthly") is not None
     if legacy_recorded_payment:
         new_annual_basis = "annualized_recorded_payment"
     if schedule:
@@ -573,7 +573,9 @@ def evaluate_plan(
             new_annual_basis = "canonical_schedule"
     if before_new is not None and schedule and new_annual_service is not None:
         exact_existing_annual = before_new * 12
-        if recorded_refinance_basis and not legacy_recorded_payment:
+        # The retained debt basis belongs to the recorded refinance. Its legacy
+        # monthly annualization survives whether a new payment was stored or priced.
+        if recorded_refinance_basis and not legacy_recorded_schedule:
             exact_existing_annual = retained
         after_annual = round(exact_existing_annual + new_annual_service, 2)
 
