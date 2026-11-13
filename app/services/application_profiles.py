@@ -2036,6 +2036,10 @@ async def log_profile_action(
     target_id: UUID | None = None,
     metadata: dict | None = None,
 ) -> None:
+    if action.startswith(("financial_plan.", "deal_budget.", "terms.", "collateral.", "financial_review.", "evidence.")):
+        from app.capital_partners.services.refresh import after_saved_source
+
+        await after_saved_source(db, profile.id, actor_id=getattr(user, "id", None), reason="saved_financial_input")
     if profile.dealer_id:
         from app.dealer_os.services.audit import log_action
 

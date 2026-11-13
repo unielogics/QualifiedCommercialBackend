@@ -40,7 +40,7 @@ async def attach_generated_documents(
     listing: CpListing,
     artifacts: list[tuple[Any, str, str]],
     *,
-    actor_id: UUID,
+    actor_id: UUID | None,
     now: datetime,
 ) -> list[dict[str, Any]]:
     """Reuse the ready attachment for the same artifact; replace changed ones.
@@ -103,7 +103,8 @@ async def attach_generated_documents(
     for artifact, kind, name, attached, key, version, size in prepared:
         if attached is None:
             for previous in listing.documents:
-                if previous.kind == kind and previous.status != E.DocumentStatus.SUPERSEDED:
+                protected = (listing.source_snapshot or {}).get("active_generated_document_ids") or []
+                if previous.kind == kind and previous.status != E.DocumentStatus.SUPERSEDED and str(previous.id) not in protected:
                     previous.status = E.DocumentStatus.SUPERSEDED
                     previous.superseded_at = now
             attached = CpListingDocument(

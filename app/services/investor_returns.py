@@ -235,7 +235,7 @@ def listing_projection(listing, *, query, member=False):
     def record(value):
         return value if isinstance(value, dict) else {}
 
-    financials = record(snapshot.get("financials"))
+    financials = record(snapshot.get("active_financials") if member and isinstance(snapshot.get("active_financials"), dict) else snapshot.get("financials"))
     terms = record(financials.get("proposed_terms"))
     report = record(financials.get("deal_budget"))
     basis = report.get("basis")

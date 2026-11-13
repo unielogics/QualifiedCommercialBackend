@@ -416,6 +416,9 @@ _LISTING_FIELDS = [
 
 def _apply(listing: CpListing, payload: S.ListingIn) -> None:
     data = payload.model_dump(exclude_unset=True)
+    protected = {"refresh_job", "active_financials", "active_listing", "active_generated_document_ids"}
+    SYNC.preserve_active_financials(listing)
+    internal = {key: deepcopy((listing.source_snapshot or {})[key]) for key in protected if key in (listing.source_snapshot or {})}
     for key in _LISTING_FIELDS:
         if key in data:
             value = data[key]
@@ -430,6 +433,8 @@ def _apply(listing: CpListing, payload: S.ListingIn) -> None:
                 if products and not any(item.get("primary") for item in products):
                     products[0]["primary"] = True
                 value = products
+            if key == "source_snapshot":
+                value = {**{k: v for k, v in (value or {}).items() if k not in protected}, **internal}
             setattr(listing, key, value)
 
     if listing.profile_id is None:
@@ -471,6 +476,7 @@ async def _apply_file_financing(db: AsyncSession, listing: CpListing, *, prior: 
         if payload.expected_source_fingerprint is not None and payload.expected_source_fingerprint != source_fingerprint(fresh):
             raise HTTPException(409, "The file or financing changed after this draft was prepared. Draft again before applying it.")
     await _guard_financing_change(db, prior or listing, fresh)
+    SYNC.preserve_active_financials(listing)
     SYNC.apply_canonical_financing(listing, fresh)
     listing.source_snapshot = {**(listing.source_snapshot or {}), **fresh}
     if payload is not None and payload.ai_draft_id:
@@ -605,13 +611,14 @@ async def refresh_listing_snapshot(listing_id: uuid.UUID, admin: CpAdmin, db: Db
         raise HTTPException(status.HTTP_404_NOT_FOUND, "The file behind this listing was not found.")
     fresh = await P.readiness_snapshot(db, profile)
     await _guard_financing_change(db, listing, fresh)
+    SYNC.preserve_active_financials(listing)
     SYNC.apply_canonical_financing(listing, fresh)
     refreshed_at = datetime.now(UTC).isoformat()
     listing.source_snapshot = {**(listing.source_snapshot or {}), **fresh, "refreshed_at": refreshed_at}
     # The figures, the plan, the terms and the programs just went onto the
     # listing: stamp them so the file page knows they are current.
     current, _sections, _cockpit = await SYNC.current_fingerprints(db, profile)
-    SYNC.mark_published(listing, current, by=admin.id, keys=["figures", "plan", "terms", "collateral", "deal_budget", "programs"])
+    SYNC.mark_published(listing, current, by=admin.id, keys=["figures", "plan", "terms", "collateral", "deal_budget", "programs", "operating_projection"])
     financials = fresh.get("financials") or {}
     await L.log_event(
         db,
@@ -627,6 +634,24 @@ async def refresh_listing_snapshot(listing_id: uuid.UUID, admin: CpAdmin, db: Db
     )
     await db.commit()
     return await _listing_admin_out(db, listing)
+
+
+@router.get("/listings/{listing_id}/refresh", response_model=S.ListingRefreshOut)
+async def listing_refresh_status(listing_id: uuid.UUID, admin: CpAdmin, db: Db):
+    from .services import refresh
+
+    return await refresh.read_state(db, await _load_admin_listing(db, listing_id))
+
+
+@router.post("/listings/{listing_id}/refresh", response_model=S.ListingRefreshOut, status_code=202)
+async def request_listing_refresh(listing_id: uuid.UUID, admin: CpAdmin, db: Db, payload: S.ListingRefreshIn | None = None):
+    from .services import refresh
+
+    listing = await _load_admin_listing(db, listing_id)
+    result = await refresh.request(db, listing, actor_id=admin.id,
+        idempotency_key=payload.idempotency_key if payload else None)
+    await db.commit()
+    return result
 
 
 @router.post("/listings/{listing_id}/publish-package", response_model=S.ListingAdminOut)
@@ -674,6 +699,7 @@ async def publish_listing_package(listing_id: uuid.UUID, admin: CpAdmin, db: Db)
         artifacts.append((presentation, E.DocumentKind.INVESTOR_PRESENTATION, "Investor presentation"))
     fresh = await P.readiness_snapshot(db, profile)
     await _guard_financing_change(db, listing, fresh)
+    SYNC.preserve_active_financials(listing)
     if not storage.configured():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Document storage is not available right now.")
     now = datetime.now(UTC)

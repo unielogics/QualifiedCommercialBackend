@@ -277,3 +277,6 @@ async def after_publication(db: AsyncSession, profile: ApplicationProfile, *, fa
     from app.services import file_events
 
     await file_events.emit(db, profile=profile, kind="document.received" if submit else "financial_form.version_saved", visibility=file_events.VISIBILITY_CLIENT if submit else file_events.VISIBILITY_DESK, title=f"{family.label} v{version.version_number} {'filed' if submit else 'saved'}", actor=actor, target_type="financial_version", target_id=version.id, meta={"kind": family.kind, "family_id": str(family.id), "version_number": version.version_number, "file_id": str(file.id), "submitted": submit})
+    from app.capital_partners.services.refresh import after_saved_source
+
+    await after_saved_source(db, profile.id, actor_id=getattr(actor, "id", None), reason="financial_version")

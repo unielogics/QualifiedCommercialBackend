@@ -2505,6 +2505,9 @@ async def generate_package_readiness_documents(
             )
         raise
 
+    from app.capital_partners.services.refresh import after_package_generated
+
+    await after_package_generated(db, intake_id, actor_id=user.id)
     return response
 
 @core.admin_router.get("/{intake_id}/package.zip")

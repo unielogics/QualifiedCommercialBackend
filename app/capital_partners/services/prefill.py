@@ -243,6 +243,7 @@ async def readiness_snapshot(db: AsyncSession, profile: ApplicationProfile) -> d
         )
     cockpit = await financial_cockpit.load_cockpit(db, profile)
     coverage = cockpit["coverage"]
+    operating_projection = await SYNC._operating_projection(db, profile, cockpit)
     package = (
         await db.execute(
             select(ProductionPackage)
@@ -252,7 +253,7 @@ async def readiness_snapshot(db: AsyncSession, profile: ApplicationProfile) -> d
         )
     ).scalar_one_or_none()
     return {
-        "file_fingerprints": SYNC.fingerprints(SYNC.file_sections(cockpit, program_keys=[selection.program_key for selection in selections], package=None)),
+        "file_fingerprints": SYNC.fingerprints(SYNC.file_sections(cockpit, program_keys=[selection.program_key for selection in selections], package=None, operating_projection=operating_projection)),
         "readiness": {
             "programs": program_rows,
             "bank_months": coverage["bank_months"],
@@ -265,6 +266,7 @@ async def readiness_snapshot(db: AsyncSession, profile: ApplicationProfile) -> d
             "files_accepted": coverage["files_accepted"],
         },
         "financials": {**financial_cockpit.listing_summary(cockpit), "operating_earnings": operating_earnings_brief(cockpit),
+            **({"operating_projection": operating_projection} if operating_projection is not None else {}),
             "document_summaries": safe_document_summaries(cockpit),
             "proposed_terms": SYNC.proposed_terms(cockpit), "collateral": cockpit.get("collateral"),
             "deal_budget": deal_budget.reporting(profile, SYNC.proposed_terms(cockpit))},

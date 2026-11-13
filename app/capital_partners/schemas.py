@@ -860,6 +860,27 @@ class PublishIn(BaseModel):
     expected_ppm_source_fingerprint: str | None = Field(default=None, min_length=1, max_length=128)
 
 
+class ListingRefreshIn(BaseModel):
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=160)
+
+
+class ListingRefreshOut(BaseModel):
+    listing_id: UUID
+    job_id: UUID | None = None
+    status: Literal["idle", "queued", "running", "succeeded", "failed", "blocked"]
+    source_fingerprint: str | None = None
+    requested_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    error_code: str | None = None
+    message: str | None = None
+    figures_updated: bool = False
+    documents_updated: bool = False
+    ppm_updated: bool = False
+    review_required: bool = False
+    publication_required: bool = False
+
+
 class StatusIn(BaseModel):
     status: Literal["open", "closing", "fully_subscribed", "funded", "repaid", "workout"]
     outcome: Literal["performing", "repaid_in_full", "repaid_after_extension", "in_workout"] | None = None

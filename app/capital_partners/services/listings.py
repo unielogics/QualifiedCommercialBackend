@@ -12,6 +12,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import func, select
@@ -141,6 +142,18 @@ def card(listing: CpListing, committed: Decimal, *, now: datetime | None = None)
         **listing_dates(listing),
         "published_at": listing.published_at,
     }
+
+
+def member_view(listing):
+    snapshot = listing.source_snapshot or {}
+    active = snapshot.get("active_listing")
+    if not getattr(listing, "published_at", None) or not isinstance(active, dict):
+        return listing
+    view = SimpleNamespace(**vars(listing))
+    for key, value in active.items():
+        setattr(view, key, deepcopy(value))
+    view.source_snapshot = {**snapshot, "financials": snapshot.get("active_financials") or {}}
+    return view
 
 
 def project_product_payments(product: dict[str, Any]) -> dict[str, Any]:
@@ -298,13 +311,26 @@ def partner_financials(listing: CpListing) -> dict[str, Any] | None:
     plan beside it (what changes, the coverage before and after). None for a
     listing that was not cut from a file."""
     snapshot = listing.source_snapshot if isinstance(listing.source_snapshot, dict) else {}
-    financials = snapshot.get("financials")
+    candidate = snapshot.get("financials")
+    financials = snapshot.get("active_financials") if getattr(listing, "published_at", None) and isinstance(snapshot.get("active_financials"), dict) else candidate
     if not isinstance(financials, dict):
         return None
     out: dict[str, Any] = {k: financials.get(k) for k in PARTNER_FINANCIAL_KEYS if financials.get(k) is not None}
     earnings = partner_operating_earnings(financials.get("operating_earnings"))
     if earnings is not None:
         out["operating_earnings"] = earnings
+    if isinstance(financials.get("operating_projection"), dict):
+        from .operating_projection import public
+
+        out["operating_projection"] = public(financials["operating_projection"])
+    from .sync import publication_changed
+
+    pending = isinstance(candidate, dict) and publication_changed(listing)
+    if pending:
+        from .operating_projection import public
+
+        out["financial_update_pending"] = True
+        out["pending_operating_projection"] = public(candidate.get("operating_projection"))
     if "document_summaries" in financials:
         from .document_catalog import safe_document_summaries
 
@@ -427,9 +453,13 @@ def document_out(doc: CpListingDocument) -> dict[str, Any]:
 
 def ready_documents(listing: CpListing) -> list[CpListingDocument]:
     access = getattr(listing, "_ppm_access", {})
+    from .package_documents import GENERATED_KINDS
+
+    active = (listing.source_snapshot or {}).get("active_generated_document_ids")
     return [d for d in listing.documents if d.status == E.DocumentStatus.READY and (
         d.kind != E.DocumentKind.PPM or not access.get("publication_bound") or (
-            access.get("current") and str(d.id) == access.get("document_id")))]
+            access.get("current") and str(d.id) == access.get("document_id")))
+        and (d.kind not in GENERATED_KINDS or not isinstance(active, list) or str(d.id) in active)]
 
 
 def publish_issues(listing: CpListing) -> list[dict[str, str]]:
@@ -565,6 +595,7 @@ async def market(db: AsyncSession, f: MarketFilters) -> dict[str, Any]:
             .order_by(CpListing.published_at.desc().nullslast())
         )
     ).scalars().all()
+    rows = [member_view(row) for row in rows]
     committed = await committed_amounts(db, [r.id for r in rows])
     base = [r for r in rows if f.vertical == "all" or r.vertical == f.vertical]
     now = now_utc()
@@ -707,8 +738,9 @@ async def create_subscription(
     if entity_id is not None and not any(e.id == entity_id for e in member.entities):
         raise RuleError("entity_not_yours", "That investing entity does not belong to this membership.")
     committed = (await committed_amounts(db, [listing.id])).get(listing.id, ZERO)
-    remaining = remaining_amount(listing, committed)
-    minimum = _d(listing.minimum_investment)
+    economic_view = member_view(listing)
+    remaining = remaining_amount(economic_view, committed)
+    minimum = _d(economic_view.minimum_investment)
     if amount < minimum:
         raise RuleError("below_minimum", f"The minimum subscription is {minimum:,.2f}.")
     if amount > remaining:
@@ -870,6 +902,15 @@ async def publish(db: AsyncSession, listing: CpListing, *, actor_user_id: uuid.U
         listing.publish_reason = reason
         listing.opens_at = listing.opens_at or now
     await record_publication(db, listing, actor_user_id)
+    from .sync import publication_view
+
+    listing.source_snapshot = {**(listing.source_snapshot or {}), **publication_view(listing)}
+    from .package_documents import GENERATED_KINDS
+
+    selected = listing.source_snapshot["active_generated_document_ids"]
+    for document in listing.documents:
+        if document.kind in GENERATED_KINDS and document.status == E.DocumentStatus.READY and str(document.id) not in selected:
+            document.status, document.superseded_at = E.DocumentStatus.SUPERSEDED, now
     await log_event(db, listing.id, "listing.publication_updated" if updating else "listing.published", actor_user_id=actor_user_id, detail={"reason": reason})
 
 
