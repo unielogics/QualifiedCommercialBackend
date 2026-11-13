@@ -25,7 +25,8 @@ WORKING_FIELDS = ("basis", "noi", "noi_delta", "goal_gap", "earnings", "earnings
                   "first_year_dscr_current_debt_delta", "loan_cash_change_monthly", "loan_cash_change_annual",
                   "combined_cash_change_monthly", "combined_cash_change_annual", "cash_after_debt_basis", "cash_after_debt_mode",
                   "cash_after_debt_before_annual", "cash_after_debt_after_annual", "cash_after_debt_delta_annual",
-                  "cash_after_debt_before_monthly", "cash_after_debt_after_monthly", "cash_after_debt_delta_monthly")
+                  "cash_after_debt_before_monthly", "cash_after_debt_after_monthly", "cash_after_debt_delta_monthly",
+                  "dscr_with_refinance_after", "dscr_with_refinance_delta", "refinance_annual_debt_service", "refinance_coverage_basis")
 
 
 def _d(value):
@@ -221,6 +222,18 @@ def evaluate(raw, cockpit, evaluation, *, source_file_ids=None, now=None):
     cash_loan_delta = loan_cash * 12 if loan_cash is not None else None if saved_loan else Decimal(0)
     cash_level_delta = working_cash_delta + cash_loan_delta if working_cash_delta is not None and cash_loan_delta is not None and cash_before is not None else None
     cash_after = cash_before + cash_level_delta if cash_level_delta is not None else None
+    loan_evaluation = (cockpit.get("plan") or {}).get("evaluation") or {}
+    refinance_debt = _d(loan_evaluation.get("debt_service_after_annual"))
+    loan_operating = _d(loan_evaluation.get("annual_new_operating_expenses"))
+    refinance_ready = bool(saved_loan and cash_bridge.get("available") and cash_bridge.get("loan_status") == "calculated"
+                           and not loan_evaluation.get("coverage_unavailable_reason") and debt_currency_ok
+                           and loan_operating is not None and loan_operating >= 0
+                           and refinance_debt is not None and refinance_debt >= 0)
+    # Coverage uses the canonical annual stress/coverage window, not twelve
+    # regular payments. Financing fees already in that denominator stay there;
+    # only separately classified operating charges reduce earnings once.
+    refinance_ratio = ((working_earnings - loan_operating) / refinance_debt
+                       if refinance_ready and working_earnings is not None and refinance_debt > 0 else None)
     working = {"basis": "after_setup_before_timing" if setup_known else BASIS,
         "noi": _money(working_noi), "noi_delta": _money(working_noi_delta),
         "goal_gap": _money(max(Decimal(0), target - working_noi)) if target is not None and working_noi is not None else None,
@@ -242,6 +255,10 @@ def evaluate(raw, cockpit, evaluation, *, source_file_ids=None, now=None):
         "cash_after_debt_before_monthly": _money(cash_before / 12) if cash_before is not None else None,
         "cash_after_debt_after_monthly": _money(cash_after / 12) if cash_after is not None else None,
         "cash_after_debt_delta_monthly": _money(cash_level_delta / 12) if cash_level_delta is not None else None}
+    working.update(dscr_with_refinance_after=_ratio(refinance_ratio),
+                   dscr_with_refinance_delta=_ratio(refinance_ratio - before_ratio) if refinance_ratio is not None and before_ratio is not None else None,
+                   refinance_annual_debt_service=_money(refinance_debt) if refinance_ready else None,
+                   refinance_coverage_basis="saved_coverage_window_after_new_operating_charges")
     missing = _unique(path for row in rows for path in [*row["math_missing"], *row["fix_fields"]])
     if not noi_ok or current_noi is None:
         missing.append("noi_source_comparability")
