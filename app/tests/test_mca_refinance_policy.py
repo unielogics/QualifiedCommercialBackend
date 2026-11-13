@@ -11,7 +11,7 @@ from starlette.requests import Request
 from app.routers import dealer_ai_intake as routes
 from app.services import bucket_ai
 from app.services import mca_refinance_policy as policy
-from app.tests._business_profile_fixture import BUSINESS_PROFILE
+from app.tests._business_profile_fixture import APPLICATION_START_DETAILS, BUSINESS_PROFILE
 
 
 def make_intake(count=2, amount=350_000, term=120, *, details=None, typed=None):
@@ -197,7 +197,7 @@ async def test_start_saves_out_of_scope_application_instead_of_rejecting_it():
 
     db = Mock(commit=AsyncMock(), flush=AsyncMock())
     payload = routes.McaRefiStart(**BUSINESS_PROFILE, full_name="Test Owner", email="owner@example.com", phone="+12025550123", active_mca_count=3,
-                                  requested_amount=450_000, terms_accepted=True, privacy_accepted=True)
+                                  requested_amount=450_000, terms_accepted=True, privacy_accepted=True, **APPLICATION_START_DETAILS)
     with patch.object(routes, "PublicUnderwritingIntake", side_effect=construct), patch.object(routes, "_throttle_or_429"), patch.object(routes, "_latest_active_intake_by_email", AsyncMock(return_value=None)), patch.object(routes, "_find_or_create_mca_client", AsyncMock(return_value=client)), patch.object(routes, "_create_bucket_for_mca_refi", AsyncMock(return_value=(bucket, SimpleNamespace(id=uuid4())))), patch.object(routes, "_load_public_intake", side_effect=load), patch.object(routes, "_record_resume_email", AsyncMock()), patch.object(routes, "_response", AsyncMock(return_value="saved")), patch.object(routes.profiles_service, "provision_profile_for_intake", AsyncMock()):
         result = await routes.start_mca_refinance(payload, request(), db)
     assert result == "saved"

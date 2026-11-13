@@ -16,7 +16,7 @@ from app.routers import buckets
 from app.routers import dealer_ai_intake as core
 from app.routers.dealer_ai_intake_routes import client, funding_review, mca_refinance, public_intake
 from app.schemas.bucket import BucketFileUploadInit
-from app.tests._business_profile_fixture import BUSINESS_PROFILE
+from app.tests._business_profile_fixture import APPLICATION_START_DETAILS, BUSINESS_PROFILE
 
 NOW = datetime.now(UTC)
 PIN = "729518"
@@ -76,7 +76,7 @@ async def test_public_starts_store_client_choice_before_commit_without_recording
             created.append(row)
 
     db = SimpleNamespace(add=add, flush=AsyncMock(), commit=AsyncMock(side_effect=lambda: checkpoints.append(room.passcode_set_by_client_at)))
-    payload = model(**BUSINESS_PROFILE, full_name="Example Owner", email=owner.email, phone="2025550123", secure_room_pin=PIN,
+    payload = model(**BUSINESS_PROFILE, **APPLICATION_START_DETAILS, full_name="Example Owner", email=owner.email, phone="2025550123", secure_room_pin=PIN,
         terms_accepted=True, privacy_accepted=True)
     with ExitStack() as stack:
         for name in ("_find_or_create_client", "_find_or_create_funding_client", "_find_or_create_mca_client"):

@@ -14,11 +14,12 @@ from app.routers import application_profiles as rooms
 from app.routers import dealer_ai_intake as core
 from app.routers import mca_leads
 from app.services import mca_public_intake as service
+from app.tests._business_profile_fixture import APPLICATION_START_DETAILS, BUSINESS_PROFILE
 from app.tests.test_mca_leads import request_body
 
 
 def body(**changes):
-    return {**request_body(), "secure_room_pin": "627493", "terms_accepted": True, "privacy_accepted": True,
+    return {**request_body(), **BUSINESS_PROFILE, **APPLICATION_START_DETAILS, "secure_room_pin": "627493", "terms_accepted": True, "privacy_accepted": True,
             "consent_version": "mca-ai-intake-v3", **changes}
 
 
