@@ -29,7 +29,8 @@ def _intake(state=None):
     return SimpleNamespace(intake_state=state or {}, id="intake-1")
 
 
-_EMPTY_DETAILS = {"business_phone": None, "employee_count": None, "street": None, "city": None, "state": None, "zip": None, "industry": None}
+_EMPTY_ADDRESS = {"street": None, "city": None, "state": None, "zip": None, "industry": None}
+_EMPTY_DETAILS = {**_EMPTY_ADDRESS, "business_phone": None, "employee_count": None}
 
 
 # --- the website --------------------------------------------------------------------------------
@@ -157,7 +158,7 @@ def test_the_ai_is_told_what_the_client_said_in_every_variant() -> None:
         assert '"business_profile": _business_profile(intake) or None' in inspect.getsource(builder), builder.__name__
 
     asked = _intake({"business_profile": {"website": None, "website_none": True, "description": "We run two coffee shops."}})
-    assert core._business_profile(asked) == {"website": None, "has_no_website": True, "description": "We run two coffee shops.", **_EMPTY_DETAILS}
+    assert core._business_profile(asked) == {"website": None, "has_no_website": True, "description": "We run two coffee shops.", **_EMPTY_ADDRESS}
     assert core._business_profile(_intake()) == {}
 
 
