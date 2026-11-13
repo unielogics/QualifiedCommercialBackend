@@ -32,6 +32,18 @@
   [
     "admin_router",
     "GET",
+    "/admin/ai-underwriter-leads/{intake_id}/artifacts",
+    "get_package_artifacts"
+  ],
+  [
+    "admin_router",
+    "GET",
+    "/admin/ai-underwriter-leads/{intake_id}/artifacts/{artifact_id}/url",
+    "get_package_artifact_url"
+  ],
+  [
+    "admin_router",
+    "GET",
     "/admin/ai-underwriter-leads/{intake_id}/client-thread",
     "get_dealer_ai_client_thread"
   ],

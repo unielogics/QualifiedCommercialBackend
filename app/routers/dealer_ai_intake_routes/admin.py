@@ -37,6 +37,8 @@ __all__ = [
     "update_intake_notification_routing",
     "admin_dealer_channel_inbox",
     "get_dealer_ai_lead",
+    "get_package_artifacts",
+    "get_package_artifact_url",
     "admin_request_lead_deletion",
     "admin_cancel_lead_deletion",
     "admin_restore_lead",
