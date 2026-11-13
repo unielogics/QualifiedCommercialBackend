@@ -308,7 +308,7 @@ def test_partial_plan_exposes_known_subtotal_but_no_complete_projection_total():
     assert result["disclosure"]["cost_mix"][0]["annual_amount"] == 0
 
 
-@pytest.mark.parametrize("category", ["loan_payments", "income_taxes", "owner_draws", "transfers", "depreciation_amortization"])
+@pytest.mark.parametrize("category", ["loan_payments", "income_taxes", "owner_draws", "transfers"])
 def test_nonoperating_and_noncash_changes_do_not_improve_operating_earnings(category):
     result = plan.evaluate(body(expenses=[expense(category=category)]), context(), now=NOW)
     assert not result["totals"]["proposed"]["complete"]

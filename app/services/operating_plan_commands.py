@@ -12,7 +12,7 @@ from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from app.schemas.earnings_improvement import cost_amount
 
 FACTORS = {"weekly": 52, "biweekly": 26, "semi_monthly": 24, "monthly": 12, "quarterly": 4, "annual": 1}
-OUTSIDE = {"loan_payments", "income_taxes", "owner_draws", "transfers", "depreciation_amortization"}
+OUTSIDE = {"loan_payments", "income_taxes", "owner_draws", "transfers"}
 CENT = Decimal(".01")
 ZERO = Decimal(0)
 

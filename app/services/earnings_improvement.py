@@ -149,8 +149,26 @@ def review_stamp(action, cockpit, linked_expense=None, body=None):
     context = _context_values(cockpit)
     for key in ("financing", "legacy_adjustments", "legacy_overrides"):
         context.pop(key, None)
+    if _noncash_review(action, linked_expense):
+        context["noncash_basis"] = {"noi_definition": (cockpit.get("noi") or {}).get("definition"),
+                                   "noi_kind": ((cockpit.get("noi") or {}).get("headline") or {}).get("kind"),
+                                   "earnings_kind": ((cockpit.get("ebitda") or {}).get("headline") or {}).get("kind")}
     return _stamp({"review_schema": "operating-evidence-v3", "proposal": proposal_stamp(action, linked_expense, body), "context": _stamp(context),
                    "treatment": action.get("baseline_treatment"), "reconciliation": action.get("baseline_reconciliation_note")})
+
+
+def _noncash_review(action, linked_expense):
+    return ((linked_expense or {}).get("category") in NON_CASH
+            or action.get("kind") == "expense_group_change" and action.get("expense_category") in NON_CASH)
+
+
+def _valid_review_stamps(action, cockpit, linked_expense, body):
+    current = {review_stamp(action, cockpit, linked_expense, body)}
+    if _noncash_review(action, linked_expense):
+        return current
+    return current | {_prior_v2_review_stamp(action, cockpit, linked_expense, body),
+                      _legacy_review_stamp(action, cockpit, linked_expense, body),
+                      _legacy_review_stamp(action, cockpit, linked_expense, body, before_guidance=True)}
 
 
 def _prior_v2_review_stamp(action, cockpit, linked_expense=None, body=None):
@@ -332,8 +350,15 @@ def _impact(action, body, expenses, cockpit, allowed_files, now, command_result=
     linked = expenses.get(action.get("expense_row_id"))
     if linked and linked["excluded"]:
         issues.append("The linked expense is excluded or marked duplicate; restore or relink it before using this action.")
-    if linked and linked["category"] in NON_OPERATING | NON_CASH:
-        issues.append("Debt principal, financing interest, income tax, distributions, transfers and noncash D&A are not operating earnings improvements.")
+    from app.services.operating_metric_effects import effects, noncash_da
+
+    noncash = noncash_da(action, expenses)
+    if linked and linked["category"] in NON_OPERATING:
+        issues.append("Debt principal, financing interest, income tax, distributions and transfers are not operating earnings improvements.")
+    if noncash and action["kind"] not in {"expense_reduction", "expense_increase", "expense_group_change"}:
+        issues.append("Use an ordinary D&A cost proposal; noncash depreciation does not establish sales growth, processing savings or cash income.")
+    if noncash and action["cadence"] == "one_time":
+        issues.append("Use a recurring reporting period for D&A cost proposals; a one-time accounting adjustment is not recurring operating improvement.")
     if any(str(file_id) not in allowed_files for file_id in action["source_file_ids"]):
         issues.append("A linked source is unavailable to this business file or no longer current.")
     if not action["source_file_ids"]:
@@ -453,6 +478,10 @@ def _impact(action, body, expenses, cockpit, allowed_files, now, command_result=
     horizon = date.fromisoformat(body["projection_start"]) if body.get("projection_start") else now.date()
     effective = date.fromisoformat(action["effective_date"]) if action.get("effective_date") else None
     fraction = _active_days(effective, horizon) if effective else None
+    metric_effects = effects(cockpit, recurring, implementation, recurring_cost, one_time_cost, fraction, action=action, body=body) if noncash else {}
+    if noncash:
+        recurring = metric_effects["earnings_gross_annual_impact"]
+        risks.append("A depreciation/amortization proposal changes accounting NOI only where that expense is included in its source. It does not release cash or improve EBITDA before actual implementation costs; tax treatment remains subject to preparer review.")
     net_annual = recurring - recurring_cost if recurring is not None and implementation is not None else None
     first_year = (net_annual * fraction + one_time_benefit - one_time_cost if fraction and net_annual is not None else 0 if fraction == 0 and net_annual is not None else None)
     if effective and effective < horizon:
@@ -460,7 +489,7 @@ def _impact(action, body, expenses, cockpit, allowed_files, now, command_result=
     if one_time_benefit:
         risks.append("One-time effects are shown in the first-year illustration and are not multiplied into recurring annual coverage.")
     return {"id": action["id"], "label": action["label"], "kind": kind, "status": action["status"],
-        "review_state": action["status"], "gross_annual_impact": _money(recurring),
+        "review_state": action["status"], "gross_annual_impact": _money(recurring), **metric_effects,
         "implementation_recurring_annual": _money(recurring_cost), "implementation_one_time": _money(one_time_cost),
         "net_annual_impact": _money(net_annual), "first_year_impact": _money(first_year),
         "monthly_impact": _money(net_annual / 12) if net_annual is not None else None,
@@ -692,11 +721,7 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
             result["approval_issues"] = list(dict.fromkeys(own_issues))
             if action["status"] == "approved":
                 fresh = bool(action["reviewed_by_user_id"] and action["reviewed_at"] and action["review_reason"]
-                             and action["review_source_stamp"] in {
-                                 review_stamp(intent, cockpit, expenses.get(action.get("expense_row_id")), original),
-                                 _prior_v2_review_stamp(intent, cockpit, expenses.get(action.get("expense_row_id")), original),
-                                 _legacy_review_stamp(intent, cockpit, expenses.get(action.get("expense_row_id")), original),
-                                 _legacy_review_stamp(intent, cockpit, expenses.get(action.get("expense_row_id")), original, before_guidance=True)})
+                             and action["review_source_stamp"] in _valid_review_stamps(intent, cockpit, expenses.get(action.get("expense_row_id")), original))
                 if not fresh:
                     result["review_state"] = "stale"
                     result["risk_flags"].append("The proposal, linked expense or financial evidence changed. Staff must review the action again.")
@@ -737,6 +762,19 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
             # zero savings figure. Known rows remain an explicitly named subtotal.
             for field in ("annual_impact", "monthly_impact", "first_year_impact", "one_time_cost"):
                 total[field] = None
+        # Empty legacy plans retain their exact prior result shape. Noncash
+        # accounting changes need independent completeness for each metric.
+        if any(row.get("effect_type") == "noncash_da" for row in results):
+            from app.services.operating_metric_effects import metric_value
+
+            selected = proposed_rows if key == "proposed" else approved_rows
+            for metric in ("noi", "cash"):
+                annuals = [metric_value(row, metric, "net_annual") for row in selected]
+                firsts = [metric_value(row, metric, "first_year") for row in selected]
+                metric_complete = bool(selected) and len(selected) == expected and all(value is not None for value in [*annuals, *firsts])
+                total[metric + "_complete"] = metric_complete
+                total[metric + "_annual_impact"] = _money(sum(annuals)) if metric_complete else None
+                total[metric + "_first_year_impact"] = _money(sum(firsts)) if metric_complete else None
     earnings = (cockpit.get("ebitda") or {}).get("headline") or {}
     potential = (cockpit.get("ebitda") or {}).get("potential") or {}
     source_baseline = potential.get("baseline") or {}
@@ -752,6 +790,7 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
     annual_earnings = number(earnings.get("annualized_value"))
     annual_noi = number(noi.get("annualized_value"))
     comparable, noi_comparable, reviewed_noi = comparison_scope(body, cockpit)
+    debt_currency_ok = debt.get("currency") in {None, "USD"} and debt.get("currency_basis") != "conflicting_accepted_schedule"
     baseline = {"period": earnings.get("period"), "currency": earnings.get("currency"), "plan_currency": body["currency"], "basis": earnings.get("basis"),
         "revenue": source_baseline.get("revenue"), "earnings": annual_earnings, "earnings_kind": earnings.get("kind"),
         "noi": annual_noi, "noi_kind": noi.get("kind"), "noi_label": noi.get("label"),
@@ -760,6 +799,11 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
         "dscr": ((cockpit.get("dscr") or {}).get("headline") or {}).get("value"),
         "annual_debt_service": current_service, "provisional": bool(earnings.get("provisional", True)),
         "noi_provisional": bool(noi.get("provisional", True))}
+    if any(row.get("effect_type") == "noncash_da" for row in results):
+        baseline["noi_includes_da"] = (cockpit.get("noi", {}).get("definition") or {}).get("includes_depreciation_and_amortization")
+    if not debt_currency_ok:
+        baseline.update(dscr=None, debt_service_currency=debt.get("currency"),
+                        dscr_unavailable_reason="Reconcile the earnings and accepted debt-service currencies before calculating coverage; no currency conversion is assumed.")
     ratio = number(baseline["dscr"])
     recommended = annual_earnings < 0 if annual_earnings is not None and annual_earnings < 0 else ratio < 1.1 if ratio is not None else None
     recommendation = {"threshold": 1.1, "recommended": recommended,
@@ -768,7 +812,7 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
 
     def projection(total, reviewed):
         available = comparable and annual_earnings is not None and total["complete"]
-        noi_available = noi_comparable and annual_noi is not None and total["complete"]
+        noi_available = noi_comparable and annual_noi is not None and total.get("noi_complete", total["complete"])
         after = annual_earnings + total["annual_impact"] if available else None
         first_year = annual_earnings + total["first_year_impact"] if available else None
         coverage_rows = approved_rows if reviewed else proposed_rows
@@ -778,24 +822,24 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
         new_operating = number(evaluation.get("annual_new_operating_expenses", 0))
         refinance_after = after - new_operating if after is not None and new_operating is not None else None
         refinance_first_year = first_year_coverage - new_operating if first_year_coverage is not None and new_operating is not None else None
-        after_noi = annual_noi + total["annual_impact"] if noi_available else None
-        first_year_noi = annual_noi + total["first_year_impact"] if noi_available else None
+        after_noi = annual_noi + total.get("noi_annual_impact", total["annual_impact"]) if noi_available else None
+        first_year_noi = annual_noi + total.get("noi_first_year_impact", total["first_year_impact"]) if noi_available else None
         return {"status": "awaiting_review" if reviewed and total["count"] == 0 else "no_actions" if not reviewed and not active else "reviewed_illustration" if reviewed and available else "unreviewed_illustration" if available else "unavailable",
             "earnings": _money(after), "noi": _money(after_noi),
             "noi_status": "awaiting_review" if reviewed and total["count"] == 0 else "no_actions" if not reviewed and not active else "reviewed_illustration" if reviewed and noi_available else "unreviewed_illustration" if noi_available else "unavailable",
             "first_year_noi": _money(first_year_noi),
             "first_year_earnings": _money(first_year),
             "first_year_coverage_impact": _money(coverage_impact), "first_year_coverage_earnings": _money(first_year_coverage),
-            "first_year_dscr_current": round(first_year_coverage / current_service, 2) if first_year_coverage is not None and current_service is not None and current_service > 0 else None,
-            "first_year_dscr_with_refinance": round(refinance_first_year / after_service, 2) if refinance_first_year is not None and after_service is not None and after_service > 0 else None,
+            "first_year_dscr_current": round(first_year_coverage / current_service, 2) if debt_currency_ok and first_year_coverage is not None and current_service is not None and current_service > 0 else None,
+            "first_year_dscr_with_refinance": round(refinance_first_year / after_service, 2) if debt_currency_ok and refinance_first_year is not None and after_service is not None and after_service > 0 else None,
             "first_year_earnings_with_refinance": _money(refinance_first_year),
             "annual_new_operating_expenses": new_operating,
             "coverage_basis": "Stabilized run-rate coverage uses annual impact; first-year coverage uses effective-date proration and implementation costs against the selected annual debt-service window. One-time benefits do not increase recurring debt-service coverage.",
-            "dscr_current": round(after / current_service, 2) if after is not None and current_service is not None and current_service > 0 else None,
-            "dscr_with_refinance": round(refinance_after / after_service, 2) if refinance_after is not None and after_service is not None and after_service > 0 else None,
+            "dscr_current": round(after / current_service, 2) if debt_currency_ok and after is not None and current_service is not None and current_service > 0 else None,
+            "dscr_with_refinance": round(refinance_after / after_service, 2) if debt_currency_ok and refinance_after is not None and after_service is not None and after_service > 0 else None,
             "annual_debt_service": current_service, "refinance_annual_debt_service": after_service,
-            "target_gap_current": _money(max(0, current_service * 1.25 - after)) if after is not None and current_service is not None and current_service > 0 else None,
-            "target_gap_refinance": _money(max(0, after_service * 1.25 - refinance_after)) if refinance_after is not None and after_service is not None and after_service > 0 else None}
+            "target_gap_current": _money(max(0, current_service * 1.25 - after)) if debt_currency_ok and after is not None and current_service is not None and current_service > 0 else None,
+            "target_gap_refinance": _money(max(0, after_service * 1.25 - refinance_after)) if debt_currency_ok and refinance_after is not None and after_service is not None and after_service > 0 else None}
 
     missing = []
     if annual_earnings is None:
@@ -806,6 +850,8 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
         missing.append("Reconcile the NOI business, currency and accounting basis with this operating plan before showing projected NOI. The current NOI keeps its own reporting basis.")
     if current_service is None:
         missing.append("Current annual debt service is not established.")
+    if not debt_currency_ok:
+        missing.append(baseline["dscr_unavailable_reason"])
     if not comparable:
         missing.append("Reconcile the disclosure and current earnings business, currency, accounting basis and period before relying on projected coverage.")
     risks = []
@@ -837,8 +883,8 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
         "released_cash_flow": released,
         "actions": results, "totals": sums, "baseline": baseline, "recommendation": recommendation,
         "projection": {"proposed": projection(sums["proposed"], False), "approved": projection(sums["approved"], True)},
-        "targets": {"current": [{"ratio": ratio, "earnings_required": _money(current_service * ratio)} for ratio in (1.0, 1.1, 1.25) if current_service is not None and current_service > 0],
-                    "refinance": [{"ratio": ratio, "earnings_required": _money(after_service * ratio)} for ratio in (1.0, 1.1, 1.25) if after_service is not None and after_service > 0]},
+        "targets": {"current": [{"ratio": ratio, "earnings_required": _money(current_service * ratio)} for ratio in (1.0, 1.1, 1.25) if debt_currency_ok and current_service is not None and current_service > 0],
+                    "refinance": [{"ratio": ratio, "earnings_required": _money(after_service * ratio)} for ratio in (1.0, 1.1, 1.25) if debt_currency_ok and after_service is not None and after_service > 0]},
         "missing": missing, "risk_flags": risks,
         "all_actions_reviewed": bool(active) and all(row["review_state"] in {"approved", "rejected", "excluded"} for row in results),
         "notes": ["Historical earnings, NOI and current DSCR remain unchanged. Every improvement is a conditional operating illustration, not lender-approved income or a funding guarantee.",
@@ -850,7 +896,7 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
         result["expense_changes"] = expense_changes(body, results, baseline,
             earnings_comparable=comparable, noi_comparable=noi_comparable,
             refinance_annual_debt_service=after_service, new_operating_annual=number(evaluation.get("annual_new_operating_expenses", 0)),
-            source_groups=result["expense_groups"])
+            source_groups=result["expense_groups"], metric_context=cockpit)
         for key in ("commands", "itemization", "historical_corrections"):
             if resolved[key]:
                 result[key] = resolved[key]

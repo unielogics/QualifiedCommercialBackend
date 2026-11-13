@@ -35,6 +35,15 @@ def coverage_adjustment(context, plan, dscr):
         "proposed_annual_impact": proposed.get("annual_impact") if proposed.get("complete") else None,
         "proposed_dscr": None, "reason": None, "noi_eligible": projection.get("noi") is not None,
         "basis": "First 12 months of net operating improvements, after effective-date proration and implementation costs; compared with the loan's selected annual debt-service stress window."}
+    if any(row.get("effect_type") == "noncash_da" for row in evaluated.get("actions") or []):
+        from app.services.operating_metric_effects import metric_value
+
+        noi_values = [number(metric_value(row, "noi", "first_year")) for row in recurring]
+        noi_ready = bool(context.get("available") and context.get("state") != "client_submitted"
+                         and approved.get("noi_complete") and projection.get("noi") is not None
+                         and noi_values and all(value is not None for value in noi_values))
+        result.update(noi_applied=noi_ready,
+                      applied_noi_annual_impact=round(sum(noi_values), 2) if noi_ready else None)
     if not context.get("available"):
         result["reason"] = "No published operating expenses and earnings plan is available."
         return result
@@ -86,7 +95,7 @@ def finish_evaluation(result, operating, context, dscr):
     projection = (evaluated.get("projection") or {}).get("proposed") or {}
     baseline = number((evaluated.get("baseline") or {}).get("earnings"))
     # This is a client proposal preview, not the primary reviewed projection.
-    if proposed.get("complete") and projection.get("status") == "unreviewed_illustration" and baseline is not None and denominator is not None and denominator > 0:
+    if not (evaluated.get("baseline") or {}).get("dscr_unavailable_reason") and proposed.get("complete") and projection.get("status") == "unreviewed_illustration" and baseline is not None and denominator is not None and denominator > 0:
         proposed_delta = number(projection.get("first_year_coverage_impact"))
         if proposed_delta is not None:
             operating["proposed_dscr"] = round((baseline + proposed_delta - (number(result.get("annual_new_operating_expenses")) or 0)) / denominator, 2)

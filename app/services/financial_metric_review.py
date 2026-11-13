@@ -53,24 +53,32 @@ def _currency(value: Any) -> str | None:
     return reported if re.fullmatch(r"[A-Z]{3}", reported) and reported != "XXX" else None
 
 
-def _currency_comparison(source_refs):
+def _debt_currency(service):
+    # Preserve the established legacy application-USD convention unless an
+    # accepted source now explicitly contradicts it. Conflicts never pick one.
+    return None if service.get("currency_basis") == "conflicting_accepted_schedule" else _currency(service.get("currency")) or "USD"
+
+
+def _currency_comparison(source_refs, denominator_currency="USD"):
     """Describe the existing ratio's denominations; never convert its amounts."""
     reported = sorted({str(ref.get("currency")).strip().upper() for ref in source_refs if ref.get("currency")})
     normalized = [_currency(ref.get("currency")) for ref in source_refs]
     known = {value for value in normalized if value}
-    mismatch = any(value != "USD" for value in known)
-    unknown = not normalized or any(value is None for value in normalized)
+    mismatch = denominator_currency is not None and any(value != denominator_currency for value in known)
+    unknown = denominator_currency is None or not normalized or any(value is None for value in normalized)
     status = "mismatch" if mismatch else "unknown" if unknown else "comparable"
     if mismatch:
-        note = f"Source currency {', '.join(reported)} differs from the USD debt-service denomination. Amounts are retained without currency conversion; coverage is unavailable until their denominations are reconciled."
+        note = f"Source currency {', '.join(reported)} differs from the {denominator_currency} debt-service denomination. Amounts are retained without currency conversion; coverage is unavailable until their denominations are reconciled."
+    elif denominator_currency is None:
+        note = "Debt-service currency is conflicting; reconcile its accepted source before showing coverage. No currency conversion is assumed."
     elif unknown:
-        note = "Source currency is unconfirmed against USD debt service. The existing ratio is shown without currency conversion; confirm currency before relying on it."
+        note = f"Source currency is unconfirmed against {denominator_currency} debt service. The existing ratio is shown without currency conversion; confirm currency before relying on it."
     else:
         note = None
     return {"numerator_currency": next(iter(known)) if len(known) == 1 and not unknown else None,
-            "denominator_currency": "USD", "source_currencies": reported,
+            "denominator_currency": denominator_currency, "source_currencies": reported,
             "currency_comparable": status == "comparable", "currency_status": status, "currency_note": note,
-            "denominator_currency_basis": "Application debt schedules and debt-service figures are denominated in USD; source amounts are not converted."}
+            "denominator_currency_basis": "Application debt schedules and debt-service figures are denominated in USD; source amounts are not converted." if denominator_currency == "USD" else "Accepted debt-schedule denomination; source amounts are not converted."}
 
 
 def _months(start, end):
@@ -322,9 +330,9 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
     if bank.get("estimates_available"):
         for source, annual in (("avg_deposits", "annualized_deposits"), ("avg_withdrawals", "annualized_withdrawals")):
             bank[annual] = round(bank[source] * 12, 2) if bank.get(source) is not None else None
-    operand("debt.monthly", "Published / provisional monthly debt service", service.get("monthly"), source_refs=[{"version_id": service.get("version_id"), "basis": service.get("source"), "currency": "USD"}], period="Monthly", editable=False, editor_action="debt_schedule",
+    operand("debt.monthly", "Published / provisional monthly debt service", service.get("monthly"), source_refs=[{"version_id": service.get("version_id"), "basis": service.get("source"), "currency": _debt_currency(service)}], period="Monthly", editable=False, editor_action="debt_schedule",
             details={"rows": debt_rows or [], "service": dict(service)})
-    operand("debt.annual", "Annual debt service", service.get("annual"), source_refs=[{"version_id": service.get("version_id"), "basis": service.get("source"), "currency": "USD"}], period="Annual", editable=False)
+    operand("debt.annual", "Annual debt service", service.get("annual"), source_refs=[{"version_id": service.get("version_id"), "basis": service.get("source"), "currency": _debt_currency(service)}], period="Annual", editable=False)
     active_inputs = {i["key"]: i for i in inputs}
     stale = [event for key, event in latest.items() if event.get("action") == "correct" and (key not in active_inputs or active_inputs[key]["source_stamp"] != event.get("source_stamp"))]
     eligible = [result for result in results if result["value"] is not None and not result["entity_mismatch"]
@@ -357,9 +365,9 @@ def finish(review, dscr, service, bank):
             formula = "((average monthly bank cash retained + scheduled monthly debt service − identified financing credits monthly equivalent) × 12) / annual debt service"
         candidate["input_keys"] = keys + ["debt.annual"]
         candidate["source_refs"] = earnings["source_refs"] if earnings else next(i["source_refs"] for i in review["inputs"] if i["key"] == "bank.avg_net")
-        comparison = _currency_comparison(candidate["source_refs"])
+        comparison = _currency_comparison(candidate["source_refs"], _debt_currency(service))
         candidate.update(comparison)
-        if comparison["currency_status"] == "mismatch":
+        if comparison["currency_status"] == "mismatch" or comparison["denominator_currency"] is None:
             candidate["source_numerator"] = candidate["numerator"]
             candidate["numerator"] = None
             candidate["value"] = candidate["pro_forma_value"] = None

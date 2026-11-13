@@ -169,10 +169,30 @@ def cash_bridge(body, cockpit, evaluation=None):
         missing.append("released_cash_flow.currency")
     active = [row for row in body.get("adjustments", []) if not row.get("excluded") and row.get("status") != "rejected"]
     totals = (evaluation.get("totals") or {}).get("proposed") or {}
-    recurring = Decimal(0) if not active else _d(totals.get("annual_impact")) if totals.get("complete") else None
-    first_year = Decimal(0) if not active else _d(totals.get("first_year_impact")) if totals.get("complete") else None
+    recurring = Decimal(0) if not active else _d(totals.get("cash_annual_impact", totals.get("annual_impact"))) if totals.get("cash_complete", totals.get("complete")) else None
+    first_year = Decimal(0) if not active else _d(totals.get("cash_first_year_impact", totals.get("first_year_impact"))) if totals.get("cash_complete", totals.get("complete")) else None
     operations = recurring / 12 if recurring is not None else None
     combined = net + operations if available and net is not None and operations is not None else None
+    loan_missing = list(dict.fromkeys(reasons)) if not available else []
+    loan_fix_fields = []
+    if not current["saved"]:
+        loan_fix_fields.append("coverage_plan.saved")
+    if before is None or after is None or (loan.get("ebitda") or {}).get("replacement_payment_missing"):
+        loan_fix_fields.append("coverage_plan.debt_service")
+    if currency != "USD":
+        loan_fix_fields.append("debt_service.currency")
+    if operating is None or financing is None:
+        loan_fix_fields.append("coverage_plan.recurring_charges")
+    principal = loan.get("principal_solution") or {}
+    if principal and (principal.get("status") != "calculated" or principal.get("requires_apply")):
+        loan_fix_fields.append("coverage_plan.principal")
+    if not available and not loan_fix_fields:
+        loan_fix_fields.append("coverage_plan.source_reconciliation")
+    observed_complete = all(value is not None for value in (before, after, operating, financing)) and currency == "USD"
+    loan_status = "not_saved" if not current["saved"] else "calculated" if available else "source_blocked" if observed_complete else "incomplete"
+    operations_missing = [f"adjustments.{row['id']}.qualified_cash_effect" for row in active] if recurring is None else []
+    explicit_window = bool(body.get("projection_start") and all(row.get("effective_date") and row.get("implementation_cost") is not None for row in active))
+    modeled_first_year = first_year if explicit_window or not active else None
     complete = not missing
     return {"status": "stale" if stale else "not_saved" if not current["saved"] else "unavailable" if not available else "not_required" if not required else "complete" if complete else "incomplete",
         "available": available, "required": required, "complete": complete, "stale": stale,
@@ -185,6 +205,21 @@ def cash_bridge(body, cockpit, evaluation=None):
         "net_operations_first_year": _money(first_year), "combined_incremental_monthly": _money(combined),
         "allocated_monthly": _money(allocated), "unallocated_monthly": _money(remaining),
         "linked_allocations": linked, "allocations": linked, "missing": list(dict.fromkeys(missing)),
+        "loan_status": loan_status, "loan_missing": loan_missing, "loan_fix_fields": loan_fix_fields,
+        "before_debt_service_annual": _money(before * 12) if before is not None else None,
+        "after_debt_service_annual": _money(after * 12) if after is not None else None,
+        "gross_loan_relief_annual": _money(gross * 12) if gross is not None else None,
+        "new_operating_charges_annual": _money(operating), "new_financing_fees_annual": _money(financing),
+        "net_loan_cash_change_annual": _money(net * 12) if available and net is not None else None,
+        "recurring_cash_released_annual": _money(capacity * 12) if capacity is not None else None,
+        "allocated_annual": _money(allocated * 12) if allocated is not None else None,
+        "unallocated_annual": _money(remaining * 12) if remaining is not None else None,
+        "operations_status": "no_changes" if not active else "incomplete" if recurring is None else "calculated",
+        "operations_missing": operations_missing,
+        "modeled_operations_annual": _money(recurring), "modeled_operations_first_year": _money(modeled_first_year),
+        "combined_incremental_annual": _money(combined * 12) if combined is not None else None,
+        "combined_incremental_first_year": None,
+        "run_rate_note": "Annual loan and combined cash amounts are twelve-month stabilized run-rate equivalents, not a dated first-year or year-end bank balance. Retaining cash or reserving it for an asset does not create revenue or profit.",
         "notes": ["Signed loan cash change is current regular debt service less replacement regular debt service and new operating charges. Financing fees already included in debt service are not deducted again.",
             "Operations are conditional recurring net changes; first-year timing and setup costs stay separate.",
             "Combined incremental cash is an illustration, not a bank balance or an NOI addback. Cash assignments do not create expenses or duplicate their modeled earnings effect."]}
