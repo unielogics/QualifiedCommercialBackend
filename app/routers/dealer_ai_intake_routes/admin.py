@@ -612,6 +612,28 @@ async def admin_restore_lead(
         effective_profile_hold=profile_hold,
     )
 
+@core.admin_router.get("/{intake_id}/artifacts")
+async def get_package_artifacts(intake_id: UUID, user: core.CurrentUser,
+    response: Response, db: AsyncSession = Depends(core.get_db)) -> dict:
+    from app.services import package_artifacts
+
+    core._require_intake_operator(user)
+    intake = await package_artifacts.load_intake(db, intake_id)
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return await package_artifacts.metadata(db, intake)
+
+
+@core.admin_router.get("/{intake_id}/artifacts/{artifact_id}/url")
+async def get_package_artifact_url(intake_id: UUID, artifact_id: UUID, user: core.CurrentUser,
+    response: Response, db: AsyncSession = Depends(core.get_db), download: bool = False) -> dict:
+    from app.services import package_artifacts
+
+    core._require_intake_operator(user)
+    await package_artifacts.load_intake(db, intake_id)
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return await package_artifacts.fresh_url(db, intake_id, artifact_id, download=download)
+
+
 @core.admin_router.get("/{intake_id}/package-readiness/references")
 async def get_package_readiness_references(intake_id: UUID, artifact_id: UUID,
     user: core.CurrentUser, db: AsyncSession = Depends(core.get_db), include_analysis_snapshot: bool = False) -> dict:
