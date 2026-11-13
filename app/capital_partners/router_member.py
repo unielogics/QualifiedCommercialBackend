@@ -224,7 +224,7 @@ async def listing_detail(ref: str, ctx: ClearedMember, db: Db) -> S.ListingDetai
             for s in subs
         ]
     return S.ListingDetail(
-        **L.card(listing, committed),
+        **L.card(L.member_view(listing), committed),
         summary=listing.summary, guarantee_text=listing.guarantee_text, borrower_track_record=listing.borrower_track_record,
         exit_plan=listing.exit_plan, valuation_amount=listing.valuation_amount, valuation_source=listing.valuation_source,
         title_status=listing.title_status, servicer_label=listing.servicer_label,

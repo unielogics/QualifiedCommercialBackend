@@ -80,6 +80,14 @@ async def job_marketplace_ppm_refresh() -> None:
         log.info("Marketplace PPM refresh: %s", result)
 
 
+async def job_marketplace_saved_refresh() -> None:
+    from app.capital_partners.services.refresh import drain_pending
+
+    result = await drain_pending(limit=3)
+    if result["succeeded"] or result["failed"]:
+        log.info("Marketplace saved-source refresh: %s", result)
+
+
 def start_scheduler() -> None:
     """Idempotent — safe to call from FastAPI startup hooks (which fire
     on every uvicorn reload in dev). `replace_existing=True` collapses
@@ -105,6 +113,15 @@ def start_scheduler() -> None:
         id="chatgpt_product_feed", replace_existing=True, coalesce=True, max_instances=1,
     )
 
+    scheduler.add_job(
+        _wrap(job_marketplace_saved_refresh),
+        "interval",
+        seconds=30,
+        id="marketplace_saved_refresh",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
     scheduler.add_job(
         _wrap(job_marketplace_ppm_refresh),
         "interval",

@@ -126,6 +126,10 @@ async def emit(
             db.add(row)
             await db.flush()
             await _notify(db, profile, row, actor_id=actor_id, already_notified={i for i in already_notified if i})
+            if kind in {"document.received", "financial_form.version_saved"}:
+                from app.capital_partners.services.refresh import after_saved_source
+
+                await after_saved_source(db, profile.id, actor_id=actor_id, reason="saved_file")
             return row
     except Exception:  # noqa: BLE001
         log.exception("file_events.emit failed kind=%s", kind)

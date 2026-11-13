@@ -3019,6 +3019,9 @@ async def _reconcile_analysis_consumers(
             profile = await db.get(ApplicationProfile, profile_id)
             if profile is None:
                 continue
+            from app.capital_partners.services.refresh import after_saved_source
+
+            await after_saved_source(db, profile_id, reason="saved_file_analysis")
             try:
                 # Readiness is an advisory projection of the durable analysis,
                 # not part of making the provider result durable.  A policy or

@@ -6274,20 +6274,22 @@ def _prepend_published_program_metric(
 async def _create_executive_summary_artifact(
     db: AsyncSession,
     intake: PublicUnderwritingIntake,
-    user: CurrentUser,
+    user: CurrentUser | None,
     *,
     financials: dict[str, Any] | None = None,
     context_snapshot: dict[str, Any] | None = None,
     source_snapshot_metadata: dict[str, Any] | None = None,
     cleanup_s3_keys: list[str] | None = None,
+    prepared_summary: dict[str, Any] | None = None,
 ) -> PublicUnderwritingIntakeArtifact:
-    summary = await _generate_management_json(
-        db,
-        intake,
-        user,
-        purpose="executive_summary",
-        context_snapshot=context_snapshot,
-    )
+    if prepared_summary is not None:
+        from copy import deepcopy
+
+        summary = deepcopy(prepared_summary)
+    else:
+        summary = await _generate_management_json(
+            db, intake, user, purpose="executive_summary", context_snapshot=context_snapshot,
+        )
     readiness_snapshot = (
         context_snapshot.get("package_readiness")
         if isinstance(context_snapshot, dict)
@@ -6369,7 +6371,7 @@ async def _create_executive_summary_artifact(
         body_text=body_text,
         body_json=summary,
         s3_key=s3_key,
-        created_by_user_id=user.id,
+        created_by_user_id=getattr(user, "id", None),
     )
     db.add(artifact)
     await db.flush()
@@ -6378,7 +6380,7 @@ async def _create_executive_summary_artifact(
         intake.bucket_id,
         "underwriting_executive_summary_generated",
         user=user,
-        actor_role=user.role.value if hasattr(user.role, "value") else str(user.role),
+        actor_role=(user.role.value if hasattr(user.role, "value") else str(user.role)) if user is not None else "system",
         target_type="public_underwriting_intake",
         target_id=str(intake.id),
         detail=title,
@@ -6530,7 +6532,7 @@ async def _store_lender_packet_pdf(
 async def _create_lender_packet_artifact(
     db: AsyncSession,
     intake: PublicUnderwritingIntake,
-    user: CurrentUser,
+    user: CurrentUser | None,
     executive_summary: PublicUnderwritingIntakeArtifact | None = None,
     *,
     files_snapshot: list[BucketFile] | None = None,
@@ -6584,7 +6586,7 @@ async def _create_lender_packet_artifact(
             },
         },
         s3_key=s3_key,
-        created_by_user_id=user.id,
+        created_by_user_id=getattr(user, "id", None),
     )
     db.add(artifact)
     await db.flush()
@@ -6593,7 +6595,7 @@ async def _create_lender_packet_artifact(
         intake.bucket_id,
         "underwriting_lender_packet_generated",
         user=user,
-        actor_role=user.role.value if hasattr(user.role, "value") else str(user.role),
+        actor_role=(user.role.value if hasattr(user.role, "value") else str(user.role)) if user is not None else "system",
         target_type="public_underwriting_intake",
         target_id=str(intake.id),
         detail=title,
@@ -6611,7 +6613,7 @@ async def _ensure_lender_packet_artifact(
 
 
 async def _create_investor_presentation_artifact(
-    db: AsyncSession, intake: PublicUnderwritingIntake, user: CurrentUser, *,
+    db: AsyncSession, intake: PublicUnderwritingIntake, user: CurrentUser | None, *,
     financials: dict[str, Any], source_snapshot_metadata: dict[str, Any],
     cleanup_s3_keys: list[str], generated_at: datetime,
 ) -> PublicUnderwritingIntakeArtifact:
@@ -6644,7 +6646,7 @@ async def _create_investor_presentation_artifact(
             "operating_plan_snapshot": ((financials.get("operating_earnings") or {}).get("improvement_plan") or {}).get("snapshot"),
             "_pdf": {"size_bytes": len(pdf), "sha256": hashlib.sha256(pdf).hexdigest(),
                      "content_type": "application/pdf", **source_snapshot_metadata}},
-        s3_key=key, created_by_user_id=user.id)
+        s3_key=key, created_by_user_id=getattr(user, "id", None))
     db.add(artifact)
     await db.flush()
     return artifact
@@ -7185,7 +7187,7 @@ async def _publish_package_artifact_to_bucket(
     previous_artifact: PublicUnderwritingIntakeArtifact | None,
     generation_id: UUID,
     generated_at: datetime,
-    user: CurrentUser,
+    user: CurrentUser | None,
 ) -> tuple[BucketFile, list[UUID]]:
     """Make one immutable PDF snapshot the bucket's current package document.
 
@@ -7217,7 +7219,7 @@ async def _publish_package_artifact_to_bucket(
     for file in current_files:
         file.status = "superseded"
         file.deleted_at = generated_at
-        file.deleted_by_user_id = user.id
+        file.deleted_by_user_id = getattr(user, "id", None)
         # The historical artifact continues to reference these immutable bytes.
         # Supersession hides the bucket row but intentionally retains storage.
         file.delete_storage_status = "retained_superseded"
@@ -7267,9 +7269,9 @@ async def _publish_package_artifact_to_bucket(
         content_type="application/pdf",
         size_bytes=max(0, int(pdf_meta.get("size_bytes") or 0)),
         content_hash=str(pdf_meta.get("sha256") or "") or None,
-        uploaded_by_name=user.name or "Qualified Commercial",
-        uploaded_by_email=user.email,
-        uploaded_by_user_id=user.id,
+        uploaded_by_name=getattr(user, "name", None) or "Qualified Commercial",
+        uploaded_by_email=getattr(user, "email", None),
+        uploaded_by_user_id=getattr(user, "id", None),
         source_kind="generated",
         source_detail=f"{source_base}:v{version}",
         status="uploaded",
@@ -9134,11 +9136,12 @@ async def _profile_hold_intake_ids(
     return {row for row in rows if row is not None}
 
 
-async def _load_admin_dealer_lead(db: AsyncSession, intake_id: UUID) -> PublicUnderwritingIntake:
+async def _load_admin_dealer_lead(db: AsyncSession, intake_id: UUID, *, refresh: bool = False) -> PublicUnderwritingIntake:
     intake = (
         await db.execute(
             select(PublicUnderwritingIntake)
             .where(PublicUnderwritingIntake.id == intake_id)
+            .execution_options(populate_existing=refresh)
             .options(
                 selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents).selectinload(BucketRequestedDocument.template_file),
                 selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),

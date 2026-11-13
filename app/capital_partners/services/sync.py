@@ -31,6 +31,7 @@ SECTION_LABELS: dict[str, str] = {
     "deal_budget": "Closing costs and investor charges",
     "programs": "Programs",
     "package": "Package PDFs",
+    "operating_projection": "Saved operating plan",
 }
 
 
@@ -77,7 +78,8 @@ def proposed_terms(cockpit: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def file_sections(
-    cockpit: dict[str, Any], *, program_keys: list[str], package: dict[str, Any] | None
+    cockpit: dict[str, Any], *, program_keys: list[str], package: dict[str, Any] | None,
+    operating_projection=None,
 ) -> dict[str, Any]:
     """The comparable sections of a file, free of timestamps."""
     from app.services import financial_cockpit
@@ -109,6 +111,8 @@ def file_sections(
         sections["collateral"] = deepcopy(cockpit["collateral"])
     if isinstance(cockpit.get("deal_budget"), dict):
         sections["deal_budget"] = deepcopy(cockpit["deal_budget"])
+    if operating_projection is not None:
+        sections["operating_projection"] = deepcopy(operating_projection)
     return sections
 
 
@@ -170,6 +174,59 @@ def apply_canonical_financing(listing: CpListing, fresh: dict[str, Any]) -> None
     existing = {key: getattr(listing, key, None) for key in ("products", "loan_amount", "offered_amount", "minimum_investment", "maturity_date")}
     for key, value in canonical_financing_fields(fresh.get("financials") or {}, existing, is_new=getattr(listing, "id", None) is None).items():
         setattr(listing, key, value)
+
+
+def preserve_active_financials(listing):
+    snapshot = listing.source_snapshot or {}
+    if getattr(listing, "published_at", None) and "active_financials" not in snapshot:
+        listing.source_snapshot = {**snapshot, **publication_view(listing)}
+
+
+def publication_view(listing):
+    """Explicitly selected offering economics and generated-document identities."""
+    from .package_documents import GENERATED_KINDS
+
+    fields = ("program_label", "collateral_type", "lien_position", "note_rate_pct", "term_months", "ltv_pct", "ltv_kind",
+        "minimum_investment", "loan_amount", "offered_amount", "payment_frequency", "personal_guarantee", "products", "maturity_date")
+    economic = json.loads(json.dumps({key: getattr(listing, key, None) for key in fields}, default=str))
+    snapshot = listing.source_snapshot or {}
+    receipts = ((snapshot.get("published") or {}).get("package") or {}).get("documents") or []
+    candidate_ids = {str(row.get("document_id")) for row in receipts}
+    documents = [str(row.id) for row in listing.documents if row.kind in GENERATED_KINDS and row.status == "ready"
+        and (not candidate_ids or str(row.id) in candidate_ids)]
+    return {"active_financials": deepcopy(snapshot.get("financials") or {}), "active_listing": economic,
+        "active_generated_document_ids": documents}
+
+
+def publication_changed(listing):
+    snapshot = listing.source_snapshot or {}
+    if not getattr(listing, "published_at", None):
+        return False
+
+    def facts(value):
+        if isinstance(value, dict):
+            return {key: facts(item) for key, item in value.items() if key not in {"generated_at", "refreshed_at"}}
+        if isinstance(value, list):
+            return [facts(item) for item in value]
+        return value
+
+    if saved_source_fingerprint(facts(snapshot.get("active_financials"))) != saved_source_fingerprint(facts(snapshot.get("financials"))):
+        return True
+    active = snapshot.get("active_listing")
+    if isinstance(active, dict):
+        numeric = {"note_rate_pct", "term_months", "ltv_pct", "minimum_investment", "loan_amount", "offered_amount"}
+        for key, old in active.items():
+            new = getattr(listing, key, None)
+            if key == "products":
+                if economic_products(old) != economic_products(new):
+                    return True
+            elif key in numeric:
+                if economic_number(old) != economic_number(new):
+                    return True
+            elif (str(old) if old is not None else None) != (str(new) if new is not None else None):
+                return True
+    receipts = ((snapshot.get("published") or {}).get("package") or {}).get("documents") or []
+    return {str(row.get("document_id")) for row in receipts} != set(snapshot.get("active_generated_document_ids") or [])
 
 
 def normalized_financing(value: Any) -> Any:
@@ -357,8 +414,15 @@ async def current_fingerprints(
         cockpit,
         program_keys=[s.program_key for s in selections],
         package=await current_package(db, profile),
+        operating_projection=await _operating_projection(db, profile, cockpit),
     )
     return fingerprints(sections), sections, cockpit
+
+
+async def _operating_projection(db, profile, cockpit):
+    from .operating_projection import saved
+
+    return await saved(db, profile, cockpit)
 
 
 async def sync_for_listing(db: AsyncSession, listing: CpListing) -> dict[str, Any] | None:
