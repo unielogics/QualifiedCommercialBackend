@@ -271,10 +271,13 @@ def validate_body(raw):
         raise HTTPException(422, detail={"message": "Review the operating plan fields", "errors": errors}) from exc
 
 
+COMMAND_ACTION_KINDS = frozenset({"expense_reduction", "expense_increase", "expense_group_change", "price_change"})
+
+
 def action_missing(row):
     required = ["label", "driver_key", "explanation", "implementation_cost"]
     kind = row["kind"]
-    if row.get("command"):
+    if row.get("command") and kind in COMMAND_ACTION_KINDS:
         if row["command"].get("value") is None:
             required += ["command.value"]
         if kind == "expense_group_change":
@@ -307,6 +310,10 @@ def action_missing(row):
         if kind == "revenue_change":
             required.append("contribution_margin_pct")
     missing = [key for key in required if row.get(key) is None or row.get(key) == ""]
+    if row.get("command") and kind not in COMMAND_ACTION_KINDS:
+        # A retained cost/price command cannot replace another kind's explicit
+        # inputs or execute under a different financial treatment.
+        missing.append("command")
     if kind == "processing_cost_change":
         missing += [key for key in ("current_processing_rate_basis", "proposed_processing_rate_basis") if row.get(key) in {None, "", "unknown"}]
     return list(dict.fromkeys(missing))
