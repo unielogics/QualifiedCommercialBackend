@@ -34,7 +34,7 @@ def _groups(rows, *, by_source=False):
 
 
 def evaluate(body, action_results=None, baseline=None, *, earnings_comparable=False, noi_comparable=False,
-             refinance_annual_debt_service=None, new_operating_annual=None, source_groups=None):
+             refinance_annual_debt_service=None, new_operating_annual=None, source_groups=None, metric_context=None):
     """No writes, no assumed setup cost/date, and no alternate eligibility gate."""
     body = validate_body(body)
     baseline = baseline or {}
@@ -64,7 +64,7 @@ def evaluate(body, action_results=None, baseline=None, *, earnings_comparable=Fa
         action = attached[0] if len(attached) == 1 and attached[0]["kind"] in ORDINARY else None
         current = cost_amount(expense)
         annual = engine._annual(current, expense["cadence"])
-        outside = expense["category"] in engine.NON_OPERATING | engine.NON_CASH
+        outside = expense["category"] in engine.NON_OPERATING
         nonrecurring = expense["cadence"] == "one_time"
         status = "unchanged"
         proposed, proposed_annual = current, annual
@@ -139,6 +139,14 @@ def evaluate(body, action_results=None, baseline=None, *, earnings_comparable=Fa
             if attached:
                 issues.append("This row is outside recurring operating-cost changes; use the appropriate separate disclosure or one-time model.")
         result = results.get(action["id"], {}) if action else {}
+        metric_effects = {}
+        if expense["category"] in engine.NON_CASH and action:
+            from app.services.operating_metric_effects import basis
+
+            policy = basis(metric_context or {}, action, body)
+            metric_effects = {"effect_type": "noncash_da", "noi_gross_annual_effect": gross if policy["noi"] else None,
+                              "earnings_gross_annual_effect": 0.0 if gross is not None and policy["earnings"] else None,
+                              "cash_gross_annual_effect": 0.0 if gross is not None else None}
         rows.append({"expense_row_id": expense["id"], "expense_category": expense["category"], "source_group_key": expense["source_group_key"],
             "label": expense["label"], "cadence": expense["cadence"], "cost_basis": expense["cost_basis"],
             "proposed_cadence": action["cadence"] if action else None if attached else expense["cadence"],
@@ -150,7 +158,7 @@ def evaluate(body, action_results=None, baseline=None, *, earnings_comparable=Fa
             "included_in_proposed_projection": bool(result.get("proposed_math_valid")),
             "included_in_approved_projection": bool(result.get("included_in_approved_projection")),
             "missing_math": list(dict.fromkeys(missing)), "completion_missing": action_missing(action) if action else [],
-            "issues": list(dict.fromkeys(issues))})
+            "issues": list(dict.fromkeys(issues)), **metric_effects})
     changed = [row for row in rows if row["action_ids"]]
     unlinked = [row for row in active if row["kind"] in ORDINARY and row["id"] not in used]
     complete = bool(changed) and not unlinked and all(row["status"] in {"calculated", "unchanged"} for row in rows
@@ -167,9 +175,14 @@ def evaluate(body, action_results=None, baseline=None, *, earnings_comparable=Fa
             source_issues.append(f"Reconcile current source group for expense row {row['expense_row_id']} ({reference.get('label') if reference else row['label']}; {status}) before adding this cost change to source earnings or NOI.")
     source_comparable = bool(not source_issues and (earnings_comparable or noi_comparable)) if bound else None
     earnings, noi = baseline.get("earnings"), baseline.get("noi")
-    after = earnings + gross if complete and not source_issues and earnings_comparable and earnings is not None else None
-    after_noi = noi + gross if complete and not source_issues and noi_comparable and noi is not None else None
+    earnings_effects = [row.get("earnings_gross_annual_effect", row["gross_annual_effect"]) for row in changed]
+    noi_effects = [row.get("noi_gross_annual_effect", row["gross_annual_effect"]) for row in changed]
+    earnings_gross = sum(earnings_effects) if all(value is not None for value in earnings_effects) else None
+    noi_gross = sum(noi_effects) if all(value is not None for value in noi_effects) else None
+    after = earnings + earnings_gross if complete and earnings_gross is not None and not source_issues and earnings_comparable and earnings is not None else None
+    after_noi = noi + noi_gross if complete and noi_gross is not None and not source_issues and noi_comparable and noi is not None else None
     debt = baseline.get("annual_debt_service")
+    coverage_ok = not baseline.get("dscr_unavailable_reason")
     refi = after - new_operating_annual if after is not None and new_operating_annual is not None else None
     return {"policy_version": POLICY_VERSION, "scope": SCOPE, "notes": [NOTE], "rows": rows,
         "source_comparable": source_comparable, "source_reconciliation_issues": source_issues,
@@ -180,6 +193,6 @@ def evaluate(body, action_results=None, baseline=None, *, earnings_comparable=Fa
             "issues": [f"Action {row['id']} needs one current expense link or an unambiguous ordinary cost treatment." for row in unlinked]},
         "gross_projection": {"scope": SCOPE, "status": "illustration" if after is not None or after_noi is not None else "unavailable",
             "earnings": engine._money(after), "noi": engine._money(after_noi),
-            "dscr_current": round(after / debt, 2) if after is not None and debt is not None and debt > 0 else None,
+            "dscr_current": round(after / debt, 2) if coverage_ok and after is not None and debt is not None and debt > 0 else None,
             "dscr_with_refinance": round(refi / refinance_annual_debt_service, 2)
-                if refi is not None and refinance_annual_debt_service is not None and refinance_annual_debt_service > 0 else None}}
+                if coverage_ok and refi is not None and refinance_annual_debt_service is not None and refinance_annual_debt_service > 0 else None}}

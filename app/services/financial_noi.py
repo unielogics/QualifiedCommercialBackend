@@ -363,12 +363,16 @@ def preview_scenario(noi, evaluation):
     total = sum(number(row.get("amount_annual")) or 0 for row in adjustments)
     planned = round(current + total - operating, 2) if current is not None and operating is not None and (headline.get("currency") == "USD" or total == operating == 0) else None
     operating_plan = evaluation.get("operating_plan") or {}
-    if operating_plan.get("applied") and operating_plan.get("noi_eligible") and comparable and planned is not None:
+    if "noi_applied" in operating_plan:
+        noi_impact = number(operating_plan.get("applied_noi_annual_impact"))
+        if operating_plan["noi_applied"] and comparable and planned is not None and noi_impact is not None:
+            planned = round(planned + noi_impact, 2)
+    elif operating_plan.get("applied") and operating_plan.get("noi_eligible") and comparable and planned is not None:
         planned = round(planned + (number(operating_plan.get("applied_annual_impact")) or 0), 2)
     debt = number(evaluation.get("debt_service_after_annual")) if evaluation.get("active") and not evaluation.get("coverage_unavailable_reason") else None
     scenario.update(plan=planned, operating_adjustments=deepcopy(adjustments), annual_new_operating_expenses=operating,
         annual_debt_service_plan=debt, after_debt_service_plan=round(planned - debt, 2) if comparable and planned is not None and debt is not None else None)
-    if operating_plan.get("applied"):
+    if operating_plan.get("applied") or operating_plan.get("noi_applied"):
         scenario["operating_plan"] = deepcopy(operating_plan)
     return scenario
 

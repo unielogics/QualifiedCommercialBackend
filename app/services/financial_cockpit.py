@@ -1182,6 +1182,32 @@ def documented_debts(analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(groups.values())
 
 
+def accepted_schedule_currency(accepted_schedule):
+    """The registered first-party USD worksheet is distinct from imports.
+
+    Version metadata alone is not provenance: uploaded originals also carry
+    schema metadata. Explicit foreign denominations always survive; conflicts
+    cannot be repaired by borrowing a currency from a loan or budget.
+    """
+    from app.services import financial_version_selection, sheet_layout
+
+    accepted_schedule = accepted_schedule or {}
+    body, facts = accepted_schedule.get("body") or {}, accepted_schedule.get("key_facts") or {}
+    raw = [body.get("currency"), facts.get("currency")]
+    raw.extend(row.get("currency") for row in financial_version_selection.active_debt_schedule_rows(body))
+    stated = [str(value).strip().upper() for value in raw if value is not None and str(value).strip()]
+    if any(not re.fullmatch(r"[A-Z]{3}", value) for value in stated) or len(set(stated)) > 1:
+        return {"currency": None, "currency_basis": "conflicting_accepted_schedule",
+                "currency_issue": "Reconcile conflicting debt-schedule currencies before comparing or assigning loan cash relief."}
+    if stated:
+        return {"currency": stated[0], "currency_basis": "explicit_accepted_schedule", "currency_issue": None}
+    if (accepted_schedule.get("source") == "form" and accepted_schedule.get("status") in {"published", "filed"}
+            and body.get("schema_version") == sheet_layout.DEBT_SCHEMA_VERSION):
+        return {"currency": "USD", "currency_basis": "first_party_qc_ds_v2_usd", "currency_issue": None}
+    return {"currency": None, "currency_basis": "unconfirmed_accepted_schedule",
+            "currency_issue": "Confirm the accepted debt schedule's currency before assigning its cash relief."}
+
+
 def debt_service(
     rows: list[dict[str, Any]],
     document: dict[str, Any] | None,
@@ -2295,6 +2321,7 @@ def build_cockpit(
     service["observed_additions_suppressed"] = curated
     if accepted_schedule is not None:
         service["version_id"] = accepted_schedule.get("version_id")
+        service.update(accepted_schedule_currency(accepted_schedule))
         schedule["version_id"] = accepted_schedule.get("version_id")
         related = [associations.get(str(accepted_schedule.get(key))) for key in ("source_file_id", "pdf_file_id")]
         related.extend(accepted_schedule.get("source_associations") or [])
@@ -3128,6 +3155,8 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
         },
         schedule_set_aside=set_aside,
         accepted_schedule={"body": accepted_body, "key_facts": accepted_version.key_facts,
+                           "source": accepted_version.source, "status": accepted_version.status,
+                           "schema_version": accepted_version.schema_version,
                            "source_file_id": str(accepted_version.source_file_id) if accepted_version.source_file_id else None,
                            "pdf_file_id": str(accepted_version.pdf_file_id) if accepted_version.pdf_file_id else None,
                            "source_associations": [document_associations.summary(row) for row in version_associations.values()],

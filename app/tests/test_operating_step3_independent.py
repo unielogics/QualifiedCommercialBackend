@@ -131,7 +131,7 @@ def test_two_actions_for_one_current_line_are_visible_and_never_silently_selecte
     assert comparison["gross_projection"]["noi"] is None
 
 
-@pytest.mark.parametrize("category", ["loan_payments", "income_taxes", "owner_draws", "transfers", "depreciation_amortization"])
+@pytest.mark.parametrize("category", ["loan_payments", "income_taxes", "owner_draws", "transfers"])
 def test_a_changed_non_operating_line_never_creates_noi_savings(category):
     row = expense(category, 1000)
     comparison = preview(body(rows=[row], actions=[action(row, 500)]))["expense_changes"]
