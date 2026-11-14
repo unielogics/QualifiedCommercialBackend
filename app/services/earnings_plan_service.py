@@ -200,7 +200,7 @@ def plan_result(evaluation: dict) -> dict:
     """The engine's figures a saved version keeps: enough to redraw its document without recomputing."""
     plan = evaluation["plan"]
     return {key: deepcopy(plan[key]) for key in ("model", "rates", "behaviors", "items", "proposed", "reviewed", "months", "first_year", "effects",
-                                                 "sections", "bridge", "metrics", "debt_service", "target", "goal", "released", "baseline",
+                                                 "sections", "bridge", "metrics", "debt_service", "target", "goal", "released", "per_unit", "baseline",
                                                  "questions", "labels", "source_stamp")}
 
 

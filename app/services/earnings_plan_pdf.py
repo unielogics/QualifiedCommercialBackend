@@ -122,6 +122,19 @@ def _six_change(key: str, value) -> str:
     return _signed_times(value) if key == "dscr" else _points(value) if key == "operating_margin" else _signed_usd(value)
 
 
+_SINGULAR = {"units": "unit", "hrs": "hour", "hours": "hour", "jobs": "job", "customers": "customer", "orders": "order", "people": "person",
+             "clients": "client", "dollars": "dollar", "visits": "visit", "miles": "mile"}
+
+
+def per_word(unit) -> str:
+    """One of what a measure counts, from the unit it is counted in: "units / mo" is a unit, "hrs / mo" an hour."""
+    words = str(unit or "").strip().lower().replace("/", " ").split()
+    word = words[0] if words else ""
+    if not word or word in {"per", "count", "multiplier"}:
+        return "unit"
+    return _SINGULAR.get(word) or (word[:-1] if len(word) > 3 and word.endswith("s") and not word.endswith("ss") else word)
+
+
 def _factor_value(factor: dict, value) -> str:
     """A stream metric in its own unit: $262.00, 95%, 340 units / mo."""
     unit = str(factor.get("unit") or "")
@@ -255,6 +268,10 @@ class _Plan:
         self.proposed = self.result.get("proposed") or {}
         self.reviewed = self.result.get("reviewed") or {}
         self.model = self.result.get("model") or {}
+        #: Today's value of every metric as the engine read it. A stream that states its revenue never types its price.
+        self.factors_today = self.model.get("factors") or {}
+        #: What one unit of each stream's volume, and of each measure alongside it, brings in and costs.
+        self.per_unit = self.result.get("per_unit") or []
         self.items = self.result.get("items") or []
         self.effects = self.result.get("effects") or {}
         self.labels = self.result.get("labels") or {}
@@ -297,9 +314,29 @@ class _Plan:
         return " · ".join(part for part in (self.source.get("currency") or self.body.get("currency") or "USD", basis.capitalize()) if part)
 
     def unit_word(self, stream: dict | None) -> str:
+        """One of what the stream sells: its kind's own word, or for a stream described freely, the unit it is counted in."""
         from app.schemas.earnings_plan_v2 import STREAM_TEMPLATES
 
-        return STREAM_TEMPLATES.get((stream or {}).get("type") or "custom", STREAM_TEMPLATES["custom"])["unit_word"]
+        stream = stream or {}
+        kind = stream.get("type") or "custom"
+        if kind != "custom" and kind in STREAM_TEMPLATES:
+            return STREAM_TEMPLATES[kind]["unit_word"]
+        first = next((factor for factor in stream.get("factors") or [] if factor.get("volume") and not factor.get("alongside")), None)
+        return per_word(first.get("unit")) if first else "unit"
+
+    def metric_today(self, stream: dict, index: int):
+        """A metric's value today: what the engine read, or what the plan typed for a version saved before that was kept."""
+        stored = self.factors_today.get(stream.get("id")) or []
+        factors = stream.get("factors") or []
+        return stored[index] if index < len(stored) else factors[index].get("value") if index < len(factors) else None
+
+    def one_of(self, stream: dict, factor_id) -> tuple[dict | None, str]:
+        """The per-unit figures of a stream's volume (`factor_id` None) or of a measure alongside it, and the word for one."""
+        row = next((item for item in self.per_unit if item.get("stream_id") == stream.get("id") and item.get("factor_id") == factor_id), None)
+        if factor_id is None:
+            return row, self.unit_word(stream)
+        factor = next((item for item in stream.get("factors") or [] if item.get("id") == factor_id), {})
+        return row, per_word(factor.get("unit"))
 
     def stream_type(self, stream: dict) -> str:
         from app.schemas.earnings_plan_v2 import STREAM_TEMPLATES
@@ -601,21 +638,36 @@ def _model_part(plan: _Plan) -> str:
     volume_now = plan.model.get("volume") or {}
     factors_then = plan.proposed.get("factors") or {}
     rows = []
+    stated = False
     for stream in body.get("streams") or []:
         identifier = stream.get("id")
+        states = bool(stream.get("remainder")) or stream.get("monthly_revenue") is not None
+        stated = stated or states
         made, changed = [], []
         for index, factor in enumerate(stream.get("factors") or []):
-            now = factor.get("value")
+            now = plan.metric_today(stream, index)
             then = (factors_then.get(identifier) or [])[index] if index < len(factors_then.get(identifier) or []) else now
             made.append(f"{_esc(factor.get('label') or 'Metric')} <b>{_esc(_factor_value(factor, now))}</b>")
             if _finite(now) and _finite(then) and abs(then - now) > 1e-9:
                 changed.append(f"{_esc(factor.get('label') or 'Metric')} <b>{_esc(_factor_value(factor, then))}</b>")
+        # What one unit brings in and costs, for the stream's own volume and for each measure alongside it.
+        for factor_id in [None, *[factor.get("id") for factor in stream.get("factors") or [] if factor.get("alongside")]]:
+            figures, word = plan.one_of(stream, factor_id)
+            if not figures:
+                continue
+            for side, lines in (("today", made), ("proposed", changed)):
+                one = figures.get(side)
+                if one and (side == "today" or plan.available):
+                    lines.append(f"<small>Per {_esc(word)}: {_usd(one.get('revenue'), 2)} revenue · {_usd(one.get('cost'), 2)} cost</small>")
         volume = volume_now.get(identifier)
         word = plan.unit_word(stream)
+        # A stream that states its revenue has a volume only once it is measured; one described the earlier way always printed its own.
+        counted = bool(_finite(volume) and volume) if states else _finite(volume)
         per = f" · {_usd(_num(revenue_now.get(identifier)) / volume, 2)} revenue per {_esc(word)}" if _finite(volume) and volume else ""
+        kind = "What the other streams leave" if stream.get("remainder") and len(body.get("streams") or []) > 1 else plan.stream_type(stream)
         rows.append(_row([
-            (f"<b>{_esc(stream.get('name') or 'Revenue stream')}</b><br><small>{_esc(plan.stream_type(stream))}"
-             + (f" · {_plain(volume, 0)} a year{per}" if _finite(volume) else "") + "</small>", "name"),
+            (f"<b>{_esc(stream.get('name') or 'Revenue stream')}</b><br><small>{_esc(kind)}"
+             + (f" · {_plain(volume, 0)} a year{per}" if counted else "") + "</small>", "name"),
             ("<br>".join(made) or DASH, ""), ("<br>".join(changed) or "<span class='muted'>No change</span>", ""),
             (_usd(revenue_now.get(identifier)), "num"), (_usd(revenue_then.get(identifier)) if plan.available else DASH, "num")]))
     if rows:
@@ -629,8 +681,10 @@ def _model_part(plan: _Plan) -> str:
         match = _tag(f"Differs from {name} revenue by {_signed_usd(plan.model.get('difference'))}", "warn")
     streams = (_table([("Revenue stream", ""), ("How it is made today", ""), ("With the plan", ""), ("Today a year", "num"), ("Plan a year", "num")], rows, "streams")
                or "<p class='muted'>No revenue stream is described in this plan.</p>")
-    reconcile = (f"<p class='fine'>Model total {_usd(plan.model.get('total'))} against {_esc(name)} revenue {_usd(plan.baseline.get('revenue'))}. "
-                 "A stream's revenue is its metrics multiplied together over twelve months.</p>") if plan.available else ""
+    how = ("A stream states what it brings in an average month; the price of one unit is that revenue divided by the stream's volume, and is never typed. "
+           "The cost of one unit takes the stream's share, by revenue, of every cost on the source."
+           if stated else "A stream's revenue is its metrics multiplied together over twelve months.")
+    reconcile = (f"<p class='fine'>Model total {_usd(plan.model.get('total'))} against {_esc(name)} revenue {_usd(plan.baseline.get('revenue'))}. {how}</p>") if plan.available else ""
 
     behaviors, rates, then_lines = plan.result.get("behaviors") or {}, plan.result.get("rates") or {}, plan.proposed.get("lines") or {}
 
@@ -638,6 +692,9 @@ def _model_part(plan: _Plan) -> str:
         effective, rate = behaviors.get(line.get("id"), line.get("behavior") or "fixed"), _num(rates.get(line.get("id")))
         stream = plan.streams.get(line.get("link"))
         if effective == "unit":
+            measure = next((factor for factor in (stream or {}).get("factors") or [] if line.get("measure") and factor.get("id") == line.get("measure")), None)
+            if measure:
+                return f"${_grouped(rate, 2)} per {per_word(measure.get('unit'))} of {(stream or {}).get('name') or 'its stream'} ({str(measure.get('label') or 'measure').lower()})"
             return f"${_grouped(rate, 2)} per {plan.unit_word(stream)} of {(stream or {}).get('name') or 'its stream'}"
         if effective == "pct":
             return f"{_grouped(rate * 100, 1)}% of {'all revenue' if line.get('link') == ALL else ((stream or {}).get('name') or 'its stream') + ' revenue'}"
@@ -705,7 +762,7 @@ def _what(plan: _Plan, row: dict, kind: str) -> str:
         size = f"{_plain(value)}%" if percent else f"${_grouped(_num(value), 2)}" if unit == "$" else f"{_plain(value)} pts" if unit == "%" else f"{_plain(value)} {unit.split(' ')[0]}".strip()
         after = (plan.proposed.get("factors") or {}).get(target.get("stream_id")) or []
         then = after[index] if index is not None and index < len(after) else None
-        moved = f" · {_factor_value(factor, factor.get('value'))} {ARROW} {_factor_value(factor, then)}" if _finite(then) else ""
+        moved = f" · {_factor_value(factor, plan.metric_today(stream, index))} {ARROW} {_factor_value(factor, then)}" if _finite(then) and index is not None else ""
         return f"{verb} by {size}{moved}"
     if target.get("kind") == "line":
         line = plan.lines.get(target.get("line_id")) or {}

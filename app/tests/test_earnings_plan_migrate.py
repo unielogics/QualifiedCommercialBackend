@@ -20,8 +20,12 @@ def test_a_new_plan_reproduces_the_file_and_adds_up_to_its_source():
     assert [line["id"] for line in body["lines"]] == [row["key"] for row in cockpit["baseline"]["groups"]["rows"]]
     assert round(sum(line["base"] for line in body["lines"]), 2) == 601886 + 664891
     assert body["source"]["stamp"] == envelope.baseline_stamp(envelope.engine_baseline(cockpit)) and body["source"]["confirmations"] == {}
+    # One stream that is all of the source's revenue, with nothing typed: no price, no volume, nothing to reconcile by hand.
+    assert body["streams"] == [{"id": "s1", "name": "All revenue", "type": "custom", "added": False, "monthly_revenue": None, "remainder": True, "factors": [
+        {"id": "f1", "label": "Revenue per month", "value": None, "unit": "$", "volume": False, "alongside": False, "custom": False}]}]
     result = v1.evaluate(body, cockpit)
     assert result["plan"]["model"]["reconciles"] is True and result["plan"]["source_changed"] is False
+    assert result["plan"]["model"]["total"] == 1236000 and result["plan"]["model"]["factors"] == {"s1": [103000]} and result["plan"]["per_unit"] == []
     assert result["comparison"]["proposed"]["earnings"] == result["comparison"]["baseline"]["earnings"] == -22377
     assert result["projection"]["proposed"]["status"] == "no_actions"
     # Ten source lines to confirm, two categories the return prints no line for, and the confirmation.
@@ -132,3 +136,6 @@ def test_resync_moves_single_lines_to_the_new_source_and_asks_for_confirmation_a
     assert fresh["source"]["confirmations"] == {} and fresh["source"]["stamp"] != body["source"]["stamp"]
     result = v1.evaluate(fresh, amended)
     assert result["plan"]["source_changed"] is False and all(row["status"] == "matches_source" for row in result["expense_groups"])
+    # The stream that is all revenue follows the source by itself: a return with other receipts needs no rebalancing.
+    more = v1.evaluate(body, file_cockpit(analyses=[filed_return(gross_receipts=1300000, gross_profit=698114, total_income=706514, ordinary_business_income=41623)]))
+    assert more["plan"]["model"]["total"] == 1300000 and more["plan"]["model"]["reconciles"] is True

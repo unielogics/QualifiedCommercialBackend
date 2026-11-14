@@ -84,6 +84,23 @@ def reference_body() -> dict:
     }
 
 
+def measured_body() -> dict:
+    """The design's file described the way revenue is known: one stream that is all of it, measured in units and in hours.
+
+    The stream states no price: 400 units a month against $103,000 a month is $257.50 a unit. Supplies follow the
+    units, wages follow the labor hours alongside them, card processing follows revenue. Nothing is proposed.
+    """
+    body = reference_body()
+    body.update(changes=[], growth=[], activities=[])
+    body["streams"] = [{"id": "s1", "name": "All revenue", "type": "custom", "remainder": True, "factors": [
+        {"id": "f0", "label": "Units sold", "value": 400, "unit": "units / mo", "volume": True, "custom": True},
+        {"id": "f1", "label": "Revenue per unit", "value": None, "unit": "$", "volume": False},
+        {"id": "f2", "label": "Labor hours", "value": 1200, "unit": "hrs / mo", "alongside": True, "custom": True}]}]
+    follows = {"c1": {"behavior": "unit", "link": "s1"}, "sal": {"behavior": "unit", "link": "s1", "measure": "f2"}, "o1": {"behavior": "pct", "link": "all"}}
+    body["lines"] = [{**line, **follows.get(line["id"], {"behavior": "fixed", "link": "all"})} for line in body["lines"]]
+    return body
+
+
 # ---------------------------------------------------------------------------
 # The same plan on a file: a cockpit built from the design's return and debts
 # ---------------------------------------------------------------------------
@@ -108,9 +125,12 @@ def file_cockpit(*, terms: bool = True, goal: float | None = None, analyses=None
     return cockpit
 
 
-def file_body(*, keep_design_statuses: bool = False) -> dict:
-    """The design's plan on that file's own group keys. Nothing is approved unless asked: an approval needs a reviewer."""
-    body = reference_body()
+def file_body(*, keep_design_statuses: bool = False, measured: bool = False) -> dict:
+    """The design's plan on that file's own group keys. Nothing is approved unless asked: an approval needs a reviewer.
+
+    `measured` gives the same file described the way revenue is known (see `measured_body`), with nothing proposed.
+    """
+    body = measured_body() if measured else reference_body()
     for line in body["lines"]:
         line["group"] = GROUP_KEYS.get(line["group"], line["group"])
     body["source"]["confirmations"] = {GROUP_KEYS.get(key, key): value for key, value in body["source"]["confirmations"].items()}

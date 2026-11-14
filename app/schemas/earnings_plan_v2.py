@@ -77,7 +77,17 @@ class Factor(_Form):
     value: float | None = Field(default=None, ge=0, le=1e15)
     unit: str = Field(default="", max_length=40)
     volume: bool = False
+    # A measure of the same month that revenue does not follow, such as the labor hours behind the units sold. It gives
+    # revenue and cost per hour by division and can drive a cost; it moves with the stream's volume unless the plan changes it.
+    alongside: bool = False
     custom: bool = False
+
+    @model_validator(mode="after")
+    def one_role(self):
+        # Volume metrics multiply into what revenue follows; a measure alongside is counted, never multiplied.
+        if self.alongside:
+            self.volume = False
+        return self
 
 
 class Stream(_Form):
@@ -85,12 +95,20 @@ class Stream(_Form):
     name: str = Field(default="", max_length=240)
     type: StreamType = "custom"
     added: bool = False
+    # What the stream brings in an average month. The revenue is the known figure, so the price of one unit is this
+    # divided by the stream's volume and is never typed. None leaves the stream to its metrics multiplied together,
+    # which is how plans were described before revenue was stated.
+    monthly_revenue: float | None = Field(default=None, ge=0, le=1e15)
+    # The stream is whatever the other streams do not explain, so the model always adds up to the source's revenue.
+    remainder: bool = False
     factors: list[Factor] = Field(min_length=1, max_length=12)
 
     @model_validator(mode="after")
     def distinct_factors(self):
         if len({row.id for row in self.factors}) != len(self.factors):
             raise ValueError("Each metric of a revenue stream needs its own ID")
+        if self.remainder:
+            self.monthly_revenue = None
         return self
 
 
@@ -101,7 +119,16 @@ class Line(_Form):
     base: float = Field(default=0, ge=0, le=1e15)
     behavior: LineBehavior = "fixed"
     link: Key = ALL
+    # The measure alongside the linked stream's volume that a per-unit cost follows (wages per labor hour). None
+    # follows the stream's own volume.
+    measure: Key | None = None
     added: bool = False
+
+    @model_validator(mode="after")
+    def only_a_per_unit_cost_follows_a_measure(self):
+        if self.behavior != "unit" or self.link == ALL:
+            self.measure = None
+        return self
 
 
 class Target(_Form):
@@ -254,12 +281,16 @@ class EarningsPlanBody(_Form):
         streams = {row.id: row for row in self.streams}
         if len(streams) != len(self.streams):
             raise ValueError("Each revenue stream needs its own ID")
+        if sum(1 for row in self.streams if row.remainder) > 1:
+            raise ValueError("Only one revenue stream can hold what the others do not explain")
         lines = {row.id: row for row in self.lines}
         if len(lines) != len(self.lines):
             raise ValueError("Each cost line needs its own ID")
         for line in self.lines:
             if line.link != ALL and line.link not in streams:
                 raise ValueError("A cost line must follow one of this plan's revenue streams, or all revenue")
+            if line.measure is not None and all(factor.id != line.measure or not factor.alongside for factor in streams[line.link].factors):
+                raise ValueError("A cost per unit must follow its stream's volume or one of the measures alongside it")
         items = [row.id for block in (self.changes, self.growth, self.activities) for row in block]
         if len(set(items)) != len(items):
             raise ValueError("Each change needs its own ID")

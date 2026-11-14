@@ -10,6 +10,14 @@ The model
 * A revenue stream is a set of factors. Volume factors multiply into the
   business units sold in a month; the others multiply into the price of one
   unit. Annual revenue is units x price x 12.
+* Revenue is the known figure, so a stream normally states what it brings in
+  an average month (`monthly_revenue`), or is the one stream that holds what
+  the others do not explain (`remainder`, so the model always adds up to the
+  source). Its price is then never typed: it is that revenue divided by the
+  stream's volume. A stream with no volume yet still brings its revenue.
+* A measure alongside (`alongside`) counts the same month another way, such as
+  the labor hours behind the units sold. Revenue does not follow it; it moves
+  with the stream's volume unless the plan changes it, and a cost can follow it.
 * A cost line is fixed, a dollar amount per unit of one stream, or a percent of
   a stream's (or all) revenue. Its rate is read off today's figures, so with no
   changes the model reproduces the source exactly.
@@ -82,6 +90,29 @@ def _rescale(rate: float, base: float, change: dict) -> float:
     return rate * (1 + _sign(change) * number(change.get("value")) / base) if base else rate
 
 
+def _made(stream: dict, values: list[float], skip: int | None = None) -> tuple[float, float, bool]:
+    """A stream's volume in a month, the price of one unit of it, and whether it names a volume at all.
+
+    Volume metrics multiply into the units and the others into the price. A measure alongside is in neither.
+    """
+    units, price, counted = 1.0, 1.0, False
+    for index, (factor, value) in enumerate(zip(stream.get("factors") or [], values, strict=True)):
+        if index == skip or factor.get("alongside"):
+            continue
+        scaled = value / 100 if factor.get("unit") == "%" else value
+        if factor.get("volume"):
+            units *= scaled
+            counted = True
+        else:
+            price *= scaled
+    return units, price, counted
+
+
+def measure_key(stream_id: Any, factor_id: Any) -> str:
+    """Where a measure alongside a stream's volume is kept in the model."""
+    return f"{stream_id}:{factor_id}"
+
+
 def change_key(change: dict) -> str:
     """Where a change lands: one change per place."""
     target = change.get("target") or {}
@@ -129,17 +160,62 @@ class Plan:
         for row in self.activities:
             self.items.append({"id": str(row["id"]), "kind": "activity", "key": f"na:{row['id']}", "row": row, "area": 5})
         self.item_by_id = {item["id"]: item for item in self.items}
+        self._read_today()
         self.model = self.revenue(lambda _id: False, 0.0)
         self.rates: dict[str, float] = {}
         for line in self.lines:
             behavior, link = line.get("behavior"), line.get("link")
             if behavior == "unit":
-                driver = self.model["volume"].get(link)
+                driver = self.model["measures"].get(measure_key(link, line["measure"])) if line.get("measure") else self.model["volume"].get(link)
             elif behavior == "pct":
                 driver = self.model["total"] if link == ALL else self.model["revenue"].get(link)
             else:
                 driver = 0
             self.rates[line["id"]] = number(line.get("base")) / driver if driver else 0.0
+
+    # ------------------------------------------------------------------ today
+    def _read_today(self) -> None:
+        """Every stream as it stands today: its metrics, what it brings in a year when it says so, and its volume.
+
+        `stated` holds the yearly revenue of each stream that states it, and of the one stream that takes what the
+        others leave of the source's revenue. `today` holds each metric's value; a stated stream's price is worked
+        out here by division. `measured` says whether a stream has a volume to divide by and to grow.
+        """
+        self.stated: dict[str, float] = {}
+        self.today: dict[str, list[float]] = {}
+        self.measured: dict[str, bool] = {}
+        self.base: dict[str, tuple[float, float]] = {}
+        described, rest = 0.0, None
+        for stream in self.streams:
+            typed = [number(factor.get("value")) for factor in stream.get("factors") or []]
+            self.today[stream["id"]] = typed
+            if stream.get("remainder") and rest is None:
+                rest = stream
+            elif stream.get("monthly_revenue") is not None and not stream.get("remainder"):
+                self.stated[stream["id"]] = number(stream.get("monthly_revenue")) * 12
+            else:
+                units, price, _counted = _made(stream, typed)
+                described += units * price * 12
+        if rest is not None:
+            self.stated[rest["id"]] = max(0.0, number(self.baseline.get("revenue")) - described - sum(self.stated.values()))
+        for stream in self.streams:
+            identifier = stream["id"]
+            rows, typed = stream.get("factors") or [], self.today[identifier]
+            units, price, counted = _made(stream, typed)
+            measured = counted and units > 0
+            if identifier in self.stated:
+                prices = [index for index, factor in enumerate(rows) if not factor.get("volume") and not factor.get("alongside")]
+                if prices:
+                    # The price is never typed: one unit brings the stream's revenue divided by its volume. With no
+                    # volume yet, the whole month stands in for one unit.
+                    last = prices[-1]
+                    _units, others, _counted = _made(stream, typed, skip=last)
+                    one = self.stated[identifier] / 12 / (units if measured else 1.0)
+                    worked = one / others if others > 0 else one
+                    typed[last] = worked * 100 if rows[last].get("unit") == "%" else worked
+                    _units, price, _counted = _made(stream, typed)
+            self.measured[identifier] = measured
+            self.base[identifier] = (units, price)
 
     # ------------------------------------------------------------------ items
     def _change_area(self, key: str) -> int:
@@ -182,31 +258,38 @@ class Plan:
         volume: dict[str, float] = {}
         revenue: dict[str, float] = {}
         factors: dict[str, list[float]] = {}
+        measures: dict[str, float] = {}
         total = 0.0
         for stream in self.streams:
+            identifier = stream["id"]
             rows = stream.get("factors") or []
             values = []
-            for factor in rows:
-                change = self.change_at.get(f"f:{stream['id']}:{factor.get('id')}")
-                current = number(factor.get("value"))
+            for factor, current in zip(rows, self.today[identifier], strict=True):
+                change = self.change_at.get(f"f:{identifier}:{factor.get('id')}")
                 values.append(max(0.0, _apply(current, change)) if change and on(str(change["id"])) else current)
             for activity in self.growth:
-                if activity.get("stream_id") != stream["id"] or not on(str(activity["id"])):
+                if activity.get("stream_id") != identifier or not on(str(activity["id"])):
                     continue
                 at = next((index for index, factor in enumerate(rows) if factor.get("id") == activity.get("factor_id")), None)
                 if at is not None:
                     values[at] += number(activity.get("added_per_month"))
-            units, price = 1.0, 1.0
+            units, price, _counted = _made(stream, values)
+            units_today, price_today = self.base[identifier]
+            measured = self.measured[identifier]
+            # How far the plan moves the stream's volume; measures alongside move with it.
+            grown = units / units_today if measured else 1.0
+            if identifier in self.stated:
+                # The stream brings what it states, moved by what the plan does to its volume and to its price.
+                volume[identifier] = units * 12 if measured else 0.0
+                revenue[identifier] = self.stated[identifier] * grown * (price / price_today if price_today > 0 else 1.0)
+            else:
+                volume[identifier] = units * 12
+                revenue[identifier] = units * price * 12
             for factor, value in zip(rows, values, strict=True):
-                scaled = value / 100 if factor.get("unit") == "%" else value
-                if factor.get("volume"):
-                    units *= scaled
-                else:
-                    price *= scaled
-            volume[stream["id"]] = units * 12
-            revenue[stream["id"]] = units * price * 12
-            factors[stream["id"]] = values
-            total += revenue[stream["id"]]
+                if factor.get("alongside"):
+                    measures[measure_key(identifier, factor.get("id"))] = value * grown * 12
+            factors[identifier] = values
+            total += revenue[identifier]
         pricing = self.change_at.get("pricing")
         if pricing and on(str(pricing["id"])) and base_total:
             if pricing.get("mode") == "percent":
@@ -215,7 +298,7 @@ class Plan:
                 lift = 1 + _sign(pricing) * number(pricing.get("value")) / base_total
             revenue = {key: value * lift for key, value in revenue.items()}
             total *= lift
-        return {"volume": volume, "revenue": revenue, "total": total, "factors": factors}
+        return {"volume": volume, "revenue": revenue, "total": total, "factors": factors, "measures": measures}
 
     def behavior(self, line: dict) -> str:
         """A line whose driver is zero today is held fixed."""
@@ -236,7 +319,8 @@ class Plan:
             elif behavior == "unit":
                 # A per-unit line moves by dollars a unit, a percent of itself, or dollars a year at the source's volume.
                 unit = rate if not active else _rescale(rate, base, change) if change.get("mode") == "annual" else _apply(rate, change)
-                value = unit * (model["volume"].get(link) or 0.0)
+                driver = model["measures"].get(measure_key(link, line["measure"])) if line.get("measure") else model["volume"].get(link)
+                value = unit * (driver or 0.0)
             else:
                 share = rate
                 if active:
@@ -283,6 +367,7 @@ class Plan:
             "lines": amounts,
             "stream_revenue": model["revenue"],
             "stream_volume": model["volume"],
+            "measures": model["measures"],
             "factors": model["factors"],
         }
 
@@ -348,6 +433,51 @@ def metrics(baseline: dict, scenario: dict | None, annual_debt: float | None, ch
         "operating_margin": noi / revenue if revenue else None,
         "debt_service": annual_debt,
     }
+
+
+# Units that count nothing: the one sale a month a plan used to be seeded with, and a multiplier left at one.
+_PLACEHOLDER_UNITS = {"count", "multiplier"}
+
+
+def _counts_something(stream: dict, today: list[float]) -> bool:
+    """False for a volume that only stands in for one: one sale a month, a multiplier of one."""
+    return any(factor.get("volume") and not factor.get("alongside") and not (factor.get("unit") in _PLACEHOLDER_UNITS and value == 1)
+               for factor, value in zip(stream.get("factors") or [], today, strict=True))
+
+
+def per_unit(plan: Plan, scenarios: dict[str, dict]) -> list[dict]:
+    """What one unit of a stream's volume, and of each measure alongside it, brings in and costs.
+
+    Revenue is the stream's own. The cost is every cost on the source (cost of goods sold and operating expenses)
+    shared between the streams by revenue, so the per-unit figures of all the streams add back up to the
+    business's NOI. A stream with nothing to divide by has no row; `factor_id` None is the stream's own volume.
+    """
+    base = plan.baseline
+
+    def one(revenue: float, total: float, costs: float, quantity: float | None) -> dict | None:
+        if not quantity or quantity <= 0:
+            return None
+        carried = costs * revenue / total if total else 0.0
+        return {"quantity": quantity, "revenue": revenue / quantity, "cost": carried / quantity, "noi": (revenue - carried) / quantity}
+
+    rows = []
+    for stream in plan.streams:
+        identifier = stream["id"]
+        places: list[tuple[Any, str | None]] = []
+        if plan.measured[identifier] and _counts_something(stream, plan.today[identifier]):
+            places.append((None, None))
+        places += [(factor.get("id"), measure_key(identifier, factor.get("id"))) for factor in stream.get("factors") or [] if factor.get("alongside")]
+        for factor_id, key in places:
+            today = one(plan.model["revenue"][identifier], plan.model["total"], number(base.get("cogs")) + number(base.get("operating_expenses")),
+                        plan.model["volume"].get(identifier) if key is None else plan.model["measures"].get(key))
+            if today is None:
+                continue
+            row = {"stream_id": identifier, "factor_id": factor_id, "today": today}
+            for view, scenario in scenarios.items():
+                row[view] = one(scenario["stream_revenue"][identifier], sum(scenario["stream_revenue"].values()), scenario["cogs"] + scenario["opex"],
+                                scenario["stream_volume"].get(identifier) if key is None else scenario["measures"].get(key))
+            rows.append(row)
+    return rows
 
 
 def to_finish(plan: Plan, *, questions: Iterable[dict] = ()) -> list[dict]:
@@ -417,7 +547,10 @@ def evaluate(body: dict, baseline: dict, *, target_dscr: float = TARGET_DSCR, go
     return {
         "model": {"volume": plan.model["volume"], "revenue": plan.model["revenue"], "total": plan.model["total"],
                   "difference": plan.model["total"] - number(baseline.get("revenue")),
-                  "reconciles": abs(plan.model["total"] - number(baseline.get("revenue"))) <= RECONCILE_TOLERANCE},
+                  "reconciles": abs(plan.model["total"] - number(baseline.get("revenue"))) <= RECONCILE_TOLERANCE,
+                  # Today's value of every metric (a stated stream's price is worked out, not typed) and of every measure alongside.
+                  "factors": plan.model["factors"], "measures": plan.model["measures"]},
+        "per_unit": per_unit(plan, scenarios),
         "rates": plan.rates,
         "behaviors": {line["id"]: plan.behavior(line) for line in plan.lines},
         "items": [{"id": item["id"], "kind": item["kind"], "key": item["key"], "area": item["area"], "label": plan.label(item["id"]),

@@ -10,6 +10,7 @@ from app.tests.earnings_plan_fixture import (
     QUESTIONS,
     REFERENCE,
     item_id,
+    measured_body,
     reference_baseline,
     reference_body,
 )
@@ -217,3 +218,113 @@ def test_a_cost_that_follows_revenue_can_be_changed_by_dollars_a_year():
     assert near(engine.evaluate(body, reference_baseline())["proposed"]["lines"]["o1"], 30_000)
     body["changes"][0].update(direction="down", value=99_000)
     assert engine.evaluate(body, reference_baseline())["proposed"]["lines"]["o1"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Revenue is the known figure: a stream states it, and the price of one unit comes from dividing.
+# The same figures as the dashboard's earningsPlanMath.test.ts.
+# ---------------------------------------------------------------------------
+
+def metric(factor_id: str, direction: str, value: float, mode: str = "percent") -> dict:
+    return {"id": item_id(f"f:s1:{factor_id}"), "target": {"kind": "factor", "stream_id": "s1", "factor_id": factor_id}, "direction": direction,
+            "mode": mode, "value": value, "start_month": 1, "note": "Agreed with the owner."}
+
+
+def test_a_stream_that_is_all_revenue_divides_it_by_its_volume():
+    result = engine.evaluate(measured_body(), reference_baseline())
+    model = result["model"]
+    # $1,236,000 a year is $103,000 a month: 400 units a month is $257.50 a unit, 1,200 hours a month $85.83 an hour.
+    assert model["total"] == 1_236_000 and model["reconciles"] is True and model["difference"] == 0
+    assert model["revenue"] == {"s1": 1_236_000} and model["volume"] == {"s1": 4_800} and model["measures"] == {"s1:f2": 14_400}
+    assert model["factors"] == {"s1": [400, 257.5, 1_200]}
+    # Supplies are a cost per unit, wages a cost per labor hour, card processing a share of revenue.
+    assert result["rates"]["c1"] == pytest.approx(78.75) and result["rates"]["sal"] == pytest.approx(348_194 / 14_400) and result["rates"]["o1"] == pytest.approx(0.02)
+    assert result["behaviors"]["sal"] == "unit"
+    # With nothing proposed the plan is the source, to the dollar.
+    assert near(result["proposed"]["noi"], -30_777) and near(result["proposed"]["revenue"], 1_236_000)
+    volume, hours = result["per_unit"]
+    assert (volume["stream_id"], volume["factor_id"], hours["factor_id"]) == ("s1", None, "f2")
+    # Every cost on the source ($601,886 + $664,891) over the same units: one unit costs more than it brings in.
+    assert volume["today"] == pytest.approx({"quantity": 4_800, "revenue": 257.5, "cost": 263.911875, "noi": -6.411875})
+    assert hours["today"] == pytest.approx({"quantity": 14_400, "revenue": 85.8333333333, "cost": 87.970625, "noi": -2.1372916667})
+    assert volume["proposed"] == pytest.approx(volume["today"]) and hours["reviewed"] == pytest.approx(hours["today"])
+
+
+def test_volume_price_and_a_measure_alongside_each_move_what_follows_them():
+    body = measured_body()
+    body["changes"] = [metric("f0", "up", 10), metric("f2", "down", 5), metric("f1", "up", 5, "amount")]
+    result = engine.evaluate(body, reference_baseline())
+    plan = result["proposed"]
+    # 440 units at $262.50; hours follow the units and are then cut 5% (1,200 x 1.1 x 0.95 a month).
+    assert plan["factors"]["s1"] == pytest.approx([440, 262.5, 1_140]) and plan["stream_volume"]["s1"] == pytest.approx(5_280)
+    assert plan["measures"]["s1:f2"] == pytest.approx(15_048)
+    assert near(plan["revenue"], 1_386_000)
+    assert near(plan["lines"]["c1"], 415_800) and near(plan["lines"]["sal"], 363_862.73) and near(plan["lines"]["o1"], 27_720)
+    assert near(plan["noi"], 62_754.27)
+    volume, hours = result["per_unit"]
+    assert volume["proposed"] == pytest.approx({"quantity": 5_280, "revenue": 262.5, "cost": 250.6147215909, "noi": 11.8852784091})
+    assert hours["proposed"] == pytest.approx({"quantity": 15_048, "revenue": 92.1052631579, "cost": 87.9349900319, "noi": 4.170273126})
+    # Nothing here is reviewed, so the reviewed figures stay where the source is.
+    assert volume["reviewed"] == pytest.approx(volume["today"])
+    # Cutting hours alone moves the wages that follow them and nothing else.
+    body["changes"] = [metric("f2", "down", 5)]
+    alone = engine.evaluate(body, reference_baseline())["proposed"]
+    assert near(alone["revenue"], 1_236_000) and near(alone["lines"]["sal"], 348_194 * 0.95) and near(alone["lines"]["c1"], 378_000)
+    assert near(alone["noi"], -30_777 + 348_194 * 0.05)
+
+
+def test_streams_always_add_up_to_the_source_while_one_holds_the_rest():
+    body = measured_body()
+    body["streams"] = [
+        {"id": "s1", "name": "Other revenue", "type": "custom", "remainder": True, "factors": [{"id": "f1", "label": "Revenue per month", "value": None, "unit": "$", "volume": False}]},
+        {"id": "s2", "name": "Detail packages", "type": "units", "monthly_revenue": 75_000, "factors": [
+            {"id": "f0", "label": "Units sold", "value": 300, "unit": "units / mo", "volume": True}, {"id": "f1", "label": "Price per unit", "value": None, "unit": "$", "volume": False}]},
+    ]
+    body["lines"] = [{**line, "behavior": "fixed", "link": "all", "measure": None} for line in body["lines"]]
+    base = reference_baseline()
+    model = engine.evaluate(body, base)["model"]
+    # $75,000 a month over 300 units is $250 a unit; the other stream is what is left of $103,000 a month.
+    assert model["revenue"] == {"s1": 336_000, "s2": 900_000} and model["total"] == 1_236_000 and model["reconciles"] is True
+    assert model["factors"] == {"s1": [28_000], "s2": [300, 250]} and model["volume"] == {"s1": 0, "s2": 3_600}
+    # A stream with nothing to divide by has no per-unit figures; the measured one carries its share of the costs.
+    rows = engine.evaluate(body, base)["per_unit"]
+    assert [(row["stream_id"], row["factor_id"]) for row in rows] == [("s2", None)]
+    assert rows[0]["today"] == pytest.approx({"quantity": 3_600, "revenue": 250, "cost": 256.2251213592, "noi": -6.2251213592})
+    # The source changes: the stated stream keeps what it states and the rest follows.
+    moved = engine.evaluate(body, {**base, "revenue": 1_300_000})["model"]
+    assert moved["revenue"] == {"s1": 400_000, "s2": 900_000} and moved["reconciles"] is True
+    # A stream with no volume typed yet still brings its revenue, and a change to that volume has nothing to move.
+    unmeasured = copy.deepcopy(body)
+    unmeasured["streams"][1]["factors"][0]["value"] = None
+    unmeasured["changes"] = [{**metric("f0", "up", 10), "target": {"kind": "factor", "stream_id": "s2", "factor_id": "f0"}}]
+    result = engine.evaluate(unmeasured, base)
+    assert result["model"]["revenue"]["s2"] == 900_000 and result["model"]["volume"]["s2"] == 0 and result["model"]["factors"]["s2"] == [0, 75_000]
+    assert near(result["proposed"]["revenue"], 1_236_000) and result["per_unit"] == []
+    # A price change on the stream that holds the rest moves that stream alone.
+    priced = copy.deepcopy(body)
+    priced["changes"] = [{**metric("f1", "up", 10), "target": {"kind": "factor", "stream_id": "s1", "factor_id": "f1"}}]
+    assert engine.evaluate(priced, base)["proposed"]["stream_revenue"] == pytest.approx({"s1": 369_600, "s2": 900_000})
+    # Streams that state more than the source leave nothing for the rest, and the model says by how much it is over.
+    body["streams"][1]["monthly_revenue"] = 110_000
+    over = engine.evaluate(body, base)
+    assert over["model"]["revenue"] == {"s1": 0, "s2": 1_320_000} and over["model"]["difference"] == 84_000 and over["model"]["reconciles"] is False
+    assert [item["code"] for item in over["to_finish"] if item["step"] == 1] == ["reconcile_revenue"]
+
+
+def test_a_plan_described_as_units_times_price_still_gets_per_unit_figures(result):
+    # The design's three streams: $250 a unit, $1,500 a contract, $100 an hour, each carrying its share of every cost.
+    rows = {row["stream_id"]: row for row in result["per_unit"]}
+    assert [row["factor_id"] for row in result["per_unit"]] == [None, None, None]
+    assert rows["s1"]["today"] == pytest.approx({"quantity": 3_600, "revenue": 250, "cost": 256.2251213592, "noi": -6.2251213592})
+    assert rows["s2"]["today"]["revenue"] == pytest.approx(1_500) and rows["s3"]["today"]["revenue"] == pytest.approx(100)
+    assert rows["s1"]["proposed"] == pytest.approx({"quantity": 4_080, "revenue": 262, "cost": 231.5407474683, "noi": 30.4592525317})
+    # Shared by revenue, the streams' costs add back up to every cost on the source.
+    assert sum(row["today"]["cost"] * row["today"]["quantity"] for row in result["per_unit"]) == pytest.approx(601_886 + 664_891)
+    # One sale a month, as plans were once seeded, counts nothing: there is no per-unit figure to print.
+    seeded = reference_body()
+    seeded.update(changes=[], growth=[], activities=[])
+    seeded["lines"] = [{**line, "behavior": "fixed", "link": "all"} for line in seeded["lines"]]
+    seeded["streams"] = [{"id": "s1", "name": "All revenue", "type": "custom", "factors": [
+        {"id": "f0", "label": "Sales", "value": 1, "unit": "count", "volume": True}, {"id": "f1", "label": "Revenue per month", "value": 103_000, "unit": "$", "volume": False}]}]
+    old = engine.evaluate(seeded, reference_baseline())
+    assert old["model"]["total"] == 1_236_000 and old["per_unit"] == []

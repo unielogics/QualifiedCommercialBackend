@@ -136,10 +136,23 @@ _PROPOSAL_FIELDS = {
 
 
 def model_stamp(body: dict) -> str:
-    """The revenue model and cost lines every change rests on."""
-    return _stamp({"streams": [{"id": stream["id"], "factors": [[factor["id"], factor.get("value"), factor.get("unit"), bool(factor.get("volume"))]
-                                                               for factor in stream.get("factors") or []]} for stream in body.get("streams") or []],
-                   "lines": [[line["id"], line.get("group"), line.get("base"), line.get("behavior"), line.get("link")] for line in body.get("lines") or []]})
+    """The revenue model and cost lines every change rests on.
+
+    What a stream states about its revenue, a measure alongside and a cost's measure are added only where a plan
+    uses them, so a plan described the earlier way keeps the stamp its approvals were given to.
+    """
+    def stream_key(stream: dict) -> dict:
+        key: dict = {"id": stream["id"], "factors": [[factor["id"], factor.get("value"), factor.get("unit"), bool(factor.get("volume")),
+                                                      *(["alongside"] if factor.get("alongside") else [])] for factor in stream.get("factors") or []]}
+        if stream.get("remainder"):
+            key["remainder"] = True
+        elif stream.get("monthly_revenue") is not None:
+            key["monthly_revenue"] = stream["monthly_revenue"]
+        return key
+
+    return _stamp({"streams": [stream_key(stream) for stream in body.get("streams") or []],
+                   "lines": [[line["id"], line.get("group"), line.get("base"), line.get("behavior"), line.get("link"), *([line["measure"]] if line.get("measure") else [])]
+                             for line in body.get("lines") or []]})
 
 
 def proposal_stamp(block: str, row: dict, body: dict) -> str:
@@ -179,7 +192,7 @@ def _effective_date(body: dict, month: int) -> str | None:
     return date(year + index // 12, index % 12 + 1, 1).isoformat()
 
 
-def _action_kind(item: dict, effect: dict) -> str:
+def _action_kind(plan: engine.Plan, item: dict, effect: dict) -> str:
     if item["kind"] == "growth":
         return "marketing_investment"
     if item["kind"] == "activity":
@@ -188,6 +201,11 @@ def _action_kind(item: dict, effect: dict) -> str:
     if target.get("kind") == "pricing":
         return "price_change"
     if target.get("kind") == "factor":
+        stream = plan.stream_by_id.get(target.get("stream_id")) or {}
+        factor = next((row for row in stream.get("factors") or [] if row.get("id") == target.get("factor_id")), {})
+        # A measure counted alongside a stream's volume moves the costs that follow it and never revenue.
+        if factor.get("alongside"):
+            return "expense_increase" if item["row"].get("direction") == "up" else "expense_reduction"
         return "unit_volume"
     if target.get("kind") == "group":
         return "expense_group_change"
@@ -206,7 +224,7 @@ def _actions(plan: engine.Plan, detail: dict, body: dict, stale: set[str]) -> li
         group = target.get("group") or (plan.line_by_id.get(target.get("line_id")) or {}).get("group")
         flags = ["The source figures or the plan's model changed after this change was reviewed. Staff must review it again."] if state == "stale" else []
         rows.append({
-            "id": item["id"], "label": plan.label(item["id"]), "kind": _action_kind(item, effect), "plan_kind": item["kind"],
+            "id": item["id"], "label": plan.label(item["id"]), "kind": _action_kind(plan, item, effect), "plan_kind": item["kind"],
             "area": item["area"], "product_name": "", "status": row.get("status") or "proposed", "excluded": not included, "review_state": state,
             "gross_annual_impact": _money(effect["ebitda"] + recurring_setup), "implementation_recurring_annual": _money(recurring_setup),
             "implementation_one_time": _money(effect["one_time"]), "net_annual_impact": _money(effect["ebitda"]),

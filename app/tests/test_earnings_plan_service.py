@@ -16,10 +16,17 @@ from app.schemas import earnings_improvement as v1_schema
 from app.schemas import earnings_plan_v2 as schema
 from app.services import client_financial_forms, operating_plan_forms, operating_plan_schema
 from app.services import earnings_improvement as v1
+from app.services import earnings_plan_envelope as envelope
 from app.services import earnings_plan_service as plan_service
 from app.services import financial_workspace as ws
 from app.services import operating_plan_service as service
-from app.tests.earnings_plan_fixture import REVIEWED_IN_DESIGN, file_body, file_cockpit, item_id
+from app.tests.earnings_plan_fixture import (
+    REVIEWED_IN_DESIGN,
+    file_body,
+    file_cockpit,
+    item_id,
+    measured_body,
+)
 from app.tests.test_financial_workspace import Memory, context
 
 STAFF = SimpleNamespace(id=uuid4(), role=Role.LOAN_EXEC, name="Desk")
@@ -568,3 +575,76 @@ async def test_the_read_back_of_a_plan_says_dollars_a_year_in_words():
     units = {row[3] for row in rows}
     assert pdf is None and read["draft"] is True
     assert "dollars a year" in units and "annual" not in units and units <= {"dollars a year", "amount", "percent", "per month"}
+
+
+def refused(body) -> str:
+    with pytest.raises(HTTPException) as caught:
+        schema.validate_body(body)
+    return " ".join(error["msg"] for error in caught.value.detail["errors"])
+
+
+def test_a_stream_states_its_revenue_or_holds_the_rest_and_never_both():
+    saved = schema.validate_body(measured_body())
+    stream = saved["streams"][0]
+    assert stream["remainder"] is True and stream["monthly_revenue"] is None
+    assert [(factor["id"], factor["volume"], factor["alongside"]) for factor in stream["factors"]] == [("f0", True, False), ("f1", False, False), ("f2", False, True)]
+    assert next(line for line in saved["lines"] if line["id"] == "sal")["measure"] == "f2"
+    # The stream that holds the rest states nothing of its own, and a measure alongside is never part of the volume.
+    body = measured_body()
+    body["streams"][0].update(monthly_revenue=90_000)
+    body["streams"][0]["factors"][2]["volume"] = True
+    cleaned = schema.validate_body(body)["streams"][0]
+    assert cleaned["monthly_revenue"] is None and cleaned["factors"][2]["volume"] is False and cleaned["factors"][2]["alongside"] is True
+    # Only one stream can be what the others leave.
+    body = measured_body()
+    body["streams"].append({"id": "s2", "name": "Other", "type": "custom", "remainder": True, "factors": [{"id": "f1", "label": "Revenue per month", "unit": "$"}]})
+    assert "Only one revenue stream can hold what the others do not explain" in refused(body)
+    # A stream that states its revenue keeps it, and a negative amount is not revenue.
+    body["streams"][1].update(remainder=False, monthly_revenue=40_000)
+    assert schema.validate_body(body)["streams"][1]["monthly_revenue"] == 40_000
+    body["streams"][1]["monthly_revenue"] = -1
+    assert "greater than or equal to 0" in refused(body)
+
+
+def test_a_cost_per_unit_follows_its_streams_volume_or_a_measure_alongside_it():
+    # The volume itself is not a measure alongside, and neither is a metric of another stream.
+    body = measured_body()
+    next(line for line in body["lines"] if line["id"] == "sal")["measure"] = "f0"
+    assert "must follow its stream's volume or one of the measures alongside it" in refused(body)
+    body = measured_body()
+    next(line for line in body["lines"] if line["id"] == "sal")["measure"] = "gone"
+    assert "must follow its stream's volume or one of the measures alongside it" in refused(body)
+    # A cost that is fixed, or a share of revenue, follows no measure.
+    body = measured_body()
+    for line in body["lines"]:
+        if line["id"] == "sal":
+            line.update(behavior="pct")
+        if line["id"] == "rent":
+            line.update(measure="f2")
+    lines = {line["id"]: line for line in schema.validate_body(body)["lines"]}
+    assert lines["sal"]["measure"] is None and lines["rent"]["measure"] is None
+    # Growth adds volume, so it cannot feed a measure revenue does not follow.
+    body = measured_body()
+    body["growth"] = [{"id": str(uuid4()), "name": "Extra shifts", "monthly_spend": 500, "stream_id": "s1", "factor_id": "f2", "added_per_month": 40, "note": "More hours."}]
+    assert "must feed a volume metric" in refused(body)
+
+
+def test_an_approval_is_given_to_what_a_stream_states_and_older_plans_keep_their_stamp():
+    # A plan described as units times price keeps exactly the stamp its approvals were given to.
+    body = schema.validate_body(file_body())
+    earlier = envelope._stamp({
+        "streams": [{"id": stream["id"], "factors": [[factor["id"], factor.get("value"), factor.get("unit"), bool(factor.get("volume"))] for factor in stream["factors"]]}
+                    for stream in body["streams"]],
+        "lines": [[line["id"], line.get("group"), line.get("base"), line.get("behavior"), line.get("link")] for line in body["lines"]]})
+    assert envelope.model_stamp(body) == earlier
+    # Stating revenue, measuring it another way or hanging a cost on a measure is a different model.
+    measured = schema.validate_body(measured_body())
+    stamps = {envelope.model_stamp(measured)}
+    for change in (lambda plan: plan["streams"][0].update(remainder=False, monthly_revenue=103_000),
+                   lambda plan: plan["streams"][0]["factors"][2].update(value=1_300),
+                   lambda plan: next(line for line in plan["lines"] if line["id"] == "sal").update(measure=None)):
+        other = deepcopy(measured)
+        change(other)
+        stamps.add(envelope.model_stamp(schema.validate_body(other)))
+    assert len(stamps) == 4
+

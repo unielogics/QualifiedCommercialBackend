@@ -61,9 +61,10 @@ def seed(cockpit: dict, *, business_name: str = "", today: date | None = None) -
     if not baseline["available"]:
         return schema.validate_body(body)
     body["source"] = {"stamp": envelope.baseline_stamp(baseline), "confirmations": {}, "corrections": {}}
-    body["streams"] = [{"id": SEED_STREAM, "name": "All revenue", "type": "custom", "factors": [
-        {"id": "f0", "label": "Sales", "value": 1, "unit": "count", "volume": True},
-        {"id": "f1", "label": "Revenue per month", "value": round(baseline["revenue"] / 12, 4), "unit": "$", "volume": False}]}]
+    # One stream that is all of the source's revenue, so the model equals the average month from the start and keeps
+    # equalling it when the source changes. The business then says what that month is made of: units, hours, jobs.
+    body["streams"] = [{"id": SEED_STREAM, "name": "All revenue", "type": "custom", "remainder": True, "factors": [
+        {"id": "f1", "label": "Revenue per month", "value": None, "unit": "$", "volume": False}]}]
     body["lines"] = [{"id": group["key"], "group": group["key"], "label": group["label"], "base": round(group["amount"], 2),
                       "behavior": "fixed", "link": schema.ALL} for group in baseline["groups"] if group["amount"] > 0]
     return schema.validate_body(body)

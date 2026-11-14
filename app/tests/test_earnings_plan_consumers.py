@@ -16,7 +16,7 @@ from app.services import earnings_improvement as v1
 from app.services import earnings_plan_pdf as document
 from app.services import earnings_plan_service as plan_service
 from app.services import financial_baseline, operating_plan_schema, operating_plan_service
-from app.tests.earnings_plan_fixture import file_body, file_cockpit
+from app.tests.earnings_plan_fixture import file_body, file_cockpit, item_id
 from app.tests.test_earnings_plan_pdf import words
 from app.tests.test_earnings_plan_service import approve, finished
 from app.tests.test_financial_baseline import filed_return
@@ -157,3 +157,31 @@ def test_a_loan_cost_the_budget_has_not_confirmed_counts_as_zero_and_is_flagged(
     plain_body, plain_cockpit = file_with()
     plain = v1.evaluate(plain_body, plain_cockpit)
     assert plain_cockpit["baseline"]["debt_service"]["new_operating_confirmed"] is True and not any("not confirmed" in flag for flag in plain["risk_flags"])
+
+
+def test_a_plan_that_states_its_revenue_reads_the_same_for_every_reader():
+    # Revenue stated and divided by what is counted is one more way to describe the same file: nothing downstream reads it differently.
+    cockpit = file_cockpit(goal=215_000)
+    body = file_body(measured=True)
+
+    def metric(factor_id, direction, value, mode="percent"):
+        return {"id": item_id(f"f:s1:{factor_id}"), "target": {"kind": "factor", "stream_id": "s1", "factor_id": factor_id}, "direction": direction,
+                "mode": mode, "value": value, "start_month": 1, "note": "Agreed with the owner."}
+
+    body["changes"] = [metric("f0", "up", 10), metric("f2", "down", 5), metric("f1", "up", 5, "amount")]
+    body = finished(body)
+    seen, evaluation = readers(body, cockpit)
+    plan = seen["plan"]
+    # NOI moves from -30,777 to 62,754.27; EBITDA carries the same 8,400 of other income above it.
+    assert plan["today"] == (-22377.0, -30777.0, -0.03, -799977.0, -2.49, 777600.0)
+    assert plan["proposed"] == (71154.27, 62754.27, 0.4, -106445.73, 4.53, 177600.0)
+    assert seen["comparison"] == plan
+    for reader in ("package", "partner"):
+        ebitda, noi, dscr, _cash, _margin, debt = plan["proposed"]
+        assert seen[reader]["proposed"] == (ebitda, noi, dscr, debt), reader
+    assert seen["marketplace"]["proposed"] == plan["proposed"][:4]
+    # More units and a higher price are revenue changes; fewer hours for the same units is a cost change, and reads as one.
+    kinds = {row["label"]: (row["kind"], row["revenue_change_annual"]) for row in evaluation["actions"]}
+    assert kinds["All revenue · Labor hours"] == ("expense_reduction", 0.0)
+    assert kinds["All revenue · Units sold"][0] == kinds["All revenue · Revenue per unit"][0] == "unit_volume"
+    assert evaluation["plan"]["model"]["reconciles"] is True and evaluation["plan"]["per_unit"][0]["today"]["revenue"] == 257.5

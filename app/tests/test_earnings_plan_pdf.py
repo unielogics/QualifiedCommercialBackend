@@ -107,7 +107,9 @@ def test_each_part_prints_the_source_the_model_the_changes_and_the_handoff():
             "Current payments $64,800 / mo New payment $14,800 / mo Cash released $50,000 / mo DSCR from terms alone −0.03x → −0.13x",
             "Payroll taxes Included in another line", "Transportation Not applicable",
             # 3 · the revenue model and how each cost behaves
-            "Reconciles to IRS revenue", "Units sold 300 units / mo Price per unit $250.00 Units sold 340 units / mo Price per unit $262.00 $900,000 $1,068,960",
+            "Reconciles to IRS revenue",
+            "Units sold 300 units / mo Price per unit $250.00 Per unit: $250.00 revenue · $256.23 cost "
+            "Units sold 340 units / mo Price per unit $262.00 Per unit: $262.00 revenue · $231.54 cost $900,000 $1,068,960",
             "Revenue model $1,236,000 $1,500,960", "$105.00 per unit of Detail packages", "55.0% of Fleet maintenance contracts revenue", "2.0% of all revenue",
             "Cost of goods sold $601,886 $677,666 +$75,780", "Growth spending and new activities", "$0 $50,400 +$50,400", "Operating expenses $664,891 $648,797 −$16,094",
             # 4 · every change with its logic
@@ -303,3 +305,40 @@ def test_a_change_in_dollars_a_year_reads_as_dollars_a_year():
     assert "Rent Decrease by $28,805 a year · $196,805 → $168,000 a year" in text
     untouched, plain_facts = saved()
     assert "Card processing Decrease by 0.4 pts" in words(document.build_html(body=untouched, financial_totals=plain_facts))
+
+
+def test_a_stream_that_states_its_revenue_prints_what_one_unit_brings_in_and_costs():
+    cockpit = file_cockpit(goal=215_000)
+    body = file_body(measured=True)
+
+    def metric(factor_id, direction, value, mode="percent"):
+        return {"id": item_id(f"f:s1:{factor_id}"), "target": {"kind": "factor", "stream_id": "s1", "factor_id": factor_id}, "direction": direction,
+                "mode": mode, "value": value, "start_month": 1, "note": "Agreed with the owner."}
+
+    body["changes"] = [metric("f0", "up", 10), metric("f2", "down", 5), metric("f1", "up", 5, "amount")]
+    body = schema.validate_body(finished(body))
+    evaluation = v1.evaluate(body, cockpit)
+    facts = plan_service.version_facts(operating_plan_schema.key_facts(body), body, cockpit, evaluation, client_submission=False, goal=cockpit["_operating_goal"])
+    text = words(document.build_html(body=body, financial_totals=facts))
+    # Today: the quantities are typed, the price is revenue divided by them, and one unit carries every cost on the source.
+    assert "Units sold 400 units / mo Revenue per unit $257.50 Labor hours 1,200 hrs / mo" in text
+    assert "Per unit: $257.50 revenue · $263.91 cost Per hour: $85.83 revenue · $87.97 cost" in text
+    # With the plan: more units at a higher price, fewer hours for each.
+    assert "Units sold 440 units / mo Revenue per unit $262.50 Labor hours 1,140 hrs / mo" in text
+    assert "Per unit: $262.50 revenue · $250.61 cost Per hour: $92.11 revenue · $87.93 cost" in text
+    assert "All revenue Custom metrics · 4,800 a year · $257.50 revenue per unit" in text
+    assert "A stream states what it brings in an average month; the price of one unit is that revenue divided by the stream's volume, and is never typed." in text
+    # Each cost names what it follows: the units, the hours alongside them, or revenue.
+    assert "$78.75 per unit of All revenue" in text and "$24.18 per hour of All revenue (labor hours)" in text and "2.0% of all revenue" in text
+    # A change to the worked-out price starts from the worked-out price.
+    assert "Increase by $5.00 · $257.50 → $262.50" in text and "Decrease by 5% · 1,200 hrs / mo → 1,140 hrs / mo" in text
+    # A plan described as units times price reads as it always did, with its per-unit figures beside it.
+    earlier, earlier_facts = saved()
+    older = words(document.build_html(body=earlier, financial_totals=earlier_facts))
+    assert "Units sold 300 units / mo Price per unit $250.00 Per unit: $250.00 revenue · $256.23 cost" in older
+    assert "A stream's revenue is its metrics multiplied together over twelve months." in older
+    # A version saved before per-unit figures were kept still prints, without them.
+    earlier_facts["plan_result"].pop("per_unit")
+    earlier_facts["plan_result"]["model"].pop("factors")
+    assert "Units sold 300 units / mo Price per unit $250.00 Units sold" in words(document.build_html(body=earlier, financial_totals=earlier_facts))
+
