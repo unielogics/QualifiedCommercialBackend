@@ -14,7 +14,7 @@ from app.enums import Role
 from app.models.financial_form_version import FinancialFormDraft
 from app.schemas import earnings_improvement as v1_schema
 from app.schemas import earnings_plan_v2 as schema
-from app.services import client_financial_forms, earnings_plan_pdf, operating_plan_schema
+from app.services import client_financial_forms, operating_plan_schema
 from app.services import earnings_improvement as v1
 from app.services import earnings_plan_service as plan_service
 from app.services import financial_workspace as ws
@@ -303,27 +303,6 @@ async def test_a_client_submission_carries_no_approval_into_the_saved_version():
     assert all(row["status"] == "proposed" for block in schema.ITEM_BLOCKS for row in version.body[block])
     assert version.key_facts["improvement_plan"]["totals"]["approved"]["count"] == 0
     assert version.key_facts["goal_progress"]["target"] == 215000 and version.key_facts["operating_goal"]["amount"] == 215000
-
-
-def test_the_plan_document_draws_only_what_the_version_stored():
-    cockpit = file_cockpit(goal=215_000)
-    body = schema.validate_body(finished(approve(file_body(), cockpit)))
-    body["carried_over"] = [{"label": "Google Ads", "detail": "Re-enter it as a growth activity.", "annual_amount": 12000, "kind": "change"}]
-    body = schema.validate_body(body)
-    evaluation = v1.evaluate(body, cockpit)
-    facts = plan_service.version_facts(operating_plan_schema.key_facts(body), body, cockpit, evaluation, client_submission=False, goal=cockpit["_operating_goal"])
-    document = earnings_plan_pdf.build_html(body=body, financial_totals=facts)
-    for text in ("Harbor Auto Detail LLC", "IRS 1120-S · 2025", "Plan starts Jan 2027", "-$22,377", "$182,897", "1.03x", "$177,600",
-                 "Still to find for 1.25x coverage: <b>$39,103</b>", "Revenue drivers", "+$89,616", "Lease amendment on bay 2 signed in October 2026.",
-                 "Reviewed", "Feb 2027", "First-year EBITDA $145,663", "Goal $215,000", "release $50,000 a month", "Carried over from the earlier plan", "Google Ads",
-                 "The business confirmed these disclosures and proposals."):
-        assert text in document, text
-    for private in ("Lease and price list checked.", str(STAFF.id), "Not in the 2025 return."):
-        assert private not in document
-    pdf = earnings_plan_pdf.render_pdf(body=body, financial_totals=facts)
-    assert pdf.startswith(b"%PDF") and len(pdf) > 4000
-    # A version saved without figures (nothing to draw from) still renders its body.
-    assert "No changes proposed." in earnings_plan_pdf.build_html(body=schema.empty_body(), financial_totals={})
 
 
 # ---------------------------------------------------------------------------

@@ -252,21 +252,30 @@ def _debt_service(cockpit: dict[str, Any]) -> dict[str, Any]:
     after_annual = signed_number(evaluation.get("debt_service_after_annual")) if planned else None
     after_monthly = signed_number(evaluation.get("debt_service_after_regular_monthly")
                                   if "debt_service_after_regular_monthly" in evaluation else evaluation.get("debt_service_after_monthly")) if planned else None
+    # Recurring costs the saved terms add that the budget classes as operating expenses. They are the loan's, not the
+    # business's history, so they leave EBITDA and NOI alone and come off what covers the debt once the terms apply.
+    charges = signed_number(evaluation.get("annual_new_operating_expenses"))
+    charges_known = "annual_new_operating_expenses" not in evaluation or charges is not None
     return {
         "source": service.get("source"), "currency": service.get("currency") or "USD",
         "current_annual": _money(current_annual), "current_monthly": _money(current_monthly), "obligations": len(obligations),
         "with_terms_annual": _money(after_annual), "with_terms_monthly": _money(after_monthly),
         "released_monthly": _money(current_monthly - after_monthly) if current_monthly is not None and after_monthly is not None else None,
+        "new_operating_annual": _money(max(0.0, charges or 0.0)) if planned else None,
+        # False while the budget lists such a cost but its amounts are not confirmed: it is counted as zero until they are.
+        "new_operating_confirmed": charges_known if planned else None,
         "retired": evaluation.get("retired_count") if planned else None,
         "terms": {key: terms.get(key) for key in ("label", "source", "amount", "rate_pct", "term_months", "monthly_payment")} if terms else None,
     }
 
 
-def _metrics(ebitda, noi, revenue, annual_debt) -> dict[str, Any]:
+def _metrics(ebitda, noi, revenue, annual_debt, charges: float = 0.0) -> dict[str, Any]:
+    """The six figures against one debt service. ``charges`` are operating costs the loan itself adds: off coverage, not off earnings."""
+    covering = ebitda - charges if ebitda is not None else None
     return {
         "ebitda": _money(ebitda), "noi": _money(noi),
-        "dscr": round(ebitda / annual_debt, 2) if ebitda is not None and annual_debt else None,
-        "free_cash_flow": _money(ebitda - annual_debt) if ebitda is not None and annual_debt is not None else None,
+        "dscr": round(covering / annual_debt, 2) if covering is not None and annual_debt else None,
+        "free_cash_flow": _money(covering - annual_debt) if covering is not None and annual_debt is not None else None,
         "operating_margin": round(noi / revenue * 100, 2) if noi is not None and revenue else None,
         "debt_service": _money(annual_debt),
     }
@@ -274,11 +283,11 @@ def _metrics(ebitda, noi, revenue, annual_debt) -> dict[str, Any]:
 
 def _targets(ebitda, debt: dict[str, Any]) -> list[dict[str, Any]]:
     """Earnings still to find for each coverage goal; a target is not a forecast."""
-    def needed(ratio, annual):
-        return _money(max(0.0, ratio * annual - ebitda)) if ebitda is not None and annual else None
+    def needed(ratio, annual, charges=0.0):
+        return _money(max(0.0, ratio * annual - (ebitda - charges))) if ebitda is not None and annual else None
 
     return [{"ratio": ratio, "current_debt": needed(ratio, debt["current_annual"]),
-             "with_terms": needed(ratio, debt["with_terms_annual"])} for ratio in TARGET_RATIOS]
+             "with_terms": needed(ratio, debt["with_terms_annual"], debt.get("new_operating_annual") or 0.0)} for ratio in TARGET_RATIOS]
 
 
 def _candidates(cockpit: dict[str, Any], selected_file: str | None) -> list[dict[str, Any]]:
@@ -426,7 +435,8 @@ def build(cockpit: dict[str, Any], analyses: list[dict[str, Any]]) -> dict[str, 
     if groups and groups["status"] == "lines_exceed_total":
         notes.append("The listed expense lines add up to more than the source's total; one line is counted twice or read wrong.")
     current = _metrics(ebitda, noi, revenue, debt["current_annual"])
-    with_terms = _metrics(ebitda, noi, revenue, debt["with_terms_annual"]) if debt["with_terms_annual"] is not None else None
+    with_terms = (_metrics(ebitda, noi, revenue, debt["with_terms_annual"], debt.get("new_operating_annual") or 0.0)
+                  if debt["with_terms_annual"] is not None else None)
     return {
         "policy_version": POLICY_VERSION, "source": source, "reason": earnings.get("reason") if not source["kind"] else None,
         "ladder": _rows(ladder, kind=source["kind"]) if ladder else [], "figures": ladder, "staff_adjustments": adjustments,

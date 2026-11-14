@@ -312,16 +312,26 @@ class Plan:
         return steps
 
 
-def metrics(baseline: dict, scenario: dict | None, annual_debt: float | None) -> dict:
-    """The six figures for one scenario against one debt service. `scenario` None is today."""
+def loan_operating(baseline: dict) -> float:
+    """Operating costs a year the saved loan terms themselves add; nothing without saved terms."""
+    return max(0.0, number(baseline.get("loan_operating_annual"))) if baseline.get("debt_service_with_terms") is not None else 0.0
+
+
+def metrics(baseline: dict, scenario: dict | None, annual_debt: float | None, charges: float = 0.0) -> dict:
+    """The six figures for one scenario against one debt service. `scenario` None is today.
+
+    `charges` are operating costs the loan itself adds (see `loan_operating`). They are not the business's
+    earnings history or its plan, so EBITDA, NOI and margin are left alone; they come off what covers the debt.
+    """
     ebitda = number(baseline.get("ebitda")) if scenario is None else scenario["ebitda"]
     noi = number(baseline.get("noi")) if scenario is None else scenario["noi"]
     revenue = number(baseline.get("revenue")) if scenario is None else scenario["revenue"]
+    covering = ebitda - charges
     return {
         "ebitda": ebitda,
         "noi": noi,
-        "dscr": ebitda / annual_debt if annual_debt else None,
-        "free_cash_flow": ebitda - annual_debt if annual_debt is not None else None,
+        "dscr": covering / annual_debt if annual_debt else None,
+        "free_cash_flow": covering - annual_debt if annual_debt is not None else None,
         "operating_margin": noi / revenue if revenue else None,
         "debt_service": annual_debt,
     }
@@ -361,7 +371,8 @@ def evaluate(body: dict, baseline: dict, *, target_dscr: float = TARGET_DSCR, go
     `baseline` carries revenue, cogs, operating_expenses, noi, ebitda, the
     annual debt service today (`debt_service_current`) and with the saved loan
     terms (`debt_service_with_terms`, None when there are none), the monthly
-    cash the terms release (`released_monthly`) and the source's expense groups.
+    cash the terms release (`released_monthly`), any operating costs a year the
+    terms add (`loan_operating_annual`) and the source's expense groups.
     """
     plan = Plan(body, baseline)
     proposed = plan.scenario(plan.proposed)
@@ -371,6 +382,7 @@ def evaluate(body: dict, baseline: dict, *, target_dscr: float = TARGET_DSCR, go
     current_debt = baseline.get("debt_service_current")
     terms_debt = baseline.get("debt_service_with_terms")
     plan_debt = terms_debt if terms_debt is not None else current_debt
+    charges = loan_operating(baseline)
     effects = {item["id"]: plan.effect(item["id"], proposed) for item in plan.items}
     sections = []
     for key, label, areas in SECTIONS:
@@ -382,10 +394,10 @@ def evaluate(body: dict, baseline: dict, *, target_dscr: float = TARGET_DSCR, go
     for view, scenario in scenarios.items():
         views[view] = {
             "current_debt": metrics(baseline, scenario, current_debt),
-            "with_terms": metrics(baseline, scenario, terms_debt) if terms_debt is not None else None,
+            "with_terms": metrics(baseline, scenario, terms_debt, charges) if terms_debt is not None else None,
         }
     today = {"current_debt": metrics(baseline, None, current_debt),
-             "with_terms": metrics(baseline, None, terms_debt) if terms_debt is not None else None}
+             "with_terms": metrics(baseline, None, terms_debt, charges) if terms_debt is not None else None}
     released = number(baseline.get("released_monthly")) if terms_debt is not None else 0.0
     allocated = sum(number(row.get("monthly_amount")) for row in body.get("allocations") or [])
     goal_amount = number(goal) if goal else None
@@ -406,9 +418,9 @@ def evaluate(body: dict, baseline: dict, *, target_dscr: float = TARGET_DSCR, go
         "sections": sections,
         "bridge": {"proposed": plan.bridge(plan.proposed), "reviewed": plan.bridge(plan.reviewed)},
         "metrics": {"today": today, **views},
-        "debt_service": {"current": current_debt, "with_terms": terms_debt, "plan": plan_debt},
+        "debt_service": {"current": current_debt, "with_terms": terms_debt, "plan": plan_debt, "loan_operating": charges},
         "target": {"ratio": target_dscr,
-                   **{view: (max(0.0, target_dscr * plan_debt - scenario["ebitda"]) if plan_debt else None) for view, scenario in scenarios.items()}},
+                   **{view: (max(0.0, target_dscr * plan_debt - (scenario["ebitda"] - charges)) if plan_debt else None) for view, scenario in scenarios.items()}},
         "goal": {"amount": goal_amount, "proposed_gap": goal_amount - proposed["noi"] if goal_amount is not None else None,
                  "reviewed_gap": goal_amount - reviewed["noi"] if goal_amount is not None else None},
         "released": {"available_monthly": released, "allocated_monthly": allocated, "over_allocated": allocated > released,

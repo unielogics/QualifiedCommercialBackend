@@ -93,6 +93,9 @@ def engine_baseline(cockpit: dict) -> dict:
         "debt_service_current": number(debt.get("current_annual")), "debt_service_with_terms": terms_annual,
         "debt_service_current_monthly": number(debt.get("current_monthly")), "debt_service_with_terms_monthly": number(debt.get("with_terms_monthly")),
         "released_monthly": max(0.0, released_monthly) if released_monthly is not None else None,
+        # Recurring operating costs the saved terms add, and whether the budget has confirmed their amount.
+        "loan_operating_annual": (number(debt.get("new_operating_annual")) or 0.0) if terms_annual is not None else None,
+        "loan_operating_confirmed": debt.get("new_operating_confirmed") is not False,
         "terms_label": (debt.get("terms") or {}).get("label"),
         "statement": (block.get("groups") or {}).get("statement"),
         "source_name": "IRS" if kind == "tax_return" else "P&L" if kind == "profit_and_loss" else "source",
@@ -235,7 +238,7 @@ def _totals(plan: engine.Plan, detail: dict, baseline: dict, view: str) -> dict:
             "noi_first_year_impact": _money(detail["first_year"][view]["noi"] - (baseline.get("noi") or 0.0))}
 
 
-def _projection(detail: dict, baseline: dict, totals: dict, view: str, *, active: int, new_operating: float | None) -> dict:
+def _projection(detail: dict, baseline: dict, totals: dict, view: str, *, active: int) -> dict:
     reviewed = view == "reviewed"
     available = bool(baseline.get("available"))
     status = ("awaiting_review" if reviewed and totals["count"] == 0 else "no_actions" if not reviewed and not active
@@ -244,9 +247,11 @@ def _projection(detail: dict, baseline: dict, totals: dict, view: str, *, active
     current, terms = baseline.get("debt_service_current"), baseline.get("debt_service_with_terms")
     after = scenario["ebitda"] if available else None
     first_year = first["ebitda"] if available else None
-    # Operating charges the loan itself adds come off earnings once, as they always have, before the with-terms ratios.
-    with_terms = after - new_operating if after is not None and new_operating is not None else None
-    first_with_terms = first_year - new_operating if first_year is not None and new_operating is not None else None
+    # Operating charges the loan itself adds come off earnings once, as they always have, before the with-terms ratios:
+    # the same figure the plan's own six metrics use, so every reader gets one coverage with the terms.
+    new_operating = engine.loan_operating(baseline)
+    with_terms = after - new_operating if after is not None else None
+    first_with_terms = first_year - new_operating if first_year is not None else None
 
     def over(numerator, denominator):
         return _ratio(numerator / denominator) if numerator is not None and denominator else None
@@ -258,7 +263,8 @@ def _projection(detail: dict, baseline: dict, totals: dict, view: str, *, active
         "first_year_coverage_impact": _money(totals["first_year_impact"]) if available and totals["count"] else None,
         "first_year_coverage_earnings": _money(first_year) if totals["count"] else None,
         "first_year_dscr_current": over(first_year, current), "first_year_dscr_with_refinance": over(first_with_terms, terms),
-        "first_year_earnings_with_refinance": _money(first_with_terms), "annual_new_operating_expenses": new_operating,
+        "first_year_earnings_with_refinance": _money(first_with_terms),
+        "annual_new_operating_expenses": new_operating if baseline.get("loan_operating_confirmed", True) else None,
         "coverage_basis": "Run-rate coverage uses a full year with every change in place; first-year coverage counts each change from its start month and deducts one-time setup costs.",
         "dscr_current": over(after, current), "dscr_with_refinance": over(with_terms, terms),
         "annual_debt_service": current, "refinance_annual_debt_service": terms,
@@ -303,9 +309,10 @@ def _working(detail: dict, baseline: dict, view: str = "proposed") -> dict:
         return _ratio(numerator / denominator) if available and numerator is not None and denominator else None
 
     delta = scenario["ebitda"] - e0 if available else None
-    before_ratio, after_ratio, terms_ratio = over(e0, current), over(scenario["ebitda"], current), over(scenario["ebitda"], terms)
+    charges = engine.loan_operating(baseline)
+    before_ratio, after_ratio, terms_ratio = over(e0, current), over(scenario["ebitda"], current), over(scenario["ebitda"] - charges, terms)
     cash_before = e0 - current if available and current is not None else None
-    cash_after = scenario["ebitda"] - plan_debt if available and plan_debt is not None else None
+    cash_after = scenario["ebitda"] - charges - plan_debt if available and plan_debt is not None else None
     loan_cash = (current - terms) / 12 if current is not None and terms is not None else None
     return {
         "basis": "after_setup_before_timing",
@@ -440,9 +447,8 @@ def evaluate(raw: Any, cockpit: dict, *, source_file_ids=None, now=None, include
     actions = _actions(plan, detail, live, stale)
     active = [row for row in actions if not row["excluded"] and row["status"] != "rejected"]
     totals = {"proposed": _totals(plan, detail, baseline, "proposed"), "approved": _totals(plan, detail, baseline, "reviewed")}
-    new_operating = number(((cockpit.get("plan") or {}).get("evaluation") or {}).get("annual_new_operating_expenses", 0))
-    projection = {"proposed": _projection(detail, baseline, totals["proposed"], "proposed", active=len(active), new_operating=new_operating),
-                  "approved": _projection(detail, baseline, totals["approved"], "reviewed", active=len(active), new_operating=new_operating)}
+    projection = {"proposed": _projection(detail, baseline, totals["proposed"], "proposed", active=len(active)),
+                  "approved": _projection(detail, baseline, totals["approved"], "reviewed", active=len(active))}
     released = _released(body, cockpit, detail)
     risks = list(file_view["risk_flags"])
     changed_message = "The source figures changed after this plan was built. Confirm the source amounts again and check the cost lines against them."
@@ -452,6 +458,8 @@ def evaluate(raw: Any, cockpit: dict, *, source_file_ids=None, now=None, include
         risks.append(f"{len(stale)} reviewed change(s) need another review: the source figures or the plan's model changed after they were approved.")
     if released["missing"]:
         risks.append(released["missing"][0])
+    if not baseline.get("loan_operating_confirmed", True):
+        risks.append("The saved loan terms list a recurring operating cost whose amount is not confirmed. Coverage with the terms counts it as zero until the budget is confirmed.")
     missing = [] if baseline["available"] else [baseline.get("reason") or "An earnings source is needed before the plan's figures can be shown against the file."]
     result = {
         "schema_version": RESULT_VERSION, "context_stamp": v1.context_stamp(cockpit),

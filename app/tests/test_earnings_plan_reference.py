@@ -172,3 +172,21 @@ def test_pricing_and_whole_group_changes():
     assert near(proposed["lines"]["o1"] / proposed["lines"]["o2"], 24_720 * 1.02 / 2_372)
     assert [row["area"] for row in result["items"]] == [0, 4]
     assert result["bridge"]["proposed"][0]["label"] == "Pricing" and result["bridge"]["proposed"][0]["value"] > 0
+
+
+def test_operating_costs_the_loan_adds_come_off_coverage_with_the_terms_and_off_nothing_else(result):
+    # The same figures as the dashboard's earningsPlanMath.test.ts: (182,896.64 - 12,000) / 177,600.
+    costly = engine.evaluate(reference_body(), {**reference_baseline(), "loan_operating_annual": 12_000}, goal=REFERENCE["plan"]["noi_goal"], questions=QUESTIONS)
+    with_terms = costly["metrics"]["proposed"]["with_terms"]
+    assert near(with_terms["ebitda"], 182_896.64) and near(with_terms["noi"], 174_496.64)
+    assert near(with_terms["dscr"], 170_896.64 / 177_600) and near(with_terms["free_cash_flow"], -6_703.36)
+    assert near(with_terms["operating_margin"], result["metrics"]["proposed"]["with_terms"]["operating_margin"])
+    assert near(costly["metrics"]["today"]["with_terms"]["dscr"], (-22_377 - 12_000) / 177_600)
+    assert near(costly["metrics"]["reviewed"]["with_terms"]["free_cash_flow"], 52_164 - 12_000 - 177_600)
+    assert near(costly["target"]["proposed"], 51_103.36) and costly["debt_service"]["loan_operating"] == 12_000
+    # Against today's debt the loan does not exist, so neither do its costs.
+    assert costly["metrics"]["proposed"]["current_debt"] == result["metrics"]["proposed"]["current_debt"] and costly["proposed"] == result["proposed"]
+    # Without saved terms there is no loan to bring them.
+    none = engine.evaluate(reference_body(), {**reference_baseline(), "debt_service_with_terms": None, "loan_operating_annual": 12_000}, questions=QUESTIONS)
+    assert none["debt_service"]["loan_operating"] == 0 and none["metrics"]["proposed"]["with_terms"] is None
+    assert near(none["target"]["proposed"], 1.25 * 777_600 - 182_896.64) and result["debt_service"]["loan_operating"] == 0
