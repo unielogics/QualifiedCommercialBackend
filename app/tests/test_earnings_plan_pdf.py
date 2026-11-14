@@ -288,3 +288,18 @@ def test_a_document_is_drawn_from_the_version_and_not_from_the_file():
     # Drawing changes nothing it was given, and reads no file, so the same version always gives the same document.
     assert (body, facts) == before and first == document.build_html(body=deepcopy(body), financial_totals=deepcopy(facts))
     assert item_id("l:rent") not in first
+
+
+def test_a_change_in_dollars_a_year_reads_as_dollars_a_year():
+    def edit(body):
+        card = next(row for row in body["changes"] if row["id"] == item_id("l:o1"))
+        card.update(mode="annual", value=4_720)
+
+    body, facts = saved(edit=edit)
+    text = words(document.build_html(body=body, financial_totals=facts))
+    # The cost follows revenue, so the dollars are measured on the source's revenue and the plan figure carries the plan's.
+    assert "Card processing Decrease by $4,720 a year at today's volume · $24,287 a year in the plan, with the volume it follows" in text
+    # A fixed cost says its dollars plainly, and a rate change keeps its own unit.
+    assert "Rent Decrease by $28,805 a year · $196,805 → $168,000 a year" in text
+    untouched, plain_facts = saved()
+    assert "Card processing Decrease by 0.4 pts" in words(document.build_html(body=untouched, financial_totals=plain_facts))

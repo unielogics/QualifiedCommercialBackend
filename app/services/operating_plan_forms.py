@@ -127,6 +127,10 @@ async def status(db, profile):
         filled_by_staff=bool(version and version.actor_user_id))
 
 
+# How a change's amount is read back: "annual" is the model's word for dollars a year on a cost that follows a driver.
+_SIZED = {"annual": "dollars a year"}
+
+
 async def answers(db, profile):
     from app.services import form_answers
 
@@ -143,7 +147,7 @@ async def answers(db, profile):
         changes = [[display(row.get("name") or earnings_plan_math.change_key(row)) if block != "changes" else display(earnings_plan_math.change_key(row)),
                     display(row.get("direction") if block == "changes" else "spend" if block == "growth" else "new cost"),
                     display(row.get("value") if block == "changes" else row.get("monthly_spend") if block == "growth" else row.get("monthly_amount")),
-                    display(row.get("mode") if block == "changes" else "per month"), display(row.get("start_month")), display(row.get("status")), display(row.get("note"))]
+                    display(_SIZED.get(row.get("mode"), row.get("mode")) if block == "changes" else "per month"), display(row.get("start_month")), display(row.get("status")), display(row.get("note"))]
                    for block, row in earnings_plan_v2.items(body) if row.get("included") is not False]
         tables = [{"key": "lines", "title": "Current costs", "columns": ["Cost", "Group", "Annual amount", "Behaviour"],
                    "rows": [[display(row.get("label")), display(row.get("group")), display(row.get("base")), display(row.get("behavior"))] for row in body.get("lines") or []]},

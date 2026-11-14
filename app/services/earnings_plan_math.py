@@ -72,6 +72,16 @@ def _apply(base: float, change: dict) -> float:
     return base + _sign(change) * value
 
 
+def _rescale(rate: float, base: float, change: dict) -> float:
+    """A rate moved so that the cost changes by the change's dollars a year at the source's volume.
+
+    A cost that follows a stream or revenue is a rate times a driver. Saying "lower it by $20,000 a year" means
+    its amount on the source's own volume; the rate that gives that amount then follows whatever the plan does
+    to the driver.
+    """
+    return rate * (1 + _sign(change) * number(change.get("value")) / base) if base else rate
+
+
 def change_key(change: dict) -> str:
     """Where a change lands: one change per place."""
     target = change.get("target") or {}
@@ -224,12 +234,15 @@ class Plan:
             if behavior == "fixed":
                 value = _apply(base, change) if active else base
             elif behavior == "unit":
-                value = (_apply(rate, change) if active else rate) * (model["volume"].get(link) or 0.0)
+                # A per-unit line moves by dollars a unit, a percent of itself, or dollars a year at the source's volume.
+                unit = rate if not active else _rescale(rate, base, change) if change.get("mode") == "annual" else _apply(rate, change)
+                value = unit * (model["volume"].get(link) or 0.0)
             else:
                 share = rate
                 if active:
-                    # A percent-of-revenue line moves by a percent of itself, or by points of revenue.
-                    share = _apply(rate, change) if change.get("mode") == "percent" else rate + _sign(change) * number(change.get("value")) / 100
+                    # A percent-of-revenue line moves by points of revenue, a percent of itself, or dollars a year at the source's revenue.
+                    share = (_rescale(rate, base, change) if change.get("mode") == "annual" else _apply(rate, change) if change.get("mode") == "percent"
+                             else rate + _sign(change) * number(change.get("value")) / 100)
                 value = share * (model["total"] if link == ALL else model["revenue"].get(link) or 0.0)
             amounts[line["id"]] = max(0.0, value)
         for key, change in self.change_at.items():

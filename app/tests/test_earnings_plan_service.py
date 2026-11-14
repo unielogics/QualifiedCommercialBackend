@@ -14,7 +14,7 @@ from app.enums import Role
 from app.models.financial_form_version import FinancialFormDraft
 from app.schemas import earnings_improvement as v1_schema
 from app.schemas import earnings_plan_v2 as schema
-from app.services import client_financial_forms, operating_plan_schema
+from app.services import client_financial_forms, operating_plan_forms, operating_plan_schema
 from app.services import earnings_improvement as v1
 from app.services import earnings_plan_service as plan_service
 from app.services import financial_workspace as ws
@@ -534,3 +534,37 @@ async def test_client_plan_routes_open_only_an_earnings_plan_link_and_respect_re
             with pytest.raises(HTTPException) as error:
                 await call
             assert error.value.status_code == 404
+
+
+def test_dollars_a_year_is_a_way_to_size_a_cost_line_and_nothing_else():
+    body = file_body()
+    rent = change(body, "l:rent")
+    rent.update(mode="annual", value=28_805)
+    saved = schema.validate_body(body)
+    assert change(saved, "l:rent")["mode"] == "annual"
+    # On pricing, a metric or a whole group an amount already is what it says: one spelling for one meaning.
+    priced = file_body()
+    priced["changes"].append({"id": str(uuid4()), "target": {"kind": "pricing"}, "direction": "up", "mode": "annual", "value": 1_000, "note": "Round up the price list."})
+    assert schema.validate_body(priced)["changes"][-1]["mode"] == "amount"
+    with pytest.raises(HTTPException):
+        schema.validate_body({**file_body(), "changes": [{**rent, "mode": "per_month"}]})
+    # Sizing a reviewed change differently is a different proposal: the approval does not carry over.
+    cockpit = file_cockpit()
+    approved = approve(file_body(), cockpit)
+    assert change(approved, "l:rent")["status"] == "approved"
+    resized = deepcopy(approved)
+    change(resized, "l:rent").update(mode="annual")
+    assert change(plan_service.protect_reviews(resized, approved), "l:rent")["status"] == "proposed"
+
+
+@pytest.mark.asyncio
+async def test_the_read_back_of_a_plan_says_dollars_a_year_in_words():
+    body = file_body()
+    change(body, "l:rent").update(mode="annual", value=28_805)
+    draft = SimpleNamespace(body=schema.validate_body(body), updated_at=datetime(2026, 11, 14, tzinfo=UTC))
+    with patch.object(operating_plan_forms, "current", AsyncMock(return_value=(None, None, draft))):
+        read, pdf = await operating_plan_forms.answers(None, None)
+    rows = next(table for table in read["tables"] if table["key"] == "changes")["rows"]
+    units = {row[3] for row in rows}
+    assert pdf is None and read["draft"] is True
+    assert "dollars a year" in units and "annual" not in units and units <= {"dollars a year", "amount", "percent", "per month"}

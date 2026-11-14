@@ -190,3 +190,30 @@ def test_operating_costs_the_loan_adds_come_off_coverage_with_the_terms_and_off_
     none = engine.evaluate(reference_body(), {**reference_baseline(), "debt_service_with_terms": None, "loan_operating_annual": 12_000}, questions=QUESTIONS)
     assert none["debt_service"]["loan_operating"] == 0 and none["metrics"]["proposed"]["with_terms"] is None
     assert near(none["target"]["proposed"], 1.25 * 777_600 - 182_896.64) and result["debt_service"]["loan_operating"] == 0
+
+
+def test_a_cost_that_follows_revenue_can_be_changed_by_dollars_a_year():
+    # The same figures as the dashboard's earningsPlanMath.test.ts.
+    body = reference_body()
+    body.update(growth=[], activities=[])
+    words = {"direction": "down", "mode": "annual", "start_month": 1, "note": "Agreed with the owner."}
+    body["changes"] = [
+        {"id": item_id("pricing"), "target": {"kind": "pricing"}, "direction": "up", "mode": "percent", "value": 2, "start_month": 1, "note": "List prices rise 2%."},
+        # Card processing is 2.0% of all revenue ($24,720 on the source): $4,720 a year less is $20,000 at the source's revenue.
+        {**words, "id": item_id("l:o1"), "target": {"kind": "line", "line_id": "o1"}, "value": 4_720},
+        # Detail supplies are $105 a unit on 3,600 units ($378,000): $18,000 a year less is $100 a unit.
+        {**words, "id": item_id("l:c1"), "target": {"kind": "line", "line_id": "c1"}, "value": 18_000},
+        # A fixed cost has no driver: dollars a year is simply the amount.
+        {**words, "id": item_id("l:sal"), "target": {"kind": "line", "line_id": "sal"}, "value": 30_194},
+    ]
+    lines = engine.evaluate(body, reference_baseline())["proposed"]["lines"]
+    # The new rate follows the driver: revenue is 2% higher, so the percent-of-revenue cost is too; volume did not move.
+    assert near(lines["o1"], 20_000 * 1.02) and near(lines["c1"], 360_000) and near(lines["sal"], 318_000)
+    # Without the pricing change the cost lands exactly on the dollars asked for.
+    body["changes"] = body["changes"][1:]
+    assert near(engine.evaluate(body, reference_baseline())["proposed"]["lines"]["o1"], 20_000)
+    # Raising works the same way, and a cut larger than the cost stops at zero.
+    body["changes"][0].update(direction="up", value=5_280)
+    assert near(engine.evaluate(body, reference_baseline())["proposed"]["lines"]["o1"], 30_000)
+    body["changes"][0].update(direction="down", value=99_000)
+    assert engine.evaluate(body, reference_baseline())["proposed"]["lines"]["o1"] == 0

@@ -151,8 +151,18 @@ class _Item(_Form):
 class Change(_Item):
     target: Target
     direction: Literal["up", "down"] = "down"
-    mode: Literal["amount", "percent"] = "percent"
+    # "amount" is in the unit of what is changed: dollars a year for a fixed cost, a group or pricing, the metric's own
+    # unit for a revenue metric, dollars a unit for a per-unit cost, points of revenue for a percent-of-revenue cost.
+    # "annual" is dollars a year for a cost that follows a stream or revenue, measured at the source's volume.
+    mode: Literal["amount", "annual", "percent"] = "percent"
     value: float | None = Field(default=None, ge=0, le=1e15)
+
+    @model_validator(mode="after")
+    def dollars_a_year_belong_to_cost_lines(self):
+        # Everywhere else an amount already is dollars a year or the metric's own unit: one spelling for one meaning.
+        if self.mode == "annual" and self.target.kind != "line":
+            self.mode = "amount"
+        return self
 
 
 class Growth(_Item):

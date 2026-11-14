@@ -710,7 +710,9 @@ def _what(plan: _Plan, row: dict, kind: str) -> str:
     if target.get("kind") == "line":
         line = plan.lines.get(target.get("line_id")) or {}
         behavior = (plan.result.get("behaviors") or {}).get(line.get("id"), line.get("behavior") or "fixed")
-        size = f"{_plain(value)}%" if percent else f"{_usd(value)} a year" if behavior == "fixed" else f"${_grouped(_num(value), 2)} a unit" if behavior == "unit" else f"{_plain(value)} pts"
+        annual = row.get("mode") == "annual" and behavior != "fixed"
+        size = (f"{_plain(value)}%" if percent else f"{_usd(value)} a year at today's volume" if annual else f"{_usd(value)} a year" if behavior == "fixed"
+                else f"${_grouped(_num(value), 2)} a unit" if behavior == "unit" else f"{_plain(value)} pts")
         then = then_lines.get(line.get("id"))
         if not _finite(then):
             moved = ""
