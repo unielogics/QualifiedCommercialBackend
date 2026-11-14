@@ -45,7 +45,7 @@ def readers(body, cockpit):
                 round(figures["operating_margin"] * 100, 2), figures["debt_service"])
 
     def block(figures):
-        return (figures["earnings"], figures["noi"], figures["dscr"], figures["cash_after_debt"], figures["operating_margin"], figures["debt_service"])
+        return (figures["earnings"], figures["noi"], figures["dscr"], figures["cash_after_debt"], round(figures["operating_margin"], 2), figures["debt_service"])
 
     result = {"plan": {"today": own(plan["metrics"]["today"]["current_debt"]), "proposed": own(plan["metrics"]["proposed"][basis]),
                        "reviewed": own(plan["metrics"]["reviewed"][basis])},
@@ -185,3 +185,18 @@ def test_a_plan_that_states_its_revenue_reads_the_same_for_every_reader():
     assert kinds["All revenue · Labor hours"] == ("expense_reduction", 0.0)
     assert kinds["All revenue · Units sold"][0] == kinds["All revenue · Revenue per unit"][0] == "unit_volume"
     assert evaluation["plan"]["model"]["reconciles"] is True and evaluation["plan"]["per_unit"][0]["today"]["revenue"] == 257.5
+
+
+
+def test_the_margin_a_screen_prints_to_one_place_is_not_rounded_twice():
+    # NOI of 24,619 on 1,261,673 of revenue is 1.9513%: one place is 2.0%. Sent as 1.95 it printed 1.9% on the File page
+    # beside 2.0% in the plan. Both blocks the File page reads now carry enough of the figure to print the same digit.
+    cockpit = file_cockpit(goal=215_000)
+    body = finished(file_body())
+    evaluation = v1.evaluate(body, cockpit)
+    plan = evaluation["plan"]["metrics"]["proposed"]["with_terms"]["operating_margin"]
+    sent = evaluation["comparison"]["proposed"]["operating_margin"]
+    assert sent == round(plan * 100, 4) == 11.6257
+    assert cockpit["baseline"]["metrics"]["current"]["operating_margin"] == round(-30777 / 1236000 * 100, 4) == -2.49
+    # One place from what is sent is one place from the plan's own figure.
+    assert f"{sent:.1f}" == f"{plan * 100:.1f}" == "11.6"

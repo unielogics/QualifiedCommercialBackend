@@ -41,7 +41,7 @@ def test_the_v1_entry_point_reads_a_v2_plan_and_keeps_every_key_its_readers_use(
 def test_before_and_after_are_the_design_numbers_on_the_file():
     result = v1.evaluate(file_body(), file_cockpit())
     assert result["comparison"]["baseline"] == {"earnings": -22377.0, "noi": -30777.0, "dscr": -0.03, "cash_after_debt": -799977.0, "operating_margin": -2.49, "debt_service": 777600.0}
-    assert result["comparison"]["proposed"] == {"earnings": 182896.64, "noi": 174496.64, "dscr": 1.03, "cash_after_debt": 5296.64, "operating_margin": 11.63, "debt_service": 177600.0}
+    assert result["comparison"]["proposed"] == {"earnings": 182896.64, "noi": 174496.64, "dscr": 1.03, "cash_after_debt": 5296.64, "operating_margin": 11.6257, "debt_service": 177600.0}
     assert result["comparison"]["loan_basis"] == "saved_terms" and result["comparison"]["target_gap"]["proposed"] == 39103.36
     proposed = result["projection"]["proposed"]
     assert (proposed["status"], proposed["earnings"], proposed["noi"], proposed["dscr_current"], proposed["dscr_with_refinance"]) == (

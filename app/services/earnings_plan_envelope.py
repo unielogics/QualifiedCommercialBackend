@@ -296,8 +296,10 @@ def _six(figures: dict | None) -> dict:
     if not figures:
         return {"earnings": None, "noi": None, "dscr": None, "cash_after_debt": None, "operating_margin": None, "debt_service": None}
     margin = figures.get("operating_margin")
+    # The margin keeps four places of a percent. A screen prints one, and a figure already rounded to two can land on
+    # the other side of that last digit (1.9513% sent as 1.95 printed 1.9% beside the plan's own 2.0%).
     return {"earnings": _money(figures.get("ebitda")), "noi": _money(figures.get("noi")), "dscr": _ratio(figures.get("dscr")),
-            "cash_after_debt": _money(figures.get("free_cash_flow")), "operating_margin": round(margin * 100, 2) if margin is not None else None,
+            "cash_after_debt": _money(figures.get("free_cash_flow")), "operating_margin": round(margin * 100, 4) if margin is not None else None,
             "debt_service": _money(figures.get("debt_service"))}
 
 

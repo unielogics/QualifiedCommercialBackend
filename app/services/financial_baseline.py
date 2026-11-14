@@ -276,7 +276,8 @@ def _metrics(ebitda, noi, revenue, annual_debt, charges: float = 0.0) -> dict[st
         "ebitda": _money(ebitda), "noi": _money(noi),
         "dscr": round(covering / annual_debt, 2) if covering is not None and annual_debt else None,
         "free_cash_flow": _money(covering - annual_debt) if covering is not None and annual_debt is not None else None,
-        "operating_margin": round(noi / revenue * 100, 2) if noi is not None and revenue else None,
+        # Four places of a percent: a screen prints one, and rounding twice can move that digit.
+        "operating_margin": round(noi / revenue * 100, 4) if noi is not None and revenue else None,
         "debt_service": _money(annual_debt),
     }
 
