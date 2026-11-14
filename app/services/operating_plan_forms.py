@@ -112,6 +112,9 @@ async def status(db, profile):
     cash = (version.body.get("released_cash_flow") or {}) if version else {}
     saving_actions = any(not row.get("excluded") and row.get("status") != "rejected" and row.get("kind") in {"expense_reduction", "expense_group_change", "product_cost_change", "processing_cost_change"}
                          for row in version.body.get("adjustments", [])) if version else False
+    if version and operating_plan_schema.is_v2(version.body):
+        # A v2 plan assigns released cash freely; only assigning more than there is leaves it unfinished.
+        saving_actions = bool(version.body.get("allocations"))
     if version and ((getattr(profile, "financial_plan", None) or {}).get("updated_at") or cash.get("source_fingerprint") or cash.get("allocations") or saving_actions):
         from app.services.earnings_improvement import evaluate
         from app.services.financial_cockpit import load_cockpit
@@ -133,6 +136,22 @@ async def answers(db, profile):
     body = version.body if version else draft.body
     def display(value):
         return "Not provided" if value in (None, "") else str(value).replace("_", " ")
+    if operating_plan_schema.is_v2(body):
+        from app.schemas import earnings_plan_v2
+        from app.services import earnings_plan_math
+
+        changes = [[display(row.get("name") or earnings_plan_math.change_key(row)) if block != "changes" else display(earnings_plan_math.change_key(row)),
+                    display(row.get("direction") if block == "changes" else "spend" if block == "growth" else "new cost"),
+                    display(row.get("value") if block == "changes" else row.get("monthly_spend") if block == "growth" else row.get("monthly_amount")),
+                    display(row.get("mode") if block == "changes" else "per month"), display(row.get("start_month")), display(row.get("status")), display(row.get("note"))]
+                   for block, row in earnings_plan_v2.items(body) if row.get("included") is not False]
+        tables = [{"key": "lines", "title": "Current costs", "columns": ["Cost", "Group", "Annual amount", "Behaviour"],
+                   "rows": [[display(row.get("label")), display(row.get("group")), display(row.get("base")), display(row.get("behavior"))] for row in body.get("lines") or []]},
+                  {"key": "changes", "title": "Plan changes", "columns": ["Change", "Direction", "Amount", "Unit", "Start month", "Status", "Explanation"], "rows": changes}]
+        return {"kind": KIND, "label": LABEL, "source": "filled", "figures_from": "form", "draft": version is None,
+            "who": body.get("business_name"), "as_of": body.get("period_end"), "updated_at": version.created_at if version else draft.updated_at,
+            "filled_by": version.actor_name if version else None, "headline": [], "tables": tables,
+            "notes": body.get("notes"), "files": []}, version.pdf_file_id if version else None
     tables = [{"key": block, "title": "Operating expenses" if block == "expenses" else "Proposed adjustments",
         "columns": [spec["label"] for spec in specs],
         "rows": [[display(row.get(spec["key"])) for spec in specs] for row in body.get(block) or [] if not row.get("excluded")]}

@@ -54,7 +54,12 @@ def project(body, cockpit, saved_version):
     sources = [row["file_id"] for row in (cockpit.get("operating_evidence") or {}).get("files", [])]
     result = engine.evaluate(body, cockpit, source_file_ids=sources, include_expense_changes=True)
     base = deepcopy(body)
-    base["adjustments"] = []
+    from app.schemas import earnings_plan_v2
+
+    if earnings_plan_v2.is_v2(base):
+        base = earnings_plan_v2.without_changes(base)
+    else:
+        base["adjustments"] = []
     baseline = engine.evaluate(base, cockpit, source_file_ids=sources, include_expense_changes=True)
     summary = result["draft_feedback"]["summary"]
     current = baseline["draft_feedback"]["summary"]

@@ -15,9 +15,30 @@ from app.schemas.earnings_improvement import REVIEW_FIELDS, validate_body
 from app.services import earnings_improvement as math
 
 REVIEW_KIND = "operating_plan.adjustments_reviewed"
+UPGRADED = {"code": "operating_plan_upgraded", "message": "This plan was moved to the new earnings plan. Reload it before saving."}
+
+
+def is_v2(body):
+    from app.schemas import earnings_plan_v2
+
+    return earnings_plan_v2.is_v2(body)
+
+
+def linked_file_ids(body):
+    """Every supporting file a plan body links, whichever model it is in."""
+    if is_v2(body):
+        from app.services import earnings_plan_service
+
+        return earnings_plan_service.source_file_ids(body)
+    return {str(fid) for block in ("expenses", "adjustments", "historical_corrections")
+            for row in (body or {}).get(block, []) for fid in row.get("source_file_ids", [])}
 
 
 def completion(body, cockpit):
+    if is_v2(body):
+        from app.services import earnings_plan_service
+
+        return earnings_plan_service.completion(body, cockpit)
     from app.schemas.earnings_improvement import completion as disclosure_completion
     from app.services.released_cash_flow import evaluate
 
@@ -52,10 +73,16 @@ def shareable_package(evaluation, evidence):
 
 def protect_reviews(incoming, current, *, trusted=False):
     """Ordinary writers may retain an unchanged review, never author one."""
+    if is_v2(incoming):
+        from app.services import earnings_plan_service
+
+        return earnings_plan_service.protect_reviews(incoming, current, trusted=trusted)
     if trusted:
         return validate_body(incoming)
     if not isinstance(incoming, dict):
         return validate_body(incoming)
+    if is_v2(current):
+        raise HTTPException(409, UPGRADED)
     old = validate_body(current)
     body = deepcopy(incoming)
     # Removing a row is recoverable; its prior proposal and evidence stay in history.
@@ -92,11 +119,14 @@ def protect_reviews(incoming, current, *, trusted=False):
 async def prepare_draft(db, profile, *, incoming, current, actor=None):
     from app.services.financial_workspace import filter_current_files, source_files_for_profile
 
+    if is_v2(current) and not is_v2(incoming):
+        # An editor still holding the earlier model must not write over the plan it was carried into.
+        raise HTTPException(409, UPGRADED)
     body = protect_reviews(incoming, current, trusted=bool(db.info.get("operating_plan_review_write")))
-    ids = {str(fid) for block in ("expenses", "adjustments", "historical_corrections") for row in body[block] for fid in row["source_file_ids"]}
+    ids = linked_file_ids(body)
     files = await filter_current_files(db, await source_files_for_profile(db, profile)) if ids else []
     permitted = {str(file.id) for file in files}
-    previous_ids = {str(fid) for block in ("expenses", "adjustments", "historical_corrections") for row in (current or {}).get(block, []) for fid in row.get("source_file_ids", [])}
+    previous_ids = linked_file_ids(current)
     if ids - permitted - previous_ids:
         raise HTTPException(422, "Link only current supporting files belonging to this application")
     return body
@@ -125,10 +155,8 @@ async def client_preview(db, profile, body, *, current):
     result = await preview(db, profile, protected, goal=goal)
     evidence = client_evidence(result["evidence"])
     permitted = {row["file_id"] for row in evidence["files"]}
-    retained = {str(fid) for block in ("expenses", "adjustments", "historical_corrections") for row in (current or {}).get(block, [])
-                for fid in row.get("source_file_ids", [])}
-    supplied = {str(fid) for block in ("expenses", "adjustments", "historical_corrections") for row in protected[block]
-                for fid in row.get("source_file_ids", [])}
+    retained = linked_file_ids(current)
+    supplied = linked_file_ids(protected)
     if supplied - permitted - retained:
         raise HTTPException(422, "Use supporting sources available to this operating form")
     return {"evaluation": client_evaluation(result["evaluation"]), "evidence": evidence,
@@ -160,6 +188,8 @@ async def suggest(db, profile, body, *, current, expense_row_id, actor_id=None,
     from app.services.operating_plan_goals import reject_client_goal, require_goal
     from app.services.operating_plan_guidance import client_evaluation, client_evidence
 
+    if is_v2(body) or is_v2(current):
+        raise HTTPException(409, {"code": "not_available_for_this_plan", "message": "Suggestions belong to the earlier plan editor. Reload the plan."})
     goal = await require_goal(db, profile)
     if client:
         reject_client_goal(body)
@@ -204,15 +234,18 @@ async def summary(db, profile, *, family_id=None):
         raise HTTPException(404, "Operating plan not found")
     if family_id and family is None:
         raise HTTPException(404, "Operating plan not found")
+    from app.services import operating_plan_schema
+
     draft = await db.get(FinancialFormDraft, family.id) if family else None
     version = await db.get(FinancialFormVersion, family.current_version_id) if family and family.current_version_id else None
-    body = validate_body(draft.body if draft else version.body if version else empty_body())
+    body = operating_plan_schema.validate(draft.body if draft else version.body if version else empty_body())
     cockpit = await load_cockpit(db, profile)
     evaluation = math.evaluate(body, cockpit, include_expense_changes=True)
     progress = completion(body, cockpit)
     disclosure = evaluation["disclosure"]
     stamp = draft.updated_at if draft else version.created_at if version else None
-    return {"has_plan": bool(family), "state": "working_draft" if draft and (version is None or body != validate_body(version.body)) else "published" if version else "not_started",
+    return {"has_plan": bool(family), "model": body["schema_version"],
+        "state": "working_draft" if draft and (version is None or body != operating_plan_schema.validate(version.body)) else "published" if version else "not_started",
         "family_id": str(family.id) if family else None,
         "expense_count": progress["active_expenses"], "action_count": progress["active_adjustments"],
         "reviewed_action_count": sum(row["review_state"] in {"approved", "rejected"} for row in evaluation["actions"] if not row["excluded"]),

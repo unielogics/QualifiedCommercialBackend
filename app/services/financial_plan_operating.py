@@ -26,6 +26,12 @@ def coverage_adjustment(context, plan, dscr):
     dated = bool(recurring and all(number(row.get("first_year_impact")) is not None for row in recurring))
     first_impact = round(sum(number(row.get("first_year_impact")) for row in recurring), 2) if dated else None
     run_rate = round(sum(number(row.get("net_annual_impact")) or 0 for row in recurring), 2)
+    additive = (evaluated.get("additive_totals") or {}).get("approved")
+    if additive and recurring:
+        # In the v2 plan changes interact (a cost follows the revenue another change adds), so the reviewed
+        # scenario is taken whole instead of adding up what each change is worth on its own.
+        first_impact = number(additive.get("first_year_impact")) if dated else None
+        run_rate = number(additive.get("annual_impact")) or 0.0
     impact = first_impact if dated else run_rate
     result = {"status": "none", "applied": False, "source": "published_operating_plan",
         "version_number": context.get("version_number"), "version_id": context.get("version_id"),

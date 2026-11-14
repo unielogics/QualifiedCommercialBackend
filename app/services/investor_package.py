@@ -55,6 +55,11 @@ async def operating_snapshot(db, profile, cockpit, choices):
         "effective_period_amount": cost_amount(row),
         "source_names": [names[str(fid)] for fid in row.get("source_file_ids", []) if names.get(str(fid))]}
         for row in body.get("expenses", []) if not row.get("excluded")]
+    if operating_plan_service.is_v2(body):
+        result["expenses"] = [{"id": row["id"], "category": row.get("group"), "label": row.get("label"), "payee": "", "current_amount": row.get("base"),
+            "cadence": "annual", "essential": True, "notes": "", "source_file_ids": [], "cost_basis": "total", "unit_label": "",
+            "current_units_per_period": None, "current_unit_cost": None, "current_fixed_amount": None,
+            "effective_period_amount": row.get("base"), "source_names": []} for row in body.get("lines") or []]
     result["plan_notes"] = body.get("notes") or ""
     result["snapshot"] = {"state": "working_draft" if working else getattr(record, "status", "published"),
         "family_id": str(family.id), "revision": record.revision if working else None,

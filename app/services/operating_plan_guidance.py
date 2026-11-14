@@ -182,13 +182,13 @@ def client_evaluation(evaluation):
             row["proposed_math_valid"] = bool(results[row["id"]]["proposed_math_valid"])
     if "expense_changes" in evaluation:
         safe["expense_changes"] = deepcopy(evaluation["expense_changes"])
-    for key in ("commands", "itemization", "historical_corrections", "goal_progress", "cash_bridge", "comparison"):
+    for key in ("commands", "itemization", "historical_corrections", "goal_progress", "cash_bridge", "comparison", "plan"):
         if key in evaluation:
             safe[key] = deepcopy(evaluation[key])
     if "draft_feedback" in evaluation:
         from app.services.operating_draft_feedback import public
 
-        safe["draft_feedback"] = public(evaluation["draft_feedback"])
+        safe["draft_feedback"] = deepcopy(evaluation["draft_feedback"]) if "plan" in evaluation else public(evaluation["draft_feedback"])
     if "source_review" in evaluation:
         safe["source_review"] = deepcopy(evaluation["source_review"])
     safe["schema_version"] = evaluation.get("schema_version")

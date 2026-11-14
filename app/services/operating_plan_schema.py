@@ -2,15 +2,25 @@
 from __future__ import annotations
 
 from app.schemas import earnings_improvement as domain
+from app.schemas import earnings_plan_v2 as plan_v2
 
 KIND = "operating_plan"
 LABEL = "Operating expenses and earnings plan"
 REQUIREMENT_KEY = "operating_expenses_and_earnings_plan"
 SCHEMA_VERSION = domain.SCHEMA_VERSION
 empty_body = domain.empty_body
-validate = domain.validate_body
-key_facts = domain.key_facts
 completion = domain.completion
+is_v2 = plan_v2.is_v2
+
+
+def validate(raw):
+    """One form kind, two models: a body is read by the schema it names."""
+    return plan_v2.validate_body(raw) if plan_v2.is_v2(raw) else domain.validate_body(raw)
+
+
+def key_facts(raw):
+    return plan_v2.key_facts(raw) if plan_v2.is_v2(raw) else domain.key_facts(raw)
+
 
 CADENCES = ("weekly", "biweekly", "semi_monthly", "monthly", "quarterly", "annual", "one_time")
 CATEGORIES = ("rent", "salaries", "payroll_taxes", "insurance", "utilities", "marketing", "software", "professional_fees", "supplies", "repairs", "transportation", "cogs", "merchant_processing", "loan_payments", "income_taxes", "owner_draws", "transfers", "depreciation_amortization", "other")
@@ -74,5 +84,8 @@ def describe():
 def totals(body):
     # Worksheet totals disclose counts only, never a client's hidden staff
     # review fields or a parallel source of projected earnings.
+    if plan_v2.is_v2(body):
+        return {"disclosed_expense_rows": len(body.get("lines") or []),
+                "adjustment_rows": sum(row.get("included") is not False for _block, row in plan_v2.items(body))}
     return {"disclosed_expense_rows": sum(bool(row.get("label")) for row in (body or {}).get("expenses") or []),
             "adjustment_rows": sum(bool(row.get("label")) for row in (body or {}).get("adjustments") or [])}

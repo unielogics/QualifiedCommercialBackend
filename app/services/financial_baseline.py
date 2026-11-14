@@ -303,6 +303,30 @@ def _candidates(cockpit: dict[str, Any], selected_file: str | None) -> list[dict
     return rows
 
 
+def _compare_statement(groups: dict[str, Any], cockpit: dict[str, Any], analyses: list[dict[str, Any]]) -> None:
+    """Beside each line of the return, what the latest P&L says for the same line, annualized.
+
+    For comparison only: the return stays the source and nothing here changes a
+    figure. A P&L too short to annualize is left out rather than scaled up.
+    """
+    statement = cockpit.get("profit_and_loss") or {}
+    file_id, factor = statement.get("file_id"), _annual_factor(statement.get("months_covered"))
+    facts = next((row.get("key_facts") or {} for row in analyses if str(row.get("file_id")) == str(file_id)), None)
+    if not file_id or factor is None or facts is None:
+        return
+    try:
+        other = expense_groups(statement if isinstance(facts.get("income_statements"), list) else facts, kind="profit_and_loss")
+        amounts = {row["key"]: _money(row["amount"] * factor) for row in other["rows"]}
+    except Exception:  # noqa: BLE001 - an odd statement must not cost the file its baseline; the column is optional
+        log.exception("financial baseline: statement comparison unavailable profile=%s", cockpit.get("profile_id"))
+        return
+    for row in groups["rows"]:
+        if row["key"] in amounts:
+            row["statement_amount"] = amounts[row["key"]]
+    groups["statement"] = {"file_id": str(file_id), "label": f"P&L · {statement.get('period_label') or 'period unconfirmed'}",
+                           "months_covered": statement.get("months_covered"), "annualized": factor != 1}
+
+
 def expense_groups(facts: dict[str, Any], *, kind: str, interest: float | None = None) -> dict[str, Any]:
     """Named lines plus the remainder, so the list adds up to its source."""
     lines = named_lines(facts)
@@ -353,6 +377,7 @@ def build(cockpit: dict[str, Any], analyses: list[dict[str, Any]]) -> dict[str, 
         ladder = return_ladder(facts, income=signed_number(year.get("income")), interest=signed_number(year.get("interest")),
                                depreciation=signed_number(year.get("depreciation")), revenue=signed_number(year.get("gross_receipts")))
         groups = expense_groups(facts, kind="tax_return", interest=ladder["interest"])
+        _compare_statement(groups, cockpit, analyses)
         form = _FORMS.get(year.get("tax_form"), year.get("tax_form"))
         source = {"kind": "tax_return", "label": f"IRS {form} · {year.get('year')}" if form else f"Filed return · {year.get('year')}", "file_id": selected_file,
                   "file_name": selected.get("file_name"), "form": year.get("tax_form"), "year": year.get("year"),

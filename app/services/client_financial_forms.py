@@ -60,6 +60,10 @@ def client_body(kind: str, body: dict, *, can_edit: bool = True) -> dict:
             row["owner"] = row.get("origin") or row.get("owner") or "admin"
             row["editable"] = can_edit
     if kind == "operating_plan":
+        if operating_plan_schema.is_v2(visible):
+            from app.services import earnings_plan_service
+
+            return earnings_plan_service.client_body(visible)
         for row in visible.get("adjustments") or []:
             for key in operating_plan_schema.STAFF_FIELDS - {"status"}:
                 row.pop(key, None)
@@ -109,6 +113,15 @@ def merge_client_body(kind: str, current: dict, incoming: dict) -> dict:
         from app.services.operating_plan_goals import reject_client_goal
 
         reject_client_goal(incoming)
+        if operating_plan_schema.is_v2(incoming):
+            from app.services import earnings_plan_service
+
+            # The v2 plan is one model the business edits whole; staff review fields are settled server-side.
+            return earnings_plan_service.merge_client_body(current, incoming)
+        if operating_plan_schema.is_v2(current):
+            from app.services.operating_plan_service import UPGRADED
+
+            raise HTTPException(409, UPGRADED)
         result = _copy_fields(result, incoming, operating_plan_schema.CLIENT_HEADER_FIELDS)
         for block, fields in (("expenses", operating_plan_schema.CLIENT_EXPENSE_FIELDS), ("adjustments", operating_plan_schema.CLIENT_ADJUSTMENT_FIELDS)):
             if block in incoming:

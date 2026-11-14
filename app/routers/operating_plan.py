@@ -111,6 +111,86 @@ async def evaluate(profile_id: UUID, payload: Evaluate, user: CurrentUser, db: D
     return await operating_plan_service.preview(db, profile, body)
 
 
+class PlanBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    body: dict
+    family_id: UUID | None = None
+
+
+class PlanDraft(PlanBody):
+    # None only for the first save of a plan nobody has edited yet.
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+def _plan_body(payload):
+    from app.schemas import earnings_plan_v2
+
+    if not earnings_plan_v2.is_v2(payload.body):
+        raise HTTPException(422, "Send the earnings plan in the operating-plan-v2 model")
+    return payload.body
+
+
+@router.get("/v2")
+async def plan_workspace(profile_id: UUID, user: CurrentUser, db: Db, family_id: UUID | None = None):
+    """The plan in the v2 model with its figures. Reading never writes: a v1 plan is carried over in memory."""
+    staff(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    from app.services import earnings_plan_service
+
+    return await earnings_plan_service.workspace(db, profile, family_id=family_id, actor=user)
+
+
+@router.post("/v2/evaluate")
+async def plan_evaluate(profile_id: UUID, payload: PlanBody, user: CurrentUser, db: Db):
+    """Figures for a plan as edited, without saving it. Reviews in the posted body are never trusted."""
+    staff(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    from app.services import earnings_plan_service
+    from app.services.financial_cockpit import load_cockpit
+
+    current = await operating_plan_service.current_body(db, profile, payload.family_id)
+    body = earnings_plan_service.protect_reviews(_plan_body(payload), current)
+    evaluation = operating_plan_service.math.evaluate(body, await load_cockpit(db, profile))
+    return {"body": body, "evaluation": evaluation, "completion": earnings_plan_service._completion(body, evaluation),
+            "context_stamp": evaluation["context_stamp"]}
+
+
+@router.post("/v2/resync")
+async def plan_resync(profile_id: UUID, payload: PlanBody, user: CurrentUser, db: Db):
+    """The same plan brought onto the file's current source figures. Returned, not saved."""
+    staff(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    from app.services import earnings_plan_migrate, earnings_plan_service
+    from app.services.financial_cockpit import load_cockpit
+
+    cockpit = await load_cockpit(db, profile)
+    current = await operating_plan_service.current_body(db, profile, payload.family_id)
+    body = earnings_plan_service.protect_reviews(earnings_plan_migrate.resync(_plan_body(payload), cockpit), current)
+    evaluation = operating_plan_service.math.evaluate(body, cockpit)
+    return {"body": body, "evaluation": evaluation, "completion": earnings_plan_service._completion(body, evaluation),
+            "context_stamp": evaluation["context_stamp"]}
+
+
+@router.put("/v2/draft")
+async def plan_save_draft(profile_id: UUID, payload: PlanDraft, user: CurrentUser, db: Db):
+    """Save the working draft in the v2 model, creating the plan on its first save."""
+    staff(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    from app.services import earnings_plan_service
+    from app.services import financial_workspace as workspace
+
+    body = _plan_body(payload)
+    family, draft = await workspace.resolve_family(db, profile, kind="operating_plan", family_id=payload.family_id, actor=user)
+    if payload.expected_revision is None:
+        if draft.revision != 0:
+            raise HTTPException(409, {"code": "financial_draft_conflict", "current_revision": draft.revision, "message": "This draft changed. Reload before saving."})
+    else:
+        workspace._check_revision(draft, payload.expected_revision)
+    await workspace.stage_draft(db, profile, family, draft, body, actor=user)
+    await db.commit()
+    return await earnings_plan_service.workspace(db, profile, family_id=family.id, actor=user)
+
+
 @router.post("/review")
 async def review(profile_id: UUID, payload: Review, user: CurrentUser, db: Db):
     if user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:

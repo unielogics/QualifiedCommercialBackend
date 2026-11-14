@@ -565,7 +565,9 @@ async def load_workspace(db: AsyncSession, profile: ApplicationProfile, *, kind:
         needs_context = ((getattr(profile, "financial_plan", None) or {}).get("updated_at")
                          or cash.get("source_fingerprint") or cash.get("allocations")
                          or any(row.get("itemization_parent_id") for row in body.get("expenses", []))
-                         or goal["status"] == "set")
+                         or goal["status"] == "set"
+                         # A v2 plan's to-finish list is read off the file's source (its lines to confirm, the categories to answer).
+                         or operating_plan_schema.is_v2(body))
         progress = operating_completion(body, await load_cockpit(db, profile) if needs_context else {})
     return {"kind": kind, **({"goal": goal} if kind == "operating_plan" else {}), "family_id": str(family.id), "label": family.label, "body": body, "schema": sheets._schema_for(kind), "worksheet": {"layout": layout, "values": sheet_layout.flatten(kind, visible), "computed": computed}, "draft": {"revision": draft.revision, "base_version_id": str(draft.base_version_id) if draft.base_version_id else None, "updated_at": draft.updated_at.isoformat(), "dirty": current is None or body_hash(body) != current.body_sha256}, "completion": progress, "accepted_completion": debt_schedule_completion(accepted.body) if accepted else None, "accepted_version_id": str(accepted.id) if accepted else None, "current_version_id": str(family.current_version_id) if family.current_version_id else None, "versions": [_version_read(version) for version in versions], "families": [{"id": str(item.id), "kind": item.kind, "label": item.label, "current_version_id": str(item.current_version_id) if item.current_version_id else None} for item in await _families(db, profile.id)], "evidence": evidence}
 
@@ -808,6 +810,10 @@ def _render(kind: str, body: dict, facts: dict) -> bytes:
 
     visible = active_body(kind, body)
     if kind == "operating_plan":
+        if operating_plan_schema.is_v2(visible):
+            from app.services import earnings_plan_pdf
+
+            return earnings_plan_pdf.render_pdf(body=visible, financial_totals=facts)
         from app.services.operating_plan_pdf import render_pdf
 
         return render_pdf(body=visible, financial_totals=facts)
@@ -858,43 +864,50 @@ async def publish_version(db: AsyncSession, profile: ApplicationProfile, *, kind
 
         goal = await require_goal(db, profile) if operating_client_submission else await read_goal(db, profile)
         operating_context["_operating_goal"] = goal
-        why_missing = [f"adjustments.{row['id']}.explanation" for row in body["adjustments"]
-                       if not row["excluded"] and row["status"] != "rejected" and not row["explanation"].strip()]
-        if why_missing:
-            raise HTTPException(422, {"code": "operating_change_reason_required", "message": "Explain why each planned change is reasonable before saving a version. Your working draft is retained.",
-                                      "missing": why_missing})
-        from app.schemas.earnings_improvement import expense_missing, source_duplicate_missing
-        from app.services.operating_plan_commands import correction_missing, itemization_missing
+        plan_v2 = operating_plan_schema.is_v2(body)
+        if plan_v2:
+            # The v2 plan always computes; what is left to do is one list, and it is the only thing that holds a version back.
+            from app.services import earnings_plan_service
 
-        duplicate_missing = source_duplicate_missing(body)
-        documented_groups = {row["source_group_key"] for row in body["historical_corrections"]
-            if len(row["reason"].strip()) >= 3}
-        expense_details = [f"expenses.{row['id']}.{key}" for row in body["expenses"] if not row["excluded"]
-            for key in expense_missing(row) if not (
-                row.get("itemization_parent_id") and row["label"].strip() and row["source_group_key"] in documented_groups
-                and key in {"current_amount", "current_units_per_period", "current_unit_cost", "current_fixed_amount"}
-                and row.get(key) is None)] if goal["status"] == "set" else []
-        split_missing = [*itemization_missing(body, operating_context), *correction_missing(body)]
-        if split_missing:
-            raise HTTPException(422, {"code": "operating_itemization_incomplete",
-                "message": "Reconcile each source split or explain the historical correction for preparer review. Supporting uploads are optional. Your working draft is retained.",
-                "missing": split_missing})
-        if duplicate_missing or expense_details:
-            raise HTTPException(422, {"code": "operating_expenses_incomplete",
-                "message": "Complete the current expense details and resolve duplicate imported rows before saving a version. Your working draft is retained.",
-                "missing": [*expense_details, *duplicate_missing]})
-        assessment = earnings_improvement.evaluate(body, operating_context)
-        from app.services.operating_source_review import evaluate as source_review
+            earnings_plan_service.require_complete(body, earnings_improvement.evaluate(body, operating_context))
+        else:
+            why_missing = [f"adjustments.{row['id']}.explanation" for row in body["adjustments"]
+                           if not row["excluded"] and row["status"] != "rejected" and not row["explanation"].strip()]
+            if why_missing:
+                raise HTTPException(422, {"code": "operating_change_reason_required", "message": "Explain why each planned change is reasonable before saving a version. Your working draft is retained.",
+                                          "missing": why_missing})
+            from app.schemas.earnings_improvement import expense_missing, source_duplicate_missing
+            from app.services.operating_plan_commands import correction_missing, itemization_missing
 
-        source_progress = source_review(body, operating_context)
-        if source_progress["active"] and not source_progress["complete"]:
-            raise HTTPException(422, {"code": "operating_source_review_incomplete", "message": "Review the selected source figures or explain the corrections that need review. Your draft is retained.",
-                                      "missing": source_progress["missing"]})
-        allocation = assessment["released_cash_flow"]
-        if (submit or goal["status"] == "set") and allocation["required"] and not allocation["complete"]:
-            raise HTTPException(422, {"code": "released_cash_flow_incomplete",
-                "message": "Reconcile the recurring released-cash-flow allocation before submitting. Your draft is retained.",
-                "missing": allocation["missing"], "released_cash_flow": allocation})
+            duplicate_missing = source_duplicate_missing(body)
+            documented_groups = {row["source_group_key"] for row in body["historical_corrections"]
+                if len(row["reason"].strip()) >= 3}
+            expense_details = [f"expenses.{row['id']}.{key}" for row in body["expenses"] if not row["excluded"]
+                for key in expense_missing(row) if not (
+                    row.get("itemization_parent_id") and row["label"].strip() and row["source_group_key"] in documented_groups
+                    and key in {"current_amount", "current_units_per_period", "current_unit_cost", "current_fixed_amount"}
+                    and row.get(key) is None)] if goal["status"] == "set" else []
+            split_missing = [*itemization_missing(body, operating_context), *correction_missing(body)]
+            if split_missing:
+                raise HTTPException(422, {"code": "operating_itemization_incomplete",
+                    "message": "Reconcile each source split or explain the historical correction for preparer review. Supporting uploads are optional. Your working draft is retained.",
+                    "missing": split_missing})
+            if duplicate_missing or expense_details:
+                raise HTTPException(422, {"code": "operating_expenses_incomplete",
+                    "message": "Complete the current expense details and resolve duplicate imported rows before saving a version. Your working draft is retained.",
+                    "missing": [*expense_details, *duplicate_missing]})
+            assessment = earnings_improvement.evaluate(body, operating_context)
+            from app.services.operating_source_review import evaluate as source_review
+
+            source_progress = source_review(body, operating_context)
+            if source_progress["active"] and not source_progress["complete"]:
+                raise HTTPException(422, {"code": "operating_source_review_incomplete", "message": "Review the selected source figures or explain the corrections that need review. Your draft is retained.",
+                                          "missing": source_progress["missing"]})
+            allocation = assessment["released_cash_flow"]
+            if (submit or goal["status"] == "set") and allocation["required"] and not allocation["complete"]:
+                raise HTTPException(422, {"code": "released_cash_flow_incomplete",
+                    "message": "Reconcile the recurring released-cash-flow allocation before submitting. Your draft is retained.",
+                    "missing": allocation["missing"], "released_cash_flow": allocation})
     if kind == "real_estate_schedule":
         described_properties = {row["id"] for row in real_estate_schema.properties(body)}
         missing = [f"mortgages.{row['id']}.property_row_id" for row in real_estate_schema.mortgages(body)
@@ -917,6 +930,12 @@ async def publish_version(db: AsyncSession, profile: ApplicationProfile, *, kind
             facts["operating_goal"] = goal
             facts["goal_progress"] = evaluation.get("goal_progress")
             facts["cash_bridge"] = evaluation.get("cash_bridge")
+        if operating_plan_schema.is_v2(body):
+            from app.services import earnings_plan_service
+
+            # The figures the plan document draws, kept with the version so a later download never recomputes them.
+            facts["plan_model"] = evaluation["schema_version"]
+            facts["plan_result"] = earnings_plan_service.plan_result(evaluation)
     versions = list((await db.execute(select(FinancialFormVersion).where(FinancialFormVersion.family_id == family.id))).scalars().all())
     if kind == "debt_schedule":
         completion = debt_schedule_completion(body)

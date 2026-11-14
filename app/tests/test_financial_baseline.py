@@ -94,6 +94,24 @@ def test_expense_groups_add_up_to_the_return_with_the_remainder_named():
     assert all(row["key"] != financial_baseline.REMAINDER_KEY for row in listed["rows"])
 
 
+def test_the_latest_statement_sits_beside_each_return_line_for_comparison_only():
+    lines = {"salaries_and_wages": 263700, "rent": 147600, "insurance": 17325}
+    current = cockpit([filed_return(), statement(**lines)])
+    groups = current["baseline"]["groups"]
+    beside = {row["key"]: row.get("statement_amount") for row in groups["rows"]}
+    # Nine months, annualized: the design's P&L column.
+    assert (beside["cogs"], beside["salaries_and_wages"], beside["rent"], beside["insurance"]) == (588400, 351600, 196800, 23100)
+    # What the P&L does not name line by line is its own remainder (its depreciation line is named, so it is not in the rest).
+    assert beside["utilities"] is None and beside["other_deductions"] == round((502725 - 263700 - 147600 - 17325 - 6300) * 12 / 9, 2)
+    assert groups["statement"] == {"file_id": "statement", "label": groups["statement"]["label"], "months_covered": 9, "annualized": True}
+    # The return is still the source and its own figures did not move.
+    assert current["baseline"]["source"]["kind"] == "tax_return" and current["baseline"]["figures"]["ebitda"] == -22377
+    assert {row["key"]: row["amount"] for row in groups["rows"]}["rent"] == 196805
+    # With no P&L, or one too short to annualize, there is nothing to put beside the lines.
+    assert "statement" not in cockpit([filed_return()])["baseline"]["groups"]
+    assert "statement" not in cockpit([filed_return(), statement(end="2026-03-31")])["baseline"]["groups"]
+
+
 def test_interest_is_financing_and_unread_add_backs_are_named():
     current = cockpit([filed_return(interest_expense=5000, depreciation=3000, ordinary_business_income=-22377)])
     figures = current["baseline"]["figures"]

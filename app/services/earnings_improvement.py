@@ -697,6 +697,13 @@ def comparison_scope(body, cockpit):
 
 
 def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_changes=False):
+    from app.schemas import earnings_plan_v2
+
+    if earnings_plan_v2.is_v2(raw):
+        # The v2 plan has its own engine and returns the same keys, so every reader of this result keeps working.
+        from app.services import earnings_plan_envelope
+
+        return earnings_plan_envelope.evaluate(raw, cockpit, source_file_ids=source_file_ids, now=now, include_expense_changes=include_expense_changes)
     body = validate_body(raw)
     original = deepcopy(body)
     from app.services.operating_plan_commands import resolve
@@ -1040,6 +1047,13 @@ def evaluate(raw, cockpit, *, source_file_ids=None, now=None, include_expense_ch
 
 def review_actions(raw, cockpit, action_ids, decision, reason, actor, *, baseline_treatment="unreconciled",
                    baseline_reconciliation_note="", source_file_ids=None, now=None):
+    from app.schemas import earnings_plan_v2
+
+    if earnings_plan_v2.is_v2(raw):
+        from app.services import earnings_plan_service
+
+        return earnings_plan_service.review(raw, cockpit, action_ids, decision, reason, actor, baseline_treatment=baseline_treatment,
+                                            baseline_reconciliation_note=baseline_reconciliation_note, now=now)
     if actor.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
         raise HTTPException(403, "Underwriting role required to review operating adjustments")
     if decision not in {"approved", "rejected", "proposed"} or not reason.strip() or len(reason) > 2000:
