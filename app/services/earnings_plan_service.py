@@ -123,6 +123,62 @@ def merge_client_body(current: dict, incoming: Any) -> dict:
     return protect_reviews(merged, current)
 
 
+# What a client's plan screens take from the server's evaluation: the figures to compute from and what only the server
+# can know. Everything else on those screens is worked out in the browser from the plan itself.
+CLIENT_PLAN_KEYS = ("baseline", "questions", "source_stamp", "source_changed", "stale_reviews", "labels", "warnings")
+
+
+def client_evaluation(evaluation: dict) -> dict:
+    plan = evaluation["plan"]
+    return {"context_stamp": evaluation["context_stamp"], "plan": {key: deepcopy(plan[key]) for key in CLIENT_PLAN_KEYS}}
+
+
+async def client_workspace(db, profile, *, family_id, pdf_base: str, can_edit: bool, completed: bool) -> dict:
+    """`workspace` as a client link sees it: the same plan and baseline, statuses without who or why, links to its own PDFs."""
+    result = await workspace(db, profile, family_id=family_id)
+    versions = []
+    for row in result["versions"]:
+        version = {key: row.get(key) for key in ("id", "version_number", "created_at", "source", "status")}
+        if row.get("pdf_file_id"):
+            version["pdf_url"] = f"{pdf_base}/{row['id']}/pdf"
+        versions.append(version)
+    return {**{key: result[key] for key in ("kind", "model", "origin", "family_id", "goal", "context_stamp", "stream_templates", "draft", "current_version_id")},
+            "body": client_body(result["body"]), "evaluation": client_evaluation(result["evaluation"]),
+            "versions": versions, "can_edit": can_edit, "completed": completed}
+
+
+async def client_resync(db, profile, incoming: Any, *, current: Any) -> dict:
+    """A client's plan brought onto the file's current source figures. Returned, not saved."""
+    from app.services import earnings_plan_migrate as migrate
+    from app.services.financial_cockpit import load_cockpit
+
+    if not schema.is_v2(incoming):
+        raise HTTPException(422, "Send the earnings plan in the operating-plan-v2 model")
+    cockpit = await load_cockpit(db, profile)
+    body = merge_client_body(current, migrate.resync(incoming, cockpit))
+    evaluation = envelope.evaluate(body, cockpit)
+    return {"body": client_body(body), "evaluation": client_evaluation(evaluation), "context_stamp": evaluation["context_stamp"]}
+
+
+async def stage_client_draft(db, profile, *, family_id, incoming: Any, expected_revision: int | None, actor=None):
+    """Keep a client's plan as typed so far. One revision check, one merge, no second read of the workspace."""
+    from app.services import financial_workspace
+
+    if not schema.is_v2(incoming):
+        raise HTTPException(422, "Send the earnings plan in the operating-plan-v2 model")
+    family, draft = await financial_workspace.resolve_family(db, profile, kind="operating_plan", family_id=family_id, actor=actor)
+    if expected_revision is None or expected_revision != draft.revision:
+        raise HTTPException(409, {"code": "financial_draft_conflict", "current_revision": draft.revision,
+                                  "message": "This plan changed or needs to be refreshed. Reload before saving your changes."})
+    from app.services.operating_plan_goals import reject_client_goal
+
+    reject_client_goal(incoming)
+    merged = merge_client_body(draft.body, incoming)
+    if financial_workspace.body_hash(merged) != financial_workspace.body_hash(draft.body):
+        await financial_workspace.stage_draft(db, profile, family, draft, merged, actor=actor)
+    return family
+
+
 def version_facts(facts: dict, body: dict, cockpit: dict, evaluation: dict, *, client_submission: bool, goal: dict | None) -> dict:
     """What a saved v2 version records beside its body, for the package and the file's readers."""
     from app.services import operating_plan_service

@@ -431,3 +431,127 @@ async def test_the_first_save_creates_the_plan_and_a_stale_tab_is_told_to_reload
         assert error.value.status_code == 409
         await routes.plan_save_draft(profile.id, routes.PlanDraft(body=file_body(), expected_revision=3), actor, db)
     assert staged.await_count == 2
+
+
+# ---------------------------------------------------------------------------
+# The client link: the same plan, without staff review detail
+# ---------------------------------------------------------------------------
+
+PRIVATE = {"reviewed_by_user_id", "reviewed_at", "review_reason", "review_stamp", "baseline_treatment", "baseline_reconciliation_note"}
+
+
+@pytest.mark.asyncio
+async def test_a_client_link_loads_the_plan_and_its_baseline_without_who_reviewed_or_why():
+    cockpit = file_cockpit(goal=215_000)
+    profile, family, draft = context("operating_plan")
+    draft.body = approve(file_body(), cockpit)
+    db = Memory()
+    db.objects[(FinancialFormDraft, family.id)] = draft
+    from app.models.financial_form_version import FinancialFormFamily, FinancialFormVersion
+
+    db.objects[(FinancialFormFamily, family.id)] = family
+    with_pdf = FinancialFormVersion(id=uuid4(), family_id=family.id, version_number=2, schema_version="operating-plan-v2", body=draft.body, key_facts={},
+                                    body_sha256="b", pdf_sha256="p", source="form", status="published", pdf_file_id=uuid4(), actor_name="Desk", created_at=ws.now())
+    original = FinancialFormVersion(id=uuid4(), family_id=family.id, version_number=1, schema_version="operating-plan-v1", body={}, key_facts={},
+                                    body_sha256="b", pdf_sha256="p", source="original", status="original", pdf_file_id=None, actor_name="Client upload", created_at=ws.now())
+    db.versions = [original, with_pdf]
+    with patch("app.services.financial_cockpit.load_cockpit", AsyncMock(return_value=cockpit)):
+        seen = await plan_service.client_workspace(db, profile, family_id=family.id, pdf_base="/api/v1/x/versions", can_edit=True, completed=False)
+    assert set(seen) == {"kind", "model", "origin", "family_id", "goal", "context_stamp", "stream_templates", "draft", "current_version_id",
+                         "body", "evaluation", "versions", "can_edit", "completed"}
+    rent = change(seen["body"], "l:rent")
+    assert rent["status"] == "approved" and not PRIVATE & set(rent)
+    # Only what the page cannot work out itself: the baseline to compute from, and what the server alone knows.
+    assert set(seen["evaluation"]) == {"context_stamp", "plan"} and set(seen["evaluation"]["plan"]) == set(plan_service.CLIENT_PLAN_KEYS)
+    assert seen["evaluation"]["plan"]["baseline"]["ebitda"] == -22377 and seen["evaluation"]["plan"]["baseline"]["debt_service_with_terms"] == 177600
+    assert [row["key"] for row in seen["evaluation"]["plan"]["questions"]] == ["payroll_taxes", "transportation"]
+    assert str(STAFF.id) not in str(seen) and "Lease and price list checked." not in str(seen)
+    assert (seen["goal"]["amount"], seen["draft"]["revision"], seen["can_edit"], seen["completed"]) == (215_000, 4, True, False)
+    assert [(row["version_number"], row.get("pdf_url"), "actor_name" in row) for row in seen["versions"]] == [
+        (2, f"/api/v1/x/versions/{with_pdf.id}/pdf", False), (1, None, False)]
+
+
+@pytest.mark.asyncio
+async def test_a_client_draft_checks_the_revision_and_never_writes_a_review():
+    from app.tests.test_earnings_plan_migrate import old_plan
+
+    profile, family, draft = context("operating_plan")
+    draft.body = old_plan()
+    staged = AsyncMock()
+    posted = file_body(keep_design_statuses=True)
+    change(posted, "l:rent")["review_reason"] = "the client wrote this"
+    with patch.object(ws, "resolve_family", AsyncMock(return_value=(family, draft))), patch.object(ws, "stage_draft", staged):
+        for revision in (None, 3):
+            with pytest.raises(HTTPException) as error:
+                await plan_service.stage_client_draft(Memory(), profile, family_id=family.id, incoming=posted, expected_revision=revision)
+            assert error.value.status_code == 409 and error.value.detail == {
+                "code": "financial_draft_conflict", "current_revision": 4, "message": "This plan changed or needs to be refreshed. Reload before saving your changes."}
+        with pytest.raises(HTTPException) as error:
+            await plan_service.stage_client_draft(Memory(), profile, family_id=family.id, incoming=v1_schema.empty_body(), expected_revision=4)
+        assert error.value.status_code == 422
+        with pytest.raises(HTTPException) as error:
+            await plan_service.stage_client_draft(Memory(), profile, family_id=family.id, incoming={**posted, "goal": {"amount": 1}}, expected_revision=4)
+        assert error.value.status_code == 422 and error.value.detail["code"] == "operating_goal_read_only"
+        assert staged.await_count == 0
+        # The first save from the new screens replaces the earlier model; nothing the page says about reviews is kept.
+        assert await plan_service.stage_client_draft(Memory(), profile, family_id=family.id, incoming=posted, expected_revision=4) is family
+        saved = staged.await_args.args[4]
+        assert saved["schema_version"] == "operating-plan-v2" and all(row["status"] == "proposed" and row["review_reason"] == "" for row in saved["changes"])
+        # Saving what is already stored writes nothing, so the revision does not move under another tab.
+        draft.body = saved
+        await plan_service.stage_client_draft(Memory(), profile, family_id=family.id, incoming=plan_service.client_body(saved), expected_revision=4)
+    assert staged.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_client_can_bring_the_plan_onto_changed_source_figures():
+    from app.tests.test_financial_baseline import filed_return
+
+    current = approve(file_body(), file_cockpit())
+    amended = file_cockpit(analyses=[filed_return(rent=200000, total_deductions=668086, ordinary_business_income=-25572)])
+    with patch("app.services.financial_cockpit.load_cockpit", AsyncMock(return_value=amended)):
+        result = await plan_service.client_resync(Memory(), SimpleNamespace(id=uuid4()), plan_service.client_body(current), current=current)
+        with pytest.raises(HTTPException) as error:
+            await plan_service.client_resync(Memory(), SimpleNamespace(id=uuid4()), v1_schema.empty_body(), current=current)
+    assert error.value.status_code == 422
+    assert set(result) == {"body", "evaluation", "context_stamp"} and result["evaluation"]["plan"]["source_changed"] is False
+    assert next(line["base"] for line in result["body"]["lines"] if line["id"] == "rent") == 200000
+    assert result["body"]["source"]["confirmations"] == {}
+    # The lines moved, so no earlier approval stands; and the client still sees no review detail.
+    assert all(row["status"] == "proposed" and not PRIVATE & set(row) for row in result["body"]["changes"])
+
+
+@pytest.mark.asyncio
+async def test_client_plan_routes_open_only_an_earnings_plan_link_and_respect_read_only():
+    from app.routers import application_profiles as routes
+
+    profile, family, draft = context("operating_plan")
+    link = SimpleNamespace(kind="operating_plan", permission="edit", profile_id=profile.id, financial_family_id=family.id, completed_at=None,
+                           invitee_email="owner@example.test", last_used_at=None)
+    db = Memory()
+    db.commit = AsyncMock()
+    from app.models.application_profile import ApplicationProfile
+
+    db.objects[(ApplicationProfile, profile.id)] = profile
+    opened = AsyncMock(return_value={"origin": "saved"})
+    staged = AsyncMock(return_value=family)
+    with patch.object(routes, "_open_link_or_404", AsyncMock(return_value=link)), patch.object(ws, "resolve_family", AsyncMock(return_value=(family, draft))), \
+         patch.object(plan_service, "client_workspace", opened), patch.object(plan_service, "stage_client_draft", staged):
+        assert await routes.public_earnings_plan("tok", db) == {"origin": "saved"}
+        assert opened.await_args.kwargs == {"family_id": family.id, "pdf_base": "/api/v1/application-profiles/public/financial-forms/tok/versions",
+                                            "can_edit": True, "completed": False}
+        assert link.last_used_at is not None and db.commit.await_count == 1
+        await routes.save_public_earnings_plan_draft("tok", routes.PublicEarningsPlanDraft(body=file_body(), expected_revision=4), db)
+        assert staged.await_args.kwargs["expected_revision"] == 4 and staged.await_args.kwargs["actor"].id is None
+        assert staged.await_args.kwargs["actor"].name == "owner@example.test"
+        link.permission = "view"
+        assert (await routes.public_earnings_plan("tok", db)) == {"origin": "saved"} and opened.await_args.kwargs["can_edit"] is False
+        with pytest.raises(HTTPException) as error:
+            await routes.save_public_earnings_plan_draft("tok", routes.PublicEarningsPlanDraft(body=file_body(), expected_revision=4), db)
+        assert error.value.status_code == 403 and staged.await_count == 1
+        link.kind = "debt_schedule"
+        for call in (routes.public_earnings_plan("tok", db),
+                     routes.save_public_earnings_plan_draft("tok", routes.PublicEarningsPlanDraft(body=file_body(), expected_revision=4), db)):
+            with pytest.raises(HTTPException) as error:
+                await call
+            assert error.value.status_code == 404

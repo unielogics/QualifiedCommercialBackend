@@ -6912,6 +6912,70 @@ async def public_operating_plan_evidence(token: str, file_id: UUID,
             "preview_url": preview_url, "expires_in": 300}
 
 
+class PublicEarningsPlanDraft(PublicOperatingPlanEvaluate):
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+async def _public_earnings_plan_link(db: AsyncSession, token: str, *, require_edit: bool = False):
+    link = await _open_link_or_404(db, token)
+    if link.kind != "operating_plan":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "This link is no longer available")
+    if require_edit and getattr(link, "permission", "edit") != "edit":
+        raise HTTPException(403, "This form link is read-only")
+    return link, await db.get(ApplicationProfile, link.profile_id)
+
+
+async def _public_earnings_plan(db: AsyncSession, token: str, link, profile, family_id: UUID) -> dict:
+    from app.services import earnings_plan_service
+
+    return await earnings_plan_service.client_workspace(
+        db, profile, family_id=family_id,
+        pdf_base=f"/api/v1/application-profiles/public/financial-forms/{token}/versions",
+        can_edit=getattr(link, "permission", "edit") == "edit", completed=link.completed_at is not None)
+
+
+@router.get("/public/financial-forms/{token}/plan")
+async def public_earnings_plan(token: str, db: AsyncSession = Depends(get_db)) -> dict:
+    """What the earnings plan screens load for a client link.
+
+    The plan comes in the current model with the file's baseline, so the page
+    works every figure out itself. A plan still stored in the earlier model is
+    carried over in memory and becomes the current model on its first save.
+    """
+    from app.services import financial_workspace
+
+    link, profile = await _public_earnings_plan_link(db, token)
+    link.last_used_at = datetime.now(UTC)
+    # The draft row carries the revision every later save is checked against.
+    family, _draft = await financial_workspace.resolve_family(db, profile, kind="operating_plan", family_id=link.financial_family_id)
+    result = await _public_earnings_plan(db, token, link, profile, family.id)
+    await db.commit()
+    return result
+
+
+@router.put("/public/financial-forms/{token}/plan/draft")
+async def save_public_earnings_plan_draft(token: str, payload: PublicEarningsPlanDraft, db: AsyncSession = Depends(get_db)) -> dict:
+    """Keep the plan as typed so far. Staff review fields are settled here, never taken from the page."""
+    from app.services import earnings_plan_service
+
+    link, profile = await _public_earnings_plan_link(db, token, require_edit=True)
+    family = await earnings_plan_service.stage_client_draft(
+        db, profile, family_id=link.financial_family_id, incoming=payload.body, expected_revision=payload.expected_revision,
+        actor=SimpleNamespace(id=None, name=link.invitee_email or "Borrower", email=link.invitee_email or ""))
+    link.last_used_at = datetime.now(UTC)
+    await db.commit()
+    return await _public_earnings_plan(db, token, link, profile, family.id)
+
+
+@router.post("/public/financial-forms/{token}/plan/resync")
+async def resync_public_earnings_plan(token: str, payload: PublicOperatingPlanEvaluate, db: AsyncSession = Depends(get_db)) -> dict:
+    """The same plan on the file's current source figures. Returned for the page to keep editing; nothing is saved."""
+    from app.services import earnings_plan_service
+
+    profile, current = await _public_operating_scope(db, token, require_edit=True)
+    return await earnings_plan_service.client_resync(db, profile, payload.body, current=current)
+
+
 @router.post("/public/financial-forms/{token}/draft")
 async def save_public_financial_form_draft(
     token: str, payload: FinancialStatementWrite, db: AsyncSession = Depends(get_db)
