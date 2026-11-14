@@ -31,6 +31,9 @@ class FinancialCockpitRead(BaseModel):
     dscr: dict[str, Any] = Field(default_factory=dict)
     ebitda: dict[str, Any] = Field(default_factory=dict)
     noi: dict[str, Any] = Field(default_factory=dict)
+    #: The selected earnings source as one ladder (revenue to NOI to EBITDA),
+    #: its expense groups and debt service; see app/services/financial_baseline.py.
+    baseline: dict[str, Any] = Field(default_factory=dict)
     operating_plan: dict[str, Any] = Field(default_factory=dict)
     operating_evidence: dict[str, Any] = Field(default_factory=dict)
     metric_review: dict[str, Any] = Field(default_factory=dict)

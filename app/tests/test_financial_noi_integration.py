@@ -70,7 +70,7 @@ def test_latest_year_missing_operating_lines_stays_unavailable_even_when_book_ea
     cockpit = build([annual(2024), annual(2025, cost_of_goods_sold=None, total_operating_expenses=None,
                                          operating_income=None)])
     assert cockpit["noi"]["headline"] is None
-    assert "latest business P&L has missing" in cockpit["noi"]["reason"]
+    assert "missing operating-income inputs" in cockpit["noi"]["reason"]
     assert cockpit["ebitda"]["headline"]["value"] == 30000
     assert cockpit["dscr"]["headline"]["numerator"] == 30000
     assert cockpit["noi"]["years"][-1]["value"] is None

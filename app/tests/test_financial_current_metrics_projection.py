@@ -35,8 +35,8 @@ def test_unavailable_live_value_clears_cached_coverage_and_ebitda():
     assert source["key_metrics"]["estimated_dscr"] == 99
 
 
-def test_latest_validated_pl_supplies_primary_coverage_and_annual_earnings():
-    cockpit = build([tax(), pnl()])
+def test_validated_pl_supplies_primary_coverage_and_annual_earnings_without_a_return():
+    cockpit = build([pnl()])
     result = current_review_projection({}, cockpit)
     metrics = result["key_metrics"]
     assert metrics["bankable_ebitda"] == 52000
@@ -44,6 +44,16 @@ def test_latest_validated_pl_supplies_primary_coverage_and_annual_earnings():
     assert metrics["dscr_earnings"] == 52000
     assert metrics["estimated_dscr"] == cockpit["dscr"]["headline"]["value"]
     assert result["financial_calculation_review"]["validated_annual"]["ebitda_annual"] == 52000
+
+
+def test_accepted_filed_return_supplies_primary_coverage_and_annual_earnings():
+    cockpit = build([tax(tax_form="1120-S"), pnl()])
+    result = current_review_projection({}, cockpit)
+    metrics = result["key_metrics"]
+    assert metrics["dscr_basis"] == "tax_return" and metrics["dscr_earnings"] == 115000
+    assert metrics["estimated_dscr"] == cockpit["dscr"]["headline"]["value"]
+    assert result["financial_calculation_review"]["validated_annual"]["ebitda_annual"] == 115000
+    assert result["financial_calculation_review"]["validated_annual"]["basis"] == "validated_filed_return_annual_ebitda"
 
 
 def test_cross_currency_candidate_cannot_resurrect_coverage_via_current_projection():

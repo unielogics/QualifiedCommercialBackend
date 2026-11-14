@@ -49,14 +49,24 @@ def correction(c, key="profit_and_loss.net_income", value=30000, state=None, **e
                          source_stamp=target(c, key)["source_stamp"], idempotency_key="correction-1", actor=ACTOR, **extra)[0]
 
 
-def test_complete_latest_pl_reconciles_once_and_supplies_dscr_instead_of_prior_tax():
+def test_filed_return_supplies_dscr_and_a_complete_newer_pl_is_the_comparison():
     c = build([tax(), pnl()])
+    result = c["ebitda"]["headline"]
+    assert result["kind"] == "tax_estimate" and result["value"] == result["annualized_value"] == 115000
+    assert result["entity_comparable"] and result["period_assumed"]
+    assert c["dscr"]["headline"]["key"] == "tax_return"
+    assert c["dscr"]["headline"]["numerator"] == 115000
+    assert c["dscr"]["comparative_candidates"][0]["numerator"] == 52000
+    assert "dscr.profit_and_loss" in target(c)["used_by"] and target(c)["used_by_headline"] == []
+
+
+def test_complete_pl_reconciles_once_and_supplies_dscr_without_a_return():
+    c = build([pnl()])
     result = c["ebitda"]["headline"]
     assert result["kind"] == "computed_ebitda" and result["value"] == 26000
     assert result["annualized_value"] == 52000 and result["entity_comparable"]
     assert c["dscr"]["headline"]["key"] == "profit_and_loss"
     assert c["dscr"]["headline"]["numerator"] == 52000
-    assert c["dscr"]["comparative_candidates"][0]["numerator"] == 115000
     assert "dscr.profit_and_loss" in target(c)["used_by"]
     assert target(c)["used_by_headline"] == ["dscr.profit_and_loss"]
     assert target(c)["source_refs"][0]["analysis_id"] == "analysis-1"
@@ -85,18 +95,27 @@ def test_dscr_blocks_known_currency_mismatch_and_retains_currency_provenance(cur
     assert target(c, "debt.annual")["source_refs"][0]["currency"] == "USD"
 
 
-def test_latest_comparable_pl_leads_and_prior_tax_currency_evidence_is_comparative():
+def test_return_in_another_currency_leads_without_coverage_until_staff_choose_the_pl():
+    from app.services.financial_earnings_sources import change
+
     c = build([tax(currency="EUR"), pnl(currency="USD")])
-    assert c["ebitda"]["headline"]["currency"] == "USD"
-    assert c["dscr"]["headline"]["key"] == "profit_and_loss"
-    assert c["dscr"]["headline"]["value"] == 4.33
-    tax_candidate = next(row for row in c["dscr"]["comparative_candidates"] if row["key"] == "tax_return")
+    assert c["ebitda"]["headline"]["kind"] == "tax_estimate" and c["ebitda"]["headline"]["currency"] == "EUR"
+    tax_candidate = next(row for row in c["dscr"]["candidates"] if row["key"] == "tax_return")
     assert tax_candidate["source_numerator"] == 115000
     assert tax_candidate["value"] is None and tax_candidate["numerator"] is None
     assert tax_candidate["currency_status"] == "mismatch"
     assert tax_candidate["source_currencies"] == ["EUR"]
     assert "EUR" in tax_candidate["note"]
-    selected = [row["key"] for row in c["metric_review"]["calculations"] if row.get("selected") and row["key"].startswith("dscr.")]
+    # No conversion is assumed, and the P&L does not step in on its own.
+    assert c["dscr"]["headline"] is None
+    selection = c["ebitda"]["source_selection"]
+    state, _ = change(None, selection, mode="manual", selected_file_id="source", excluded_file_ids=[],
+        reason="Use the dollar P&L", expected_revision=0, source_stamp=selection["source_stamp"],
+        idempotency_key="choose-pl", actor=ACTOR)
+    chosen = build([tax(currency="EUR"), pnl(currency="USD")], state)
+    assert chosen["ebitda"]["headline"]["currency"] == "USD"
+    assert chosen["dscr"]["headline"]["key"] == "profit_and_loss" and chosen["dscr"]["headline"]["value"] == 4.33
+    selected = [row["key"] for row in chosen["metric_review"]["calculations"] if row.get("selected") and row["key"].startswith("dscr.")]
     assert selected == ["dscr.profit_and_loss"]
 
 
@@ -136,10 +155,12 @@ def test_effective_operand_changes_dscr_plan_and_net_profit_but_not_raw_analysis
     assert result["debt"]["service"]["annual"] == 12000
 
 
-def test_unknowns_and_explicit_zero_are_distinct_and_tax_is_only_estimate():
+def test_unknowns_and_explicit_zero_are_distinct_and_unread_add_backs_are_named():
     c = build([tax(interest=None, depreciation=None)])
     assert c["ebitda"]["headline"]["kind"] == "tax_estimate"
-    assert c["ebitda"]["headline"]["provisional"] and not c["ebitda"]["headline"]["complete"]
+    # The return is accepted, so it stands; what was not read is named.
+    assert not c["ebitda"]["headline"]["provisional"] and not c["ebitda"]["headline"]["complete"]
+    assert c["ebitda"]["headline"]["value"] == c["ebitda"]["headline"]["annualized_value"] == 100000
     assert len(c["ebitda"]["headline"]["missing_inputs"]) == 2
     key = next(i["key"] for i in c["metric_review"]["inputs"] if i["key"].endswith(".interest"))
     state = correction(c, key, 0)

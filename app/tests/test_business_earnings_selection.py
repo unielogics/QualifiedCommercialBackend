@@ -54,7 +54,9 @@ def test_personal_returns_do_not_displace_suffix_matched_business_tax_or_nested_
     assert current["currency_status"] == "comparable"
     assert cockpit["ebitda"]["headline"]["kind"] == "tax_estimate"
     assert cockpit["ebitda"]["headline"]["value"] == -193701
-    assert validated_annual_pair(cockpit) is None  # Tax estimates never become factual P&L EBITDA.
+    # The accepted business return is the validated annual basis.
+    pair = validated_annual_pair(cockpit)
+    assert pair["basis"] == "validated_filed_return_annual_ebitda" and pair["ebitda_annual"] == -193701
     excluded = cockpit["metric_review"]["excluded_income_sources"]
     assert {item["file_id"] for item in excluded} == {"personal-2024", "personal-2025"}
     assert all("Personal" in item["reason"] for item in excluded)

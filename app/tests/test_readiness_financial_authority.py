@@ -23,8 +23,8 @@ from app.services.financial_cockpit import build_cockpit
 from app.tests.test_numbers_first_readiness import computation as base_computation
 
 
-def current_business_authority():
-    analysis = {"file_id": "company-2025", "classification": "tax_return", "accepted": True,
+def current_business_authority(accepted=True):
+    analysis = {"file_id": "company-2025", "classification": "tax_return", "accepted": accepted,
                 "key_facts": {"tax_form": "Form 1065", "tax_year": "Calendar year 2025",
                               "entity_name": "Example Capital Partners LLC", "accounting_method": "cash",
                               "ordinary_business_income_loss": -410155, "interest_expense": 163121,
@@ -45,7 +45,10 @@ def test_negative_tax_based_coverage_does_not_replace_a_reviewed_assumption_or_s
     assert current["key"] == "current_dscr" and current["value"] == -0.2
     assert current["numerator"] == -193701 and current["denominator"] == 958554.6
     assert current["source"]["basis"] == "tax_return"
-    assert current["source"]["provisional"] and current["source"]["informational"]
+    # The accepted return is the validated annual basis; the score still reads the reviewed assumption.
+    assert not current["source"]["provisional"] and current["source"]["reviewed"] and current["source"]["informational"]
+    unaccepted, _ = readiness.business_dscr_metrics(profile, current_business_authority(accepted=False), {}, "en")
+    assert unaccepted[0]["value"] == -0.2 and unaccepted[0]["source"]["provisional"]
     assert assumption["key"] == "underwriting_dscr" and assumption["value"] == 1.4
     assert assumption["source"]["assumption"] and assumption["source"]["reviewed"]
     assert score_status == readiness.classify_dscr(Decimal("1.4"))
@@ -78,13 +81,14 @@ def computation(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_recompute_persists_current_business_coverage_without_promoting_tax_estimate_to_ebitda(computation):
+async def test_recompute_persists_current_business_coverage_and_reads_the_accepted_return_as_annual_ebitda(computation):
     db, profile, _, authority = computation
     snapshot = await readiness.recompute(db, profile, idempotency_key="original-event", expected_snapshot_version=None)
     metrics = {metric["key"]: metric for metric in snapshot.metrics}
     assert metrics["current_dscr"]["value"] == -0.2
     assert metrics["underwriting_dscr"]["value"] == 1.4
-    assert metrics["internal_adjusted_ebitda"]["value"] is None
+    assert metrics["internal_adjusted_ebitda"]["value"] == -193701
+    assert metrics["internal_adjusted_ebitda"]["source"]["source_basis"] == "current_validated_annual_filed_return"
     source = next(item for item in snapshot.source_manifest if item["kind"] == "financial_calculation_authority")
     assert source["signature"] == authority["signature"]
     assert readiness.snapshot_authority_matches(snapshot, authority, profile)
@@ -294,8 +298,11 @@ def test_manual_fallback_never_promotes_unverified_or_source_file_periods(extra)
 
 
 @pytest.mark.asyncio
-async def test_manual_fallback_stays_informational_and_does_not_change_coverage(computation):
+async def test_manual_fallback_stays_informational_and_does_not_change_coverage(computation, monkeypatch):
     db, profile, period, _ = computation
+    # A return that is not accepted is not a validated annual basis, so the
+    # reviewed manual period stands in.
+    monkeypatch.setattr(readiness, "load_financial_authority", AsyncMock(return_value=current_business_authority(accepted=False)))
     period.source_kind = "derived"
     period.review_status = "confirmed"
     period.ebitda = Decimal("12000")

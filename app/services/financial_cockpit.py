@@ -2541,11 +2541,15 @@ def build_cockpit(
         selected_source = next((row for row in selection.get("sources", []) if row.get("selected")), None)
         profit_kind = "profit_and_loss" if selected_source and selected_source.get("kind") == "profit_and_loss" else "tax_return" if selected_source else None
         cockpit["net_profit"]["conclusion"] = next((row for row in cockpit["net_profit"].get("candidates", []) if row["key"] == profit_kind), None)
-        cockpit["net_profit"]["baseline_policy"] = "latest_business_period"
+        cockpit["net_profit"]["baseline_policy"] = "filed_return_first"
         if not selected_source:
             cockpit["net_profit"]["note"] = "The latest business reporting period is incomplete or excluded. Prior years are comparison evidence only."
     from app.services.financial_plan_budget import profit_projection
     cockpit["net_profit"]["budget_scenario"] = profit_projection(cockpit["net_profit"], cockpit["ebitda"], evaluation)
+    from app.services import financial_baseline
+
+    # One ladder explains the selected earnings source for every reader.
+    cockpit["baseline"] = financial_baseline.safe_build(cockpit, analyses)
     from app.services.financial_kpi_evidence import attach as attach_kpi_evidence
 
     attach_kpi_evidence(cockpit)
@@ -3186,6 +3190,11 @@ async def load_cockpit(db: AsyncSession, profile: ApplicationProfile) -> dict[st
 
     if cockpit["operating_plan"].get("available"):
         refresh_cockpit(cockpit, operating_budget_snapshot(profile))
+        from app.services import financial_baseline
+
+        # The reviewed operating plan can change the financing projection the
+        # baseline reports debt service from.
+        cockpit["baseline"] = financial_baseline.safe_build(cockpit, analyses)
     from app.services.investor_collateral import snapshot as collateral_snapshot
 
     current_collateral = collateral_snapshot(profile)

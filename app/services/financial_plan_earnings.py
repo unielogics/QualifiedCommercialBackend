@@ -33,7 +33,7 @@ def _difference(before, after):
 def scenario_ebitda(ebitda, plan, evaluation, dscr, service):
     headline = deepcopy((ebitda or {}).get("headline") or {})
     kind = headline.get("kind")
-    supported = kind in {"computed_ebitda", "reported_ebitda"}
+    supported = kind in {"computed_ebitda", "reported_ebitda", "tax_estimate"}
     before = _number(headline.get("value")) if supported else None
     annual = _number(headline.get("annualized_value")) if supported else None
     status = "projected_unchanged" if before is not None else "tax_estimate_only" if kind == "tax_estimate" else "unavailable"
@@ -48,7 +48,7 @@ def scenario_ebitda(ebitda, plan, evaluation, dscr, service):
         adjusted_base = None
         notes.append("Scenario addbacks are denominated in USD; they are not applied to a source EBITDA in another currency. No currency conversion is assumed.")
     if adjusted_base is None:
-        notes.append("Adjusted EBITDA requires an accepted, reconciled annual P&L basis for the same business, a known reporting period/accounting basis, and a comparable USD denomination.")
+        notes.append("Adjusted EBITDA requires an accepted business return, or an accepted, reconciled annual P&L with a known reporting period and accounting basis, for the same business in a comparable USD denomination.")
 
     included, excluded, used_ids = [], [], set()
     for item in plan.get("add_backs") or []:
@@ -67,7 +67,7 @@ def scenario_ebitda(ebitda, plan, evaluation, dscr, service):
         elif item.get("id") and item["id"] in used_ids:
             reason = "This adjustment identity is already included; it is not counted twice."
         elif adjusted_base is None:
-            reason = "No comparable, source-supported annual P&L EBITDA baseline is available."
+            reason = "No comparable, source-supported annual EBITDA baseline is available."
         if reason:
             excluded.append({**adjustment, "reason": reason, "status": "not_applied"})
         else:

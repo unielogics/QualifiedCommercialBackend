@@ -1,9 +1,11 @@
 """Audited EBITDA source choice and separately labelled revenue illustrations.
 
-The latest business period is always the baseline; earlier business returns
-are comparison evidence only. Excluding or failing to reconcile the latest
-period never substitutes an older, more favourable year. A forecast is never
-an accepted fact.
+A filed business return leads: the latest one is the baseline and earlier
+returns are comparison evidence only. A P&L is the labelled fallback. Staff
+may select it, and it stands in on its own only when there is no return, or
+the latest return cannot be used and the P&L is not from an earlier year.
+Excluding or failing to reconcile the lead never substitutes an older, more
+favourable year. A forecast is never an accepted fact.
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ def _source_order(row):
 def attach(ebitda, review, analyses, years, statement, bank, *, state=None, entity=None, now=None):
     """Apply a current source receipt after operand/recipe reviews, before plans."""
     from app.services.document_associations import identity_matches, source_excluded
+    from app.services.financial_noi_review import _as_of, _automatic_exclusion, _year
     from app.services.financial_tax_earnings import normalize_tax_earnings, tax_source_is_business
 
     state = state or {}
@@ -71,13 +74,22 @@ def attach(ebitda, review, analyses, years, statement, bank, *, state=None, enti
         tax_period = normalize_tax_earnings(facts) if is_tax and business_tax else {}
         candidate = by_file.get(str(row.get("file_id")))
         identity = _identity(facts)
+        # A forecast, or a period that has not started, is not a result. A
+        # period still in progress stays what it always was here: a year-to-date
+        # statement (accounting packages often print the whole fiscal year).
+        first = facts.get("period_start") or tax_period.get("period_start")
+        last = facts.get("period_end") or tax_period.get("period_end")
+        projection = _automatic_exclusion(facts, first, None,
+            _year(last) or _year(facts.get("tax_year") or facts.get("fiscal_year") or facts.get("return_year")), _as_of(now))
         scope_reason = (
             "Personal or unscoped tax return; never used for business EBITDA."
             if is_tax and not business_tax else
             "This document's business association requires review in Evidence."
             if source_excluded(row.get("identity_association")) else
             "The document does not establish this business's identity."
-            if entity and not identity_matches(entity, identity, row.get("identity_association")) else None
+            if entity and not identity_matches(entity, identity, row.get("identity_association")) else
+            "Forecast or future-period information is not an earnings baseline."
+            if projection else None
         )
         reason = scope_reason or ("This source is not the current parsed earnings record for its period." if candidate is None else None)
         source_refs = candidate.get("source_refs", []) if candidate else []
@@ -101,7 +113,7 @@ def attach(ebitda, review, analyses, years, statement, bank, *, state=None, enti
             "source_stamp": stamp({"analysis": row.get("analysis_id"), "hash": row.get("content_hash"), "facts": facts,
                                    "association": row.get("identity_association"), "entity": entity}),
         })
-        period_scope = (not is_tax or business_tax) and (
+        period_scope = (not is_tax or business_tax) and not projection and (
             scope_reason is None or not identity or not entity or identity_matches(entity, identity))
         if period_scope:
             # A matching or identity-unresolved business document still marks
@@ -117,19 +129,30 @@ def attach(ebitda, review, analyses, years, statement, bank, *, state=None, enti
     stale = bool(event and event.get("source_stamp") != catalog_stamp)
     excluded = set(event.get("excluded_file_ids", [])) if event else set()
     mode = event.get("mode", "automatic") if event else "automatic"
-    latest = max(business_periods, key=_source_order) if business_periods else None
+    # The filed return leads; without one, the latest P&L does.
+    returns = [row for row in business_periods if row["kind"] == "tax_return"]
+    lead_pool = returns or business_periods
+    latest = max(lead_pool, key=_source_order) if lead_pool else None
     current_period = _source_order(latest)[:3] if latest else None
     for row in sources:
-        row["current_period"] = bool(row in business_periods and _source_order(row)[:3] == current_period)
-        row["baseline_eligible"] = bool(row["eligible"] and row["current_period"])
-        row["comparative_only"] = bool(row in business_periods and not row["current_period"])
+        in_scope = row in business_periods
+        leads = in_scope and (not returns or row["kind"] == "tax_return")
+        row["current_period"] = bool(leads and _source_order(row)[:3] == current_period)
+        row["fallback_only"] = bool(in_scope and returns and row["kind"] == "profit_and_loss")
+        row["baseline_eligible"] = bool(row["eligible"] and (row["current_period"] or row["fallback_only"]))
+        row["comparative_only"] = bool(in_scope and not row["current_period"] and not row["fallback_only"])
     preferred = event.get("selected_file_id") if event and mode == "manual" else None
     available = [row for row in sources if row["baseline_eligible"] and row["file_id"] not in excluded]
+    leading = [row for row in available if row["current_period"]]
+    # A fallback never reaches back past the year of the return it stands in for.
+    standing_in = [row for row in available if row["fallback_only"] and _source_order(row)[0] >= current_period[0]]
     selected = None
     manual_none = bool(event and mode == "manual" and preferred is None)
     if not manual_none and available:
-        chosen = next((row for row in available if row["file_id"] == preferred), None) or max(available, key=_source_order)
-        selected = chosen["file_id"]
+        chosen = (next((row for row in available if row["file_id"] == preferred), None)
+                  or (max(leading, key=_source_order) if leading else None)
+                  or (max(standing_in, key=_source_order) if standing_in else None))
+        selected = chosen["file_id"] if chosen else None
     legacy_selection_replaced = bool(preferred and selected and preferred != selected)
     forecast_assumptions = (event.get("forecast_assumptions") if event and not stale and selected
                             and not legacy_selection_replaced else None)
@@ -139,8 +162,12 @@ def attach(ebitda, review, analyses, years, statement, bank, *, state=None, enti
         if row["eligible"] and row["file_id"] in excluded:
             row["reason"] = "Excluded from the EBITDA baseline by staff; retained for historical comparison."
         elif row["eligible"] and not row["selected"]:
-            row["reason"] = ("Historical comparison only; the latest business reporting period supplies the baseline."
-                             if row["comparative_only"] else "Alternative source for the latest reporting period; not added to the selected baseline.")
+            row["reason"] = ("Historical comparison only; the latest filed return supplies the baseline."
+                             if row["comparative_only"] and returns else
+                             "Historical comparison only; the latest business reporting period supplies the baseline."
+                             if row["comparative_only"] else
+                             "Labelled fallback; the filed return supplies the baseline. Staff can select this P&L instead."
+                             if row["fallback_only"] else "Alternative source for the latest reporting period; not added to the selected baseline.")
     selected_row = next((row for row in sources if row["selected"]), None)
     for candidate in candidates:
         candidate["selected_for_ebitda"] = bool(selected_row and _file(candidate) == selected_row["file_id"])
@@ -162,7 +189,7 @@ def attach(ebitda, review, analyses, years, statement, bank, *, state=None, enti
         "mode": mode, "selected_file_id": selected, "excluded_file_ids": sorted(excluded),
         "stale": stale, "sources": sources, "history": history,
         "forecast_assumptions": forecast_assumptions,
-        "baseline_policy": "latest_business_period", "latest_file_id": latest["file_id"] if latest else None,
+        "baseline_policy": "filed_return_first", "latest_file_id": latest["file_id"] if latest else None,
         "latest_period_end": latest.get("period_end") if latest else None,
         "legacy_selection_replaced": legacy_selection_replaced,
     }
@@ -198,6 +225,12 @@ def revenue_trend(years, statement, candidates, bank, *, now=None, assumptions=N
     for row in years:
         candidate = candidate_files.get(str(row.get("file_id")), {})
         first, last = row.get("period_start"), row.get("period_end")
+        label = str(row.get("year") or "")
+        # A return that prints its tax year without period dates is read as
+        # that full year, the same reading its earnings and coverage use.
+        assumed = not first and not last and len(label) == 4 and label.isdigit()
+        if assumed:
+            first, last = f"{label}-01-01", f"{label}-12-31"
         try:
             start, end = date.fromisoformat(first), date.fromisoformat(last)
             complete = (start.day == 1 and start.month == end.month % 12 + 1 and end.day == monthrange(end.year, end.month)[1]
@@ -206,6 +239,7 @@ def revenue_trend(years, statement, candidates, bank, *, now=None, assumptions=N
             complete = False
         revenue = number(row.get("gross_receipts"))
         periods.append({
+            "period_assumed": assumed,
             "year": str(row.get("year") or ""), "period_start": first, "period_end": last,
             "months_covered": 12 if complete else None, "revenue": revenue,
             "average_monthly_revenue": round(revenue / 12, 2) if complete and revenue is not None else None,
@@ -252,7 +286,10 @@ def revenue_trend(years, statement, candidates, bank, *, now=None, assumptions=N
                 "reason": "A current, dated P&L or explicitly reviewed revenue assumptions are needed for a current-year outlook. Historical growth alone does not establish future revenue."}
     if len(full) >= 2:
         prior, current = full[-2:]
-        comparable = bool(prior["currency"] and prior["currency"] == current["currency"] and prior["basis"] and prior["basis"] == current["basis"]
+        # An accounting method the reader did not find does not block the
+        # comparison; two methods that differ do.
+        comparable = bool(prior["currency"] and prior["currency"] == current["currency"]
+                          and (not prior["basis"] or not current["basis"] or prior["basis"] == current["basis"])
                           and prior["period_start"][5:] == current["period_start"][5:]
                           and prior["period_end"][5:] == current["period_end"][5:]
                           and int(current["year"]) - int(prior["year"]) == 1)
@@ -278,8 +315,11 @@ def revenue_trend(years, statement, candidates, bank, *, now=None, assumptions=N
         except (TypeError, ValueError):
             dated = False
         comparable = bool(statement.get("currency") and statement.get("basis") and
-                          (not baseline or statement.get("currency") == baseline["currency"] and statement.get("basis") == baseline["basis"]))
-        if (dated and comparable and current_earnings and str(statement.get("file_id")) == selected_file_id
+                          (not baseline or statement.get("currency") == baseline["currency"]
+                           and (not baseline["basis"] or statement.get("basis") == baseline["basis"])))
+        # The current year's P&L illustrates the run rate whether or not it is
+        # the baseline: with a filed return leading, it is the outlook beside it.
+        if (dated and comparable and current_earnings and not current_earnings.get("excluded_from_ebitda")
                 and not current_earnings.get("entity_mismatch") and months is not None and 3 <= months < 12 and revenue is not None):
             projected = round(revenue * 12 / months, 2)
             forecast.update(status="illustration", method="p_and_l_run_rate", target_year=today.year,
@@ -287,7 +327,7 @@ def revenue_trend(years, statement, candidates, bank, *, now=None, assumptions=N
                             change_pct=round((projected - baseline["revenue"]) / baseline["revenue"] * 100, 2) if baseline and baseline["revenue"] > 0 else None,
                             source_refs=candidate_files.get(str(statement.get("file_id")), {}).get("source_refs", []), reason=None,
                             assumptions=["Illustration only: current P&L revenue per reported month continues for twelve months; no seasonal adjustment is assumed."])
-            if current_earnings.get("value") is not None and str(statement.get("file_id")) == selected_file_id:
+            if current_earnings.get("value") is not None:
                 forecast.update(projected_ebitda=round(current_earnings["value"] * 12 / months, 2),
                                 ebitda_kind=current_earnings.get("kind"), margin=round(current_earnings["value"] / revenue, 6) if revenue > 0 else None)
                 forecast["assumptions"].append("Annualize earnings from the same current P&L period; retain its reconciliation and missing-component limitations.")
@@ -364,7 +404,7 @@ def align_coverage(ebitda, dscr, review=None):
     dscr["bank_proxy"] = next((row for row in [*active, *comparative] if row.get("key") == "bank_cash_flow"), None)
     dscr["headline"] = next((row for row in active if row.get("value") is not None), None)
     dscr["pro_forma_headline"] = next((row for row in active if row.get("pro_forma_value") is not None), None)
-    dscr["baseline_policy"] = "latest_business_period"
+    dscr["baseline_policy"] = "filed_return_first"
     dscr["selected_file_id"] = selected_id
     if dscr["headline"]:
         dscr["reason"] = None
@@ -414,7 +454,7 @@ def change(state, selection, *, mode, selected_file_id, excluded_file_ids, reaso
         if not target or not target["eligible"] or selected in excluded:
             raise HTTPException(422, "Select an eligible business source; personal or excluded evidence cannot supply EBITDA")
         if not target.get("baseline_eligible", False):
-            raise HTTPException(422, "Use the latest business reporting period as the earnings baseline. Older periods are historical comparison only.")
+            raise HTTPException(422, "Use the latest filed return or a current P&L as the earnings baseline. Older periods are historical comparison only.")
     elif mode == "automatic" and selected is not None:
         raise HTTPException(422, "Automatic selection does not accept a manual source")
     event = {"id": str(uuid.uuid4()), "source_metric": "ebitda", **request, "revision": expected_revision + 1,

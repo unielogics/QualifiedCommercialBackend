@@ -33,6 +33,17 @@ def _identity_dependency(association):
         "status", "allows_financial_use", "expected_entity", "observed_entity", "observed_entities")}
 
 
+def _earnings_operand(review, file_id, field, original):
+    """The value earnings already use for this return, corrections included.
+
+    Operating income then starts from the same bottom line as EBITDA, whatever
+    basis the return prints (ordinary business income first).
+    """
+    target = next((item for item in (review or {}).get("inputs", [])
+        if item.get("key", "").startswith(f"tax_return:{file_id}:") and item["key"].endswith(f".{field}")), None)
+    return number(target.get("value")) if target else original
+
+
 def _reviewed_tax_input(review, file_id, field, original):
     target = next((item for item in (review or {}).get("inputs", [])
         if item.get("key", "").startswith(f"tax_return:{file_id}:") and item["key"].endswith(f".{field}")), None)
@@ -104,11 +115,11 @@ def catalog(analyses, candidates, *, entity=None, metric_review=None, now=None):
             income, income_paths = _first(facts, ("ordinary_business_income", "ordinary_business_income_loss", "ordinary_business_income_loss_current"))
             interest = number(tax.get("interest"))
             proposed = _money(income + interest) if income is not None and interest is not None else None
-            notes.append("Tax-derived estimate: ordinary business tax income plus known deducted interest. Depreciation and amortization remain expenses; tax/book differences and non-operating items require staff review.")
-            if not first or not last:
+            notes.append("From the filed return: its bottom line, less other income, plus deducted interest. Depreciation and amortization remain expenses.")
+            if not first and not last:
+                notes.append("The return prints its tax year without period dates; it is read as that full year.")
+            elif not first or not last:
                 notes.append("The return's exact reporting dates are not established. Confirm that the reviewed amount represents the stated annual period; no automatic annualization is applied.")
-            if income is None or interest is None:
-                notes.append("Tax income or interest is unknown. Enter a supported annual amount after reviewing the return; missing deductions are not assumed to be zero.")
             operands = {"income": income, "interest": interest, "income_fact_paths": income_paths,
                         "interest_fact_paths": tax.get("component_fact_paths", {}).get("interest", [])}
         else:
@@ -121,10 +132,23 @@ def catalog(analyses, candidates, *, entity=None, metric_review=None, now=None):
             "hash": row.get("content_hash"), "facts": facts, "accepted": row.get("accepted"),
             "association": row.get("identity_association"), "entity": entity, "operands": operands,
             "citation_manifest": row.get("financial_fact_citations")})
+        other = None
         if is_tax:
-            income = _reviewed_tax_input(metric_review, row.get("file_id"), "income", income)
-            interest = _reviewed_tax_input(metric_review, row.get("file_id"), "interest", interest)
-            proposed = _money(income + interest) if income is not None and interest is not None else None
+            from app.services.financial_baseline import return_ladder
+
+            income = _earnings_operand(metric_review, row.get("file_id"), "income",
+                                       _reviewed_tax_input(metric_review, row.get("file_id"), "income", income))
+            interest = _earnings_operand(metric_review, row.get("file_id"), "interest",
+                                         _reviewed_tax_input(metric_review, row.get("file_id"), "interest", interest))
+            # An interest deduction the reader did not find is not added back:
+            # operating income is then understated, never missing.
+            ladder = return_ladder(facts, income=income, interest=interest, depreciation=None) if business_tax else {}
+            other = ladder.get("other_income")
+            proposed = _money(ladder["noi"]) if ladder.get("noi") is not None else None
+            if income is None:
+                notes.append("The return's bottom line was not read. Enter it from the document; operating income is not estimated without it.")
+            elif interest is None:
+                notes.append("Interest was not read from the return, so none is added back.")
             relevant_values = {"income": income, "interest": interest,
                 "non_operating": {key: facts.get(key) for key in (
                     "other_income", "non_operating_income", "rental_income", "capital_gains", "tax_form", "form_type")}}
@@ -146,6 +170,9 @@ def catalog(analyses, candidates, *, entity=None, metric_review=None, now=None):
         currency = tax.get("currency") if is_tax else (candidate or {}).get("currency")
         basis = tax.get("basis") if is_tax else (candidate or {}).get("basis")
         months = _period({"period_start": first, "period_end": last})[2]
+        period_assumed = bool(is_tax and business_tax and not first and not last and year)
+        if period_assumed:
+            months = 12
         automatic_reason = _automatic_exclusion(facts, first, last, year, _as_of(now))
         if automatic_reason:
             notes.append("Forecast or future-period evidence is excluded from automatic current NOI. An explicit review remains a disclosed annual assumption, not historical actual income.")
@@ -162,7 +189,8 @@ def catalog(analyses, candidates, *, entity=None, metric_review=None, now=None):
             "proposed_annual_value": proposed, "eligible": reason is None, "reason": reason,
             "automatic_eligible": reason is None and automatic_reason is None, "automatic_reason": automatic_reason,
             "belongs_to_business": belongs, "months_covered": months, "financial_stamp": financial_stamp,
-            **({"tax_operands": {"income": income, "interest": interest}} if is_tax else {}),
+            **({"tax_operands": {"income": income, "interest": interest, "other_income": other},
+                "period_assumed": period_assumed} if is_tax else {}),
             "accepted": bool(row.get("accepted")), "notes": notes, "citation_status": citation_status,
             "source_refs": [{**ref, "citations": citations,
                 "pages": sorted({citation["page"] for citation in citations if isinstance(citation.get("page"), int)})}

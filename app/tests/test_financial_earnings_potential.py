@@ -41,9 +41,18 @@ def test_only_explicit_illustration_can_supply_forecast_dscr():
     assert result["current"]["dscr"] == -0.26
 
 
+def test_a_filed_return_stands_without_its_accounting_method_and_a_statement_does_not():
+    source = evidence()
+    source["headline"]["basis"] = None
+    assert build(source, {"annual": 210939.12}, {})["current"]["dscr"] == -0.26
+    source["headline"]["kind"] = "computed_ebitda"
+    assert build(source, {"annual": 210939.12}, {})["current"] is None
+
+
 @pytest.mark.parametrize("issue", ["stale", "missing_annual", "missing_revenue", "missing_basis", "foreign_currency", "unknown_debt"])
 def test_missing_or_incomparable_evidence_does_not_fabricate_coverage(issue):
     source, service = evidence(), {"annual": 210939.12}
+    source["headline"]["kind"] = "computed_ebitda"
     if issue == "stale":
         source["source_selection"]["stale"] = True
     elif issue == "missing_annual":

@@ -16,16 +16,23 @@ from app.services.financial_metric_reporting import (
 from app.tests.test_financial_metric_review import build, correction, pnl, tax
 
 
-def test_incomplete_prior_tax_does_not_replace_complete_latest_pl_primary_or_annual_pair():
-    cockpit = build([tax(interest=None, depreciation=None), pnl()])
+def test_filed_return_supplies_primary_and_annual_pair_and_a_pl_does_without_one():
+    cockpit = build([tax(tax_form="1120-S", interest=None, depreciation=None), pnl()])
     brief = metric_brief(cockpit)
-    assert brief["primary_dscr"]["key"] == cockpit["dscr"]["headline"]["key"] == "profit_and_loss"
+    assert brief["primary_dscr"]["key"] == cockpit["dscr"]["headline"]["key"] == "tax_return"
     assert brief["primary_dscr"]["value"] == cockpit["dscr"]["headline"]["value"]
     annual = brief["validated_annual"]
-    assert annual["ebitda_annual"] == 52000 and annual["dscr"] == 4.33
-    assert annual["dscr_label"] == "P&L EBITDA-based DSCR"
+    # Add-backs the reader did not find are left out: the figure can only understate.
+    assert annual["ebitda_annual"] == 100000 and annual["dscr"] == 8.33
+    assert annual["dscr_label"] == "Filed return EBITDA-based DSCR"
     assert brief["primary_dscr"]["value"] == annual["dscr"]
-    assert next(row for row in brief["ebitda"]["candidates"] if row["kind"] == "tax_estimate")["provisional"]
+    assert not next(row for row in brief["ebitda"]["candidates"] if row["kind"] == "tax_estimate")["provisional"]
+    # A return whose currency is not established is not a validated annual basis.
+    assert metric_brief(build([tax(interest=None, depreciation=None), pnl()]))["validated_annual"] is None
+    alone = metric_brief(build([pnl()]))
+    assert alone["primary_dscr"]["key"] == "profit_and_loss"
+    assert alone["validated_annual"]["ebitda_annual"] == 52000 and alone["validated_annual"]["dscr"] == 4.33
+    assert alone["validated_annual"]["dscr_label"] == "P&L EBITDA-based DSCR"
 
 
 def test_current_correction_reaches_review_without_a_hypothetical_plan_or_private_audit_text():
@@ -144,10 +151,10 @@ def profile_fixture():
 
 
 @pytest.mark.asyncio
-async def test_intelligence_uses_current_primary_dscr_and_keeps_strict_annual_pl_ebitda_separate():
+async def test_intelligence_uses_current_primary_dscr_and_validated_annual_pl_ebitda():
     db, profile, intake = profile_fixture()
     before = deepcopy(intake.result_snapshot)
-    cockpit = build([tax(interest=None, depreciation=None), pnl()])
+    cockpit = build([pnl()])
     with patch("app.services.financial_version_selection.accepted_debt_schedule_snapshot", AsyncMock(return_value=None)), \
          patch.object(financial_cockpit, "load_cockpit", AsyncMock(return_value=cockpit)):
         result = await application_profiles.intelligence_state(db, profile)

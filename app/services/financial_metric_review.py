@@ -164,6 +164,10 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
         period = str(year.get("year") or "Unknown tax period")
         tax_months = _months(year.get("period_start"), year.get("period_end"))
         year["annual_coverage_eligible"] = tax_months == 12 if year.get("period_start") or year.get("period_end") else True
+        # A return that prints its tax year without period dates is that full
+        # year: the same reading coverage already gives it.
+        period_assumed = not year.get("period_start") and not year.get("period_end")
+        annual = tax_months == 12 or period_assumed
         if year.get("period_start") or year.get("period_end"):
             period += f" ({year.get('period_start') or '?'} – {year.get('period_end') or '?'})"
         keys = [f"{prefix}.{key}" for key in ("income", "interest", "depreciation")]
@@ -187,7 +191,9 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
         notes = ["Tax-derived earnings estimate: tax income + known interest + known current-year depreciation and amortization. This is not a reconciliation from book net income to full EBITDA; unknown components remain flagged for review."]
         if year.get("depreciation") is not None and not year["ebitda_complete"]:
             notes.append("Only the known current-year depreciation/amortization components are included; the remaining component has not been established.")
-        if tax_months != 12:
+        if period_assumed:
+            notes.append("The return prints its tax year without period dates; it is read as that full year.")
+        elif tax_months != 12:
             notes.append("The tax reporting duration is unknown or is not a full twelve months. This period estimate is not annualized; existing DSCR still uses its reported tax basis without a new annualization assumption.")
         source_entity = source_refs[0].get("entity")
         from app.services.document_associations import identity_matches
@@ -198,10 +204,15 @@ def prepare(analyses, years, statement, bank, months, accounts, service, *, stat
             notes.append("The source business identity is not established.")
         if mismatch:
             notes.append("The source names a different business; excluded from business earnings and DSCR.")
+        # A filed, accepted return of this business is a source in its own
+        # right. Add-backs the reader did not find stay named in missing_inputs
+        # and count as zero, so the figure is conservative rather than absent.
         result = {"key": prefix, "label": "Tax-derived earnings estimate", "value": year["ebitda"],
-                  "annualized_value": year["ebitda"] if tax_months == 12 else None, "period": period, "months_covered": tax_months,
+                  "annualized_value": year["ebitda"] if annual else None, "period": period,
+                  "months_covered": 12 if period_assumed else tax_months, "period_assumed": period_assumed,
                   "period_start": year.get("period_start"), "period_end": year.get("period_end"),
-                  "annualization_factor": 1 if tax_months == 12 else None, "kind": "tax_estimate", "complete": False, "provisional": True,
+                  "annualization_factor": 1 if annual else None, "kind": "tax_estimate", "complete": bool(year["ebitda_complete"]),
+                  "provisional": not bool(source_refs[0].get("accepted")) or not identity_known or not entity or mismatch,
                   "formula": "tax income + known interest + known current-year depreciation and amortization", "input_keys": keys,
                   "missing_inputs": missing, "notes": notes, "source_refs": source_refs, "entity_mismatch": mismatch}
         result["entity_comparable"] = bool(entity and identity_known and not mismatch)

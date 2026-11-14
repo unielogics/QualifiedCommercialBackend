@@ -122,11 +122,15 @@ def test_correction_effective_current_source_is_preserved_as_factual_baseline():
     assert result["source_refs"][0]["analysis_id"] == "analysis-1"
 
 
-def test_tax_only_and_bank_only_do_not_become_scenario_ebitda():
+def test_filed_return_supplies_scenario_ebitda_and_bank_only_does_not():
     tax_result = projection(planned([tax()], add_backs=[addback()]))
-    assert tax_result["status"] == "tax_estimate_only" and tax_result["before"] is None and tax_result["after"] is None
+    assert tax_result["status"] == "projected_unchanged" and tax_result["before"] == tax_result["after"] == 115000
+    assert tax_result["annual_before"] == tax_result["annual_after"] == 115000
     assert tax_result["tax_estimate"]["kind"] == "tax_estimate"
+    # Without a known currency the return is not a comparable base for add-backs.
     assert tax_result["adjusted_annual"]["after"] is None
+    filed = projection(planned([tax(tax_form="1120-S")], add_backs=[addback()]))["adjusted_annual"]
+    assert (filed["before"], filed["after"], filed["status"]) == (115000, 127000, "hypothetical_adjusted")
     banks = [file("bank_statement", {"bank": "Bank", "account_last4": "1234", "currency": "USD", "statement_period": f"2026-0{month}",
                                      "total_deposits_and_credits": 10000, "total_withdrawals_and_debits": 8000}, key=f"bank-{month}") for month in (1, 2, 3)]
     bank_result = projection(planned(banks, retire=["row:debt"], new_payment_monthly=500, add_backs=[addback()]))
@@ -134,13 +138,13 @@ def test_tax_only_and_bank_only_do_not_become_scenario_ebitda():
     assert bank_result["debt_service_savings_monthly"] == bank_result["cash_flow_change_monthly"] == 500
 
 
-def test_latest_pl_supplies_both_coverage_and_earnings_with_prior_tax_comparative():
+def test_filed_return_supplies_both_coverage_and_earnings_with_the_newer_pl_comparative():
     c = planned([tax(), pnl()], retire=["row:debt"], new_payment_monthly=500)
-    assert c["dscr"]["headline"]["key"] == "profit_and_loss"
-    assert projection(c)["source_kind"] == "computed_ebitda"
-    assert projection(c)["before"] == projection(c)["after"] == 26000
-    assert c["plan"]["evaluation"]["income_before_annual"] == 52000
-    assert c["dscr"]["comparative_candidates"][0]["numerator"] == 115000
+    assert c["dscr"]["headline"]["key"] == "tax_return"
+    assert projection(c)["source_kind"] == "tax_estimate"
+    assert projection(c)["before"] == projection(c)["after"] == 115000
+    assert c["plan"]["evaluation"]["income_before_annual"] == 115000
+    assert c["dscr"]["comparative_candidates"][0]["numerator"] == 52000
 
 
 def test_zero_and_loss_baselines_remain_known_and_signed():

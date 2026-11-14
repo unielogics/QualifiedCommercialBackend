@@ -1,4 +1,4 @@
-"""One operating-income selection/review policy, independent of debt and EBITDA."""
+"""One operating-income review policy; its source is the one earnings come from."""
 
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -34,48 +34,56 @@ def review(rows, *, mode="source", selected="tax-2025", year=2025, amount=105000
 
 
 @pytest.mark.parametrize("income,interest,expected", [(-10000, 1000, -9000), (0, 0, 0), (10000, 0, 10000)])
-def test_automatic_tax_noi_is_computable_provisional_and_never_adds_da(income, interest, expected):
+def test_automatic_tax_noi_comes_from_the_accepted_return_and_never_adds_da(income, interest, expected):
     result = build([annual_tax(ordinary_business_income=income, interest=interest, depreciation=999999)])["noi"]
     assert result["headline"]["value"] == result["headline"]["annualized_value"] == expected
-    assert result["status"] == "provisional" and result["review_needed"]
+    assert result["status"] == "source_supported" and not result["review_needed"]
     assert result["headline"]["kind"] == "tax_derived_noi" and not result["headline"]["staff_reviewed"]
     assert result["headline"]["year"] == "2025" and result["headline"]["currency"] == "USD"
     assert result["policy_version"] == "business-noi-v2" and len(result["authority_stamp"]) == 64
     assert result["review"]["current"] is None
 
 
-@pytest.mark.parametrize("missing", ["ordinary_business_income", "interest"])
-def test_automatic_tax_does_not_invent_missing_operands(missing):
-    result = build([annual_tax(**{missing: None})])["noi"]
+def test_automatic_tax_needs_its_bottom_line_and_names_unread_interest():
+    result = build([annual_tax(ordinary_business_income=None)])["noi"]
     assert result["headline"] is None and result["status"] == "unavailable"
     assert result["review_needed"] and result["scenario"]["current"] is None
+    # Interest the reader did not find is not added back: lower, never missing.
+    result = build([annual_tax(interest=None)])["noi"]
+    assert result["headline"]["annualized_value"] == 100000 and result["headline"]["missing_inputs"] == ["interest"]
+    assert "interest_not_read" in result["source_limitations"] and result["status"] == "source_supported"
 
 
-def test_latest_business_period_wins_and_pnl_is_preferred_within_the_same_period():
+def test_filed_return_leads_and_a_p_and_l_supplies_noi_only_without_one():
     newest_tax = annual_tax()
     result = build([annual_pl(2024), newest_tax])["noi"]
     assert result["headline"]["source_refs"][0]["file_id"] == "tax-2025"
     result = build([annual_pl(), newest_tax])["noi"]
+    assert result["headline"]["source_refs"][0]["file_id"] == "tax-2025"
+    assert result["status"] == "source_supported" and not result["review_needed"]
+    result = build([annual_pl()])["noi"]
     assert result["headline"]["source_refs"][0]["file_id"] == "pl-2025"
     assert result["status"] == "source_supported" and not result["review_needed"]
 
 
-def test_incomplete_newer_pl_can_show_dated_older_tax_estimate_with_explicit_fallback_reason():
+def test_latest_filed_return_leads_an_incomplete_newer_p_and_l():
     result = build([annual_tax(2024), annual_pl(2025, total_operating_expenses=None)])["noi"]
     assert result["headline"]["year"] == "2024" and result["headline"]["annualized_value"] == 105000
-    assert result["status"] == "provisional" and result["review_needed"]
-    assert "older_tax_fallback" in result["reason_codes"]
-    assert "older tax" in result["status_reason"]
+    assert result["status"] == "source_supported" and not result["review_needed"]
+    assert result["reason_codes"] == [] and "filed business return" in result["status_reason"]
 
 
-def test_unknown_tax_duration_does_not_invent_an_annual_noi():
+def test_a_return_printing_only_its_tax_year_is_read_as_that_full_year():
     row = annual_tax(period_start=None, period_end=None)
     result = build([row])["noi"]
-    assert result["headline"]["value"] == 105000
-    assert result["headline"]["annualized_value"] is None
-    assert result["headline"]["period_start"] is None
-    assert result["scenario"]["current"] is None
-    assert "annual_period_unconfirmed" in result["reason_codes"]
+    assert result["headline"]["value"] == result["headline"]["annualized_value"] == 105000
+    assert result["headline"]["period_start"] is None and result["headline"]["period_assumed"]
+    assert result["scenario"]["current"] == 105000
+    assert "calendar_year_assumed" in result["source_limitations"]
+    assert "annual_period_unconfirmed" not in result["reason_codes"]
+    # Dates that are printed and are not a full year are never stretched.
+    short = build([annual_tax(period_end="2025-09-30")])["noi"]
+    assert short["headline"]["annualized_value"] is None and "annual_period_unconfirmed" in short["reason_codes"]
 
 
 def test_personal_or_different_business_tax_never_supplies_business_noi():
@@ -84,13 +92,18 @@ def test_personal_or_different_business_tax_never_supplies_business_noi():
         assert result["headline"] is None and result["status"] == "unavailable"
 
 
-def test_noi_is_independent_of_ebitda_source_exclusions_and_stale_picker():
+def test_noi_follows_the_earnings_source_selection():
     rows = [annual_pl()]
     first = financial_noi.build_noi(rows, entity="Example LLC")
-    second = financial_noi.build_noi(rows, entity="Example LLC", source_selection={
+    same = financial_noi.build_noi(rows, entity="Example LLC", source_selection={
+        "stale": False, "selected_file_id": "pl-2025", "excluded_file_ids": []})
+    assert same["headline"]["value"] == first["headline"]["value"]
+    assert same["status"] == first["status"] == "source_supported"
+    # No earnings source in use means no operating income from another one.
+    unselected = financial_noi.build_noi(rows, entity="Example LLC", source_selection={
         "stale": True, "selected_file_id": None, "excluded_file_ids": ["pl-2025"]})
-    assert second["headline"]["value"] == first["headline"]["value"]
-    assert second["status"] == first["status"] == "source_supported"
+    assert unselected["headline"] is None and unselected["reason_codes"] == ["earnings_source_not_selected"]
+    assert "earnings source selection" in unselected["status_reason"]
 
 
 def test_explicit_review_resolves_action_without_accepting_tax_or_erasing_source_limitations():

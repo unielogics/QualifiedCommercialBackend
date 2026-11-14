@@ -11,7 +11,7 @@ import hashlib
 import json
 from typing import Any
 
-CALCULATION_POLICY_VERSION = "business-financial-math-v8-noi-governance"
+CALCULATION_POLICY_VERSION = "business-financial-math-v9-filed-return-first"
 
 
 def _digest(value: Any) -> str:

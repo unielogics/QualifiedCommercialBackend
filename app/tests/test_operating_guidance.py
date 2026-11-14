@@ -27,7 +27,12 @@ def test_named_tax_expenses_are_drafts_with_one_total_and_multiple_salary_groups
     groups = guidance["expense_groups"]
     assert next(row for row in groups if row["category"] == "marketing")["baseline_annual_amount"] == 12000
     assert len([row for row in groups if row["category"] == "salaries"]) == 2
-    assert not any("deductions" in row["key"] for row in groups)
+    # The total is never a row beside its own lines; only what the lines leave over is.
+    remainder = next(row for row in groups if row["key"].endswith(":other_deductions"))
+    interest = guidance["expense_reconciliation"]["outside_plan"][0]["amount"]
+    assert remainder["derived"] and remainder["category"] == "other"
+    assert sum(row["baseline_annual_amount"] for row in groups if row["category"] != "cogs") + interest == 500000
+    assert guidance["expense_reconciliation"]["reconciles"]
     assert all(row["source_candidate_key"] == row["key"] for row in candidates)
     assert all(row["cadence"] == "annual" for row in candidates)
     assert "therapist" in " ".join(guidance["business"]["questions"])

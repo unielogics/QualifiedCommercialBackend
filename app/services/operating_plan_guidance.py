@@ -2,31 +2,17 @@
 
 from __future__ import annotations
 
-import math
 import re
 from copy import deepcopy
 
+# The line table and its reader live with the baseline, so the plan and the
+# file page list the same source lines.
+from app.services.financial_baseline import LINES, REMAINDER_KEY  # noqa: F401
+from app.services.financial_baseline import amount as _number  # noqa: F401
+from app.services.financial_baseline import expense_groups as _source_groups
+from app.services.financial_baseline import fact as _fact  # noqa: F401
+
 POLICY_VERSION = "operating-guidance-v1"
-# Match named facts, not fixed IRS line numbers: the same expense appears on
-# different lines on Schedule C, Forms 1120/1120-S and supporting schedules.
-LINES = (
-    ("rent", "rent", "Rent and premises", ("rent", "rents", "rent_expense", "rent_and_lease", "rent_buildings")),
-    ("salaries_and_wages", "salaries", "Employee salaries and wages", ("salaries_and_wages", "wages", "salaries", "payroll_expense")),
-    ("officer_compensation", "salaries", "Officer compensation", ("officer_compensation", "compensation_of_officers", "officers_compensation")),
-    ("contract_labor", "professional_fees", "Contract labor", ("contract_labor", "contractor_expense", "subcontractors")),
-    ("payroll_taxes", "payroll_taxes", "Employer payroll taxes", ("payroll_taxes", "employer_payroll_taxes")),
-    ("insurance", "insurance", "Business insurance", ("insurance", "insurance_expense", "business_insurance")),
-    ("utilities", "utilities", "Utilities", ("utilities", "utility_expense")),
-    ("advertising", "marketing", "Marketing and advertising", ("advertising", "marketing", "marketing_expense", "advertising_expense")),
-    ("software", "software", "Software and subscriptions", ("software", "software_subscriptions", "subscriptions")),
-    ("professional_fees", "professional_fees", "Legal and professional fees", ("professional_fees", "legal_and_professional", "legal_and_professional_fees", "legal_fees")),
-    ("supplies", "supplies", "Supplies", ("supplies", "office_supplies", "supplies_expense")),
-    ("repairs", "repairs", "Repairs and maintenance", ("repairs", "repairs_and_maintenance", "repair_expense")),
-    ("transportation", "transportation", "Travel and transportation", ("transportation", "travel", "car_and_truck_expenses")),
-    ("cogs", "cogs", "Cost of goods sold", ("cost_of_goods_sold", "cogs")),
-    ("taxes_and_licenses", "other", "Taxes and licenses (classify before use)", ("taxes_and_licenses",)),
-    ("depreciation_amortization", "depreciation_amortization", "Depreciation and amortization", ("depreciation_and_amortization", "depreciation", "depreciation_expense")),
-)
 ESSENTIALS = (
     ("rent", "Rent and premises", "Confirm rent, related-party rent, shared premises or home-office arrangements."),
     ("salaries", "Employee compensation", "Itemize employee roles, headcount, wages, owner pay and contractor costs separately."),
@@ -40,42 +26,6 @@ ESSENTIALS = (
     ("cogs", "Product and service delivery costs", "Explain direct materials, direct labor and other variable delivery costs, or mark not applicable."),
     ("merchant_processing", "Payment processing", "Confirm processing volume, fees and statement period; bank settlements are not gross sales."),
 )
-
-
-def _number(value):
-    if isinstance(value, dict):
-        value = value.get("value", value.get("amount"))
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        result = float(str(value).replace(",", "").replace("$", ""))
-        return result if math.isfinite(result) and result >= 0 else None
-    except (ValueError, TypeError):
-        return None
-
-
-def _fact(facts, aliases):
-    containers = [("", facts)]
-    for section in ("expenses", "expense_breakdown", "deductions", "deductions_detail", "other_deductions_detail", "income_statement", "profit_and_loss"):
-        value = facts.get(section)
-        if isinstance(value, dict):
-            containers.append((section + ".", value))
-    for prefix, values in containers:
-        for key in aliases:
-            value = _number(values.get(key))
-            if value is not None:
-                return value, prefix + key
-    normalized = {re.sub(r"[^a-z0-9]", "", alias.casefold()) for alias in aliases}
-    for section in ("expense_lines", "expense_breakdown", "other_deductions_detail", "deductions_detail"):
-        rows = facts.get(section)
-        if not isinstance(rows, list):
-            continue
-        matched = [(index, row) for index, row in enumerate(rows) if isinstance(row, dict) and any(
-            re.sub(r"[^a-z0-9]", "", str(row.get(key) or "").casefold()) in normalized
-            for key in ("key", "category", "label", "description"))]
-        if matched and all(_number(row.get("amount", row.get("value"))) is not None for _, row in matched):
-            return sum(_number(row.get("amount", row.get("value"))) for _, row in matched), section
-    return None, None
 
 
 def _source(cockpit):
@@ -139,18 +89,27 @@ def build_guidance(analyses, cockpit, *, business_name=None, naics_code=None, in
                 "Expense detail explains the source baseline. Only explicit proposed changes affect the scenario; the tax/P&L and current NOI stay unchanged."]
     reporting = {key: (source or {}).get(key) for key in ("period_start", "period_end", "currency", "basis")}
     reporting.update(source_file_id=(source or {}).get("file_id"), source_label=(source or {}).get("file_name"), year=(source or {}).get("year"))
-    groups, candidates = [], []
+    groups, candidates, reconciliation = [], [], None
     if source:
         months = source.get("months_covered")
         factor = 12 / months if isinstance(months, (int, float)) and 0 < months <= 12 else None
-        for key, category, label, aliases in LINES:
-            value, path = _fact(facts, aliases)
-            if value is None:
-                continue
+        kind = "tax_return" if source.get("kind") == "business_tax_return" else "profit_and_loss"
+        interest = None
+        if kind == "tax_return":
+            from app.services.financial_tax_earnings import normalize_tax_earnings
+
+            interest = normalize_tax_earnings(facts).get("interest")
+        listed = _source_groups(facts, kind=kind, interest=interest)
+        reconciliation = {key: listed[key] for key in ("status", "listed", "total", "remainder", "reconciles")}
+        reconciliation["outside_plan"] = listed["outside_plan"]
+        for line in listed["rows"]:
+            key, category, label, value, path = line["key"], line["category"], line["label"], line["amount"], line["fact_path"]
             scope = ":".join(str(source.get(field) or "unknown") for field in ("period_start", "period_end", "year", "currency", "basis"))
             group_key = f"source:{source['file_id']}:{scope}:{key}"
             annual = round(value * factor, 2) if factor is not None else None
             notes = ["Split this reference total into multiple expense lines; do not retain the reference total as well as its full breakdown."]
+            if line.get("derived"):
+                notes = ["The rest of the source's total after the lines listed above. Itemize it only with amounts the business can support."]
             if factor is None:
                 notes.append("The source reporting duration is unconfirmed. Confirm the annual amount before adopting it.")
             elif factor != 1:
@@ -160,7 +119,8 @@ def build_guidance(analyses, cockpit, *, business_name=None, naics_code=None, in
             group = {"key": group_key, "category": category, "label": label, "baseline_annual_amount": annual,
                      "source_amount": value, "currency": source.get("currency"), "basis": source.get("basis"),
                      "year": source.get("year"), "period_start": source.get("period_start"), "period_end": source.get("period_end"),
-                     "source_file_ids": [source["file_id"]], "source_label": source.get("file_name"), "source_fact_keys": [path], "notes": notes}
+                     "source_file_ids": [source["file_id"]], "source_label": source.get("file_name"), "source_fact_keys": [path], "notes": notes,
+                     **({"derived": True} if line.get("derived") else {})}
             groups.append(group)
             candidates.append({"key": group_key, "source_candidate_key": group_key, "source_group_key": group_key,
                 "label": label, "payee": "", "category": category, "current_amount": annual, "cadence": "annual",
@@ -171,7 +131,7 @@ def build_guidance(analyses, cockpit, *, business_name=None, naics_code=None, in
     else:
         warnings.append("No compatible historical business source is available for expense totals. Enter supported costs and ask the desk to establish or review the NOI baseline.")
     return {"policy_version": POLICY_VERSION, "business": {"name": name, "naics_code": code, "industry": industry or facts.get("industry"), "questions": questions},
-            "reporting": reporting, "expense_groups": groups,
+            "reporting": reporting, "expense_groups": groups, "expense_reconciliation": reconciliation,
             "essentials": [{"category": category, "label": label, "prompt": prompt} for category, label, prompt in ESSENTIALS],
             "action_templates": [
                 {"key": "rent", "label": "Review rent or occupancy costs", "kind": "expense_reduction", "category": "rent", "explanation": "Compare supported current and proposed rent, timing and any implementation cost."},

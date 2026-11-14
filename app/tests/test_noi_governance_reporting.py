@@ -22,7 +22,7 @@ def test_tax_noi_packet_uses_known_tax_operands_instead_of_missing_pnl_columns()
     inputs = next(line for line in lines if line.startswith("NOI inputs:"))
     assert "20,000" in inputs and "5,000" in inputs
     assert "Unavailable" not in inputs and "COGS" not in inputs
-    assert "NOI status: provisional" in "\n".join(lines)
+    assert "NOI status: source supported" in "\n".join(lines)
 
 
 def test_deterministic_policy_metadata_is_not_printed_as_an_ai_financial_fact():
@@ -39,7 +39,7 @@ def test_deterministic_policy_metadata_is_not_printed_as_an_ai_financial_fact():
     assert "Financial Calculation Signature" not in text
     assert "Financial Calculation Policy Version" not in text
     assert "Current financial review" in text
-    assert "NOI status: provisional" in text
+    assert "NOI status: source supported" in text
 
 
 def test_generic_and_annual_noi_aliases_match_while_source_period_stays_separate():

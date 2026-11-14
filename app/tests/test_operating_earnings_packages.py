@@ -153,26 +153,27 @@ async def test_failed_current_intelligence_clears_cached_earnings_without_changi
 
 
 @pytest.mark.parametrize("selected", [None, "tax"])
-def test_published_program_fact_respects_latest_period_and_manual_unavailable_receipt(selected):
+def test_published_program_fact_reads_the_selected_source_and_manual_unavailable_receipt(selected):
     from app.enums import Role
     from app.services.financial_earnings_sources import change
     from app.services.program_earnings_facts import annual_ebitda_fact
     from app.tests.test_financial_metric_review import pnl, tax
 
-    analyses = [pnl(), tax()]
+    analyses = [pnl(), tax(tax_form="1120-S")]
     current = build(analyses)
     selection = current["ebitda"]["source_selection"]
     if selected == "tax":
-        from fastapi import HTTPException
-
-        with pytest.raises(HTTPException) as error:
-            change(None, selection, mode="manual", selected_file_id=selected, excluded_file_ids=["source"],
-                reason="Try the older tax period", expected_revision=0, source_stamp=selection["source_stamp"],
-                idempotency_key="source-for-program-test", actor=SimpleNamespace(id=uuid4(), name="Reviewer", role=Role.LOAN_EXEC))
-        assert error.value.status_code == 422
-        assert "latest business reporting period" in error.value.detail
+        # The accepted filed return leads and is the program's annual EBITDA.
         value, fact = annual_ebitda_fact(analyses, entity="Example LLC")
+        assert value == 115000 and fact["selected_file_id"] == "tax"
+        assert fact["basis"] == "validated_filed_return_annual_ebitda" and fact["verification_status"] == "verified"
+        # Staff may put the current P&L in its place.
+        state, _ = change(None, selection, mode="manual", selected_file_id="source", excluded_file_ids=[],
+            reason="Use the current P&L", expected_revision=0, source_stamp=selection["source_stamp"],
+            idempotency_key="source-for-program-test", actor=SimpleNamespace(id=uuid4(), name="Reviewer", role=Role.LOAN_EXEC))
+        value, fact = annual_ebitda_fact(analyses, entity="Example LLC", state=state)
         assert value == 52000 and fact["selected_file_id"] == "source"
+        assert fact["basis"] == "validated_profit_and_loss_annual_ebitda"
         return
     state, _ = change(None, selection, mode="manual", selected_file_id=selected, excluded_file_ids=["source"],
                       reason="Reviewed the current source choice", expected_revision=0, source_stamp=selection["source_stamp"],

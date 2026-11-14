@@ -49,7 +49,7 @@ def test_empty_file_can_save_manual_annual_noi_without_creating_a_source_stateme
     assert current["noi"]["scenario"]["after_debt_service_current"] == 30000
 
 
-def test_tax_calculation_is_provisional_then_staff_reviewed_without_da_addback():
+def test_tax_calculation_stands_on_the_return_then_staff_reviewed_without_da_addback():
     source = business_tax(ordinary_business_income=-54369, interest=6552, depreciation=99000)
     original = deepcopy(source)
     first = build([source])
@@ -57,7 +57,7 @@ def test_tax_calculation_is_provisional_then_staff_reviewed_without_da_addback()
     assert candidate["eligible"] and candidate["year"] == 2025
     assert candidate["proposed_annual_value"] == -47817
     assert first["noi"]["headline"]["value"] == -47817
-    assert first["noi"]["status"] == "provisional" and first["noi"]["review_needed"]
+    assert first["noi"]["status"] == "source_supported" and not first["noi"]["review_needed"]
     state, _ = save(first, mode="source", selected_file_id="tax", annual_value=-47817)
     current = build([source], state=state)
     headline = current["noi"]["headline"]
@@ -68,13 +68,14 @@ def test_tax_calculation_is_provisional_then_staff_reviewed_without_da_addback()
     assert current["noi"]["years"] == [] and source == original
     assert current["ebitda"]["headline"] == first["ebitda"]["headline"]
     assert current["dscr"]["headline"] == first["dscr"]["headline"]
-    assert "non-operating" in " ".join(candidate["notes"])
+    assert "less other income" in " ".join(candidate["notes"])
 
 
-def test_missing_tax_interest_remains_unknown_but_supported_reviewed_amount_can_be_entered():
+def test_missing_tax_interest_is_not_added_back_and_a_supported_reviewed_amount_can_be_entered():
     source = business_tax(interest=None)
     first = build([source])
-    assert first["noi"]["review"]["sources"][0]["proposed_annual_value"] is None
+    candidate = first["noi"]["review"]["sources"][0]
+    assert candidate["proposed_annual_value"] == 100000 and "none is added back" in " ".join(candidate["notes"])
     state, _ = save(first, mode="source", selected_file_id="tax", annual_value=100500)
     assert build([source], state=state)["noi"]["headline"]["value"] == 100500
 
@@ -88,7 +89,7 @@ def test_review_supports_zero_loss_and_cent_rounding(amount):
 def test_explicit_prior_year_tax_review_keeps_latest_source_pl_history_and_trend_independent():
     sources = [business_tax(), pnl(operating_income=40000)]
     first = build(sources)
-    assert first["noi"]["source_headline"]["value"] == 40000
+    assert first["noi"]["source_headline"]["value"] == 105000  # The filed return leads.
     state, _ = save(first, mode="source", selected_file_id="tax", annual_value=105000)
     current = build(sources, state=state)
     assert current["noi"]["headline"]["value"] == 105000
@@ -98,7 +99,7 @@ def test_explicit_prior_year_tax_review_keeps_latest_source_pl_history_and_trend
     assert current["noi"]["trend"] == first["noi"]["trend"]
 
 
-def test_source_change_stales_review_without_silently_falling_back_to_original_pl():
+def test_source_change_stales_review_without_silently_falling_back_to_the_source_figure():
     sources = [business_tax(), pnl(operating_income=40000)]
     state, _ = save(build(sources), mode="source", selected_file_id="tax")
     replacement = deepcopy(sources)
@@ -107,7 +108,7 @@ def test_source_change_stales_review_without_silently_falling_back_to_original_p
     assert current["noi"]["review"]["stale"]
     assert current["noi"]["headline"] is None
     assert current["noi"]["scenario"]["current"] is None
-    assert current["noi"]["source_headline"]["value"] == 40000
+    assert current["noi"]["source_headline"]["value"] == 105000
     assert "Review and save" in current["noi"]["reason"]
 
 

@@ -1899,7 +1899,8 @@ async def intelligence_state(db: AsyncSession, profile: ApplicationProfile) -> A
             unit=validated_annual["currency"] if validated_annual else None,
             status="ready" if validated_annual else "needs_evidence",
             period=validated_annual.get("period") if validated_annual else None,
-            source="Current validated annual P&L: reviewed effective inputs" if validated_annual else "Current calculation review contains period figures, estimates or incomplete evidence; strict annual EBITDA is unavailable"))
+            source=("Current accepted filed return: reviewed effective inputs" if validated_annual.get("basis") == "validated_filed_return_annual_ebitda"
+                    else "Current validated annual P&L: reviewed effective inputs") if validated_annual else "Current calculation review contains period figures, estimates or incomplete evidence; strict annual EBITDA is unavailable"))
     return ApplicationIntelligenceRead(
         profile_id=profile.id,
         metrics=metrics,

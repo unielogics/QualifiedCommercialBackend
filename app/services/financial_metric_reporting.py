@@ -125,7 +125,12 @@ def operating_earnings_brief(cockpit):
 
 
 def validated_annual_pair(cockpit):
-    """A current, reconciled P&L annual basis; never a tax or cash substitute."""
+    """The selected source's annual earnings when it is accepted and comparable.
+
+    An accepted business return of this business qualifies as filed; a P&L
+    also needs a known period, accounting basis and a complete reconciliation.
+    Bank cash flow never does.
+    """
     earnings = cockpit.get("ebitda") or {}
     selection = earnings.get("source_selection")
     if isinstance(selection, dict) and (selection.get("stale") or not selection.get("selected_file_id")):
@@ -139,27 +144,35 @@ def validated_annual_pair(cockpit):
         currency = str(result.get("currency") or (refs[0].get("currency") if refs else "") or "").upper()
         basis = str(result.get("basis") or (refs[0].get("basis") if refs else "") or "").strip().casefold()
         reported, computed = _number(result.get("reported_value")), _number(result.get("computed_value"))
-        if (result.get("kind") not in {"computed_ebitda", "reported_ebitda"}
-                or annual is None or not result.get("complete") or result.get("provisional")
+        filed = result.get("kind") == "tax_estimate"
+        if (result.get("kind") not in {"computed_ebitda", "reported_ebitda", "tax_estimate"}
+                or annual is None or result.get("provisional")
                 or not result.get("entity_comparable") or result.get("entity_mismatch")
-                or result.get("months_covered") not in range(6, 13)
                 or not re.fullmatch(r"[A-Z]{3}", currency) or currency == "XXX"
-                or basis not in {"cash", "accrual"}
-                or not refs or not all(source.get("accepted") and source.get("period_start") and source.get("period_end") for source in refs)
+                or not refs or not all(source.get("accepted") for source in refs)
                 or reported is not None and computed is not None and abs(reported - computed) > 0.01):
             continue
+        if filed:
+            # A return is a full filed year. Add-backs the reader did not find
+            # are left out, so this figure can only understate.
+            if result.get("months_covered") != 12:
+                continue
+        elif (not result.get("complete") or result.get("months_covered") not in range(6, 13)
+              or basis not in {"cash", "accrual"}
+              or not all(source.get("period_start") and source.get("period_end") for source in refs)):
+            continue
         candidate = next((row for row in (cockpit.get("dscr") or {}).get("candidates", [])
-                          if row.get("key") == "profit_and_loss" and _number(row.get("numerator")) is not None
+                          if row.get("key") == ("tax_return" if filed else "profit_and_loss") and _number(row.get("numerator")) is not None
                           and abs(float(row["numerator"]) - annual) <= 0.01), None)
         service = (cockpit.get("debt") or {}).get("service") or {}
         debt_validated = bool(service.get("schedule_authoritative") or service.get("observed_additions_suppressed")) and not service.get("identity_association_conflict")
         debt_currency = str(service.get("currency") or "USD").upper()  # The system debt templates are denominated in dollars.
         return {"ebitda": _result(result), "ebitda_annual": annual, "currency": currency,
-                "basis": "validated_profit_and_loss_annual_ebitda", "period": result.get("period"),
+                "basis": "validated_filed_return_annual_ebitda" if filed else "validated_profit_and_loss_annual_ebitda", "period": result.get("period"),
                 "dscr": _number(candidate.get("value")) if candidate and debt_validated and currency == debt_currency else None,
                 "annual_debt_service": _number((cockpit.get("dscr") or {}).get("annual_debt_service")),
                 "debt_service_validated": debt_validated, "debt_service_basis": service.get("source"),
-                "dscr_label": "P&L EBITDA-based DSCR", "source_refs": _refs(refs)}
+                "dscr_label": "Filed return EBITDA-based DSCR" if filed else "P&L EBITDA-based DSCR", "source_refs": _refs(refs)}
     return None
 
 
@@ -265,7 +278,7 @@ def current_review_projection(result, cockpit):
                     "debt_service_monthly": service.get("monthly"),
                     "annual_ebitda": strict_ebitda, "bankable_ebitda": strict_ebitda,
                     "estimated_ebitda_or_cash_flow": strict_ebitda,
-                    "ebitda_source": "profit_and_loss" if strict_ebitda is not None else None,
+                    "ebitda_source": ("tax_return" if annual.get("basis") == "validated_filed_return_annual_ebitda" else "profit_and_loss") if strict_ebitda is not None else None,
                     "annual_revenue": current_revenue, "annualized_revenue": current_revenue,
                     "revenue_period": revenue_baseline.get("period"),
                     "noi": operating.get("annualized_value"), "annual_noi": operating.get("annualized_value"),

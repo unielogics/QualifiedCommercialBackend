@@ -2749,7 +2749,8 @@ def business_dscr_metrics(
     primary = authority.get("primary_dscr") or {}
     annual = authority.get("validated_annual") or {}
     value = _decimal(primary.get("value"))
-    verified_annual = (primary.get("key") == "profit_and_loss" and annual.get("currency") == "USD"
+    # The validated annual basis is the accepted filed return, else the P&L.
+    verified_annual = (primary.get("key") in {"profit_and_loss", "tax_return"} and annual.get("currency") == "USD"
                        and annual.get("dscr") == primary.get("value") and annual.get("dscr") is not None)
     rows = [_metric(
         key="current_dscr", label=_t(locale, "Current DSCR"), value=value, unit="x",
@@ -3430,7 +3431,8 @@ async def recompute(
                 ],
                 "filed_results_unchanged": True,
                 "source_basis": "current_property_period" if property_only else "reviewed_manual_financial_periods"
-                if manual_earnings is not None else "current_validated_annual_profit_and_loss",
+                if manual_earnings is not None else "current_validated_annual_filed_return"
+                if annual_earnings.get("basis") == "validated_filed_return_annual_ebitda" else "current_validated_annual_profit_and_loss",
                 **{key: value for key, value in (manual_earnings or {}).items() if key != "value"},
                 "policy_version": authority.get("policy_version"),
             },

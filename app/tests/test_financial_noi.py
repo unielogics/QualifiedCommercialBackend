@@ -71,14 +71,19 @@ def test_repeated_identical_operating_adjustments_count_once():
     assert len(result["scenario"]["operating_adjustments"]) == 1
 
 
-def test_tax_net_income_and_bank_deposits_do_not_supply_operating_noi():
+def test_filed_return_supplies_operating_income_and_bank_deposits_never_do():
     tax = source(kind="tax_return", tax_form="1120-S", ordinary_business_income=250000,
                  operating_income=None, net_income=250000)
     bank = source(kind="bank_statement", deposits=500000, withdrawals=100000)
     result = build([tax, bank])
-    assert result["headline"] is None and result["candidates"] == []
-    assert "Tax net income" in result["reason"]
-    assert result["scenario"]["current"] is None
+    headline = result["headline"]
+    assert headline["kind"] == "tax_derived_noi" and headline["annualized_value"] == 250000
+    # Interest the reader did not find is not added back, and is named.
+    assert headline["missing_inputs"] == ["interest"] and "interest_not_read" in result["source_limitations"]
+    assert result["candidates"] == [] and result["status"] == "source_supported"
+    assert result["scenario"]["current"] == 250000
+    only_bank = build([bank])
+    assert only_bank["headline"] is None and only_bank["scenario"]["current"] is None
 
 
 def test_personal_and_other_business_sources_never_contribute_or_override_latest_period():
@@ -94,27 +99,26 @@ def test_personal_and_other_business_sources_never_contribute_or_override_latest
 def test_newest_incomplete_period_does_not_fall_back_to_profitable_prior_year():
     result = build([source(2024), source(2025, total_operating_expenses=None)])
     assert result["headline"] is None
-    assert "latest business P&L has missing" in result["reason"]
+    assert "missing operating-income inputs" in result["reason"] and "older period is not substituted" in result["reason"]
     assert result["years"][-1]["value"] is None
     assert not result["trend"]["comparable"]
 
 
-def test_newer_business_tax_year_prevents_prior_pl_from_becoming_current_noi():
+def test_newer_filed_return_supplies_noi_and_the_prior_pl_stays_history():
     latest_tax = source(2025, key="tax-2025", kind="tax_return", tax_form="1120-S", ordinary_business_income=200000)
     result = build([source(2024), latest_tax])
-    assert result["headline"] is None
+    assert result["headline"]["source_refs"][0]["file_id"] == "tax-2025"
+    assert result["headline"]["annualized_value"] == 200000
     assert result["years"][0]["value"] == 50000
-    assert "latest business reporting period" in result["reason"]
 
 
-def test_latest_printed_calendar_year_tax_label_prevents_older_pl_noi_fallback():
+def test_latest_printed_calendar_year_tax_label_supplies_the_annual_noi():
     latest_tax = source(2025, key="tax-2025", kind="tax_return", tax_form="1120-S", tax_year="Calendar year 2025",
                         period_start=None, period_end=None, ordinary_business_income=200000)
     result = build([source(2024), latest_tax])
-    assert result["headline"] is None
+    assert result["headline"]["year"] == "2025" and result["headline"]["annualized_value"] == 200000
     assert result["years"][0]["year"] == "2024"
-    assert result["scenario"]["current"] is None
-    assert "latest business reporting period" in result["reason"]
+    assert result["scenario"]["current"] == 200000
 
 
 def test_printed_year_without_pl_dates_does_not_invent_an_annual_noi_period():

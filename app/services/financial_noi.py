@@ -220,47 +220,68 @@ def _automatic_tax(source, metric_review):
     inputs = [item["key"] for item in (metric_review or {}).get("inputs", [])
               if item.get("key", "").startswith(f"tax_return:{source['file_id']}:")
               and item["key"].endswith((".income", ".interest"))]
-    return {"key": f"noi-tax:{source['file_id']}", "kind": "tax_derived_noi", "label": "Tax-derived NOI estimate",
+    other = values.get("other_income")
+    assumed = bool(source.get("period_assumed"))
+    fundamentals = [{"key": "ordinary_business_income", "label": "Return's bottom line", "value": values["income"], "signed_value": values["income"], "source_refs": source["source_refs"]}]
+    if other:
+        fundamentals.append({"key": "other_income", "label": "Less other income", "value": other, "signed_value": -other, "source_refs": source["source_refs"]})
+    fundamentals.append({"key": "interest", "label": "Known deducted interest", "value": values["interest"], "signed_value": values["interest"], "source_refs": source["source_refs"]})
+    return {"key": f"noi-tax:{source['file_id']}", "kind": "tax_derived_noi", "label": "NOI from the filed return",
         "value": value, "annualized_value": annual, "year": str(source["year"]) if source.get("year") else None,
-        "period": f"{source['period_start']} – {source['period_end']}" if source.get("period_start") and source.get("period_end") else f"Tax year {source['year']} (reporting duration unconfirmed)" if source.get("year") else "Unknown tax reporting period",
+        "period": f"{source['period_start']} – {source['period_end']}" if source.get("period_start") and source.get("period_end") else f"Tax year {source['year']}" if assumed else f"Tax year {source['year']} (reporting duration unconfirmed)" if source.get("year") else "Unknown tax reporting period",
         "period_start": source.get("period_start"), "period_end": source.get("period_end"),
         "months_covered": source.get("months_covered"), "annualization_factor": 1 if annual is not None else None,
+        "period_assumed": assumed,
         "annualized_run_rate": False, "currency": source.get("currency"), "basis": source.get("basis"),
-        "complete": True, "provisional": True, "tax_derived_estimate": True, "staff_reviewed": False,
+        "complete": True, "provisional": not source["accepted"], "tax_derived_estimate": True, "staff_reviewed": False,
         "staff_adjusted": False, "source_accepted": source["accepted"], "entity_comparable": True,
         "entity_mismatch": False, "reconciliation_required": False,
-        "formula": "ordinary business tax income + known deducted interest (D&A remains expensed)",
+        "formula": "return's bottom line - other income + known deducted interest (D&A remains expensed)",
         "source_value": value, "reviewed_value": None, "input_keys": inputs, "active_input_keys": inputs,
-        "missing_inputs": [], "fundamentals": [
-            {"key": "ordinary_business_income", "label": "Ordinary business tax income", "value": values["income"], "signed_value": values["income"], "source_refs": source["source_refs"]},
-            {"key": "interest", "label": "Known deducted interest", "value": values["interest"], "signed_value": values["interest"], "source_refs": source["source_refs"]}],
-        "notes": [*source["notes"], "Automatic provisional estimate only. Review its business, annual reporting period, tax/book differences and non-operating items before relying on it; no program condition is approved."],
+        "missing_inputs": ["interest"] if values["interest"] is None else [], "fundamentals": fundamentals,
+        "notes": list(source["notes"]),
         "source_refs": source["source_refs"]}
 
 
-def _automatic_basis(review, candidates, metric_review):
+def _automatic_basis(review, candidates, metric_review, selection=None):
+    """Operating income from the document earnings come from.
+
+    With an earnings selection, that document and no other. Without one (a
+    caller outside the cockpit), the same rule the selection applies: the
+    latest filed return, else the latest P&L; never an older period.
+    """
     from app.services.financial_noi_review import period_key
 
     sources = review["sources"]
-    latest = review["latest_period"]
-    current = [row for row in sources if row["belongs_to_business"] and not row["automatic_reason"] and period_key(row) == latest]
-    eligible = [row for row in current if row["automatic_eligible"]]
     by_file = {row["source_refs"][0]["file_id"]: row for row in candidates}
-    pl = [by_file[row["file_id"]] for row in eligible if row["kind"] == "profit_and_loss"
-          and row["file_id"] in by_file and by_file[row["file_id"]]["value"] is not None]
-    if pl:
-        return max(pl, key=lambda row: (bool(row["complete"]), not row["provisional"], row["key"])), []
+    if isinstance(selection, dict) and "selected_file_id" in selection:
+        chosen_id = str(selection.get("selected_file_id") or "") if not selection.get("stale") else ""
+        chosen = next((row for row in sources if chosen_id and row["file_id"] == chosen_id), None)
+        if chosen is None:
+            actual = [row for row in sources if row["belongs_to_business"] and not row["automatic_reason"]]
+            projected = any(row["belongs_to_business"] and row["automatic_reason"] for row in sources)
+            return None, ["forecast_or_future_source" if projected and not actual else "earnings_source_not_selected"]
+        if chosen["automatic_reason"]:
+            return None, ["forecast_or_future_source"]
+        current = [chosen]
+    else:
+        belonging = [row for row in sources if row["belongs_to_business"] and not row["automatic_reason"]]
+        pool = [row for row in belonging if row["kind"] == "business_tax_return"] or belonging
+        if not pool:
+            return None, (["forecast_or_future_source"] if any(row["belongs_to_business"] and row["automatic_reason"] for row in sources)
+                          else ["missing_noi_operands"])
+        latest = max(period_key(row) for row in pool)
+        current = [row for row in pool if period_key(row) == latest]
+    eligible = [row for row in current if row["eligible"]]
+    if not eligible:
+        return None, ["business_identity_review"]
     tax = [row for row in eligible if row["kind"] == "business_tax_return" and row["proposed_annual_value"] is not None]
     if tax:
-        return _automatic_tax(tax[0], metric_review), ["tax_estimate"]
-    if current and not eligible:
-        return None, ["business_identity_review"]
-    older_tax = [row for row in sources if row["automatic_eligible"] and row["kind"] == "business_tax_return"
-                 and row["proposed_annual_value"] is not None and period_key(row) < latest]
-    if older_tax:
-        return _automatic_tax(max(older_tax, key=period_key), metric_review), ["tax_estimate", "older_tax_fallback"]
-    if any(row["belongs_to_business"] and row["automatic_reason"] for row in sources) and not current:
-        return None, ["forecast_or_future_source"]
+        return _automatic_tax(tax[0], metric_review), []
+    statements = [by_file[row["file_id"]] for row in eligible if row["kind"] == "profit_and_loss"
+                  and row["file_id"] in by_file and by_file[row["file_id"]]["value"] is not None]
+    if statements:
+        return max(statements, key=lambda row: (bool(row["complete"]), not row["provisional"], row["key"])), []
     return None, ["missing_noi_operands"]
 
 
@@ -276,6 +297,10 @@ def _governance(headline, review, automatic_codes):
         limitations.append("source_quotations_unverified")
     if headline and headline.get("tax_derived_estimate"):
         limitations.append("tax_book_and_non_operating_review")
+        if headline.get("period_assumed"):
+            limitations.append("calendar_year_assumed")
+        if "interest" in (headline.get("missing_inputs") or []):
+            limitations.append("interest_not_read")
     if headline and headline.get("staff_reviewed") and not headline.get("source_refs"):
         limitations.append("manual_without_linked_source")
     if headline and headline.get("forecast_assumption"):
@@ -302,19 +327,20 @@ def _governance(headline, review, automatic_codes):
         if source and not source["accepted"]:
             codes.append("source_not_accepted")
         status = "provisional" if codes else "source_supported"
-        reason = ("A newer business reporting period is incomplete. This explicitly dated older tax estimate is shown for review, rather than substituted as current-year P&L income."
-                  if "older_tax_fallback" in codes else
-                  "Tax-derived operating-income estimate: ordinary business tax income plus known deducted interest, with D&A retained as an expense. Staff review is required; it is not verified P&L income or program eligibility."
-                  if "tax_estimate" in codes else
-                  "The source amount is computable, but its reporting period, currency or operating-expense reconciliation needs staff review."
-                  if codes else "The latest supported business P&L supplies operating income. Refinancing and EBITDA remain separate.")
+        reason = ("The source amount is computable, but its reporting period, currency or operating-expense reconciliation needs staff review."
+                  if codes else
+                  "The filed business return supplies operating income: its bottom line, less other income, plus deducted interest. Depreciation and amortization stay expensed."
+                  if headline.get("tax_derived_estimate") else
+                  "The latest supported business P&L supplies operating income. Refinancing and EBITDA remain separate.")
     else:
         status, codes = "unavailable", list(automatic_codes)
         reason = ("The latest business source's identity or association needs review before NOI can be used."
                   if "business_identity_review" in codes else
+                  "No earnings source is in use on this file, so operating income is not shown. Review the earnings source selection."
+                  if "earnings_source_not_selected" in codes else
                   "Only forecast or future-period business sources are available. Add a completed historical P&L or business tax return, or explicitly review an annual NOI assumption."
                   if "forecast_or_future_source" in codes else
-                  "The latest business P&L has missing operating-income inputs for the latest business reporting period, and no computable business tax estimate is available. Tax net income alone is not NOI: tax income and deducted interest must both be known; missing operands are never assumed to be zero.")
+                  "The source in use has missing operating-income inputs: a return needs its bottom line read, a P&L its operating income or its revenue, cost of goods sold and operating expenses. An older period is not substituted.")
     result = {"policy_version": NOI_POLICY_VERSION, "status": status,
         "review_needed": status not in {"source_supported", "reviewed"}, "status_reason": reason,
         "reason_codes": list(dict.fromkeys(codes)), "source_limitations": limitations}
@@ -445,7 +471,7 @@ def build_noi(analyses, *, statement=None, entity=None, metric_review=None,
     review = financial_noi_review.prepare(analyses, candidates, state=review_state, entity=entity, metric_review=metric_review, now=now)
     historical_ids = {row["file_id"] for row in review["sources"] if not row["automatic_reason"]}
     years = [row for row in years if row["source_refs"][0]["file_id"] in historical_ids]
-    headline, automatic_codes = _automatic_basis(review, candidates, metric_review)
+    headline, automatic_codes = _automatic_basis(review, candidates, metric_review, source_selection)
     for item in candidates:
         item["selected"] = item is headline
         item["historical_comparison_only"] = item is not headline

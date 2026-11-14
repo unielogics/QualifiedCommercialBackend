@@ -85,15 +85,15 @@ def assert_public_noi(shared, canonical):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("annual_noi", [-15000, 0, 60000])
-async def test_tax_fallback_is_the_same_provisional_annual_value_across_current_and_shared_consumers(
+async def test_filed_return_noi_is_the_same_annual_value_across_current_and_shared_consumers(
     monkeypatch, annual_noi,
 ):
     source = business_tax(annual_noi)
     untouched = deepcopy(source)
     cockpit = build([source])
     noi = cockpit["noi"]
-    assert noi["status"] == "provisional" and noi["review_needed"]
-    assert noi["status_reason"] and noi["reason_codes"]
+    assert noi["status"] == "source_supported" and not noi["review_needed"]
+    assert noi["status_reason"] and noi["reason_codes"] == []
     assert noi["headline"]["annualized_value"] == annual_noi
     assert noi["headline"]["currency"] == "USD"
     assert str(noi["headline"]["year"]) == "2025"
@@ -108,7 +108,7 @@ async def test_tax_fallback_is_the_same_provisional_annual_value_across_current_
     metrics = projected["key_metrics"]
     assert metrics["noi"] == metrics["annual_noi"] == annual_noi
     assert metrics["noi_status"] == noi["status"]
-    assert metrics["noi_review_needed"] is True
+    assert metrics["noi_review_needed"] is False
     assert metrics["noi_status_reason"] == noi["status_reason"]
     assert metrics["noi_reason_codes"] == noi["reason_codes"]
     assert metrics["noi_policy_version"] == noi["policy_version"]
@@ -126,15 +126,15 @@ async def test_tax_fallback_is_the_same_provisional_annual_value_across_current_
     metric = next(row for row in intelligence.metrics if row.key == "noi")
     assert metric.value == annual_noi and metric.unit == "USD"
     assert metric.period == noi["headline"]["period"]
-    assert metric.calculation_status == "provisional"
-    assert metric.review_needed is True and metric.status == "needs_evidence"
-    assert metric.status_reason == noi["status_reason"] and metric.action == "review_noi"
+    assert metric.calculation_status == "source_supported"
+    assert metric.review_needed is False and metric.status == "ready"
+    assert metric.status_reason == noi["status_reason"] and metric.action is None
     assert intake.result_snapshot == original_snapshot
 
     monkeypatch.setattr(application_profiles, "find_profile", AsyncMock(return_value=profile))
     public = await current_intake_report(db, intake, original_snapshot, external=True)
     assert public["key_metrics"]["annual_noi"] == annual_noi
-    assert public["key_metrics"]["noi_status"] == "provisional"
+    assert public["key_metrics"]["noi_status"] == "source_supported"
     assert_public_noi(public["operating_earnings"]["noi"], noi)
     assert "financial_calculation_review" not in public
     assert "financial_calculation_authority" not in public
@@ -253,7 +253,7 @@ def test_legacy_partner_snapshot_is_flagged_without_rewriting_history_or_private
 
 
 @pytest.mark.parametrize("case", ["tax_usd", "tax_eur", "loan_payments_in_expenses"])
-def test_saved_and_live_noi_use_identical_provisional_illustration_gates(case):
+def test_saved_and_live_noi_use_identical_illustration_gates(case):
     source = (
         annual_pnl(notable_expense_lines={"bank_loan_payments_ytd": 6000})
         if case == "loan_payments_in_expenses"
@@ -261,7 +261,9 @@ def test_saved_and_live_noi_use_identical_provisional_illustration_gates(case):
     )
     cockpit = build([source], plan={"retire": ["row:debt"], "new_payment_monthly": 300})
     noi = cockpit["noi"]
-    assert noi["status"] == "provisional" and noi["review_needed"]
+    # Loan payments inside a P&L's expenses need reconciling; an accepted return stands.
+    provisional = case == "loan_payments_in_expenses"
+    assert noi["status"] == ("provisional" if provisional else "source_supported") and noi["review_needed"] is provisional
     saved = noi["scenario"]
     live = preview_scenario(noi, cockpit["plan"]["evaluation"])
     for key in (*CANONICAL_FIELDS, "authority_stamp"):

@@ -46,7 +46,8 @@ def test_entity_alias_and_current_amortization_fix_latest_business_estimate_with
     assert len(current["tax"]["years"]) == 2
     assert current["ebitda"]["headline"]["value"] == -54369
     assert current["ebitda"]["headline"]["kind"] == "tax_estimate"
-    assert current["ebitda"]["headline"]["provisional"] is True
+    # An accepted return of this business is a source in its own right.
+    assert current["ebitda"]["headline"]["provisional"] is False
     assert current["dscr"]["headline"]["numerator"] == -54369
     selected = selection(current)
     assert selected["selected_file_id"] == "tax-2025"
@@ -160,21 +161,34 @@ def test_dated_comparable_current_p_and_l_uses_run_rate_with_explicit_seasonalit
     assert "seasonal" in forecast["assumptions"][0]
 
 
-def test_current_p_and_l_prevents_selecting_prior_year_tax_as_earnings_baseline():
+def test_filed_return_leads_a_current_p_and_l_and_an_older_return_cannot_be_selected():
     rows = [*sources(), pnl(basis="cash")]
     original = build(rows, now=datetime(2026, 11, 9, tzinfo=UTC))
+    assert selection(original)["selected_file_id"] == "tax-2025"
+    assert selection(original)["baseline_policy"] == "filed_return_first"
+    fallback = next(row for row in selection(original)["sources"] if row["file_id"] == "source")
+    assert fallback["fallback_only"] and fallback["baseline_eligible"] and not fallback["selected"]
     with pytest.raises(HTTPException) as error:
-        change(None, selection(original), mode="manual", selected_file_id="tax-2025", excluded_file_ids=[],
+        change(None, selection(original), mode="manual", selected_file_id="tax-2024", excluded_file_ids=[],
                reason="Try the prior tax period", expected_revision=0, source_stamp=selection(original)["source_stamp"],
                idempotency_key="source-review-1", actor=ACTOR)
     assert error.value.status_code == 422
-    assert "latest business reporting period" in error.value.detail
-    assert selection(original)["selected_file_id"] == "source"
+    assert "Older periods are historical comparison only" in error.value.detail
+    # Staff may still put the current P&L in the return's place.
+    state, _ = change(None, selection(original), mode="manual", selected_file_id="source", excluded_file_ids=[],
+        reason="Use the current P&L", expected_revision=0, source_stamp=selection(original)["source_stamp"],
+        idempotency_key="source-review-2", actor=ACTOR)
+    chosen = build(rows, state=state, now=datetime(2026, 11, 9, tzinfo=UTC))
+    assert selection(chosen)["selected_file_id"] == "source" and chosen["ebitda"]["headline"]["value"] == 26000
+    assert chosen["dscr"]["headline"]["key"] == "profit_and_loss"
 
 
 def test_explicit_assumptions_replace_current_p_and_l_illustration_consistently():
     original = build([*sources(), pnl(basis="cash")], now=datetime(2026, 11, 9, tzinfo=UTC))
-    state, _ = save(original, forecast_assumptions={"revenue_growth_pct": 10, "ebitda_margin_pct": 5})
+    # Staff put the current P&L in the return's place; assumptions start from it.
+    state, _ = change(None, selection(original), mode="manual", selected_file_id="source", excluded_file_ids=[],
+        reason="Use the current P&L with reviewed assumptions", expected_revision=0, source_stamp=selection(original)["source_stamp"],
+        idempotency_key="source-review-1", actor=ACTOR, forecast_assumptions={"revenue_growth_pct": 10, "ebitda_margin_pct": 5})
     current = build([*sources(), pnl(basis="cash")], state=state, now=datetime(2026, 11, 9, tzinfo=UTC))
     forecast = current["ebitda"]["revenue_trend"]["forecast"]
     assert forecast["method"] == "reviewed_assumptions"
@@ -207,6 +221,13 @@ def test_automatic_source_uses_actual_dates_not_human_period_label_order():
     assert selection(c)["selected_file_id"] == "tax-2025"
     current_pnl = pnl(period_start="2026-01-01", period_end="2026-06-30")
     c = build([*sources(), current_pnl])
+    # A newer P&L is the labelled fallback; the latest filed return still leads.
+    assert selection(c)["selected_file_id"] == "tax-2025"
+    assert next(row for row in selection(c)["sources"] if row["file_id"] == "source")["fallback_only"]
+    # Without a return, the P&L with the latest actual dates leads.
+    older = pnl(period_start="2025-01-01", period_end="2025-06-30")
+    older.update(file_id="pl-older", file_name="Later label, earlier period.pdf")
+    c = build([older, current_pnl])
     assert selection(c)["selected_file_id"] == "source"
 
 
@@ -230,7 +251,7 @@ def test_newer_business_period_invalidates_old_source_receipt_until_current_revi
     state, _ = save(original)
     rows = [*sources(), pnl(basis="cash")]
     pending = build(rows, state=state)
-    assert selection(pending)["latest_file_id"] == "source"
+    assert selection(pending)["latest_file_id"] == "tax-2025"
     assert selection(pending)["stale"] and pending["ebitda"]["headline"] is None
     assert pending["dscr"]["headline"] is None
     with pytest.raises(HTTPException) as error:
@@ -243,16 +264,16 @@ def test_newer_business_period_invalidates_old_source_receipt_until_current_revi
         idempotency_key="source-review-2", actor=ACTOR)
     current = build(rows, state=accepted)
     assert not selection(current)["stale"]
-    assert current["ebitda"]["headline"]["value"] == 26000
-    assert current["dscr"]["headline"]["key"] == "profit_and_loss"
+    assert current["ebitda"]["headline"]["value"] == -54369
+    assert current["dscr"]["headline"]["key"] == "tax_return"
 
 
-def test_current_partial_pl_baseline_keeps_prior_full_years_as_annual_trend_only():
+def test_filed_return_baseline_keeps_the_current_partial_pl_as_the_outlook_beside_it():
     current = build([*sources(), pnl(basis="cash")], now=datetime(2026, 11, 9, tzinfo=UTC))
     trend = current["ebitda"]["revenue_trend"]
-    assert selection(current)["selected_file_id"] == "source"
-    assert current["ebitda"]["headline"]["value"] == 26000
-    assert current["dscr"]["headline"]["numerator"] == 52000
+    assert selection(current)["selected_file_id"] == "tax-2025"
+    assert current["ebitda"]["headline"]["value"] == -54369
+    assert current["dscr"]["headline"]["numerator"] == -54369
     assert [row["year"] for row in trend["periods"]] == ["2024", "2025"]
     assert trend["comparison"]["prior_year"] == "2024" and trend["comparison"]["current_year"] == "2025"
     assert trend["direction"] == "up"
@@ -308,11 +329,11 @@ def test_matching_annual_pl_history_takes_one_observation_per_period_when_tax_al
     latest = pnl(period_start="2025-01-01", period_end="2025-12-31", basis="cash", gross_revenue=200000)
     current = build([*sources(), prior, latest])
     trend = current["ebitda"]["revenue_trend"]
-    assert selection(current)["selected_file_id"] == "source"
-    assert [row["file_id"] for row in trend["periods"]] == ["pl-2024", "source"]
-    assert trend["comparison"]["prior_revenue"] == 100000
-    assert trend["comparison"]["current_revenue"] == 200000
-    assert trend["comparison"]["change_pct"] == 100
+    # The returns lead, so each year is observed once, from its return.
+    assert selection(current)["selected_file_id"] == "tax-2025"
+    assert [row["file_id"] for row in trend["periods"]] == ["tax-2024", "tax-2025"]
+    assert trend["comparison"]["prior_revenue"] == 40884
+    assert trend["comparison"]["current_revenue"] == 604785
 
 
 def test_excluding_latest_period_never_falls_back_to_previous_year():
@@ -340,14 +361,19 @@ def test_latest_missing_income_is_unavailable_instead_of_using_previous_year():
     assert "older" in current["ebitda"]["reason"]
 
 
-def test_dated_business_source_without_parsed_earnings_blocks_an_older_baseline():
+def test_unread_newer_p_and_l_does_not_displace_the_filed_return_but_blocks_without_one():
     unread = file("current_p_and_l", {"business_name": ENTITY, "currency": "USD", "basis": "cash",
         "period_start": "2026-01-01", "period_end": "2026-06-30"}, key="unread-current")
     current = build(sources())
     attach(current["ebitda"], current["metric_review"], [*sources(), unread], current["tax"]["years"], None, {}, entity=ENTITY)
-    assert current["ebitda"]["headline"] is None
-    assert selection(current)["selected_file_id"] is None
-    assert selection(current)["latest_file_id"] == "unread-current"
+    assert current["ebitda"]["headline"]["value"] == -54369
+    assert selection(current)["selected_file_id"] == selection(current)["latest_file_id"] == "tax-2025"
+    # With no return, an unread latest P&L still never revives an older one.
+    older = pnl(period_start="2025-01-01", period_end="2025-06-30", basis="cash")
+    alone = build([older])
+    attach(alone["ebitda"], alone["metric_review"], [older, unread], [], alone["profit_and_loss"], {}, entity=ENTITY)
+    assert alone["ebitda"]["headline"] is None and selection(alone)["selected_file_id"] is None
+    assert selection(alone)["latest_file_id"] == "unread-current"
 
 
 @pytest.mark.parametrize("stale", [False, True])
@@ -372,11 +398,13 @@ def test_denied_or_stale_latest_same_business_return_never_restores_older_earnin
 
 
 def test_identity_unresolved_latest_business_return_blocks_older_but_known_other_business_does_not():
-    unresolved = business(2026, 700000, 100000, entity=None)
+    # A fiscal year that has already ended; a period still running is a projection.
+    fiscal = {"period_start": "2025-07-01", "period_end": "2026-06-30"}
+    unresolved = business(2026, 700000, 100000, entity=None, **fiscal)
     current = build([*sources(), unresolved])
     assert current["ebitda"]["headline"] is None and current["dscr"]["headline"] is None
     assert selection(current)["latest_file_id"] == "tax-2026"
-    unrelated = business(2026, 700000, 100000, entity="Unrelated Business LLC")
+    unrelated = business(2026, 700000, 100000, entity="Unrelated Business LLC", **fiscal)
     current = build([*sources(), unrelated])
     assert current["ebitda"]["headline"]["value"] == -54369
     assert selection(current)["latest_file_id"] == "tax-2025"
@@ -405,14 +433,14 @@ def test_same_latest_period_tax_and_p_and_l_remain_alternatives_without_summing(
     assert {ref["file_id"] for ref in current["ebitda"]["headline"]["source_refs"]} == {"tax-2025"}
 
 
-def test_latest_p_and_l_is_also_the_coverage_basis_and_prior_tax_is_comparative():
+def test_filed_return_is_also_the_coverage_basis_and_the_newer_p_and_l_is_comparative():
     current = build([*sources(), pnl(basis="cash")])
     align_coverage(current["ebitda"], current["dscr"], current["metric_review"])
-    assert current["dscr"]["headline"]["key"] == "profit_and_loss"
-    assert current["dscr"]["headline"]["numerator"] == 52000
-    assert {row["key"] for row in current["dscr"]["comparative_candidates"]} == {"tax_return"}
+    assert current["dscr"]["headline"]["key"] == "tax_return"
+    assert current["dscr"]["headline"]["numerator"] == -54369
+    assert {row["key"] for row in current["dscr"]["comparative_candidates"]} == {"profit_and_loss"}
     selected = [row["key"] for row in current["metric_review"]["calculations"] if row.get("selected")]
-    assert "dscr.profit_and_loss" in selected and "dscr.tax_return" not in selected
+    assert "dscr.tax_return" in selected and "dscr.profit_and_loss" not in selected
 
 
 def test_older_p_and_l_cannot_replace_the_newer_tax_coverage_basis():
@@ -487,7 +515,19 @@ def test_full_annual_p_and_l_and_tax_same_period_are_one_comparison_observation(
     assert trend["comparison"]["comparable"] is True
 
 
-@pytest.mark.parametrize("changes", [{"currency": "CAD"}, {"accounting_basis": None}, {"period_start": None}, {"period_end": "2025-11-30"}])
+def test_unread_accounting_method_or_dates_do_not_block_the_year_over_year_comparison():
+    rows = sources()
+    rows[1]["key_facts"].update(accounting_basis=None)
+    assert build(rows)["ebitda"]["revenue_trend"]["comparison"]["comparable"] is True
+    # A return that prints only its tax year is read as that full year.
+    for row in rows[:2]:
+        row["key_facts"].update(period_start=None, period_end=None)
+    trend = build(rows)["ebitda"]["revenue_trend"]
+    assert trend["comparison"]["comparable"] is True and trend["direction"] == "up"
+    assert all(row["period_assumed"] and row["months_covered"] == 12 for row in trend["periods"])
+
+
+@pytest.mark.parametrize("changes", [{"currency": "CAD"}, {"accounting_basis": "Accrual"}, {"period_start": None}, {"period_end": "2025-11-30"}])
 def test_mismatched_unknown_and_short_periods_do_not_supply_growth(changes):
     rows = sources()
     rows[1]["key_facts"].update(changes)

@@ -32,10 +32,11 @@ def build(ebitda, service, evaluation, *, statement=None):
     basis = headline.get("basis") or period.get("basis")
     usable = bool(headline and not selection.get("stale") and file_id
                   and annual_earnings is not None and revenue is not None and revenue > 0
-                  and currency and basis in {"cash", "accrual"})
+                  # A filed return stands without its accounting method read.
+                  and currency and (basis in {"cash", "accrual"} or headline.get("kind") == "tax_estimate"))
     denominator_compatible = usable and currency == "USD" and not service.get("identity_association_conflict")
     notes = [
-        "The latest business period is the earnings baseline; the prior year supplies trend only.",
+        "The latest filed return, or without one the latest P&L, is the earnings baseline; the prior year supplies trend only.",
         "Targets are required earnings, not forecasts or evidence of program qualification.",
         "A refinance changes debt service. It does not itself change EBITDA or the source margin.",
         "A negative margin remains negative when revenue grows unless a separate operating improvement is supported.",
