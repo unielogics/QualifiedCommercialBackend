@@ -329,3 +329,407 @@ async def test_a_backfilled_document_that_fails_does_not_stop_the_next(db, monke
     assert await bucket_ai.drain_file_analyses(db, limit=2) == 1
 
     assert calls == [newer_id, older_id]
+
+
+# ── a document that keeps failing is given up on ────────────────────────────
+#
+# With the queue moving again, one thing was left: a document that fails for a
+# reason that will not go away was started on again every minute, one model
+# call each time, for as long as it stayed uploaded. Nothing recorded that an
+# attempt had been made, so nothing could stop.
+
+
+async def _uploaded(db, name, *, queue=True, content_hash=None, days_ago=0):
+    """One uploaded document, queued for analysis the way an upload queues it."""
+    bucket = Bucket(name=f"{name} room", ai_context={"review_type": "dealer"})
+    db.add(bucket)
+    await db.flush()
+    file = BucketFile(
+        bucket_id=bucket.id, file_name=f"{name}.pdf", s3_key=f"k/{name}.pdf", status="uploaded",
+        content_hash=content_hash,
+    )
+    if days_ago:
+        file.created_at = NOW - timedelta(days=days_ago)
+    db.add(file)
+    await db.flush()
+    if queue:
+        await bucket_ai.enqueue_file_analysis(db, file)
+    await db.commit()
+    return file.id
+
+
+async def _analyses(db, file_id):
+    """Every analysis row the file has, read fresh."""
+    return list(
+        (
+            await db.execute(
+                select(BucketFileAnalysis)
+                .where(BucketFileAnalysis.bucket_file_id == file_id)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _queue_rows(db, file_id):
+    return [row for row in await _analyses(db, file_id) if row.status == "pending"]
+
+
+async def _verdicts(db, file_id):
+    return [row for row in await _analyses(db, file_id) if row.status != "pending"]
+
+
+async def _passes(db, count, *, limit=5):
+    return [await bucket_ai.drain_file_analyses(db, limit=limit) for _ in range(count)]
+
+
+async def test_a_document_that_keeps_failing_is_stopped_after_its_attempts(db, monkeypatch, caplog) -> None:
+    file_id = await _uploaded(db, "stuck")
+    calls: list = []
+    monkeypatch.setattr(bucket_ai, "analyze_bucket_file", _analyzer(db, failing={file_id}, calls=calls))
+
+    with caplog.at_level(logging.ERROR, logger=bucket_ai.log.name):
+        processed = await _passes(db, bucket_ai.MAX_ANALYSIS_ATTEMPTS + 4)
+
+    # Started on five times, a pass apart, and never again after that: not from
+    # the queue, and not from the backfill of documents with no analysis.
+    assert processed == [0] * (bucket_ai.MAX_ANALYSIS_ATTEMPTS + 4)
+    assert calls == [file_id] * bucket_ai.MAX_ANALYSIS_ATTEMPTS
+    # It is off the queue ...
+    (queue_row,) = await _queue_rows(db, file_id)
+    assert queue_row.content_hash.startswith("consumed:")
+    assert bucket_ai.queue_attempts(queue_row) == bucket_ai.MAX_ANALYSIS_ATTEMPTS
+    # ... and the failure is filed where an analysis is read, in words the desk
+    # is shown, so the document stops saying it is still being checked.
+    (verdict,) = await _verdicts(db, file_id)
+    assert verdict.status == "failed"
+    assert verdict.usability_status == "needs_review"
+    assert verdict.skip_reason == bucket_ai.ATTEMPTS_EXHAUSTED
+    assert verdict.analysis_version == bucket_ai.CURRENT_FILE_ANALYSIS_VERSION
+    assert verdict.error == bucket_ai.ATTEMPTS_EXHAUSTED_MESSAGE
+    assert "5 times" in verdict.error and "Traceback" not in verdict.error and "varchar" not in verdict.error.lower()
+    # Said once in the log, with the reason the last attempt gave.
+    gave_up = [record for record in caplog.records if "gave up" in record.getMessage()]
+    assert len(gave_up) == 1
+    assert str(file_id) in gave_up[0].getMessage()
+    assert "value too long" in gave_up[0].getMessage()
+
+
+async def test_each_failed_attempt_is_counted_and_its_error_kept_on_the_queue_row(db, monkeypatch) -> None:
+    file_id = await _uploaded(db, "stuck")
+    monkeypatch.setattr(bucket_ai, "analyze_bucket_file", _analyzer(db, failing={file_id}, calls=[]))
+
+    await _passes(db, 2)
+
+    (queue_row,) = await _queue_rows(db, file_id)
+    assert queue_row.content_hash == "pending"  # still queued
+    assert bucket_ai.queue_attempts(queue_row) == 2
+    assert queue_row.analysis == {
+        "queue_attempts": 2,
+        "queue_last_error": "RuntimeError: value too long for type character varying(32)",
+    }
+    # Nothing is written where the desk reads a document's reason: while the
+    # attempts go on, the document is in progress, not explained by an error.
+    assert queue_row.error is None and queue_row.skip_detail is None
+    assert await _verdicts(db, file_id) == []
+
+
+async def test_only_the_first_line_of_an_error_is_kept(db, monkeypatch) -> None:
+    """A database error goes on to quote the statement and the values it was
+    given, which are the client's. Those stay in the log."""
+    file_id = await _uploaded(db, "stuck")
+
+    async def refuses(session, file, **_kwargs):
+        raise RuntimeError(
+            "value too long for type character varying(32)\n"
+            "[SQL: UPDATE application_profiles SET entity_type=$1 WHERE id = $2]\n"
+            "[parameters: ('Limited liability company taxed as an S corporation', 'c0ffee')]"
+        )
+
+    monkeypatch.setattr(bucket_ai, "analyze_bucket_file", refuses)
+
+    await _passes(db, 1)
+
+    (queue_row,) = await _queue_rows(db, file_id)
+    assert queue_row.analysis["queue_last_error"] == "RuntimeError: value too long for type character varying(32)"
+    assert "parameters" not in str(queue_row.analysis) and "S corporation" not in str(queue_row.analysis)
+
+
+async def test_an_attempt_is_on_record_before_the_work_starts(db, monkeypatch) -> None:
+    """A document whose analysis takes the process down never reaches an error
+    handler. If the attempt were only counted there, that document would be
+    started on again after every restart, for good."""
+    import asyncio
+
+    file_id = await _uploaded(db, "fatal")
+    calls: list = []
+
+    async def cut_off(session, file, **_kwargs):
+        calls.append(file.id)
+        raise asyncio.CancelledError  # not an Exception: no handler in the drain runs
+
+    monkeypatch.setattr(bucket_ai, "analyze_bucket_file", cut_off)
+    for _restart in range(bucket_ai.MAX_ANALYSIS_ATTEMPTS):
+        with pytest.raises(asyncio.CancelledError):
+            await bucket_ai.drain_file_analyses(db, limit=5)
+        await db.rollback()  # what the lost connection does to the open transaction
+
+    (queue_row,) = await _queue_rows(db, file_id)
+    assert queue_row.content_hash == "pending"
+    assert bucket_ai.queue_attempts(queue_row) == bucket_ai.MAX_ANALYSIS_ATTEMPTS
+
+    # The next pass does not start on it a sixth time; it stops.
+    assert await bucket_ai.drain_file_analyses(db, limit=5) == 0
+    assert len(calls) == bucket_ai.MAX_ANALYSIS_ATTEMPTS
+    (verdict,) = await _verdicts(db, file_id)
+    assert verdict.status == "failed" and verdict.skip_reason == bucket_ai.ATTEMPTS_EXHAUSTED
+
+
+async def test_a_document_that_recovers_before_the_limit_is_analyzed_as_usual(db, monkeypatch) -> None:
+    file_id = await _uploaded(db, "flaky")
+    failing = {file_id}
+    calls: list = []
+    monkeypatch.setattr(bucket_ai, "analyze_bucket_file", _analyzer(db, failing=failing, calls=calls))
+
+    assert await _passes(db, 2) == [0, 0]
+    failing.clear()  # whatever was wrong has passed
+    assert await _passes(db, 3) == [1, 0, 0]
+
+    assert calls == [file_id] * 3
+    (verdict,) = await _verdicts(db, file_id)
+    assert verdict.status == "completed"
+    (queue_row,) = await _queue_rows(db, file_id)
+    assert queue_row.content_hash.startswith("consumed:")
+
+
+async def test_a_legacy_upload_that_was_never_queued_is_stopped_too(db, monkeypatch) -> None:
+    """The backfill picks up uploads that predate queuing. They had no queue
+    row to count on, so one that failed was picked up again on every pass."""
+    stuck = await _uploaded(db, "legacy-stuck", queue=False, days_ago=1)
+    fine = await _uploaded(db, "legacy-fine", queue=False, days_ago=2)
+    calls: list = []
+    monkeypatch.setattr(bucket_ai, "analyze_bucket_file", _analyzer(db, failing={stuck}, calls=calls))
+
+    processed = await _passes(db, bucket_ai.MAX_ANALYSIS_ATTEMPTS + 3)
+
+    assert processed == [1] + [0] * (bucket_ai.MAX_ANALYSIS_ATTEMPTS + 2)
+    assert calls.count(fine) == 1
+    assert calls.count(stuck) == bucket_ai.MAX_ANALYSIS_ATTEMPTS
+    (verdict,) = await _verdicts(db, stuck)
+    assert verdict.status == "failed" and verdict.skip_reason == bucket_ai.ATTEMPTS_EXHAUSTED
+
+
+async def test_stopping_leaves_a_finished_analysis_alone(db, monkeypatch) -> None:
+    """When a re-run the desk asked for keeps failing, the analysis the
+    document already has is still the truth about it."""
+    file_id = await _uploaded(db, "reread", queue=False, content_hash="sha-current")
+    db.add(
+        BucketFileAnalysis(
+            bucket_file_id=file_id, bucket_id=(await db.get(BucketFile, file_id)).bucket_id,
+            content_hash="sha-current", analysis_version=bucket_ai.CURRENT_FILE_ANALYSIS_VERSION,
+            status="completed", usability_status="usable", summary="Three months of statements.",
+        )
+    )
+    await bucket_ai.enqueue_file_analysis(db, await db.get(BucketFile, file_id), force=True)
+    await db.commit()
+    calls: list = []
+    monkeypatch.setattr(bucket_ai, "analyze_bucket_file", _analyzer(db, failing={file_id}, calls=calls))
+
+    await _passes(db, bucket_ai.MAX_ANALYSIS_ATTEMPTS + 2)
+
+    assert len(calls) == bucket_ai.MAX_ANALYSIS_ATTEMPTS
+    (verdict,) = await _verdicts(db, file_id)
+    assert verdict.status == "completed" and verdict.usability_status == "usable"
+    assert verdict.summary == "Three months of statements." and verdict.error is None
+    (queue_row,) = await _queue_rows(db, file_id)
+    assert queue_row.content_hash.startswith("consumed:")
+
+
+async def test_the_failure_is_filed_against_the_bytes_the_file_holds(db, monkeypatch) -> None:
+    """Readers match an analysis to the file by its content hash; a failure
+    filed under any other name would leave them saying "still processing"."""
+    file_id = await _uploaded(db, "known-bytes", content_hash="sha-of-the-upload")
+    monkeypatch.setattr(bucket_ai, "analyze_bucket_file", _analyzer(db, failing={file_id}, calls=[]))
+
+    await _passes(db, bucket_ai.MAX_ANALYSIS_ATTEMPTS + 1)
+
+    # The strict read the file page's document count uses.
+    statuses = (
+        await db.execute(
+            select(BucketFileAnalysis.status)
+            .join(BucketFile, BucketFile.id == BucketFileAnalysis.bucket_file_id)
+            .where(
+                BucketFileAnalysis.bucket_file_id == file_id,
+                BucketFileAnalysis.analysis_version == bucket_ai.CURRENT_FILE_ANALYSIS_VERSION,
+                BucketFileAnalysis.content_hash == BucketFile.content_hash,
+            )
+        )
+    ).scalars().all()
+    assert statuses == ["failed"]
+
+
+async def test_the_room_reads_a_stopped_document_as_failed_not_as_still_checking(db, monkeypatch) -> None:
+    from app.services import locked_file_requests
+
+    file_id = await _uploaded(db, "stuck")
+    (queue_row,) = await _queue_rows(db, file_id)
+    queue_row.created_at = NOW - timedelta(hours=1)  # queued an hour before it was given up on
+    await db.commit()
+    monkeypatch.setattr(bucket_ai, "analyze_bucket_file", _analyzer(db, failing={file_id}, calls=[]))
+    file = await db.get(BucketFile, file_id)
+
+    before = await _room_state(db, locked_file_requests, file)
+    await _passes(db, bucket_ai.MAX_ANALYSIS_ATTEMPTS + 1)
+    after = await _room_state(db, locked_file_requests, await db.get(BucketFile, file_id))
+
+    assert (before.analysis_status, before.analysis_reason_code) == ("pending", "analysis_pending")
+    assert (after.analysis_status, after.analysis_reason_code) == ("failed", "analysis_failed")
+
+
+async def _room_state(db, locked_file_requests, file):
+    """The analysis state the room shows for a file, by the room's own rule
+    for choosing which of the file's analysis rows is current."""
+    rows = sorted(
+        await _analyses(db, file.id),
+        key=lambda row: (row.analysis_version, row.created_at, str(row.id)),
+        reverse=True,
+    )
+    current = next(
+        (row for row in rows if not file.content_hash or row.content_hash == file.content_hash), None
+    )
+    return locked_file_requests.public_analysis_state(file, current)
+
+
+async def test_a_retry_the_desk_asks_for_starts_the_count_again(db, monkeypatch) -> None:
+    file_id = await _uploaded(db, "stuck")
+    failing = {file_id}
+    calls: list = []
+    monkeypatch.setattr(bucket_ai, "analyze_bucket_file", _analyzer(db, failing=failing, calls=calls))
+    await _passes(db, bucket_ai.MAX_ANALYSIS_ATTEMPTS + 1)
+    assert len(calls) == bucket_ai.MAX_ANALYSIS_ATTEMPTS
+
+    # The desk presses retry after the cause is fixed.
+    failing.clear()
+    await bucket_ai.enqueue_file_analysis(db, await db.get(BucketFile, file_id), force=True)
+    await db.commit()
+
+    assert await _passes(db, 2) == [1, 0]
+    assert len(calls) == bucket_ai.MAX_ANALYSIS_ATTEMPTS + 1
+    assert sorted(row.status for row in await _verdicts(db, file_id)) == ["completed", "failed"]
+
+
+async def test_stopping_one_document_does_not_hold_up_the_one_behind_it(db, monkeypatch) -> None:
+    stuck = await _uploaded(db, "stuck")
+    monkeypatch.setattr(bucket_ai, "analyze_bucket_file", _analyzer(db, failing={stuck}, calls=[]))
+    await _passes(db, bucket_ai.MAX_ANALYSIS_ATTEMPTS)  # every attempt used; not yet stopped
+    behind = await _uploaded(db, "behind")
+    calls: list = []
+    monkeypatch.setattr(bucket_ai, "analyze_bucket_file", _analyzer(db, failing={stuck}, calls=calls, disturbs_session=True))
+
+    assert await bucket_ai.drain_file_analyses(db, limit=5) == 1
+
+    assert calls == [behind]
+    assert [row.status for row in await _verdicts(db, stuck)] == ["failed"]
+    assert [row.status for row in await _verdicts(db, behind)] == ["completed"]
+
+
+async def test_a_stop_that_cannot_be_recorded_costs_no_model_call_and_no_pass(db, monkeypatch, caplog) -> None:
+    stuck = await _uploaded(db, "stuck")
+    behind = await _uploaded(db, "behind")
+    failing = {stuck, behind}
+    calls: list = []
+    monkeypatch.setattr(bucket_ai, "analyze_bucket_file", _analyzer(db, failing=failing, calls=calls))
+    await _passes(db, bucket_ai.MAX_ANALYSIS_ATTEMPTS)
+    calls.clear()
+    failing.discard(behind)
+    # Filing the failure fails for the stuck document, whatever the reason.
+    real = bucket_ai._get_or_create_analysis_row
+
+    async def refuse(session, file, content_hash):
+        if file.id == stuck:
+            raise RuntimeError("could not file it")
+        return await real(session, file, content_hash)
+
+    monkeypatch.setattr(bucket_ai, "_get_or_create_analysis_row", refuse)
+
+    with caplog.at_level(logging.ERROR, logger=bucket_ai.log.name):
+        assert await _passes(db, 2) == [0, 0]
+
+    # Nothing was sent to the model for it, and the pass went on to the next.
+    assert stuck not in calls
+    (queue_row,) = await _queue_rows(db, stuck)
+    assert queue_row.content_hash == "pending"
+    assert any("could not stop retrying" in record.getMessage() for record in caplog.records)
+    # Once it can be filed, it is.
+    monkeypatch.setattr(bucket_ai, "_get_or_create_analysis_row", real)
+    await bucket_ai.drain_file_analyses(db, limit=5)
+    assert [row.status for row in await _verdicts(db, stuck)] == ["failed"]
+
+
+async def test_an_archive_still_being_unpacked_uses_none_of_its_attempts(db, monkeypatch) -> None:
+    file_id = await _uploaded(db, "bundle")
+    file = await db.get(BucketFile, file_id)
+    file.extraction_status = "retryable"
+    await db.commit()
+    calls: list = []
+    monkeypatch.setattr(bucket_ai, "analyze_bucket_file", _analyzer(db, failing=set(), calls=calls))
+    monkeypatch.setattr("app.routers.buckets._reconcile_completed_bucket_file", AsyncMock())
+
+    assert await _passes(db, 3) == [0, 0, 0]
+
+    assert calls == []
+    (queue_row,) = await _queue_rows(db, file_id)
+    assert queue_row.content_hash == "pending" and bucket_ai.queue_attempts(queue_row) == 0
+
+
+# ── a document queued a second time ─────────────────────────────────────────
+
+
+async def test_a_document_queued_a_second_time_can_leave_the_queue(db, monkeypatch) -> None:
+    """A document whose first analysis ended without a finished result is
+    queued again by the next thing that asks (an archive being re-read, a file
+    opened from its room). Both queue rows were renamed to the same name when
+    taken, the database refused the second as a duplicate, and that refusal
+    was outside anything that caught it: every pass ended there, with every
+    document behind it waiting."""
+    file_id = await _uploaded(db, "twice")
+    behind = await _uploaded(db, "behind")
+    calls: list = []
+
+    async def ends_unfinished(session, file, **_kwargs):
+        calls.append(file.id)
+        if file.id == file_id and calls.count(file_id) == 1:
+            session.add(  # the model call failed: a failed analysis, filed and committed
+                BucketFileAnalysis(
+                    bucket_file_id=file.id, bucket_id=file.bucket_id, content_hash="sha-first",
+                    status="failed", analysis_version=bucket_ai.CURRENT_FILE_ANALYSIS_VERSION,
+                )
+            )
+        else:
+            session.add(
+                BucketFileAnalysis(
+                    bucket_file_id=file.id, bucket_id=file.bucket_id, content_hash=f"sha:{file.id.hex[:16]}",
+                    status="completed", analysis_version=bucket_ai.CURRENT_FILE_ANALYSIS_VERSION,
+                )
+            )
+        await session.flush()
+        return object()
+
+    monkeypatch.setattr(bucket_ai, "analyze_bucket_file", ends_unfinished)
+    assert await bucket_ai.drain_file_analyses(db, limit=1) == 1  # the first, unfinished, analysis
+    # Queued again, the ordinary way; it now sits ahead of the other document.
+    await bucket_ai.enqueue_file_analysis(db, await db.get(BucketFile, file_id))
+    await db.commit()
+    for row in await _queue_rows(db, file_id):
+        if row.content_hash == "pending":
+            row.created_at = NOW - timedelta(days=1)
+    await db.commit()
+
+    assert await bucket_ai.drain_file_analyses(db, limit=5) == 2
+
+    assert calls == [file_id, file_id, behind]
+    taken = [row.content_hash for row in await _queue_rows(db, file_id)]
+    assert len(taken) == 2 and len(set(taken)) == 2
+    assert all(name.startswith("consumed:") for name in taken)

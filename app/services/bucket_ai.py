@@ -4067,20 +4067,54 @@ async def enqueue_file_analysis(db: AsyncSession, file: BucketFile, *, force: bo
 
 CONSUMED_PLACEHOLDER_PREFIX = "consumed:"
 
+#: How many times the drain starts on one queued document before it stops.
+MAX_ANALYSIS_ATTEMPTS = 5
+#: Where a queue placeholder keeps that count, and what the last failed
+#: attempt said. A placeholder has no analysis of its own, so its `analysis`
+#: holds only this; `error` is left empty because the desk is shown it.
+QUEUE_ATTEMPTS_KEY = "queue_attempts"
+QUEUE_LAST_ERROR_KEY = "queue_last_error"
+#: `skip_reason` on the failed analysis filed when the drain stops.
+ATTEMPTS_EXHAUSTED = "analysis_attempts_exhausted"
+#: `error` on that analysis. The desk is shown it as the reason on the
+#: document, so it is written for them and carries nothing internal.
+ATTEMPTS_EXHAUSTED_MESSAGE = (
+    f"AI analysis of this document failed {MAX_ANALYSIS_ATTEMPTS} times in a row and was stopped. "
+    "Retry the analysis, or review the document by hand."
+)
+#: Hash of that analysis when the file's bytes were never fingerprinted.
+GAVE_UP_HASH_PREFIX = "gave-up:"
 
-def consumed_placeholder_hash(content_hash: str) -> str:
+
+def consumed_placeholder_hash(placeholder_id: UUID) -> str:
     """The hash a queue placeholder is renamed to once the drain has taken it.
 
     Placeholders are `pending` or `pending:<hex>`; the drain selects on the
-    `pending%` prefix, so the rename is what dequeues them. Bounded to the
-    64-character column by construction (9 + at most 40).
+    `pending%` prefix, so the rename is what dequeues them.
+
+    Named from the row's own id. A document can be queued more than once, and
+    (file, hash, version) is unique: named from the old hash, two taken
+    placeholders of one document were both `consumed:pending`, the database
+    refused the second, and that document could never leave the queue.
+    41 characters of the column's 64.
     """
-    return f"{CONSUMED_PLACEHOLDER_PREFIX}{content_hash}"[:64]
+    return f"{CONSUMED_PLACEHOLDER_PREFIX}{placeholder_id.hex}"
+
+
+def _queue_notes(placeholder: Any) -> dict:
+    notes = getattr(placeholder, "analysis", None)
+    return notes if isinstance(notes, dict) else {}
+
+
+def queue_attempts(placeholder: Any) -> int:
+    """How many times the drain has started on this queued document."""
+    made = _queue_notes(placeholder).get(QUEUE_ATTEMPTS_KEY)
+    return made if type(made) is int and made > 0 else 0
 
 
 async def _queued_placeholders(db: AsyncSession, ids: list[UUID]) -> list[BucketFileAnalysis]:
-    """Queue placeholders read again by id, oldest first, with what the drain
-    reads off each: the file and its bucket.
+    """Queue placeholders read again by id, in the order given, with what the
+    drain reads off each: the file and its bucket.
 
     `populate_existing` because the session may already hold these rows in a
     state the drain cannot use: expired by a rollback, or with the file no
@@ -4088,12 +4122,11 @@ async def _queued_placeholders(db: AsyncSession, ids: list[UUID]) -> list[Bucket
     """
     if not ids:
         return []
-    return list(
+    rows = (
         (
             await db.execute(
                 select(BucketFileAnalysis)
                 .where(BucketFileAnalysis.id.in_(ids))
-                .order_by(BucketFileAnalysis.created_at.asc())
                 .options(selectinload(BucketFileAnalysis.file).selectinload(BucketFile.bucket))
                 .execution_options(populate_existing=True)
             )
@@ -4101,33 +4134,215 @@ async def _queued_placeholders(db: AsyncSession, ids: list[UUID]) -> list[Bucket
         .scalars()
         .all()
     )
+    by_id = {row.id: row for row in rows}
+    return [by_id[row_id] for row_id in ids if row_id in by_id]
 
 
-async def _files_with_buckets(db: AsyncSession, ids: list[UUID]) -> list[BucketFile]:
-    """Files read again by id, newest first, each with its bucket; fresh for
-    the same reason as `_queued_placeholders`."""
-    if not ids:
+async def _queue_unqueued(db: AsyncSession, files: list[BucketFile]) -> list[BucketFileAnalysis]:
+    """Queue placeholders for uploads that never had one, in the order given.
+
+    The backfill works them as queued documents from here, which is what
+    counts their attempts: with no row of its own, a legacy upload that could
+    not be analyzed was picked up again on every pass.
+    """
+    rows = [
+        BucketFileAnalysis(
+            bucket_file_id=file.id,
+            bucket_id=file.bucket_id,
+            content_hash="pending",
+            analysis_version=CURRENT_FILE_ANALYSIS_VERSION,
+            status="pending",
+        )
+        for file in files
+    ]
+    db.add_all(rows)
+    try:
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        # An upload queued one of them in the same moment. All of them are
+        # left for the next pass, which finds that one in the queue.
+        await db.rollback()
+        log.exception("drain_file_analyses: legacy backfill could not queue its files")
         return []
-    return list(
-        (
+    return await _queued_placeholders(db, [row.id for row in rows])
+
+
+async def _note_failed_attempt(db: AsyncSession, placeholder_id: UUID | None, error: Exception) -> None:
+    """Keep what a failed attempt said on the queue row, for whoever reads why
+    the drain stopped. Best effort: the count is what stops the retries, and
+    it was committed before the attempt began.
+
+    Only the error's first line. A database error goes on to quote the
+    statement and its values, and those belong in the log, not in a row.
+    """
+    if placeholder_id is None:
+        return
+    try:
+        # Read again by id: the rollback expired every row this session holds.
+        placeholder = (
             await db.execute(
-                select(BucketFile)
-                .where(BucketFile.id.in_(ids))
-                .order_by(BucketFile.created_at.desc())
-                .options(selectinload(BucketFile.bucket))
+                select(BucketFileAnalysis)
+                .where(BucketFileAnalysis.id == placeholder_id)
                 .execution_options(populate_existing=True)
             )
-        )
-        .scalars()
-        .all()
+        ).scalar_one_or_none()
+        if placeholder is None:
+            return
+        said = (str(error).splitlines() or [""])[0].strip()
+        placeholder.analysis = {
+            **_queue_notes(placeholder),
+            QUEUE_LAST_ERROR_KEY: f"{type(error).__name__}: {said}"[:500],
+        }
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+        log.exception("drain_file_analyses: could not note the failed attempt placeholder=%s", placeholder_id)
+
+
+async def _stop_retrying(db: AsyncSession, placeholder_id: UUID | None, file_id: UUID) -> None:
+    """Give up on a queued document that has used its attempts.
+
+    It leaves the queue. Where the file has no finished analysis of the bytes
+    it holds, the failure is filed as its analysis, so the room and the file
+    page say the analysis failed (which the desk can retry) instead of saying
+    it is still being checked, for good. A finished analysis is left as it
+    is: only a re-run of it failed.
+
+    Small on purpose. It reads nothing from storage and reconciles nothing,
+    which is the work that had just failed five times. If even this cannot be
+    written the document stays queued and the stop is tried again next pass;
+    either way nothing more is sent to the model.
+    """
+    last_error = None
+    try:
+        placeholder = (
+            await db.execute(
+                select(BucketFileAnalysis)
+                .where(BucketFileAnalysis.id == placeholder_id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if placeholder is None:
+            return
+        last_error = _queue_notes(placeholder).get(QUEUE_LAST_ERROR_KEY)
+        placeholder.content_hash = consumed_placeholder_hash(placeholder.id)
+        file = (
+            await db.execute(
+                select(BucketFile).where(BucketFile.id == file_id).execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if file is not None and file.deleted_at is None and file.status == "uploaded":
+            # Readers match an analysis to a file by the file's content hash,
+            # and take the newest when the file has none yet.
+            verdict = await _get_or_create_analysis_row(
+                db, file, file.content_hash or f"{GAVE_UP_HASH_PREFIX}{placeholder.id.hex}"
+            )
+            if verdict.status not in {"completed", "skipped"}:
+                verdict.status = "failed"
+                verdict.usability_status = "needs_review"
+                verdict.skip_reason = ATTEMPTS_EXHAUSTED
+                verdict.skip_detail = None
+                verdict.error = ATTEMPTS_EXHAUSTED_MESSAGE
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+        log.exception("drain_file_analyses: could not stop retrying file=%s", file_id)
+        return
+    log.error(
+        "drain_file_analyses: gave up file=%s after %d attempts; last error: %s",
+        file_id,
+        MAX_ANALYSIS_ATTEMPTS,
+        last_error or "none recorded",
     )
+
+
+async def _analyze_queued_document(
+    db: AsyncSession, placeholder: BucketFileAnalysis, failed_file_ids: list[UUID]
+) -> bool:
+    """Work one queued document: count the attempt, take it off the queue and
+    analyze it. True when it was analyzed.
+
+    Whatever goes wrong with this document stays with this document. It is
+    logged, the session is rolled back, and the pass goes on to the next one.
+    """
+    from app.services.document_version_selection import document_file_ids
+
+    file = placeholder.file
+    live = file is not None and file.deleted_at is None and file.status == "uploaded"
+    if live and file.extraction_status == "retryable":
+        # The independent retry pass owns archive recovery. Preserve this
+        # placeholder until extraction succeeds or becomes terminal.
+        return False
+    # Ids are read now, while the rows are loaded: a rollback expires them,
+    # and naming a document from an expired row raises in turn.
+    placeholder_id = getattr(placeholder, "id", None)
+    file_id = file.id if file is not None else None
+    try:
+        if not live or file_id not in await document_file_ids(db, [file_id], usable=False):
+            # Nothing here to analyze any more. The placeholder is consumed
+            # rather than deleted: bucket history is retention-guarded at the
+            # database (migration 0239 refuses a physical delete outside a
+            # governed purge). Readers match an analysis by the file's real
+            # content hash, so a consumed placeholder is inert; the rename is
+            # what keeps it out of the next pass.
+            placeholder.content_hash = consumed_placeholder_hash(placeholder_id)
+            await db.commit()
+            return False
+        made = queue_attempts(placeholder)
+        if made >= MAX_ANALYSIS_ATTEMPTS:
+            await _stop_retrying(db, placeholder_id, file_id)
+            return False
+        review_type = (file.bucket.ai_context or {}).get("review_type") if file.bucket else None
+        product_intent = _funding_intent(file.bucket.ai_context) if file.bucket else None
+        force = placeholder.skip_reason == "force_reanalysis"
+        # The attempt is counted, and the count committed, before the work
+        # starts. A failure that takes the process down with it never reaches
+        # an error handler; counted only there, that document would be started
+        # on again after every restart, for good.
+        placeholder.analysis = {**_queue_notes(placeholder), QUEUE_ATTEMPTS_KEY: made + 1}
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+        log.exception("drain_file_analyses: could not take up file=%s", file_id)
+        return False
+    try:
+        # Taken off the queue in the same transaction as its analysis: if the
+        # analysis fails, the rollback puts it back for the next attempt.
+        # analyze_bucket_file upserts the real hashed row.
+        placeholder.content_hash = consumed_placeholder_hash(placeholder_id)
+        await db.flush()
+        await analyze_bucket_file(
+            db,
+            file,
+            review_type=review_type,
+            force=force,
+            **({"funding_intent": product_intent} if product_intent else {}),
+        )
+        await db.commit()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        # One document that cannot be analyzed is logged and left queued, with
+        # this attempt counted against it; it must not stop the documents
+        # behind it.
+        await db.rollback()
+        log.exception(
+            "drain_file_analyses: failed file=%s attempt=%d of %d", file_id, made + 1, MAX_ANALYSIS_ATTEMPTS
+        )
+        failed_file_ids.append(file_id)
+        await _note_failed_attempt(db, placeholder_id, exc)
+        return False
 
 
 async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
     """Analyze files queued as 'pending' (from upload-complete) outside the
     request path, so reviews compose from a warm cache. Each file is analyzed
     once; the placeholder row is replaced by analyze_bucket_file's real
-    (hash, version) row."""
+    (hash, version) row.
+
+    A document is started on at most MAX_ANALYSIS_ATTEMPTS times. After that
+    it leaves the queue with a failed analysis the desk can see and retry,
+    rather than costing a model call a minute for as long as it stays
+    uploaded."""
     from app.services.document_version_selection import latest_document_file_clause
 
     # Retry ZIP extraction from the durable file state, not from the analysis
@@ -4189,76 +4404,32 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
     )
     processed = 0
     attempted = 0
-    # Ids are read now, while the rows are loaded. Analyzing one document
-    # leaves the rows still waiting in this pass unusable: a failure rolls the
-    # session back and expires them, and a success reconciles the room in ways
-    # that leave their file unloaded. Either way the next one would fail on a
-    # load the session cannot do from here and take the rest of the pass with
-    # it, so after every attempt the rest are read again by id.
-    queue = list(rows)
-    waiting_ids = [getattr(row, "id", None) for row in queue]
     failed_file_ids: list[UUID] = []
-    position = 0
 
-    async def reread_waiting() -> None:
-        still_waiting = waiting_ids[position:]
-        if any(row_id is None for row_id in still_waiting):
-            return  # rows with no id were never in the database to read again
-        queue[position:] = await _queued_placeholders(db, still_waiting)
-        waiting_ids[position:] = [row.id for row in queue[position:]]
+    async def work(batch: list[BucketFileAnalysis]) -> None:
+        nonlocal processed, attempted
+        # Working one document leaves the rows still waiting in this pass
+        # unusable: a failure rolls the session back and expires them, and a
+        # success reconciles the room in ways that leave their file unloaded.
+        # Either way the next one would fail on a load the session cannot do
+        # from here and take the rest of the pass with it, so after every
+        # document the rest are read again by id.
+        queue = list(batch)
+        waiting_ids = [getattr(row, "id", None) for row in queue]
+        position = 0
+        while position < len(queue):
+            placeholder = queue[position]
+            position += 1
+            attempted += 1
+            if await _analyze_queued_document(db, placeholder, failed_file_ids):
+                processed += 1
+            still_waiting = waiting_ids[position:]
+            # Rows with no id were never in the database to read again.
+            if still_waiting and all(row_id is not None for row_id in still_waiting):
+                queue[position:] = await _queued_placeholders(db, still_waiting)
+                waiting_ids[position:] = [row.id for row in queue[position:]]
 
-    while position < len(queue):
-        placeholder = queue[position]
-        position += 1
-        attempted += 1
-        file = placeholder.file
-        if (
-            file is not None
-            and file.deleted_at is None
-            and file.status == "uploaded"
-            and file.extraction_status == "retryable"
-        ):
-            # The independent retry pass above owns archive recovery. Preserve
-            # this placeholder until extraction succeeds or becomes terminal.
-            continue
-        # Consume the placeholder rather than delete it. Bucket history is
-        # retention-guarded at the database (migration 0239 refuses a physical
-        # delete outside a governed purge), and the delete that used to sit
-        # here raised on every pass, aborting the whole drain once a minute.
-        # Readers match an analysis by the file's real content hash, so a
-        # consumed placeholder is inert; the rename is what keeps it out of
-        # the next pass. analyze_bucket_file still upserts the real hashed row.
-        placeholder.content_hash = consumed_placeholder_hash(placeholder.content_hash)
-        await db.flush()
-        from app.services.document_version_selection import document_file_ids
-
-        if file is None or file.deleted_at is not None or file.status != "uploaded" or file.id not in await document_file_ids(db, [file.id], usable=False):
-            await db.commit()
-            continue
-        review_type = (file.bucket.ai_context or {}).get("review_type") if file.bucket else None
-        product_intent = _funding_intent(file.bucket.ai_context) if file.bucket else None
-        file_id = file.id
-        try:
-            await analyze_bucket_file(
-                db,
-                file,
-                review_type=review_type,
-                force=placeholder.skip_reason == "force_reanalysis",
-                **({"funding_intent": product_intent} if product_intent else {}),
-            )
-            await db.commit()
-            processed += 1
-        except Exception:
-            # One document that cannot be analyzed is logged and left queued;
-            # it must not stop the documents behind it. Naming it from the
-            # row here used to raise in turn (the rollback had expired it),
-            # which aborted the pass once a minute for as long as it stayed
-            # at the head of the queue.
-            await db.rollback()
-            log.exception("drain_file_analyses: failed file=%s", file_id)
-            failed_file_ids.append(file_id)
-        if position < len(queue):
-            await reread_waiting()
+    await work(list(rows))
     # Legacy/public-room uploads could predate analysis queuing. Backfill a
     # bounded number on every drain so existing evidence converges without a
     # one-off migration or an unbounded model-spend spike.
@@ -4279,9 +4450,9 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
                         BucketFile.deleted_at.is_(None),
                         latest_document_file_clause(BucketFile.id),
                         ~current_analysis,
-                        # A document that just failed above has no analysis
-                        # either; it waits for the next pass rather than being
-                        # tried a second time in this one.
+                        # A document that just failed above may have no
+                        # analysis at this version either; it waits for the
+                        # next pass rather than being tried twice in this one.
                         *([BucketFile.id.notin_(failed_file_ids)] if failed_file_ids else []),
                         or_(
                             BucketFile.source_kind.is_(None),
@@ -4294,44 +4465,13 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
                     )
                     .order_by(BucketFile.created_at.desc())
                     .limit(remaining)
-                    .options(selectinload(BucketFile.bucket))
                 )
             )
             .scalars()
             .all()
         )
-        backfill = list(missing_files)
-        backfill_ids = [getattr(row, "id", None) for row in backfill]
-        position = 0
-
-        async def reread_backfill() -> None:
-            still_waiting = backfill_ids[position:]
-            if any(row_id is None for row_id in still_waiting):
-                return
-            backfill[position:] = await _files_with_buckets(db, still_waiting)
-            backfill_ids[position:] = [row.id for row in backfill[position:]]
-
-        while position < len(backfill):
-            file = backfill[position]
-            position += 1
-            file_id = file.id
-            try:
-                product_intent = _funding_intent(file.bucket.ai_context) if file.bucket else None
-                await analyze_bucket_file(
-                    db,
-                    file,
-                    review_type=(file.bucket.ai_context or {}).get("review_type")
-                    if file.bucket
-                    else None,
-                    **({"funding_intent": product_intent} if product_intent else {}),
-                )
-                await db.commit()
-                processed += 1
-            except Exception:
-                await db.rollback()
-                log.exception("drain_file_analyses: legacy backfill failed file=%s", file_id)
-            if position < len(backfill):
-                await reread_backfill()
+        if missing_files:
+            await work(await _queue_unqueued(db, missing_files))
     return processed
 
 

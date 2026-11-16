@@ -965,7 +965,7 @@ async def test_analysis_drain_consumes_the_placeholder_instead_of_deleting_it():
         extraction_status=None,
         bucket=SimpleNamespace(ai_context={"review_type": "dealer"}),
     )
-    placeholder = SimpleNamespace(file=file, content_hash="pending:abc123", skip_reason=None)
+    placeholder = SimpleNamespace(id=uuid4(), file=file, content_hash="pending:abc123", skip_reason=None)
     no_zips = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
     queued = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [placeholder]))
     db = SimpleNamespace(
@@ -981,17 +981,22 @@ async def test_analysis_drain_consumes_the_placeholder_instead_of_deleting_it():
 
     assert processed == 1
     db.delete.assert_not_awaited()
-    assert placeholder.content_hash == "consumed:pending:abc123"
+    assert placeholder.content_hash == f"consumed:{placeholder.id.hex}"
     assert not placeholder.content_hash.startswith("pending")
+    # The attempt was counted before the analysis was started.
+    assert bucket_ai.queue_attempts(placeholder) == 1
     analyze.assert_awaited_once()
     assert analyze.await_args.kwargs == {"review_type": "dealer", "force": False}
     db.commit.assert_awaited()
 
 
 def test_consumed_placeholder_hash_fits_the_column():
-    assert bucket_ai.consumed_placeholder_hash("pending") == "consumed:pending"
-    forced = bucket_ai.consumed_placeholder_hash("pending:" + "f" * 32)
-    assert forced.startswith("consumed:pending:") and len(forced) <= 64
+    row_id = uuid4()
+    taken = bucket_ai.consumed_placeholder_hash(row_id)
+    assert taken == f"consumed:{row_id.hex}" and len(taken) <= 64
+    # Named from the row, not from the hash it replaces: a document queued
+    # twice has two placeholders, and (file, hash, version) is unique.
+    assert bucket_ai.consumed_placeholder_hash(uuid4()) != taken
 
 
 @pytest.mark.asyncio
