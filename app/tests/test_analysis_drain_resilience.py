@@ -188,9 +188,14 @@ async def _hash_of(db, placeholder_id) -> str:
     ).scalar_one()
 
 
-def _analyzer(db, *, failing: set, calls: list):
+def _analyzer(db, *, failing: set, calls: list, disturbs_session: bool = False):
     """Stands in for the model call: fails for the named documents, and files
-    a finished analysis for the rest as the real one does."""
+    a finished analysis for the rest as the real one does.
+
+    `disturbs_session` is what a real analysis does on the way out: it
+    reconciles the room, and the rows the session held before it are no longer
+    loaded afterwards.
+    """
 
     async def analyze(session, file, **_kwargs):
         calls.append(file.id)
@@ -204,6 +209,8 @@ def _analyzer(db, *, failing: set, calls: list):
             )
         )
         await session.flush()
+        if disturbs_session:
+            session.expire_all()
         return object()
 
     return analyze
@@ -230,6 +237,48 @@ async def test_a_document_that_cannot_be_analyzed_does_not_stop_the_ones_behind_
     failures = [record for record in caplog.records if "drain_file_analyses: failed" in record.getMessage()]
     assert len(failures) == 1
     assert str(stuck_file) in failures[0].getMessage()
+
+
+async def test_a_backlog_is_worked_through_in_one_pass_not_one_document_a_minute(db, monkeypatch) -> None:
+    """After the first fix went out the queue moved again, one document a
+    minute: each pass analyzed the first document and then failed reaching for
+    the second, whose file the first analysis had left unloaded. Nothing had
+    shown it before because a pass rarely holds two documents; the day-long
+    backlog made every pass hold five."""
+    queued = [await _queued(db, f"doc{n}", minutes_ago=50 - n) for n in range(4)]
+    await db.commit()
+    calls: list = []
+    monkeypatch.setattr(
+        bucket_ai, "analyze_bucket_file", _analyzer(db, failing=set(), calls=calls, disturbs_session=True)
+    )
+
+    assert await bucket_ai.drain_file_analyses(db, limit=4) == 4
+
+    assert calls == [file_id for file_id, _placeholder in queued]
+    for _file_id, placeholder_id in queued:
+        assert (await _hash_of(db, placeholder_id)).startswith("consumed:")
+
+
+async def test_a_backfill_is_worked_through_in_one_pass_too(db, monkeypatch) -> None:
+    bucket = Bucket(name="Legacy room", ai_context={})
+    db.add(bucket)
+    await db.flush()
+    files = []
+    for n in range(3):
+        file = BucketFile(bucket_id=bucket.id, file_name=f"old{n}.pdf", s3_key=f"k/old{n}.pdf", status="uploaded")
+        file.created_at = NOW - timedelta(days=3 - n)
+        files.append(file)
+    db.add_all(files)
+    await db.commit()
+    newest_first = [file.id for file in reversed(files)]
+    calls: list = []
+    monkeypatch.setattr(
+        bucket_ai, "analyze_bucket_file", _analyzer(db, failing=set(), calls=calls, disturbs_session=True)
+    )
+
+    assert await bucket_ai.drain_file_analyses(db, limit=3) == 3
+
+    assert calls == newest_first
 
 
 async def test_a_failed_document_is_not_tried_a_second_time_in_the_same_pass(db, monkeypatch) -> None:

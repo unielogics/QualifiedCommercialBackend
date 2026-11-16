@@ -4080,7 +4080,12 @@ def consumed_placeholder_hash(content_hash: str) -> str:
 
 async def _queued_placeholders(db: AsyncSession, ids: list[UUID]) -> list[BucketFileAnalysis]:
     """Queue placeholders read again by id, oldest first, with what the drain
-    reads off each: the file and its bucket."""
+    reads off each: the file and its bucket.
+
+    `populate_existing` because the session may already hold these rows in a
+    state the drain cannot use: expired by a rollback, or with the file no
+    longer loaded after another document's analysis reconciled the room.
+    """
     if not ids:
         return []
     return list(
@@ -4090,6 +4095,7 @@ async def _queued_placeholders(db: AsyncSession, ids: list[UUID]) -> list[Bucket
                 .where(BucketFileAnalysis.id.in_(ids))
                 .order_by(BucketFileAnalysis.created_at.asc())
                 .options(selectinload(BucketFileAnalysis.file).selectinload(BucketFile.bucket))
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()
@@ -4098,7 +4104,8 @@ async def _queued_placeholders(db: AsyncSession, ids: list[UUID]) -> list[Bucket
 
 
 async def _files_with_buckets(db: AsyncSession, ids: list[UUID]) -> list[BucketFile]:
-    """Files read again by id, newest first, each with its bucket."""
+    """Files read again by id, newest first, each with its bucket; fresh for
+    the same reason as `_queued_placeholders`."""
     if not ids:
         return []
     return list(
@@ -4108,6 +4115,7 @@ async def _files_with_buckets(db: AsyncSession, ids: list[UUID]) -> list[BucketF
                 .where(BucketFile.id.in_(ids))
                 .order_by(BucketFile.created_at.desc())
                 .options(selectinload(BucketFile.bucket))
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()
@@ -4181,14 +4189,24 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
     )
     processed = 0
     attempted = 0
-    # Ids are read now, while the rows are loaded. A failed analysis rolls the
-    # session back, which expires every row still waiting in this pass; they
-    # are read again by id, or the next one would fail on a load the session
-    # cannot do from here and take the rest of the pass with it.
+    # Ids are read now, while the rows are loaded. Analyzing one document
+    # leaves the rows still waiting in this pass unusable: a failure rolls the
+    # session back and expires them, and a success reconciles the room in ways
+    # that leave their file unloaded. Either way the next one would fail on a
+    # load the session cannot do from here and take the rest of the pass with
+    # it, so after every attempt the rest are read again by id.
     queue = list(rows)
     waiting_ids = [getattr(row, "id", None) for row in queue]
     failed_file_ids: list[UUID] = []
     position = 0
+
+    async def reread_waiting() -> None:
+        still_waiting = waiting_ids[position:]
+        if any(row_id is None for row_id in still_waiting):
+            return  # rows with no id were never in the database to read again
+        queue[position:] = await _queued_placeholders(db, still_waiting)
+        waiting_ids[position:] = [row.id for row in queue[position:]]
+
     while position < len(queue):
         placeholder = queue[position]
         position += 1
@@ -4239,9 +4257,8 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
             await db.rollback()
             log.exception("drain_file_analyses: failed file=%s", file_id)
             failed_file_ids.append(file_id)
-            still_waiting = [row_id for row_id in waiting_ids[position:] if row_id is not None]
-            queue[position:] = await _queued_placeholders(db, still_waiting)
-            waiting_ids[position:] = [row.id for row in queue[position:]]
+        if position < len(queue):
+            await reread_waiting()
     # Legacy/public-room uploads could predate analysis queuing. Backfill a
     # bounded number on every drain so existing evidence converges without a
     # one-off migration or an unbounded model-spend spike.
@@ -4286,6 +4303,14 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
         backfill = list(missing_files)
         backfill_ids = [getattr(row, "id", None) for row in backfill]
         position = 0
+
+        async def reread_backfill() -> None:
+            still_waiting = backfill_ids[position:]
+            if any(row_id is None for row_id in still_waiting):
+                return
+            backfill[position:] = await _files_with_buckets(db, still_waiting)
+            backfill_ids[position:] = [row.id for row in backfill[position:]]
+
         while position < len(backfill):
             file = backfill[position]
             position += 1
@@ -4305,9 +4330,8 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
             except Exception:
                 await db.rollback()
                 log.exception("drain_file_analyses: legacy backfill failed file=%s", file_id)
-                still_waiting = [row_id for row_id in backfill_ids[position:] if row_id is not None]
-                backfill[position:] = await _files_with_buckets(db, still_waiting)
-                backfill_ids[position:] = [row.id for row in backfill[position:]]
+            if position < len(backfill):
+                await reread_backfill()
     return processed
 
 
