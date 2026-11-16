@@ -9,7 +9,6 @@ from pydantic import BaseModel
 from app.enums import ClientStage
 from app.schemas.common import ORMModel
 
-
 _LeadSource = Literal[
     "manual_entry",
     "open_house",
@@ -145,6 +144,17 @@ class ClientSelfUpdate(BaseModel):
 
 
 class ClientRead(ORMModel):
+    """A client as stored.
+
+    The vocabularies above are what a write may set. A read reports what the
+    row holds, whatever wrote it: these fields are plain strings here on
+    purpose. Public sign-up stamps `lead_source` with the page the person came
+    from ("public_site", "equipment_page"), and while this model insisted on
+    the CRM's list, one such row made `GET /clients` answer 500 for every
+    caller, so the Clients page showed nobody at all. A value outside a
+    vocabulary is something to show, not a reason to refuse the list.
+    """
+
     id: UUID
     user_id: UUID | None
     broker_id: UUID | None
@@ -166,7 +176,7 @@ class ClientRead(ORMModel):
     experience: str | None = None
     # Lead-funnel state (alembic 0024).
     stage: ClientStage = ClientStage.LEAD
-    client_type: Literal["buyer", "seller"] | None = None
+    client_type: str | None = None
     contacted_at: datetime | None = None
     intake_started_at: datetime | None = None
     intake_completed_at: datetime | None = None
@@ -175,16 +185,16 @@ class ClientRead(ORMModel):
     checklist_overrides: dict[str, Any] | None = None
     ai_cadence_override: dict[str, Any] | None = None
     # Experience mode (alembic 0026). NULL = derive from broker_id.
-    client_experience_mode: Literal["guided", "self_directed", "hybrid"] | None = None
+    client_experience_mode: str | None = None
     client_experience_mode_reason: str | None = None
-    client_experience_mode_locked_by: Literal["agent", "client", "firm"] | None = None
+    client_experience_mode_locked_by: str | None = None
     # Lead routing / ownership / attribution (alembic 0029).
-    lead_source: _LeadSource | None = None
-    lead_temperature: _LeadTemperature | None = None
-    financing_support_needed: _FinancingSupportNeeded | None = None
-    contact_permission: _ContactPermission | None = None
-    relationship_context: _RelationshipContext | None = None
-    lead_promotion_status: _LeadPromotionStatus = "not_ready"
+    lead_source: str | None = None
+    lead_temperature: str | None = None
+    financing_support_needed: str | None = None
+    contact_permission: str | None = None
+    relationship_context: str | None = None
+    lead_promotion_status: str = "not_ready"
     originating_agent_id: UUID | None = None
     current_agent_id: UUID | None = None
     language: str | None = None
