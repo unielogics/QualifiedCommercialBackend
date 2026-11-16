@@ -4078,6 +4078,43 @@ def consumed_placeholder_hash(content_hash: str) -> str:
     return f"{CONSUMED_PLACEHOLDER_PREFIX}{content_hash}"[:64]
 
 
+async def _queued_placeholders(db: AsyncSession, ids: list[UUID]) -> list[BucketFileAnalysis]:
+    """Queue placeholders read again by id, oldest first, with what the drain
+    reads off each: the file and its bucket."""
+    if not ids:
+        return []
+    return list(
+        (
+            await db.execute(
+                select(BucketFileAnalysis)
+                .where(BucketFileAnalysis.id.in_(ids))
+                .order_by(BucketFileAnalysis.created_at.asc())
+                .options(selectinload(BucketFileAnalysis.file).selectinload(BucketFile.bucket))
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _files_with_buckets(db: AsyncSession, ids: list[UUID]) -> list[BucketFile]:
+    """Files read again by id, newest first, each with its bucket."""
+    if not ids:
+        return []
+    return list(
+        (
+            await db.execute(
+                select(BucketFile)
+                .where(BucketFile.id.in_(ids))
+                .order_by(BucketFile.created_at.desc())
+                .options(selectinload(BucketFile.bucket))
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
 async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
     """Analyze files queued as 'pending' (from upload-complete) outside the
     request path, so reviews compose from a warm cache. Each file is analyzed
@@ -4124,7 +4161,7 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
                 await db.commit()
             except Exception:  # noqa: BLE001
                 await db.rollback()
-                log.exception("drain_file_analyses: ZIP retry failed file=%s", file.id)
+                log.exception("drain_file_analyses: ZIP retry failed file=%s", file_id)
 
     rows = (
         (
@@ -4144,7 +4181,17 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
     )
     processed = 0
     attempted = 0
-    for placeholder in rows:
+    # Ids are read now, while the rows are loaded. A failed analysis rolls the
+    # session back, which expires every row still waiting in this pass; they
+    # are read again by id, or the next one would fail on a load the session
+    # cannot do from here and take the rest of the pass with it.
+    queue = list(rows)
+    waiting_ids = [getattr(row, "id", None) for row in queue]
+    failed_file_ids: list[UUID] = []
+    position = 0
+    while position < len(queue):
+        placeholder = queue[position]
+        position += 1
         attempted += 1
         file = placeholder.file
         if (
@@ -4172,6 +4219,7 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
             continue
         review_type = (file.bucket.ai_context or {}).get("review_type") if file.bucket else None
         product_intent = _funding_intent(file.bucket.ai_context) if file.bucket else None
+        file_id = file.id
         try:
             await analyze_bucket_file(
                 db,
@@ -4183,8 +4231,17 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
             await db.commit()
             processed += 1
         except Exception:
+            # One document that cannot be analyzed is logged and left queued;
+            # it must not stop the documents behind it. Naming it from the
+            # row here used to raise in turn (the rollback had expired it),
+            # which aborted the pass once a minute for as long as it stayed
+            # at the head of the queue.
             await db.rollback()
-            log.exception("drain_file_analyses: failed file=%s", file.id)
+            log.exception("drain_file_analyses: failed file=%s", file_id)
+            failed_file_ids.append(file_id)
+            still_waiting = [row_id for row_id in waiting_ids[position:] if row_id is not None]
+            queue[position:] = await _queued_placeholders(db, still_waiting)
+            waiting_ids[position:] = [row.id for row in queue[position:]]
     # Legacy/public-room uploads could predate analysis queuing. Backfill a
     # bounded number on every drain so existing evidence converges without a
     # one-off migration or an unbounded model-spend spike.
@@ -4205,6 +4262,10 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
                         BucketFile.deleted_at.is_(None),
                         latest_document_file_clause(BucketFile.id),
                         ~current_analysis,
+                        # A document that just failed above has no analysis
+                        # either; it waits for the next pass rather than being
+                        # tried a second time in this one.
+                        *([BucketFile.id.notin_(failed_file_ids)] if failed_file_ids else []),
                         or_(
                             BucketFile.source_kind.is_(None),
                             BucketFile.source_kind != "generated",
@@ -4222,7 +4283,13 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
             .scalars()
             .all()
         )
-        for file in missing_files:
+        backfill = list(missing_files)
+        backfill_ids = [getattr(row, "id", None) for row in backfill]
+        position = 0
+        while position < len(backfill):
+            file = backfill[position]
+            position += 1
+            file_id = file.id
             try:
                 product_intent = _funding_intent(file.bucket.ai_context) if file.bucket else None
                 await analyze_bucket_file(
@@ -4237,7 +4304,10 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
                 processed += 1
             except Exception:
                 await db.rollback()
-                log.exception("drain_file_analyses: legacy backfill failed file=%s", file.id)
+                log.exception("drain_file_analyses: legacy backfill failed file=%s", file_id)
+                still_waiting = [row_id for row_id in backfill_ids[position:] if row_id is not None]
+                backfill[position:] = await _files_with_buckets(db, still_waiting)
+                backfill_ids[position:] = [row.id for row in backfill[position:]]
     return processed
 
 

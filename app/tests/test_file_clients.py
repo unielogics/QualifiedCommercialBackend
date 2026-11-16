@@ -8,29 +8,20 @@ that applies it to files that predate it (`sweep`), and what the client screen
 reads back: the files that belong to a client and every text and email about
 them, with nobody else's mixed in.
 
-The real ORM runs against an on-disk SQLite copy of the schema (foreign keys
-left out of the DDL; only the queries matter here).
+The real ORM runs against an on-disk SQLite copy of the schema
+(app/tests/_sqlite_schema.py).
 """
 
 from __future__ import annotations
 
-import asyncio
-import re
-import shutil
 import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-import sqlalchemy as sa
 from fastapi import HTTPException
-from sqlalchemy import event, select
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.ext.compiler import compiles
+from sqlalchemy import select
 
-from app.db import Base
 from app.dealer_os.models import DealerRepInboxMessage, DealerRepInboxThread
 from app.enums import Role
 from app.models.application_profile import ApplicationProfile
@@ -43,78 +34,20 @@ from app.models.sms_message import SmsMessage
 from app.models.user import User
 from app.routers import clients as clients_router
 from app.services import file_clients as fc
+from app.tests._sqlite_schema import sqlite_session, sqlite_template
 
 NOW = datetime(2026, 11, 16, 15, 0, tzinfo=UTC)
 
 
-@compiles(JSONB, "sqlite")
-def _sqlite_jsonb(_type, _compiler, **_kwargs):
-    return "JSON"
-
-
-@compiles(ARRAY, "sqlite")
-def _sqlite_array(_type, _compiler, **_kwargs):
-    return "JSON"
-
-
-def _sqlite_functions(dbapi_connection, _record) -> None:
-    # The phone identity expression is written for Postgres.
-    dbapi_connection.create_function(
-        "regexp_replace", 4, lambda value, pattern, repl, _flags: re.sub(pattern, repl, value or "")
-    )
-
-
-async def _create_schema(path) -> None:
-    import app.models  # noqa: F401  (registers every table)
-
-    engine = create_async_engine(f"sqlite+aiosqlite:///{path}")
-    metadata = sa.MetaData()
-    for table in Base.metadata.tables.values():
-        clone = table.to_metadata(metadata)
-        for constraint in list(clone.foreign_key_constraints):
-            clone.constraints.discard(constraint)
-        for column in clone.columns:
-            column.foreign_keys.clear()
-            if isinstance(column.type, PG_UUID):
-                column.type = sa.String(36)
-    for table in list(metadata.tables.values()):
-        for column in table.columns:
-            if column.server_default is not None:
-                literal = str(getattr(column.server_default, "arg", ""))
-                if "::jsonb" in literal:
-                    column.server_default = sa.DefaultClause(sa.text(literal.replace("::jsonb", "")))
-                elif "now()" in literal:
-                    column.server_default = sa.DefaultClause(sa.text("CURRENT_TIMESTAMP"))
-                elif "gen_random_uuid" in literal:
-                    column.server_default = None
-        for index in table.indexes:
-            condition = index.dialect_options["postgresql"].get("where")
-            if condition is not None:
-                index.dialect_options["sqlite"]["where"] = condition
-        async with engine.begin() as connection:
-            try:
-                await connection.run_sync(lambda sync, current=table: metadata.create_all(sync, tables=[current]))
-            except Exception:  # noqa: BLE001  a few tables use Postgres-only functions; none are used here
-                pass
-    await engine.dispose()
-
-
 @pytest.fixture(scope="module")
 def template_database(tmp_path_factory):
-    path = tmp_path_factory.mktemp("file_clients") / "template.db"
-    asyncio.run(_create_schema(path))
-    return path
+    return sqlite_template(tmp_path_factory, "file_clients")
 
 
 @pytest.fixture
 async def db(template_database, tmp_path):
-    copy = tmp_path / "test.db"
-    shutil.copy(template_database, copy)
-    engine = create_async_engine(f"sqlite+aiosqlite:///{copy}")
-    event.listen(engine.sync_engine, "connect", _sqlite_functions)
-    async with AsyncSession(engine, expire_on_commit=False) as session:
+    async with sqlite_session(template_database, tmp_path) as session:
         yield session
-    await engine.dispose()
 
 
 # ── builders ────────────────────────────────────────────────────────────────

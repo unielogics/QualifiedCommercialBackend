@@ -2352,6 +2352,12 @@ async def _apply_reviewed_profile_fact(db, profile, user, canonical_key: str, ra
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "This suggestion conflicts with the selected business activity. Use Edit file classification to change the complete industry classification.")
         value = entry.label
     if canonical_key in {"funding_category", "entity_type", "industry", "subindustry", "naics_label"}:
+        limit = profiles.profile_field_limit(canonical_key)
+        if limit is not None and len(value) > limit:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"This suggestion is {len(value)} characters and the field holds {limit}. Use Edit file classification to enter it in fewer words.",
+            )
         setattr(profile, canonical_key, value)
 
 

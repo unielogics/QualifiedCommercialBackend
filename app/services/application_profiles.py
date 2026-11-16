@@ -434,6 +434,18 @@ async def affected_profiles_for_file(
     return list({profile.id: profile for profile in rows}.values())
 
 
+def profile_field_limit(field: str) -> int | None:
+    """How many characters one of the file's text fields holds, read off its
+    column so the rule cannot drift from the table."""
+    column = ApplicationProfile.__table__.c.get(field)
+    return getattr(getattr(column, "type", None), "length", None) if column is not None else None
+
+
+def fits_profile_field(field: str, value: str) -> bool:
+    limit = profile_field_limit(field)
+    return limit is None or len(value) <= limit
+
+
 async def capture_extracted_profile_facts(
     db: AsyncSession, *, file: BucketFile, analysis: BucketFileAnalysis
 ) -> list[UUID]:
@@ -504,7 +516,14 @@ async def capture_extracted_profile_facts(
             ))
             profile.extraction_reviewed_at = None
             if field_key == "entity_type" and not getattr(profile, field_key, None):
-                setattr(profile, field_key, str(value))
+                # The extraction returns free text. A legal form ("LLC",
+                # "S corporation") goes onto the file; a sentence about how
+                # the entity is taxed does not fit the field, and cutting it
+                # to fit would put a wrong legal form on the file. It stays on
+                # the fact above, in full, for the desk to accept or correct.
+                entity_type = " ".join(str(value).split())
+                if entity_type and fits_profile_field("entity_type", entity_type):
+                    profile.entity_type = entity_type
         code_raw = facts.get("naics_code") or {}
         code = str(code_raw.get("value") if isinstance(code_raw, dict) else code_raw or "").strip()
         if re.fullmatch(r"\d{6}", code) and not getattr(profile, "classified_by_user_id", None):
