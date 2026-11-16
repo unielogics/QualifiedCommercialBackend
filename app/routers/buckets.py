@@ -1360,24 +1360,29 @@ async def list_ai_action_items_across_buckets(
         default="proposed", alias="status"
     ),
     limit: int = Query(default=200, ge=1, le=500),
+    bucket_id: UUID | None = Query(default=None),
     _: User = Depends(require_role(Role.SUPER_ADMIN, Role.LOAN_EXEC)),
     db: AsyncSession = Depends(get_db),
 ) -> list[BucketAIActionItemQueueRead]:
-    """Every AI suggestion across live buckets, oldest first: the desk's inbox.
+    """Every AI suggestion across live buckets, oldest first: the desk's queue.
+
+    ``bucket_id`` narrows it to one room, which is how a file reads its own
+    suggestions without the cross-room cap cutting them off.
 
     Registered ahead of the ``/admin/{bucket_id}`` routes on purpose; the UUID
     path parameter would otherwise claim this static path.
     """
 
-    rows = (
-        await db.execute(
-            select(BucketAIActionItem, Bucket.name, Bucket.client_name)
-            .join(Bucket, Bucket.id == BucketAIActionItem.bucket_id)
-            .where(BucketAIActionItem.status == item_status, Bucket.archived_at.is_(None))
-            .order_by(BucketAIActionItem.created_at.asc())
-            .limit(limit)
-        )
-    ).all()
+    stmt = (
+        select(BucketAIActionItem, Bucket.name, Bucket.client_name)
+        .join(Bucket, Bucket.id == BucketAIActionItem.bucket_id)
+        .where(BucketAIActionItem.status == item_status, Bucket.archived_at.is_(None))
+        .order_by(BucketAIActionItem.created_at.asc())
+        .limit(limit)
+    )
+    if bucket_id is not None:
+        stmt = stmt.where(BucketAIActionItem.bucket_id == bucket_id)
+    rows = (await db.execute(stmt)).all()
     bucket_ids = {item.bucket_id for item, _name, _client in rows}
     intake_by_bucket: dict[UUID, UUID] = {}
     if bucket_ids:

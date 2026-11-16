@@ -16,7 +16,7 @@ from collections import Counter
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from math import isfinite
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
@@ -2778,6 +2778,40 @@ def _link_result(
         review_id=review_id,
         status=link_status,  # type: ignore[arg-type]
     )
+
+
+@router.get("/intake-summary")
+async def get_intake_summary(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """The desk's headline numbers: live files, where each stands, and whether
+    any of them still lacks a client."""
+
+    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "The file summary is a desk view")
+    from app.services import file_clients
+
+    return await file_clients.desk_summary(db)
+
+
+@router.get("/activity")
+async def get_file_activity(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    group: Literal["documents", "messages", "status"] | None = Query(None),
+    before: datetime | None = Query(None),
+    limit: int = Query(40, ge=1, le=200),
+) -> dict[str, Any]:
+    """What happened across every intake file, newest first: each line of the
+    files' own timelines with the file and the client it belongs to."""
+
+    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "File activity is a desk view")
+    from app.services import file_clients
+
+    items = await file_clients.desk_activity(db, group=group, before=before, limit=limit)
+    return {
+        "items": items,
+        "next_before": items[-1]["occurred_at"] if len(items) == limit else None,
+    }
 
 
 @router.get("/attention", response_model=AttentionQueue)

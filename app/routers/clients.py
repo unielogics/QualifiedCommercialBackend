@@ -1833,3 +1833,104 @@ async def log_client_engagement(
         id=row.id, kind=row.kind, summary=row.summary,
         actor_label=row.actor_label, created_at=row.occurred_at, payload=row.payload,
     )
+
+
+# ── Files and messages: the desk's view of one client ─────────────────
+#
+# A client is whoever a file is for (services/file_clients.py). These two
+# reads are what lets the client screen answer "what do we have open with this
+# person, and what have we said to each other" without opening each file.
+
+
+class ClientFileRead(BaseModel):
+    id: UUID
+    profile_id: UUID | None = None
+    bucket_id: UUID
+    variant: str
+    full_name: str
+    business_name: str | None = None
+    loan_purpose: str | None = None
+    status: str
+    outcome_status: str
+    underwriting_status: str | None = None
+    workspace_state: str
+    workspace_state_reason: str | None = None
+    requested_loan_amount: float | None = None
+    file_count: int = 0
+    missing_required_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+    last_message_at: datetime | None = None
+    archived_at: datetime | None = None
+
+
+class ClientFilesRead(BaseModel):
+    items: list[ClientFileRead]
+
+
+class ClientCommunicationRead(BaseModel):
+    id: str
+    channel: str
+    direction: str
+    occurred_at: datetime
+    counterpart: str | None = None
+    subject: str | None = None
+    snippet: str | None = None
+    status: str
+    detail: str = ""
+    context: str = ""
+    actor_name: str | None = None
+    delivered_at: datetime | None = None
+    opened_at: datetime | None = None
+    #: True when this viewer may read the full message in the communications log.
+    can_open: bool = False
+    intake_id: str | None = None
+    file_title: str | None = None
+
+
+class ClientCommunicationsRead(BaseModel):
+    items: list[ClientCommunicationRead]
+    counts: dict[str, int]
+    file_count: int
+
+
+async def _desk_client(client_id: UUID, user, db: AsyncSession) -> Client:
+    from app.services import file_clients
+
+    if user.role not in file_clients.DESK_ROLES:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "A client's files and messages are a desk view")
+    client = (
+        await db.execute(_scope(user, select(Client).where(Client.id == client_id)))
+    ).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    return client
+
+
+@router.get("/{client_id}/files", response_model=ClientFilesRead)
+async def list_client_files(
+    client_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClientFilesRead:
+    """Every file opened for this client, the archived and closed ones too."""
+    from app.services import file_clients
+
+    client = await _desk_client(client_id, user, db)
+    rows = await file_clients.files_for_client(db, client.id)
+    return ClientFilesRead(items=[ClientFileRead(**row) for row in rows])
+
+
+@router.get("/{client_id}/communications", response_model=ClientCommunicationsRead)
+async def list_client_communications(
+    client_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    limit: int = 200,
+) -> ClientCommunicationsRead:
+    """Texts and emails with this client or about their files, newest first."""
+    from app.services import file_clients
+
+    client = await _desk_client(client_id, user, db)
+    result = await file_clients.communications_for_client(db, client, viewer=user, limit=limit)
+    return ClientCommunicationsRead(**result)

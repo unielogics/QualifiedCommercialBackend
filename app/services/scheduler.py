@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -59,6 +59,14 @@ async def job_credit_link_sweep() -> None:
     """Automatic mode only: attach unowned credit pulls to the owners carrying
     their names and tell the desk what connected (services/credit_links.py)."""
     from app.services.credit_links import run_scheduled_sweep
+
+    await run_scheduled_sweep()
+
+
+async def job_file_client_sweep() -> None:
+    """Every live file has a client: give the ones that lack it theirs
+    (services/file_clients.py)."""
+    from app.services.file_clients import run_scheduled_sweep
 
     await run_scheduled_sweep()
 
@@ -149,6 +157,22 @@ def start_scheduler() -> None:
         "interval",
         minutes=30,
         id="credit_link_sweep",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # A file opened by a path that made no client record, or before the rule
+    # existed, is given its client here. The first run after a deploy is the
+    # backfill; after that it finds nothing unless a path forgot.
+    scheduler.add_job(
+        _wrap(job_file_client_sweep),
+        "interval",
+        minutes=30,
+        # Shortly after start rather than during it: the first run reads
+        # every live file once.
+        next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2),
+        id="file_client_sweep",
         replace_existing=True,
         coalesce=True,
         max_instances=1,

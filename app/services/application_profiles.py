@@ -1055,20 +1055,11 @@ async def resolve_profile(
         and source.client_id is None
         and user.role in (Role.SUPER_ADMIN, Role.LOAN_EXEC)
     ):
-        client = Client(
-            name=source.full_name,
-            email=normalized_email(source.email),
-            phone=source.phone,
-            stage="lead",
-            referral_source=source.referral_source,
-            source_channel="ai_intake",
-            client_experience_mode="guided",
-            client_experience_mode_reason="ai_intake",
-            client_experience_mode_locked_by="firm",
-        )
-        db.add(client)
-        await db.flush()
-        source.client_id = client.id
+        # A file with no client gets one when the desk opens it: the record
+        # already in the book when the email is known, a new one otherwise.
+        from app.services import file_clients
+
+        await file_clients.ensure_client(db, source)
     column = getattr(ApplicationProfile, f"{source_kind}_id")
     profile = (
         await db.execute(select(ApplicationProfile).where(column == source_id))

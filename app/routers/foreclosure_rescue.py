@@ -543,8 +543,12 @@ async def _create_foreclosure_rescue(
     )
     db.add(intake)
     await db.flush()
+    from app.services import file_clients
     from app.services.application_profiles import provision_profile_for_intake
 
+    # The owner is the client, whoever sent the request in; the profile made
+    # next carries the same record.
+    await file_clients.ensure_client(db, intake)
     await provision_profile_for_intake(db, intake)
     owner_consent_payload = payload if actor is None and payload.submitter_type == "owner_direct" else None
     await _audit(
