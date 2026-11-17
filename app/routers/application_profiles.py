@@ -236,6 +236,7 @@ from app.services import (
     financial_cockpit,
     financial_statements,
     form_answers,
+    form_kinds,
     funding_programs,
     intake_lifecycle,
     intake_retention,
@@ -6692,7 +6693,7 @@ async def mint_financial_statement_link(
 
 async def _open_link_or_404(db: AsyncSession, token: str):
     link = await financial_statements.link_for_token(db, token)
-    if link is None or link.kind not in {"pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule", "operating_plan"}:
+    if link is None or link.kind not in form_kinds.financial_kinds():
         # One message for "never existed", "expired" and "revoked". Telling them
         # apart would confirm which tokens are real to anyone probing.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "This link is no longer available")

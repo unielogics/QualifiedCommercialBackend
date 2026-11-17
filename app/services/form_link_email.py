@@ -55,15 +55,21 @@ INITIATION_SOURCE = "staff_form_link"
 #: Two clicks closer together than this are one request.
 DUPLICATE_WINDOW = timedelta(minutes=2)
 
-#: The requirement each form answers on the checklist, so the row can say it was asked.
-REQUIREMENT_KEYS = {
-    "debt_schedule": "business_debt_schedule",
-    "pfs": "owner_personal_financial_statement",
-    "p_and_l": "ytd_p_and_l_balance_sheet",
-    "balance_sheet": "ytd_p_and_l_balance_sheet",
-    "real_estate_schedule": "real_estate_schedule",
-    "operating_plan": "operating_expenses_and_earnings_plan",
-}
+def requirement_key_for(kind: str) -> str:
+    """The requirement a form answers on the checklist, so the row can say it was asked."""
+    from app.services import form_kinds
+
+    return form_kinds.requirement_key_for(kind) or ""
+
+
+def _requirement_keys() -> dict[str, str]:
+    from app.services import form_kinds
+
+    return {kind: key for kind in sorted(form_kinds.financial_kinds()) if (key := requirement_key_for(kind))}
+
+
+#: The requirement each financial form answers (read from app/services/form_kinds.py).
+REQUIREMENT_KEYS: dict[str, str] = _requirement_keys()
 
 
 def _long_date(value: datetime | None) -> str | None:
@@ -219,7 +225,7 @@ async def email_form_link(
         await db.execute(
             select(ApplicationRequirementState).where(
                 ApplicationRequirementState.profile_id == profile.id,
-                ApplicationRequirementState.requirement_key == REQUIREMENT_KEYS.get(kind, ""),
+                ApplicationRequirementState.requirement_key == requirement_key_for(kind),
             )
         )
     ).scalar_one_or_none()
