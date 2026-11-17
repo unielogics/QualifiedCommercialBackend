@@ -141,3 +141,34 @@ async def test_actual_start_stops_every_pending_same_client_assessment():
     assert first.application_started_at == second.application_started_at
     assert intake.intake_state["resource_assessment"]["verification_status"] == "self_reported_unverified"
     assert len(db.add.call_args_list) == 2
+
+
+@pytest.mark.parametrize("overrides", [
+    {"source_channel": "referral"}, {"user_id": uuid4()}, {"stage": "processing"},
+])
+async def test_anonymous_capture_cannot_claim_an_existing_relationship(overrides):
+    fields = {"id": uuid4(), "source_channel": "resource_funnel", "user_id": None, "stage": "lead", **overrides}
+    client = Client(**fields)
+    db = Mock(get=AsyncMock(return_value=client), execute=AsyncMock(return_value=scalar(None)))
+    with pytest.raises(HTTPException) as error:
+        await service.require_provisional_application_client(db, SimpleNamespace(client_id=client.id))
+    assert error.value.status_code == 409
+    assert "verified access" in error.value.detail
+
+
+async def test_resource_claim_rechecks_file_existence_under_shared_client_lock():
+    client = Client(id=uuid4(), source_channel="resource_funnel", user_id=None, stage="lead")
+    db = Mock(get=AsyncMock(return_value=client),
+              execute=AsyncMock(side_effect=[scalar(None), scalar(True)]))
+    with pytest.raises(HTTPException) as error:
+        await service.require_provisional_application_client(db, SimpleNamespace(client_id=client.id))
+    assert error.value.status_code == 409
+    assert "resource-application-claim:" in str(db.execute.call_args_list[0])
+
+
+async def test_only_unclaimed_provisional_resource_lead_can_start_anonymous_application():
+    client = Client(id=uuid4(), source_channel="resource_funnel", user_id=None, stage="lead")
+    db = Mock(get=AsyncMock(return_value=client),
+              execute=AsyncMock(side_effect=[scalar(None), scalar(False)]))
+    await service.require_provisional_application_client(db, SimpleNamespace(client_id=client.id))
+    assert db.execute.await_count == 2

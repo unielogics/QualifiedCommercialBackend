@@ -162,7 +162,7 @@ async def start_mca_refinance(
         from app.services import resource_assessments
 
         capture = await resource_assessments.resolve(db, payload.resource_handoff_token,
-            goal="mca_refinance", email=str(payload.email))
+            goal="mca_refinance", email=str(payload.email), for_application=True)
         client = await db.get(Client, capture.client_id)
         if client is None or (client.email or "").casefold() != str(payload.email).casefold():
             raise HTTPException(409, "Please request a new resource result.")

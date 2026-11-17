@@ -83,7 +83,7 @@ async def start(db, payload, request: Request) -> dict:
         from app.services import resource_assessments
 
         capture = await resource_assessments.resolve(db, payload.resource_handoff_token,
-            goal="merchant_cash_advance", email=email)
+            goal="merchant_cash_advance", email=email, for_application=True)
         duplicate = (await db.execute(select(PublicUnderwritingIntake.id).where(
             func.lower(PublicUnderwritingIntake.email) == email,
             PublicUnderwritingIntake.variant == "main_street_v1",

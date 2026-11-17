@@ -78,7 +78,7 @@ async def start(db, payload, request):
         return result_for(intake, link)
     core._throttle_or_429(_STARTS, request_context.client_ip(request) or "unknown", 20,
                          "Please wait a moment before starting another file.")
-    capture = (await resource_assessments.resolve(db, payload.resource_handoff_token, goal="term_loan", email=email)
+    capture = (await resource_assessments.resolve(db, payload.resource_handoff_token, goal="term_loan", email=email, for_application=True)
                if payload.resource_handoff_token else None)
     # A resource capability may create a new application; it never unlocks an existing one.
     duplicate = (await db.execute(select(PublicUnderwritingIntake.id).where(

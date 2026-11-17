@@ -10,7 +10,7 @@ from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import HTTPException
-from sqlalchemy import func, select, text
+from sqlalchemy import exists, func, or_, select, text
 
 from app.config import get_settings
 from app.models.activity import Activity
@@ -65,7 +65,8 @@ def validate_json_object(value: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
-async def resolve(db, token: str, *, goal: str | None = None, email: str | None = None) -> ResourceAssessment:
+async def resolve(db, token: str, *, goal: str | None = None, email: str | None = None,
+                  for_application: bool = False) -> ResourceAssessment:
     try:
         identifier, _ = token.split(".", 1)
         capture_id = UUID(hex=identifier)
@@ -81,7 +82,36 @@ async def resolve(db, token: str, *, goal: str | None = None, email: str | None 
         raise HTTPException(422, "This result belongs to a different funding goal.")
     if email is not None and capture.contact.get("email", "").casefold() != email.strip().casefold():
         raise HTTPException(422, "Use the email associated with your resource result, or start without that result.")
+    if for_application:
+        await require_provisional_application_client(db, capture)
     return capture
+
+
+async def require_provisional_application_client(db, capture: ResourceAssessment) -> None:
+    """An anonymous resource form does not prove ownership of a CRM email.
+
+    It can promote its provisional resource lead, but an existing relationship
+    or file requires the established authenticated/verified resume path. The
+    shared lock also prevents two goals claiming a stale provisional capability
+    while the first application is being created.
+    """
+    from app.models.application_profile import ApplicationProfile
+    from app.models.loan import Loan
+    from app.models.public_underwriting_intake import PublicUnderwritingIntake
+
+    await db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                     {"key": "resource-application-claim:" + str(capture.client_id)})
+    client = await db.get(Client, capture.client_id)
+    if (client is None or client.source_channel != "resource_funnel" or client.user_id is not None
+            or client.stage != "lead"):
+        raise HTTPException(409, "An existing customer relationship requires verified access. Use your current sign-in or secure resume flow, or contact your advisor.")
+    protected = (await db.execute(select(or_(
+        exists().where(PublicUnderwritingIntake.client_id == client.id),
+        exists().where(Loan.client_id == client.id),
+        exists().where(ApplicationProfile.client_id == client.id),
+    )))).scalar_one_or_none()
+    if protected:
+        raise HTTPException(409, "A file already exists for this relationship. Use your current sign-in or secure resume flow, or contact your advisor.")
 
 
 def _payload_matches(capture: ResourceAssessment, payload) -> bool:
