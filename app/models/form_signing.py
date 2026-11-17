@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String, func
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, String, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -26,6 +26,12 @@ class FormSigningSession(Base):
     __tablename__ = "form_signing_sessions"
     __table_args__ = (
         CheckConstraint("status in ('in_progress','executed','void')", name="ck_form_signing_sessions_status"),
+        # A version has at most one signing pass that still counts (migration 0282).
+        Index(
+            "uq_form_signing_sessions_live_version", "version_id", unique=True,
+            postgresql_where=text("status in ('in_progress','executed')"),
+            sqlite_where=text("status in ('in_progress','executed')"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

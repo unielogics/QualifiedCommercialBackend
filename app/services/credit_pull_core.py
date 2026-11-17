@@ -210,6 +210,9 @@ async def reusable_pull(
 
     "This person" is the credit-link rule for an exact match: the same legal
     name plus the same date of birth, the same email, or the same client.
+    Reuse stands in for a pull the person just authorized, so it is stricter
+    than linking: when a date of birth is given, the earlier pull must carry
+    the same one (a parent and child can share a name and a client).
     """
     if within_days <= 0 or not (first_name or "").strip() or not (last_name or "").strip():
         return None
@@ -222,7 +225,9 @@ async def reusable_pull(
     recent = [
         candidate.pull
         for candidate in candidates
-        if candidate.level == credit_links.LEVEL_EXACT and pulled_within(candidate.pull.pulled_at, within_days)
+        if candidate.level == credit_links.LEVEL_EXACT
+        and (dob is None or candidate.evidence.get("dob_match") is True)
+        and pulled_within(candidate.pull.pulled_at, within_days)
     ]
     return max(recent, key=lambda pull: _aware(pull.pulled_at)) if recent else None
 

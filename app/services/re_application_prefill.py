@@ -58,7 +58,7 @@ class Prefill:
             return False
         try:
             coerced = schema.coerce_value(spec, value)
-        except schema.FieldProblem:
+        except (ValueError, TypeError, ArithmeticError):  # FieldProblem, or a stored value of a shape nobody expected
             shown = raw if raw is not None else value
             self.warnings.append({
                 "path": path,
@@ -108,6 +108,25 @@ def _split_name(full: Any) -> tuple[str | None, str | None]:
     if len(parts) < 2:
         return (parts[0] or None) if parts else None, None
     return parts[0], parts[-1]
+
+
+def _name_is_a_guess(full: Any) -> bool:
+    """Only "First Last" splits for certain; "Maria De La Cruz" or "John Michael Smith" is a guess."""
+    return len(" ".join(str(full or "").split()).split(" ")) != 2
+
+
+def _street_key(text: Any) -> str:
+    return re.sub(r"[^a-z0-9 ]", "", " ".join(str(text or "").casefold().split()))
+
+
+def _same_property(street: Any, zip_code: Any, row: dict[str, Any]) -> bool:
+    """The schedule row for the subject property: the same street (the row may
+    carry the whole address after it) and, when both are known, the same ZIP."""
+    wanted, found = _street_key(street), _street_key(row.get("address"))
+    if not wanted or not (found == wanted or found.startswith(wanted + " ")):
+        return False
+    ours, theirs = str(zip_code or "")[:5], str(row.get("postal_code") or "")[:5]
+    return not ours or not theirs or ours == theirs
 
 
 def _state(intake: Any) -> dict[str, Any]:
@@ -174,10 +193,14 @@ def _from_intake(pre: Prefill, intake: Any) -> None:
         pre.put("property.payoff_amount" if purpose in {"rate_term_refi", "cash_out_refi", "bridge"} else "property.first_lien_balance",
                 details["existing_payoff_amount"], tier=tier, source=label)
 
-    # Borrower, from the person who started the file
-    first, last = _split_name(getattr(intake, "full_name", None))
-    pre.put("borrowers.borrower.first_name", first, tier=TIER_ANSWERED, source=SOURCE_APPLICATION)
-    pre.put("borrowers.borrower.last_name", last, tier=TIER_ANSWERED, source=SOURCE_APPLICATION)
+    # Borrower, from the person who started the file. Owner rows (read before
+    # this) carry a typed first and last name and win; this is one full name,
+    # so anything but "First Last" is a guess the client confirms.
+    full_name = getattr(intake, "full_name", None)
+    first, last = _split_name(full_name)
+    name_tier = TIER_CHECK if _name_is_a_guess(full_name) else TIER_ANSWERED
+    pre.put("borrowers.borrower.first_name", first, tier=name_tier, source=SOURCE_APPLICATION)
+    pre.put("borrowers.borrower.last_name", last, tier=name_tier, source=SOURCE_APPLICATION)
     pre.put("borrowers.borrower.email", getattr(intake, "email", None), tier=TIER_ANSWERED, source=SOURCE_APPLICATION)
     pre.put("borrowers.borrower.mobile_phone", getattr(intake, "phone", None), tier=TIER_ANSWERED, source=SOURCE_APPLICATION)
 
@@ -246,9 +269,8 @@ def _from_schedule(pre: Prefill, body: dict[str, Any] | None) -> None:
         return
     properties = [row for row in body.get("properties") or [] if isinstance(row, dict)]
     mortgages = [row for row in body.get("mortgages") or [] if isinstance(row, dict)]
-    street = str(pre.values.get("property.street") or "").casefold()
     subject = next(
-        (row for row in properties if street and str(row.get("address") or "").casefold().startswith(street[:12])),
+        (row for row in properties if _same_property(pre.values.get("property.street"), pre.values.get("property.zip"), row)),
         None,
     )
     if subject is not None:
@@ -383,15 +405,27 @@ async def build(db: Any, profile: Any, *, intake: Any = None) -> Prefill:
     from app.models.application_profile import ApplicationExtractedFact, ApplicationOwner
 
     pre = Prefill()
+
+    def source(name: str, read: Any, *args: Any) -> None:
+        # One unreadable source leaves its fields to the client; it never breaks the application.
+        try:
+            read(pre, *args)
+        except Exception:  # noqa: BLE001
+            log.exception("real-estate application prefill: %s unreadable for profile %s", name, profile.id)
+
     if intake is not None:
-        _from_intake(pre, intake)
+        # The email the file was opened with is where codes and copies go.
+        pre.put("borrowers.borrower.email", getattr(intake, "email", None), tier=TIER_ANSWERED, source=SOURCE_APPLICATION)
     owners = list(
         (await db.execute(select(ApplicationOwner).where(ApplicationOwner.profile_id == profile.id).order_by(ApplicationOwner.created_at))).scalars().all()
     ) if hasattr(ApplicationOwner, "created_at") else list(
         (await db.execute(select(ApplicationOwner).where(ApplicationOwner.profile_id == profile.id))).scalars().all()
     )
-    _from_owners(pre, owners)
-    _from_profile(pre, profile)
+    # Owners first: a first and last name typed on an owner row beats splitting one full name.
+    source("owners", _from_owners, owners)
+    if intake is not None:
+        source("intake", _from_intake, intake)
+    source("profile", _from_profile, profile)
     try:
         _from_schedule(pre, await _schedule_body(db, profile))
     except Exception:  # noqa: BLE001 - a schedule that cannot be read leaves those fields to the client
@@ -399,5 +433,5 @@ async def build(db: Any, profile: Any, *, intake: Any = None) -> Prefill:
     facts = list(
         (await db.execute(select(ApplicationExtractedFact).where(ApplicationExtractedFact.profile_id == profile.id))).scalars().all()
     )
-    _from_facts(pre, facts)
+    source("extracted facts", _from_facts, facts)
     return pre

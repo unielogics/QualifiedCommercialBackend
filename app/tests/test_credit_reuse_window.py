@@ -49,11 +49,14 @@ def test_the_window_setting_defaults_to_thirty_and_tolerates_junk() -> None:
 
 
 async def test_the_newest_exact_match_inside_the_window_is_reused() -> None:
-    older, newer, stranger = _pull(20), _pull(3), _pull(1)
+    older, newer, stranger, namesake = _pull(20), _pull(3), _pull(1), _pull(2)
+    same_birthday = {"name_match": True, "dob_match": True}
     candidates = [
-        credit_links.Candidate(pull=older, evidence={}, level=credit_links.LEVEL_EXACT, linked_here=False, linked_elsewhere=False),
-        credit_links.Candidate(pull=newer, evidence={}, level=credit_links.LEVEL_EXACT, linked_here=False, linked_elsewhere=False),
-        credit_links.Candidate(pull=stranger, evidence={}, level=credit_links.LEVEL_LIKELY, linked_here=False, linked_elsewhere=False),
+        credit_links.Candidate(pull=older, evidence=same_birthday, level=credit_links.LEVEL_EXACT, linked_here=False, linked_elsewhere=False),
+        credit_links.Candidate(pull=newer, evidence=same_birthday, level=credit_links.LEVEL_EXACT, linked_here=False, linked_elsewhere=False),
+        credit_links.Candidate(pull=stranger, evidence=same_birthday, level=credit_links.LEVEL_LIKELY, linked_here=False, linked_elsewhere=False),
+        # The same name on the same client with no date of birth on the pull: not sure enough to stand in for a new pull.
+        credit_links.Candidate(pull=namesake, evidence={"name_match": True, "dob_match": None, "same_client": True}, level=credit_links.LEVEL_EXACT, linked_here=False, linked_elsewhere=False),
     ]
     with patch.object(credit_links, "candidate_pulls", AsyncMock(return_value=candidates)):
         found = await credit_pull_core.reusable_pull(

@@ -9,27 +9,26 @@ from __future__ import annotations
 from typing import Any
 
 
-async def signing_started(db: Any, form: Any) -> bool:
-    """True once any signer has signed the form's current version."""
+async def live_session(db: Any, version_id: Any) -> Any:
+    """The signing pass on a version that still counts (in progress or executed), if any."""
     from sqlalchemy import select
 
-    from app.models.client_form import ClientFormVersion
+    from app.models.form_signing import FormSigningSession
 
-    if form is None or form.current_version_id is None or form.status != "submitted":
-        return False
-    try:
-        from app.models.form_signing import FormSigningSession
-    except ImportError:
-        return False
-    version = await db.get(ClientFormVersion, form.current_version_id)
-    if version is None:
-        return False
-    session = (
+    if version_id is None:
+        return None
+    return (
         await db.execute(
             select(FormSigningSession).where(
-                FormSigningSession.version_id == version.id,
+                FormSigningSession.version_id == version_id,
                 FormSigningSession.status.in_(["in_progress", "executed"]),
             )
         )
     ).scalars().first()
-    return session is not None
+
+
+async def signing_started(db: Any, form: Any) -> bool:
+    """True once any signer has signed the form's current version."""
+    if form is None or form.current_version_id is None or form.status != "submitted":
+        return False
+    return await live_session(db, form.current_version_id) is not None

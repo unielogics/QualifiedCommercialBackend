@@ -19,9 +19,11 @@ until the consent wording is approved (Settings → signed forms).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from datetime import UTC, datetime
+from functools import partial
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -42,7 +44,7 @@ EXECUTED = "executed"
 VOID = "void"
 SETTINGS_KEY = "signed_forms"
 CREDIT_SATISFIER = "signed_credit_authorization"
-COBORROWER_LABEL = "coborrower:"
+COBORROWER_LABEL = client_forms.COBORROWER_LABEL
 
 
 def _now() -> datetime:
@@ -201,11 +203,15 @@ def role_for_link(link: Any) -> str:
     return "coborrower" if str(getattr(link, "label", "") or "").startswith(COBORROWER_LABEL) else "borrower"
 
 
-async def view(db: AsyncSession, profile: Any, *, role: str | None = None) -> dict[str, Any]:
+async def view(db: AsyncSession, profile: Any, *, role: str | None = None, link: Any = None) -> dict[str, Any]:
     """What a signer (or the desk) needs to see before signing."""
     form = await client_forms.get_form(db, profile.id)
     version = await client_forms.current_version(db, form)
     session = await active_session(db, version)
+    if link is not None and role == "coborrower":
+        if session is None or form is None or form.status != "submitted":
+            raise HTTPException(status.HTTP_409_CONFLICT, {"code": "link_outdated", "message": "This application is being changed. We will email you a new link when it is ready to sign."})
+        require_current_link(link, session, role)
     signature = (session.signature_config if session else None) or await _signature_for(db, profile)
     snapshot = (session.signature_config.get("consent_snapshot") if session else None) or _consent_snapshot(signature)
     consents = []
@@ -253,11 +259,7 @@ async def sign(
     body_sha256: str,
     request: Any,
 ) -> dict[str, Any]:
-    from app.routers.dealer_ai_intake import (
-        _bucket_storage_config,
-        _put_bucket_object,
-        _read_bucket_object,
-    )
+    from app.routers.dealer_ai_intake import _bucket_storage_config
     from app.services import business_purpose, document_signature, pdf_stamping
     from app.services.payment_authorization import client_ip, decode_signature_data_url
 
@@ -278,8 +280,13 @@ async def sign(
         raise HTTPException(status.HTTP_409_CONFLICT, {"code": "already_executed", "message": "This application is already signed."})
     if role not in session.required_roles:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "This link cannot sign this application")
+    require_current_link(link, session, role)
     if role in (session.signers or {}):
-        raise HTTPException(status.HTTP_409_CONFLICT, {"code": "already_signed", "message": "You have already signed this application."})
+        # A second click, or a retry after a dropped reply: the signature is already recorded once.
+        # If every signer is on record but the signed copy was never filed, file it now.
+        if all(item in session.signers for item in session.required_roles):
+            await _execute(db, profile, session, version, document_signature=document_signature)
+        return await view(db, profile, role=role)
     if not esign_consent:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Agree to sign electronically to continue.")
     expected = {item["key"]: item["sha256"] for item in session.signature_config.get("consent_snapshot") or []}
@@ -314,19 +321,26 @@ async def sign(
     await db.flush()
     _, prefix, _ = _bucket_storage_config()
     base = f"{prefix}/client-forms/{profile.id}/{KIND}/v{version.number}/signing/{session.id}"
-    signature_key = f"{base}/{role}-signature.png"
-    _put_bucket_object(signature_key, content_type or "image/png", png)
-    signature_row.signature_s3_key = signature_key
-    signature_row.signature_hash = png_hash
-
-    current = _read_bucket_object(session.current_pdf_key) if session.current_pdf_key else None
+    # Every object is named for this attempt's signature record, so a signing
+    # that is retried after a failed save writes new objects instead of being
+    # refused by the ones a rolled-back attempt left behind.
+    signature_key = f"{base}/{role}-{signature_row.id}-signature.png"
+    current = await asyncio.to_thread(client_forms.fetch, session.current_pdf_key) if session.current_pdf_key else None
     if not current:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "The application PDF could not be read. Try again in a minute.")
     if session.current_sha256 and _sha(current) != session.current_sha256:
         raise HTTPException(status.HTTP_409_CONFLICT, {"code": "document_changed", "message": "The application document changed. Ask your advisor to send it again."})
-    stamped, _counts = pdf_stamping.stamp_party(current, party=role, typed_name=typed, signature_png=png, signed_at=now)
-    stamped_key = f"{base}/{len(session.chain) + 1:02d}-{role}.pdf"
-    _put_bucket_object(stamped_key, "application/pdf", stamped, prevent_overwrite=True)
+    try:
+        stamped, _counts = await asyncio.to_thread(pdf_stamping.stamp_party, current, party=role, typed_name=typed, signature_png=png, signed_at=now)
+        stamped_key = f"{base}/{len(session.chain) + 1:02d}-{role}-{signature_row.id}.pdf"
+        await asyncio.to_thread(client_forms.store, signature_key, content_type or "image/png", png)
+        await asyncio.to_thread(client_forms.store, stamped_key, "application/pdf", stamped)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Your signature could not be saved. Nothing was recorded; sign again in a minute.") from error
+    signature_row.signature_s3_key = signature_key
+    signature_row.signature_hash = png_hash
     session.chain = [*session.chain, {"role": role, "signature_id": str(signature_row.id), "input_sha256": _sha(current), "output_sha256": _sha(stamped), "at": now.isoformat()}]
     session.current_pdf_key = stamped_key
     session.current_sha256 = _sha(stamped)
@@ -338,10 +352,16 @@ async def sign(
 
     signature = session.signature_config
     if CREDIT_SATISFIER in (signature.get("satisfies") or []) and "credit_authorization" in (signature.get("consents") or []):
+        # The record of the authorization is filed in its own savepoint: the
+        # application signature stands whatever this step does.
+        recorded = False
         try:
-            await _credit_authorization(db, profile, intake, version, role=role, identity=identity, typed=typed, png=png, png_hash=png_hash, signature_row=signature_row, request=request, within_days=signature.get("credit_reuse_days"))
-        except Exception:  # noqa: BLE001 - the application signature stands whatever the credit step does
-            log.exception("credit authorization from the application failed for profile %s", profile.id)
+            async with db.begin_nested():
+                recorded = await _record_credit_authorization(db, profile, intake, version, role=role, identity=identity, typed=typed, png_hash=png_hash, signature_row=signature_row)
+        except Exception:  # noqa: BLE001
+            log.exception("credit authorization record from the application failed for profile %s", profile.id)
+    else:
+        recorded = False
 
     signed_all = all(item in session.signers for item in session.required_roles)
     if signed_all:
@@ -349,6 +369,21 @@ async def sign(
     elif role == "borrower" and "coborrower" in session.required_roles and "coborrower" not in session.signers:
         await _invite_coborrower(db, profile, session, version)
     await _event(db, profile, title=f"Real estate application signed by {typed}", body="Every signer has signed; the signed application is filed." if signed_all else "Waiting for the other signer.", target=session.id)
+
+    if recorded:
+        # The signing is saved before the bureau is called. The pull keeps its
+        # own failed attempts on record by committing, so nothing of the
+        # signing may still be unsaved when it runs; and a bureau that is down
+        # never erases the signature or the authorization (the desk pulls later).
+        await db.commit()
+        try:
+            await _pull_credit(db, profile, intake, version, role=role, identity=identity, request=request, within_days=signature.get("credit_reuse_days"))
+        except Exception:  # noqa: BLE001
+            log.exception("soft pull from the application failed for profile %s", profile.id)
+            if not db.is_active:
+                # A write inside the pull failed: clear it so the reply can be read. The signing is already saved.
+                await db.rollback()
+                await db.refresh(profile)
     return await view(db, profile, role=role)
 
 
@@ -380,24 +415,32 @@ def _certificate_rows(session: FormSigningSession, version: ClientFormVersion, r
 
 async def _execute(db: AsyncSession, profile: Any, session: FormSigningSession, version: ClientFormVersion, *, document_signature: Any) -> None:
     from app.dealer_os.services.contract_sign import _certificate_html
-    from app.routers.dealer_ai_intake import (
-        _bucket_storage_config,
-        _put_bucket_object,
-        _read_bucket_object,
-    )
+    from app.routers.dealer_ai_intake import _bucket_storage_config
     from app.services import pdf_stamping, re_application_pdf
     from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
     from app.services.production_signing import _append_pages
 
-    current = _read_bucket_object(session.current_pdf_key)
-    final = pdf_stamping.redact_remaining_anchors(current)
-    for role in session.required_roles:
-        page = re_application_pdf.render_pdf(_certificate_html(_certificate_rows(session, version, role), "Electronic signature certificate"))
-        final = _append_pages(final, page)
-    _, prefix, _ = _bucket_storage_config()
-    key = f"{prefix}/client-forms/{profile.id}/{KIND}/v{version.number}/signed-{session.id}.pdf"
-    s3_version = _put_bucket_object(key, "application/pdf", final, prevent_overwrite=True)
-    digest = _sha(final)
+    def build(current: bytes) -> bytes:
+        final = pdf_stamping.redact_remaining_anchors(current)
+        for role in session.required_roles:
+            page = re_application_pdf.render_pdf(_certificate_html(_certificate_rows(session, version, role), "Electronic signature certificate"))
+            final = _append_pages(final, page)
+        return final
+
+    try:
+        current = await asyncio.to_thread(client_forms.fetch, session.current_pdf_key)
+        if not current:
+            raise RuntimeError("the signed application could not be read back")
+        final = await asyncio.to_thread(build, current)
+        digest = _sha(final)
+        _, prefix, _ = _bucket_storage_config()
+        # Named by its own bytes, so a retry after a failed save is never refused by an earlier attempt's object.
+        key = f"{prefix}/client-forms/{profile.id}/{KIND}/v{version.number}/signed-{session.id}-{digest[:20]}.pdf"
+        s3_version = await asyncio.to_thread(client_forms.store, key, "application/pdf", final)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "The signed application could not be filed. Nothing was recorded; sign again in a minute.") from error
     signer_names = ", ".join(str((session.signers or {}).get(role, {}).get("name") or "") for role in session.required_roles)
     file = BucketFile(
         bucket_id=profile.primary_bucket_id,
@@ -434,105 +477,163 @@ async def _execute(db: AsyncSession, profile: Any, session: FormSigningSession, 
     from app.routers.dealer_ai_intake import _send_signed_document_copy_email
 
     for role in session.required_roles:
-        email = ((session.signers or {}).get(role) or {}).get("email")
-        if email:
-            try:
-                _send_signed_document_copy_email(to_email=email, typed_name=str(session.signers[role].get("name") or ""), document_title=schema.TITLE, pdf_bytes=final)
-            except Exception:  # noqa: BLE001 - the copy email never undoes the signing
-                log.exception("signed application copy email failed for profile %s", profile.id)
+        signer = (session.signers or {}).get(role) or {}
+        if signer.get("email"):
+            # Sent once the signing is saved: a copy of something that failed to save would be a copy of nothing.
+            client_forms.defer(db, partial(
+                _send_signed_document_copy_email, to_email=signer["email"], typed_name=str(signer.get("name") or ""),
+                document_title=schema.TITLE, pdf_bytes=final,
+            ))
+
+
+def require_current_link(link: Any, session: FormSigningSession | None, role: str) -> None:
+    """A co-borrower's link belongs to one signing pass.
+
+    When the application is reopened and submitted again, the co-borrower may
+    be someone else; the link emailed for the earlier pass must not sign the
+    new one.
+    """
+    if role != "coborrower" or session is None:
+        return
+    if str(getattr(link, "label", "") or "") != f"{COBORROWER_LABEL}{session.id}":
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": "link_outdated", "message": "This link is for an earlier version of the application. Use the newest link we emailed you, or ask your advisor for it."})
+
+
+async def coborrower_link(db: AsyncSession, profile: Any, session: FormSigningSession, version: ClientFormVersion, *, created_by: Any = None) -> tuple[Any, str, str] | None:
+    """The co-borrower's own address for this signing pass: (link, token, email), or None when no email is on the application."""
+    email = schema.get_at(version.body, "borrowers.coborrower.email")
+    if not email:
+        return None
+    link, token = await client_forms.standing_link(db, profile, role="coborrower", session_id=session.id, invitee_email=email, created_by=created_by)
+    return link, token, email
+
+
+def coborrower_invitation(*, to_email: str, borrower_name: str, url: str) -> None:
+    from app.services.email.ses_client import send_email
+
+    send_email(
+        to_email=to_email,
+        subject="Please review and sign the real estate loan application",
+        body_text=(
+            f"{borrower_name} signed a real estate loan application with Qualified Commercial and listed you as a co-borrower. "
+            f"Please review it and sign:\n\n{url}\n\nWe will email you a short code to open it.\n\nQualified Commercial"
+        ),
+    )
 
 
 async def _invite_coborrower(db: AsyncSession, profile: Any, session: FormSigningSession, version: ClientFormVersion) -> None:
-    email = schema.get_at(version.body, "borrowers.coborrower.email")
-    if not email:
-        return
     try:
-        link, token = await client_forms.mint_link(db, profile, invitee_email=email, label=f"{COBORROWER_LABEL}{session.id}")
-        from app.services.email.ses_client import send_email
-
-        borrower = ((session.signers or {}).get("borrower") or {}).get("name") or "Your co-borrower"
-        send_email(
-            to_email=email,
-            subject="Please review and sign the real estate loan application",
-            body_text=(
-                f"{borrower} signed a real estate loan application with Qualified Commercial and listed you as a co-borrower. "
-                f"Please review it and sign:\n\n{client_forms.form_url(token)}\n\nWe will email you a short code to open it.\n\nQualified Commercial"
-            ),
-        )
-    except Exception:  # noqa: BLE001 - the desk can resend the link
-        log.exception("co-borrower invitation failed for profile %s", profile.id)
-
-
-async def _credit_authorization(
-    db: AsyncSession, profile: Any, intake: Any, version: ClientFormVersion, *, role: str, identity: dict[str, Any], typed: str,
-    png: bytes, png_hash: str, signature_row: Any, request: Any, within_days: int | None,
-) -> None:
-    """The credit-authorization consent in the application counts as the room's credit authorization."""
-    if intake is None:
+        async with db.begin_nested():
+            found = await coborrower_link(db, profile, session, version)
+    except Exception:  # noqa: BLE001 - the desk can copy or email the co-borrower's link from the file
+        log.exception("co-borrower link failed for profile %s", profile.id)
         return
-    from app.models.bucket import BucketDocumentSignature
-    from app.routers.dealer_ai_intake import _bucket_storage_config, _put_bucket_object
-    from app.services import credit_pull_core, document_signature
+    if found is None:
+        return
+    _, token, email = found
+    borrower = ((session.signers or {}).get("borrower") or {}).get("name") or "Your co-borrower"
+    client_forms.defer(db, lambda: coborrower_invitation(to_email=email, borrower_name=borrower, url=client_forms.form_url(token)))
 
+
+def _applicant_of(identity: dict[str, Any]) -> dict[str, Any] | None:
     applicant = {key: identity.get(key) for key in ("legal_first_name", "legal_last_name", "dob", "street", "city", "state", "zip")}
-    if not all(applicant.values()):
+    return applicant if all(applicant.values()) else None
+
+
+async def _record_credit_authorization(
+    db: AsyncSession, profile: Any, intake: Any, version: ClientFormVersion, *, role: str, identity: dict[str, Any], typed: str,
+    png_hash: str, signature_row: Any,
+) -> bool:
+    """File the application's credit-authorization consent as the room's credit authorization.
+
+    Returns whether a pull may follow. The borrower's is a record and a
+    certificate on the room's credit row; a co-borrower's authorization is the
+    application signature itself (they have no room row), so there is nothing
+    more to file.
+    """
+    applicant = _applicant_of(identity)
+    if intake is None or applicant is None:
+        return False
+    if role != "borrower":
+        return True
+    from app.models.bucket import BucketDocumentSignature
+    from app.routers.dealer_ai_intake import _bucket_storage_config
+    from app.services import document_signature
+
+    slot = (
+        await db.execute(
+            select(BucketRequestedDocument).where(
+                BucketRequestedDocument.bucket_id == profile.primary_bucket_id,
+                BucketRequestedDocument.signature_kind == "credit_authorization",
+                BucketRequestedDocument.status.notin_(["closed", "superseded"]),
+            ).order_by(BucketRequestedDocument.created_at)
+        )
+    ).scalars().first()
+    if slot is None:
+        slot = BucketRequestedDocument(
+            bucket_id=profile.primary_bucket_id, name="Credit Report Authorization", category="Credit",
+            description="Signed within the real estate loan application.", required=True, allow_multiple_files=False,
+            status="requested", is_custom=False, requires_signature=True, signature_kind="credit_authorization",
+            requirement_key=CREDIT_SATISFIER, requirement_source={"kind": "signed_form", "form_kind": KIND},
+        )
+        db.add(slot)
+        await db.flush()
+    if slot.status == "uploaded":
+        return True
+    text = document_signature.credit_authorization_document_text()
+    record = BucketDocumentSignature(
+        requested_document_id=slot.id,
+        document_version=document_signature.CREDIT_AUTHORIZATION_DOCUMENT_VERSION,
+        document_hash=document_signature.document_hash(text),
+        typed_name=typed[:160], esign_consent=True,
+        applicant_data={**applicant, "signed_within": {"form": KIND, "version": version.number, "signature_id": str(signature_row.id)}},
+        ip_address=signature_row.ip_address, user_agent=signature_row.user_agent, signed_at=signature_row.signed_at,
+        signature_s3_key=signature_row.signature_s3_key, signature_hash=png_hash,
+    )
+    db.add(record)
+    await db.flush()
+    pdf = await asyncio.to_thread(
+        document_signature.render_signature_certificate_pdf,
+        signature=record, title="Credit Report Authorization Certificate",
+        document_text=f"{text}\n\nSigned within the {schema.TITLE}, version {version.number} (signature {signature_row.id}).",
+        extra_rows=[("Applicant name", f"{applicant['legal_first_name']} {applicant['legal_last_name']}"), ("Date of birth", str(applicant["dob"])), ("Address", ", ".join(str(applicant[key]) for key in ("street", "city", "state", "zip")))],
+        qc_signature_png=None,
+    )
+    _, prefix, _ = _bucket_storage_config()
+    key = f"{prefix}/signatures/{profile.primary_bucket_id}/{record.id}/certificate.pdf"
+    s3_version = await asyncio.to_thread(client_forms.store, key, "application/pdf", pdf)
+    record.certificate_s3_key = key
+    record.certificate_hash = _sha(pdf)
+    file = BucketFile(
+        bucket_id=profile.primary_bucket_id, requested_document_id=slot.id, file_name="Credit Report Authorization - Signed Certificate.pdf",
+        s3_key=key, s3_version_id=s3_version, content_type="application/pdf", size_bytes=len(pdf),
+        uploaded_by_name=typed[:160], source_kind="generated", source_detail="signed_document", status="uploaded", content_hash=_sha(pdf),
+    )
+    db.add(file)
+    await db.flush()
+    record.result_file_id = file.id
+    slot.status = "uploaded"
+    await db.flush()
+    return True
+
+
+async def _pull_credit(
+    db: AsyncSession, profile: Any, intake: Any, version: ClientFormVersion, *, role: str, identity: dict[str, Any], request: Any, within_days: int | None,
+) -> None:
+    """The soft pull the signature authorized, under the reuse window (a recent pull is used, never repeated)."""
+    from app.services import credit_pull_core
+
+    applicant = _applicant_of(identity)
+    if applicant is None:
         return
     if role == "borrower":
-        slot = (
-            await db.execute(
-                select(BucketRequestedDocument).where(
-                    BucketRequestedDocument.bucket_id == profile.primary_bucket_id,
-                    BucketRequestedDocument.signature_kind == "credit_authorization",
-                    BucketRequestedDocument.status.notin_(["closed", "superseded"]),
-                ).order_by(BucketRequestedDocument.created_at)
-            )
-        ).scalars().first()
-        if slot is None:
-            slot = BucketRequestedDocument(
-                bucket_id=profile.primary_bucket_id, name="Credit Report Authorization", category="Credit",
-                description="Signed within the real estate loan application.", required=True, allow_multiple_files=False,
-                status="requested", is_custom=False, requires_signature=True, signature_kind="credit_authorization",
-                requirement_key=CREDIT_SATISFIER, requirement_source={"kind": "signed_form", "form_kind": KIND},
-            )
-            db.add(slot)
-            await db.flush()
-        if slot.status != "uploaded":
-            text = document_signature.credit_authorization_document_text()
-            record = BucketDocumentSignature(
-                requested_document_id=slot.id,
-                document_version=document_signature.CREDIT_AUTHORIZATION_DOCUMENT_VERSION,
-                document_hash=document_signature.document_hash(text),
-                typed_name=typed[:160], esign_consent=True,
-                applicant_data={**applicant, "signed_within": {"form": KIND, "version": version.number, "signature_id": str(signature_row.id)}},
-                ip_address=signature_row.ip_address, user_agent=signature_row.user_agent, signed_at=signature_row.signed_at,
-                signature_s3_key=signature_row.signature_s3_key, signature_hash=png_hash,
-            )
-            db.add(record)
-            await db.flush()
-            pdf = document_signature.render_signature_certificate_pdf(
-                signature=record, title="Credit Report Authorization Certificate",
-                document_text=f"{text}\n\nSigned within the {schema.TITLE}, version {version.number} (signature {signature_row.id}).",
-                extra_rows=[("Applicant name", f"{applicant['legal_first_name']} {applicant['legal_last_name']}"), ("Date of birth", str(applicant["dob"])), ("Address", ", ".join(str(applicant[key]) for key in ("street", "city", "state", "zip")))],
-                qc_signature_png=None,
-            )
-            _, prefix, _ = _bucket_storage_config()
-            key = f"{prefix}/signatures/{profile.primary_bucket_id}/{record.id}/certificate.pdf"
-            s3_version = _put_bucket_object(key, "application/pdf", pdf, prevent_overwrite=True)
-            record.certificate_s3_key = key
-            record.certificate_hash = _sha(pdf)
-            file = BucketFile(
-                bucket_id=profile.primary_bucket_id, requested_document_id=slot.id, file_name="Credit Report Authorization - Signed Certificate.pdf",
-                s3_key=key, s3_version_id=s3_version, content_type="application/pdf", size_bytes=len(pdf),
-                uploaded_by_name=typed[:160], source_kind="generated", source_detail="signed_document", status="uploaded", content_hash=_sha(pdf),
-            )
-            db.add(file)
-            await db.flush()
-            record.result_file_id = file.id
-            slot.status = "uploaded"
-            await db.flush()
         await credit_pull_core.auto_pull_after_signature(db, intake, applicant_data=applicant, request=request, within_days=within_days)
         return
     # A co-borrower's own pull, linked to their owner row (a guarantor with no ownership share).
+    from datetime import date
+
+    from sqlalchemy import func
+
     from app.models.application_profile import ApplicationOwner
     from app.models.client import Client
     from app.services import credit_links
@@ -540,21 +641,21 @@ async def _credit_authorization(
     client = await db.get(Client, profile.client_id) if getattr(profile, "client_id", None) else None
     if client is None:
         return
-    from datetime import date
-
+    first, last = str(applicant["legal_first_name"]).strip(), str(applicant["legal_last_name"]).strip()
     owner = (
         await db.execute(
             select(ApplicationOwner).where(
                 ApplicationOwner.profile_id == profile.id,
                 ApplicationOwner.archived_at.is_(None),
-                ApplicationOwner.last_name.ilike(str(applicant["legal_last_name"])),
-                ApplicationOwner.first_name.ilike(str(applicant["legal_first_name"])),
+                # Equality, not a pattern: a name is never a wildcard.
+                func.lower(func.trim(ApplicationOwner.last_name)) == last.lower(),
+                func.lower(func.trim(ApplicationOwner.first_name)) == first.lower(),
             )
         )
     ).scalars().first()
     if owner is None:
         owner = ApplicationOwner(
-            profile_id=profile.id, first_name=applicant["legal_first_name"], last_name=applicant["legal_last_name"],
+            profile_id=profile.id, first_name=first, last_name=last,
             email=schema.get_at(version.body, "borrowers.coborrower.email"), is_primary=False, is_guarantor=True,
             dob=date.fromisoformat(str(applicant["dob"])), street=applicant["street"], city=applicant["city"], state=applicant["state"], zip=applicant["zip"],
         )
@@ -563,7 +664,7 @@ async def _credit_authorization(
     pull, reused = await credit_pull_core.pull_or_reuse(
         db, client=client,
         applicant=credit_pull_core.SoftPullApplicant(
-            legal_first_name=str(applicant["legal_first_name"]), legal_last_name=str(applicant["legal_last_name"]), dob=date.fromisoformat(str(applicant["dob"])),
+            legal_first_name=first, legal_last_name=last, dob=date.fromisoformat(str(applicant["dob"])),
             street=str(applicant["street"]), city=str(applicant["city"]), state=str(applicant["state"]), zip=str(applicant["zip"]),
         ),
         email=owner.email, within_days=within_days,
@@ -591,6 +692,7 @@ async def reopen(db: AsyncSession, profile: Any, *, actor: Any, reason: str) -> 
         session.void_reason = why
         session.voided_at = _now()
         session.voided_by_user_id = getattr(actor, "id", None)
+        await _retire_coborrower_links(db, profile, session)
     form.status = "draft"
     form.revision = int(form.revision) + 1
     await db.flush()
@@ -602,6 +704,24 @@ async def reopen(db: AsyncSession, profile: Any, *, actor: Any, reason: str) -> 
         actor=actor, target=form.id,
     )
     return await client_forms.read(db, profile, audience="desk")
+
+
+async def _retire_coborrower_links(db: AsyncSession, profile: Any, session: FormSigningSession) -> None:
+    """A voided signing pass takes its co-borrower's link with it."""
+    from app.models.financial_form_link import FinancialFormLink
+
+    if not isinstance(db, AsyncSession):
+        return
+    rows = (
+        await db.execute(
+            select(FinancialFormLink).where(
+                FinancialFormLink.profile_id == profile.id, FinancialFormLink.kind == KIND,
+                FinancialFormLink.label == f"{COBORROWER_LABEL}{session.id}", FinancialFormLink.revoked_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    for row in rows:
+        row.revoked_at = _now()
 
 
 async def _desk_event(db: AsyncSession, profile: Any, *, title: str, body: str, actor: Any, target: Any) -> None:

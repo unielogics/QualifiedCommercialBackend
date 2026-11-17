@@ -138,8 +138,11 @@ EXIT = {
 ENTITY = {"field": "request.borrowing_as", "eq": "entity"}
 
 
-def _f(key: str, label: str, type_: str = "text", *, options=None, required: bool = True, applies_when=None, help_: str | None = None, sensitive: bool = False) -> dict[str, Any]:
+def _f(key: str, label: str, type_: str = "text", *, options=None, required: bool = True, applies_when=None, help_: str | None = None, sensitive: bool = False, rule: str | None = None) -> dict[str, Any]:
     spec: dict[str, Any] = {"key": key, "label": label, "type": type_, "required": required}
+    if rule:
+        # A date's own rule: "adult" (a date of birth at least 18 years ago) or "past" (not in the future).
+        spec["rule"] = rule
     if options is not None:
         spec["options"] = [{"value": value, "label": label} for value, label in options]
     if applies_when is not None:
@@ -201,7 +204,7 @@ SECTIONS: tuple[dict[str, Any], ...] = (
             _f("purchase_price", "Purchase price", "money", applies_when=PURCHASE),
             _f("contract_close_date", "Contract closing date", "date", required=False, applies_when=PURCHASE),
             _f("original_purchase_price", "Original purchase price", "money", applies_when=OWNED),
-            _f("original_purchase_date", "Original purchase date", "date", applies_when=OWNED),
+            _f("original_purchase_date", "Original purchase date", "date", applies_when=OWNED, rule="past"),
             _f("first_lien_balance", "First mortgage balance", "money", applies_when=OWNED,
                help_="Enter 0 if the property is owned free and clear."),
             _f("first_lien_payment", "First mortgage monthly payment", "money", required=False, applies_when=OWNED),
@@ -230,7 +233,7 @@ SECTIONS: tuple[dict[str, Any], ...] = (
             _f("middle_name", "Middle name", required=False),
             _f("last_name", "Legal last name"),
             _f("suffix", "Suffix", required=False),
-            _f("dob", "Date of birth", "date", sensitive=True),
+            _f("dob", "Date of birth", "date", sensitive=True, rule="adult"),
             _f("ssn_last4", "Last 4 digits of SSN", "ssn_last4", sensitive=True,
                help_="Only the last four digits. We never ask for or store a full Social Security number."),
             _f("email", "Email", "email"),
@@ -276,7 +279,7 @@ SECTIONS: tuple[dict[str, Any], ...] = (
             _f("entity_type", "Company type", "select", options=ENTITY_TYPES),
             _f("ein", "Tax ID (EIN)", "ein"),
             _f("state_of_formation", "State of formation", "state"),
-            _f("date_established", "Date established", "date"),
+            _f("date_established", "Date established", "date", rule="past"),
             _f("good_standing", "Is the company in good standing?", "yesno"),
             _f("street", "Business street address"),
             _f("city", "City"),
@@ -444,7 +447,7 @@ def _integer(value: Any, *, low: int = 0, high: int = 100_000) -> int:
     return int(number)
 
 
-def _date(value: Any) -> str:
+def _date(value: Any, *, rule: str | None = None, today: date | None = None) -> str:
     if isinstance(value, datetime):
         value = value.date()
     if isinstance(value, date):
@@ -457,10 +460,28 @@ def _date(value: Any) -> str:
             match = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", str(value).strip())
             if not match:
                 raise FieldProblem("Enter a date like 2026-11-17") from None
-            parsed = date(int(match.group(3)), int(match.group(1)), int(match.group(2)))
+            try:
+                parsed = date(int(match.group(3)), int(match.group(1)), int(match.group(2)))
+            except ValueError:
+                raise FieldProblem("Enter a real date") from None
     if not 1900 <= parsed.year <= 2100:
         raise FieldProblem("Enter a real date")
+    now = today or date.today()
+    if rule in ("past", "adult") and parsed > now:
+        raise FieldProblem("This date cannot be in the future")
+    if rule == "adult" and (now.year - parsed.year - ((now.month, now.day) < (parsed.month, parsed.day))) < 18:
+        raise FieldProblem("The borrower must be at least 18 years old")
     return parsed.isoformat()
+
+
+def _percent(value: Any) -> float:
+    try:
+        number = Decimal(str(value).replace(",", "").replace("%", "").strip())
+    except (InvalidOperation, ValueError):
+        raise FieldProblem("Enter a percentage from 0 to 100") from None
+    if not number.is_finite() or number < 0 or number > 100:
+        raise FieldProblem("Enter a percentage from 0 to 100")
+    return float(number.quantize(Decimal("0.01")))
 
 
 def coerce_value(spec: dict[str, Any], value: Any) -> Any:
@@ -491,16 +512,13 @@ def coerce_value(spec: dict[str, Any], value: Any) -> Any:
     if kind == "year":
         return _integer(value, low=1800, high=2100)
     if kind == "percent":
-        number = _money(value)
-        if number > 100:
-            raise FieldProblem("Enter a percentage from 0 to 100")
-        return number
+        return _percent(value)
     if kind == "score":
         if str(value).strip().casefold() in {"unknown", "not sure", "dont know", "don't know"}:
             return "unknown"
         return _integer(value, low=300, high=850)
     if kind == "date":
-        return _date(value)
+        return _date(value, rule=spec.get("rule"))
     if kind == "yesno":
         if isinstance(value, bool):
             return value
@@ -705,6 +723,12 @@ def display(spec: dict[str, Any], value: Any, *, mask: bool = True) -> str:
         return f"XXX-XX-{value}" if mask else str(value)
     if kind == "score":
         return "Unknown" if value == "unknown" else str(value)
+    if kind == "date":
+        try:
+            parsed = date.fromisoformat(str(value)[:10])
+        except ValueError:
+            return str(value)
+        return f"{parsed:%b} {parsed.day}, {parsed.year}"
     if kind == "phone":
         digits = re.sub(r"\D", "", str(value))
         if len(digits) == 11 and digits.startswith("1"):

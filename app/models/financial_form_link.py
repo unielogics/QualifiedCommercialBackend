@@ -138,6 +138,10 @@ class FinancialFormLink(TimestampMixin, Base):
 
         if self.revoked_at is not None:
             return False
-        if self.expires_at is not None and self.expires_at <= _dt.now(UTC):
+        expires = self.expires_at
+        if expires is not None and expires.tzinfo is None:
+            # A driver that hands the deadline back without a zone means UTC.
+            expires = expires.replace(tzinfo=UTC)
+        if expires is not None and expires <= _dt.now(UTC):
             return False
         return True

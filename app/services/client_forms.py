@@ -18,10 +18,13 @@ the desk's own facts stay the desk's.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
-from datetime import UTC, datetime
+import uuid
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -37,6 +40,10 @@ log = logging.getLogger(__name__)
 KIND = schema.KIND
 SOURCE_TYPED_CLIENT = "You entered this"
 SOURCE_TYPED_DESK = "Entered by your advisor"
+#: The one address per file the desk copies and the room opens (see standing_link).
+STANDING_LABEL = "standing"
+COBORROWER_LABEL = "coborrower:"
+_AFTER_COMMIT = "client_forms_after_commit"
 
 
 def _now() -> datetime:
@@ -112,12 +119,61 @@ def compose(pre: prefill.Prefill, form: ClientForm | None, *, audience: str = "c
     return view
 
 
-async def read(db: AsyncSession, profile: Any, *, audience: str = "client") -> dict[str, Any]:
+async def live_view(db: AsyncSession, profile: Any, *, audience: str = "client") -> tuple[dict[str, Any], ClientForm | None]:
+    """The application as the file and the typed answers make it right now."""
     intake = await intake_for(db, profile)
     pre = await prefill.build(db, profile, intake=intake)
     form = await get_form(db, profile.id)
-    view = compose(pre, form, audience=audience)
+    return compose(pre, form, audience=audience), form
+
+
+def _differences(live: dict[str, Any], frozen: dict[str, Any]) -> list[dict[str, str]]:
+    """Fields whose answer on the file is no longer what the submitted version says."""
+    paths: dict[str, dict[str, Any]] = {}
+    for body in (frozen, live):
+        for _, path, spec in schema.applicable_paths(body):
+            paths.setdefault(path, spec)
+    changed = [
+        {"path": path, "label": spec["label"]}
+        for path, spec in paths.items()
+        if schema.get_at(live, path) != schema.get_at(frozen, path)
+    ]
+    if bool(live.get("has_coborrower")) != bool(frozen.get("has_coborrower")):
+        changed.append({"path": "has_coborrower", "label": "Co-borrower"})
+    if (schema.get_at(live, "experience.other_properties") or []) != (schema.get_at(frozen, "experience.other_properties") or []):
+        changed.append({"path": "experience.other_properties", "label": "Other properties owned"})
+    return changed
+
+
+def frozen_view(version: ClientFormVersion, form: ClientForm, live: dict[str, Any], *, audience: str) -> dict[str, Any]:
+    """A submitted application is its frozen version: what was reviewed is what is signed.
+
+    The file can move on underneath it (a desk correction, a new document);
+    none of that changes the submitted copy. The desk is told what differs so
+    it can reopen the application when the difference matters.
+    """
+    body = version.body
+    view = {
+        "kind": KIND,
+        "schema_version": version.schema_version,
+        "body": body,
+        "provenance": dict(version.provenance or {}),
+        "completion": schema.completion(body),
+        "please_check": [],
+        "revision": int(form.revision),
+        "status": form.status,
+    }
+    if audience == "desk":
+        view["warnings"] = list(live.get("warnings") or [])
+        view["changed_since_submission"] = _differences(live["body"], body)
+    return view
+
+
+async def read(db: AsyncSession, profile: Any, *, audience: str = "client") -> dict[str, Any]:
+    view, form = await live_view(db, profile, audience=audience)
     version = await current_version(db, form)
+    if form is not None and form.status == "submitted" and version is not None:
+        view = frozen_view(version, form, view, audience=audience)
     view["version"] = (
         {
             "id": str(version.id),
@@ -248,7 +304,42 @@ async def render(db: AsyncSession, profile: Any, body: dict[str, Any], *, versio
         letterhead=await _letterhead(db),
         consents=consents_for(signature),
     )
-    return re_application_pdf.render_pdf(html)
+    # Rendering is seconds of CPU; the API runs one worker, so it never renders on the event loop.
+    return await asyncio.to_thread(re_application_pdf.render_pdf, html)
+
+
+def store(key: str, content_type: str, data: bytes) -> str | None:
+    """Write one object. Keys name their content, so writing the same bytes again is harmless."""
+    from app.routers.dealer_ai_intake import _put_bucket_object
+
+    return _put_bucket_object(key, content_type, data)
+
+
+def fetch(key: str) -> bytes | None:
+    from app.routers.dealer_ai_intake import _read_bucket_object
+
+    return _read_bucket_object(key)
+
+
+def defer(db: Any, action: Callable[[], Any]) -> None:
+    """Queue something for after the request's transaction commits (an email, mostly).
+
+    A message about a signature that then fails to save would describe
+    something that never happened; run_deferred sends once the save is real.
+    """
+    info = getattr(db, "info", None)
+    if isinstance(info, dict):
+        info.setdefault(_AFTER_COMMIT, []).append(action)
+
+
+async def run_deferred(db: Any) -> None:
+    info = getattr(db, "info", None)
+    actions = info.pop(_AFTER_COMMIT, []) if isinstance(info, dict) else []
+    for action in actions:
+        try:
+            await asyncio.to_thread(action)
+        except Exception:  # noqa: BLE001 - a message that fails never undoes what was saved
+            log.exception("client form follow-up failed")
 
 
 async def submit(
@@ -275,7 +366,10 @@ async def submit(
             return await read(db, profile, audience="desk" if actor == "desk" else "client")
     if int(form.revision) != int(revision):
         raise HTTPException(status.HTTP_409_CONFLICT, {"code": "revision_conflict", "revision": int(form.revision), "message": "This form changed in another window. Reload it before submitting."})
-    view = await read(db, profile, audience="desk")
+    if form.status == "submitted" and form.current_version_id is not None:
+        # Nothing changed since it was submitted: the version that exists is the submission.
+        return await read(db, profile, audience="desk" if actor == "desk" else "client")
+    view, _ = await live_view(db, profile, audience="desk")
     if not view["completion"]["complete"] or view["please_check"]:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -284,12 +378,18 @@ async def submit(
     body = view["body"]
     number = int((await db.execute(select(func.max(ClientFormVersion.number)).where(ClientFormVersion.form_id == form.id))).scalar() or 0) + 1
     signature = await application_programs_signature(db, profile)
-    pdf = await render(db, profile, body, version_number=number, signature=signature)
-    from app.routers.dealer_ai_intake import _bucket_storage_config, _put_bucket_object
+    from app.routers.dealer_ai_intake import _bucket_storage_config
 
-    _, prefix, _ = _bucket_storage_config()
-    key = f"{prefix}/client-forms/{profile.id}/{KIND}/v{number}-{body_sha256(body)[:12]}-unsigned.pdf"
-    _put_bucket_object(key, "application/pdf", pdf, prevent_overwrite=True)
+    try:
+        pdf = await render(db, profile, body, version_number=number, signature=signature)
+        _, prefix, _ = _bucket_storage_config()
+        # Named by its own bytes: a submission that is retried after a failed save writes the same object or a new one, never a refused one.
+        key = f"{prefix}/client-forms/{profile.id}/{KIND}/v{number}-{hashlib.sha256(pdf).hexdigest()[:20]}-unsigned.pdf"
+        await asyncio.to_thread(store, key, "application/pdf", pdf)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "The application PDF could not be made or stored. Your answers are saved; submit again in a minute.") from error
     version = ClientFormVersion(
         form_id=form.id,
         profile_id=profile.id,
@@ -387,26 +487,126 @@ async def version_pdf(db: AsyncSession, profile: Any, version_id: Any) -> bytes:
     version = await db.get(ClientFormVersion, version_id)
     if version is None or version.profile_id != profile.id or not version.pdf_s3_key:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Version not found")
-    from app.routers.dealer_ai_intake import _read_bucket_object
-
-    data = _read_bucket_object(version.pdf_s3_key)
+    data = await asyncio.to_thread(fetch, version.pdf_s3_key)
     if not data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "The PDF is not available")
     return data
 
 
 async def preview_pdf(db: AsyncSession, profile: Any) -> bytes:
-    """The application as it stands right now, unsigned, never stored."""
-    view = await read(db, profile, audience="client")
+    """The application to read before acting on it.
+
+    Once submitted this is the stored copy that is being signed, byte for
+    byte: the frozen PDF, carrying any signature already on it, or the
+    executed copy. Before that it is today's answers, rendered and never stored.
+    """
+    from app.models.bucket import BucketFile
+    from app.services import signed_forms_state
+
+    form = await get_form(db, profile.id)
+    version = await current_version(db, form)
+    if form is not None and form.status == "submitted" and version is not None and version.pdf_s3_key:
+        key = version.pdf_s3_key
+        session = await signed_forms_state.live_session(db, version.id)
+        if session is not None:
+            executed = await db.get(BucketFile, session.executed_file_id) if session.executed_file_id else None
+            key = (executed.s3_key if executed is not None and executed.deleted_at is None else None) or session.current_pdf_key or key
+        data = await asyncio.to_thread(fetch, key)
+        if not data:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "The application PDF could not be read. Try again in a minute.")
+        return data
+    view, _ = await live_view(db, profile, audience="client")
     return await render(db, profile, view["body"], version_number=None, signature=await application_programs_signature(db, profile))
 
 
 async def mint_link(db: AsyncSession, profile: Any, *, invitee_email: str | None, created_by: Any = None, label: str | None = None) -> tuple[Any, str]:
+    """A one-off link with a random token (for an address other than the client's own)."""
     from app.services import financial_statements
 
     return await financial_statements.mint_link(
         db, profile, kind=KIND, label=label or "Real estate loan application", invitee_email=invitee_email, created_by=created_by
     )
+
+
+def link_open(link: Any, *, now: datetime | None = None) -> bool:
+    """Whether a link still works (not revoked, not past its deadline), whatever timezone shape the driver hands back."""
+    if getattr(link, "revoked_at", None) is not None:
+        return False
+    expires = getattr(link, "expires_at", None)
+    if expires is not None and expires.tzinfo is None:
+        expires = expires.replace(tzinfo=UTC)
+    return expires is None or expires > (now or _now())
+
+
+async def current_standing_link(db: AsyncSession, profile: Any) -> tuple[Any, str] | None:
+    """The borrower's standing link as it is today, without making or extending one."""
+    from app.models.financial_form_link import FinancialFormLink
+    from app.services import form_link_codes
+    from app.services.financial_statements import hash_token
+
+    rows = (
+        await db.execute(
+            select(FinancialFormLink)
+            .where(FinancialFormLink.profile_id == profile.id, FinancialFormLink.kind == KIND, FinancialFormLink.label == STANDING_LABEL, FinancialFormLink.revoked_at.is_(None))
+            .order_by(FinancialFormLink.created_at.desc())
+        )
+    ).scalars().all()
+    for row in rows:
+        token = form_link_codes.derive_token(row.id)
+        if link_open(row) and row.token_hash == hash_token(token):
+            return row, token
+    return None
+
+
+async def standing_link(
+    db: AsyncSession, profile: Any, *, role: str = "borrower", session_id: Any = None, invitee_email: str | None = None,
+    created_by: Any = None, reset: bool = False,
+) -> tuple[Any, str]:
+    """The file's own address for this application: the same one every time it is copied.
+
+    One per file for the borrower (its code goes to the file's current email)
+    and one per signing pass for a co-borrower (its code goes to the
+    co-borrower). Only the hash is stored, as for every link; the token is
+    recomputed from the row's id with the server's secret
+    (form_link_codes.derive_token), so the desk can copy the address again
+    tomorrow without the token ever being kept. Copying it again keeps it open
+    for another 30 days; ``reset`` retires it and starts a new one.
+    """
+    from app.models.financial_form_link import FinancialFormLink
+    from app.services import form_link_codes
+    from app.services.financial_statements import DEFAULT_LINK_TTL_DAYS, hash_token
+
+    label = STANDING_LABEL if role == "borrower" else f"{COBORROWER_LABEL}{session_id}"
+    now = _now()
+    rows = (
+        await db.execute(
+            select(FinancialFormLink)
+            .where(FinancialFormLink.profile_id == profile.id, FinancialFormLink.kind == KIND, FinancialFormLink.label == label, FinancialFormLink.revoked_at.is_(None))
+            .order_by(FinancialFormLink.created_at.desc())
+        )
+    ).scalars().all()
+    live = [row for row in rows if link_open(row) and row.token_hash == hash_token(form_link_codes.derive_token(row.id))]
+    if reset:
+        for row in live:
+            row.revoked_at = now
+        live = []
+    until = now + timedelta(days=DEFAULT_LINK_TTL_DAYS)
+    if live:
+        link = live[0]
+        link.expires_at = until
+        if invitee_email:
+            link.invitee_email = invitee_email
+        await db.flush()
+        return link, form_link_codes.derive_token(link.id)
+    link_id = uuid.uuid4()
+    token = form_link_codes.derive_token(link_id)
+    link = FinancialFormLink(
+        id=link_id, profile_id=profile.id, kind=KIND, token_hash=hash_token(token), label=label,
+        invitee_email=invitee_email, created_by=created_by, expires_at=until,
+    )
+    db.add(link)
+    await db.flush()
+    return link, token
 
 
 def form_url(token: str) -> str:

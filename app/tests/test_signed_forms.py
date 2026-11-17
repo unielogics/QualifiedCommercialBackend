@@ -10,7 +10,9 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
+from app.models.application_profile import ApplicationProfile
 from app.models.bucket import BucketFile, BucketRequestedDocument
+from app.models.client_form import ClientFormVersion
 from app.models.form_signing import FormSigningSession
 from app.services import client_forms, signed_forms
 from app.services import re_application_schema as schema
@@ -116,8 +118,21 @@ async def test_a_co_borrower_signs_from_their_own_link_before_it_executes(db, st
         await client_forms.save(db, profile, changes={"notes.notes": "late change"}, confirm=[], has_coborrower=None, revision=view["revision"], actor="client")
     assert edit.value.detail["code"] == "signing_started"
 
-    with patch("app.services.signed_forms._credit_authorization", AsyncMock()):
-        done = await _sign(db, profile, view, signing, role="coborrower", link=SimpleNamespace(id=uuid.uuid4(), label=f"coborrower:{session.id}"))
+    # A second click by the borrower records nothing new.
+    again = await _sign(db, profile, view, signing)
+    assert again["status"] == "in_progress" and len(session.chain) == 1
+    # A link emailed for another signing pass cannot sign this one.
+    with pytest.raises(HTTPException) as outdated:
+        await _sign(db, profile, view, signing, role="coborrower", link=SimpleNamespace(id=uuid.uuid4(), label=f"coborrower:{uuid.uuid4()}"))
+    assert outdated.value.detail["code"] == "link_outdated"
+    # The invitation waits for the save, and the co-borrower's address is the same each time the desk copies it.
+    assert db.info.get("client_forms_after_commit")
+    found = await signed_forms.coborrower_link(db, profile, session, await db.get(ClientFormVersion, session.version_id))
+    assert found is not None and found[0].label == f"coborrower:{session.id}"
+    assert (await signed_forms.coborrower_link(db, profile, session, await db.get(ClientFormVersion, session.version_id)))[1] == found[1]
+
+    with patch("app.services.signed_forms._pull_credit", AsyncMock()):
+        done = await _sign(db, profile, view, signing, role="coborrower", link=found[0])
     assert done["status"] == "executed"
     assert [link["role"] for link in session.chain] == ["borrower", "coborrower"]
     assert session.chain[1]["input_sha256"] == session.chain[0]["output_sha256"]
@@ -208,3 +223,61 @@ async def test_a_signed_version_stays_on_file_and_a_reopen_starts_a_new_version(
     sessions = (await db.execute(select(FormSigningSession))).scalars().all()
     assert sorted(item.status for item in sessions) == ["executed", "executed"]
     assert len({item.executed_file_id for item in sessions}) == 2
+
+
+async def test_what_was_submitted_is_what_is_read_and_signed(db, storage) -> None:
+    intake, profile, view = await _submitted(db)
+    frozen = view["body"]
+    # The file moves on after the client submitted: the desk corrects the phone.
+    intake.phone = "+17045550199"
+    await db.flush()
+    client_view = await client_forms.read(db, profile, audience="client")
+    assert client_view["status"] == "submitted" and client_view["body"] == frozen and client_view["please_check"] == []
+    desk = await client_forms.read(db, profile, audience="desk")
+    assert [item["path"] for item in desk["changed_since_submission"]] == ["borrowers.borrower.mobile_phone"]
+    # The document offered to read before signing is the stored copy that gets signed, not a new rendering.
+    version = (await db.execute(select(ClientFormVersion))).scalar_one()
+    assert await client_forms.preview_pdf(db, profile) == storage.objects[version.pdf_s3_key]
+    # Submitting again without a change makes no new version.
+    same = await client_forms.submit(db, profile, revision=client_view["revision"], actor="client")
+    assert same["version"]["number"] == 1
+
+
+async def test_a_bureau_failure_never_undoes_the_signature_or_the_authorization(db, storage) -> None:
+    _, profile, view = await _submitted(db)
+    signing = await signed_forms.view(db, profile, role="borrower")
+    storage.pull.side_effect = RuntimeError("the bureau is down")
+    result = await _sign(db, profile, view, signing)
+    assert result["status"] == "executed"
+    credit = (await db.execute(select(BucketRequestedDocument).where(BucketRequestedDocument.signature_kind == "credit_authorization"))).scalar_one()
+    assert credit.status == "uploaded"
+    # The signed copies are queued for after the save, not sent during it.
+    assert db.info.get("client_forms_after_commit")
+    await client_forms.run_deferred(db)
+    assert not db.info.get("client_forms_after_commit")
+
+
+async def test_a_signing_that_failed_to_save_can_be_tried_again(db, storage) -> None:
+    _, profile, view = await _submitted(db)
+    profile_id = profile.id
+    await db.commit()
+    signing = await signed_forms.view(db, profile, role="borrower")
+    real, failures = client_forms.store, []
+
+    def flaky(key, content_type, data):
+        if "/signed-" in key and not failures:
+            failures.append(key)
+            raise OSError("storage hiccup")
+        return real(key, content_type, data)
+
+    with patch.object(client_forms, "store", flaky):
+        with pytest.raises(HTTPException) as failed:
+            await _sign(db, profile, view, signing)
+        assert failed.value.status_code == 502
+        await db.rollback()
+        profile = await db.get(ApplicationProfile, profile_id)
+        # Nothing from the failed attempt stands in the way: the same signer signs again.
+        result = await _sign(db, profile, view, signing)
+    assert result["status"] == "executed"
+    session = (await db.execute(select(FormSigningSession))).scalar_one()
+    assert len(session.chain) == 1

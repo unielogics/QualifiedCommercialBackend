@@ -3,10 +3,18 @@
 The application shows a date of birth, the last four of an SSN and the
 borrower's declarations, so a bare link is not enough: opening it asks for a
 6-digit code sent to the email the link was made for. The code lives in the
-link's own PIN columns (hash only, 15 minutes, five tries, then a 15-minute
-lockout), is burned on use, and is exchanged for a 12-hour signed session the
-page sends back in ``X-Form-Session``. A room the client already signed into
-hands over a session directly, so nobody enters a code twice.
+link's own PIN columns (hash only, 15 minutes), is burned on use, and is
+exchanged for a 12-hour signed session the page sends back in
+``X-Form-Session``. A room the client already signed into hands over a session
+directly, so nobody enters a code twice.
+
+Guessing is bounded on the link row, where a restart cannot forget it: wrong
+tries are counted across codes (asking for a new code never buys more tries),
+every fifth one locks the link, and each lockout is twice the last (15 minutes
+up to a day). Only a correct code clears the count. Callers lock the row
+first, so parallel guesses cannot share one count. Codes are also rationed per
+link (five an hour, twelve a day), so a leaked link cannot be used to flood
+the client's inbox.
 
 Nothing secret is stored: the code is hashed and the session is a signature
 over the link id and its expiry.
@@ -29,8 +37,11 @@ from app.config import get_settings
 CODE_TTL = timedelta(minutes=15)
 MAX_ATTEMPTS = 5
 LOCKOUT = timedelta(minutes=15)
+MAX_LOCKOUT = timedelta(hours=24)
 SESSION_TTL = timedelta(hours=12)
 RESEND_GAP = timedelta(seconds=45)
+SENDS_PER_HOUR = 5
+SENDS_PER_DAY = 12
 
 
 def _now() -> datetime:
@@ -45,8 +56,30 @@ def _aware(value: datetime | None) -> datetime | None:
 
 def _secret() -> bytes:
     s = get_settings()
-    raw = s.clerk_secret_key or getattr(s, "provider_secrets_encryption_key", "") or "qc-client-form"
+    raw = s.clerk_secret_key or getattr(s, "provider_secrets_encryption_key", "")
+    if not raw:
+        # A session signed with a constant anyone can read is no session: refuse rather than fall back.
+        if str(getattr(s, "app_env", "") or "").lower() == "production":
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Form links are not available right now.")
+        raw = "qc-client-form"
     return hashlib.sha256(f"client-form-session:{raw}".encode()).digest()
+
+
+def lockout_after(attempts: int) -> timedelta:
+    """How long the link locks once ``attempts`` wrong tries have piled up: 15 minutes, doubling, up to a day."""
+    rounds = max(1, int(attempts) // MAX_ATTEMPTS)
+    return min(MAX_LOCKOUT, LOCKOUT * 2 ** min(rounds - 1, 10))
+
+
+def derive_token(link_id: Any) -> str:
+    """The token of a standing link, recomputed from the link's id.
+
+    Only the hash is stored, as for every link; the desk can still copy the
+    same address again because the token is a keyed digest of the row's id,
+    which nobody can compute without the server's secret.
+    """
+    digest = hmac.new(_secret(), f"standing-link:{link_id}".encode(), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 
 def _code_hash(link: Any, code: str) -> str:
@@ -95,10 +128,20 @@ def new_code(link: Any, *, now: datetime | None = None) -> str:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many tries. Wait a few minutes and ask for a new code.")
     if link.pin_set_at and link.pin_hash and moment - _aware(link.pin_set_at) < RESEND_GAP:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "A code was just sent. Check your email, or ask again in a minute.")
+    from app.services import link_throttle
+
+    key = f"client-form-code:{link.id}"
+    if (
+        link_throttle.count(key, window=timedelta(hours=1)) >= SENDS_PER_HOUR
+        or link_throttle.count(f"{key}:day", window=timedelta(days=1)) >= SENDS_PER_DAY
+    ):
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many codes were requested for this link. Try again later, or ask your advisor for a new link.")
+    link_throttle.note(key, window=timedelta(hours=1))
+    link_throttle.note(f"{key}:day", window=timedelta(days=1))
     code = f"{secrets.randbelow(1_000_000):06d}"
     link.pin_hash = _code_hash(link, code)
     link.pin_set_at = moment
-    link.pin_attempts = 0
+    # pin_attempts is left alone: wrong tries count across codes until one is right.
     return code
 
 
@@ -110,9 +153,9 @@ def verify_code(link: Any, code: str, *, now: datetime | None = None) -> tuple[s
     if not link.pin_hash or not link.pin_set_at or moment - _aware(link.pin_set_at) > CODE_TTL:
         raise HTTPException(status.HTTP_410_GONE, "That code has expired. Ask for a new one.")
     if not hmac.compare_digest(link.pin_hash, _code_hash(link, (code or "").strip())):
-        link.pin_attempts = int(link.pin_attempts or 0) + 1
-        if link.pin_attempts >= MAX_ATTEMPTS:
-            link.pin_locked_until = moment + LOCKOUT
+        link.pin_attempts = min(int(link.pin_attempts or 0) + 1, 10_000)
+        if link.pin_attempts % MAX_ATTEMPTS == 0:
+            link.pin_locked_until = moment + lockout_after(link.pin_attempts)
             link.pin_hash = None
         raise HTTPException(status.HTTP_403_FORBIDDEN, "That code is not right. Check the latest email and try again.")
     link.pin_hash = None

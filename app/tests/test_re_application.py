@@ -256,3 +256,97 @@ def test_a_code_expires_and_sessions_belong_to_their_link() -> None:
     assert not form_link_codes.session_valid(session, _link())
     assert not form_link_codes.session_valid("garbage", link)
     assert form_link_codes.mask_email("jordan@example.com") == "j*****@example.com"
+
+
+def test_a_new_code_never_buys_more_tries_and_each_lockout_is_twice_the_last() -> None:
+    link = _link()
+    now = datetime.now(UTC)
+    form_link_codes.new_code(link, now=now)
+    for _ in range(form_link_codes.MAX_ATTEMPTS - 1):
+        with pytest.raises(HTTPException):
+            form_link_codes.verify_code(link, "000000", now=now)
+    # Asking again does not reset the count: the fifth wrong try still locks the link.
+    form_link_codes.new_code(link, now=now + timedelta(minutes=1))
+    with pytest.raises(HTTPException):
+        form_link_codes.verify_code(link, "000000", now=now + timedelta(minutes=1))
+    assert link.pin_locked_until == now + timedelta(minutes=1) + form_link_codes.LOCKOUT
+
+    later = now + timedelta(minutes=20)
+    form_link_codes.new_code(link, now=later)
+    for _ in range(form_link_codes.MAX_ATTEMPTS):
+        with pytest.raises(HTTPException):
+            form_link_codes.verify_code(link, "000000", now=later)
+    assert link.pin_locked_until == later + 2 * form_link_codes.LOCKOUT
+    assert form_link_codes.lockout_after(10_000) == form_link_codes.MAX_LOCKOUT
+
+    # Only the right code clears the count.
+    after = later + timedelta(hours=2)
+    code = form_link_codes.new_code(link, now=after)
+    form_link_codes.verify_code(link, code, now=after)
+    assert link.pin_attempts == 0 and link.pin_locked_until is None
+
+
+def test_codes_are_rationed_per_link() -> None:
+    link = _link()
+    now = datetime.now(UTC)
+    for index in range(form_link_codes.SENDS_PER_HOUR):
+        form_link_codes.new_code(link, now=now + timedelta(minutes=index))
+    with pytest.raises(HTTPException) as flooded:
+        form_link_codes.new_code(link, now=now + timedelta(minutes=10))
+    assert flooded.value.status_code == 429
+    # Another link is not affected.
+    form_link_codes.new_code(_link(), now=now)
+
+
+def test_dates_are_real_and_a_borrower_is_an_adult() -> None:
+    from datetime import date
+
+    dob = schema.spec_for("borrowers.borrower.dob")
+    child = date.today().replace(year=date.today().year - 10).isoformat()
+    for bad in ("13/45/2020", "2099-01-01", child, "not a date"):
+        with pytest.raises(schema.FieldProblem):
+            schema.coerce_value(dob, bad)
+    assert schema.coerce_value(dob, "04/12/1978") == "1978-04-12"
+    assert schema.coerce_value(schema.spec_for("request.target_close_date"), "2099-01-01") == "2099-01-01"
+    with pytest.raises(schema.FieldProblem):
+        schema.coerce_value(schema.spec_for("entity.date_established"), "2099-01-01")
+    assert schema.display(dob, "1978-04-12") == "Apr 12, 1978"
+    with pytest.raises(schema.FieldProblem) as percent:
+        schema.coerce_value(schema.spec_for("entity.ownership_pct"), "half")
+    assert "percentage" in str(percent.value)
+
+
+async def test_a_name_that_does_not_split_cleanly_asks_the_client_to_check(db) -> None:
+    intake, profile = await _heloc_file(db)
+    intake.full_name = "Maria De La Cruz"
+    pre = await prefill.build(db, profile, intake=intake)
+    assert pre.provenance["borrowers.borrower.last_name"]["tier"] == prefill.TIER_CHECK
+    intake.full_name = "Jordan Sample"
+    pre = await prefill.build(db, profile, intake=intake)
+    assert pre.provenance["borrowers.borrower.last_name"]["tier"] == prefill.TIER_ANSWERED
+
+
+async def test_one_unreadable_source_never_breaks_the_application(db) -> None:
+    intake, profile = await _heloc_file(db)
+    with patch.object(prefill, "_from_profile", side_effect=RuntimeError("odd stored value")):
+        pre = await prefill.build(db, profile, intake=intake)
+    assert pre.values["request.loan_purpose"] == "heloc"
+
+
+async def test_the_files_link_is_the_same_every_time_and_can_be_reset(db) -> None:
+    from app.services import financial_statements
+
+    _, profile = await _heloc_file(db)
+    assert await client_forms.current_standing_link(db, profile) is None
+    link, token = await client_forms.standing_link(db, profile)
+    again, same = await client_forms.standing_link(db, profile)
+    assert again.id == link.id and same == token
+    assert (await financial_statements.link_for_token(db, token)).id == link.id
+    assert (await client_forms.current_standing_link(db, profile))[1] == token
+    # Only the hash is kept; the token comes back from the row's id and the server's secret.
+    assert token not in (link.token_hash, str(link.id)) and form_link_codes.derive_token(link.id) == token
+
+    fresh, other = await client_forms.standing_link(db, profile, reset=True)
+    assert fresh.id != link.id and other != token
+    assert await financial_statements.link_for_token(db, token) is None
+    assert (await client_forms.current_standing_link(db, profile))[1] == other
