@@ -22,7 +22,7 @@ def audience_for_role(role) -> str:
     value = role.value if hasattr(role, "value") else str(role)
     if value in (Role.SUPER_ADMIN.value, Role.LOAN_EXEC.value):
         return AUDIENCE_DESK
-    if value == Role.DEALER_PARTNER.value:
+    if value in (Role.DEALER_PARTNER.value, Role.PROFESSIONAL_REFERRAL_PARTNER.value):
         return AUDIENCE_PARTNER
     if value == Role.FIELD_REP.value:
         return AUDIENCE_REP

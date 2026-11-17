@@ -374,6 +374,12 @@
   [
     "broker_router",
     "GET",
+    "/broker/ai-underwriter-leads/programs",
+    "list_referral_programs"
+  ],
+  [
+    "broker_router",
+    "GET",
     "/broker/ai-underwriter-leads/{intake_id}",
     "get_broker_dealer_lead"
   ],

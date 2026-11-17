@@ -182,6 +182,7 @@ from app.services.dealer_ai_intelligence_pdf import (
 )
 from app.services.dealer_partner_access import (
     DEALER_INTAKE_VARIANT,
+    REFERRAL_INTAKE_ROLES,
     require_dealer_partner_standing,
 )
 from app.services.email.ses_client import send_email, send_raw_email
@@ -970,6 +971,7 @@ class AdminLeadCreate(BusinessProfileFields):
     # main_street | mca_refinance.
     variant: str = Field(default="dealer")
     client_id: UUID | None = None
+    program_key: str | None = Field(default=None, min_length=1, max_length=120)
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr | None = None
     phone: OptionalPhone = None
@@ -1057,24 +1059,20 @@ class AdminLeadCreate(BusinessProfileFields):
         return real_estate_vocabulary.fold_credit_tier(value)
 
 
-class BrokerLeadCreate(RequiredBusinessProfileFields):
-    """Dealer partner (Role.DEALER_PARTNER) creates an AI-underwriter lead on
-    behalf of their own client. Dealer-variant only — no variant selector, no
-    real-estate fields. The client can later log in with this email exactly
-    like a self-serve lead."""
+class BrokerLeadCreate(RequiredBusinessProfileFields, AdminLeadCreate):
+    """Partners use the shared application flow; ownership is always server-set."""
 
-    full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
     phone: RequiredPhone
-    business_name: str | None = Field(default=None, max_length=180)
-    notify_client: bool = False
-    force_new: bool = False
-    preferred_language: Language = Language.EN
+    broker_user_id: None = None
+    client_id: None = None
+    force_new: Literal[False] = False
 
-    @field_validator("phone", "business_name", mode="before")
+    @model_validator(mode="before")
     @classmethod
-    def empty_to_none(cls, value: object) -> object:
-        return None if value == "" else value
+    def require_operator_contact(cls, values: Any) -> Any:
+        # Required contact and business fields report their own field errors.
+        return values
 
 
 class OutcomeStatusUpdate(BaseModel):
@@ -1953,6 +1951,7 @@ class DealerAILeadRow(BaseModel):
     id: UUID
     mca_refinance_policy: dict[str, Any] | None = None
     variant: str
+    requested_program_name: str | None = None
     client_id: UUID | None = None
     bucket_id: UUID
     bucket_name: str
@@ -9081,6 +9080,7 @@ def _lead_row(
     missing_docs = _missing_required_docs(intake.bucket)
     return DealerAILeadRow(
         id=intake.id,
+        requested_program_name=(_intake_state(intake).get("requested_funding_program") or {}).get("name"),
         mca_refinance_policy=(mca_refinance_policy.evaluate(intake, bucket=intake.bucket) if mca_refinance_policy.is_mca_refinance(intake, intake.bucket) else None),
         variant=intake.variant,
         client_id=intake.client_id,
@@ -9092,7 +9092,7 @@ def _lead_row(
         business_name=intake.business_name,
         referral_source=intake.referral_source,
         opened_by_name=intake.broker.name if intake.broker else "House desk",
-        opened_by_role="Dealer partner" if intake.broker else "Internal",
+        opened_by_role="Referral partner" if intake.broker else "Internal",
         status=intake.status,
         outcome_status=intake.outcome_status,
         underwriting_status=underwriting_status,
@@ -9348,7 +9348,6 @@ async def _load_broker_dealer_lead(db: AsyncSession, user: User, intake_id: UUID
             .where(
                 PublicUnderwritingIntake.id == intake_id,
                 PublicUnderwritingIntake.broker_id == user.id,
-                PublicUnderwritingIntake.variant == DEALER_VARIANT,
             )
             .options(
                 selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents).selectinload(BucketRequestedDocument.template_file),
@@ -9613,7 +9612,7 @@ def _channel_side(role) -> str:
     internal team. Unread = messages authored by the OTHER side. Accepts a Role
     enum or a raw role string (BucketNote.author_role stores the string)."""
     role_str = getattr(role, "value", role)
-    return "partner" if role_str == Role.DEALER_PARTNER.value else "team"
+    return "partner" if role_str in {role.value for role in REFERRAL_INTAKE_ROLES} else "team"
 
 
 def _channel_last_message(intake: PublicUnderwritingIntake) -> DealerLeadMessagePreview | None:
@@ -9748,11 +9747,11 @@ async def _load_dealer_partner_user(db: AsyncSession, user_id: UUID) -> User:
     partner = await db.get(User, user_id)
     if (
         partner is None
-        or partner.role != Role.DEALER_PARTNER
+        or partner.role not in REFERRAL_INTAKE_ROLES
         or partner.deleted_at is not None
         or getattr(partner, "account_status", "active") != "active"
     ):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected user is not an active dealer partner.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected user is not an active referral partner.")
     return partner
 
 
@@ -9779,6 +9778,12 @@ async def _create_admin_ai_lead_core(
             status.HTTP_400_BAD_REQUEST,
             f"variant must be one of {', '.join(sorted(_ADMIN_VARIANT_CONSTANTS))}",
         )
+    requested_program = None
+    if payload.program_key:
+        from app.services.referral_programs import validate_request
+
+        requested_program = await validate_request(db, payload.program_key, payload.variant)
+    actor_is_partner = user.role in REFERRAL_INTAKE_ROLES
     is_re = payload.variant == "real_estate"
     is_ms = payload.variant == "main_street"
     is_mca = payload.variant == "mca_refinance"
@@ -9809,14 +9814,16 @@ async def _create_admin_ai_lead_core(
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 {
-                    "message": "An active lead already exists for this email.",
-                    "intake_id": str(existing.id),
+                    "message": "An active file already exists for this client. Contact the team for assistance."
+                    if actor_is_partner and existing.broker_id != user.id
+                    else "An active lead already exists for this email.",
+                    **({"intake_id": str(existing.id)} if not actor_is_partner or existing.broker_id == user.id else {}),
                 },
             )
 
     actor_is_client = user.role == Role.CLIENT
     provenance = {
-        ("created_by_client" if actor_is_client else "created_by_admin"): {
+        ("created_by_client" if actor_is_client else "created_by_broker" if actor_is_partner else "created_by_admin"): {
             "user_id": str(user.id),
             "name": user.name,
             "email": user.email,
@@ -9914,7 +9921,7 @@ async def _create_admin_ai_lead_core(
             if is_mca
             else "dealer_ai_intake"
         ),
-        "admin_provenance": provenance,
+        "broker_provenance" if actor_is_partner else "admin_provenance": provenance,
     }
     if is_ms:
         # The key _main_street_details() reads. Without it _main_street_context
@@ -9964,7 +9971,7 @@ async def _create_admin_ai_lead_core(
         }
 
     intake = PublicUnderwritingIntake(
-        source_kind="internal_user",
+        source_kind="dealer_partner" if actor_is_partner else "internal_user",
         source_actor_name=(user.name or user.email or "")[:200],
         source_user_id=user.id,
         client_id=client.id,
@@ -9998,6 +10005,11 @@ async def _create_admin_ai_lead_core(
         ),
         intake_state=intake_state,
     )
+    if actor_is_partner:
+        intake.broker_id = user.id
+    if requested_program:
+        intake.intake_state = {**intake_state, "requested_funding_program": requested_program.model_dump()}
+        bucket.ai_context = {**(bucket.ai_context or {}), "requested_program_key": requested_program.program_key}
     if payload.broker_user_id is not None:
         partner = await _load_dealer_partner_user(db, payload.broker_user_id)
         intake.broker_id = partner.id
@@ -10015,11 +10027,15 @@ async def _create_admin_ai_lead_core(
         bucket.id,
         "capital_readiness_claim_created"
         if actor_is_client
+        else "dealer_ai_lead_created_by_broker"
+        if actor_is_partner
         else "dealer_ai_lead_created_by_admin",
         request=request,
         user=user,
         actor_role=(
-            "client"
+            user.role.value
+            if actor_is_partner
+            else "client"
             if actor_is_client
             else "super_admin"
             if user.role == Role.SUPER_ADMIN
@@ -10030,6 +10046,8 @@ async def _create_admin_ai_lead_core(
         detail=(
             f"Client claimed a Capital Readiness diagnostic for {intake.email}"
             if actor_is_client
+            else f"Referral partner created {payload.variant} file for {intake.email}"
+            if actor_is_partner
             else f"Admin created {payload.variant} lead for {intake.email}"
         ),
     )
@@ -10129,7 +10147,7 @@ async def _create_admin_ai_lead_core(
             else MCA_PUBLIC_PATH if payload.variant == "mca_refinance"
             else "/dealer-ai-underwriter"
         ),
-        include_management=True,
+        include_management=not actor_is_partner,
         admin_thread=True,
         thread_user=user,
         assistant_message=welcome_text + email_note,

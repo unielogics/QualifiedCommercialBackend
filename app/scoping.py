@@ -67,7 +67,7 @@ def scope_client_query(user, stmt: Select) -> Select:
         # default rather than silently falling through to the
         # SUPER_ADMIN/LOAN_EXEC unfiltered case below.
         return stmt.where(sql_false())
-    return stmt
+    return stmt if user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC} else stmt.where(sql_false())
 
 
 def scope_loan_query(user, stmt: Select) -> Select:
@@ -89,7 +89,7 @@ def scope_loan_query(user, stmt: Select) -> Select:
         return stmt.where(Loan.broker_id.in_(regional_manager_broker_ids_subquery(user)))
     if user.role in _NO_FUNDING_BOOK:
         return stmt.where(sql_false())
-    return stmt
+    return stmt if user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC} else stmt.where(sql_false())
 
 
 def regional_manager_broker_ids_subquery(user):

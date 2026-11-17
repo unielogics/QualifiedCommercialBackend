@@ -95,7 +95,7 @@ from app.services import (
 from app.services.activity_log import log_activity, mark_loan_dirty
 from app.services.deal_economics import calculate_deal_earnings, optional_float
 from app.services.dealer_partner_access import (
-    DEALER_INTAKE_VARIANT,
+    REFERRAL_PARTNER_ROLES,
     require_dealer_partner_standing,
 )
 from app.services.operator_file_links import (
@@ -741,10 +741,9 @@ def _scope_intake_stmt(user: User, stmt):
         return stmt.join(
             Client, Client.id == PublicUnderwritingIntake.client_id, isouter=True
         ).where(Client.broker_id.in_(regional_manager_broker_ids_subquery(user)))
-    if user.role == Role.DEALER_PARTNER:
+    if user.role in REFERRAL_PARTNER_ROLES:
         return stmt.where(
             PublicUnderwritingIntake.broker_id == user.id,
-            PublicUnderwritingIntake.variant == DEALER_INTAKE_VARIANT,
         )
     return stmt.where(sql_false())
 
@@ -1376,7 +1375,7 @@ async def _decorate_durable_links(rows: list[UnifiedFileRow], user: User, db: As
 
 
 async def _all_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
-    if user.role == Role.DEALER_PARTNER:
+    if user.role in REFERRAL_PARTNER_ROLES:
         await require_dealer_partner_standing(db, user)
     rows: list[UnifiedFileRow] = []
     rows.extend(await _deal_rows(user, db))

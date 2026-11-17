@@ -57,7 +57,7 @@ def tier_for_role(role: Any) -> str:
     value = role.value if hasattr(role, "value") else str(role)
     if value in (Role.SUPER_ADMIN.value, Role.LOAN_EXEC.value):
         return VISIBILITY_DESK
-    if value in (Role.BROKER.value, Role.FIELD_REP.value, Role.DEALER_PARTNER.value, Role.REGIONAL_MANAGER.value):
+    if value in (Role.BROKER.value, Role.FIELD_REP.value, Role.DEALER_PARTNER.value, Role.PROFESSIONAL_REFERRAL_PARTNER.value, Role.REGIONAL_MANAGER.value):
         return VISIBILITY_TEAM
     return VISIBILITY_CLIENT
 

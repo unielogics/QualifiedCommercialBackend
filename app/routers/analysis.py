@@ -294,7 +294,7 @@ def _scope_analysis_query(user, stmt):
         # No book-of-business -- deny by default rather than falling
         # through to SUPER_ADMIN/LOAN_EXEC's firm-wide visibility below.
         return stmt.where(False)
-    return stmt
+    return stmt if user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC} else stmt.where(False)
 
 
 async def _load_analysis_run(db: AsyncSession, user, run_id: UUID) -> AnalysisRun:

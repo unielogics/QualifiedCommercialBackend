@@ -1,9 +1,6 @@
-"""Dealer-partner standing and auto-intake scope.
+"""Referral-partner standing and ownership across all intake programs.
 
-Every route that exposes an Auto Dealer Agent's assigned files must apply the
-same three gates: an active dealer-partner login, both signed agreements, and
-an owned auto-industry intake. Keeping this outside any router prevents a
-secondary interface from silently weakening the main AI-intake boundary.
+Stored role keys remain compatible with existing accounts and signatures.
 """
 
 from __future__ import annotations
@@ -18,17 +15,23 @@ from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 
 DEALER_INTAKE_VARIANT = "dealer_gatekeeper_v1"
+REFERRAL_PARTNER_ROLES = frozenset({Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER})
+REFERRAL_INTAKE_ROLES = REFERRAL_PARTNER_ROLES | {Role.BROKER}
 
 
 async def require_dealer_partner_standing(db: AsyncSession, user: User) -> None:
     """Require the individual and company agreements used by dealer intake."""
 
     if (
-        user.role != Role.DEALER_PARTNER
+        user.role not in REFERRAL_INTAKE_ROLES
         or getattr(user, "deleted_at", None) is not None
         or getattr(user, "account_status", "active") != "active"
     ):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Dealer partner role required")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Active referral partner role required")
+
+    # Existing real estate originators retain their established onboarding.
+    if user.role == Role.BROKER:
+        return
 
     individual_signed = (
         await db.execute(
@@ -67,7 +70,4 @@ async def require_dealer_partner_standing(db: AsyncSession, user: User) -> None:
 
 
 def dealer_partner_intake_is_owned(user: User, intake: PublicUnderwritingIntake) -> bool:
-    return (
-        intake.broker_id == user.id
-        and intake.variant == DEALER_INTAKE_VARIANT
-    )
+    return intake.broker_id == user.id

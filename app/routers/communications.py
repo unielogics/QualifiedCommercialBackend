@@ -59,7 +59,7 @@ from app.services import communication_images, file_events, inline_images
 from app.services.communication_events import HEARTBEAT_SECONDS, user_audience
 from app.services.communication_events import broker as communication_event_broker
 from app.services.dealer_partner_access import (
-    DEALER_INTAKE_VARIANT,
+    REFERRAL_PARTNER_ROLES,
     require_dealer_partner_standing,
 )
 from app.services.user_access import is_audit_client
@@ -361,11 +361,10 @@ async def _visible_intakes(db: AsyncSession, user: User) -> list[PublicUnderwrit
     stmt = select(PublicUnderwritingIntake).order_by(PublicUnderwritingIntake.last_message_at.desc().nullslast()).limit(SCAN_LIMIT)
     if user.role in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
         pass
-    elif user.role == Role.DEALER_PARTNER:
+    elif user.role in REFERRAL_PARTNER_ROLES:
         await require_dealer_partner_standing(db, user)
         stmt = stmt.where(
             PublicUnderwritingIntake.broker_id == user.id,
-            PublicUnderwritingIntake.variant == DEALER_INTAKE_VARIANT,
         )
     elif user.role in (Role.CLIENT, Role.BROKER, Role.REGIONAL_MANAGER):
         client_ids = scope_client_query(user, select(Client.id))
@@ -446,7 +445,7 @@ async def _loan_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicati
 def _intake_allowed_channels(user: User) -> set[str]:
     if user.role in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
         return {"underwriter_ai", "client", "partner", "internal"}
-    if user.role == Role.DEALER_PARTNER:
+    if user.role in REFERRAL_PARTNER_ROLES:
         return {"partner"}
     if user.role == Role.CLIENT:
         return {"client"}

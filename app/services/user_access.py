@@ -26,6 +26,8 @@ _FUNDING_STAFF_ROLES = {
     Role.LOAN_EXEC,
     Role.REGIONAL_MANAGER,
     Role.BROKER,
+    Role.DEALER_PARTNER,
+    Role.PROFESSIONAL_REFERRAL_PARTNER,
 }
 _EXTERNAL_PRODUCT_ROLES = {Role.CLIENT, Role.DEALER}
 
@@ -53,7 +55,7 @@ CONSOLE_LABELS: dict[str, str] = {
 }
 # The roles that live in the operator consoles at all.
 OPERATOR_CONSOLE_ROLES: frozenset[Role] = frozenset(
-    {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.REGIONAL_MANAGER, Role.BROKER, Role.FIELD_REP}
+    {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.REGIONAL_MANAGER, Role.BROKER, Role.FIELD_REP, Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER}
 )
 _ALL_CONSOLES = frozenset(CONSOLE_KEYS)
 _INHERITED_CONSOLES: dict[Role, frozenset[str]] = {
@@ -61,6 +63,8 @@ _INHERITED_CONSOLES: dict[Role, frozenset[str]] = {
     Role.LOAN_EXEC: _ALL_CONSOLES,
     Role.REGIONAL_MANAGER: frozenset({"funding"}),
     Role.BROKER: frozenset({"funding"}),
+    Role.DEALER_PARTNER: frozenset({"funding"}),
+    Role.PROFESSIONAL_REFERRAL_PARTNER: frozenset({"funding"}),
     # A field rep already reaches audit. (assigned_product_values below); the
     # Team table used to pretend otherwise.
     Role.FIELD_REP: frozenset({"field_desk", "audit"}),

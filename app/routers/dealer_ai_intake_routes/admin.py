@@ -322,7 +322,7 @@ async def list_dealer_partners(
         await db.execute(
             select(core.User)
             .where(
-                core.User.role == core.Role.DEALER_PARTNER,
+                core.User.role.in_(core.REFERRAL_INTAKE_ROLES),
                 core.User.deleted_at.is_(None),
                 core.User.account_status == "active",
             )
@@ -343,11 +343,6 @@ async def assign_lead_partner(
     it reach that partner's channel. Setting None detaches the partner."""
     core._require_super_admin(user)
     intake = await core._load_admin_dealer_lead(db, intake_id)
-    if payload.broker_user_id is not None and intake.variant != core.DEALER_VARIANT:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            "Only auto-industry dealer intake files can be assigned to an Auto Dealer Agent.",
-        )
     if payload.broker_user_id is None:
         intake.broker_id = None
     else:
