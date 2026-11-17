@@ -11,7 +11,7 @@ from __future__ import annotations
 
 
 class PrivateApiCacheMiddleware:
-    """Set ``private, no-store`` on every GET below the versioned API root."""
+    """Protect API reads and contact-bearing resource/application POST responses."""
 
     def __init__(self, app):
         self.app = app
@@ -19,7 +19,8 @@ class PrivateApiCacheMiddleware:
     async def __call__(self, scope, receive, send):
         if (
             scope.get("type") != "http"
-            or scope.get("method", "").upper() != "GET"
+            or (scope.get("method", "").upper() != "GET" and not scope.get("path", "").startswith(
+                ("/api/v1/public/resources/", "/api/v1/public/business/")))
             or not scope.get("path", "").startswith("/api/v1")
         ):
             await self.app(scope, receive, send)

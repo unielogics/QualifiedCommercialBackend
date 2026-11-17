@@ -3923,6 +3923,18 @@ async def _request_access_read(
         ))).scalar_one_or_none()
         if canonical is not None and link.can_use_ai_chat:
             capabilities = ["mca_ai_review"]
+    elif profile is not None and profile.funding_category == "working_capital" and profile.intake_id:
+        from app.models.public_underwriting_intake import PublicUnderwritingIntake
+
+        canonical = (await db.execute(select(PublicUnderwritingIntake.id).where(
+            PublicUnderwritingIntake.id == profile.intake_id,
+            PublicUnderwritingIntake.bucket_id == link.bucket_id,
+            PublicUnderwritingIntake.bucket_upload_link_id == link.id,
+            PublicUnderwritingIntake.variant == "main_street_v1",
+            PublicUnderwritingIntake.intake_state["funding_goal"].astext == "term_loan",
+        ))).scalar_one_or_none()
+        if canonical is not None and link.can_use_ai_chat:
+            capabilities = ["business_ai_review"]
     return BucketRequestAccessRead(
         capabilities=capabilities,
         room_kind=room_kind,

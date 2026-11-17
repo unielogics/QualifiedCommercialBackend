@@ -114,6 +114,13 @@ def start_scheduler() -> None:
 
     gmail_push_configured = bool(get_settings().gmail_pubsub_topic)
 
+    from app.services.resource_nurture import drain_pending as drain_resource_nurture
+
+    scheduler.add_job(
+        _wrap(drain_resource_nurture), "interval", seconds=60,
+        id="resource_nurture", replace_existing=True, coalesce=True, max_instances=1,
+    )
+
     from app.services.chatgpt_product_feed import drain_pending as drain_chatgpt_feed
 
     scheduler.add_job(

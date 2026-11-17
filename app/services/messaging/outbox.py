@@ -15,6 +15,7 @@ so a send that crashes mid-flight still leaves a record that it was attempted.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -312,7 +313,7 @@ async def deliver_email(
                 or draft.reply_to
                 or draft.headers
             ):
-                result = ses_client.send_raw_email(
+                result = await _send_ses(context, ses_client.send_raw_email,
                     to_emails=[to],
                     subject=draft.subject,
                     body_text=draft.body_text,
@@ -326,7 +327,7 @@ async def deliver_email(
                     headers=dict(draft.headers),
                 )
             else:
-                result = ses_client.send_email(
+                result = await _send_ses(context, ses_client.send_email,
                     to_email=to,
                     subject=draft.subject,
                     body_text=draft.body_text,
@@ -352,6 +353,15 @@ async def deliver_email(
         if durable_handoff:
             await db.commit()
     return SendOutcome(ok, detail, message_id, provider_thread_id, row)
+
+
+async def _send_ses(context: str, transport, **kwargs):
+    # A resource campaign batch must not block the API event loop while the
+    # synchronous SES SDK waits on the network. No session or ORM object enters
+    # this thread; only the transport's plain email arguments do.
+    if context == "resource_nurture":
+        return await asyncio.to_thread(transport, **kwargs)
+    return transport(**kwargs)
 
 
 #: SES event types mapped onto the ledger's vocabulary. `Send` and `Reject` are
@@ -460,11 +470,10 @@ async def mark_delivery(
         # badge on one send. Future prospect drafts must be blocked.
         #
         # One change against the original: a Transient bounce no longer
-        # suppresses. A full mailbox is not a dead address. The prospect_id gate
-        # is deliberate and stays — a bounce on a client's own transactional
-        # mail is a problem for that file, not grounds for writing the person
-        # onto an outreach suppression list.
-        if row.prospect_id is not None and row.to_email and _is_permanent(event, detail):
+        # suppresses. A full mailbox is not a dead address. Resource nurture
+        # is explicitly educational outreach too. Other client transactional
+        # mail remains outside this outreach suppression rule.
+        if (row.prospect_id is not None or getattr(row, "context", "") == "resource_nurture") and row.to_email and _is_permanent(event, detail):
             from app.services.prospect_outreach import set_suppression
 
             await set_suppression(

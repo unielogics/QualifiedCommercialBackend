@@ -4105,7 +4105,11 @@ async def _application_room_state(
             if readiness_snapshot is not None
             else None
         ),
-        capabilities=["documents", "ownership", "owner_credit", "business_banking", "agreements"] + (["application"] if intake and (intake.intake_state or {}).get("application_completion") == "client" else []),
+        capabilities=["documents", "ownership", "owner_credit", "business_banking", "agreements"]
+        + (["application"] if intake and (intake.intake_state or {}).get("application_completion") == "client" else [])
+        + (["business_ai_review"] if intake and intake.variant == "main_street_v1"
+           and (intake.intake_state or {}).get("funding_goal") == "term_loan"
+           and intake.bucket_upload_link_id == link.id and link.can_use_ai_chat else []),
         owners=await profiles.owner_reads_current(db, profile, owners=owner_rows, include_credit_risk=False),
         verification=verification,
         precall=room_precall,
