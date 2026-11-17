@@ -6,6 +6,7 @@ from typing import Literal
 from pydantic import EmailStr, Field, field_validator
 
 from app.schemas.application_profile import ApplicationRoomAccess
+from app.schemas.phone import OptionalPhone
 from app.services.business_profile import BusinessProfileFields
 
 
@@ -60,3 +61,12 @@ class ClientApplicationRead(ClientApplicationFields):
 
 class ClientApplicationPatch(ClientApplicationFields, ApplicationRoomAccess):
     submit: bool = False
+    # Write-only checks: the read model above returns whatever a file holds.
+    business_phone: OptionalPhone = None
+
+    @field_validator("transaction_type")
+    @classmethod
+    def fold_transaction_type(cls, value: str | None) -> str | None:
+        from app.services.real_estate_vocabulary import fold_transaction_type
+
+        return fold_transaction_type(value)
