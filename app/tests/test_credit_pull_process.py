@@ -12,8 +12,18 @@ from uuid import uuid4
 
 import pytest
 
-from app.services import credit_pull_core
+from app.services import credit_links, credit_pull_core
 from app.services.collection_tasks import _render_request_message
+
+
+@pytest.fixture(autouse=True)
+def no_recent_pull():
+    # These tests are about pulling; the reuse window has its own tests.
+    with (
+        patch.object(credit_links, "reuse_window_days", AsyncMock(return_value=30)),
+        patch.object(credit_pull_core, "reusable_pull", AsyncMock(return_value=None)),
+    ):
+        yield
 
 
 def _pull(fico=701, notes="isoftpull_id=abc; fico_source=full_feed", response=None):

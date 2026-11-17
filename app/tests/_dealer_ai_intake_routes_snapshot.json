@@ -284,6 +284,12 @@
   [
     "admin_router",
     "POST",
+    "/admin/ai-underwriter-leads/{intake_id}/personal-use-review",
+    "decide_personal_use_review"
+  ],
+  [
+    "admin_router",
+    "POST",
     "/admin/ai-underwriter-leads/{intake_id}/prepare-banker-submission",
     "prepare_banker_submission"
   ],

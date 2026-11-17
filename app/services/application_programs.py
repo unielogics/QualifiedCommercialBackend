@@ -301,15 +301,6 @@ def _is_lending_applicable(context: dict[str, Any]) -> bool:
 #: (`drafted_forms.DRAFTED_FORM_PROVIDER`; a test holds the two together).
 _DRAFTED_FORM_PROVIDER = "drafted_form"
 
-#: What a drafted form's analysis calls the form, as the dashboard names it.
-_FORM_KIND_BY_CLASSIFICATION = {
-    "personal_financial_statement": "pfs",
-    "debt_schedule": "debt_schedule",
-    "current_p_and_l": "p_and_l",
-    "balance_sheet": "balance_sheet",
-    "real_estate_schedule": "real_estate_schedule",
-    "operating_plan": "operating_plan",
-}
 
 
 def evidence_origin(file: BucketFile, analysis: BucketFileAnalysis | None) -> tuple[str, str | None]:
@@ -320,7 +311,9 @@ def evidence_origin(file: BucketFile, analysis: BucketFileAnalysis | None) -> tu
     directly, and the PDF is only our rendering of them.
     """
     if getattr(analysis, "provider", None) == _DRAFTED_FORM_PROVIDER:
-        return "filled_form", _FORM_KIND_BY_CLASSIFICATION.get(getattr(analysis, "classification", None) or "")
+        from app.services import form_kinds
+
+        return "filled_form", form_kinds.kind_for_classification(getattr(analysis, "classification", None))
     if getattr(file, "source_kind", None) == "generated" and getattr(file, "source_detail", None) == "signed_document":
         return "signed", None
     return "uploaded", None
@@ -1812,9 +1805,17 @@ async def _requested_document(
                 or not approval_valid(arf_config, "hosted_intake")
                 or canonical_key not in (arf_config.permitted_documents or [])):
             return None
+    from app.services import form_kinds
+
     collection_config = getattr(requirement, "collection_config", None) or {}
     form_kind = collection_config.get("form_kind") if getattr(requirement, "requirement_kind", None) == "form" else None
-    request_category = {"pfs": "Personal Financials", "debt_schedule": "Debts", "p_and_l": "Financials", "balance_sheet": "Financials", "real_estate_schedule": "Real estate", "operating_plan": "Financials"}.get(form_kind, requirement.category)
+    request_category = form_kinds.slot_category(form_kind, requirement.category)
+    # What the client does on this row: sign the form at its end (a configured
+    # signature), sign the room's credit authorization, or upload.
+    signature = form_kinds.signature_of(collection_config) if form_kind else None
+    signature_kind = (
+        "signed_form" if signature else SIGNATURE_REQUIREMENTS.get(getattr(requirement, "canonical_key", None) or requirement.requirement_key)
+    )
     requested = (
         await db.execute(
             select(BucketRequestedDocument)
@@ -1832,7 +1833,7 @@ async def _requested_document(
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    if requested is None and form_kind in {"pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule", "operating_plan"}:
+    if requested is None and form_kind in form_kinds.financial_kinds():
         from app.routers.application_profiles import _requested_slot
         requested = await _requested_slot(db, profile, form_kind)
     if requested is None and not collection_config.get("file_request_id"):
@@ -1858,6 +1859,7 @@ async def _requested_document(
         "policy_keys": policy_keys,
         "playbook_id": str(requirement.playbook_id),
         "form_kind": form_kind,
+        **({"signature": signature} if signature else {}),
     }
     if collection_config.get("file_request_id"):
         source = {"kind": "staff_request", "file_request_id": collection_config["file_request_id"],
@@ -1874,6 +1876,8 @@ async def _requested_document(
             is_custom=False,
             requirement_key=requirement.requirement_key,
             requirement_source=source,
+            requires_signature=bool(signature_kind),
+            signature_kind=signature_kind,
         )
         db.add(requested)
         await db.flush()
@@ -1887,6 +1891,11 @@ async def _requested_document(
         requested.allow_multiple_files = True
         requested.requirement_key = requirement.requirement_key
         requested.requirement_source = source
+        if signature_kind and requested.status != "uploaded":
+            # A signature configured (or a credit authorization) after the row
+            # was minted: the row becomes something the client signs.
+            requested.requires_signature = True
+            requested.signature_kind = signature_kind
         if requested.status == "not_applicable":
             requested.status = "requested"
     else:
@@ -3418,7 +3427,9 @@ async def _materialize_requirements(
                 **definition_metadata,
                 "staff_added": requirement_library.provenance_note(
                     staff_added.entry,
-                    requirement_library.form_kinds_for(key, getattr(requirement, "canonical_key", None)),
+                    requirement_library.form_kinds_for(
+                        key, getattr(requirement, "canonical_key", None), getattr(requirement, "collection_config", None)
+                    ),
                 ),
             }
         if (state.provenance or {}).get("source_kind") in {"lender", "staff_request", "financial_form_request"}:

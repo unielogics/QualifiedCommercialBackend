@@ -3782,9 +3782,18 @@ def _public_requested_document_read(
     document: BucketRequestedDocument,
     uploaded_files: list[BucketRequestUploadedFileRead],
 ) -> BucketRequestedDocumentRead:
+    from app.services import document_signature
     from app.services.public_identifiers import public_requirement_key
 
     metadata = locked_file_requests.public_request_metadata(document, uploaded_files)
+    # The words the signature will certify, shown verbatim: a credit
+    # authorization with no text of its own certifies the server's default,
+    # so the page must show that one rather than a shorter copy of its own.
+    certified = document.signature_document_text or (
+        document_signature.credit_authorization_document_text()
+        if document.requires_signature and document.signature_kind == "credit_authorization"
+        else None
+    )
     return BucketRequestedDocumentRead.model_validate(document).model_copy(
         update={
             # requirement_source may carry provenance and fingerprints intended
@@ -3795,6 +3804,10 @@ def _public_requested_document_read(
                 None
                 if metadata["request_kind"]
                 else public_requirement_key(document.requirement_key)
+            ),
+            "signature_document_text": certified,
+            "signature_document_sha256": (
+                document_signature.document_hash(certified) if document.requires_signature and certified else None
             ),
             **metadata,
         }

@@ -36,6 +36,14 @@ class OfferingRequirement(BaseModel):
         classes = self.collection_config.get("evidence_classes")
         if classes is not None and (not isinstance(classes, list) or len(classes) > 30 or any(not isinstance(item, str) or not item.strip() or len(item) > 120 for item in classes)):
             raise ValueError("Evidence classes must be a list of document classifications")
+        from app.services import form_kinds
+
+        try:
+            self.collection_config = form_kinds.normalize_collection_config(
+                self.collection_config, requirement_kind=self.requirement_kind, strict=True
+            )
+        except form_kinds.FormConfigError as exc:
+            raise ValueError(str(exc)) from None
         return self
 
 

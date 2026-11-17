@@ -20,6 +20,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, create_model, field_validator
 
+from app.schemas.phone import OptionalPhone
 from app.services.main_street_programs import MAIN_STREET_INDUSTRIES
 
 MAX_WEBSITE = 255
@@ -177,6 +178,9 @@ class BusinessProfileFields(BaseModel):
 class RequiredBusinessProfileFields(BusinessProfileFields):
     """New application boundary; historical reads and partial edits stay optional."""
 
+    # Normalised to E.164 on the way in, and a name or a note is refused. Only
+    # on this write boundary: read models hand back whatever an older file holds.
+    business_phone: OptionalPhone = None
     business_street: str = Field(max_length=255)
     business_city: str = Field(max_length=120)
     business_state: str = Field(max_length=2)
@@ -303,8 +307,8 @@ def of_intake(intake: Any) -> dict[str, Any]:
         else declared.get("description")
     )
     return {
-        "business_phone": declared.get("business_phone"),
-        "employee_count": declared.get("employee_count"),
+        "business_phone": desk["business_phone"] if "business_phone" in desk else declared.get("business_phone"),
+        "employee_count": desk["employee_count"] if "employee_count" in desk else declared.get("employee_count"),
         "website": website or None,
         "website_none": none and not website,
         "description": (description or None),

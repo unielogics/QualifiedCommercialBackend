@@ -51,6 +51,7 @@ __all__ = [
     "update_lead_outcome_status",
     "update_lead_language",
     "update_lead_contact",
+    "decide_personal_use_review",
     "create_admin_ai_lead",
     "admin_mark_channel_seen",
     "create_admin_ai_lead_from_bucket",
@@ -1042,6 +1043,17 @@ async def update_lead_contact(
         values_logged = ["years_in_business"]
     else:
         values_logged = []
+    contact_keys = [key for key in ("business_phone", "employee_count") if key in values]
+    if contact_keys:
+        # Not columns: the desk's correction (a real number where the file held
+        # a name) sits in desk_facts and wins on read, like the website does.
+        state = core._intake_state(intake)
+        facts = dict(state.get("desk_facts") or {})
+        for key in contact_keys:
+            facts[key] = values.pop(key)
+        state["desk_facts"] = facts
+        intake.intake_state = state
+        values_logged = [*values_logged, *contact_keys]
     business_keys = [key for key in core.business_profile.PROFILE_FIELDS if key in values]
     if business_keys:
         # Not columns either: the desk's words sit in desk_facts and win on read,
@@ -1092,6 +1104,39 @@ async def update_lead_contact(
     return await core._response(
         db, intake, token=None, include_management=True, admin_thread=True, thread_user=user
     )
+
+@core.admin_router.post("/{intake_id}/personal-use-review", response_model=core.DealerIntakeResponse)
+async def decide_personal_use_review(
+    intake_id: UUID,
+    payload: core.PersonalUseDecision,
+    request: Request,
+    user: core.CurrentUser,
+    db: AsyncSession = Depends(core.get_db),
+) -> core.DealerIntakeResponse:
+    """The desk's call on an owner-occupied personal-use request: keep the
+    hold (personal use confirmed) or clear it (business or investment use).
+    QC lends for business purposes only; nothing is sent to the client here."""
+    core._require_intake_operator(user)
+    intake = await core._load_admin_dealer_lead(db, intake_id)
+    if intake.variant != core.FUNDING_VARIANT:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Only real-estate files carry a business-purpose review")
+    record = await core.business_purpose.resolve(db, intake, decision=payload.decision, actor=user, note=payload.note)
+    await core._log(
+        db,
+        intake.bucket_id,
+        "personal_use_review_decided",
+        request=request,
+        user=user,
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=f"{record['status']}: {record.get('note') or ''}"[:500],
+    )
+    await db.commit()
+    intake = await core._load_admin_dealer_lead(db, intake.id)
+    return await core._response(
+        db, intake, token=None, include_management=True, admin_thread=True, thread_user=user
+    )
+
 
 @core.admin_router.post("", response_model=core.DealerIntakeResponse, status_code=status.HTTP_201_CREATED)
 async def create_admin_ai_lead(
@@ -1655,6 +1700,30 @@ async def run_lead_credit_pull(
         dob = _date.fromisoformat(str(applicant_data.get("dob")))
     except (TypeError, ValueError) as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Applicant date of birth on file is invalid") from exc
+
+    if not payload.force and not payload.ssn:
+        # A pull inside the reuse window is not repeated without a person's say-so.
+        window = await core.credit_links.reuse_window_days(db)
+        recent = await credit_pull_core.reusable_pull(
+            db,
+            client_id=client.id,
+            first_name=str(applicant_data.get("legal_first_name") or ""),
+            last_name=str(applicant_data.get("legal_last_name") or ""),
+            dob=dob,
+            email=intake.email,
+            within_days=window,
+        )
+        if recent is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "recent_soft_pull",
+                    "pull_id": str(recent.id),
+                    "pulled_at": recent.pulled_at.isoformat() if recent.pulled_at else None,
+                    "window_days": window,
+                    "message": f"{credit_pull_core.reuse_words(recent).replace('Using the', 'Last')}. Pull again?",
+                },
+            )
 
     try:
         pull = await credit_pull_core.run_soft_pull(
