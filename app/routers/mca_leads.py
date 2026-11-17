@@ -24,6 +24,7 @@ from app.models.activity import Activity
 from app.models.client import Client
 from app.schemas.phone import RequiredPhone
 from app.services import mca_funding_policy
+from app.services.business_profile import RequiredBusinessProfileFields
 from app.services.payment_authorization import primary_super_admin
 
 router = APIRouter(prefix="/public/mca", tags=["public-mca"])
@@ -220,9 +221,6 @@ class McaIntakeAttribution(Attribution):
                            "/medical-practice-financing", "/grocery-store-financing", "/business-funding-check"}:
             raise ValueError("Use a known MCA or Main Street website path without query strings or fragments.")
         return path
-
-
-from app.services.business_profile import RequiredBusinessProfileFields
 
 
 class McaIntakeStart(McaLeadRequest, RequiredBusinessProfileFields):
