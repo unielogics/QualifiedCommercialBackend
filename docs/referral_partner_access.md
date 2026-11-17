@@ -46,17 +46,13 @@ notice rather than silently creating the wrong application type.
 
 ## Validation
 
-- 200 targeted backend tests passed using a socket-free Windows harness for
-  mocked I/O, including cross-program creation, role and ownership restrictions,
-  signature checks, route compatibility, regional access, and invitations.
-- Five frontend role tests passed. Application-source TypeScript and focused
-  ESLint checks passed. The default repository typecheck also includes an
-  unrelated scratch source snapshot and an existing unit-test typing error.
-- Browser scenarios cover both referral role keys, selecting a real-estate
-  program, creating its file, and opening the client's assigned file. Execution
-  was blocked before page load by `ERR_NETWORK_ACCESS_DENIED` for localhost.
-- A broader backend run found three existing Windows-incompatible date-format
-  failures in file-event digest tests; these are outside the focused passing run.
-
-These are local changes. Production deployment and rendered-screen verification
-remain outstanding.
+- Backend regression tests cover cross-program creation, role and ownership
+  restrictions, signature checks, route compatibility, regional access,
+  invitations, required business details, and business-purpose safeguards.
+- Frontend role tests cover the consolidated invitation choices, legacy role
+  compatibility, default role, and the distinction between referral access and
+  real-estate origination.
+- The integrated release passed 344 targeted backend tests and changed-file
+  Ruff checks. Dashboard CI passed its complete test, type, lint, and build gates.
+- Backend production deployment is gated on the complete CI suite for the
+  exact deployment commit, followed by the server readiness check.
