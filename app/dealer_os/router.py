@@ -21617,7 +21617,7 @@ async def _run_owner_soft_pull(
         SoftPullApplicant,
         SoftPullDenied,
         SoftPullUnavailable,
-        run_soft_pull,
+        pull_or_reuse,
     )
 
     owner_pk = owner.id  # captured pre-rollback: expired instances can't lazy-load async
@@ -21633,7 +21633,7 @@ async def _run_owner_soft_pull(
 
     try:
         client = await _resolve_owner_client(db, dealer, owner)
-        pull = await run_soft_pull(
+        pull, _reused = await pull_or_reuse(
             db,
             client=client,
             applicant=SoftPullApplicant(
@@ -21647,6 +21647,7 @@ async def _run_owner_soft_pull(
                 ssn=ssn,
             ),
             actor=actor,
+            email=getattr(owner, "email", None),
         )
     except SoftPullUnavailable as exc:
         return await _record_provider_failure("provider_unavailable", "provider_unavailable", str(exc))

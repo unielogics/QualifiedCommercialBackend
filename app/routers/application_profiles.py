@@ -236,6 +236,7 @@ from app.services import (
     financial_cockpit,
     financial_statements,
     form_answers,
+    form_kinds,
     funding_programs,
     intake_lifecycle,
     intake_retention,
@@ -3742,11 +3743,11 @@ async def submit_public_application_credit_consent(
         SoftPullRateLimited,
         SoftPullUnavailable,
         SoftPullValidationError,
-        run_soft_pull,
+        pull_or_reuse,
     )
 
     try:
-        pull = await run_soft_pull(
+        pull, reused = await pull_or_reuse(
             db,
             client=client,
             applicant=SoftPullApplicant(
@@ -3759,6 +3760,7 @@ async def submit_public_application_credit_consent(
                 zip=owner.zip,
                 ssn=payload.ssn,
             ),
+            email=owner.email,
         )
     except (SoftPullDenied, SoftPullRateLimited, SoftPullUnavailable, SoftPullValidationError):
         await db.rollback()
@@ -3766,8 +3768,8 @@ async def submit_public_application_credit_consent(
         owner.invite_token_hash = token_hash
         await db.commit()
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "We could not complete the credit check right now; please try again shortly") from None
-    await credit_links.link_pull(db, profile, owner, pull, how=credit_links.HOW_SIGNATURE)
-    await profiles.log_profile_action(db, profile, None, "owner.soft_pull", f"Credit returned for {owner.full_name}", target_type="owner", target_id=owner.id, metadata={"tier": owner.credit_tier})
+    await credit_links.link_pull(db, profile, owner, pull, how=credit_links.HOW_REUSED if reused else credit_links.HOW_SIGNATURE)
+    await profiles.log_profile_action(db, profile, None, "owner.soft_pull", f"Credit returned for {owner.full_name}" + (" (a recent soft pull was reused)" if reused else ""), target_type="owner", target_id=owner.id, metadata={"tier": owner.credit_tier, "reused": reused})
     await db.commit()
     return PublicFileOwnerConsentResult(completed=True, credit_tier=owner.credit_tier, credit_score_band=_score_band(owner.credit_score))
 
@@ -3961,20 +3963,21 @@ async def _application_room_signables(
     )
     from app.services import document_signature as sig_service
 
+    def certified_text(row: BucketRequestedDocument) -> str:
+        return row.signature_document_text or (
+            sig_service.credit_authorization_document_text()
+            if row.signature_kind == "credit_authorization"
+            else ""
+        )
+
     return [
         ApplicationRoomSignable(
             id=row.id,
             name=row.name,
             kind=row.signature_kind,
             signed=row.status == "uploaded",
-            document_text=(
-                row.signature_document_text
-                or (
-                    sig_service.credit_authorization_document_text()
-                    if row.signature_kind == "credit_authorization"
-                    else ""
-                )
-            ),
+            document_text=certified_text(row),
+            document_sha256=sig_service.document_hash(certified_text(row)) if certified_text(row) else None,
             signable=bool(
                 row.signature_document_text
                 or row.signature_kind == "credit_authorization"
@@ -4564,6 +4567,7 @@ async def public_application_room_sign(
             applicant_city=payload.applicant_city,
             applicant_state=payload.applicant_state,
             applicant_zip=payload.applicant_zip,
+            document_sha256=payload.document_sha256,
         ),
         request,
         actor_name=payload.typed_name,
@@ -4574,6 +4578,9 @@ async def public_application_room_sign(
             or ""
         ),
         allow_success_fee_agreement=True,
+        # The room passes a stand-in for the intake; the soft pull needs the
+        # file itself, and only when it is this room's own file.
+        pull_intake=intake if intake is not None and intake.bucket_id == link.bucket_id else None,
     )
     if requested and requested.signature_kind == "success_fee_agreement":
         from app.services import ach_fee_workflow
@@ -6686,7 +6693,7 @@ async def mint_financial_statement_link(
 
 async def _open_link_or_404(db: AsyncSession, token: str):
     link = await financial_statements.link_for_token(db, token)
-    if link is None or link.kind not in {"pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule", "operating_plan"}:
+    if link is None or link.kind not in form_kinds.financial_kinds():
         # One message for "never existed", "expired" and "revoked". Telling them
         # apart would confirm which tokens are real to anyone probing.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "This link is no longer available")

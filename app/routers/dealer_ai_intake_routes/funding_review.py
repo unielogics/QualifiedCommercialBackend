@@ -82,6 +82,18 @@ async def start_funding_review(
         "monthly_rent": payload.monthly_rent,
         "estimated_credit_tier": payload.estimated_credit_tier,
     }
+    # Occupancy and purpose are the borrower's own answers on the form.
+    details = {
+        key: value
+        for key, value in (
+            ("occupancy", payload.occupancy),
+            ("business_purpose", payload.business_purpose),
+            ("purpose_description", payload.purpose_description),
+        )
+        if value is not None
+    }
+    if details:
+        details[core.DETAIL_SOURCES_KEY] = {key: core.business_purpose.SOURCE_FORM for key in details}
     intake = core.PublicUnderwritingIntake(
         source_kind="public_form",
         source_detail="Funding review form",
@@ -122,6 +134,7 @@ async def start_funding_review(
             **({"signup_attribution": attribution} if attribution else {}),
             **business_profile.state_entry(payload),
             "funding_review_basics": basics,
+            **({"funding_review_details": details} if details else {}),
             "legal_acceptance": {
                 "terms_accepted": payload.terms_accepted,
                 "privacy_accepted": payload.privacy_accepted,
@@ -138,6 +151,8 @@ async def start_funding_review(
     await db.commit()
     intake = await core._load_public_intake(db, token)
     await onboarding_consent.record_for_start(db, intake, payload, request, entry="starting a real estate funding review")
+    if details:
+        await core.business_purpose.after_answers(db, intake, source=core.business_purpose.SOURCE_FORM)
     await core._record_resume_email(
         intake,
         token=token,
@@ -349,7 +364,11 @@ async def funding_review_chat(
         if chat_messages and not paused:
             raw = chat_messages[-1].metadata_json.get("raw") if isinstance(chat_messages[-1].metadata_json, dict) else None
             proposed_facts = raw.get("proposed_borrower_facts") if isinstance(raw, dict) else None
-            core._merge_funding_review_details(intake, proposed_facts)
+            accepted = core._merge_funding_review_details(intake, proposed_facts)
+            if accepted.keys() & {"occupancy", "business_purpose"}:
+                await core.business_purpose.after_answers(
+                    db, intake, source=core.business_purpose.SOURCE_CHAT, answers=accepted
+                )
     await db.commit()
     intake = await core._load_public_intake(db, token)
 

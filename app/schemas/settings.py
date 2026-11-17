@@ -400,6 +400,8 @@ class CreditLinkingSettings(BaseModel):
 
     mode: Literal["manual", "automatic"] = "manual"
     last_run: dict[str, Any] | None = None
+    #: A completed soft pull younger than this is reused instead of pulling again.
+    reuse_window_days: int = 30
 
 
 class AppSettingsData(BaseModel):

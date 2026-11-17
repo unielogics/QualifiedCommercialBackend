@@ -1168,6 +1168,8 @@ class ApplicationRoomSignable(BaseModel):
     signed: bool = False
     signable: bool = False
     document_text: str = ""
+    #: SHA-256 of document_text; the room sends it back when the client signs.
+    document_sha256: str | None = None
 
 
 class ApplicationRoomSignRequest(ApplicationRoomAccess):
@@ -1182,6 +1184,7 @@ class ApplicationRoomSignRequest(ApplicationRoomAccess):
     applicant_city: str | None = Field(default=None, max_length=120)
     applicant_state: str | None = Field(default=None, max_length=2)
     applicant_zip: str | None = Field(default=None, max_length=10)
+    document_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class ApplicationRoomSignResult(BaseModel):

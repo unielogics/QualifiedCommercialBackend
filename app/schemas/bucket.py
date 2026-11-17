@@ -93,6 +93,10 @@ class BucketRequestedDocumentRead(ORMModel):
     signature_kind: str | None
     template_file_id: UUID | None
     signature_document_text: str | None
+    #: SHA-256 of the text that signing certifies (public projections fill it
+    #: in, along with the server's own credit-authorization text when the row
+    #: carries none), so the page shows and echoes exactly what is certified.
+    signature_document_sha256: str | None = None
     requirement_key: str | None = None
     requirement_source: dict | None = None
     # Public-room projections redact requirement_source and populate these
