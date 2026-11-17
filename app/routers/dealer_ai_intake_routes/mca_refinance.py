@@ -616,7 +616,7 @@ async def mca_refinance_credit_pull(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Applicant date of birth on file is invalid") from exc
 
     try:
-        pull = await credit_pull_core.run_soft_pull(
+        pull, reused = await credit_pull_core.pull_or_reuse(
             db,
             client=client,
             applicant=credit_pull_core.SoftPullApplicant(
@@ -630,6 +630,7 @@ async def mca_refinance_credit_pull(
                 ssn=payload.ssn,
             ),
             actor=None,
+            email=intake.email,
         )
     except credit_pull_core.SoftPullDenied as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": exc.code, "message": exc.message}) from exc
@@ -641,9 +642,11 @@ async def mca_refinance_credit_pull(
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
 
     state = core._intake_state(intake)
-    state["credit_pull"] = credit_pull_core.intake_credit_state(pull)
+    state["credit_pull"] = {**credit_pull_core.intake_credit_state(pull), **({"reused": True} if reused else {})}
     intake.intake_state = state
-    await credit_pull_core.stamp_primary_owner(db, intake, pull)
+    await credit_pull_core.stamp_primary_owner(
+        db, intake, pull, how=core.credit_links.HOW_REUSED if reused else core.credit_links.HOW_SIGNATURE
+    )
     await core._log(
         db,
         intake.bucket_id,

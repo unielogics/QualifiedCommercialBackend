@@ -144,6 +144,7 @@ from app.services import (
     bucket_archive,  # noqa: F401  (handlers reach this through core)
     business_profile,
     business_purpose,  # noqa: F401  (handlers reach this through core)
+    credit_links,  # noqa: F401  (handlers reach this through core)
     equipment_financing,
     file_events,  # noqa: F401  (handlers reach this through core)
     funding_requests,
@@ -1253,6 +1254,8 @@ class ConfirmLeadDeletionRequest(BaseModel):
 
 class AdminCreditPullRequest(BaseModel):
     ssn: str | None = Field(default=None, description="9 digits, no dashes; optional retry after no-hit")
+    #: Pull again even though this person was pulled inside the reuse window.
+    force: bool = False
 
     @field_validator("ssn")
     @classmethod
@@ -1470,6 +1473,10 @@ class DealerDocumentSignRequest(BaseModel):
     applicant_city: str | None = Field(default=None, max_length=120)
     applicant_state: str | None = Field(default=None, max_length=2)
     applicant_zip: str | None = Field(default=None, max_length=10)
+    #: SHA-256 of the text the signer reviewed (the room sends the server's own
+    #: hash). When it no longer matches what would be certified, the signature
+    #: is refused so nobody signs words they were not shown.
+    document_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class DealerPfsAssetRow(BaseModel):
@@ -8436,13 +8443,17 @@ async def _sign_requested_document(
     actor_name: str,
     actor_email: str,
     allow_success_fee_agreement: bool = False,
+    pull_intake: PublicUnderwritingIntake | None = None,
 ) -> BucketFile:
     """Generic e-sign fulfillment for a requires_signature BucketRequestedDocument.
     Shared by BOTH the dealer and funding-review public routers — identical
     mechanism for both verticals; only the requested document's template/text
     (admin-supplied) differs. Renders the certificate PDF, stores it as a
     normal BucketFile linked via requested_document_id (which alone satisfies
-    the checklist via the existing upload-driven status recalculation)."""
+    the checklist via the existing upload-driven status recalculation).
+
+    ``pull_intake`` is the file the credit authorization's soft pull runs on,
+    for callers (the PIN room) that pass only a stand-in for ``intake``."""
     from app.services import document_signature as sig_service
     from app.services.payment_authorization import client_ip
 
@@ -8496,6 +8507,11 @@ async def _sign_requested_document(
         else "custom-1"
     )
     doc_hash = sig_service.document_hash(document_text)
+    if payload.document_sha256 and payload.document_sha256 != doc_hash:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The text you reviewed has changed. Review the current version and sign again.",
+        )
 
     applicant_data = None
     extra_rows: list[tuple[str, str]] = []
@@ -8651,13 +8667,16 @@ async def _sign_requested_document(
     )
     if not is_success_fee:
         await db.commit()
-    if is_credit_auth and applicant_data:
+    pull_target = pull_intake if pull_intake is not None else intake
+    if is_credit_auth and applicant_data and not isinstance(pull_target, PublicUnderwritingIntake):
+        log.warning("credit authorization signed on bucket %s with no file to pull for", intake.bucket_id)
+    elif is_credit_auth and applicant_data:
         # The authorization is what the pull waits for; run it now rather
         # than leaving a second button for the client to find.
         from app.services import credit_pull_core
 
         try:
-            await credit_pull_core.auto_pull_after_signature(db, intake, applicant_data=applicant_data, request=request)
+            await credit_pull_core.auto_pull_after_signature(db, pull_target, applicant_data=applicant_data, request=request)
             await db.commit()
         except Exception:  # noqa: BLE001 - the signature stands whatever the bureau did
             log.exception("soft pull after signature failed for intake %s", intake.id)

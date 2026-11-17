@@ -11,10 +11,13 @@ class CreditLinkingRead(BaseModel):
     mode: Literal["manual", "automatic"]
     last_run: dict[str, Any] | None = None
     sweep_minutes: int
+    #: A completed soft pull younger than this is reused instead of pulling again.
+    reuse_window_days: int = 30
 
 
 class CreditLinkingWrite(BaseModel):
-    mode: Literal["manual", "automatic"]
+    mode: Literal["manual", "automatic"] | None = None
+    reuse_window_days: int | None = Field(default=None, ge=0, le=365)
 
 
 class CreditLinkRunReport(BaseModel):

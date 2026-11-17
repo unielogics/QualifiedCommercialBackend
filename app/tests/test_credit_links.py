@@ -344,7 +344,7 @@ def test_the_switch_defaults_to_manual_and_tolerates_junk() -> None:
 async def test_mode_and_settings_read_from_the_section(monkeypatch) -> None:
     monkeypatch.setattr(credit_links, "_settings_row", AsyncMock(return_value=SimpleNamespace(data={"credit_linking": {"mode": "automatic", "last_run": {"at": "x"}}})))
     assert await credit_links.mode(_db()) == "automatic"
-    assert await credit_links.read_settings(_db()) == {"mode": "automatic", "last_run": {"at": "x"}, "sweep_minutes": 30}
+    assert await credit_links.read_settings(_db()) == {"mode": "automatic", "last_run": {"at": "x"}, "sweep_minutes": 30, "reuse_window_days": 30}
 
     monkeypatch.setattr(credit_links, "_settings_row", AsyncMock(return_value=SimpleNamespace(data={"credit_linking": {"mode": "sometimes"}})))
     assert await credit_links.mode(_db()) == "manual"
