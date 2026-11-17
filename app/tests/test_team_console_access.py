@@ -128,7 +128,7 @@ async def test_an_invite_carries_the_console_grants_and_lands_on_the_rep_app():
 async def test_console_grants_are_refused_where_the_role_does_not_allow_them():
     db = _db(_staffer(role=Role.DEALER_PARTNER))
     with pytest.raises(HTTPException) as err:
-        await users_router.update_user(uuid4(), users_router.UserPatch(account_types=["funding"]), _request(), db, current=_actor())
+        await users_router.update_user(uuid4(), users_router.UserPatch(account_types=["field_desk"]), _request(), db, current=_actor())
     assert err.value.status_code == 422 and "not available" in err.value.detail
     db = _db(_staffer(role=Role.BROKER))
     with pytest.raises(HTTPException) as err:

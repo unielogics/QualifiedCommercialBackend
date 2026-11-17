@@ -18,7 +18,7 @@ from sqlalchemy.orm import selectinload
 from app.db import get_db
 from app.dealer_os.services import client_room
 from app.deps import CurrentUser
-from app.enums import ContractSubjectType, ContractType, Role
+from app.enums import Role
 from app.models.bucket import (
     Bucket,
     BucketActivityLog,
@@ -26,7 +26,6 @@ from app.models.bucket import (
     BucketRequestedDocument,
     BucketUploadLink,
 )
-from app.models.contract_agreement import ContractAgreement
 from app.models.professional_partner_application import ProfessionalPartnerApplication
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.referral_partner_company import KIND_REFERRAL_PARTNER, ReferralPartnerCompany
@@ -35,6 +34,10 @@ from app.routers.buckets import _generate_passcode
 from app.routers.dealer_ai_intake import _hash_token, _new_public_token, _record_resume_email
 from app.services import business_profile, intake_retention, onboarding_consent
 from app.services import clerk as clerk_service
+from app.services.dealer_partner_access import (
+    REFERRAL_INTAKE_ROLES,
+    require_dealer_partner_standing,
+)
 from app.services.foreclosure_rescue import (
     AMORTIZATION_MONTHS,
     CLOSING_DOCUMENTS,
@@ -298,31 +301,11 @@ def _require_operator(user: User) -> None:
 
 
 async def _require_partner(user: User, db: AsyncSession) -> UUID:
-    if user.role != Role.PROFESSIONAL_REFERRAL_PARTNER or user.referral_partner_company_id is None:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Professional partner access required")
-    individual_signed = (
-        await db.execute(
-            select(ContractAgreement.id).where(
-                ContractAgreement.contract_type == ContractType.PLATFORM_ACCESS,
-                ContractAgreement.subject_type == ContractSubjectType.USER,
-                ContractAgreement.subject_id == user.id,
-            )
-        )
-    ).first()
-    if individual_signed is None:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Sign the Platform Access Agreement before using the workspace")
-    company_signed = (
-        await db.execute(
-            select(ContractAgreement.id).where(
-                ContractAgreement.contract_type == ContractType.REFERRAL_PROTECTION,
-                ContractAgreement.subject_type == ContractSubjectType.COMPANY,
-                ContractAgreement.subject_id == user.referral_partner_company_id,
-            )
-        )
-    ).first()
-    if company_signed is None:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Your firm must have a signed Referral Protection Agreement on file")
+    await require_dealer_partner_standing(db, user)
+    if user.referral_partner_company_id is None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "A partner company is required for rescue files")
     return user.referral_partner_company_id
+
 
 
 def _details(intake: PublicUnderwritingIntake) -> dict:
@@ -427,8 +410,8 @@ async def _create_foreclosure_rescue(
     ).scalar_one_or_none()
     partner_user = (
         actor
-        if actor and actor.role == Role.PROFESSIONAL_REFERRAL_PARTNER
-        else matching_user if matching_user and matching_user.role == Role.PROFESSIONAL_REFERRAL_PARTNER else None
+        if actor and actor.role in REFERRAL_INTAKE_ROLES
+        else matching_user if matching_user and matching_user.role in REFERRAL_INTAKE_ROLES else None
     )
     owner = actor or await primary_super_admin(db)
     above_published_program_max = is_above_published_program_max(payload.requested_loan_amount)
@@ -507,6 +490,7 @@ async def _create_foreclosure_rescue(
         source_actor_name=payload.contact_name.strip(),
         source_user_id=actor.id if actor else partner_user.id if partner_user else None,
         referral_partner_company_id=partner_user.referral_partner_company_id if partner_user else None,
+        broker_id=partner_user.id if partner_user else None,
         bucket_id=bucket.id,
         bucket_upload_link_id=link.id,
         token_hash=_hash_token(token),
@@ -880,7 +864,10 @@ async def update_rescue_document_status(
 @partner_router.get("", response_model=list[ForeclosureRescueRead])
 async def list_partner_rescues(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> list[ForeclosureRescueRead]:
     company_id = await _require_partner(user, db)
-    stmt = _base_query().where(PublicUnderwritingIntake.referral_partner_company_id == company_id).order_by(PublicUnderwritingIntake.updated_at.desc())
+    stmt = _base_query().where(PublicUnderwritingIntake.referral_partner_company_id == company_id)
+    if user.role != Role.PROFESSIONAL_REFERRAL_PARTNER:
+        stmt = stmt.where(PublicUnderwritingIntake.broker_id == user.id)
+    stmt = stmt.order_by(PublicUnderwritingIntake.updated_at.desc())
     return [_read(row) for row in (await db.execute(stmt)).scalars().unique().all()]
 
 
@@ -1003,6 +990,8 @@ async def _partner_intake_or_404(db: AsyncSession, user: User, intake_id: UUID) 
         PublicUnderwritingIntake.id == intake_id,
         PublicUnderwritingIntake.referral_partner_company_id == company_id,
     )
+    if user.role != Role.PROFESSIONAL_REFERRAL_PARTNER:
+        stmt = stmt.where(PublicUnderwritingIntake.broker_id == user.id)
     intake = (await db.execute(stmt)).scalars().unique().one_or_none()
     if intake is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Foreclosure rescue not found")

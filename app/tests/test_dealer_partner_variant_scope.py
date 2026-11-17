@@ -16,7 +16,7 @@ from app.services import application_profiles, dealer_partner_access
 
 
 @pytest.mark.asyncio
-async def test_dealer_partner_detail_query_is_owner_and_auto_variant_scoped() -> None:
+async def test_dealer_partner_detail_query_is_owner_scoped_across_variants() -> None:
     statements = []
 
     async def execute(statement):
@@ -38,32 +38,27 @@ async def test_dealer_partner_detail_query_is_owner_and_auto_variant_scoped() ->
         )
     )
     assert "public_underwriting_intakes.broker_id" in sql
-    assert "public_underwriting_intakes.variant = 'dealer_gatekeeper_v1'" in sql
+    assert "public_underwriting_intakes.variant =" not in sql
 
 
 @pytest.mark.asyncio
-async def test_real_estate_intake_cannot_be_assigned_to_auto_dealer_agent() -> None:
-    intake = SimpleNamespace(
-        id=uuid4(),
-        variant=dealer_ai_intake.FUNDING_VARIANT,
-        bucket_id=uuid4(),
-    )
-    user = SimpleNamespace(id=uuid4(), role=Role.SUPER_ADMIN)
-    with patch.object(
-        dealer_ai_intake,
-        "_load_admin_dealer_lead",
-        AsyncMock(return_value=intake),
+async def test_real_estate_intake_can_be_assigned_to_a_referral_partner() -> None:
+    intake = SimpleNamespace(id=uuid4(), variant=dealer_ai_intake.FUNDING_VARIANT, bucket_id=uuid4())
+    partner = SimpleNamespace(id=uuid4())
+    db = SimpleNamespace(commit=AsyncMock())
+    with (
+        patch.object(dealer_ai_intake, "_load_admin_dealer_lead", AsyncMock(return_value=intake)),
+        patch.object(dealer_ai_intake, "_load_dealer_partner_user", AsyncMock(return_value=partner)),
+        patch.object(dealer_ai_intake.profiles_service, "find_profile", AsyncMock(return_value=None)),
+        patch.object(dealer_ai_intake, "_log", AsyncMock()),
+        patch.object(dealer_ai_intake, "_response", AsyncMock()),
     ):
-        with pytest.raises(HTTPException) as exc:
-            await dealer_ai_intake.assign_lead_partner(
-                intake.id,
-                dealer_ai_intake.AssignPartnerRequest(broker_user_id=uuid4()),
-                SimpleNamespace(headers={}, client=None),
-                user,
-                SimpleNamespace(),
-            )
-    assert exc.value.status_code == 409
-    assert "auto-industry" in exc.value.detail
+        await dealer_ai_intake.assign_lead_partner(
+            intake.id, dealer_ai_intake.AssignPartnerRequest(broker_user_id=partner.id),
+            SimpleNamespace(headers={}, client=None), SimpleNamespace(role=Role.SUPER_ADMIN), db,
+        )
+    assert intake.broker_id == partner.id
+    db.commit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -115,10 +110,11 @@ async def test_dealer_partner_loader_rejects_suspended_and_deleted_accounts(stat
 
 
 @pytest.mark.asyncio
-async def test_shared_standing_gate_requires_both_signed_agreements() -> None:
+@pytest.mark.parametrize("role", [Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER])
+async def test_shared_standing_gate_requires_both_signed_agreements(role) -> None:
     user = SimpleNamespace(
         id=uuid4(),
-        role=Role.DEALER_PARTNER,
+        role=role,
         deleted_at=None,
         account_status="active",
         referral_partner_company_id=uuid4(),
@@ -135,7 +131,7 @@ async def test_shared_standing_gate_requires_both_signed_agreements() -> None:
         assert "contract_agreements.signed_at IS NOT NULL" in sql
 
 
-def test_operator_file_scope_is_owner_and_auto_variant_scoped() -> None:
+def test_operator_file_scope_is_owner_scoped_across_variants() -> None:
     user = SimpleNamespace(id=uuid4(), role=Role.DEALER_PARTNER)
     statement = operator_files._scope_intake_stmt(
         user,
@@ -148,11 +144,11 @@ def test_operator_file_scope_is_owner_and_auto_variant_scoped() -> None:
         )
     )
     assert "public_underwriting_intakes.broker_id" in sql
-    assert "public_underwriting_intakes.variant = 'dealer_gatekeeper_v1'" in sql
+    assert "public_underwriting_intakes.variant =" not in sql
 
 
 @pytest.mark.asyncio
-async def test_application_profile_intake_source_rejects_owned_real_estate_file() -> None:
+async def test_application_profile_intake_source_accepts_owned_real_estate_file() -> None:
     user = SimpleNamespace(id=uuid4(), role=Role.DEALER_PARTNER)
     intake = SimpleNamespace(
         id=uuid4(),
@@ -166,13 +162,11 @@ async def test_application_profile_intake_source_rejects_owned_real_estate_file(
         "require_dealer_partner_standing",
         AsyncMock(),
     ):
-        with pytest.raises(HTTPException) as exc:
-            await application_profiles._load_source(db, "intake", intake.id, user)
-    assert exc.value.status_code == 404
+        assert await application_profiles._load_source(db, "intake", intake.id, user) is intake
 
 
 @pytest.mark.asyncio
-async def test_communications_intake_scan_applies_standing_and_auto_scope() -> None:
+async def test_communications_intake_scan_applies_standing_and_owner_scope() -> None:
     statements = []
 
     async def execute(statement):
@@ -194,4 +188,4 @@ async def test_communications_intake_scan_applies_standing_and_auto_scope() -> N
         )
     )
     assert "public_underwriting_intakes.broker_id" in sql
-    assert "public_underwriting_intakes.variant = 'dealer_gatekeeper_v1'" in sql
+    assert "public_underwriting_intakes.variant =" not in sql

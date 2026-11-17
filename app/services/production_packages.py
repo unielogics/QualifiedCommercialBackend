@@ -66,6 +66,7 @@ from app.services import production_arrangement as pa
 from app.services import production_prefill as prefill_svc
 from app.services import production_term_sheets as sheets_svc
 from app.services import production_term_structure as term_structure
+from app.services.dealer_partner_access import REFERRAL_PARTNER_ROLES
 from app.services.payment_authorization import client_ip, presign_private_s3_object
 
 OPERATOR_ROLES: frozenset[Role] = frozenset({Role.SUPER_ADMIN, Role.LOAN_EXEC})
@@ -202,7 +203,7 @@ def _mode_for(user: User) -> Mode:
         return "operator"
     if is_rep(user):
         return "rep"
-    if user.role == Role.DEALER_PARTNER:
+    if user.role in REFERRAL_PARTNER_ROLES:
         return "partner"
     raise not_found()
 
@@ -210,7 +211,7 @@ def _mode_for(user: User) -> Mode:
 async def _require_partner_standing(db: AsyncSession, user: User) -> None:
     """Dealer partners are hard-gated behind their signed Platform Access and
     Referral Protection agreements everywhere else; the package honours the same gate."""
-    if user.role != Role.DEALER_PARTNER:
+    if user.role not in REFERRAL_PARTNER_ROLES:
         return
     from app.routers.dealer_ai_intake import _require_dealer_partner
 

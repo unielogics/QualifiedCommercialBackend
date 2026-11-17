@@ -81,7 +81,7 @@ from app.services.bucket_evidence import (
 )
 from app.services.deal_economics import calculate_deal_earnings, optional_float
 from app.services.dealer_partner_access import (
-    DEALER_INTAKE_VARIANT,
+    REFERRAL_INTAKE_ROLES,
     dealer_partner_intake_is_owned,
     require_dealer_partner_standing,
 )
@@ -679,7 +679,7 @@ def profile_read(profile: ApplicationProfile) -> ApplicationProfileRead:
 async def _profile_is_visible(
     db: AsyncSession, profile: ApplicationProfile, user: User
 ) -> bool:
-    if user.role == Role.DEALER_PARTNER:
+    if user.role in REFERRAL_INTAKE_ROLES:
         await require_dealer_partner_standing(db, user)
     if profile.dealer_id:
         is_training = (
@@ -702,13 +702,12 @@ async def _profile_is_visible(
                 return True
             except HTTPException:
                 return False
-        if user.role == Role.DEALER_PARTNER and profile.intake_id:
+        if user.role in REFERRAL_INTAKE_ROLES and profile.intake_id:
             visible_intake = (
                 await db.execute(
                     select(PublicUnderwritingIntake.id).where(
                         PublicUnderwritingIntake.id == profile.intake_id,
                         PublicUnderwritingIntake.broker_id == user.id,
-                        PublicUnderwritingIntake.variant == DEALER_INTAKE_VARIANT,
                     )
                 )
             ).scalar_one_or_none()
@@ -731,13 +730,12 @@ async def _profile_is_visible(
         ).scalar_one_or_none()
         if visible is not None:
             return True
-    if profile.intake_id and user.role == Role.DEALER_PARTNER:
+    if profile.intake_id and user.role in REFERRAL_INTAKE_ROLES:
         visible_intake = (
             await db.execute(
                 select(PublicUnderwritingIntake.id).where(
                     PublicUnderwritingIntake.id == profile.intake_id,
                     PublicUnderwritingIntake.broker_id == user.id,
-                    PublicUnderwritingIntake.variant == DEALER_INTAKE_VARIANT,
                 )
             )
         ).scalar_one_or_none()
@@ -766,7 +764,7 @@ async def load_profile(
 async def _load_source(
     db: AsyncSession, source_kind: str, source_id: UUID, user: User
 ) -> Deal | Loan | PublicUnderwritingIntake | DealerBusiness:
-    if user.role == Role.DEALER_PARTNER:
+    if user.role in REFERRAL_INTAKE_ROLES:
         await require_dealer_partner_standing(db, user)
     if source_kind == "deal":
         source = await db.get(Deal, source_id)
@@ -790,7 +788,7 @@ async def _load_source(
         source = await db.get(PublicUnderwritingIntake, source_id)
         if source is not None and user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
             allowed = False
-            if user.role == Role.DEALER_PARTNER:
+            if user.role in REFERRAL_INTAKE_ROLES:
                 allowed = dealer_partner_intake_is_owned(user, source)
             elif user.role == Role.FIELD_REP:
                 allowed = source.broker_id == user.id

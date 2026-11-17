@@ -10,7 +10,7 @@ registers the routes.
 from __future__ import annotations
 
 # ruff: noqa: B008, E501
-from typing import Any, Literal
+from typing import Literal
 from uuid import UUID
 
 from fastapi import BackgroundTasks, Depends, HTTPException, Request, status
@@ -21,6 +21,7 @@ from sqlalchemy.orm import selectinload, with_loader_criteria
 import app.routers.dealer_ai_intake as core
 
 __all__ = [
+    "list_referral_programs",
     "list_broker_dealer_leads",
     "broker_dealer_channel_inbox",
     "broker_mark_channel_seen",
@@ -42,6 +43,14 @@ __all__ = [
 ]
 
 
+@core.broker_router.get("/programs")
+async def list_referral_programs(user: core.CurrentUser, db: AsyncSession = Depends(core.get_db)):
+    from app.services.referral_programs import active_catalog
+
+    await core._require_dealer_partner(user, db)
+    return await active_catalog(db)
+
+
 @core.broker_router.get("", response_model=core.DealerAILeadListResponse)
 async def list_broker_dealer_leads(
     user: core.CurrentUser,
@@ -49,7 +58,7 @@ async def list_broker_dealer_leads(
     q: str | None = None,
     status_filter: str | None = None,
     probability_status: str | None = None,
-    archived_filter: Literal["active", "archived", "all"] = "active",
+    archived_filter: Literal["active", "archived", "all", "visible"] = "active",
     limit: int = 50,
     offset: int = 0,
 ) -> core.DealerAILeadListResponse:
@@ -61,7 +70,6 @@ async def list_broker_dealer_leads(
         .join(core.Bucket, core.PublicUnderwritingIntake.bucket_id == core.Bucket.id)
         .where(
             core.PublicUnderwritingIntake.broker_id == user.id,
-            core.PublicUnderwritingIntake.variant == core.DEALER_VARIANT,
             # A broker's own deletion request hides the lead from their own
             # board immediately — the lead stays fully intact and visible to
             # admin (with a pending badge) until admin separately confirms.
@@ -82,6 +90,8 @@ async def list_broker_dealer_leads(
     closed_lifecycle = core._closed_intake_lifecycle_clause()
     if archived_filter == "active":
         stmt = stmt.where(core.Bucket.archived_at.is_(None), ~closed_lifecycle)
+    elif archived_filter == "visible":
+        stmt = stmt.where(core.Bucket.archived_at.is_(None))
     elif archived_filter == "archived":
         stmt = stmt.where(or_(core.Bucket.archived_at.is_not(None), closed_lifecycle))
     if status_filter and status_filter != "all":
@@ -128,7 +138,6 @@ async def broker_dealer_channel_inbox(
         .where(
             core.Bucket.archived_at.is_(None),
             core.PublicUnderwritingIntake.broker_id == user.id,
-            core.PublicUnderwritingIntake.variant == core.DEALER_VARIANT,
             core.PublicUnderwritingIntake.delete_requested_at.is_(None),
         )
         .options(selectinload(core.PublicUnderwritingIntake.bucket).selectinload(core.Bucket.notes))
@@ -155,110 +164,16 @@ async def create_broker_ai_lead(
     user: core.CurrentUser,
     db: AsyncSession = Depends(core.get_db),
 ) -> core.DealerIntakeResponse:
-    """Dealer partner creates an AI-underwriter lead ON BEHALF of their own
-    client. Dealer-variant only. Reuses the same creation helpers as the
-    public /start and admin-create flows. No terms/throttle."""
+    """Create any supported application with immutable partner ownership."""
     await core._require_dealer_partner(user, db)
+    # Use the same validation, checklists, secure rooms and consent-aware
+    # invitations as staff. Partners cannot choose another owner or force a
+    # second file over a pre-existing client relationship.
+    shared = core.AdminLeadCreate.model_validate(payload.model_dump())
+    if shared.variant == "foreclosure_rescue":
+        raise HTTPException(422, "Use the foreclosure rescue form for legal and property details")
+    return await core._create_admin_ai_lead_core(shared, request, user, db)
 
-    if not payload.force_new:
-        existing = await core._latest_active_intake_by_email(db, str(payload.email), variant=core.DEALER_VARIANT)
-        if existing is not None:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                {"message": "An active lead already exists for this email.", "intake_id": str(existing.id)},
-            )
-
-    provenance = {
-        "created_by_broker": {
-            "user_id": str(user.id),
-            "name": user.name,
-            "email": user.email,
-            "at": core._now().isoformat(),
-        },
-        "on_behalf_of_client": True,
-    }
-
-    adapter = core.DealerIntakeStart(
-        **core.business_profile.payload_fields(payload),
-        full_name=payload.full_name,
-        email=payload.email,
-        phone=payload.phone,
-        business_name=payload.business_name,
-    )
-    client = await core._find_or_create_client(db, adapter)
-    bucket, link = await core._create_bucket_for_intake(db, client, adapter, request)
-
-    if isinstance(client.lead_intake, dict):
-        client.lead_intake = {**client.lead_intake, "created_by_broker": str(user.id)}
-
-    token = core._new_public_token()
-    intake_state: dict[str, Any] = {
-        "messages": [],
-        **core.business_profile.state_entry(payload),
-        "source": "dealer_ai_intake",
-        "broker_provenance": provenance,
-    }
-
-    intake = core.PublicUnderwritingIntake(
-        source_kind="dealer_partner",
-        source_actor_name=(user.name or user.email or "")[:200],
-        source_user_id=user.id,
-        client_id=client.id,
-        bucket_id=bucket.id,
-        bucket_upload_link_id=link.id,
-        broker_id=user.id,
-        token_hash=core._hash_token(token),
-        variant=core.DEALER_VARIANT,
-        full_name=payload.full_name.strip(),
-        email=client.email or core._normalize_email(str(payload.email)),
-        phone=payload.phone,
-        business_name=payload.business_name,
-        preferred_language=payload.preferred_language,
-        asset_rows=[],
-        intake_state=intake_state,
-    )
-    db.add(intake)
-    await db.flush()
-    await core.profiles_service.provision_profile_for_intake(db, intake)
-    await core._log(
-        db,
-        bucket.id,
-        "dealer_ai_lead_created_by_broker",
-        request=request,
-        user=user,
-        actor_role="dealer_partner",
-        target_type="public_underwriting_intake",
-        target_id=str(intake.id),
-        detail=f"Broker {user.email} created dealer lead for {intake.email}",
-    )
-    welcome_text = core._admin_created_welcome(core.DEALER_VARIANT)
-    db.add(core._persist_admin_welcome_message(bucket.id, welcome_text))
-    await db.commit()
-    intake = await core._load_broker_dealer_lead(db, user, intake.id)
-
-    email_note = ""
-    if payload.notify_client:
-        record = await core._record_resume_email(
-            intake, token=token, request=request, reason="broker_created", db=db, sender_user_id=user.id,
-        )
-        await db.commit()
-        intake = await core._load_broker_dealer_lead(db, user, intake.id)
-        email_note = (
-            " A secure login link was emailed to the client."
-            if record.get("ok")
-            else " Email delivery is unavailable; share the resume link manually."
-        )
-
-    return await core._response(
-        db,
-        intake,
-        token=token,
-        public_path="/dealer-ai-underwriter",
-        include_management=False,
-        admin_thread=True,
-        thread_user=user,
-        assistant_message=welcome_text + email_note,
-    )
 
 @core.broker_router.get("/{intake_id}", response_model=core.DealerIntakeResponse)
 async def get_broker_dealer_lead(
