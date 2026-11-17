@@ -143,6 +143,7 @@ from app.services import (
     booking_reminders,
     bucket_archive,  # noqa: F401  (handlers reach this through core)
     business_profile,
+    business_purpose,  # noqa: F401  (handlers reach this through core)
     equipment_financing,
     file_events,  # noqa: F401  (handlers reach this through core)
     funding_requests,
@@ -154,6 +155,7 @@ from app.services import (
     merchant_processing,
     notifications,
     provenance,
+    real_estate_vocabulary,
     retention_holds,  # noqa: F401  (handlers reach this through core)
     upload_validation,  # noqa: F401  (handlers reach this through core)
 )
@@ -783,6 +785,11 @@ class FundingReviewStart(PublicIntakeAttribution, RequiredBusinessProfileFields,
     estimated_value_or_purchase_price: float | None = Field(default=None, ge=0)
     monthly_rent: float | None = Field(default=None, ge=0)
     estimated_credit_tier: str | None = Field(default=None, max_length=64)
+    # Who uses the property and what the money is for. Optional on the API so a
+    # page cached from before the questions still starts a file; the form asks both.
+    occupancy: str | None = Field(default=None, max_length=40)
+    business_purpose: bool | None = None
+    purpose_description: str | None = Field(default=None, max_length=real_estate_vocabulary.PURPOSE_DESCRIPTION_MAX)
     terms_accepted: bool = False
     privacy_accepted: bool = False
     terms_version: str = Field(default=TERMS_VERSION, max_length=32)
@@ -794,10 +801,33 @@ class FundingReviewStart(PublicIntakeAttribution, RequiredBusinessProfileFields,
     preferred_language: Language = Language.EN
     capital_readiness_diagnostic: CapitalReadinessDiagnostic | None = None
 
-    @field_validator("phone", "investor_name", "target_property_address", "transaction_type", "estimated_credit_tier", mode="before")
+    @field_validator(
+        "phone", "investor_name", "target_property_address", "transaction_type", "estimated_credit_tier",
+        "occupancy", "purpose_description", mode="before",
+    )
     @classmethod
     def empty_to_none(cls, value: object) -> object:
         return None if value == "" else value
+
+    @field_validator("transaction_type")
+    @classmethod
+    def fold_transaction_type(cls, value: str | None) -> str | None:
+        return real_estate_vocabulary.fold_transaction_type(value)
+
+    @field_validator("estimated_credit_tier")
+    @classmethod
+    def fold_credit_tier(cls, value: str | None) -> str | None:
+        return real_estate_vocabulary.fold_credit_tier(value)
+
+    @field_validator("occupancy")
+    @classmethod
+    def fold_occupancy(cls, value: str | None) -> str | None:
+        return real_estate_vocabulary.fold_occupancy(value)
+
+    @field_validator("purpose_description")
+    @classmethod
+    def clean_purpose(cls, value: str | None) -> str | None:
+        return real_estate_vocabulary.clean_purpose_description(value)
 
 
 def _public_intake_attribution(
@@ -942,6 +972,8 @@ class AdminLeadCreate(BusinessProfileFields):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr | None = None
     phone: OptionalPhone = None
+    # Staff type it too; a name or a note in the phone field is refused here.
+    business_phone: OptionalPhone = None
     application_completion: Literal["client", "operator"] = "operator"
     # Omitted preserves the legacy notify_client behavior. An explicit empty
     # list creates a room for copying the link without sending anything.
@@ -1013,6 +1045,16 @@ class AdminLeadCreate(BusinessProfileFields):
     def empty_to_none(cls, value: object) -> object:
         return None if value == "" else value
 
+    @field_validator("transaction_type")
+    @classmethod
+    def fold_transaction_type(cls, value: str | None) -> str | None:
+        return real_estate_vocabulary.fold_transaction_type(value)
+
+    @field_validator("estimated_credit_tier")
+    @classmethod
+    def fold_credit_tier(cls, value: str | None) -> str | None:
+        return real_estate_vocabulary.fold_credit_tier(value)
+
 
 class BrokerLeadCreate(RequiredBusinessProfileFields):
     """Dealer partner (Role.DEALER_PARTNER) creates an AI-underwriter lead on
@@ -1057,6 +1099,7 @@ class AdminLeadContactUpdate(BusinessProfileFields):
     full_name: str | None = Field(default=None, min_length=1, max_length=180)
     email: EmailStr | None = None
     phone: OptionalPhone = None
+    business_phone: OptionalPhone = None
     business_name: str | None = Field(default=None, max_length=180)
     loan_purpose: str | None = Field(default=None, max_length=255)
     requested_loan_amount: float | None = Field(default=None, ge=0)
@@ -1744,6 +1787,14 @@ class DealerIntakeRead(ORMModel):
     retention_state: Literal[
         "legal_hold", "protected", "expired", "unclassified"
     ] = "unclassified"
+    #: Desk views only: the business-purpose review of an owner-occupied
+    #: personal-use request (see app/services/business_purpose.py).
+    personal_use_review: dict[str, Any] | None = None
+
+
+class PersonalUseDecision(BaseModel):
+    decision: Literal["hold", "clear"]
+    note: str | None = Field(default=None, max_length=500)
 
 
 class SecureRoomHandoffRequest(BaseModel):
@@ -3509,7 +3560,7 @@ def _dscr_fico_estimate(intake: PublicUnderwritingIntake) -> tuple[int | None, s
         score = int(match.group())
         if 300 <= score <= 850:
             return score, f"stated tier '{tier_text}'"
-    for keyword, score in (("excellent", 780), ("prime", 760), ("good", 720), ("mid", 700), ("fair", 660), ("low", 620), ("poor", 580)):
+    for keyword, score in (("excellent", 780), ("prime", 760), ("strong", 740), ("good", 720), ("mid", 700), ("fair", 660), ("below", 620), ("low", 620), ("poor", 580)):
         if keyword in tier_text:
             return score, f"stated tier '{tier_text}'"
     return None, "no credit signal"
@@ -3581,7 +3632,9 @@ async def _merge_thread_borrower_facts(db: AsyncSession, intake: PublicUnderwrit
     if not proposed:
         return
     if intake.variant == FUNDING_VARIANT:
-        _merge_funding_review_details(intake, proposed)
+        accepted = _merge_funding_review_details(intake, proposed)
+        if accepted.keys() & {"occupancy", "business_purpose"}:
+            await business_purpose.after_answers(db, intake, source=business_purpose.SOURCE_CHAT, answers=accepted)
     elif intake.variant == MAIN_STREET_VARIANT:
         _merge_main_street_details(intake, proposed)
         _apply_loan_program_fit(intake)
@@ -3717,55 +3770,118 @@ _FUNDING_REVIEW_DETAIL_KEYS = (
     "is_commercial_property",
     "property_type",
     "requested_amount",
+    "occupancy",
+    "business_purpose",
+    "purpose_description",
+    "transaction_type",
+    "existing_payoff_amount",
 )
+
+#: Where each detail came from, kept beside the answers so later readers (the
+#: application's prefill, the desk) can tell the borrower's own form answer
+#: from the AI's reading of a chat message.
+DETAIL_SOURCES_KEY = "sources"
 
 
 def _funding_review_details(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     """Conversationally-gathered real-estate detail (down payment, prior
-    ownership, residential-vs-commercial intent) — same intake_state
-    sub-object pattern as funding_review_basics/credit_pull. Populated via
-    proposed_borrower_facts in funding_review_chat, never by the dealer flow."""
+    ownership, residential-vs-commercial intent, occupancy, business purpose)
+    — same intake_state sub-object pattern as funding_review_basics/credit_pull.
+    Populated via proposed_borrower_facts in the chat and by the start form's
+    occupancy and purpose answers, never by the dealer flow."""
     raw = _intake_state(intake).get("funding_review_details")
     return raw if isinstance(raw, dict) else {}
 
 
-def _merge_funding_review_details(intake: PublicUnderwritingIntake, proposed: Any) -> None:
-    """Validates and merges an AI-proposed proposed_borrower_facts object into
+def _number_or_none(value: Any, *, minimum: float = 0, maximum: float = 500_000_000, allow_zero: bool = True) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if number != number or number < minimum or number > maximum or (not allow_zero and number == 0):
+        return None
+    return number
+
+
+def _merge_funding_review_details(
+    intake: PublicUnderwritingIntake,
+    proposed: Any,
+    *,
+    source: str = "chat",
+) -> dict[str, Any]:
+    """Validates and merges proposed real-estate details into
     intake_state["funding_review_details"]. Never trusts the model's shape
     blindly — any key not on the allowlist, or with the wrong type, is
-    dropped rather than persisted."""
+    dropped rather than persisted, and every value is folded through
+    `real_estate_vocabulary` so "Primaary" lands as an occupancy (never as a
+    property type) and an unreadable property type is not stored at all.
+    Returns what was accepted."""
     if not isinstance(proposed, dict):
-        return
+        return {}
+    vocab = real_estate_vocabulary
     accepted: dict[str, Any] = {}
     for key in _FUNDING_REVIEW_DETAIL_KEYS:
         if key not in proposed:
             continue
         value = proposed[key]
-        if key == "prior_property_ownership" or key == "is_commercial_property":
+        if key in {"prior_property_ownership", "is_commercial_property"}:
             if isinstance(value, bool):
                 accepted[key] = value
-            continue
-        if key == "down_payment_amount":
-            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
-                accepted[key] = float(value)
-            continue
-        if key == "requested_amount":
-            if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= 500_000_000:
-                accepted[key] = float(value)
-            continue
-        if key == "property_type":
-            text = str(value).strip()
+        elif key in {"down_payment_amount", "existing_payoff_amount"}:
+            number = _number_or_none(value)
+            if number is not None:
+                accepted[key] = number
+        elif key == "requested_amount":
+            number = _number_or_none(value, allow_zero=False)
+            if number is not None:
+                accepted[key] = number
+        elif key == "property_type":
+            property_type, occupancy = vocab.fold_property_type(value)
+            if property_type:
+                accepted[key] = property_type
+            elif occupancy and "occupancy" not in proposed:
+                accepted["occupancy"] = occupancy
+        elif key == "occupancy":
+            occupancy = vocab.occupancy_of(value)
+            if occupancy:
+                accepted[key] = occupancy
+        elif key == "business_purpose":
+            purpose = vocab.fold_business_purpose(value)
+            if purpose is not None:
+                accepted[key] = purpose
+        elif key == "purpose_description":
+            text = vocab.clean_purpose_description(value)
             if text:
-                accepted[key] = text[:64]
-            continue
+                accepted[key] = text
+        elif key == "transaction_type":
+            label = vocab.transaction_type_of(value)
+            if label and label != vocab.NOT_SURE:
+                accepted[key] = label
     if "requested_amount" in accepted and not funding_requests.accept_initial_amount_fact(intake, accepted["requested_amount"], source="funding_review_chat"):
         accepted.pop("requested_amount")
     if not accepted:
-        return
+        return {}
     state = _intake_state(intake)
     existing = state.get("funding_review_details")
     merged = dict(existing) if isinstance(existing, dict) else {}
+    sources = merged.get(DETAIL_SOURCES_KEY)
+    sources = dict(sources) if isinstance(sources, dict) else {}
+    transaction_type = accepted.pop("transaction_type", None)
     merged.update(accepted)
+    for key in accepted:
+        sources[key] = source
+    if transaction_type:
+        # A restated transaction ("it's actually a HELOC") updates what the
+        # start form said, the way a restated amount does below.
+        basics = state.get("funding_review_basics")
+        basics = dict(basics) if isinstance(basics, dict) else {}
+        previous = basics.get("transaction_type")
+        basics["transaction_type"] = transaction_type
+        state["funding_review_basics"] = basics
+        if not (intake.loan_purpose or "").strip() or intake.loan_purpose == previous:
+            intake.loan_purpose = transaction_type
+        sources["transaction_type"] = source
+        accepted["transaction_type"] = transaction_type
+    merged[DETAIL_SOURCES_KEY] = sources
     state["funding_review_details"] = merged
     # A restated amount supersedes the intake-form figure everywhere (DSCR
     # potential, PDF, packets) — keep the column and the basics in sync.
@@ -3776,18 +3892,38 @@ def _merge_funding_review_details(intake: PublicUnderwritingIntake, proposed: An
             basics["requested_amount"] = accepted["requested_amount"]
             state["funding_review_basics"] = basics
     intake.intake_state = state
+    return accepted
+
+
+def _re_prequal_missing(intake: PublicUnderwritingIntake) -> list[str]:
+    """The conversational details a real-estate prequalification still needs.
+
+    Purpose-aware: a down payment is a purchase question, so a refinance or a
+    home-equity line never waits on one. Occupancy and business purpose are
+    asked on every file, because QC lends for business purposes only.
+    """
+    details = _funding_review_details(intake)
+    basics = _intake_state(intake).get("funding_review_basics")
+    basics = basics if isinstance(basics, dict) else {}
+    transaction = basics.get("transaction_type") or intake.loan_purpose
+    wanted = ["occupancy", "business_purpose", "prior_property_ownership", "is_commercial_property"]
+    if real_estate_vocabulary.is_purchase(transaction):
+        wanted.append("down_payment_amount")
+    return [key for key in wanted if details.get(key) is None]
 
 
 def _re_prequal_ready(intake: PublicUnderwritingIntake) -> bool:
     """True once a real-estate lead has enough to auto-surface a
     prequalification in chat: a completed soft credit pull, every RE baseline
-    document category uploaded, and every conversational detail (down
-    payment, prior ownership, commercial-vs-residential) answered — on top
-    of the deal basics already required to start the intake. Distinct from
-    _apply_lending_readiness (bucket_ai.py), which is dealer-shaped
+    document category uploaded, every purpose-relevant conversational detail
+    answered (see `_re_prequal_missing`), and no open personal-use review —
+    on top of the deal basics already required to start the intake. Distinct
+    from _apply_lending_readiness (bucket_ai.py), which is dealer-shaped
     (bank-statement/tax-return baseline) and does not fit RE evidence
     categories or factor in credit-pull status. Dealer leads never call this."""
     if intake.variant != FUNDING_VARIANT:
+        return False
+    if business_purpose.is_open(intake):
         return False
     if _credit_pull_state(intake).get("fico") is None:
         return False
@@ -3800,8 +3936,7 @@ def _re_prequal_ready(intake: PublicUnderwritingIntake) -> bool:
         for key in ("target_property_address", "transaction_type", "requested_amount", "estimated_value_or_purchase_price")
     ):
         return False
-    details = _funding_review_details(intake)
-    return all(details.get(key) is not None for key in _FUNDING_REVIEW_DETAIL_KEYS if key != "property_type")
+    return not _re_prequal_missing(intake)
 
 
 def _entity_structure_complete(intake: PublicUnderwritingIntake) -> bool:
@@ -4511,11 +4646,22 @@ def _context_fn_for(intake: PublicUnderwritingIntake):
 def _funding_review_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     state = _intake_state(intake)
     basics = state.get("funding_review_basics") if isinstance(state.get("funding_review_basics"), dict) else {}
+    details = _funding_review_details(intake)
+    occupancy = real_estate_vocabulary.occupancy_of(details.get("occupancy"))
+    collateral = (
+        f"{real_estate_vocabulary.OCCUPANCY_LABELS[occupancy].lower()} pledged for a business-purpose loan"
+        if occupancy in real_estate_vocabulary.OWNER_OCCUPIED
+        else "income-producing real estate"
+    )
     return {
         "review_type": "real_estate_dscr_v1",
         "deal_type": "real estate investor funding review",
         "documentation_level": "preliminary DSCR / investor review",
-        "collateral_type": "income-producing real estate",
+        "collateral_type": collateral,
+        "occupancy": real_estate_vocabulary.OCCUPANCY_LABELS.get(occupancy or "") if occupancy else None,
+        "business_purpose": details.get("business_purpose"),
+        "personal_use_review": business_purpose.client_context(intake),
+        "details_still_needed": _re_prequal_missing(intake),
         "loan_purpose": intake.loan_purpose or basics.get("transaction_type"),
         "requested_loan_amount": float(funding_requests.intake_requested_amount(intake)) if funding_requests.intake_requested_amount(intake) is not None else basics.get("requested_amount"),
         "estimated_credit_tier": basics.get("estimated_credit_tier"),
@@ -7619,6 +7765,8 @@ async def _response(
     # Redact internal-only data from the public/uploader payload. The dealer
     # sees only whitelisted intake_state keys and a sanitized review result.
     intake_read.intake_state = _client_safe_intake_state(intake.intake_state)
+    if include_management or admin_thread:
+        intake_read.personal_use_review = business_purpose.desk_read(intake)
     intake_read.result_snapshot = _client_safe_result(current_result_projection if current_result_projection is not None else _latest_result_for_intake(intake))
     review_read = None
     if review and not derived_pending:

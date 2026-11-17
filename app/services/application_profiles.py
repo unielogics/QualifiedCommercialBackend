@@ -446,6 +446,29 @@ def fits_profile_field(field: str, value: str) -> bool:
     return limit is None or len(value) <= limit
 
 
+_PHONE_FACT_KEYS = frozenset({"phone", "business_phone", "contact_phone", "mobile_phone", "cell_phone", "home_phone", "work_phone"})
+_EMAIL_FACT_KEYS = frozenset({"email", "borrower_email", "business_email", "contact_email"})
+_EMAIL_SHAPE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+
+
+def contact_fact_reads(field_key: str, value: object) -> bool:
+    """A phone fact must be a phone number and an email fact an email address.
+
+    Document extraction has put a principal's name in the phone slot; that
+    value is not kept as a suggestion the desk might accept or a form might
+    prefill. Every other fact passes through untouched.
+    """
+    from app.schemas.phone import normalize as normalize_phone
+    from app.services.extracted_facts import canonical_field_key
+
+    key = canonical_field_key(field_key)
+    if key in _PHONE_FACT_KEYS or key.endswith("_phone"):
+        return normalize_phone(str(value)) is not None
+    if key in _EMAIL_FACT_KEYS or key.endswith("_email"):
+        return bool(_EMAIL_SHAPE.fullmatch(str(value).strip()))
+    return True
+
+
 async def capture_extracted_profile_facts(
     db: AsyncSession, *, file: BucketFile, analysis: BucketFileAnalysis
 ) -> list[UUID]:
@@ -482,6 +505,8 @@ async def capture_extracted_profile_facts(
                 raw = {"value": raw}
             value = raw.get("value")
             if value in (None, ""):
+                continue
+            if not contact_fact_reads(str(field_key), value):
                 continue
             normalized = " ".join(str(value).casefold().split())
             # Once an operator accepts a scalar logical field, later uploads
