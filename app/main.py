@@ -109,6 +109,7 @@ from app.routers import (
     users,
     worksheets,
 )
+from app.routers import client_forms as client_forms_router
 from app.routers import form_kinds as form_kinds_router
 from app.routers import (
     google as google_router,
@@ -345,6 +346,7 @@ for r in [
     credit.router,
     credit_links.router,
     form_kinds_router.router,
+    client_forms_router.router,
     intake.router,
     rates.router,
     regional_managers.router,

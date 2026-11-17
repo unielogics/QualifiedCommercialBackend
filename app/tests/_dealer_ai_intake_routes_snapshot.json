@@ -638,6 +638,12 @@
   [
     "funding_router",
     "POST",
+    "/public/funding-review/{token}/forms/{kind}/open",
+    "funding_review_open_form"
+  ],
+  [
+    "funding_router",
+    "POST",
     "/public/funding-review/{token}/requested-documents/sign",
     "funding_review_sign_requested_document"
   ],

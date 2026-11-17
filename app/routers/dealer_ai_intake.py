@@ -8467,6 +8467,10 @@ async def _sign_requested_document(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Requested document not found")
     if not req.requires_signature:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "This requested document does not require a signature")
+    if req.signature_kind == "signed_form":
+        # A form that ends in a signature is signed on its own page, over the
+        # frozen form itself (app/services/signed_forms.py).
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": "sign_on_form_page", "message": "Open the application to review and sign it."})
     is_success_fee = req.signature_kind == "success_fee_agreement"
     if is_success_fee and not allow_success_fee_agreement:
         raise HTTPException(

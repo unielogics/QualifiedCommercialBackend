@@ -29,9 +29,11 @@ class LibraryItemRead(BaseModel):
     kind: str
     required_level: RequiredLevel
     description: str = ""
-    #: The first online form this item is filled in through, when it is one of the four.
-    form_kind: Literal["pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule", "operating_plan"] | None = None
-    form_kinds: list[Literal["pfs", "debt_schedule", "p_and_l", "balance_sheet", "real_estate_schedule", "operating_plan"]] = Field(default_factory=list)
+    #: The first online form this item is filled in through. A read model: the
+    #: registry (app/services/form_kinds.py) decides the kinds, so a kind added
+    #: there (the real-estate application) never breaks this read.
+    form_kind: str | None = None
+    form_kinds: list[str] = Field(default_factory=list)
     #: False for an internal review the client is never asked for.
     client_visible: bool = True
     verification_required: bool = True

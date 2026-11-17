@@ -3978,9 +3978,10 @@ async def _application_room_signables(
             signed=row.status == "uploaded",
             document_text=certified_text(row),
             document_sha256=sig_service.document_hash(certified_text(row)) if certified_text(row) else None,
+            # A form that ends in a signature opens its own page from the room.
             signable=bool(
                 row.signature_document_text
-                or row.signature_kind == "credit_authorization"
+                or row.signature_kind in {"credit_authorization", "signed_form"}
             ),
         )
         for row in rows
@@ -4518,6 +4519,27 @@ async def public_application_room_consent(
         if item.status == "active":
             background.add_task(sync_item_background, item.id)
     return await _application_room_state(db, link=link, profile=profile)
+
+
+@router.post("/public/room/{token}/forms/{kind}/open")
+async def public_application_room_open_form(
+    token: str,
+    kind: str,
+    payload: ApplicationRoomAccess,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Open the real-estate application from the PIN room: the room's PIN
+    already identified the client, so the form opens without an email code."""
+    if kind != "re_application":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
+    link, profile = await _public_application_room(db, token, payload.passcode, request)
+    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    from app.routers import client_forms as client_forms_router
+
+    url = await client_forms_router.hand_off(db, profile, email=link.recipient_email or (intake.email if intake else None))
+    await db.commit()
+    return {"url": url}
 
 
 @router.post(

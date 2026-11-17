@@ -35,7 +35,8 @@ __all__ = [
     "funding_review_sign_requested_document",
     "run_funding_review",
     "funding_router_secure_room",
-    "book_funding_review_call"
+    "book_funding_review_call",
+    "funding_review_open_form",
 ]
 
 
@@ -602,3 +603,27 @@ async def book_funding_review_call(
         public_path=core.FUNDING_PUBLIC_PATH,
         assistant_message="Your call is booked. Keep uploading property, rent, and PITIA evidence here if anything is still missing before the meeting.",
     )
+
+
+@core.funding_router.post("/{token}/forms/{kind}/open")
+async def funding_review_open_form(
+    token: str,
+    kind: str,
+    db: AsyncSession = Depends(core.get_db),
+) -> dict:
+    """Open the real-estate application from the signed-in room: the room's
+    session carries over, so the client does not type a code again."""
+    from app.routers import client_forms as client_forms_router
+
+    intake = await core._load_public_intake(db, token)
+    core._require_funding_intake(intake)
+    if kind != "re_application":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
+    profile = (
+        await db.execute(select(core.ApplicationProfile).where(core.ApplicationProfile.intake_id == intake.id).limit(1))
+    ).scalar_one_or_none()
+    if profile is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This file is not ready for an application yet")
+    url = await client_forms_router.hand_off(db, profile, email=intake.email)
+    await db.commit()
+    return {"url": url}

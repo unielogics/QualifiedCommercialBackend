@@ -108,6 +108,29 @@ OPERATING_PLAN = {
     "collection_config": {"form_kind": "operating_plan", "document_type": "operating_plan", "quantity": 1, "unit": "files", "evidence_classes": ["operating_plan"]},
 }
 
+#: The Qualified Commercial real-estate loan application, filled from what the
+#: file knows and signed at its end (app/services/re_application_schema.py).
+#: The signature also counts as the credit authorization.
+RE_APPLICATION = {
+    **document(
+        "signed_re_application",
+        "Real estate loan application",
+        "Collect the signed Qualified Commercial real estate loan application. Most answers are filled in from the intake; the client completes the rest, reviews everything and signs.",
+        category="borrower_info",
+    ),
+    "requirement_kind": "form",
+    "collection_config": {
+        "form_kind": "re_application",
+        "evidence_classes": ["re_application"],
+        "signature": {
+            "required": True,
+            "signers": ["borrower", "coborrower"],
+            "consents": ["business_purpose", "accuracy", "credit_authorization", "information_sharing", "esign"],
+            "satisfies": ["signed_credit_authorization"],
+        },
+    },
+}
+
 PFS = document(
     "owner_personal_financial_statement",
     "Owner personal financial statement",
@@ -236,6 +259,7 @@ CATALOG: dict[str, dict[str, Any]] = {
         "slug": "dscr-rental",
         "verticals": ["real_estate"],
         "docs": [
+            deepcopy(RE_APPLICATION),
             document(
                 "rent_roll",
                 "Leases / current rent roll",
@@ -275,6 +299,7 @@ CATALOG: dict[str, dict[str, Any]] = {
         "slug": "fix-and-flip",
         "verticals": ["real_estate"],
         "docs": [
+            deepcopy(RE_APPLICATION),
             document(
                 "rehab_scope",
                 "Rehab scope, budget and contractor bid",
@@ -306,6 +331,7 @@ CATALOG: dict[str, dict[str, Any]] = {
         "slug": "bridge",
         "verticals": ["real_estate"],
         "docs": [
+            deepcopy(RE_APPLICATION),
             document(
                 "purchase_contract",
                 "Purchase contract",
@@ -336,6 +362,7 @@ CATALOG: dict[str, dict[str, Any]] = {
         "slug": "construction",
         "verticals": ["real_estate"],
         "docs": [
+            deepcopy(RE_APPLICATION),
             document(
                 "construction_budget",
                 "Hard / soft cost budget and contract",
@@ -367,6 +394,7 @@ CATALOG: dict[str, dict[str, Any]] = {
         "slug": "portfolio",
         "verticals": ["real_estate"],
         "docs": [
+            deepcopy(RE_APPLICATION),
             document(
                 "real_estate_schedule",
                 "Schedule of real estate owned",

@@ -541,7 +541,9 @@ def test_the_link_check_admits_all_four_kinds_and_the_migration_agrees():
     checks = [c.sqltext.text for c in FinancialFormLink.__table__.constraints if getattr(c, "name", None) == "ck_financial_form_links_kind"]
     # The standard packet keeps its four forms; standalone real estate and
     # operating plans and an explicitly scoped worksheet are additional kinds.
-    assert checks == ["kind in ('pfs','debt_schedule','p_and_l','balance_sheet','real_estate_schedule','operating_plan','worksheet')"]
+    assert checks == ["kind in ('pfs','debt_schedule','p_and_l','balance_sheet','real_estate_schedule','operating_plan','worksheet','re_application')"]
+    client_forms_migration = Path("alembic/versions/0280_client_forms.py").read_text()
+    assert ",'re_application')" in client_forms_migration
     assert FinancialFormLink.__table__.c.packet_id.nullable
     migration = Path("alembic/versions/0203_business_statements_and_packets.py").read_text()
     assert "kind in ('pfs','debt_schedule','p_and_l','balance_sheet')" in migration

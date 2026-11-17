@@ -406,7 +406,7 @@ def test_the_migration_chain_has_one_head():
     from alembic.script import ScriptDirectory
 
     heads = ScriptDirectory.from_config(Config("alembic.ini")).get_heads()
-    assert heads == ["0279_chatgpt_product_feed"]
+    assert heads == ["0281_form_signing"]
     assert all(len(head) <= 32 for head in heads)
 
 

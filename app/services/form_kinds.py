@@ -134,7 +134,25 @@ _KINDS: tuple[FormKind, ...] = (
     ),
 )
 
-KINDS: dict[str, FormKind] = {kind.key: kind for kind in _KINDS}
+#: The Qualified Commercial real-estate loan application (app/services/re_application_schema.py):
+#: filled on its own page, frozen on submission, signed at its end.
+RE_APPLICATION = FormKind(
+    key="re_application",
+    label="Real estate loan application",
+    slot_category="Application",
+    classification="re_application",
+    engine=ENGINE_CLIENT_FORM,
+    requirement_keys=("signed_re_application",),
+    signable=True,
+    default_signature={
+        "signers": ["borrower"],
+        "consents": ["business_purpose", "accuracy", "credit_authorization", "information_sharing", "esign"],
+        "satisfies": ["signed_credit_authorization"],
+    },
+    category="borrower_info",
+)
+
+KINDS: dict[str, FormKind] = {kind.key: kind for kind in (*_KINDS, RE_APPLICATION)}
 
 
 def register(kind: FormKind) -> FormKind:
