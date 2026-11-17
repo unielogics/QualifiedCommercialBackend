@@ -146,6 +146,7 @@ from app.schemas.application_profile import (
     PublicFileOwnerConsentResult,
     PublicFileOwnerConsentSubmit,
     RoomDeliveryReceipt,
+    RoomInvitationStatus,
     RoomPinRotateRequest,
     RoomReminderCreate,
     RoomRequestCreate,
@@ -2222,6 +2223,8 @@ def _room_reminder_copy(purpose: str) -> tuple[str, str]:
     still knows what to do. The sentence is dropped into the delivery
     template as "<rep> has asked you to <purpose> for <business>".
     """
+    if purpose == "invitation":
+        return "tab=application", "sign in to your secure room and complete your application"
     if purpose == "bank_connect":
         return (
             "tab=banking",
@@ -2232,6 +2235,28 @@ def _room_reminder_copy(purpose: str) -> tuple[str, str]:
     if purpose == "use_of_funds":
         return "tab=budget", "complete the itemized business use-of-funds budget"
     return "tab=todo", "complete the requested application items"
+
+
+@router.get("/{profile_id}/room/invitation", response_model=RoomInvitationStatus)
+async def get_application_invitation_status(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RoomInvitationStatus:
+    from app.services.invitation_access import client_has_signed_in
+
+    profile = await profiles.load_profile(db, profile_id, user)
+    if user.role in {Role.CLIENT, Role.DEALER, Role.VENDOR, Role.LENDER}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only scoped staff may manage invitations")
+    link = await _profile_room_link(db, profile)
+    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    email = profiles.normalized_email(intake.email if intake else link.recipient_email)
+    signed_in = await client_has_signed_in(db, profile, link)
+    return RoomInvitationStatus(
+        can_resend=bool(email and client_room.link_is_usable(link) and not signed_in),
+        client_has_signed_in=signed_in,
+        recipient_email=email,
+    )
 
 
 @router.post("/{profile_id}/room/reminders", response_model=RoomRequestResult)
@@ -2246,6 +2271,32 @@ async def send_application_room_reminder(
     if user.role in {Role.CLIENT, Role.DEALER, Role.VENDOR, Role.LENDER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only scoped staff may send room reminders")
     link = await _profile_room_link(db, profile)
+    if payload.purpose == "invitation":
+        from app.services.invitation_access import client_has_signed_in
+
+        # Serialize resend requests for this file, and recheck authentication
+        # on the server even if a stale browser still shows the menu item.
+        await db.execute(select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update())
+        if await client_has_signed_in(db, profile, link):
+            raise HTTPException(409, "This client has already signed in. Use a room reminder instead.")
+        if payload.sms_reminder or not payload.email_room_link:
+            raise HTTPException(422, "Invitation resends use email delivery")
+        intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+        recipient = profiles.normalized_email(intake.email if intake else link.recipient_email)
+        if not recipient:
+            raise HTTPException(422, "Add the client's email before resending their invitation")
+        if payload.recipient_email and profiles.normalized_email(str(payload.recipient_email)) != recipient:
+            raise HTTPException(422, "The invitation must use the email on this file")
+        payload = payload.model_copy(update={"recipient_email": recipient})
+        recent = (await db.execute(select(ApplicationRoomDelivery.id).where(
+            ApplicationRoomDelivery.profile_id == profile.id,
+            ApplicationRoomDelivery.action_kind == "invitation_reminder",
+            ApplicationRoomDelivery.channel == "email",
+            ApplicationRoomDelivery.status == "sent",
+            ApplicationRoomDelivery.created_at >= datetime.now(UTC) - timedelta(seconds=60),
+        ).limit(1))).scalar_one_or_none()
+        if recent is not None:
+            raise HTTPException(429, "An invitation was just sent. Please wait a minute before resending.", headers={"Retry-After": "60"})
     if payload.purpose == "use_of_funds" and not client_room.link_is_usable(link):
         raise HTTPException(status.HTTP_409_CONFLICT, "This file has no usable application room")
     query, purpose = _room_reminder_copy(payload.purpose)

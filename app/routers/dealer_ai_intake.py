@@ -10133,6 +10133,10 @@ async def _create_admin_ai_lead_core(
         intake.last_link_status = delivery_status
         intake.last_link_kind = "room"
         await db.commit()
+        # UPDATE expires the database-generated timestamp even with
+        # expire_on_commit=False. Response validation cannot lazy-load it
+        # through an async session after the invitation has already been sent.
+        await db.refresh(intake, attribute_names=["updated_at"])
         email_note = (
             " The invitation was sent; share the PIN separately."
             if delivery_status == "sent"

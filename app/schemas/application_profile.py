@@ -1100,10 +1100,16 @@ class RoomRequestCreate(BaseModel):
     sms_reminder: bool = False
 
 
+class RoomInvitationStatus(BaseModel):
+    can_resend: bool
+    client_has_signed_in: bool
+    recipient_email: str | None = None
+
+
 class RoomReminderCreate(BaseModel):
     #: `bank_connect` is the desk asking for a Plaid connection by name, upload
     #: as the fallback; `business_banking` is the older neutral wording.
-    purpose: Literal["documents", "business_banking", "bank_connect", "use_of_funds", "room"] = "room"
+    purpose: Literal["documents", "business_banking", "bank_connect", "use_of_funds", "room", "invitation"] = "room"
     recipient_email: EmailStr | None = None
     recipient_phone: str | None = Field(default=None, max_length=48)
     email_room_link: bool = True

@@ -129,6 +129,7 @@ from app.routers import (
 from app.routers import (
     webhooks as webhooks_router,
 )
+from app.server_errors import server_error_response
 
 settings = get_settings()
 logging.basicConfig(level=settings.log_level)
@@ -186,6 +187,7 @@ app.add_middleware(RequestContextMiddleware)
 # important for message timelines: a successful poll must reach Postgres rather
 # than receive a cached snapshot until the page is refreshed.
 app.add_middleware(PrivateApiCacheMiddleware)
+app.add_exception_handler(Exception, server_error_response)
 
 
 @app.on_event("startup")
