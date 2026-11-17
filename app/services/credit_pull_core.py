@@ -141,9 +141,10 @@ def intake_credit_state(pull: CreditPull, *, status: str = "completed") -> dict:
     }
 
 
-async def stamp_primary_owner(db: AsyncSession, intake, pull: CreditPull) -> bool:
+async def stamp_primary_owner(db: AsyncSession, intake, pull: CreditPull, *, how: str | None = None) -> bool:
     """Record the pull on the application's primary owner, so a booked file
-    stops asking the borrower for a credit check they already completed."""
+    stops asking the borrower for a credit check they already completed. A
+    newer pull replaces an older one; an older one never replaces a newer."""
     from sqlalchemy import select
 
     from app.models.application_profile import ApplicationOwner, ApplicationProfile
@@ -164,12 +165,104 @@ async def stamp_primary_owner(db: AsyncSession, intake, pull: CreditPull) -> boo
             .limit(1)
         )
     ).scalar_one_or_none()
-    if owner is None or owner.credit_pull_id is not None:
+    if owner is None or owner.credit_pull_id == pull.id:
         return False
+    if owner.credit_pull_id is not None:
+        current = owner.credit_pulled_at
+        if current is None or pull.pulled_at is None or pull.pulled_at <= current:
+            return False
     from app.services import credit_links
 
-    await credit_links.link_pull(db, profile, owner, pull, how=credit_links.HOW_SIGNATURE)
+    await credit_links.link_pull(db, profile, owner, pull, how=how or credit_links.HOW_SIGNATURE)
     return True
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def pulled_within(pulled_at: datetime | str | None, days: int, *, now: datetime | None = None) -> bool:
+    """Whether a pull taken at ``pulled_at`` is younger than ``days`` days."""
+    if days <= 0 or pulled_at is None:
+        return False
+    if isinstance(pulled_at, str):
+        try:
+            pulled_at = datetime.fromisoformat(pulled_at)
+        except ValueError:
+            return False
+    moment = _aware(pulled_at)
+    return moment is not None and (now or datetime.now(UTC)) - moment < timedelta(days=days)
+
+
+async def reusable_pull(
+    db: AsyncSession,
+    *,
+    client_id,
+    first_name: str | None,
+    last_name: str | None,
+    dob: date | None = None,
+    email: str | None = None,
+    within_days: int,
+) -> CreditPull | None:
+    """This person's newest completed soft pull younger than the window.
+
+    "This person" is the credit-link rule for an exact match: the same legal
+    name plus the same date of birth, the same email, or the same client.
+    """
+    if within_days <= 0 or not (first_name or "").strip() or not (last_name or "").strip():
+        return None
+    from types import SimpleNamespace
+
+    from app.services import credit_links
+
+    person = SimpleNamespace(id=None, first_name=first_name, last_name=last_name, dob=dob, email=email)
+    candidates = await credit_links.candidate_pulls(db, SimpleNamespace(client_id=client_id), person)
+    recent = [
+        candidate.pull
+        for candidate in candidates
+        if candidate.level == credit_links.LEVEL_EXACT and pulled_within(candidate.pull.pulled_at, within_days)
+    ]
+    return max(recent, key=lambda pull: _aware(pull.pulled_at)) if recent else None
+
+
+async def pull_or_reuse(
+    db: AsyncSession,
+    *,
+    client: Client,
+    applicant: SoftPullApplicant,
+    actor: User | None = None,
+    email: str | None = None,
+    within_days: int | None = None,
+) -> tuple[CreditPull, bool]:
+    """The pull a new authorization should count on, and whether it was reused.
+
+    Franco (2026-11-16): when this person was soft-pulled less than the reuse
+    window ago (30 days by default, a setting), that pull is used and the
+    bureau is not called again. An SSN retry after a no-hit always pulls.
+    """
+    from app.services import credit_links
+
+    window = await credit_links.reuse_window_days(db) if within_days is None else max(0, within_days)
+    if not applicant.ssn:
+        recent = await reusable_pull(
+            db,
+            client_id=client.id,
+            first_name=applicant.legal_first_name,
+            last_name=applicant.legal_last_name,
+            dob=applicant.dob,
+            email=email,
+            within_days=window,
+        )
+        if recent is not None:
+            return recent, True
+    return await run_soft_pull(db, client=client, applicant=applicant, actor=actor), False
+
+
+def reuse_words(pull: CreditPull) -> str:
+    when = _aware(pull.pulled_at)
+    return f"Using the soft pull from {when.strftime('%b %d, %Y').replace(' 0', ' ')}" if when else "Using a recent soft pull"
 
 
 async def _alert_desk(db: AsyncSession, intake, *, title: str, body: str) -> None:
@@ -192,7 +285,9 @@ async def _alert_desk(db: AsyncSession, intake, *, title: str, body: str) -> Non
     )
 
 
-async def auto_pull_after_signature(db: AsyncSession, intake, *, applicant_data: dict, request=None) -> dict:
+async def auto_pull_after_signature(
+    db: AsyncSession, intake, *, applicant_data: dict, request=None, within_days: int | None = None
+) -> dict:
     """Run the soft pull the moment the authorization is signed.
 
     The signature carries name, date of birth and address; the bureau can
@@ -201,12 +296,17 @@ async def auto_pull_after_signature(db: AsyncSession, intake, *, applicant_data:
     pull that comes back without a score goes to the desk. The intake's
     credit state is updated in place; the caller commits.
     """
-    from app.services import mca_refinance_policy
+    from app.services import credit_links, mca_refinance_policy
     from app.services.bucket_ai import log_bucket_ai_activity
 
     state = dict(intake.intake_state or {})
     current = state.get("credit_pull") if isinstance(state.get("credit_pull"), dict) else {}
-    if current.get("pull_id") or current.get("fico") is not None:
+    if (current.get("pull_id") or current.get("fico") is not None) and not current.get("pulled_at"):
+        # A record without a date is kept, as it always was.
+        return current
+    window = await credit_links.reuse_window_days(db) if within_days is None else max(0, within_days)
+    if (current.get("pull_id") or current.get("fico") is not None) and pulled_within(current.get("pulled_at"), window):
+        # The file already counts on a pull younger than the reuse window.
         return current
     if intake.client_id is None:
         return current
@@ -251,7 +351,9 @@ async def auto_pull_after_signature(db: AsyncSession, intake, *, applicant_data:
         ssn=None,
     )
     try:
-        pull = await run_soft_pull(db, client=client, applicant=applicant, actor=None)
+        pull, reused = await pull_or_reuse(
+            db, client=client, applicant=applicant, actor=None, email=getattr(intake, "email", None), within_days=window
+        )
     except SoftPullDenied as exc:
         if exc.code == "no_hit_provide_ssn":
             record = remember(status="needs_ssn", error_code=exc.code)
@@ -285,9 +387,36 @@ async def auto_pull_after_signature(db: AsyncSession, intake, *, applicant_data:
         return record
 
     record = intake_credit_state(pull, status="completed")
+    if reused:
+        record["reused"] = True
     state["credit_pull"] = record
     intake.intake_state = state
-    await stamp_primary_owner(db, intake, pull)
+    await stamp_primary_owner(db, intake, pull, how=credit_links.HOW_REUSED if reused else credit_links.HOW_SIGNATURE)
+    if reused:
+        words = reuse_words(pull)
+        await log_bucket_ai_activity(
+            db, intake.bucket_id, "credit_pull_reused", target_type="intake", target_id=str(intake.id),
+            detail=f"{words}; the authorization was signed within {window} days of it, so the bureau was not called again",
+        )
+        try:
+            from app.services import file_events
+
+            await file_events.emit(
+                db,
+                kind="credit.reused",
+                visibility=file_events.VISIBILITY_DESK,
+                title=words,
+                body=f"A new authorization was signed less than {window} days after this soft pull, so no new pull ran.",
+                intake_id=intake.id,
+                bucket_id=getattr(intake, "bucket_id", None),
+                actor_label="Qualified Commercial",
+                target_type="credit_pull",
+                target_id=pull.id,
+                meta={"pull_id": str(pull.id), "window_days": window},
+            )
+        except Exception:  # noqa: BLE001 - the timeline line never blocks the reuse
+            log.exception("credit reuse event failed for intake %s", intake.id)
+        return record
     await log_bucket_ai_activity(
         db, intake.bucket_id, "credit_pull_completed", target_type="intake", target_id=str(intake.id),
         detail=("Soft pull ran on signature" + (f" · FICO {pull.fico}" if pull.fico is not None and not is_proxy_score(pull) else " · no bureau score returned")),

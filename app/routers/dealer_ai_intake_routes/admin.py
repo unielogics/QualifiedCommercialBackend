@@ -1706,6 +1706,30 @@ async def run_lead_credit_pull(
     except (TypeError, ValueError) as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Applicant date of birth on file is invalid") from exc
 
+    if not payload.force and not payload.ssn:
+        # A pull inside the reuse window is not repeated without a person's say-so.
+        window = await core.credit_links.reuse_window_days(db)
+        recent = await credit_pull_core.reusable_pull(
+            db,
+            client_id=client.id,
+            first_name=str(applicant_data.get("legal_first_name") or ""),
+            last_name=str(applicant_data.get("legal_last_name") or ""),
+            dob=dob,
+            email=intake.email,
+            within_days=window,
+        )
+        if recent is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "recent_soft_pull",
+                    "pull_id": str(recent.id),
+                    "pulled_at": recent.pulled_at.isoformat() if recent.pulled_at else None,
+                    "window_days": window,
+                    "message": f"{credit_pull_core.reuse_words(recent).replace('Using the', 'Last')}. Pull again?",
+                },
+            )
+
     try:
         pull = await credit_pull_core.run_soft_pull(
             db,

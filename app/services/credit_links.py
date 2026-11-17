@@ -34,6 +34,14 @@ HOW_MANUAL = "manual"
 HOW_AUTOMATIC = "automatic"
 HOW_SIGNATURE = "signature"
 HOW_SWEEP = "sweep"
+#: A signature authorized a pull, but this person had one younger than the
+#: reuse window, so that one was linked instead of pulling again.
+HOW_REUSED = "reused"
+
+#: Franco (2026-11-16): a soft pull younger than this is reused, not repeated.
+#: A setting (credit_linking.reuse_window_days); 0 means always pull.
+DEFAULT_REUSE_WINDOW_DAYS = 30
+MAX_REUSE_WINDOW_DAYS = 365
 
 LEVEL_EXACT = "exact"
 LEVEL_LIKELY = "likely"
@@ -299,6 +307,7 @@ def link_words(owner: Any, facts: dict[str, Any], how: str) -> str:
         HOW_AUTOMATIC: "Linked automatically",
         HOW_SIGNATURE: "Linked from the signed authorization",
         HOW_SWEEP: "Linked by the desk's match",
+        HOW_REUSED: "Reused a recent soft pull instead of pulling again",
     }.get(how, "Linked")
     return f"{lead}: pull from {_date_words(facts.get('pulled_at'))}, {score_words(facts)}, to {owner.full_name}"
 
@@ -598,12 +607,25 @@ async def mode(db: AsyncSession) -> str:
     return value if value in MODES else MODE_MANUAL
 
 
+def _window(section: dict[str, Any]) -> int:
+    value = section.get("reuse_window_days")
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_REUSE_WINDOW_DAYS:
+        return DEFAULT_REUSE_WINDOW_DAYS
+    return value
+
+
+async def reuse_window_days(db: AsyncSession) -> int:
+    """How many days a completed soft pull is reused before another runs."""
+    return _window(_section(await _settings_row(db)))
+
+
 async def read_settings(db: AsyncSession) -> dict[str, Any]:
     section = _section(await _settings_row(db))
     return {
         "mode": section.get("mode") if section.get("mode") in MODES else MODE_MANUAL,
         "last_run": section.get("last_run"),
         "sweep_minutes": SWEEP_MINUTES,
+        "reuse_window_days": _window(section),
     }
 
 

@@ -38,15 +38,28 @@ async def write_credit_linking(
     """Manual: pulls wait for a person. Automatic: the hook and the sweep link
     them and the desk is told what connected."""
 
-    await credit_links.write_section(db, mode=payload.mode)
+    changes = payload.model_dump(exclude_none=True)
+    if not changes:
+        return CreditLinkingRead(**await credit_links.read_settings(db))
+    await credit_links.write_section(db, **changes)
+    summary = "; ".join(
+        part
+        for part in (
+            f"Credit pull linking set to {payload.mode}" if payload.mode else "",
+            f"Soft pulls reused for {payload.reuse_window_days} days"
+            if payload.reuse_window_days is not None
+            else "",
+        )
+        if part
+    )
     db.add(
         Activity(
             loan_id=None,
             actor_id=user.id,
             actor_label=user.role.value if hasattr(user.role, "value") else str(user.role),
             kind="settings.updated",
-            summary=f"Credit pull linking set to {payload.mode}",
-            payload={"credit_linking": {"mode": payload.mode}},
+            summary=summary,
+            payload={"credit_linking": changes},
         )
     )
     await db.commit()
