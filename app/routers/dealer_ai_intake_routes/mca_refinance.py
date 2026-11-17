@@ -156,7 +156,18 @@ async def start_mca_refinance(
             status.HTTP_409_CONFLICT,
             "A secure MCA refinance review already exists for this email. We sent a short access code so you can continue that file.",
         )
-    client = await core._find_or_create_mca_client(db, payload)
+    capture = None
+    if payload.resource_handoff_token:
+        from app.models.client import Client
+        from app.services import resource_assessments
+
+        capture = await resource_assessments.resolve(db, payload.resource_handoff_token,
+            goal="mca_refinance", email=str(payload.email))
+        client = await db.get(Client, capture.client_id)
+        if client is None or (client.email or "").casefold() != str(payload.email).casefold():
+            raise HTTPException(409, "Please request a new resource result.")
+    else:
+        client = await core._find_or_create_mca_client(db, payload)
     bucket, link = await core._create_bucket_for_mca_refi(db, client, payload, request,
         **({"room_pin": payload.secure_room_pin} if payload.secure_room_pin else {}))
     if payload.secure_room_pin:
@@ -214,6 +225,8 @@ async def start_mca_refinance(
     db.add(intake)
     await db.flush()
     await core.profiles_service.provision_profile_for_intake(db, intake)
+    if capture is not None:
+        await resource_assessments.link_application(db, capture, intake)
     await db.commit()
     intake = await core._load_public_intake(db, token)
     await onboarding_consent.record_for_start(db, intake, payload, request, entry="starting an MCA refinance application")
@@ -300,6 +313,16 @@ async def verify_mca_refinance_login(
         await db.commit()
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired access code")
     intake.token_hash = core._hash_token(public_token)
+    if payload.resource_handoff_token:
+        from app.services import resource_assessments
+
+        capture = await resource_assessments.resolve(db, payload.resource_handoff_token,
+            goal="mca_refinance", email=intake.email)
+        # Email ownership has now been verified by the one-time access code.
+        # Only this submitted resource snapshot is adopted; no client is merged.
+        capture.client_id = intake.client_id
+        await db.flush()
+        await resource_assessments.link_application(db, capture, intake)
     await core._log(
         db,
         intake.bucket_id,

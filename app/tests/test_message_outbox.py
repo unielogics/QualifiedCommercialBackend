@@ -8,6 +8,7 @@ This is the door they all go through now, and the contract it keeps is the one
 
 from __future__ import annotations
 
+from threading import get_ident
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
@@ -401,6 +402,29 @@ async def test_a_transactional_bounce_is_not_written_onto_the_outreach_list():
         )
     assert row.status == "bounced"
     assert suppress.await_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event,detail", [("Bounce", "Permanent/General"), ("Complaint", "abuse")])
+async def test_resource_nurture_feedback_suppresses_without_prospect_id(event, detail):
+    row = SimpleNamespace(
+        id=uuid4(), status="sent", to_email="resource@example.com", prospect_id=None,
+        context="resource_nurture", opened_at=None, delivered_at=None, failed_at=None, detail=None,
+    )
+    db = _delivery_db(row=row)
+    with patch("app.services.prospect_outreach.set_suppression", new=AsyncMock()) as suppress:
+        await outbox.mark_delivery(db, provider_message_id="SES-resource", event=event, detail=detail)
+    suppress.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resource_transport_runs_off_the_api_event_loop():
+    event_loop_thread = get_ident()
+    def transport(**kwargs):
+        assert get_ident() != event_loop_thread
+        return SesSendResult(True, "SES-resource", "sent")
+    result = await outbox._send_ses("resource_nurture", transport, to_email="resource@example.com")
+    assert result.ok
 
 
 # --- a Gmail grant that cannot actually send ----------------------------------------

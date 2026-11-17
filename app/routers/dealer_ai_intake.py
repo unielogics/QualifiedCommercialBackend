@@ -1416,6 +1416,7 @@ class DealerLoginStartResponse(BaseModel):
 class DealerLoginVerifyRequest(BaseModel):
     email: EmailStr
     code: str = Field(min_length=4, max_length=16)
+    resource_handoff_token: str | None = Field(default=None, max_length=180, repr=False)
 
 
 class DealerLogoutRequest(BaseModel):
@@ -2159,7 +2160,9 @@ async def _record_resume_email(
     sender_user_id: UUID | None = None,
 ) -> dict[str, Any]:
     resume_url = _public_url(f"{public_path}?token={token}")
-    if _is_main_street_mca_intake(intake):
+    if _is_main_street_mca_intake(intake) or (
+        intake.variant == "main_street_v1" and (_intake_state(intake)).get("funding_goal") == "term_loan"
+    ):
         link = intake.bucket_upload_link
         if link is None or not client_room.link_is_usable(link):
             raise HTTPException(409, "This file has no active secure room")
@@ -4478,6 +4481,8 @@ def _merge_main_street_details(
         accepted["financing_equipment_or_vehicle"] = True
     if _is_main_street_mca_intake(intake):
         accepted["intent"] = "merchant_cash_advance"
+    if state.get("funding_goal") == "term_loan":
+        accepted["intent"] = "working_capital"
     existing.update(accepted)
     state["main_street_details"] = existing
     intake.intake_state = state
@@ -4538,6 +4543,11 @@ def _main_street_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         from app.services.mca_funding_policy import ai_context
 
         return {**context, **ai_context(), "mca_funding_declaration": state.get("mca_funding_declaration")}
+
+    if state.get("funding_goal") == "term_loan":
+        from app.services.business_public_intake import term_context
+
+        return {**context, **term_context()}
 
     if kind == "non_lending":
         # No lending package, no program fit, no fundability verdict. Asking a
@@ -10785,6 +10795,7 @@ async def _load_mca_intake_by_session(db: AsyncSession, request: Request) -> tup
 
 
 class McaRefiStart(PublicIntakeAttribution, RequiredBusinessProfileFields, ClientRoomPinChoice):
+    resource_handoff_token: str | None = Field(default=None, max_length=180, repr=False)
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
     phone: RequiredPhone

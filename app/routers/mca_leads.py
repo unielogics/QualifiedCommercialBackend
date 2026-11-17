@@ -217,7 +217,7 @@ class McaIntakeAttribution(Attribution):
         if english not in {"/", "/programs", "/main-street", "/business-funding", "/merchant-cash-advance",
                            "/mca-funding-intake", "/programs/main-street", "/programs/merchant-cash-advance",
                            "/industries/main-street", "/working-capital-loans", "/manufacturing-business-loans",
-                           "/medical-practice-financing", "/grocery-store-financing"}:
+                           "/medical-practice-financing", "/grocery-store-financing", "/business-funding-check"}:
             raise ValueError("Use a known MCA or Main Street website path without query strings or fragments.")
         return path
 
@@ -226,6 +226,7 @@ from app.services.business_profile import RequiredBusinessProfileFields
 
 
 class McaIntakeStart(McaLeadRequest, RequiredBusinessProfileFields):
+    resource_handoff_token: str | None = Field(default=None, max_length=180, repr=False)
     employee_count: int = Field(ge=0, le=2147483647)
     sms_transactional_consent: Literal[True]
     application_email_consent: Literal[True]

@@ -31,9 +31,12 @@ class Settings(BaseSettings):
     audit_app_url: str = "https://audit.qualifiedcommercial.com"
     capital_app_url: str = "https://capital.qualifiedcommercial.com"
     public_api_url: str = "https://api.qualifiedcommercial.com"
+    resource_marketing_url: str = "https://qualifiedcommercial.com"
 
     # Clerk (auth)
     clerk_secret_key: str = ""
+    resource_token_secret: str = ""
+    resource_nurture_enabled: bool = False
     # When true, a Clerk session that still owes its two-step-verification
     # setup is rejected. Ships OFF so every account can enrol without being
     # locked out; flip it in Secrets Manager once `two_factor_enabled` is true

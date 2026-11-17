@@ -35,7 +35,7 @@ def intake_id(key: UUID) -> UUID:
 
 
 def request_stamp(payload) -> str:
-    values = payload.model_dump(mode="json", exclude={"secure_room_pin", "idempotency_key"})
+    values = payload.model_dump(mode="json", exclude={"secure_room_pin", "idempotency_key", "resource_handoff_token"})
     return hashlib.sha256(json.dumps(values, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -78,8 +78,25 @@ async def start(db, payload, request: Request) -> dict:
         return await _retry(db, existing, payload, request)
     core._throttle_or_429(_STARTS, request_context.client_ip(request) or "unknown", 20,
                          "Please wait a moment before starting another file.")
-    client = await db.get(Client, _lead_id(payload.idempotency_key))
-    if client is not None:
+    capture = None
+    if payload.resource_handoff_token:
+        from app.services import resource_assessments
+
+        capture = await resource_assessments.resolve(db, payload.resource_handoff_token,
+            goal="merchant_cash_advance", email=email)
+        duplicate = (await db.execute(select(PublicUnderwritingIntake.id).where(
+            func.lower(PublicUnderwritingIntake.email) == email,
+            PublicUnderwritingIntake.variant == "main_street_v1",
+            PublicUnderwritingIntake.intake_state["funding_intent"].astext == policy.PROGRAM_KEY,
+            PublicUnderwritingIntake.archived_at.is_(None)).limit(1))).scalar_one_or_none()
+        if duplicate is not None:
+            raise HTTPException(409, "Use your saved secure room or request a resume link below.")
+        client = await db.get(Client, capture.client_id)
+        if client is None or (client.email or "").casefold() != email:
+            raise HTTPException(409, "Please request a new resource result.")
+    else:
+        client = await db.get(Client, _lead_id(payload.idempotency_key))
+    if client is not None and capture is None:
         # A prior public lead made with this exact capability may be promoted;
         # an arbitrary matching email or caller-supplied client ID may not.
         saved = client.lead_intake if isinstance(client.lead_intake, dict) else {}
@@ -87,7 +104,7 @@ async def start(db, payload, request: Request) -> dict:
                 or any(saved.get(key) != getattr(payload, key) for key in (
                     "active_mca_count", "has_modified_mca", "last_year_tax_earnings", "tax_year"))):
             raise HTTPException(409, "Use your saved secure room or ask your advisor to review this request.")
-    else:
+    elif client is None:
         found = (await db.execute(select(Client.id).where(func.lower(Client.email) == email).limit(1))).scalar_one_or_none()
         if found is not None:
             raise HTTPException(409, "For secure access, use your saved room link or contact your advisor. You can request a resume link below.")
@@ -101,7 +118,7 @@ async def start(db, payload, request: Request) -> dict:
             lead_intake={})
         db.add(client)
         await db.flush()
-    declaration = payload.model_dump(mode="json", exclude={"secure_room_pin", "idempotency_key", "website"})
+    declaration = payload.model_dump(mode="json", exclude={"secure_room_pin", "idempotency_key", "website", "resource_handoff_token"})
     from app.services import business_profile, onboarding_consent
 
     onboarding_consent.require_application_choices(payload)
@@ -110,9 +127,12 @@ async def start(db, payload, request: Request) -> dict:
                "terms_version": core.TERMS_VERSION, "privacy_version": core.PRIVACY_VERSION,
                "allowed_contact_channels": ["phone", "email"], "credit_pull_authorized": False,
                **core._request_audit(request)}
-    client.lead_intake = {**(client.lead_intake or {}), "funding_intent": policy.PROGRAM_KEY,
-        "business_name": payload.business_name, "mca_intake_declaration": declaration,
-        "mca_intake_consent": consent, "mca_product_policy": policy.declaration_metadata()}
+    if capture is None:
+        client.lead_intake = {**(client.lead_intake or {}), "funding_intent": policy.PROGRAM_KEY,
+            "business_name": payload.business_name, "mca_intake_declaration": declaration,
+            "mca_intake_consent": consent, "mca_product_policy": policy.declaration_metadata()}
+    # Resource contact capture does not authorize rewriting an existing CRM
+    # relationship. This application's declarations remain on the intake below.
     # Existing builder needs contact/business only; the full application is
     # completed in the room, preserving unknown industry rather than guessing.
     bucket, link = await core._create_bucket_for_main_street(db, client, payload, request,
@@ -132,6 +152,8 @@ async def start(db, payload, request: Request) -> dict:
     db.add(intake)
     await db.flush()
     await core.profiles_service.provision_profile_for_intake(db, intake)
+    if capture is not None:
+        await resource_assessments.link_application(db, capture, intake)
     db.add(Activity(client_id=client.id, actor_label="public_mca_intake", kind="mca.intake_started",
                     summary="Started secure standard MCA review", payload={"intake_id": str(intake.id), "consent_version": CONSENT_VERSION}))
     await db.commit()
