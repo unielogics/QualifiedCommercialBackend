@@ -30,7 +30,10 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.application_profile import ApplicationRequirementResponse, ApplicationRequirementState
+from app.models.application_profile import (
+    ApplicationRequirementResponse,
+    ApplicationRequirementState,
+)
 from app.models.bucket import BucketFile
 from app.models.client_form import ClientFormVersion
 from app.models.form_signing import FormSigningSession
