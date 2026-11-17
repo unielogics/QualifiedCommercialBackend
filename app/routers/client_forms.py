@@ -71,6 +71,12 @@ class FormReopen(BaseModel):
     reason: str = Field(min_length=3, max_length=500)
 
 
+class FormShare(BaseModel):
+    recipient_name: str = Field(min_length=2, max_length=180)
+    organization: str | None = Field(default=None, max_length=180)
+    recipient_email: EmailStr | None = None
+
+
 class SigningApproval(BaseModel):
     approved: bool
     note: str | None = Field(default=None, max_length=500)
@@ -92,10 +98,10 @@ def _with_schema(view: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _desk_view(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
-    from app.services import signed_forms
+    from app.services import application_relay, signed_forms
 
     view = await client_forms.read(db, profile, audience="desk")
-    return {**_with_schema(view), "signing": await signed_forms.view(db, profile)}
+    return {**_with_schema(view), "signing": await signed_forms.view(db, profile), "relay": await application_relay.relay_read(db, profile.id)}
 
 
 # --- the desk -----------------------------------------------------------------
@@ -175,6 +181,30 @@ async def reopen_client_form(profile_id: UUID, kind: str, payload: FormReopen, u
     await profiles.log_profile_action(db, profile, user, "client_form.reopened", f"Reopened the real estate application: {payload.reason}"[:500], target_type="client_form", target_id=None)
     await db.commit()
     return await _desk_view(db, profile)
+
+
+@router.post("/application-profiles/{profile_id}/forms/{kind}/share")
+async def share_client_form(profile_id: UUID, kind: str, payload: FormShare, request: Request, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> dict:
+    """A seven-day passcode link to the signed application only, for a partner who is not on the lender roster.
+
+    Lenders on the roster receive the signed application in their submission
+    package; this is for anyone else the information-sharing consent covers.
+    The passcode is in this reply only.
+    """
+    from app.services import application_relay
+
+    _require_kind(kind)
+    profile = await _staff_profile(db, profile_id, user)
+    result = await application_relay.share_with_partner(
+        db, profile, actor=user, recipient_name=payload.recipient_name, organization=payload.organization,
+        recipient_email=str(payload.recipient_email) if payload.recipient_email else None, request=request,
+    )
+    await profiles.log_profile_action(
+        db, profile, user, "client_form.shared", f"Shared the signed real estate application with {result['recipient']}"[:500],
+        target_type="bucket_share", target_id=UUID(result["share_id"]),
+    )
+    await db.commit()
+    return result
 
 
 @router.get("/form-kinds/signing-approval")

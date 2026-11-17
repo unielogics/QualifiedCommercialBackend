@@ -190,6 +190,11 @@ async def materialize_lender_requirements(db, profile, offering, lender) -> None
     consent["label"] = f"Authorize sharing with {lender.name}"
     consent["collection_config"]["disclosure_text"] += f" Institution: {lender.name}."
     await materialize_external_requirements(db, profile, requirements=[consent], source_key=f"lender:{lender.id}:sharing", approved=True)
+    from app.services import application_relay
+    if await application_relay.answer_lender_sharing(db, profile, consent["requirement_key"]):
+        # The signed application's sharing consent answered it: re-read the state
+        # against that answer and close the client's collection task.
+        await materialize_external_requirements(db, profile, requirements=[consent], source_key=f"lender:{lender.id}:sharing", approved=True)
     if definitions:
         await materialize_external_requirements(db, profile, requirements=definitions, source_key=f"lender:{lender.id}:{offering.id}", approved=offering.checklist_confirmed)
 
@@ -244,6 +249,11 @@ async def package_material(db, profile, lender, offering, source, extra_ids: lis
     missing_unknown = file_ids - source["files"].keys()
     if missing_unknown:
         raise HTTPException(422, "A selected document is outside this application's evidence inventory")
+    from app.services import application_relay
+    # The signed application is the relay copy: it travels in every package.
+    signed_application = await application_relay.executed_application(db, profile.id)
+    if signed_application is not None:
+        file_ids.add(str(signed_application.file.id))
     for definition in required:
         state = source["states"].get(definition["requirement_key"])
         required_level = definition.get("required_level", "required")
@@ -263,7 +273,8 @@ async def package_material(db, profile, lender, offering, source, extra_ids: lis
             structured_responses.append({"key": metadata.get("canonical_key") or key, "label": state.label,
                 "kind": metadata.get("requirement_kind", "field"), "value": response.value.get("answer"),
                 "provenance": {"source": response.source, "source_version": response.source_version, "received_at": response.created_at.isoformat(),
-                               **({name: (response.provenance or {}).get(name) for name in ("disclosure_version", "disclosure_text", "disclosure_hash", "scope")} if metadata.get("requirement_kind") == "consent" else {})}})
+                               **({name: (response.provenance or {}).get(name) for name in ("disclosure_version", "disclosure_text", "disclosure_hash", "scope")} if metadata.get("requirement_kind") == "consent" else {}),
+                               **({"basis": application_relay.lender_basis(response.provenance)} if response.source == application_relay.SOURCE else {})}})
         origin = (metadata.get("collection_config") or {}).get("origin") or metadata.get("origin")
         if key not in {item["requirement_key"] for item in required} and state and origin == "lender_explicit":
             snapshots.append({"key": key, "label": state.label, "kind": metadata.get("requirement_kind", "document"), "status": state.status, "required": state.required_level == "required", "waivable": False})
@@ -272,6 +283,8 @@ async def package_material(db, profile, lender, offering, source, extra_ids: lis
         if state and state.evidence_file_id and state.status == "verified":
             file_ids.add(str(state.evidence_file_id))
     files = [source["files"][key] for key in sorted(file_ids) if key in source["files"]]
+    if signed_application is not None and str(signed_application.file.id) not in {str(file.id) for file in files}:
+        files.append(signed_application.file)
     official_files = []
     if offering:
         for key in offering.official_form_file_ids or []:

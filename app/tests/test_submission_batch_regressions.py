@@ -13,6 +13,16 @@ from app.services import submission_batches as service
 from app.services.email.ses_client import SesSendResult
 
 
+@pytest.fixture(autouse=True)
+def no_signed_application():
+    """These tests use a stand-in database; the signed-application relay has its own tests."""
+    with (
+        patch("app.services.application_relay.executed_application", AsyncMock(return_value=None)),
+        patch("app.services.application_relay.answer_lender_sharing", AsyncMock(return_value=None)),
+    ):
+        yield
+
+
 class Rows:
     def __init__(self, rows):
         self.rows = rows

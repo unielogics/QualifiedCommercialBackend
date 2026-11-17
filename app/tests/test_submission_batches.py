@@ -26,6 +26,16 @@ class Rows:
         return self.rows[0] if self.rows else None
 
 
+@pytest.fixture(autouse=True)
+def no_signed_application():
+    """These tests use a stand-in database; the signed-application relay has its own tests."""
+    with (
+        patch("app.services.application_relay.executed_application", AsyncMock(return_value=None)),
+        patch("app.services.application_relay.answer_lender_sharing", AsyncMock(return_value=None)),
+    ):
+        yield
+
+
 def source():
     return {"readiness": NS(selections=[], programs=[], requirements=[]), "files": {}, "analyses": {}, "context": {"annual_revenue": 400000}, "states": {}}
 

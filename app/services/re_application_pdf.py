@@ -131,10 +131,18 @@ table.grid td { padding:4px 5px; border-bottom:1px solid #e4e7ec; overflow-wrap:
 .signs { margin-top:10px; }
 .sign { break-inside:avoid; border:1px solid #cfd7e6; padding:10px 12px; margin:8px 0; }
 .sign-label { font-weight:bold; color:#173b7a; }
-.sign-line { height:44px; border-bottom:1px solid #101828; position:relative; }
+/* The stamper draws the signature up to 30pt tall above the SIG anchor and
+   clears from 26pt above it to 3pt below it, so the anchor sits just above the
+   line (clear of it) at the bottom of a box tall enough for both. */
+.sign-line { height:52px; border-bottom:1px solid #101828; position:relative; }
+.sign-line .anchor { position:absolute; left:0; bottom:7px; line-height:1px; }
 .sign-meta { display:table; width:100%; margin-top:4px; }
-.sign-meta span { display:table-cell; }
-.sign-meta .date { text-align:right; }
+/* Direct children only: the hidden anchor inside the date slot must stay inline
+   after "Date:", where the stamper writes the date. */
+.sign-meta > span { display:table-cell; }
+/* The date is stamped to the right of its anchor, so the slot starts at a fixed
+   column with room after it instead of hugging the page edge. */
+.sign-meta > .date { text-align:left; width:2.4in; white-space:nowrap; }
 .anchor { color:#ffffff; font-size:1px; }
 """
 

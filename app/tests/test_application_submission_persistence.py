@@ -24,6 +24,7 @@ from app.models.application_profile import (
     ApplicationRequirementState,
 )
 from app.models.arf_channel import ApplicationAssessmentSnapshot
+from app.models.form_signing import FormSigningSession
 from app.models.funding_program import FundingProgramCatalog
 from app.models.lender import Lender
 from app.models.submission_batch import (
@@ -51,7 +52,9 @@ async def test_two_lenders_share_collection_but_keep_policy_and_send_approval_se
         table.to_metadata(metadata)
     classes = [User, ApplicationProfile, ApplicationProgramSelection, ApplicationRequirementState, ApplicationRequirementResponse,
                ApplicationCollectionTask, ApplicationExtractedFact, Lender, LenderOffering,
-               SubmissionBatch, LenderSubmission, LenderSubmissionEvent, FundingProgramCatalog, ApplicationAssessmentSnapshot]
+               SubmissionBatch, LenderSubmission, LenderSubmissionEvent, FundingProgramCatalog, ApplicationAssessmentSnapshot,
+               # Packages look for a signed application to carry (app/services/application_relay.py).
+               FormSigningSession]
     tables = [metadata.tables[model.__tablename__] for model in classes]
     for table in tables:
         for column in table.columns:

@@ -208,9 +208,19 @@ async def materialize_response_state(
         same_definition = (
             not current_definition or response.provenance.get("definition_id") == current_definition
         )
-        same_disclosure = kind != "consent" or response.provenance.get(
-            "disclosure_hash"
-        ) == disclosure_hash(metadata.get("collection_config") or {})
+        current_disclosure = (
+            disclosure_hash(metadata.get("collection_config") or {}) if kind == "consent" else None
+        )
+        same_disclosure = (
+            kind != "consent"
+            or response.provenance.get("disclosure_hash") == current_disclosure
+            # A signed form records the words the client signed and names the
+            # disclosure they satisfy (app/services/application_relay.py).
+            or (
+                response.source == "signed_form"
+                and response.provenance.get("satisfies_disclosure_hash") == current_disclosure
+            )
+        )
         expired = bool(
             metadata.get("expiration_days")
             and response.created_at < timestamp() - timedelta(days=int(metadata["expiration_days"]))
