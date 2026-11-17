@@ -25,14 +25,16 @@ from typing import Any
 from app.services import business_statement_schema as bss
 from app.services import debt_types, pfs_schema
 
-FORM_LABELS: dict[str, str] = {
-    "pfs": "Personal financial statement",
-    "debt_schedule": "Business debt schedule",
-    "p_and_l": "Profit and loss statement",
-    "balance_sheet": "Balance sheet",
-    "real_estate_schedule": "Real estate schedule",
-    "operating_plan": "Operating expenses and earnings plan",
-}
+
+def _financial_labels() -> dict[str, str]:
+    from app.services import form_kinds
+
+    financial = form_kinds.financial_kinds()
+    return {key: label for key, label in form_kinds.labels().items() if key in financial}
+
+
+#: The financial forms this module reads back (labels from app/services/form_kinds.py).
+FORM_LABELS: dict[str, str] = _financial_labels()
 
 #: Whose answers a debt row carries, by the source that wrote it.
 ORIGIN_WORDS: dict[str, str] = {

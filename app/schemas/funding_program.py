@@ -325,6 +325,20 @@ class FundingProgramRequirementWrite(BaseModel):
         return value
 
     @model_validator(mode="after")
+    def _known_online_form(self):
+        # An online form and its signature are configuration the registry
+        # checks on write (app/services/form_kinds.py).
+        from app.services import form_kinds
+
+        try:
+            self.collection_config = form_kinds.normalize_collection_config(
+                self.collection_config, requirement_kind=self.requirement_kind, strict=True
+            )
+        except form_kinds.FormConfigError as exc:
+            raise ValueError(str(exc)) from None
+        return self
+
+    @model_validator(mode="after")
     def _no_self_attested_document_checks(self):
         if self.review_checks and self.completion_mode == "borrower_self_attest":
             raise ValueError("Document checks require AI verification or staff verification, not borrower self-attestation")

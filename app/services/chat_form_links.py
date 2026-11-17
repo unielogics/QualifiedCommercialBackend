@@ -145,7 +145,9 @@ async def mint_form_link(
     many earlier chat links `link_for_action` closed before this mint; it goes
     on the audit row so "why was the borrower's link revoked?" has an answer.
     """
-    if kind not in FORM_KINDS:
+    from app.services import form_kinds
+
+    if kind not in FORM_KINDS or kind not in form_kinds.financial_kinds():
         raise ValueError(f"Unknown form kind: {kind}")
 
     statement_id: uuid.UUID | None = None

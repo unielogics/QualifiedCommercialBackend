@@ -73,24 +73,15 @@ CATEGORY_LABELS: dict[str, str] = {
 }
 CATEGORY_ORDER = list(CATEGORY_LABELS)
 
-#: The online forms a requirement can be filled in through, by requirement key.
-FORM_KINDS_BY_KEY: dict[str, tuple[str, ...]] = {
-    "owner_personal_financial_statement": ("pfs",),
-    "business_debt_schedule": ("debt_schedule",),
-    "refinance_debt_schedule": ("debt_schedule",),
-    "ytd_p_and_l_balance_sheet": ("p_and_l", "balance_sheet"),
-    "ytd_profit_and_loss": ("p_and_l",),
-    "real_estate_schedule": ("real_estate_schedule",),
-    "operating_expenses_and_earnings_plan": ("operating_plan",),
-}
-
-
 def category_label(category: str) -> str:
     return CATEGORY_LABELS.get(category, category.replace("_", " ").capitalize())
 
 
-def form_kinds_for(key: str, canonical_key: str | None = None) -> tuple[str, ...]:
-    return FORM_KINDS_BY_KEY.get(canonical_key or "") or FORM_KINDS_BY_KEY.get(key, ())
+def form_kinds_for(key: str, canonical_key: str | None = None, config: dict | None = None) -> tuple[str, ...]:
+    """The online forms a requirement is filled in through (app/services/form_kinds.py)."""
+    from app.services import form_kinds
+
+    return form_kinds.kinds_for_requirement(key, canonical_key, config)
 
 
 # ---------------------------------------------------------------------------
