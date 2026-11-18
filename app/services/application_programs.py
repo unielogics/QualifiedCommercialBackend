@@ -3638,6 +3638,11 @@ async def _materialize_requirements(
         from app.services import released_cash_flow
 
         await released_cash_flow.materialize(db, profile, requirement, state, requested)
+        # One personal statement does not answer for every owner: the row waits
+        # for each owner who has to give one (app/services/owner_statements.py).
+        from app.services import owner_statements
+
+        await owner_statements.materialize(db, profile, requirement, state, requested)
         if state.provenance["qualification_review"]["blocking"]:
             state.provenance = {**state.provenance, "review_checks_status": "pending"}
     await db.flush()

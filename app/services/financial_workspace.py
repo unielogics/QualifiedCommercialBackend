@@ -279,6 +279,12 @@ async def _families(db: AsyncSession, profile_id: UUID, kind: str | None = None)
 
 async def existing_family(db: AsyncSession, profile_id: UUID, kind: str) -> FinancialFormFamily | None:
     rows = await _families(db, profile_id, kind)
+    if kind == "pfs" and rows:
+        # A personal statement is one person's. A reader that names nobody gets
+        # the applicant's own, never whichever owner's happens to be newest.
+        from app.services import owner_statements
+
+        return await owner_statements.default_family(db, profile_id, rows)
     return rows[0] if rows else None
 
 
@@ -396,6 +402,12 @@ async def resolve_family(db: AsyncSession, profile: ApplicationProfile, *, kind:
             FinancialFormFamily.kind == kind, FinancialFormFamily.identity["statement_id"].astext == str(statement_id)))).scalar_one_or_none()
     else:
         family = await existing_family(db, profile.id, kind)
+        if family is None and kind == "pfs":
+            # Another owner's statement may already be on the file. The
+            # applicant's own is started for them rather than seeded from it.
+            from app.services import owner_statements
+
+            family = await owner_statements.start_default(db, profile, actor=actor)
     if family_id and (family is None or family.profile_id != profile.id or family.kind != kind):
         raise HTTPException(404, "Financial form family not found")
     if family is None:
@@ -1005,6 +1017,13 @@ async def publish_version(db: AsyncSession, profile: ApplicationProfile, *, kind
     if filed and slot:
         slot.status = "uploaded"
     await db.flush()
+    if filed and slot and kind == "pfs":
+        # One owner's statement does not close a row that asks every owner for one.
+        from app.services import owner_statements
+
+        if not await owner_statements.all_received(db, profile):
+            slot.status = "requested"
+            await db.flush()
     from app.services.financial_publication import after_publication
 
     await after_publication(db, profile, family=family, version=version, file=file, actor=actor, submit=submit or kind == "debt_schedule" and filed)
@@ -1698,6 +1717,14 @@ async def propose_import(db: AsyncSession, profile: ApplicationProfile, *, kind:
         # Different source owners/periods create distinct families, even when
         # the file has another form of the same kind already open.
         candidates = await _families(db, profile.id, kind)
+        if kind == "pfs" and candidates:
+            # A personal statement is one person's: an upload joins its own
+            # owner's statement, never whichever statement is newest.
+            from app.services import owner_statements
+
+            allowed = {row.id for row in await owner_statements.import_candidates(db, profile, candidates, identity)}
+            same_key = body_hash(identity)
+            candidates = [row for row in candidates if row.id in allowed or row.identity_key == same_key]
         family = next((candidate for candidate in candidates if _compatible_identity(candidate, identity)), None)
         if family is None:
             await lock_financial_profile(db, profile)

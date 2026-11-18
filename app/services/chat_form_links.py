@@ -162,16 +162,26 @@ async def mint_form_link(
         from app.services.real_estate_forms import ensure_workspace
 
         real_estate_workspace = await ensure_workspace(db, profile)
+    statement_family_id: uuid.UUID | None = None
     if kind == "pfs":
-        # Create the statement the link will fill, as the router does, so the
-        # borrower lands on a draft they can resume rather than a blank that
-        # becomes a second sheet. Nobody is signed in: no actor.
-        statement = await financial_statements.latest_for_profile(db, profile.id)
-        if statement is None:
-            statement = await financial_statements.save_statement(
-                db, profile, body=pfs_schema.empty_body(), actor_user_id=None
-            )
-        statement_id = statement.id
+        # A personal statement is one person's: the room's link opens the
+        # statement of the person it is sent to, else the applicant's own, never
+        # a co-owner's (owner_statements).
+        from app.services import owner_statements
+
+        statement_id, statement_family_id = await owner_statements.link_target(
+            db, profile, email=recipient
+        )
+        if statement_id is None and statement_family_id is None:
+            # Create the statement the link will fill, as the router does, so the
+            # borrower lands on a draft they can resume rather than a blank that
+            # becomes a second sheet. Nobody is signed in: no actor.
+            statement = await financial_statements.latest_for_profile(db, profile.id)
+            if statement is None:
+                statement = await financial_statements.save_statement(
+                    db, profile, body=pfs_schema.empty_body(), actor_user_id=None
+                )
+            statement_id = statement.id
 
     link, token = await financial_statements.mint_link(
         db,
@@ -184,6 +194,8 @@ async def mint_form_link(
     )
     if real_estate_workspace:
         link.financial_family_id = uuid.UUID(real_estate_workspace["family_id"])
+    elif statement_family_id is not None:
+        link.financial_family_id = statement_family_id
     await profiles.log_profile_action(
         db,
         profile,

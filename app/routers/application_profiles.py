@@ -6895,11 +6895,24 @@ async def public_financial_form(token: str, db: AsyncSession = Depends(get_db)) 
             from app.services.operating_plan_service import client_preview
 
             response["operating_plan"] = await client_preview(db, profile, body, current=managed["body"])
+    # Whose statement this link opens. A personal statement is one person's, so
+    # the page names them and is seeded with their own details, not the
+    # primary owner's: a co-owner must not find somebody else's name on theirs.
+    statement_for = None
+    if link.kind == "pfs" and getattr(link, "financial_family_id", None):
+        from app.services import owner_statements
+
+        person = await owner_statements.person_for_family(db, profile, link.financial_family_id)
+        if person is not None:
+            prefill = await financial_statements.form_prefill(db, profile, owner=person)
+            statement_for = owner_statements.owner_name(person) or None
     await db.commit()
     return {
         "kind": link.kind,
         "schema": schema,
         "body": body,
+        # Present only on a personal statement that is tied to one owner.
+        **({"statement_for": statement_for} if statement_for else {}),
         # Drives the thank-you state, so a reload returns to it rather than to
         # a form the borrower has already finished with.
         "completed": link.completed_at is not None,

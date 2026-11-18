@@ -165,7 +165,18 @@ async def email_form_link(
     if recent is not None:
         return recent
 
-    statement_id = await _placeholder_statement_id(db, profile, user) if kind == "pfs" else None
+    statement_id, statement_family_id = None, None
+    if kind == "pfs":
+        # A personal statement is one person's: this link opens the statement of
+        # the owner it is being sent to, else the applicant's own, and never a
+        # co-owner's. Each other owner is sent their own (owner_statements).
+        from app.services import owner_statements
+
+        statement_id, statement_family_id = await owner_statements.link_target(
+            db, profile, email=recipient, actor=user
+        )
+        if statement_id is None and statement_family_id is None:
+            statement_id = await _placeholder_statement_id(db, profile, user)
     managed_workspace = None
     if kind == "operating_plan":
         from app.services.operating_plan_forms import ensure_workspace
@@ -186,6 +197,8 @@ async def email_form_link(
     )
     if managed_workspace:
         link.financial_family_id = uuid.UUID(managed_workspace["family_id"])
+    elif statement_family_id is not None:
+        link.financial_family_id = statement_family_id
     base = get_settings().frontend_app_url.rstrip("/")
     room_url = None
     if room_link is not None:

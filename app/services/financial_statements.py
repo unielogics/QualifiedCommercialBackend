@@ -185,7 +185,18 @@ async def link_owners(
 async def latest_for_profile(
     db: AsyncSession, profile_id: UUID
 ) -> FinancialStatement | None:
-    """The statement to show when a file has one. Newest wins."""
+    """The statement to show when a file has one.
+
+    A personal statement is one person's, so on a file that keeps a statement
+    per owner this is the applicant's own (see `owner_statements`), never the
+    newest of anybody's. A file with no managed statement keeps newest-wins.
+    """
+    if isinstance(getattr(db, "info", None), dict):
+        from app.services import owner_statements
+
+        row = await owner_statements.default_statement_row(db, profile_id)
+        if row is not owner_statements.UNMANAGED:
+            return row
     return (
         await db.execute(
             select(FinancialStatement)
@@ -1147,7 +1158,7 @@ async def debt_body_for_profile(
 # ---------------------------------------------------------------------------
 
 
-async def form_prefill(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
+async def form_prefill(db: AsyncSession, profile: ApplicationProfile, *, owner: Any = None) -> dict[str, Any]:
     """Business and owner identity, for seeding a form before anyone types.
 
     A borrower opening a link we sent them should not be asked their own
@@ -1161,6 +1172,10 @@ async def form_prefill(db: AsyncSession, profile: ApplicationProfile) -> dict[st
 
     Precedence matches `production_prefill`: the dealer record, then the intake,
     then facts read off uploaded documents.
+
+    `owner` names the person the form is for. A personal statement opened from
+    an owner's own link is seeded with that owner's name and address; without
+    it the primary owner stands in, as the applicant.
     """
     from app.dealer_os.models import DealerBusiness
     from app.models.application_profile import ApplicationExtractedFact
@@ -1203,8 +1218,9 @@ async def form_prefill(db: AsyncSession, profile: ApplicationProfile) -> dict[st
             business = text(raw)
 
     owners = await profiles.owner_rows(db, profile)
-    owner = next((row for row in owners if getattr(row, "is_primary", False)), None)
-    owner = owner or (owners[0] if owners else None)
+    if owner is None:
+        owner = next((row for row in owners if getattr(row, "is_primary", False)), None)
+        owner = owner or (owners[0] if owners else None)
 
     name = ""
     address = ""
