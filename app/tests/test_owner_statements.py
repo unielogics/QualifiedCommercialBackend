@@ -651,3 +651,114 @@ def test_the_owners_combined_liquidity_leaves_out_what_it_is_told_to():
     after = {"key_metrics": {}}
     bucket_ai._compute_key_metrics_from_cache(after, rows, pfs_uncounted_file_ids={"jordan-before"})
     assert after["key_metrics"]["pfs_total_liquid_assets"] == 69000
+
+
+# ---------------------------------------------------------------------------
+# Only when the file asks for statements
+# ---------------------------------------------------------------------------
+
+
+def _merged(*levels, program=None, policy="business_baseline"):
+    return {
+        "requirement": SimpleNamespace(required_level=levels[0] if levels else "optional"),
+        "program_keys": {program} if program else set(),
+        "policy_keys": {policy} if policy else set(),
+        "definitions": [SimpleNamespace(required_level=level) for level in levels],
+    }
+
+
+def test_an_optional_listing_asks_for_nothing_and_required_or_recommended_does():
+    from app.services.requirement_library import STAFF_POLICY_KEY
+
+    assert not os_.asks(None)
+    assert not os_.asks(_merged("optional"))
+    assert os_.asks(_merged("optional", "required", program="sba_7a"))
+    assert os_.asks(_merged("recommended", program="term_loan", policy=None))
+    # The desk asks at whatever level it chose.
+    assert os_.asks(_merged("optional", policy=STAFF_POLICY_KEY))
+    # A lender asks whenever its checklist lists one, until it is cancelled.
+    lender = SimpleNamespace(provenance={"source_kind": "lender", "external_definition": {"label": "PFS"}})
+    assert os_.asks(_merged("optional"), lender) and os_.asks(None, lender)
+    cancelled = SimpleNamespace(provenance={**lender.provenance, "cancelled_at": NOW.isoformat()})
+    assert not os_.asks(_merged("optional"), cancelled)
+
+
+def test_the_saved_state_reads_the_same_rule():
+    from app.services.requirement_library import STAFF_POLICY_KEY
+
+    def state(level, policies=("business_baseline",), **provenance):
+        return SimpleNamespace(required_level=level, source_policy_keys=list(policies), provenance=provenance)
+
+    assert not os_.state_asks(state("optional"))
+    assert os_.state_asks(state("recommended"))
+    assert os_.state_asks(state("optional", policies=("business_baseline", STAFF_POLICY_KEY)))
+    assert os_.state_asks(state("optional", source_kind="lender", external_definition={"label": "PFS"}))
+
+
+def test_nobody_owes_a_statement_on_a_file_that_asks_for_none():
+    jordan, alex = owner("Jordan", "Sample", 50, is_primary=True), owner("Alex", "Rivera", 50)
+    mine = statement(name="Jordan Sample", versions=[version(1)])
+    tracker = os_.build([jordan, alex], [mine], needed=False)
+    assert tracker.needed == [] and {row.reason for row in tracker.rows} == {"not_asked"}
+    # Whose a statement is does not depend on whether the file asks for one.
+    assert tracker.row_for(jordan.id).statement is mine
+    model = os_.read_model(tracker, now=NOW, need=os_.Need(False))
+    assert model["needed"] is False and model["required_count"] == 0 and model["missing_owner_ids"] == []
+    asked = os_.read_model(os_.build([jordan, alex], [mine]), now=NOW, need=os_.Need(True, ("SBA 7(a)",)))
+    assert asked["needed"] is True and asked["asked_by"] == ["SBA 7(a)"] and asked["required_count"] == 2
+
+
+def test_the_room_asks_for_a_statement_only_while_an_open_or_answered_row_names_one():
+    def row(status, **changes):
+        return SimpleNamespace(**{"status": status, "requirement_key": None, "category": "Debts", "name": "Debt schedule", **changes})
+
+    assert os_.asked_in_room(None) is None
+    assert os_.asked_in_room([row("requested")]) is False
+    assert os_.asked_in_room([row("requested", category="Personal Financials", name="Personal financial statement")]) is True
+    assert os_.asked_in_room([row("uploaded", requirement_key=os_.REQUIREMENT_KEY, category="Other", name="PFS")]) is True
+    assert os_.asked_in_room([row("not_applicable", requirement_key=os_.REQUIREMENT_KEY, category="Personal Financials")]) is False
+
+
+def test_the_ai_lists_name_a_statement_only_while_the_room_asks_for_one():
+    stored = {
+        "stage_1_required_items": ["debt schedule", "personal financial statement for each owner", "requested amount"],
+        "baseline_document_policy": {
+            "allowed_document_categories": ["current year/YTD P&L", "personal financial statement for each owner"],
+            "do_not_request_other_document_categories": True,
+            "stage_2_after_good_probability_only": ["personal financial statement for each 20%+ owner", "owner resume"],
+        },
+        "review_type": "dealer_gatekeeper_v1",
+    }
+    quiet = os_.ai_document_lists(stored, asked=False)
+    assert quiet["stage_1_required_items"] == ["debt schedule", "requested amount"]
+    assert quiet["baseline_document_policy"]["allowed_document_categories"] == ["current year/YTD P&L"]
+    assert quiet["baseline_document_policy"]["stage_2_after_good_probability_only"] == ["owner resume"]
+    assert quiet["review_type"] == "dealer_gatekeeper_v1"
+    # Nothing is changed in place, and a context nobody could check is left alone.
+    assert len(stored["stage_1_required_items"]) == 3 and os_.ai_document_lists(stored, asked=None) is stored
+    # While the room asks, a policy that names its documents names this one too.
+    policy = {"baseline_document_policy": {"allowed_document_categories": ["debt schedule"], "do_not_request_other_document_categories": True}}
+    asked = os_.ai_document_lists(policy, asked=True)
+    assert asked["baseline_document_policy"]["allowed_document_categories"] == ["debt schedule", os_.AI_ASK_WORDS]
+    assert os_.ai_document_lists(stored, asked=True)["stage_1_required_items"] == stored["stage_1_required_items"]
+
+
+def test_the_ai_context_follows_the_rooms_own_rows():
+    from app.services import bucket_ai
+
+    context = {"stage_1_required_items": ["debt schedule", "personal financial statement for each owner"]}
+    asking = SimpleNamespace(ai_context=context, requested_documents=[
+        SimpleNamespace(status="requested", requirement_key=os_.REQUIREMENT_KEY, category="Personal Financials", name="Personal financial statement"),
+    ])
+    quiet = SimpleNamespace(ai_context=context, requested_documents=[
+        SimpleNamespace(status="not_applicable", requirement_key=os_.REQUIREMENT_KEY, category="Personal Financials", name="Personal financial statement"),
+    ])
+    assert bucket_ai._statement_lists(context, asking)["stage_1_required_items"] == context["stage_1_required_items"]
+    assert bucket_ai._statement_lists(context, quiet)["stage_1_required_items"] == ["debt schedule"]
+
+
+def test_new_files_are_not_seeded_with_a_statement_to_ask_for():
+    from app.routers import dealer_ai_intake as core
+
+    assert not [row for row in core.REQUIRED_DOCUMENTS if os_.mentions_statement(row["name"])]
+    assert "Personal financial statement" not in core._admin_created_welcome(core.DEALER_VARIANT)

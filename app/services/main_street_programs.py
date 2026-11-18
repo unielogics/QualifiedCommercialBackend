@@ -248,22 +248,11 @@ MAIN_STREET_REQUIRED_DOCUMENTS: list[dict[str, Any]] = [
         "allow_multiple_files": False,
         "required": True,
     },
-    # Present so the borrower can volunteer it, but NOT required day one. The PFS
-    # is the highest-friction item in the package and it drives no Main Street
-    # threshold on its own — it earns its place on an SBA or jumbo file and
-    # nowhere else. Promoted to required by the router when the file heads down
-    # one of those paths.
-    {
-        "name": "Owner personal financial statement",
-        "category": "Personal Financials",
-        "description": (
-            "A personal financial statement for each owner with 20% or more "
-            "ownership. Needed for SBA and larger term requests — you can fill it "
-            "out online here."
-        ),
-        "allow_multiple_files": True,
-        "required": False,
-    },
+    # No personal financial statement. It is the highest-friction item in the
+    # package and drives no Main Street threshold on its own: it earns its place
+    # on an SBA or larger term file, where the program asks for it and the
+    # checklist adds the row (app/services/owner_statements.py). A borrower who
+    # sends one anyway still has it read.
 ]
 
 _MERCHANT_SERVICES_DOCUMENTS: list[dict[str, Any]] = [

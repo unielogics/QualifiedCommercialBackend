@@ -25,7 +25,7 @@ from fastapi import (
     status,
 )
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7336,7 +7336,8 @@ _FORM_LABEL = {
     "operating_plan": "Operating expenses and earnings plan",
 }
 
-#: The four forms one packet link opens, in the order the page shows them.
+#: The forms one packet link can open, in the order the page shows them. The
+#: personal financial statement only on a file that asks for one (`_mint_packet`).
 PACKET_KINDS = ("p_and_l", "balance_sheet", "debt_schedule", "pfs")
 
 
@@ -7357,11 +7358,27 @@ async def _requested_slot(
         return await business_statements.slot_for_kind(db, profile, kind)
     if profile.primary_bucket_id is None:
         return None
+    if kind == "pfs":
+        # The row the checklist requirement collects into first: one the
+        # engine made itself carries the requirement's own category, not
+        # "Personal Financials", and a category match alone would open a second.
+        from app.services import owner_statements
+
+        live = await owner_statements.live_slot(db, profile)
+        if live is not None:
+            return live
     return (
         await db.execute(
-            select(BucketRequestedDocument).where(
+            select(BucketRequestedDocument)
+            .where(
                 BucketRequestedDocument.bucket_id == profile.primary_bucket_id,
                 BucketRequestedDocument.category == _FORM_SLOT_CATEGORY[kind],
+            )
+            # An open row before a closed one, then the oldest: one answer, not
+            # whichever row the database hands back first.
+            .order_by(
+                case((BucketRequestedDocument.status.in_(["closed", "not_applicable"]), 1), else_=0),
+                BucketRequestedDocument.created_at,
             )
         )
     ).scalars().first()
@@ -7842,7 +7859,7 @@ async def mint_financial_form_link(
     file's schedule, so it needs no placeholder.
     """
     if kind == "packet":
-        # One link that opens all four forms. Not a kind: four ordinary links
+        # One link that opens the file's forms. Not a kind: ordinary links
         # whose tokens derive from one base. Never reaches the category guard.
         profile = await profiles.load_profile(db, profile_id, user)
         _require_statement_staff(user)
@@ -7864,6 +7881,12 @@ async def mint_financial_form_link(
 
         await ensure_workspace(db, profile, actor=user)
     if kind == "pfs":
+        # Sending a personal statement link is asking for one: a file that asked
+        # for none now does (owner_statements).
+        from app.services import owner_statements
+
+        if await owner_statements.ask_for_file(db, profile, user=user):
+            await application_programs.get_program_readiness(db, profile)
         statement = await financial_statements.latest_for_profile(db, profile.id)
         managed = await managed_snapshot(db, profile, "pfs")
         if statement is None and managed is None:
@@ -8391,38 +8414,46 @@ async def _ensure_legacy_form_slot(
 
 
 async def _mint_packet(db: AsyncSession, profile: ApplicationProfile, user: User) -> dict:
-    """One forwardable link that opens all four forms.
+    """One forwardable link that opens the file's financial forms.
 
-    Four ordinary links — pfs, debt_schedule, p_and_l, balance_sheet — whose
-    tokens are `{base}.{kind}`, sharing a `packet_id`, hashed at rest, with the
-    usual TTL. Every child's checklist row is ensured first, silently, so a
-    submit on any of the four can file on Main Street, dealer and real-estate
-    files alike. The PFS child attaches the latest PFS statement exactly as a
-    `pfs` link does; when that statement is already submitted the child is
-    minted complete, so the packet shows the step as done rather than
-    reopening a filed statement. One client-tier event, not four.
+    Ordinary links — p_and_l, balance_sheet, debt_schedule and, on a file that
+    asks for personal statements, pfs — whose tokens are `{base}.{kind}`,
+    sharing a `packet_id`, hashed at rest, with the usual TTL. Every child's
+    checklist row is ensured first, silently, so a submit on any of them can
+    file on Main Street, dealer and real-estate files alike. A file that asks
+    for no personal statement (owner_statements.need) gets no PFS child and no
+    PFS row: the packet must not ask for what the file does not. The PFS child
+    attaches the latest PFS statement exactly as a `pfs` link does; when that
+    statement is already submitted the child is minted complete, so the packet
+    shows the step as done rather than reopening a filed statement. One
+    client-tier event, not one per form.
     """
+    from app.services import owner_statements
+
     if profile.primary_bucket_id is None:
         raise HTTPException(
             status.HTTP_409_CONFLICT, "This file has no document room to file the forms in"
         )
-    for kind in ("pfs", "debt_schedule"):
-        await _ensure_legacy_form_slot(db, profile, kind)
+    with_statement = (await owner_statements.need(db, profile)).needed
+    kinds = tuple(kind for kind in PACKET_KINDS if with_statement or kind != "pfs")
+    await _ensure_legacy_form_slot(db, profile, "debt_schedule")
     for kind in business_statement_schema.KINDS:
         await business_statements.ensure_slot(db, profile, kind, required=False)
 
-    statement = await financial_statements.latest_for_profile(db, profile.id)
-    managed = await managed_snapshot(db, profile, "pfs")
-    if statement is None and managed is None:
-        statement = await financial_statements.save_statement(
-            db, profile, body=pfs_schema.empty_body(), actor_user_id=user.id
-        )
+    statement = None
+    if with_statement:
+        statement = await financial_statements.latest_for_profile(db, profile.id)
+        managed = await managed_snapshot(db, profile, "pfs")
+        if statement is None and managed is None:
+            statement = await financial_statements.save_statement(
+                db, profile, body=pfs_schema.empty_body(), actor_user_id=user.id
+            )
 
     base = secrets.token_urlsafe(32)
     packet_id = uuid4()
     now = datetime.now(UTC)
     expires_at = None
-    for kind in PACKET_KINDS:
+    for kind in kinds:
         link, _token = await financial_statements.mint_link(
             db,
             profile,
@@ -8449,11 +8480,11 @@ async def _mint_packet(db: AsyncSession, profile: ApplicationProfile, user: User
         actor=user,
         target_type="financial_form_packet",
         target_id=packet_id,
-        meta={"packet_id": str(packet_id), "kinds": list(PACKET_KINDS)},
+        meta={"packet_id": str(packet_id), "kinds": list(kinds)},
     )
     await profiles.log_profile_action(
         db, profile, user, "financial_form.packet_link_minted",
-        "Created a packet link that opens all four financial forms",
+        f"Created a packet link that opens {len(kinds)} financial forms",
         target_type="financial_form_packet", target_id=packet_id,
     )
     await db.commit()
@@ -8946,6 +8977,20 @@ async def request_financial_form(
                 title="We asked for the real estate schedule", actor=user, target_type="financial_form", target_id=profile.id, meta={"kind": kind})
         await db.commit()
         return {"requested": True, "already": already}
+    if kind == "pfs":
+        # Personal statements are on a file only while something asks for
+        # them; the desk asking is one of those things (owner_statements).
+        from app.services import owner_statements
+
+        _slot, already = await owner_statements.ensure_request(db, profile, actor=user)
+        if not already:
+            await profiles.log_profile_action(db, profile, user, "financial_form.requested", "Requested the personal financial statement",
+                target_type="financial_form", target_id=profile.id)
+            await file_events.emit(db, profile=profile, kind="document.requested", visibility=file_events.VISIBILITY_CLIENT,
+                title="We asked for the personal financial statement", actor=user, target_type="financial_form",
+                target_id=profile.id, meta={"kind": kind})
+        await db.commit()
+        return {"requested": True, "already": already}
 
     existing = await _requested_slot(db, profile, kind)
     if existing is not None:
@@ -9101,6 +9146,12 @@ async def add_application_requirement(
     removed = next((item for item in before.inactive_requirements if item.requirement_key == removed_key), None)
     if removed is not None:
         await requirement_lifecycle.change(db, profile, removed.requirement_key, action="restore", reason="", actor=user)
+        from app.services import owner_statements
+
+        if removed.requirement_key == owner_statements.REQUIREMENT_KEY:
+            # Restored, a personal statement still needs something to ask for
+            # it; adding it back is the desk asking.
+            await owner_statements.ask_for_file(db, profile, user=user)
         await profiles.log_profile_action(db, profile, user, "requirement.restored", f"Restored {removed.label} to the checklist",
                                          target_type="application_requirement", target_id=profile.id,
                                          metadata={"requirement_key": removed.requirement_key})

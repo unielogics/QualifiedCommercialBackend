@@ -3307,9 +3307,13 @@ async def _materialize_requirements(
         for requirement in grouped_policies.get(policy.playbook_id, []):
             merge_requirement(requirement, policy_key=policy.policy_key)
     # Requirements the desk added behave like the initial checklist, but a key a
-    # program or the policy already requires keeps that definition.
+    # program or the policy already requires keeps that definition. One they
+    # list only more weakly (an optional personal statement the desk now asks
+    # for) takes the desk's level: asking for it is the point of adding it.
     for extra in extra_requirements or []:
-        if (extra.requirement.requirement_key not in merged
+        already = merged.get(extra.requirement.requirement_key)
+        if (already is None
+                or LEVEL_RANK.get(extra.requirement.required_level, 0) > LEVEL_RANK.get(already["requirement"].required_level, 0)
                 or extra.entry.get("source_policy_key") == "coverage_plan"
                 or requirement_lifecycle.debt_identity(extra.requirement.requirement_key, getattr(extra.requirement, "collection_config", None), getattr(extra.requirement, "canonical_key", None))):
             merge_requirement(extra.requirement, policy_key=extra.entry.get("source_policy_key") or requirement_library.STAFF_POLICY_KEY)
@@ -3341,11 +3345,21 @@ async def _materialize_requirements(
             }
             merge_requirement(SimpleNamespace(**definition))
 
+    # Personal financial statements are on the file only while something asks
+    # for them: a program or lender listing them as required or recommended, or
+    # the desk. The initial business checklist lists them as optional.
+    from app.services import owner_statements
+
+    statements_dormant = await owner_statements.settle(db, profile, merged, existing)
     active_keys = set(merged)
     for key, state in existing.items():
         if key not in active_keys and state.status not in {"waived", "not_applicable"}:
             state.status = "stale"
-            state.state_reason = "No longer required by the selected programs"
+            state.state_reason = (
+                owner_statements.DORMANT_REASON
+                if statements_dormant and key == owner_statements.REQUIREMENT_KEY
+                else "No longer required by the selected programs"
+            )
             state.provenance = {**(state.provenance or {}), "inactive_definition": True}
         if key not in active_keys and state.requested_document_id:
             requested = await db.get(BucketRequestedDocument, state.requested_document_id)
@@ -3355,6 +3369,8 @@ async def _materialize_requirements(
                 and requested.requirement_source.get("kind") == "program_readiness"
             ):
                 requested.status = "not_applicable"
+    if statements_dormant:
+        await owner_statements.close_template_rows(db, profile)
 
     result: list[ApplicationRequirementState] = []
     for key, merged_item in merged.items():

@@ -993,7 +993,16 @@ async def publish_version(db: AsyncSession, profile: ApplicationProfile, *, kind
     from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
 
     slot = await _requested_slot(db, profile, kind)
-    if slot is None and filed:
+    statement_asked = True
+    if kind == "pfs":
+        # A statement on a file that asks for none is kept and read, but it
+        # opens no row in the room and reopens none the checklist closed.
+        from app.services import owner_statements
+
+        statement_asked = (await owner_statements.need(db, profile)).needed
+        if slot is not None and slot.status in {"closed", "not_applicable"}:
+            slot = None
+    if slot is None and filed and statement_asked:
         if kind in bss.KINDS:
             slot = await business_statements.ensure_slot(db, profile, kind, required=False)
         else:

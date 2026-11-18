@@ -1,9 +1,11 @@
 """A personal financial statement for each owner: the desk's tracker and its actions.
 
 The logic is in `app/services/owner_statements.py`. These routes are the desk's
-side of it: who owes a statement, where each one stands, a private link per
-owner, and whose statement an upload is. The owner's own page is the existing
-no-login form page; their link simply opens their statement and nobody else's.
+side of it: whether the file asks for statements at all, who owes one, where
+each one stands, a private link per owner, and whose statement an upload is.
+The owner's own page is the existing no-login form page; their link simply
+opens their statement and nobody else's. Sending a link or asking an owner is
+the desk asking the file for statements, so it puts them on the checklist.
 """
 
 from typing import Annotated
@@ -101,6 +103,9 @@ async def mint_owner_statement_link(profile_id: UUID, owner_id: UUID, user: Curr
     profile = await _staff_profile(db, profile_id, user)
     owner = await owner_statements._owner_or_404(db, profile, owner_id)
     name = owner_statements.owner_name(owner)
+    # Sending a link is asking: a file that asked for no statements now does.
+    if await owner_statements.ask_for_file(db, profile, user=user):
+        await _refresh_checklist(db, profile)
     link, token = await owner_statements.mint_link(
         db, profile, owner, user=user, label=f"Copied for {name}", invitee_email=profiles.normalized_email(owner.email)
     )
@@ -122,15 +127,11 @@ async def mint_owner_statement_link(profile_id: UUID, owner_id: UUID, user: Curr
 
 
 async def _email(db: AsyncSession, profile_id: UUID, profile, owner, user) -> dict:
-    from app.routers.application_profiles import (
-        _requested_slot,
-        _room_delivery_read,
-        request_financial_form,
-    )
+    from app.routers.application_profiles import _room_delivery_read, request_financial_form
 
     # On the checklist first. Idempotent, and it commits its own write.
     await request_financial_form(profile_id, owner_statements.KIND, user, db)
-    slot = await _requested_slot(db, profile, owner_statements.KIND)
+    slot = await owner_statements.live_slot(db, profile)
     delivery = await owner_statements.email_link(db, profile, owner, user=user, slot=slot)
     await db.commit()
     receipt = _room_delivery_read(delivery)

@@ -811,7 +811,9 @@ async def materialize_external_requirements(
             by_key[key] = state
             await db.flush()
         # Program-owned definitions keep their approved source and validation.
-        if metadata and metadata.get("source_kind") != "lender":
+        # One no program asks for any more (an optional personal statement,
+        # say) is nobody's, and the lender's checklist takes it.
+        if metadata and metadata.get("source_kind") != "lender" and not metadata.get("inactive_definition"):
             continue
         metadata.update(
             {

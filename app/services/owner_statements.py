@@ -24,6 +24,13 @@ This module is that tie, and the workflow built on it:
   owner it belongs to.
 * **A checklist that waits for all of them.** The requirement reads "1 of 2
   owner statements" and is met only when every required owner's statement is in.
+* **Only when the file asks for them.** A personal statement is not needed on
+  every file. A program or a lender asks for one by listing it as required or
+  recommended, and the desk asks by adding it or sending an owner a link. The
+  initial business checklist lists it as optional, which takes one that arrives
+  and asks for nothing. While nothing asks, the requirement is off the
+  checklist, the room has no row for it, the AI does not ask for one and the
+  desk sees no owner block (`asks`, `settle`, `need`).
 
 Nothing here is summed across people. Net worth and liquidity are one person's.
 """
@@ -62,6 +69,33 @@ _NAME_SUFFIXES = frozenset({"jr", "sr", "ii", "iii", "iv"})
 #: `default_statement_row` answers this when the file has no managed statement,
 #: so the caller keeps its own older lookup.
 UNMANAGED = object()
+
+#: How much a program, a checklist or a lender has to want a statement for the
+#: file to ask for one. "Optional" takes a statement that arrives and asks for
+#: nothing: the level the initial business checklist gives it, which every
+#: dealer and Main Street file gets.
+ASKING_LEVELS = frozenset({"required", "recommended"})
+
+#: Requirement sources that are somebody asking in their own right, at any level.
+_ASKING_SOURCE_KINDS = frozenset({"lender", "staff_request", "financial_form_request"})
+
+#: The checklist state's words while nothing on the file asks for a statement.
+DORMANT_REASON = "Not needed on this file: no program, lender or team member asks for a personal financial statement"
+
+#: The room's category for personal statement rows.
+SLOT_CATEGORY = "Personal Financials"
+
+#: The AI context's own lists of documents to ask for. Files opened before
+#: statements were asked for only when needed carry one in them regardless.
+_AI_LIST_KEYS = frozenset({
+    "stage_1_required_items",
+    "allowed_document_categories",
+    "stage_2_after_good_probability_only",
+    "required_items",
+})
+#: What the AI may ask for when a file does ask for statements and its policy
+#: lets it ask only for the documents it names.
+AI_ASK_WORDS = "personal financial statement from each owner who owes one (it is on this file's checklist)"
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +265,7 @@ class OwnerRow:
     #: How the first statement came to be theirs: assigned, name, only_owner, primary.
     how: str | None = None
     required: bool = False
-    #: ownership, requested, not_needed, under_threshold.
+    #: ownership, requested, not_needed, under_threshold, or not_asked on a file that asks for none.
     reason: str = "under_threshold"
     request: dict = field(default_factory=dict)
 
@@ -277,7 +311,7 @@ def _rank(statement: Statement) -> tuple:
     )
 
 
-def build(owners: list, statements: list[Statement]) -> Tracker:
+def build(owners: list, statements: list[Statement], *, needed: bool = True) -> Tracker:
     """Tie each statement to its owner. No database, no writes.
 
     1. A statement the desk assigned belongs to those owners.
@@ -286,6 +320,7 @@ def build(owners: list, statements: list[Statement]) -> Tracker:
     4. A statement nobody has put a name on is the primary owner's, when they have none.
 
     Anything left is unassigned. It counts for nobody until the desk assigns it.
+    On a file that does not ask for statements (`needed` False) nobody owes one.
     """
     active = [owner for owner in owners if not getattr(owner, "archived_at", None)]
     by_id = {str(owner.id): owner for owner in active}
@@ -351,7 +386,9 @@ def build(owners: list, statements: list[Statement]) -> Tracker:
         mine = sorted(bound[owner_id], key=_rank, reverse=True)
         request = _request_for(statements, owner_id)
         share = owner_pct(owner) or Decimal(0)
-        if request.get("state") == "not_needed":
+        if not needed:
+            required, reason = False, "not_asked"
+        elif request.get("state") == "not_needed":
             required, reason = False, "not_needed"
         elif share >= THRESHOLD_PCT:
             required, reason = True, "ownership"
@@ -523,9 +560,14 @@ def _differs(draft: Any, version: Any) -> bool:
     return body_hash(getattr(draft, "body", None) or {}) != getattr(version, "body_sha256", None)
 
 
-def read_model(tracker: Tracker, *, now: datetime | None = None) -> dict[str, Any]:
-    """Every owner beside their statement, for the desk."""
+def read_model(tracker: Tracker, *, now: datetime | None = None, need: Need | None = None) -> dict[str, Any]:
+    """Every owner beside their statement, for the desk.
+
+    `needed` says whether the file asks for statements at all; the desk shows
+    none of this while it does not.
+    """
     now = now or datetime.now(UTC)
+    need = need if need is not None else Need(True)
     names = {str(row.owner.id): owner_name(row.owner) for row in tracker.rows}
     owners = []
     for row in tracker.rows:
@@ -561,6 +603,8 @@ def read_model(tracker: Tracker, *, now: datetime | None = None) -> dict[str, An
     needed = [item for item in owners if item["required"]]
     received = [item for item in needed if item["status"] == "received"]
     return {
+        "needed": need.needed,
+        "asked_by": list(need.asked_by),
         "threshold_pct": float(THRESHOLD_PCT),
         "required_count": len(needed),
         "received_count": len(received),
@@ -569,6 +613,346 @@ def read_model(tracker: Tracker, *, now: datetime | None = None) -> dict[str, An
         "owners": owners,
         "unassigned": [_statement_read(statement, now=now) for statement in tracker.unassigned if has_content(statement)],
     }
+
+
+# ---------------------------------------------------------------------------
+# Whether the file asks for personal statements at all
+# ---------------------------------------------------------------------------
+
+
+def asks(merged: dict | None, state: Any = None) -> bool:
+    """Whether anything on the file asks for personal financial statements.
+
+    `merged` is the readiness engine's entry for the requirement (its
+    definitions and the programs and checklists they came from); `state` is the
+    requirement's saved state, which is where a lender's checklist is recorded.
+
+    * A program or a checklist asks when it lists the statement as required or
+      recommended. As optional it takes one that arrives and asks for nothing.
+    * The desk asks at whatever level it chose, by adding it to the file.
+    * A lender asks whenever its checklist lists one.
+
+    An owner the desk asked by name is the other way the desk asks
+    (`owner_asked`), read separately because it lives on the statements.
+    """
+    from app.services.requirement_library import STAFF_POLICY_KEY
+
+    metadata = getattr(state, "provenance", None) or {}
+    if (
+        metadata.get("source_kind") in _ASKING_SOURCE_KINDS
+        and metadata.get("external_definition")
+        and not metadata.get("cancelled_at")
+    ):
+        return True
+    if not merged:
+        return False
+    if set(merged.get("policy_keys") or ()) & {STAFF_POLICY_KEY, "coverage_plan"}:
+        return True
+    return any(getattr(row, "required_level", None) in ASKING_LEVELS for row in merged.get("definitions") or ())
+
+
+def state_asks(state: Any) -> bool:
+    """`asks`, read off the saved state alone.
+
+    The state keeps the strongest level any definition gave it and every
+    checklist it came from, which is all the rule looks at. Readers use this, so
+    a file the engine has not been through since the rule came in reads right.
+    """
+    from app.services.requirement_library import STAFF_POLICY_KEY
+
+    if asks(None, state):
+        return True
+    if set(getattr(state, "source_policy_keys", None) or ()) & {STAFF_POLICY_KEY, "coverage_plan"}:
+        return True
+    return getattr(state, "required_level", None) in ASKING_LEVELS
+
+
+async def owner_asked(db: Any, profile: Any) -> bool:
+    """Whether the desk asked an owner for a statement by name (an owner under the line)."""
+    from app.services import financial_workspace as workspace
+
+    for family in await workspace._families(db, profile.id, KIND):
+        for entry in ((getattr(family, "identity", None) or {}).get("owner_requests") or {}).values():
+            if isinstance(entry, dict) and entry.get("state") == "requested":
+                return True
+    return False
+
+
+async def settle(db: Any, profile: Any, merged: dict, existing: dict) -> bool:
+    """Take the statement off the checklist while nothing on the file asks for one.
+
+    Called by the readiness engine once every source has been merged. True when
+    it is off; the engine then treats it as it treats a requirement no selected
+    program has any more (its room row closes, its state keeps its history),
+    with `DORMANT_REASON` as the reason.
+    """
+    item = merged.get(REQUIREMENT_KEY)
+    state = existing.get(REQUIREMENT_KEY)
+    if item is None and state is None:
+        return False
+    if asks(item, state) or await owner_asked(db, profile):
+        return False
+    merged.pop(REQUIREMENT_KEY, None)
+    return True
+
+
+async def close_template_rows(db: Any, profile: Any) -> None:
+    """Close the statement row an intake template put in the room, while nothing asks for one.
+
+    The engine closes the rows it made or adopted itself. The dealer intake used
+    to seed a "Personal financial statement" row on every file; one the engine
+    never got to adopt is closed here. A row somebody on the desk added stays.
+    """
+    from app.models.bucket import BucketRequestedDocument
+
+    if getattr(profile, "primary_bucket_id", None) is None:
+        return
+    rows = (
+        await db.execute(
+            select(BucketRequestedDocument).where(
+                BucketRequestedDocument.bucket_id == profile.primary_bucket_id,
+                BucketRequestedDocument.requirement_key == REQUIREMENT_KEY,
+                BucketRequestedDocument.is_custom.is_(False),
+                BucketRequestedDocument.status.notin_(["closed", "not_applicable", "uploaded"]),
+            )
+        )
+    ).scalars().all()
+    for row in rows:
+        # No source at all: SQL NULL and a stored JSON null both read as None.
+        if isinstance(row, BucketRequestedDocument) and not row.requirement_source:
+            row.status = "not_applicable"
+
+
+@dataclass(frozen=True)
+class Need:
+    """Whether the file asks for personal statements, and who asks."""
+
+    needed: bool
+    #: Programs, a lender or the desk, in the desk's words.
+    asked_by: tuple[str, ...] = ()
+
+
+async def _state(db: Any, profile: Any) -> Any:
+    from app.models.application_profile import ApplicationRequirementState
+
+    if not isinstance(getattr(db, "info", None), dict):
+        return None
+    rows = (
+        await db.execute(
+            select(ApplicationRequirementState).where(
+                ApplicationRequirementState.profile_id == profile.id,
+                ApplicationRequirementState.requirement_key == REQUIREMENT_KEY,
+            )
+        )
+    ).scalars().all()
+    # Only the requirement's own state: a scripted session answers every query with whatever it holds.
+    return next(
+        (
+            row
+            for row in rows
+            if isinstance(row, ApplicationRequirementState)
+            and row.requirement_key == REQUIREMENT_KEY
+            and row.profile_id == profile.id
+        ),
+        None,
+    )
+
+
+async def need(db: Any, profile: Any) -> Need:
+    """Whether this file asks for personal financial statements right now.
+
+    Read off the requirement's saved state: on the checklist and not removed,
+    waived or ruled out by the desk, and asked for by something (`state_asks`),
+    or an owner the desk asked by name.
+    """
+    from app.services import requirement_lifecycle
+
+    state = await _state(db, profile)
+    if state is None:
+        return Need(False)
+    metadata = state.provenance or {}
+    if (
+        metadata.get("inactive_definition")
+        or requirement_lifecycle.is_removed(state)
+        or state.status in {"waived", "not_applicable"}
+    ):
+        return Need(False)
+    if not state_asks(state) and not await owner_asked(db, profile):
+        return Need(False)
+    return Need(True, asked_by=tuple(await _asked_by(db, profile, state)))
+
+
+async def _asked_by(db: Any, profile: Any, state: Any) -> list[str]:
+    from app.models.application_profile import ApplicationProgramSelection
+    from app.services.requirement_library import STAFF_POLICY_KEY
+
+    words: list[str] = []
+    keys = list(getattr(state, "source_program_keys", None) or [])
+    if keys:
+        rows = (
+            await db.execute(
+                select(ApplicationProgramSelection).where(
+                    ApplicationProgramSelection.profile_id == profile.id,
+                    ApplicationProgramSelection.program_key.in_(keys),
+                    ApplicationProgramSelection.removed_at.is_(None),
+                )
+            )
+        ).scalars().all()
+        names = {row.program_key: row.program_name for row in rows if isinstance(row, ApplicationProgramSelection)}
+        words.extend(dict.fromkeys(names.get(key) or key for key in keys))
+    metadata = state.provenance or {}
+    if metadata.get("source_kind") == "lender" and metadata.get("external_definition"):
+        words.append("A lender's checklist")
+    policies = set(getattr(state, "source_policy_keys", None) or [])
+    if STAFF_POLICY_KEY in policies:
+        added = metadata.get("staff_added") or {}
+        who = str(added.get("added_by_name") or "").strip()
+        words.append(f"Added by {who}" if who else "Added by your team")
+    if not words and policies - {STAFF_POLICY_KEY, "coverage_plan"}:
+        words.append("The file's initial checklist")
+    if not words:
+        words.append("An owner was asked by name")
+    return words
+
+
+async def live_slot(db: Any, profile: Any) -> Any:
+    """The room row the statement requirement collects into, while it is open. None otherwise."""
+    from app.models.bucket import BucketRequestedDocument
+
+    state = await _state(db, profile)
+    if state is None or not state.requested_document_id or (state.provenance or {}).get("inactive_definition"):
+        return None
+    row = await db.get(BucketRequestedDocument, state.requested_document_id)
+    if (
+        not isinstance(row, BucketRequestedDocument)
+        or row.bucket_id != getattr(profile, "primary_bucket_id", None)
+        or row.status in {"closed", "not_applicable"}
+    ):
+        return None
+    return row
+
+
+async def ask_for_file(db: Any, profile: Any, *, user: Any, note: str | None = None) -> bool:
+    """The desk asking this file for personal financial statements. True when this is what put them on it.
+
+    Nothing to add when a program, a lender or the desk already asks. Otherwise
+    the statement goes on the checklist as the desk's own requirement, marked
+    "Added by your team", which the desk can take off like any other. A
+    statement the desk took off the checklist earlier is put back.
+    """
+    from app.services import requirement_library, requirement_lifecycle
+
+    state = await _state(db, profile)
+    if state is not None and requirement_lifecycle.is_removed(state):
+        await requirement_lifecycle.change(db, profile, REQUIREMENT_KEY, action="restore", reason="", actor=user)
+    if (await need(db, profile)).needed or requirement_library.find_entry(profile, REQUIREMENT_KEY) is not None:
+        return False
+    plan = await requirement_library.plan_add(
+        db,
+        profile,
+        requirement_key=REQUIREMENT_KEY,
+        custom=None,
+        required_level="required",
+        note=note,
+        user_id=getattr(user, "id", None),
+        user_name=getattr(user, "name", None) or getattr(user, "email", None),
+        on_file={},
+    )
+    if plan.already:
+        return False
+    profile.extra_requirements = requirement_library.with_entry(profile, plan.entry)
+    await db.flush()
+    return True
+
+
+async def ensure_request(db: Any, profile: Any, *, actor: Any) -> tuple[Any, bool]:
+    """Put personal statements on the file's checklist because the desk asked: `(room row, already)`.
+
+    `already` is True when the file was asking for them before this.
+    """
+    from app.services import application_programs
+    from app.services import financial_workspace as workspace
+
+    if getattr(profile, "primary_bucket_id", None) is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This file has no document room to request into")
+    await workspace.lock_financial_profile(db, profile)
+    added = await ask_for_file(db, profile, user=actor)
+    await application_programs.get_program_readiness(db, profile)
+    slot = await live_slot(db, profile)
+    if slot is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "The personal financial statement request could not be prepared")
+    return slot, not added
+
+
+def mentions_statement(value: Any) -> bool:
+    words = str(value or "").casefold()
+    return "personal financial statement" in words or re.search(r"\bpfs\b", words) is not None
+
+
+def asked_in_room(requested_documents: Any) -> bool | None:
+    """Whether the room asks for a personal statement now: an open or answered row for one.
+
+    None when the rows were not read, so the caller leaves things as they are.
+    """
+    if requested_documents is None:
+        return None
+    for doc in requested_documents:
+        if getattr(doc, "status", None) in {"closed", "not_applicable"}:
+            continue
+        if (
+            getattr(doc, "requirement_key", None) == REQUIREMENT_KEY
+            or getattr(doc, "category", None) == SLOT_CATEGORY
+            or mentions_statement(getattr(doc, "name", None))
+        ):
+            return True
+    return False
+
+
+def ai_document_lists(context: Any, *, asked: bool | None) -> Any:
+    """The AI context's own document lists, naming a personal statement only while the room asks for one.
+
+    A file opened when every dealer file asked for one still carries it in the
+    lists written then; those words come out. While the room does ask, a policy
+    that lets the AI ask only for the documents it names gets this one named.
+    """
+    if not isinstance(context, dict) or asked is None:
+        return context
+
+    def lists(values: dict) -> dict:
+        result = dict(values)
+        for key in _AI_LIST_KEYS & set(result):
+            if isinstance(result[key], list) and not asked:
+                result[key] = [item for item in result[key] if not mentions_statement(item)]
+        return result
+
+    result = lists(context)
+    policy = result.get("baseline_document_policy")
+    if isinstance(policy, dict):
+        policy = lists(policy)
+        allowed = policy.get("allowed_document_categories")
+        if (
+            asked
+            and policy.get("do_not_request_other_document_categories")
+            and isinstance(allowed, list)
+            and not any(mentions_statement(item) for item in allowed)
+        ):
+            policy["allowed_document_categories"] = [*allowed, AI_ASK_WORDS]
+        result["baseline_document_policy"] = policy
+    return result
+
+
+def ai_lists_for_bucket(context: Any, bucket: Any) -> Any:
+    """`ai_document_lists` for a room, when its rows are loaded."""
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy.exc import NoInspectionAvailable
+
+    try:
+        loaded = "requested_documents" not in sa_inspect(bucket).unloaded
+    except NoInspectionAvailable:
+        loaded = hasattr(bucket, "requested_documents")
+    if not loaded:
+        return context
+    return ai_document_lists(context, asked=asked_in_room(getattr(bucket, "requested_documents", None)))
 
 
 # ---------------------------------------------------------------------------
@@ -675,7 +1059,8 @@ async def materialize(db: Any, profile: Any, requirement: Any, state: Any, reque
     if not is_requirement(requirement):
         return False
     provenance = dict(getattr(state, "provenance", None) or {})
-    tracker = await load(db, profile, with_links=False)
+    # Only a requirement something asks for gets this far (`settle`).
+    tracker = await load(db, profile, with_links=False, needed=True)
     if not tracker.needed:
         if "owner_statements" in provenance:
             previous = provenance.pop("owner_statements")
@@ -752,7 +1137,7 @@ async def materialize(db: Any, profile: Any, requirement: Any, state: Any, reque
 
 
 async def all_received(db: Any, profile: Any) -> bool:
-    """Whether every required owner's statement is in. True on a file that tracks no owners."""
+    """Whether every required owner's statement is in. True on a file that tracks no owners or asks for none."""
     tracker = await load(db, profile, with_links=False)
     return all(row_status(row) == "received" for row in tracker.needed)
 
@@ -811,8 +1196,13 @@ async def _owners(db: Any, profile: Any) -> list:
     return [row for row in (await db.execute(query)).scalars().all() if isinstance(row, ApplicationOwner | DealerOwner)]
 
 
-async def load(db: Any, profile: Any, *, families: list | None = None, with_links: bool = True) -> Tracker:
-    """Every owner and every personal statement on the file, tied together."""
+async def load(
+    db: Any, profile: Any, *, families: list | None = None, with_links: bool = True, needed: bool | None = None
+) -> Tracker:
+    """Every owner and every personal statement on the file, tied together.
+
+    `needed` defaults to whether the file asks for statements now (`need`).
+    """
     from app.models.financial_form_link import FinancialFormLink
     from app.models.financial_form_version import (
         FinancialFormDraft,
@@ -872,18 +1262,19 @@ async def load(db: Any, profile: Any, *, families: list | None = None, with_link
                 )
                 if target is not None:
                     target.links.append(link)
-    return build(owners, list(statements.values()))
+    if needed is None:
+        needed = (await need(db, profile)).needed
+    return build(owners, list(statements.values()), needed=needed)
 
 
 async def read(db: Any, profile: Any) -> dict[str, Any]:
-    tracker = await load(db, profile)
-    result = read_model(tracker)
+    wanted = await need(db, profile)
+    tracker = await load(db, profile, needed=wanted.needed)
+    result = read_model(tracker, need=wanted)
     result["profile_id"] = str(profile.id)
-    from app.routers.application_profiles import _requested_slot
-
-    slot = await _requested_slot(db, profile, KIND)
+    slot = await live_slot(db, profile)
     result["on_checklist"] = slot is not None
-    result["loose_files"] = await _loose_files(db, profile, tracker, slot)
+    result["loose_files"] = await _loose_files(db, profile, tracker, slot) if wanted.needed else []
     return result
 
 
@@ -1183,9 +1574,14 @@ async def person_for_family(db: Any, profile: Any, family_id: UUID) -> Any:
 
 
 async def mint_link(db: Any, profile: Any, owner: Any, *, user: Any, label: str, invitee_email: str | None = None) -> tuple[Any, str]:
-    """A private link to one owner's own statement. The token exists in readable form only here."""
+    """A private link to one owner's own statement. The token exists in readable form only here.
+
+    Sending a link is the desk asking: on a file that asked for no statements,
+    this puts them on its checklist (`ask_for_file`).
+    """
     from app.services import financial_statements
 
+    await ask_for_file(db, profile, user=user)
     family = await statement_for(db, profile, owner, actor=user)
     pointer = (family.identity or {}).get("statement_id")
     link, token = await financial_statements.mint_link(
@@ -1480,6 +1876,8 @@ async def set_requirement(db: Any, profile: Any, owner: Any, *, required: bool, 
 
     if not required and len((reason or "").strip()) < 8:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Say why a statement is not needed from this owner")
+    if required:
+        await ask_for_file(db, profile, user=user)
     family = await statement_for(db, profile, owner, actor=user)
     if required:
         # An owner at or over the line needs no request to be required: this takes them back to the rule.

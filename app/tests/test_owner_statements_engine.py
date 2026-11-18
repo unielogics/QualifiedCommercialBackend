@@ -68,7 +68,9 @@ def no_storage_and_no_side_effects():
         yield
 
 
-async def _file(db, *, shares=(50, 50), on_checklist=True):
+async def _file(db, *, shares=(50, 50), on_checklist=True, level="required"):
+    """A Main Street file with owners. Its initial checklist lists the personal
+    statement at `level`; as "optional" the file asks for none."""
     desk = User(clerk_id="desk", email="desk@example.com", name="Sam Desk", role=Role.LOAN_EXEC)
     bucket = Bucket(name="Sample Fabrication LLC")
     db.add_all([desk, bucket])
@@ -83,7 +85,7 @@ async def _file(db, *, shares=(50, 50), on_checklist=True):
     await db.flush()
     db.add(AICollectionRequirement(
         playbook_id=policy.id, requirement_key=os_.REQUIREMENT_KEY, requirement_kind="document",
-        label="Owner personal financial statement", category="financials", required_level="required",
+        label="Owner personal financial statement", category="financials", required_level=level,
         visibility=["borrower", "underwriter"], verification_required=False, can_underwriter_waive=True,
         completion_mode="ai_can_complete", objective_text="Review required owners.", completion_criteria="One per owner.",
     ))
@@ -107,6 +109,8 @@ async def _file(db, *, shares=(50, 50), on_checklist=True):
         )
         db.add(slot)
     await db.flush()
+    # The checklist as the desk first opens it.
+    await application_programs.get_program_readiness(db, profile)
     return SimpleNamespace(desk=desk, bucket=bucket, profile=profile, owners=owners, slot=slot)
 
 
@@ -518,3 +522,136 @@ async def test_the_ai_review_counts_each_person_once_and_holds_the_row_until_eve
     result = {"key_metrics": {}}
     bucket_ai._compute_key_metrics_from_cache(result, rows, pfs_uncounted_file_ids=uncounted)
     assert result["key_metrics"]["pfs_total_liquid_assets"] == 42000
+
+
+# ---------------------------------------------------------------------------
+# Only when the file asks for statements
+# ---------------------------------------------------------------------------
+
+
+async def _pfs_rows(db, bucket_id):
+    """Every room row for a personal statement: the room's own category, or the requirement's."""
+    from sqlalchemy import or_
+
+    return list((await db.execute(select(BucketRequestedDocument).where(
+        BucketRequestedDocument.bucket_id == bucket_id,
+        or_(BucketRequestedDocument.category == "Personal Financials",
+            BucketRequestedDocument.requirement_key == os_.REQUIREMENT_KEY),
+    ))).scalars().all())
+
+
+def _keys(readiness):
+    return {item.requirement_key for item in readiness.requirements}
+
+
+@pytest.mark.asyncio
+async def test_a_checklist_that_lists_the_statement_as_optional_asks_for_none(db):
+    file = await _file(db, level="optional", on_checklist=False)
+    # The row the dealer intake used to seed on every file, before the checklist adopted it.
+    seeded = BucketRequestedDocument(
+        bucket_id=file.bucket.id, name="Personal financial statement", category="Personal Financials",
+        requirement_key=os_.REQUIREMENT_KEY, required=True, status="requested",
+    )
+    db.add(seeded)
+    await db.flush()
+    readiness = await application_programs.get_program_readiness(db, file.profile)
+    assert os_.REQUIREMENT_KEY not in _keys(readiness)
+    assert seeded.status == "not_applicable"
+    model = await os_.read(db, file.profile)
+    assert model["needed"] is False and model["required_count"] == 0 and model["asked_by"] == []
+    assert model["on_checklist"] is False and model["loose_files"] == []
+    assert await os_.all_received(db, file.profile)
+    assert (await os_.review_context(db, file.profile))[0] is True
+
+
+@pytest.mark.asyncio
+async def test_the_checklist_drops_the_statement_when_its_last_asker_does_and_takes_it_back(db):
+    file = await _file(db, level="recommended")
+    readiness = await application_programs.get_program_readiness(db, file.profile)
+    row = next(item for item in readiness.requirements if item.requirement_key == os_.REQUIREMENT_KEY)
+    slot = await db.get(BucketRequestedDocument, row.requested_document_id)
+    assert slot.status == "requested" and (await os_.need(db, file.profile)).needed
+
+    definition = (await db.execute(select(AICollectionRequirement).where(
+        AICollectionRequirement.requirement_key == os_.REQUIREMENT_KEY))).scalar_one()
+    definition.required_level = "optional"
+    await db.flush()
+    readiness = await application_programs.get_program_readiness(db, file.profile)
+    assert os_.REQUIREMENT_KEY not in _keys(readiness)
+    state = await os_._state(db, file.profile)
+    assert state.status == "stale" and state.state_reason == os_.DORMANT_REASON
+    assert state.provenance["inactive_definition"] is True and slot.status == "not_applicable"
+    assert not (await os_.need(db, file.profile)).needed
+
+    definition.required_level = "required"
+    await db.flush()
+    readiness = await application_programs.get_program_readiness(db, file.profile)
+    row = next(item for item in readiness.requirements if item.requirement_key == os_.REQUIREMENT_KEY)
+    assert row.requested_document_id == slot.id and slot.status == "requested"
+    assert (await os_.read(db, file.profile))["required_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_the_desk_asking_puts_statements_on_a_file_that_asked_for_none(db):
+    from app.services.requirement_library import STAFF_POLICY_KEY
+
+    file = await _file(db, level="optional", on_checklist=False)
+    assert not (await os_.need(db, file.profile)).needed
+    slot, already = await os_.ensure_request(db, file.profile, actor=file.desk)
+    assert already is False and slot.status == "requested"
+    readiness = await application_programs.get_program_readiness(db, file.profile)
+    row = next(item for item in readiness.requirements if item.requirement_key == os_.REQUIREMENT_KEY)
+    assert row.required_level == "required" and STAFF_POLICY_KEY in row.source_policy_keys
+    model = await os_.read(db, file.profile)
+    assert model["needed"] is True and model["asked_by"] == ["Added by Sam Desk"]
+    assert model["required_count"] == 2 and model["on_checklist"] is True
+    again, already = await os_.ensure_request(db, file.profile, actor=file.desk)
+    assert already is True and again.id == slot.id
+    assert [row.id for row in await _pfs_rows(db, file.bucket.id)] == [slot.id]
+    # A statement filed now lands on that same row rather than opening a second.
+    jordan, _alex = file.owners
+    link, _ = await os_.mint_link(db, file.profile, jordan, user=file.desk, label="Copied for Jordan Sample")
+    await _submit(db, file.profile, link, 12000)
+    assert [row.id for row in await _pfs_rows(db, file.bucket.id)] == [slot.id]
+
+
+@pytest.mark.asyncio
+async def test_sending_an_owner_a_link_is_the_desk_asking(db):
+    file = await _file(db, level="optional", on_checklist=False)
+    _jordan, alex = file.owners
+    await os_.mint_link(db, file.profile, alex, user=file.desk, label="Copied for Alex Rivera")
+    await application_programs.get_program_readiness(db, file.profile)
+    model = await os_.read(db, file.profile)
+    assert model["needed"] is True and model["required_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_statement_saved_on_a_file_that_asks_for_none_is_kept_and_opens_no_row(db):
+    file = await _file(db, level="optional", on_checklist=False)
+    jordan, _alex = file.owners
+    family = await os_.statement_for(db, file.profile, jordan, actor=file.desk)
+    link, _token = await financial_statements.mint_link(db, file.profile, kind="pfs")
+    link.financial_family_id = family.id
+    await _submit(db, file.profile, link, 7000)
+    assert await _pfs_rows(db, file.bucket.id) == []
+    saved = (await db.execute(select(FinancialFormVersion).where(FinancialFormVersion.family_id == family.id))).scalars().all()
+    assert saved
+    for row in saved:
+        assert (await db.get(BucketFile, row.pdf_file_id)).requested_document_id is None
+    assert not (await os_.need(db, file.profile)).needed
+
+
+@pytest.mark.asyncio
+async def test_the_forms_packet_leaves_the_statement_out_unless_the_file_asks_for_one(db):
+    from app.routers.application_profiles import _mint_packet
+
+    async def kinds(file):
+        packet = await _mint_packet(db, file.profile, file.desk)
+        rows = (await db.execute(select(FinancialFormLink).where(FinancialFormLink.packet_id == packet["packet_id"]))).scalars().all()
+        return {row.kind for row in rows}
+
+    file = await _file(db, level="optional", on_checklist=False)
+    assert await kinds(file) == {"p_and_l", "balance_sheet", "debt_schedule"}
+    assert await _pfs_rows(db, file.bucket.id) == []
+    await os_.ensure_request(db, file.profile, actor=file.desk)
+    assert await kinds(file) == {"p_and_l", "balance_sheet", "debt_schedule", "pfs"}

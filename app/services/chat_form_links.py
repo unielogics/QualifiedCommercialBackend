@@ -364,6 +364,12 @@ async def link_for_action(
     target = target_for(action.action_type, action.requirement_key)
     if target is None:
         raise ValueError(f"{action.action_type} opens no form")
+    if target[0] == "worksheet" and "pfs" in target[1]:
+        # The worksheet shows a personal statement only on a file that asks for one.
+        from app.services import owner_statements
+
+        if not (await owner_statements.need(db, profile)).needed:
+            target = (target[0], tuple(kind for kind in target[1] if kind != "pfs"))
     if target[0] == "operating_plan":
         from app.services.operating_plan_goals import require_goal
 

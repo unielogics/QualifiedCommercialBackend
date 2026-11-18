@@ -118,10 +118,10 @@ def test_baseline_names_preserve_the_readiness_keywords():
     assert any("tax" in n and "return" in n for n in names)
 
 
-def test_pfs_is_present_but_not_required_day_one():
-    pfs = [r for r in MAIN_STREET_REQUIRED_DOCUMENTS if "personal financial" in r["name"].lower()]
-    assert len(pfs) == 1
-    assert pfs[0]["required"] is False
+def test_the_package_does_not_ask_for_a_personal_financial_statement():
+    """A file asks for one only when a program, a lender or the desk does
+    (owner_statements); the package never puts the row in the room itself."""
+    assert not [r for r in MAIN_STREET_REQUIRED_DOCUMENTS if "personal financial" in r["name"].lower()]
 
 
 def test_merchant_services_asks_only_for_processing_statements():

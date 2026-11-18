@@ -1530,8 +1530,9 @@ class FinancialFormStatus(BaseModel):
 
 
 class FinancialFormPacket(BaseModel):
-    """One forwardable link that opens all four forms: four child links that
-    share a `packet_id`. Listed so the desk can see what is out and close it."""
+    """One forwardable link that opens the file's financial forms: child links
+    that share a `packet_id` (three, or four with a personal financial
+    statement). Listed so the desk can see what is out and close it."""
 
     packet_id: UUID
     created_at: datetime | None = None

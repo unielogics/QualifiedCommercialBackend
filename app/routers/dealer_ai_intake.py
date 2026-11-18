@@ -444,13 +444,9 @@ REQUIRED_DOCUMENTS = [
         "description": "Upload a schedule of all outstanding business debt: lender, balance, and monthly payment for each.",
         "allow_multiple_files": False,
     },
-    {
-        "name": "Personal financial statement",
-        "category": "Personal Financials",
-        "requirement_key": "owner_personal_financial_statement",
-        "description": "Upload a completed personal financial statement (PFS) for each owner. Use the blank form below if you need one.",
-        "allow_multiple_files": True,
-    },
+    # No personal financial statement: a file asks for one only when a program,
+    # a lender or the desk does (app/services/owner_statements.py), and the
+    # checklist then adds the row.
 ]
 
 REAL_ESTATE_REQUIRED_DOCUMENTS = [
@@ -4386,7 +4382,6 @@ def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
                 "current year/YTD P&L",
                 "last 6 months main operating bank statements",
                 "debt schedule",
-                "personal financial statement for each owner",
                 "identification for each owner",
                 "requested amount",
                 "detailed use of funds with amount breakdown",
@@ -4597,7 +4592,6 @@ def _main_street_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         ],
         "max_new_conditional_documents_per_turn": 2,
         "stage_2_after_good_probability_only": [
-            "personal financial statement for each 20%+ owner",
             "owner resume",
             "use-of-proceeds breakdown",
             "identification for each owner",
@@ -4921,7 +4915,6 @@ async def _create_bucket_for_intake(
                 "current year/YTD P&L",
                 "last 6 months main operating bank statements",
                 "debt schedule",
-                "personal financial statement for each owner",
                 "identification for each owner",
                 "requested amount",
                 "detailed use of funds with amount breakdown",
@@ -10239,11 +10232,24 @@ def _contract_field_values_from_lead(intake: PublicUnderwritingIntake, contract_
 
 
 async def _request_pfs(db: AsyncSession, intake: PublicUnderwritingIntake, owner_name: str | None, *, actor: Any = None) -> BucketRequestedDocument:
-    """Shared by admin+broker request-pfs endpoints. Idempotent via
-    _ensure_requested_document — requesting the baseline PFS again (no
-    owner_name) returns the existing row rather than duplicating; a distinct
-    owner_name creates a separate per-owner PFS request, same naming
-    convention as the per-owner ID documents in _apply_dealer_detail_documents."""
+    """Shared by admin+broker request-pfs endpoints.
+
+    Asking is the desk asking the file for personal financial statements: they
+    go on its checklist the way a program's would, one row with every owner
+    tracked on it (owner_statements.ensure_request), and asking again changes
+    nothing. A distinct owner_name also keeps the older separate per-owner row,
+    same naming convention as the per-owner ID documents in
+    _apply_dealer_detail_documents. A lead with no file yet gets the room row
+    alone, idempotent via _ensure_requested_document."""
+    from app.services import owner_statements
+    from app.services.application_programs import profile_for_chat_scope
+
+    profile = await profile_for_chat_scope(db, bucket_id=intake.bucket_id, intake_id=intake.id)
+    if profile is not None and profile.primary_bucket_id is not None:
+        slot, _already = await owner_statements.ensure_request(db, profile, actor=actor)
+        if not owner_name:
+            await db.commit()
+            return slot
     name = f"Personal financial statement — {owner_name}" if owner_name else "Personal financial statement"
     description = (
         f"Upload a completed personal financial statement (PFS) for {owner_name}. Use the blank form below if you need one."

@@ -386,11 +386,15 @@ def test_the_public_submit_keeps_exactly_two_emit_sites_and_the_service_owns_the
 # ── the packet ──────────────────────────────────────────────────────────────
 
 
-def _mint(profile=None, user=None, *, pfs=None, requested_slot=None):
+def _mint(profile=None, user=None, *, pfs=None, requested_slot=None, asks=True):
+    """Mint a packet on a file that asks for personal statements (`asks`) or not."""
+    from app.services import owner_statements
+
     profile = profile or _profile()
     user = user or _user()
     db = _db(scalar=None)
     with (
+        patch.object(owner_statements, "need", AsyncMock(return_value=owner_statements.Need(asks))),
         patch.object(profiles, "load_profile", AsyncMock(return_value=profile)),
         patch.object(router, "_requested_slot", AsyncMock(return_value=requested_slot)),
         patch.object(business_statements, "ensure_slot", AsyncMock(return_value=_slot())) as ensure,
@@ -424,11 +428,12 @@ def test_the_packet_is_four_children_with_derived_tokens_sharing_one_id():
     db.commit.assert_awaited_once()
 
 
-def test_the_packet_ensures_all_four_slots_silently_and_emits_one_event():
+def test_the_packet_ensures_the_business_slots_silently_and_emits_one_event():
     result, links, slots, ensure, create_pfs, emit, logged, db = _mint()
     assert [call.args[2] for call in ensure.await_args_list] == ["p_and_l", "balance_sheet"]
     assert all(call.kwargs == {"required": False} for call in ensure.await_args_list)
-    assert sorted(slot.category for slot in slots) == ["Debts", "Personal Financials"]
+    # The personal statement's row is the checklist's own, on a file that asks for one.
+    assert sorted(slot.category for slot in slots) == ["Debts"]
     assert all(slot.required is False for slot in slots)
     emit.assert_awaited_once()
     event = emit.await_args.kwargs
@@ -443,6 +448,15 @@ def test_existing_slots_are_not_recreated():
     _, _, slots, ensure, *_ = _mint(requested_slot=_slot("Personal financial statement"))
     assert slots == []
     assert ensure.await_count == 2   # the two new kinds still go through ensure_slot, idempotently
+
+
+def test_a_file_that_asks_for_no_personal_statement_gets_a_three_form_packet():
+    result, links, slots, ensure, create_pfs, emit, logged, db = _mint(asks=False)
+    assert {link.kind for link in links} == {"debt_schedule", "p_and_l", "balance_sheet"}
+    assert [slot.category for slot in slots] == ["Debts"]
+    create_pfs.assert_not_awaited()
+    assert emit.await_args.kwargs["meta"]["kinds"] == ["p_and_l", "balance_sheet", "debt_schedule"]
+    assert logged.await_args.args[4] == "Created a packet link that opens 3 financial forms"
 
 
 def test_an_already_submitted_pfs_is_marked_done_on_its_child():

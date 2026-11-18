@@ -752,6 +752,14 @@ def _funding_intent(context: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _statement_lists(context: Any, bucket: Any) -> Any:
+    """The context's own document lists, naming a personal financial statement
+    only while the room asks for one (app/services/owner_statements.py)."""
+    from app.services import owner_statements
+
+    return owner_statements.ai_lists_for_bucket(context, bucket)
+
+
 def _public_ai_context(bucket: Bucket) -> dict[str, Any]:
     context = bucket.ai_context or {}
     review_type = context.get("review_type")
@@ -3679,8 +3687,13 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
             "bucket_type": bucket.bucket_type,
             "description": bucket.description,
         },
-        "ai_context": {key: value for key, value in (review.context_snapshot or bucket.ai_context or {}).items()
-                       if key not in {"financial_calculation_review", "desk_financial_plan"}},
+        # Lists written when every dealer file asked for a personal statement
+        # name one only while the room asks for it (owner_statements).
+        "ai_context": _statement_lists(
+            {key: value for key, value in (review.context_snapshot or bucket.ai_context or {}).items()
+             if key not in {"financial_calculation_review", "desk_financial_plan"}},
+            bucket,
+        ),
     }
     try:
         from app.services.application_programs import profile_for_chat_scope
@@ -5406,7 +5419,7 @@ async def _chat_context(
     if audience == "admin":
         if readiness_profile is not None:
             await _attach_current_financial_context(db, readiness_profile, base)
-        admin_ai_context = dict(bucket.ai_context or {})
+        admin_ai_context = dict(_statement_lists(bucket.ai_context or {}, bucket))
         admin_ai_context.pop("financial_calculation_review", None)
         admin_ai_context.pop("desk_financial_plan", None)
         if program_context is not None:
@@ -5457,7 +5470,7 @@ async def _chat_context(
     if upload_link is not None:
         review = await latest_review(db, bucket.id)
         tasks = await visible_action_items(db, bucket.id, route="uploader", upload_link_id=upload_link.id, approved_only=True)
-        public_ai_context = _public_ai_context(bucket)
+        public_ai_context = _statement_lists(_public_ai_context(bucket), bucket)
         public_review_type = public_ai_context.get("review_type") if public_ai_context else None
         latest_result = review.result if review and isinstance(review.result, dict) else None
         # SECURITY (H3): the uploader (public token + passcode) must NOT receive the
@@ -5510,7 +5523,7 @@ async def _chat_context(
         review = await latest_review(db, bucket.id)
         tasks = await visible_action_items(db, bucket.id, route="share", share_id=share.id, approved_only=True)
         notes = [note for note in bucket.notes if note.visibility == "shared" or share.can_see_internal_notes]
-        public_ai_context = _public_ai_context(bucket)
+        public_ai_context = _statement_lists(_public_ai_context(bucket), bucket)
         public_review_type = public_ai_context.get("review_type") if public_ai_context else None
         from app.services.financial_workspace import filter_current_files
 
@@ -5559,7 +5572,7 @@ async def _chat_context(
             or note.vendor_access_id == vendor_access.id
             or vendor_access.can_see_internal_notes
         ]
-        public_ai_context = _public_ai_context(bucket)
+        public_ai_context = _statement_lists(_public_ai_context(bucket), bucket)
         public_review_type = public_ai_context.get("review_type") if public_ai_context else None
         scoped_versions = await current_version_context(db, visible_file_ids={file.id for file in visible_files})
         return {

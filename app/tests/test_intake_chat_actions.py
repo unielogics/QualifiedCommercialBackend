@@ -36,6 +36,15 @@ PFS = "owner_personal_financial_statement"
 DEBT = "business_debt_schedule"
 PNL = "ytd_p_and_l_balance_sheet"
 ALL_SHEETS = ("p_and_l", "balance_sheet", "debt_schedule", "pfs")
+
+
+@pytest.fixture(autouse=True)
+def the_file_asks_for_personal_statements():
+    """These files list the personal statement on their checklist, so the file asks for one."""
+    from app.services import owner_statements
+
+    with patch.object(owner_statements, "need", AsyncMock(return_value=owner_statements.Need(True))) as need:
+        yield need
 LABELS = {
     PFS: "Personal financial statement",
     DEBT: "Business debt schedule",
@@ -523,6 +532,21 @@ async def test_open_worksheet_execute_opens_all_four_sheets_with_pin() -> None:
     assert result.room_url and result.room_url.endswith("&form=worksheet")
     assert set(action.result) == STORED_KEYS
     assert action.result["pin_set"] is True
+
+
+async def test_the_worksheet_leaves_out_the_personal_statement_on_a_file_that_asks_for_none(the_file_asks_for_personal_statements) -> None:
+    from app.services import owner_statements
+
+    the_file_asks_for_personal_statements.return_value = owner_statements.Need(False)
+    db = FakeDB()
+    action = _action("open_worksheet", DEBT)
+    _, readiness = _execute_env(db, action)
+    form, worksheet = _mint_fakes(pin="135790")
+    with patch.object(intake_chat_actions, "get_program_readiness", AsyncMock(return_value=readiness)), \
+            patch.object(chat_form_links, "mint_form_link", form), \
+            patch.object(chat_form_links, "mint_worksheet_link", worksheet):
+        await execute_room_action(db, action=action, link=_room_link())
+    assert worksheet.await_args.kwargs["sheets"] == ("p_and_l", "balance_sheet", "debt_schedule")
 
 
 async def test_open_worksheet_still_executes_while_another_actionable_item_is_outstanding() -> None:
