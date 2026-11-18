@@ -610,3 +610,44 @@ async def test_sending_the_missing_links_emails_each_owner_their_own_and_reports
     assert [(item["owner_name"], item["sent"]) for item in result["items"]] == [("Alex Rivera", True), ("Riley Chen", False)]
     assert result["items"][1]["detail"] == "No personal email on file for this owner"
     assert sent.await_count == 1
+
+
+# --- the AI review ------------------------------------------------------------------------------
+
+
+def test_each_person_counts_once_in_a_combined_figure():
+    jordan, alex = owner("Jordan", "Sample", 50, is_primary=True), owner("Alex", "Rivera", 50)
+    newer, older = filed("Jordan Sample", [jordan], days_ago=2), filed("Jordan Sample", [jordan], days_ago=40)
+    older.versions[0].created_at = NOW - timedelta(days=40)
+    joint = filed("Alex Rivera", [alex, jordan], days_ago=5)
+    spouse = filed("Morgan Lee", [], set_aside=True)
+    tracker = os_.build([jordan, alex], [newer, older, joint, spouse])
+    left_out = os_.uncounted(tracker)
+    assert os_.file_ids(older) <= left_out and os_.file_ids(spouse) <= left_out
+    # The statement that counts for an owner is never left out, even when it is another owner's second.
+    assert not (os_.file_ids(newer) & left_out) and not (os_.file_ids(joint) & left_out)
+
+
+def test_one_statement_does_not_mark_the_room_row_done_while_another_owner_is_missing():
+    from app.services import bucket_ai
+
+    slot = SimpleNamespace(name="Personal financial statement", category="Personal Financials", status="requested", closed_at=None, closed_reason=None)
+    held = bucket_ai._mark_satisfied_requests([slot], {"personal_financial_statement"}, held_classes={"personal_financial_statement"})
+    assert held == 0 and slot.status == "requested"
+    assert bucket_ai._mark_satisfied_requests([slot], {"personal_financial_statement"}) == 1 and slot.status == "uploaded"
+
+
+def test_the_owners_combined_liquidity_leaves_out_what_it_is_told_to():
+    from app.services import bucket_ai
+
+    rows = [
+        {"file_id": "jordan-now", "ai_classification": "personal_financial_statement", "key_facts": {"liquid_assets": 61000}},
+        {"file_id": "jordan-before", "ai_classification": "personal_financial_statement", "key_facts": {"liquid_assets": 42000}},
+        {"file_id": "alex", "ai_classification": "personal_financial_statement", "key_facts": {"liquid_assets": 8000}},
+    ]
+    before = {"key_metrics": {}}
+    bucket_ai._compute_key_metrics_from_cache(before, rows)
+    assert before["key_metrics"]["pfs_total_liquid_assets"] == 111000
+    after = {"key_metrics": {}}
+    bucket_ai._compute_key_metrics_from_cache(after, rows, pfs_uncounted_file_ids={"jordan-before"})
+    assert after["key_metrics"]["pfs_total_liquid_assets"] == 69000

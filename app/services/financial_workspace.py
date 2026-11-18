@@ -289,7 +289,13 @@ async def existing_family(db: AsyncSession, profile_id: UUID, kind: str) -> Fina
 
 
 async def has_managed_family(db: AsyncSession, profile: Any, kind: str) -> bool:
-    return await existing_family(db, profile.id, kind) is not None
+    """Whether any form of this kind on the file keeps versions.
+
+    Any, not the applicant's: the legacy statement writers and the old PDF
+    refresher this guards must never touch a file that keeps versions,
+    whichever owner's statement those versions are.
+    """
+    return bool(await _families(db, profile.id, kind))
 
 
 async def lock_financial_profile(db: AsyncSession, profile: ApplicationProfile) -> None:

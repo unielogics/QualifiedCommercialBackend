@@ -432,8 +432,10 @@ async def test_an_uploaded_statement_lands_in_the_history_of_the_owner_it_names_
 
 @pytest.mark.asyncio
 async def test_the_older_copy_link_path_gives_the_applicant_their_own_statement_on_a_two_owner_file(db):
-    """The desk's generic "copy link" and the room's "fill in online" still go through the older
-    lookups. With only the co-owner's statement on file they must start the applicant's, not open Alex's."""
+    """The desk's generic "copy link", the packet, the room's "fill in online" and the signed-in
+    client's page still go through the older lookups. With only the co-owner's statement on file
+    they get the applicant's own versioned statement, started for them: never Alex's, and never a
+    legacy statement row beside the versioned ones."""
     from app.services.financial_workspace_legacy import managed_snapshot
 
     file = await _file(db)
@@ -442,21 +444,77 @@ async def test_the_older_copy_link_path_gives_the_applicant_their_own_statement_
     link_for_alex, _ = await os_.mint_link(db, file.profile, alex, user=file.desk, label="Emailed to Alex Rivera")
     await _submit(db, file.profile, link_for_alex, 42000)
 
-    # What `mint_financial_form_link` and the room's form-open route do, step for step.
-    statement = await financial_statements.latest_for_profile(db, file.profile.id)
+    # What `mint_financial_form_link`, `_mint_packet` and the room's form-open route do, step for step.
+    assert await financial_statements.latest_for_profile(db, file.profile.id) is None
     managed = await managed_snapshot(db, file.profile, "pfs")
-    assert statement is None and managed is None
-    statement = await financial_statements.save_statement(db, file.profile, body=pfs_schema.empty_body(), actor_user_id=file.desk.id)
-    link, _token = await financial_statements.mint_link(db, file.profile, kind="pfs", statement_id=statement.id, created_by=file.desk.id)
-    assert await managed_snapshot(db, file.profile, "pfs") is None
-
-    opened = await client_financial_forms.ensure_snapshot(db, file.profile, "pfs", statement_id=link.statement_id, family_id=link.financial_family_id)
-    assert opened["family_id"] != str(theirs.id)
-    assert opened["body"]["applicant"]["name"] == "Jordan Sample"
-    assert opened["versions"] == []
+    assert managed is not None and managed["family_id"] != str(theirs.id)
+    assert managed["body"]["applicant"]["name"] == "Jordan Sample" and managed["versions"] == []
     tracker = await os_.load(db, file.profile)
-    assert str(tracker.row_for(jordan.id).statement.family.id) == opened["family_id"]
+    assert str(tracker.row_for(jordan.id).statement.family.id) == managed["family_id"]
     assert tracker.row_for(alex.id).statement.family.id == theirs.id
-    # And the same lookups now find the applicant's own.
-    assert (await managed_snapshot(db, file.profile, "pfs"))["family_id"] == opened["family_id"]
-    assert (await financial_statements.latest_for_profile(db, file.profile.id)).id == statement.id
+    # Asked again, it is the same statement, not a third.
+    assert (await managed_snapshot(db, file.profile, "pfs"))["family_id"] == managed["family_id"]
+    families = (await db.execute(select(FinancialFormFamily).where(FinancialFormFamily.profile_id == file.profile.id))).scalars().all()
+    assert len(families) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_file_that_keeps_versions_for_any_owner_refuses_legacy_statement_writes(db):
+    """The old statement writers and PDF refresher are kept off a file that keeps versions,
+    whichever owner's statement those versions are."""
+    from fastapi import HTTPException
+
+    file = await _file(db)
+    _jordan, alex = file.owners
+    assert await ws.has_managed_family(db, file.profile, "pfs") is False
+    await os_.statement_for(db, file.profile, alex, actor=file.desk)
+    # Only the co-owner has one, and the applicant's lookup finds nothing of theirs ...
+    assert await ws.existing_family(db, file.profile.id, "pfs") is None
+    # ... but the file keeps versions, so a legacy write is refused rather than written beside them.
+    assert await ws.has_managed_family(db, file.profile, "pfs") is True
+    with pytest.raises(HTTPException) as refused:
+        await financial_statements.save_statement(db, file.profile, body=pfs_schema.empty_body(), status="draft")
+    assert refused.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_the_ai_review_counts_each_person_once_and_holds_the_row_until_every_owner_is_in(db):
+    from app.services import bucket_ai
+
+    file = await _file(db)
+    jordan, alex = file.owners
+    link, _ = await os_.mint_link(db, file.profile, alex, user=file.desk, label="Emailed to Alex Rivera")
+    await _submit(db, file.profile, link, 42000)
+    owners_in, uncounted = await os_.review_context(db, file.profile)
+    assert owners_in is False and uncounted == set()
+    file.slot.status = "requested"
+    held = bucket_ai._mark_satisfied_requests([file.slot], {"personal_financial_statement"}, held_classes={"personal_financial_statement"})
+    assert held == 0 and file.slot.status == "requested"
+
+    # An older upload of Alex's that arrived without a name started its own statement, and the desk
+    # then said it is Alex's: the same person twice, in two statements.
+    document = await _upload(db, file, "statement-scan.pdf")
+    document.created_at = datetime.now(UTC) - timedelta(days=40)
+    second = await os_._start(db, file.profile, alex, actor=file.desk)
+    old = FinancialFormVersion(
+        family_id=second.id, version_number=1, schema_version="sba413.v1", body={}, key_facts={"liquid_assets": 15000},
+        body_sha256=ws.body_hash({}), source="original", status="original", source_file_id=document.id, pdf_file_id=document.id,
+        created_at=datetime.now(UTC) - timedelta(days=40),
+    )
+    db.add(old)
+    await db.flush()
+    second.current_version_id = old.id
+    await db.flush()
+    tracker = await os_.load(db, file.profile)
+    assert len(tracker.row_for(alex.id).statements) == 2
+    # The newer statement counts for Alex; the older one is left out of any combined figure.
+    assert tracker.row_for(alex.id).statement.family.id != second.id
+    owners_in, uncounted = await os_.review_context(db, file.profile)
+    assert str(document.id) in uncounted
+    rows = [
+        {"file_id": fid, "ai_classification": "personal_financial_statement", "key_facts": {"liquid_assets": cash}}
+        for fid, cash in ((str(document.id), 15000), ("online-statement", 42000))
+    ]
+    result = {"key_metrics": {}}
+    bucket_ai._compute_key_metrics_from_cache(result, rows, pfs_uncounted_file_ids=uncounted)
+    assert result["key_metrics"]["pfs_total_liquid_assets"] == 42000

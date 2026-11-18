@@ -91,6 +91,11 @@ async def managed_snapshot(db: Any, profile: Any, kind: str, *, statement_id: UU
             return None
     else:
         family = await workspace.existing_family(db, profile.id, kind)
+        if family is None and kind == "pfs" and await workspace.has_managed_family(db, profile, kind):
+            # Another owner's statement keeps versions, so the applicant's does
+            # too. Open theirs, started on first use, rather than fall back to
+            # a legacy statement row or hand over a co-owner's statement.
+            return await workspace.load_workspace(db, profile, kind=kind)
     if family is None:
         return None
     return await workspace.load_workspace(db, profile, kind=kind, family_id=family.id)

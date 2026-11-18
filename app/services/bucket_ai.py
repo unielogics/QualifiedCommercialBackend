@@ -1365,7 +1365,8 @@ FINANCIAL_VERSION_RULE = (
 
 
 def _compute_key_metrics_from_cache(
-    result: dict[str, Any], per_file_analyses: list[dict[str, Any]], *, accepted_debt_schedule: dict | None = None
+    result: dict[str, Any], per_file_analyses: list[dict[str, Any]], *, accepted_debt_schedule: dict | None = None,
+    pfs_uncounted_file_ids: set[str] | frozenset[str] = frozenset(),
 ) -> None:
     """Deterministically populate numeric key_metrics from the durable per-file
     bank/tax facts, so the intelligence cards show real figures even when the
@@ -1583,7 +1584,11 @@ def _compute_key_metrics_from_cache(
 
     from app.services.public_underwriting_packet_pdf import extract_personal_financial_statements
 
-    pfs_rows = extract_personal_financial_statements(normalized)
+    # One person counts once: an owner's earlier statement, or one the desk set
+    # aside as no owner's, does not add to the owners' combined liquidity.
+    pfs_rows = extract_personal_financial_statements(
+        [item for item in normalized if str(item.get("file_id")) not in pfs_uncounted_file_ids]
+    )
     liquid_vals = [row["liquid_assets"] for row in pfs_rows if row.get("liquid_assets") is not None]
     if _blank("pfs_total_liquid_assets") and liquid_vals:
         km["pfs_total_liquid_assets"] = round(sum(liquid_vals), 2)
@@ -1888,19 +1893,24 @@ def _apply_lending_readiness(result: dict[str, Any], per_file_analyses: list[dic
             result["one_next_step"] = question
 
 
-def _mark_satisfied_requests(documents, present_classes: set[str]) -> int:
+def _mark_satisfied_requests(documents, present_classes: set[str], *, held_classes: set[str] | frozenset[str] = frozenset()) -> int:
     """Mark an open ask uploaded when an analyzed file reads as what it asked for.
 
     Only an ask the client still owes can be answered this way. A closed one
     (an archived room's, or a duplicate merged into the room's own row) stays
     closed: flipping it to uploaded resurrected a merged duplicate beside the
     row that had adopted it.
+
+    `held_classes` are asks one document cannot answer: the personal financial
+    statement while another owner's is still missing.
     """
     marked = 0
     for doc in documents:
         if not is_open_request(doc):
             continue
         wanted = classifications_for_requested_doc(doc.name, doc.category)
+        if wanted & held_classes:
+            continue
         if wanted & present_classes:
             doc.status = "uploaded"
             marked += 1
@@ -3916,11 +3926,20 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         # uploaded when an analyzed file satisfies its category, so satisfied
         # baseline items stop showing as "missing" in the UI.
         present_classes = {item.get("ai_classification") for item in per_file_analyses if item.get("ai_classification")}
-        _mark_satisfied_requests(bucket.requested_documents, present_classes)
+        # A personal financial statement is one per owner (owner_statements):
+        # one owner's does not answer the row, and one person counts once.
+        owners_in, pfs_uncounted = True, set()
+        if screen_profile is not None:
+            from app.services import owner_statements
+
+            owners_in, pfs_uncounted = await owner_statements.review_context(db, screen_profile)
+        _mark_satisfied_requests(bucket.requested_documents, present_classes,
+            held_classes=frozenset() if owners_in else frozenset({"personal_financial_statement"}))
         # Deterministically fill numeric key_metrics from the cached bank/tax facts
         # (the synthesis pass frequently leaves them null) and compute lending
         # readiness + a concrete clarifying next step from the open gaps.
-        _compute_key_metrics_from_cache(result, per_file_analyses, accepted_debt_schedule=accepted_schedule)
+        _compute_key_metrics_from_cache(result, per_file_analyses, accepted_debt_schedule=accepted_schedule,
+            pfs_uncounted_file_ids=pfs_uncounted)
         if screen_profile is not None:
             from app.services import financial_cockpit
             from app.services.financial_metric_reporting import current_review_projection

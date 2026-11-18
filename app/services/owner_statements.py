@@ -757,6 +757,32 @@ async def all_received(db: Any, profile: Any) -> bool:
     return all(row_status(row) == "received" for row in tracker.needed)
 
 
+def uncounted(tracker: Tracker) -> set[str]:
+    """Files that must not add to a combined figure across owners.
+
+    An owner's earlier or second statement is the same person again, and a
+    statement the desk set aside is no owner's. Liquidity summed across owners
+    counts each person once, from the statement that counts for them.
+    """
+    counted: set[str] = set()
+    excluded: set[str] = set()
+    for row in tracker.rows:
+        if row.statement is not None:
+            counted |= file_ids(row.statement)
+        for statement in row.statements[1:]:
+            excluded |= file_ids(statement)
+    for statement in tracker.statements:
+        if _identity(statement).get("set_aside"):
+            excluded |= file_ids(statement)
+    return excluded - counted
+
+
+async def review_context(db: Any, profile: Any) -> tuple[bool, set[str]]:
+    """What the AI review needs: whether every required owner's statement is in, and the files not to count twice."""
+    tracker = await load(db, profile, with_links=False)
+    return all(row_status(row) == "received" for row in tracker.needed), uncounted(tracker)
+
+
 # ---------------------------------------------------------------------------
 # Reading the file
 # ---------------------------------------------------------------------------
