@@ -1,5 +1,6 @@
 """AI suggestions follow their file: when the file leaves active work, the
-ones still waiting close, and they reopen if the file comes back.
+ones still waiting close, and they reopen if the file comes back. A suggestion
+nobody answers in 90 days closes too, for good.
 
 A suggestion (``bucket_ai_action_items`` with status ``proposed``) waits for
 the desk to approve or dismiss it. A file marked lost or denied keeps its room
@@ -21,15 +22,23 @@ something a person decided.
   (``FILE_CLOSED``).
 
 A funded file is still active work, and a room no file uses (a standalone
-Documents room) has no lifecycle to follow, so neither is touched.
+Documents room) has no lifecycle to follow, so neither is touched by that rule.
+
+Expiry is the second rule, for every room: a suggestion left waiting and
+untouched for 90 days (``EXPIRE_AFTER``, read off ``updated_at``) closes as
+``EXPIRED`` and is never reopened by the system. On 2026-11-19, after the
+first rule ran, 87 of the 167 still waiting were older than that: 66 in one
+standalone room nobody had used in 140 days. A file that comes back after 90
+days gets its old suggestions back as expired rather than waiting: the AI's
+next review files fresh ones if they still apply.
 
 The rule is applied in three places:
 
 * readers that count or list waiting work filter with ``room_is_live()``, so
   a file closed a moment ago drops off the desk at once;
-* ``reconcile`` closes and reopens the rows; ``run_scheduled_sweep`` runs it
-  every few minutes, which catches a file closed by any path, and its first
-  run after a deploy is the backfill;
+* ``reconcile`` closes, expires and reopens the rows; ``run_scheduled_sweep``
+  runs it every few minutes, which catches a file closed by any path, and its
+  first run after a deploy is the backfill;
 * ``closing_reason`` lets the AI review file new recommendations on a closed
   file already closed.
 
@@ -48,7 +57,7 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -68,15 +77,22 @@ CLOSED = "closed"
 
 FILE_CLOSED = "file_closed"
 ROOM_ARCHIVED = "room_archived"
-#: Reasons the system writes. Only these are ever reopened by it.
-SYSTEM_REASONS = (FILE_CLOSED, ROOM_ARCHIVED)
+EXPIRED = "expired"
+#: Closed because of where the file stands: these come back with the file.
+REOPENABLE_REASONS = (FILE_CLOSED, ROOM_ARCHIVED)
+
+#: How long a suggestion may wait untouched before it closes as expired.
+EXPIRE_AFTER_DAYS = 90
+EXPIRE_AFTER = timedelta(days=EXPIRE_AFTER_DAYS)
 
 REASON_TEXT = {
     FILE_CLOSED: "the file was closed (lost, denied or withdrawn)",
     ROOM_ARCHIVED: "the room was archived",
+    EXPIRED: f"unanswered for {EXPIRE_AFTER_DAYS} days",
 }
 
 CLOSED_ACTION = "ai_actions_closed"
+EXPIRED_ACTION = "ai_actions_expired"
 REOPENED_ACTION = "ai_actions_reopened"
 
 
@@ -132,11 +148,15 @@ def _reason(archived: Any, file_closed: Any) -> str | None:
     return None
 
 
-def _system_closed():
+def _reopenable_closed():
     return and_(
         BucketAIActionItem.status == CLOSED,
-        BucketAIActionItem.closed_reason.in_(SYSTEM_REASONS),
+        BucketAIActionItem.closed_reason.in_(REOPENABLE_REASONS),
     )
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 async def closing_reason(db: AsyncSession, bucket_id: UUID) -> str | None:
@@ -160,24 +180,32 @@ def _has(*where: Any):
 
 
 async def rooms_out_of_step(
-    db: AsyncSession, *, bucket_ids: Iterable[UUID] | None = None
+    db: AsyncSession,
+    *,
+    bucket_ids: Iterable[UUID] | None = None,
+    now: datetime | None = None,
 ) -> dict[UUID, str | None]:
-    """The rooms whose suggestions disagree with their file, each with the
-    reason its suggestions should be closed for now (None: the file is live
-    again). A room in step is left out, so a quiet pass writes nothing."""
+    """The rooms whose suggestions disagree with their file or have waited too
+    long, each with the reason its suggestions should be closed for now (None:
+    the file is live). A room in step is left out, so a quiet pass writes
+    nothing."""
 
+    cutoff = (now or datetime.now(UTC)) - EXPIRE_AFTER
     stmt = select(
         Bucket.id,
         Bucket.archived_at.is_not(None).label("archived"),
         room_file_closed().label("file_closed"),
         _has(BucketAIActionItem.status == WAITING).label("waiting"),
         _has(
+            BucketAIActionItem.status == WAITING, BucketAIActionItem.updated_at < cutoff
+        ).label("stale"),
+        _has(
             BucketAIActionItem.status == CLOSED, BucketAIActionItem.closed_reason == FILE_CLOSED
         ).label("closed_for_file"),
         _has(
             BucketAIActionItem.status == CLOSED, BucketAIActionItem.closed_reason == ROOM_ARCHIVED
         ).label("closed_for_room"),
-    ).where(_has(or_(BucketAIActionItem.status == WAITING, _system_closed())))
+    ).where(_has(or_(BucketAIActionItem.status == WAITING, _reopenable_closed())))
     if bucket_ids is not None:
         wanted = sorted(set(bucket_ids))
         if not wanted:
@@ -188,6 +216,7 @@ async def rooms_out_of_step(
         reason = _reason(row.archived, row.file_closed)
         out_of_step = (
             (reason is not None and bool(row.waiting))
+            or (reason is None and bool(row.stale))
             or (reason is None and bool(row.closed_for_file or row.closed_for_room))
             or (reason == FILE_CLOSED and bool(row.closed_for_room))
             or (reason == ROOM_ARCHIVED and bool(row.closed_for_file))
@@ -203,8 +232,9 @@ async def reconcile(
     bucket_ids: Iterable[UUID] | None = None,
     now: datetime | None = None,
 ) -> dict[str, int]:
-    """Close what waits on a closed file and reopen what this closed on a file
-    that is active again. Flushes; the caller commits.
+    """Close what waits on a closed file, expire what has waited untouched for
+    ``EXPIRE_AFTER``, and reopen what this closed on a file that is active
+    again. Flushes; the caller commits.
 
     Rows another transaction holds are skipped, not waited on: a person
     answering a suggestion at this moment wins, and the next pass looks again.
@@ -213,8 +243,9 @@ async def reconcile(
     """
 
     now = now or datetime.now(UTC)
-    report = {"rooms": 0, "closed": 0, "reopened": 0, "relabelled": 0}
-    reason_by_room = await rooms_out_of_step(db, bucket_ids=bucket_ids)
+    cutoff = now - EXPIRE_AFTER
+    report = {"rooms": 0, "closed": 0, "expired": 0, "reopened": 0, "relabelled": 0}
+    reason_by_room = await rooms_out_of_step(db, bucket_ids=bucket_ids, now=now)
     report["rooms"] = len(reason_by_room)
     if not reason_by_room:
         return report
@@ -224,7 +255,7 @@ async def reconcile(
             select(BucketAIActionItem)
             .where(
                 BucketAIActionItem.bucket_id.in_(sorted(reason_by_room)),
-                or_(BucketAIActionItem.status == WAITING, _system_closed()),
+                or_(BucketAIActionItem.status == WAITING, _reopenable_closed()),
             )
             .order_by(BucketAIActionItem.bucket_id, BucketAIActionItem.created_at)
             .with_for_update(skip_locked=True, of=BucketAIActionItem)
@@ -232,37 +263,49 @@ async def reconcile(
     ).scalars().all()
     closed: Counter[tuple[UUID, str]] = Counter()
     reopened: Counter[UUID] = Counter()
+
+    def close(item: BucketAIActionItem, reason: str) -> None:
+        item.status = CLOSED
+        item.closed_at = now
+        item.closed_reason = reason
+        closed[(item.bucket_id, reason)] += 1
+
     for item in items:
         reason = reason_by_room[item.bucket_id]
         if item.status == WAITING:
-            if reason is None:
-                continue
-            item.status = CLOSED
-            item.closed_at = now
-            item.closed_reason = reason
-            closed[(item.bucket_id, reason)] += 1
+            if reason is not None:
+                close(item, reason)
+            elif _as_utc(item.updated_at) < cutoff:
+                close(item, EXPIRED)
         elif reason is None:
-            item.status = WAITING
-            item.closed_at = None
-            item.closed_reason = None
-            reopened[item.bucket_id] += 1
+            if _as_utc(item.created_at) < cutoff:
+                # The file came back, but this was asked for too long ago to
+                # wait again; the next review files it afresh if it applies.
+                item.closed_at = now
+                item.closed_reason = EXPIRED
+                closed[(item.bucket_id, EXPIRED)] += 1
+            else:
+                item.status = WAITING
+                item.closed_at = None
+                item.closed_reason = None
+                reopened[item.bucket_id] += 1
         elif item.closed_reason != reason:
             # Still closed, for another reason now: a room restored while its
             # file stays lost, or a lost file's room archived.
             item.closed_reason = reason
             report["relabelled"] += 1
 
-    for (room_id, reason), count in sorted(closed.items(), key=lambda pair: str(pair[0][0])):
+    for (room_id, reason), count in sorted(closed.items(), key=lambda pair: (str(pair[0][0]), pair[0][1])):
         db.add(
             BucketActivityLog(
                 bucket_id=room_id,
                 actor_name="QC system",
                 actor_role="system",
-                action=CLOSED_ACTION,
+                action=EXPIRED_ACTION if reason == EXPIRED else CLOSED_ACTION,
                 target_type="bucket",
                 target_id=str(room_id),
                 detail=(
-                    f"{count} waiting AI suggestion{'s' if count != 1 else ''} closed: "
+                    f"{count} AI suggestion{'s' if count != 1 else ''} closed: "
                     f"{REASON_TEXT[reason]}"
                 ),
                 created_at=now,
@@ -284,7 +327,8 @@ async def reconcile(
                 created_at=now,
             )
         )
-    report["closed"] = sum(closed.values())
+    report["expired"] = sum(count for (_room, reason), count in closed.items() if reason == EXPIRED)
+    report["closed"] = sum(closed.values()) - report["expired"]
     report["reopened"] = sum(reopened.values())
     await db.flush()
     return report
@@ -298,7 +342,8 @@ async def run_scheduled_sweep() -> dict[str, int] | None:
 
     from app.db import SessionLocal
 
-    total = {"rooms": 0, "closed": 0, "reopened": 0, "relabelled": 0, "failed": 0}
+    keys = ("rooms", "closed", "expired", "reopened", "relabelled")
+    total = dict.fromkeys((*keys, "failed"), 0)
     async with SessionLocal() as db:
         try:
             rooms = sorted(await rooms_out_of_step(db))
@@ -316,8 +361,8 @@ async def run_scheduled_sweep() -> dict[str, int] | None:
                 total["failed"] += 1
                 log.exception("ai_suggestion_closure: room %s failed; rolled back", room_id)
                 continue
-            for key in ("rooms", "closed", "reopened", "relabelled"):
+            for key in keys:
                 total[key] += report[key]
-    if any(total[key] for key in ("closed", "reopened", "relabelled", "failed")):
+    if any(total[key] for key in ("closed", "expired", "reopened", "relabelled", "failed")):
         log.info("ai_suggestion_closure: %s", total)
     return total

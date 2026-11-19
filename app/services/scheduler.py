@@ -73,8 +73,8 @@ async def job_file_client_sweep() -> None:
 
 async def job_ai_suggestion_closure() -> None:
     """AI suggestions follow their file: close the ones waiting on a file that
-    was lost, denied, withdrawn or archived, and reopen them if it comes back
-    (services/ai_suggestion_closure.py)."""
+    was lost, denied, withdrawn or archived, reopen them if it comes back, and
+    expire any left unanswered for 90 days (services/ai_suggestion_closure.py)."""
     from app.services.ai_suggestion_closure import run_scheduled_sweep
 
     await run_scheduled_sweep()
@@ -196,8 +196,9 @@ def start_scheduler() -> None:
 
     # A file can close by many paths (the desk's status change, the pipeline
     # board, a rescue withdrawn, an import), so the suggestions waiting on it
-    # are closed here rather than at each one. The first run after a deploy is
-    # the backfill; the desk's queue filters closed files out in the meantime.
+    # are closed here rather than at each one, along with any left unanswered
+    # for 90 days. The first run after a deploy is the backfill; the desk's
+    # queue filters closed files out in the meantime.
     scheduler.add_job(
         _wrap(job_ai_suggestion_closure),
         "interval",

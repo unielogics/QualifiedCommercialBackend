@@ -12,7 +12,9 @@ tests pin the rule (services/ai_suggestion_closure.py):
   a person answered;
 * the desk's queue, its attention queue and its activity feed drop a closed
   file at once, before the sweep has run;
-* an AI review of a closed file files its recommendations already closed.
+* an AI review of a closed file files its recommendations already closed;
+* a suggestion left waiting and untouched for 90 days expires, in any room,
+  and is never reopened by the system.
 
 The real ORM runs against an on-disk SQLite copy of the schema
 (app/tests/_sqlite_schema.py). Every name here is made up.
@@ -114,6 +116,7 @@ async def _lost(db, name="Example Freight LLC", **fields):
 
 
 async def _suggestion(db, room, title="Ask for the 2025 business return", *, status="proposed", age_days=10, **fields):
+    created_at = NOW - timedelta(days=age_days)
     item = BucketAIActionItem(
         bucket_id=room.id,
         title=title,
@@ -121,7 +124,9 @@ async def _suggestion(db, room, title="Ask for the 2025 business return", *, sta
         status=status,
         route="uploader",
         created_by="ai",
-        created_at=NOW - timedelta(days=age_days),
+        created_at=created_at,
+        # As in production: nothing edits a suggestion after the AI files it.
+        updated_at=fields.pop("updated_at", created_at),
         **fields,
     )
     db.add(item)
@@ -163,7 +168,7 @@ async def test_a_lost_files_waiting_suggestions_close_and_answered_ones_stay(db)
 
     report = await closure.reconcile(db, now=NOW)
 
-    assert report == {"rooms": 1, "closed": 2, "reopened": 0, "relabelled": 0}
+    assert report == {"rooms": 1, "closed": 2, "expired": 0, "reopened": 0, "relabelled": 0}
     for item in (waiting, second):
         item = await _reload(db, item)
         assert item.status == "closed"
@@ -173,7 +178,7 @@ async def test_a_lost_files_waiting_suggestions_close_and_answered_ones_stay(db)
     assert (await _reload(db, rejected)).status == "rejected"
     (entry,) = await _room_log(db, room, closure.CLOSED_ACTION)
     assert entry.actor_role == "system"  # never counted as client activity or put in a digest
-    assert entry.detail.startswith("2 waiting AI suggestions closed")
+    assert entry.detail == "2 AI suggestions closed: the file was closed (lost, denied or withdrawn)"
 
 
 @pytest.mark.parametrize(
@@ -282,7 +287,7 @@ async def test_a_file_that_comes_back_gets_exactly_its_suggestions_back(db) -> N
     await db.flush()
     report = await closure.reconcile(db, now=NOW + timedelta(hours=1))
 
-    assert report == {"rooms": 1, "closed": 0, "reopened": 1, "relabelled": 0}
+    assert report == {"rooms": 1, "closed": 0, "expired": 0, "reopened": 1, "relabelled": 0}
     waiting = await _reload(db, waiting)
     assert (waiting.status, waiting.closed_at, waiting.closed_reason) == ("proposed", None, None)
     assert (await _reload(db, dismissed)).status == "rejected"
@@ -348,6 +353,83 @@ async def test_a_person_answering_a_closed_suggestion_keeps_their_answer(db) -> 
     await db.flush()
     await closure.reconcile(db, now=NOW)
     assert (await _reload(db, item)).status == "rejected"
+
+
+# ── unanswered for 90 days ──────────────────────────────────────────────────
+
+
+async def test_a_suggestion_left_unanswered_for_90_days_expires_for_good(db) -> None:
+    _intake, live_room, _profile = await _file(db, name="Example Live LLC")
+    shared_room = await _room(db, "Example shared documents")
+    old = await _suggestion(db, live_room, "Asked 91 days ago", age_days=91)
+    recent = await _suggestion(db, live_room, "Asked 89 days ago", age_days=89)
+    forgotten = await _suggestion(db, shared_room, "Asked 120 days ago", age_days=120)
+    answered = await _suggestion(db, live_room, "Approved long ago", status="approved", age_days=200)
+
+    report = await closure.reconcile(db, now=NOW)
+
+    assert report == {"rooms": 2, "closed": 0, "expired": 2, "reopened": 0, "relabelled": 0}
+    for item in (old, forgotten):
+        item = await _reload(db, item)
+        assert (item.status, item.closed_reason) == ("closed", closure.EXPIRED)
+        assert item.closed_at is not None
+    assert (await _reload(db, recent)).status == "proposed"
+    assert (await _reload(db, answered)).status == "approved"
+    (entry,) = await _room_log(db, shared_room, closure.EXPIRED_ACTION)
+    assert entry.actor_role == "system"
+    assert entry.detail == "1 AI suggestion closed: unanswered for 90 days"
+
+    # Expired is final: the next pass finds nothing to do, even on a live file.
+    assert await closure.rooms_out_of_step(db, now=NOW) == {}
+    assert (await closure.reconcile(db, now=NOW))["rooms"] == 0
+
+
+async def test_the_clock_runs_from_the_last_time_anyone_touched_it(db) -> None:
+    room = await _room(db, "Example shared documents")
+    touched = await _suggestion(db, room, age_days=120, updated_at=NOW - timedelta(days=5))
+
+    await closure.reconcile(db, now=NOW)
+
+    assert (await _reload(db, touched)).status == "proposed"
+
+
+async def test_a_file_that_comes_back_late_gets_its_old_suggestions_back_expired(db) -> None:
+    intake, room, profile = await _lost(db)
+    stale = await _suggestion(db, room, "Asked 120 days ago", age_days=120)
+    fresh = await _suggestion(db, room, "Asked 10 days ago", age_days=10)
+    await closure.reconcile(db, now=NOW)
+    assert (await _reload(db, stale)).closed_reason == closure.FILE_CLOSED  # the file's reason comes first
+    assert (await _reload(db, fresh)).closed_reason == closure.FILE_CLOSED
+
+    profile.underwriting_status = "in_underwriting"
+    intake.status = "reviewed"
+    intake.outcome_status = "submitted"
+    await db.flush()
+    report = await closure.reconcile(db, now=NOW + timedelta(hours=1))
+
+    assert report == {"rooms": 1, "closed": 0, "expired": 1, "reopened": 1, "relabelled": 0}
+    stale = await _reload(db, stale)
+    assert (stale.status, stale.closed_reason) == ("closed", closure.EXPIRED)
+    assert (await _reload(db, fresh)).status == "proposed"
+    assert len(await _room_log(db, room, closure.EXPIRED_ACTION)) == 1
+    assert len(await _room_log(db, room, closure.REOPENED_ACTION)) == 1
+
+
+async def test_a_review_files_a_suggestion_again_once_the_old_one_expired(db) -> None:
+    from app.services import bucket_ai
+
+    _intake, room, _profile = await _file(db, name="Example Live LLC")
+    title = "Ask for the 2025 business return"
+    await _suggestion(db, room, title, age_days=120)
+    await closure.reconcile(db, now=NOW)
+    review = SimpleNamespace(id=uuid.uuid4())
+    result = {"recommended_next_document_requests": [{"title": title, "instructions": "Upload the full return."}]}
+
+    (again,) = await bucket_ai._create_review_recommendation_actions(db, bucket=room, review=review, result=result)
+
+    assert (again.status, again.closed_reason) == ("proposed", None)
+    # While that one waits, the next review does not file it a second time.
+    assert await bucket_ai._create_review_recommendation_actions(db, bucket=room, review=review, result=result) == []
 
 
 # ── the desk sees it at once ────────────────────────────────────────────────
@@ -486,7 +568,7 @@ async def test_the_sweep_commits_room_by_room_and_one_failure_spares_the_rest(db
 
     report = await closure.run_scheduled_sweep()
 
-    assert report == {"rooms": 1, "closed": 1, "reopened": 0, "relabelled": 0, "failed": 1}
+    assert report == {"rooms": 1, "closed": 1, "expired": 0, "reopened": 0, "relabelled": 0, "failed": 1}
     assert await _status(db, first) == "proposed"  # rolled back, tried again next pass
     assert await _status(db, second) == "closed"
     assert await _status(db, live) == "proposed"
@@ -494,7 +576,7 @@ async def test_the_sweep_commits_room_by_room_and_one_failure_spares_the_rest(db
     monkeypatch.setattr(closure, "reconcile", real_reconcile)
     assert (await closure.run_scheduled_sweep())["closed"] == 1
     quiet = await closure.run_scheduled_sweep()
-    assert quiet == {"rooms": 0, "closed": 0, "reopened": 0, "relabelled": 0, "failed": 0}
+    assert quiet == {"rooms": 0, "closed": 0, "expired": 0, "reopened": 0, "relabelled": 0, "failed": 0}
 
 
 async def test_only_rooms_out_of_step_are_visited(db) -> None:

@@ -5695,7 +5695,7 @@ async def _create_review_recommendation_actions(
                         BucketAIActionItem.status.in_(("proposed", "approved")),
                         and_(
                             BucketAIActionItem.status == ai_suggestion_closure.CLOSED,
-                            BucketAIActionItem.closed_reason.in_(ai_suggestion_closure.SYSTEM_REASONS),
+                            BucketAIActionItem.closed_reason.in_(ai_suggestion_closure.REOPENABLE_REASONS),
                         ),
                     ),
                 )
