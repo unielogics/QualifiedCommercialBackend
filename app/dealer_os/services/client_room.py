@@ -83,8 +83,16 @@ def _hash_passcode(passcode: str) -> str:
 
 
 def _generate_passcode() -> str:
+    """Every access PIN the system issues: six digits from a secure source.
+
+    Rooms, upload links, file shares, production-package and worksheet links
+    all draw from here, so they follow one rule. The whole range 000000-999999
+    is used and leading zeros are kept, so a PIN is a string and must never go
+    through int(). A code a guesser tries first is never issued: a generated PIN
+    passes the same `passcode_problem` check as one a client chooses.
+    """
     while True:
-        candidate = f"{secrets.randbelow(900000) + 100000}"
+        candidate = f"{secrets.randbelow(1_000_000):06d}"
         if passcode_problem(candidate) is None:
             return candidate
 

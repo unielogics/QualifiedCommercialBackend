@@ -13,6 +13,27 @@ from app.schemas.application_profile import (
 from app.schemas.common import ORMModel
 from app.schemas.communication import CommunicationImage
 
+#: Shown when the desk types a PIN for a new share or upload link that is not one.
+NEW_ACCESS_PIN_MESSAGE = "The access PIN must be exactly 6 digits (0-9)."
+
+
+def new_access_pin(value: object) -> object:
+    """A PIN typed for a NEW share or upload link: six ASCII digits, or blank.
+
+    Blank (or absent) means the route generates one. Only new credentials are
+    checked here: shares and links issued earlier with a longer code still open
+    with it, because the access routes verify whatever was hashed.
+    """
+    if not isinstance(value, str):
+        return value
+    code = value.strip()
+    if not code:
+        return None
+    if len(code) != 6 or not code.isascii() or not code.isdigit():
+        raise ValueError(NEW_ACCESS_PIN_MESSAGE)
+    return code
+
+
 PublicAnalysisClassification = Literal[
     "accounts_receivable_aging",
     "balance_sheet",
@@ -246,6 +267,11 @@ class BucketUploadLinkCreate(BaseModel):
     @classmethod
     def empty_email_to_none(cls, value: object) -> object:
         return None if value == "" else value
+
+    @field_validator("passcode", mode="before")
+    @classmethod
+    def six_digit_pin(cls, value: object) -> object:
+        return new_access_pin(value)
 
 
 class BucketUploadLinkRead(ORMModel):
@@ -565,7 +591,9 @@ class BucketShareCreate(BaseModel):
     recipient_name: str = Field(min_length=1, max_length=180)
     recipient_email: EmailStr | None = None
     file_ids: list[UUID] = Field(min_length=1)
-    passcode: str | None = Field(default=None, max_length=80)
+    # New shares get six digits like every other PIN. Shares created before
+    # this rule keep their longer code: share access verifies the stored hash.
+    passcode: str | None = Field(default=None, pattern=r"^[0-9]{6}$")
     can_preview: bool = True
     can_download: bool = False
     can_add_notes: bool = True
@@ -581,6 +609,11 @@ class BucketShareCreate(BaseModel):
     @classmethod
     def empty_email_to_none(cls, value: object) -> object:
         return None if value == "" else value
+
+    @field_validator("passcode", mode="before")
+    @classmethod
+    def six_digit_pin(cls, value: object) -> object:
+        return new_access_pin(value)
 
 
 class BucketShareEmailRequest(BaseModel):

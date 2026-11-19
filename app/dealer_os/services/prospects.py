@@ -11,7 +11,6 @@ import base64
 import hashlib
 import json
 import re
-import secrets
 import unicodedata
 from collections.abc import Iterable
 from datetime import UTC, datetime, time, timedelta
@@ -3093,5 +3092,10 @@ async def complete_target_conversion(
 
 
 def random_room_pin() -> str:
-    """Six decimal digits; leading zeros retained."""
-    return f"{secrets.randbelow(1_000_000):06d}"
+    """Six decimal digits, leading zeros kept, never an easy-to-guess code.
+
+    The one generator every access PIN comes from is the client room's.
+    """
+    from .client_room import _generate_passcode
+
+    return _generate_passcode()

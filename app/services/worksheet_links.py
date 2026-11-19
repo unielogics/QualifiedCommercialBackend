@@ -460,8 +460,10 @@ async def set_pin(link: FinancialFormLink, pin: str | None = None) -> str:
         code = _generate_passcode()
         while passcode_problem(code):
             code = _generate_passcode()
-    elif passcode_problem(code):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "That PIN is too easy to guess")
+    elif problem := passcode_problem(code):
+        # The rule's own words: "Choose a 6-digit PIN." for a wrong shape,
+        # "too easy to guess" only for a code that really is.
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, problem)
     link.pin_hash = await asyncio.to_thread(_hash_passcode, code)
     link.pin_set_at = _now()
     link.pin_attempts = 0

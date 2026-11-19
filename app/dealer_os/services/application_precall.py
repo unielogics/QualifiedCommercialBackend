@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -169,7 +168,7 @@ async def create_draft_for_booking(
     from app.routers.dealer_ai_intake import AdminLeadCreate, _create_admin_ai_lead_core
     from app.services import business_profile
 
-    pin = f"{secrets.randbelow(900000) + 100000}"
+    pin = client_room._generate_passcode()
     requested_amount = data.get("requested_amount")
     try:
         amount_value = float(requested_amount) if requested_amount not in (None, "") else None
@@ -601,7 +600,7 @@ async def rotate_passcode(db: AsyncSession, intake: PublicUnderwritingIntake):
     link = await _room_link(db, intake)
     if link is None:
         raise RuntimeError("The AI Intake has no active application room")
-    pin = f"{secrets.randbelow(900000) + 100000}"
+    pin = client_room._generate_passcode()
     link.passcode_hash = _hash_passcode(pin)
     link.encrypted_passcode = None
     link.passcode_encryption_provider = None

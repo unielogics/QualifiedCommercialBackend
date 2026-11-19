@@ -74,11 +74,13 @@ def test_a_client_cannot_reuse_the_code_they_were_sent():
     assert client_room.passcode_problem("104293", "884120") is None
 
 
-def test_a_generated_code_is_always_six_digits_in_range():
+def test_a_generated_code_is_always_six_digits():
+    # The whole 000000-999999 range is drawn now, so a code may start with 0;
+    # it is a string of six digits, never a number in 100000-999999.
+    # Leading zeros: test_access_pin_generation.py.
     for _ in range(200):
         code = client_room._generate_passcode()
-        assert len(code) == 6 and code.isdigit()
-        assert 100000 <= int(code) <= 999999
+        assert len(code) == 6 and code.isascii() and code.isdigit()
         assert client_room.passcode_problem(code) is None
 
 
