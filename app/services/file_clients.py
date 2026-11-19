@@ -750,13 +750,22 @@ async def desk_activity(
     limit: int = 40,
 ) -> list[dict[str, Any]]:
     """What happened on the files, newest first, with the file and the client
-    each line belongs to. Only files that came through an intake."""
+    each line belongs to. Only live files that came through an intake: the
+    same files the summary counts. A file that closed (lost, denied,
+    withdrawn) or whose room was archived keeps its history on its own
+    timeline and leaves the desk's."""
 
+    from app.routers.dealer_ai_intake import _closed_intake_lifecycle_clause
+
+    # Aliased: the lifecycle clause has its own correlated look at the profile.
+    profile = aliased(ApplicationProfile)
     stmt = (
         select(FileEvent, PublicUnderwritingIntake, Client.name)
-        .join(ApplicationProfile, ApplicationProfile.id == FileEvent.profile_id)
-        .join(PublicUnderwritingIntake, PublicUnderwritingIntake.id == ApplicationProfile.intake_id)
+        .join(profile, profile.id == FileEvent.profile_id)
+        .join(PublicUnderwritingIntake, PublicUnderwritingIntake.id == profile.intake_id)
+        .join(Bucket, Bucket.id == PublicUnderwritingIntake.bucket_id)
         .outerjoin(Client, Client.id == PublicUnderwritingIntake.client_id)
+        .where(Bucket.archived_at.is_(None), ~_closed_intake_lifecycle_clause())
         .order_by(FileEvent.created_at.desc())
         .limit(max(1, min(limit, 200)))
     )

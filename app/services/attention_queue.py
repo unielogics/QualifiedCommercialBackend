@@ -5,6 +5,11 @@ stop — a client who never uploaded, a checklist that aged out, AI suggestions
 nobody answered, a room the client was never given a way into — were visible
 nowhere. Each row here names one of those and carries the one link that opens
 the file, so the queue is something to work rather than something to read.
+
+Only live files are worked: a file that closed (lost, denied, withdrawn) or
+whose room was archived has nothing left to chase, so none of its rows appear
+(``ai_suggestion_closure.room_is_live`` for rooms, the Files list's lifecycle
+rule for intakes).
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from app.models.bucket import (
 )
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.schemas.operator_file import AttentionItem, AttentionKind, AttentionQueue, AttentionView
+from app.services.ai_suggestion_closure import room_is_live
 
 INTAKE_NO_FILES_DAYS = 7
 REQUEST_OVERDUE_DAYS = 30
@@ -108,6 +114,11 @@ async def _intakes_without_files(db: AsyncSession, now: datetime) -> list[Attent
         ApplicationProfile.intake_id.is_(None),
     ).correlate(PublicUnderwritingIntake).scalar_subquery()
     safe_profile_id = case((has_anchor, anchored_id), (bucket_profile_count == 1, unanchored_bucket_id), else_=None)
+    from app.routers.dealer_ai_intake import _closed_intake_lifecycle_clause
+
+    room_open = exists(
+        select(Bucket.id).where(Bucket.id == PublicUnderwritingIntake.bucket_id, Bucket.archived_at.is_(None))
+    )
     rows = (
         await db.execute(
             select(PublicUnderwritingIntake, safe_profile_id)
@@ -115,6 +126,8 @@ async def _intakes_without_files(db: AsyncSession, now: datetime) -> list[Attent
                 PublicUnderwritingIntake.status == "collecting",
                 PublicUnderwritingIntake.created_at < cutoff,
                 ~has_file,
+                room_open,
+                ~_closed_intake_lifecycle_clause(),
             )
         )
     ).all()
@@ -175,7 +188,7 @@ async def _overdue_requests(db: AsyncSession, now: datetime) -> list[AttentionIt
             )
             .join(BucketRequestedDocument, BucketRequestedDocument.bucket_id == Bucket.id)
             .where(
-                Bucket.archived_at.is_(None),
+                room_is_live(),
                 BucketRequestedDocument.status == "requested",
                 BucketRequestedDocument.created_at < cutoff,
             )
@@ -215,7 +228,7 @@ async def _stale_action_items(db: AsyncSession, now: datetime) -> list[Attention
             )
             .join(BucketAIActionItem, BucketAIActionItem.bucket_id == Bucket.id)
             .where(
-                Bucket.archived_at.is_(None),
+                room_is_live(),
                 BucketAIActionItem.status == "proposed",
                 BucketAIActionItem.created_at < cutoff,
             )
@@ -253,7 +266,7 @@ async def _buckets_without_client_entry(db: AsyncSession, now: datetime) -> list
     any_share = exists(select(BucketShare.id).where(BucketShare.bucket_id == Bucket.id))
     rows = (
         await db.execute(
-            select(Bucket).where(Bucket.archived_at.is_(None), ~live_link, ~any_share)
+            select(Bucket).where(room_is_live(), ~live_link, ~any_share)
         )
     ).scalars().all()
     intakes = await _intake_by_bucket(db, {bucket.id for bucket in rows})

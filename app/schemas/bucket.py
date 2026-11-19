@@ -1010,6 +1010,10 @@ class BucketAIActionItemRead(ORMModel):
     approved_by_user_id: UUID | None
     approved_at: datetime | None
     completed_at: datetime | None
+    # With status "closed": when and why the system closed it (file_closed,
+    # room_archived). services/ai_suggestion_closure owns both.
+    closed_at: datetime | None = None
+    closed_reason: str | None = None
     created_at: datetime
     updated_at: datetime
 

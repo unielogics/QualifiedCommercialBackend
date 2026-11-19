@@ -5679,17 +5679,30 @@ async def _create_review_recommendation_actions(
     raw_items = result.get("recommended_next_document_requests")
     if not isinstance(raw_items, list):
         return []
+    from app.services import ai_suggestion_closure
+
+    # A review of a file that has closed (lost, denied, withdrawn, archived)
+    # files its recommendations already closed: nobody is waiting on them, and
+    # they come back with everything else if the file does.
+    closed_reason = await ai_suggestion_closure.closing_reason(db, bucket.id)
     existing_titles = {
         title.lower()
         for title in (
             await db.execute(
                 select(BucketAIActionItem.title).where(
                     BucketAIActionItem.bucket_id == bucket.id,
-                    BucketAIActionItem.status.in_(("proposed", "approved")),
+                    or_(
+                        BucketAIActionItem.status.in_(("proposed", "approved")),
+                        and_(
+                            BucketAIActionItem.status == ai_suggestion_closure.CLOSED,
+                            BucketAIActionItem.closed_reason.in_(ai_suggestion_closure.SYSTEM_REASONS),
+                        ),
+                    ),
                 )
             )
         ).scalars().all()
     }
+    closed_at = _now() if closed_reason else None
     created: list[BucketAIActionItem] = []
     for raw in raw_items[:8]:
         if not isinstance(raw, dict):
@@ -5706,7 +5719,9 @@ async def _create_review_recommendation_actions(
         item = BucketAIActionItem(
             bucket_id=bucket.id,
             source_message_id=None,
-            status="proposed",
+            status=ai_suggestion_closure.CLOSED if closed_reason else "proposed",
+            closed_at=closed_at,
+            closed_reason=closed_reason,
             route=route,
             title=title[:220],
             instructions=instructions,
@@ -5726,7 +5741,10 @@ async def _create_review_recommendation_actions(
             actor_role="system",
             target_type="ai_review",
             target_id=str(review.id),
-            detail=f"{len(created)} review recommendations",
+            detail=(
+                f"{len(created)} review recommendations"
+                + (f", closed on arrival: {ai_suggestion_closure.REASON_TEXT[closed_reason]}" if closed_reason else "")
+            ),
         )
     return created
 

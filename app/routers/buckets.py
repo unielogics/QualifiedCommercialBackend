@@ -140,8 +140,8 @@ from app.schemas.bucket import (
     IntakeChatActionResult,
 )
 from app.schemas.retention import LegalHoldChange, RetentionStatusRead
-from app.services import application_profiles as profiles
 from app.services import (
+    ai_suggestion_closure,
     bucket_archive,
     bucket_file_archive,
     bucket_requests,
@@ -155,6 +155,7 @@ from app.services import (
     retention_holds,
     upload_validation,
 )
+from app.services import application_profiles as profiles
 from app.services import clerk as clerk_service
 from app.services.ai import engagement
 from app.services.bucket_ai import (
@@ -1366,6 +1367,11 @@ async def list_ai_action_items_across_buckets(
 ) -> list[BucketAIActionItemQueueRead]:
     """Every AI suggestion across live buckets, oldest first: the desk's queue.
 
+    A room is live while it is not archived and its file has not closed (lost,
+    denied, withdrawn). The sweep closes what waits on a closed file within
+    minutes (services/ai_suggestion_closure); filtering here as well takes it
+    off the desk the moment the file closes.
+
     ``bucket_id`` narrows it to one room, which is how a file reads its own
     suggestions without the cross-room cap cutting them off.
 
@@ -1376,7 +1382,7 @@ async def list_ai_action_items_across_buckets(
     stmt = (
         select(BucketAIActionItem, Bucket.name, Bucket.client_name)
         .join(Bucket, Bucket.id == BucketAIActionItem.bucket_id)
-        .where(BucketAIActionItem.status == item_status, Bucket.archived_at.is_(None))
+        .where(BucketAIActionItem.status == item_status, ai_suggestion_closure.room_is_live())
         .order_by(BucketAIActionItem.created_at.asc())
         .limit(limit)
     )
@@ -1800,6 +1806,10 @@ async def patch_ai_action_item(
             item.approved_by_user_id = user.id
         if item.status == "completed" and item.completed_at is None:
             item.completed_at = _now()
+        # A person's decision replaces a closure the system made when the file
+        # closed, so the file coming back never reopens what someone answered.
+        item.closed_at = None
+        item.closed_reason = None
     await _log(db, bucket_id, f"ai_action_{item.status}", request=request, user=user, target_type="ai_action_item", target_id=str(item.id), detail=", ".join(changes) or item.title)
     await db.commit()
     await db.refresh(item)
