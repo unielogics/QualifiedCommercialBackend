@@ -432,7 +432,15 @@ async def assert_payment_room_identity(
     link: Any,
     profile: ApplicationProfile,
 ) -> None:
-    """Limit payment authority to the canonical room owned by the client identity."""
+    await require_client_room_identity(db, link=link, profile=profile,
+                                       denial="This secure room invitation is not authorized for payment actions")
+
+
+async def require_client_room_identity(
+    db: AsyncSession, *, link: Any, profile: ApplicationProfile,
+    denial: str = "Use the borrower’s own secure room to share identifiers.",
+) -> None:
+    """Limit sensitive actions to the canonical room owned by the client identity."""
 
     from app.dealer_os.services import client_room
     from app.services import application_profiles as profile_service
@@ -449,7 +457,7 @@ async def assert_payment_room_identity(
     ):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            "This secure room invitation is not authorized for payment actions",
+            denial,
         )
 
 

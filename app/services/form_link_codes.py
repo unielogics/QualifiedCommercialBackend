@@ -93,15 +93,17 @@ def mask_email(email: str | None) -> str | None:
     return f"{name[:1]}{'*' * max(1, min(len(name) - 1, 6))}@{domain}"
 
 
-def issue_session(link: Any, *, now: datetime | None = None) -> tuple[str, datetime]:
+def issue_session(link: Any, *, now: datetime | None = None, email_verified: bool = False) -> tuple[str, datetime]:
     expires = (now or _now()) + SESSION_TTL
     payload = {"lid": str(link.id), "exp": int(expires.timestamp())}
+    if email_verified:
+        payload["email_verified"] = True
     body = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
     signature = hmac.new(_secret(), body.encode(), hashlib.sha256).hexdigest()[:32]
     return f"{body}.{signature}", expires
 
 
-def session_valid(session: str | None, link: Any, *, now: datetime | None = None) -> bool:
+def session_valid(session: str | None, link: Any, *, now: datetime | None = None, require_email: bool = False) -> bool:
     try:
         body, signature = (session or "").split(".", 1)
     except ValueError:
@@ -113,7 +115,7 @@ def session_valid(session: str | None, link: Any, *, now: datetime | None = None
         payload = json.loads(base64.urlsafe_b64decode((body + "=" * (-len(body) % 4)).encode()).decode())
     except (ValueError, UnicodeDecodeError):
         return False
-    return payload.get("lid") == str(link.id) and int(payload.get("exp", 0) or 0) > int((now or _now()).timestamp())
+    return (not require_email or payload.get("email_verified") is True) and payload.get("lid") == str(link.id) and int(payload.get("exp", 0) or 0) > int((now or _now()).timestamp())
 
 
 def require_session(session: str | None, link: Any) -> None:
@@ -161,7 +163,7 @@ def verify_code(link: Any, code: str, *, now: datetime | None = None) -> tuple[s
     link.pin_hash = None
     link.pin_attempts = 0
     link.pin_locked_until = None
-    return issue_session(link, now=moment)
+    return issue_session(link, now=moment, email_verified=True)
 
 
 def send_code_email(*, to_email: str, code: str, form_title: str) -> bool:

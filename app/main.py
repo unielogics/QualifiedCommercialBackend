@@ -124,6 +124,7 @@ from app.routers import (
 from app.routers import (
     public as public_router,
 )
+from app.routers import secure_ssns as secure_ssns_router
 from app.routers import (
     settings as settings_router,
 )
@@ -357,6 +358,7 @@ for r in [
     credit_links.router,
     form_kinds_router.router,
     client_forms_router.router,
+    secure_ssns_router.router,
     intake.router,
     rates.router,
     regional_managers.router,
