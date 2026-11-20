@@ -153,6 +153,7 @@ from app.services import (
     locked_file_requests,
     provenance,
     retention_holds,
+    secure_ssns,
     upload_validation,
 )
 from app.services import application_profiles as profiles
@@ -3945,6 +3946,8 @@ async def _request_access_read(
         ))).scalar_one_or_none()
         if canonical is not None and link.can_use_ai_chat:
             capabilities = ["business_ai_review"]
+    if payment_documents_visible and secure_ssns.configured():
+        capabilities.append("secure_ssns")
     return BucketRequestAccessRead(
         capabilities=capabilities,
         room_kind=room_kind,

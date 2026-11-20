@@ -19,13 +19,20 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import Role
 from app.models.application_profile import ApplicationProfile
 from app.request_context import client_ip
 from app.services import application_profiles as profiles
-from app.services import client_forms, financial_statements, form_link_codes, link_throttle
+from app.services import (
+    client_forms,
+    financial_statements,
+    form_link_codes,
+    link_throttle,
+    secure_ssns,
+)
 from app.services import re_application_schema as schema
 
 router = APIRouter(tags=["client-forms"])
@@ -334,6 +341,13 @@ async def _lock_link(db: AsyncSession, link: Any) -> None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "This link is no longer available")
 
 
+def can_share_ssns(link: Any, session: str | None) -> bool:
+    return bool(secure_ssns.configured() and get_settings().clerk_secret_key
+                and link.label == client_forms.STANDING_LABEL and not link.invitee_email
+                and link.permission == "edit"
+                and form_link_codes.session_valid(session, link, require_email=True))
+
+
 @router.get("/public/forms/{token}")
 async def open_client_form(token: str, request: Request, x_form_session: str | None = Header(default=None), db: AsyncSession = Depends(get_db)) -> dict:
     link, profile, _ = await _open_link(db, token, request)
@@ -342,7 +356,7 @@ async def open_client_form(token: str, request: Request, x_form_session: str | N
         return {"kind": KIND, "title": schema.TITLE, "needs_code": True, "email_hint": form_link_codes.mask_email(hint)}
     await _coborrower_guard(db, profile, link)
     view = await client_forms.read(db, profile, audience="client")
-    return {**_with_schema(view), "needs_code": False}
+    return {**_with_schema(view), "needs_code": False, "can_share_ssns": can_share_ssns(link, x_form_session)}
 
 
 @router.post("/public/forms/{token}/code")
