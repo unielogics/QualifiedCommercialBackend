@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.models.activity import Activity
+from app.services import email_marketing
 from app.services.payment_authorization import client_ip
 
 from . import schemas as S
@@ -77,6 +78,8 @@ async def create_access_request(
         template_key="cp.access_request",
     )
     row.emailed = sent > 0
+    await email_marketing.enroll(db, email=row.email, consent=payload.email_marketing_consent,
+                                 source="capital_access_request", outcome="inquiry_received", locale=row.locale)
 
     db.add(
         Activity(

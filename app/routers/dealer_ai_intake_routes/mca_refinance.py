@@ -225,6 +225,10 @@ async def start_mca_refinance(
     db.add(intake)
     await db.flush()
     await core.profiles_service.provision_profile_for_intake(db, intake)
+    await onboarding_consent.enroll_intake(
+        db, intake, payload, source="mca_refinance_intake",
+        program="mca_refinance",
+    )
     if capture is not None:
         await resource_assessments.link_application(db, capture, intake)
     await db.commit()

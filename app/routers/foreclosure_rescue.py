@@ -32,7 +32,7 @@ from app.models.referral_partner_company import KIND_REFERRAL_PARTNER, ReferralP
 from app.models.user import User
 from app.routers.buckets import _generate_passcode
 from app.routers.dealer_ai_intake import _hash_token, _new_public_token, _record_resume_email
-from app.services import business_profile, intake_retention, onboarding_consent
+from app.services import business_profile, email_marketing, intake_retention, onboarding_consent
 from app.services import clerk as clerk_service
 from app.services.dealer_partner_access import (
     REFERRAL_INTAKE_ROLES,
@@ -103,6 +103,8 @@ class ForeclosureRescueIntakeCreate(business_profile.RequiredBusinessProfileFiel
     application_email_consent: bool = False
     sms_transactional_consent: bool = False
     sms_marketing_consent: bool = False
+    email_marketing_consent: bool = Field(default=False, strict=True)
+    locale: Literal["en", "es"] = "en"
 
     @model_validator(mode="after")
     def validate_conditional_fields(self):
@@ -207,6 +209,8 @@ class ProfessionalPartnerApplicationCreate(BaseModel):
     contact_phone: str = Field(min_length=7, max_length=48)
     notes: str | None = Field(default=None, max_length=3000)
     consent: bool
+    email_marketing_consent: bool = Field(default=False, strict=True)
+    locale: Literal["en", "es"] = "en"
 
     @model_validator(mode="after")
     def consent_required(self):
@@ -550,6 +554,13 @@ async def _create_foreclosure_rescue(
             else "Five-minute foreclosure rescue intake submitted"
         ),
     )
+    if actor is None:
+        await email_marketing.enroll(
+            db, email=payload.contact_email, consent=payload.email_marketing_consent,
+            source="foreclosure_rescue", program="foreclosure_rescue", outcome="new_rescue", locale=payload.locale,
+            client_id=intake.client_id if owner_consent_payload else None,
+            intake_id=intake.id if owner_consent_payload else None,
+        )
     await db.commit()
     if owner_consent_payload is not None:
         await onboarding_consent.record_for_start(db, intake, owner_consent_payload, request, entry="submitting their foreclosure rescue request")
@@ -597,13 +608,15 @@ async def create_professional_partner_application(
     db: AsyncSession = Depends(get_db),
 ) -> ProfessionalPartnerApplication:
     row = ProfessionalPartnerApplication(
-        **payload.model_dump(mode="json", exclude={"contact_email"}),
+        **payload.model_dump(mode="json", exclude={"contact_email", "email_marketing_consent", "locale"}),
         contact_email=str(payload.contact_email).strip().lower(),
         status="pending",
         ip_address=request.client.host if request.client else None,
         user_agent=(request.headers.get("user-agent") or "")[:512] or None,
     )
     db.add(row)
+    await email_marketing.enroll(db, email=payload.contact_email, consent=payload.email_marketing_consent,
+                                 source="foreclosure_partner_application", outcome="pending", locale=payload.locale)
     await db.commit()
     await db.refresh(row)
     return row

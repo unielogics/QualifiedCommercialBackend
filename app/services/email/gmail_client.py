@@ -21,6 +21,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from app.services.email.social_footer import with_social_footer
+
 # google-api-python-client + google-auth are optional in this image —
 # they aren't pulled in via pyproject.toml today. Importing them at
 # module top would crash anywhere `build_message()` (the pure helper)
@@ -157,6 +159,7 @@ def build_message(
     the message is built as multipart/mixed with the text body as
     the first part and each attachment as a binary part.
     """
+    body, body_html = with_social_footer(body, body_html)
     msg = EmailMessage()
     msg["To"] = to
     # Cc / Bcc headers in the raw MIME — Gmail's messages.send delivers

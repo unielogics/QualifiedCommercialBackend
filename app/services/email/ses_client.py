@@ -24,6 +24,7 @@ from email.utils import formataddr
 
 from app.config import get_settings
 from app.services import booking_metrics
+from app.services.email.social_footer import with_social_footer
 
 log = logging.getLogger(__name__)
 
@@ -100,6 +101,7 @@ def send_email(
 
     try:
         client = _ses_client(settings.ses_region or "us-east-1")
+        body_text, body_html = with_social_footer(body_text, body_html)
         body: dict = {"Text": {"Data": body_text, "Charset": "UTF-8"}}
         if body_html:
             body["Html"] = {"Data": body_html, "Charset": "UTF-8"}
@@ -161,6 +163,7 @@ def send_raw_email(
         return SesSendResult(False, None, "bad recipients")
 
     try:
+        body_text, body_html = with_social_footer(body_text, body_html)
         msg = EmailMessage()
         msg["From"] = formataddr(((source_name or "Qualified Commercial").strip(), from_addr))
         msg["To"] = ", ".join(recipients)

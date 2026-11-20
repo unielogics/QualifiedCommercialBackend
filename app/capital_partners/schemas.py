@@ -48,6 +48,7 @@ class AccessRequestIn(BaseModel):
     phone: RequiredPhone
     note: str | None = Field(default=None, max_length=4000)
     consent: bool
+    email_marketing_consent: bool = Field(default=False, strict=True)
     locale: LocaleT = "en"
     #: Honeypot. A real browser leaves it empty.
     website: str | None = None

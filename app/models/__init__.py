@@ -224,6 +224,7 @@ from app.models.payments import (  # noqa: F401
     PlaidTransferCursor,
     PrivateFundingPaymentPlan,
 )
+from app.models.email_marketing import MarketingCampaign, MarketingDelivery, MarketingEnrollment, MarketingSubscriber  # noqa: F401
 from app.models.prequal_request import PrequalRequest  # noqa: F401
 from app.models.prospect_outreach import (  # noqa: F401
     DealerProspectEmailDraft,

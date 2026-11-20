@@ -21,7 +21,7 @@ from app.models.arf_channel import ARFReferral
 from app.models.bucket import Bucket
 from app.models.client import Client
 from app.models.user import User
-from app.services import application_profiles, arf_channel
+from app.services import application_profiles, arf_channel, email_marketing
 
 public_router = APIRouter(prefix="/public/arf", tags=["arf"])
 admin_router = APIRouter(prefix="/admin/arf", tags=["arf"])
@@ -71,6 +71,8 @@ class ReferralCreate(BaseModel):
     campaign: str | None = Field(default=None, max_length=160)
     partner: str | None = Field(default=None, max_length=160)
     consent: Literal[True]
+    email_marketing_consent: bool = Field(default=False, strict=True)
+    locale: Literal["en", "es"] = "en"
     website: str = Field(default="", max_length=0)
     @model_validator(mode="after")
     def known_product(self):
@@ -115,6 +117,9 @@ async def save_contact_referral(payload: ReferralCreate, db: AsyncSession):
     db.add(ARFReferral(idempotency_key=str(payload.idempotency_key), profile_id=profile.id, full_name=payload.full_name.strip(), email=str(payload.email), phone=payload.phone, business_name=payload.business_name, program_key=payload.program_key, industry_key=payload.industry_key, attribution={key: value for key, value in {"source": payload.source, "campaign": payload.campaign, "partner": payload.partner}.items() if value}, consent_version="arf-contact-referral-v1", consented_at=datetime.now(UTC)))
     db.add(Activity(actor_label="public_referral", kind="arf.referral_captured", summary="ARF financing review contact request received", payload={"profile_id": str(profile.id), "channel": arf_channel.CHANNEL_KEY, "program_key": payload.program_key}))
     try:
+        await email_marketing.enroll(db, email=payload.email, consent=payload.email_marketing_consent,
+                                     source="business_capital_referral", program=payload.program_key,
+                                     outcome="inquiry_received", client_id=client.id, locale=payload.locale)
         await db.commit()
     except IntegrityError:
         await db.rollback()

@@ -75,8 +75,12 @@ async def test_unknowns_are_accepted_for_document_review_not_preapproved(monkeyp
     assert payload.last_year_tax_earnings == "unknown"
 
 
-async def test_actual_start_constructs_one_main_street_file_and_defers_full_application(monkeypatch):
-    payload = mca_leads.McaIntakeStart.model_validate(body(active_mca_count=None, has_modified_mca=None, last_year_tax_earnings="unknown"))
+@pytest.mark.parametrize("marketing_choice", [False, True])
+async def test_actual_start_constructs_one_main_street_file_and_defers_full_application(monkeypatch, marketing_choice):
+    payload = mca_leads.McaIntakeStart.model_validate(body(active_mca_count=None, has_modified_mca=None,
+        last_year_tax_earnings="unknown", email_marketing_consent=marketing_choice))
+    enroll = AsyncMock()
+    monkeypatch.setattr("app.services.email_marketing.enroll", enroll)
     bucket = SimpleNamespace(id=uuid4())
     link = SimpleNamespace(id=uuid4(), token="room-capability", passcode_set_by_client_at=None)
     builder = AsyncMock(return_value=(bucket, link))
@@ -93,6 +97,9 @@ async def test_actual_start_constructs_one_main_street_file_and_defers_full_appl
     saved = [call.args[0] for call in db.add.call_args_list]
     identity = next(row for row in saved if isinstance(row, Client))
     intake = next(row for row in saved if isinstance(row, PublicUnderwritingIntake))
+    enroll.assert_awaited_once_with(db, email=intake.email, consent=marketing_choice, source="mca_funding_intake",
+                                    program="merchant_cash_advance", outcome="application_started",
+                                    client_id=identity.id, intake_id=intake.id, locale=intake.preferred_language)
     record_consent.assert_awaited_once()
     assert record_consent.await_args.args[:3] == (db, intake, payload)
     assert record_consent.await_args.kwargs == {"entry": "mca_funding"}

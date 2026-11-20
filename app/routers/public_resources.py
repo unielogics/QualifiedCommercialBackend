@@ -46,6 +46,7 @@ class ResourceLead(BaseModel):
     answers: dict[str, Any]
     contact: ResourceContact
     email_marketing_consent: bool = Field(default=False, strict=True)
+    lending_updates_consent: bool = Field(default=False, strict=True)
     privacy_acknowledged: Literal[True]
     attribution: dict[str, Any] = Field(default_factory=dict)
     website: str = Field(default="", max_length=0)

@@ -57,11 +57,14 @@ async def test_invalid_capture_never_writes(change):
     db.add.assert_not_called()
 
 
-async def test_capture_persists_result_then_retries_same_idempotent_capability(monkeypatch):
+@pytest.mark.parametrize("updates_choice", [False, True])
+async def test_capture_persists_result_then_retries_same_idempotent_capability(monkeypatch, updates_choice):
     monkeypatch.setattr("app.services.payment_authorization.primary_super_admin", AsyncMock(return_value=None))
     db = Mock(get=AsyncMock(return_value=None), execute=AsyncMock(side_effect=[scalar(None), scalar(None), scalar(None)]),
               flush=AsyncMock(), commit=AsyncMock())
-    payload = public_resources.ResourceLead.model_validate(body())
+    enroll = AsyncMock()
+    monkeypatch.setattr("app.services.email_marketing.enroll", enroll)
+    payload = public_resources.ResourceLead.model_validate(body(lending_updates_consent=updates_choice))
     result = await service.capture(db, payload, request())
     rows = [call.args[0] for call in db.add.call_args_list]
     assessment = next(row for row in rows if isinstance(row, ResourceAssessment))
@@ -71,6 +74,10 @@ async def test_capture_persists_result_then_retries_same_idempotent_capability(m
     assert assessment.client_id == contact.id and assessment.contact["email"] == "owner@example.com"
     assert assessment.answers["debts"] is None
     assert assessment.email_marketing_consent is True and event.payload["enrollment"] == "pending"
+    assert event.payload["lending_updates_consent"] is updates_choice
+    enroll.assert_awaited_once_with(db, email="owner@example.com", consent=updates_choice,
+                                    source="business_funding_check", program="term_loan", outcome="resource_requested",
+                                    client_id=contact.id, locale="en")
     assert result["resource_token"] not in str(assessment.contact) + str(event.payload)
     assert assessment.resource_token_hash == service.token_hash(result["resource_token"])
     assert timedelta(days=13) < assessment.token_expires_at - datetime.now(UTC) <= timedelta(days=14)
@@ -80,6 +87,7 @@ async def test_capture_persists_result_then_retries_same_idempotent_capability(m
     retry = await service.capture(db, payload, request())
     assert retry == result
     db.add.assert_not_called()
+    assert enroll.await_count == 1
     changed = payload.model_copy(update={"goal": "merchant_cash_advance"})
     with pytest.raises(HTTPException) as error:
         await service.capture(db, changed, request())

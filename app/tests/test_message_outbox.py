@@ -406,10 +406,11 @@ async def test_a_transactional_bounce_is_not_written_onto_the_outreach_list():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("event,detail", [("Bounce", "Permanent/General"), ("Complaint", "abuse")])
-async def test_resource_nurture_feedback_suppresses_without_prospect_id(event, detail):
+@pytest.mark.parametrize("context", ["resource_nurture", "email_marketing"])
+async def test_marketing_feedback_suppresses_without_prospect_id(event, detail, context):
     row = SimpleNamespace(
         id=uuid4(), status="sent", to_email="resource@example.com", prospect_id=None,
-        context="resource_nurture", opened_at=None, delivered_at=None, failed_at=None, detail=None,
+        context=context, opened_at=None, delivered_at=None, failed_at=None, detail=None,
     )
     db = _delivery_db(row=row)
     with patch("app.services.prospect_outreach.set_suppression", new=AsyncMock()) as suppress:

@@ -166,6 +166,10 @@ async def start_dealer_intake(
     db.add(intake)
     await db.flush()
     await core.profiles_service.provision_profile_for_intake(db, intake)
+    await onboarding_consent.enroll_intake(
+        db, intake, payload, source="equipment_intake" if equipment_application else "dealer_intake",
+        program="equipment_financing" if equipment_application else "dealer",
+    )
     if equipment_application:
         await core._configure_equipment_bucket(
             db,

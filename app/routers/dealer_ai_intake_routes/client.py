@@ -122,7 +122,8 @@ async def claim_capital_readiness_diagnostic(
 
     claim_hash = hashlib.sha256(
         json.dumps(
-            payload.model_dump(mode="json", exclude={"secure_room_pin"}),
+            payload.model_dump(mode="json", exclude={"secure_room_pin"} if payload.email_marketing_consent
+                               else {"secure_room_pin", "email_marketing_consent"}),
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -213,6 +214,10 @@ async def claim_capital_readiness_diagnostic(
         "privacy_version": payload.privacy_version,
     }
     state["capital_readiness_claim"] = {**state["capital_readiness_claim"], **onboarding_consent.choices_record(payload, email=intake.email)}
+    await onboarding_consent.enroll_intake(
+        db, intake, payload, source="capital_readiness_diagnostic",
+        program="main_street",
+    )
     state.update(business_profile.state_entry(payload))
     intake.intake_state = state
     intake.source_kind = "client_capital_readiness"

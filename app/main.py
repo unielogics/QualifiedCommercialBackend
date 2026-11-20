@@ -114,6 +114,7 @@ from app.routers import (
     worksheets,
 )
 from app.routers import client_forms as client_forms_router
+from app.routers import email_marketing as email_marketing_router
 from app.routers import form_kinds as form_kinds_router
 from app.routers import (
     google as google_router,
@@ -359,6 +360,8 @@ for r in [
     form_kinds_router.router,
     client_forms_router.router,
     secure_ssns_router.router,
+    email_marketing_router.admin,
+    email_marketing_router.public,
     intake.router,
     rates.router,
     regional_managers.router,

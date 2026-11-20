@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     clerk_secret_key: str = ""
     resource_token_secret: str = ""
     resource_nurture_enabled: bool = False
+    email_marketing_enabled: bool = True
     # When true, a Clerk session that still owes its two-step-verification
     # setup is rejected. Ships OFF so every account can enrol without being
     # locked out; flip it in Secrets Manager once `two_factor_enabled` is true
