@@ -479,7 +479,8 @@ async def mark_delivery(
         # suppresses. A full mailbox is not a dead address. Resource nurture
         # is explicitly educational outreach too. Other client transactional
         # mail remains outside this outreach suppression rule.
-        if (row.prospect_id is not None or getattr(row, "context", "") == "resource_nurture") and row.to_email and _is_permanent(event, detail):
+        outreach = row.prospect_id is not None or getattr(row, "context", "") in {"resource_nurture", "email_marketing"}
+        if outreach and row.to_email and _is_permanent(event, detail):
             from app.services.prospect_outreach import set_suppression
 
             await set_suppression(
