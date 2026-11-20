@@ -72,7 +72,19 @@ def choices_record(payload: Any, *, email: str | None = None) -> dict[str, Any]:
             "version": "application-email-v1",
             "email": str(email or getattr(payload, "email", None) or getattr(payload, "contact_email", "")),
         }
+    if getattr(payload, "email_marketing_consent", False):
+        record["email_marketing_consent"] = True
     return record
+
+
+async def enroll_intake(db, intake, payload, *, source: str, program: str) -> None:
+    from app.services import email_marketing
+
+    await email_marketing.enroll(
+        db, email=intake.email, consent=payload.email_marketing_consent,
+        source=source, program=program, outcome="application_started",
+        client_id=intake.client_id, intake_id=intake.id, locale=intake.preferred_language or "en",
+    )
 
 
 async def record_choices(

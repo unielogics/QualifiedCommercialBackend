@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import request_context
 from app.models.message_send import MessageSend
+from app.services.email.social_footer import with_social_footer
 from app.services.email.user_inbox_sync import _encrypt_body
 from app.services.messaging.redact import mask_all
 
@@ -100,6 +101,10 @@ class Draft:
     #: minted. Declared secrets are removed by exact match, which is the only
     #: layer that cannot miss.
     secrets: tuple = ()
+
+    def with_social_footer(self) -> Draft:
+        text, html = with_social_footer(self.body_text, self.body_html, self.artifact_locale)
+        return replace(self, body_text=text, body_html=html)
 
 
 async def record(
@@ -206,6 +211,7 @@ async def deliver_email(
     have one, falling back to firm SES — the existing `send_as_user` behaviour.
     Without it the message goes from the firm address.
     """
+    draft = draft.with_social_footer()
     to = (draft.to or "").strip()
     if not to or "@" not in to:
         row = recorded_row
@@ -359,7 +365,7 @@ async def _send_ses(context: str, transport, **kwargs):
     # A resource campaign batch must not block the API event loop while the
     # synchronous SES SDK waits on the network. No session or ORM object enters
     # this thread; only the transport's plain email arguments do.
-    if context == "resource_nurture":
+    if context in {"resource_nurture", "email_marketing"}:
         return await asyncio.to_thread(transport, **kwargs)
     return transport(**kwargs)
 

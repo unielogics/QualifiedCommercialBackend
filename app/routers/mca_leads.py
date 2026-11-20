@@ -23,7 +23,7 @@ from app.db import get_db
 from app.models.activity import Activity
 from app.models.client import Client
 from app.schemas.phone import RequiredPhone
-from app.services import mca_funding_policy
+from app.services import email_marketing, mca_funding_policy
 from app.services.business_profile import RequiredBusinessProfileFields
 from app.services.payment_authorization import primary_super_admin
 
@@ -76,6 +76,7 @@ class McaLeadRequest(BaseModel):
     monthly_revenue: Range
     time_in_business: Literal["under_6_months", "6_12_months", "1_2_years", "2_plus_years"]
     consent: Literal[True]
+    email_marketing_consent: bool = Field(default=False, strict=True)
     locale: Literal["en", "es"] = "en"
     attribution: Attribution
     website: str = Field(default="", max_length=0)
@@ -188,6 +189,9 @@ async def capture_mca_lead(
             summary=f"MCA funding review requested for {payload.business_name}",
             payload={"funding_intent": "merchant_cash_advance", "active_mca_count": payload.active_mca_count, "consent_version": CONSENT_VERSION},
         ))
+        await email_marketing.enroll(db, email=payload.email, consent=payload.email_marketing_consent,
+                                     source="mca_lead", program="merchant_cash_advance", outcome="pending_review",
+                                     client_id=client.id, locale=payload.locale)
         await db.commit()
     except IntegrityError:
         await db.rollback()

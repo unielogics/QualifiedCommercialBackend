@@ -737,6 +737,7 @@ class CapitalReadinessClaimRequest(RequiredBusinessProfileFields, ClientRoomPinC
     application_email_consent: bool = False
     sms_transactional_consent: bool = False
     sms_marketing_consent: bool = False
+    email_marketing_consent: bool = Field(default=False, strict=True)
 
 
 class CapitalReadinessClaimResponse(BaseModel):
@@ -761,6 +762,7 @@ class DealerIntakeStart(PublicIntakeAttribution, RequiredBusinessProfileFields, 
     application_email_consent: bool = False
     sms_transactional_consent: bool = False
     sms_marketing_consent: bool = False
+    email_marketing_consent: bool = Field(default=False, strict=True)
     preferred_language: Language = Language.EN
     capital_readiness_diagnostic: CapitalReadinessDiagnostic | None = None
     requested_amount: float | None = Field(default=None, ge=0, le=100_000_000)
@@ -796,6 +798,7 @@ class FundingReviewStart(PublicIntakeAttribution, RequiredBusinessProfileFields,
     application_email_consent: bool = False
     sms_transactional_consent: bool = False
     sms_marketing_consent: bool = False
+    email_marketing_consent: bool = Field(default=False, strict=True)
     preferred_language: Language = Language.EN
     capital_readiness_diagnostic: CapitalReadinessDiagnostic | None = None
 
@@ -10826,6 +10829,7 @@ class McaRefiStart(PublicIntakeAttribution, RequiredBusinessProfileFields, Clien
     application_email_consent: bool = False
     sms_transactional_consent: bool = False
     sms_marketing_consent: bool = False
+    email_marketing_consent: bool = Field(default=False, strict=True)
     preferred_language: Language = Language.EN
 
     @field_validator("phone", "business_name", "payment_frequency", mode="before")

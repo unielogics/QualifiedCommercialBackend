@@ -3978,7 +3978,7 @@ async def send_test_email(
         reply_to=reply_to,
         headers={"Message-ID": test_message_id},
         artifact_locale=payload.artifact_locale,
-    )
+    ).with_social_footer()
     ledger = await record_outbox(
         db,
         channel="email",
@@ -4001,7 +4001,7 @@ async def send_test_email(
         provider_result = ses_client.send_raw_email(
             to_emails=[recipient],
             subject=subject,
-            body_text=body_text,
+            body_text=outbox_draft.body_text,
             body_html=outbox_draft.body_html,
             attachments=list(outbox_draft.attachments),
             source_email=from_email,

@@ -44,6 +44,7 @@ class BusinessIntakeStart(RequiredBusinessProfileFields, ClientRoomPinChoice):
     application_email_consent: Literal[True]
     sms_transactional_consent: Literal[True]
     sms_marketing_consent: bool = False
+    email_marketing_consent: bool = Field(default=False, strict=True)
     resource_handoff_token: str | None = Field(default=None, max_length=180, repr=False)
     attribution: dict[str, Any] = Field(default_factory=dict)
 

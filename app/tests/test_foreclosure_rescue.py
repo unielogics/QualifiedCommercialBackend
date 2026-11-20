@@ -1,5 +1,8 @@
 from datetime import date, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -59,6 +62,25 @@ def _intake(**changes):
     }
     values.update(changes)
     return ForeclosureRescueIntakeCreate.model_validate(values)
+
+
+@pytest.mark.asyncio
+async def test_professional_opt_in_is_scoped_to_the_submitter(monkeypatch):
+    from app.routers import foreclosure_rescue as route
+
+    payload = _intake(email_marketing_consent=True, locale="es")
+    enroll = AsyncMock()
+    monkeypatch.setattr(route.email_marketing, "enroll", enroll)
+    monkeypatch.setattr(route, "primary_super_admin", AsyncMock(return_value=None))
+    monkeypatch.setattr("app.services.file_clients.ensure_client", AsyncMock())
+    monkeypatch.setattr("app.services.application_profiles.provision_profile_for_intake", AsyncMock())
+    db = Mock(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None)),
+              flush=AsyncMock(), commit=AsyncMock())
+    db.add.side_effect = lambda row: setattr(row, "id", uuid4())
+    request = SimpleNamespace(client=None, headers={})
+    await route._create_foreclosure_rescue(payload, request, db, send_resume_email=False)
+    enroll.assert_awaited_once_with(db, email=payload.contact_email, consent=True, source="foreclosure_rescue",
+                                    program="foreclosure_rescue", outcome="new_rescue", locale="es", client_id=None, intake_id=None)
 
 
 def test_program_terms_and_amortization_fixture():

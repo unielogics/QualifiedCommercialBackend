@@ -122,6 +122,7 @@ def _payload_matches(capture: ResourceAssessment, payload) -> bool:
 
 async def capture(db, payload, request) -> dict[str, Any]:
     from app import request_context
+    from app.services import email_marketing
     from app.services.funding_resource_calculations import calculate_funding_report
     from app.services.payment_authorization import primary_super_admin
 
@@ -174,8 +175,13 @@ async def capture(db, payload, request) -> dict[str, Any]:
         actor_label="public_resource", kind="resource.lead_received", summary="Business funding result requested",
         payload={"assessment_id": str(identifier), "goal": payload.goal, "resource_id": payload.resource_id,
                  "consent_version": CONSENT_VERSION, "privacy_acknowledged": True,
-                 "email_marketing_consent": payload.email_marketing_consent, "consented_at": now.isoformat(),
+                 "email_marketing_consent": payload.email_marketing_consent,
+                 "lending_updates_consent": payload.lending_updates_consent, "consented_at": now.isoformat(),
                  "attribution": row.attribution, "enrollment": "pending" if payload.email_marketing_consent else "not_opted_in"}))
+    await email_marketing.enroll(
+        db, email=email, consent=payload.lending_updates_consent, source="business_funding_check",
+        program=payload.goal, outcome="resource_requested", client_id=client.id, locale=payload.locale,
+    )
     await db.commit()
     return {"status": "received", "capture_id": str(identifier), "resource_token": capability, "report": report}
 

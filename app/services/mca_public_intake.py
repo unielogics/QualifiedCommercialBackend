@@ -36,6 +36,8 @@ def intake_id(key: UUID) -> UUID:
 
 def request_stamp(payload) -> str:
     values = payload.model_dump(mode="json", exclude={"secure_room_pin", "idempotency_key", "resource_handoff_token"})
+    if not payload.email_marketing_consent:
+        values.pop("email_marketing_consent", None)  # Keep legacy replay fingerprints valid.
     return hashlib.sha256(json.dumps(values, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -152,6 +154,10 @@ async def start(db, payload, request: Request) -> dict:
     db.add(intake)
     await db.flush()
     await core.profiles_service.provision_profile_for_intake(db, intake)
+    await onboarding_consent.enroll_intake(
+        db, intake, payload, source="mca_funding_intake",
+        program="merchant_cash_advance",
+    )
     if capture is not None:
         await resource_assessments.link_application(db, capture, intake)
     db.add(Activity(client_id=client.id, actor_label="public_mca_intake", kind="mca.intake_started",

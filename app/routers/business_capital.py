@@ -71,6 +71,8 @@ class ContactRequest(BaseModel):
     campaign: str | None = Field(default=None, max_length=160)
     partner: str | None = Field(default=None, max_length=160)
     consent: Literal[True]
+    email_marketing_consent: bool = Field(default=False, strict=True)
+    locale: Literal["en", "es"] = "en"
     website: str = Field(default="", max_length=0)
 
 

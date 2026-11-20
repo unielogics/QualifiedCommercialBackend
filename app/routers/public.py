@@ -56,7 +56,7 @@ from app.models.user import User
 from app.routers.fred import _build_summary, _current_spreads
 from app.schemas.fred import FredSeriesSummary
 from app.schemas.phone import RequiredPhone
-from app.services import booking_operations, booking_reminders
+from app.services import booking_operations, booking_reminders, email_marketing
 from app.services import fred as fred_service
 from app.services.team_calendar import effective_booking_settings, lock_calendar_owner
 
@@ -238,6 +238,8 @@ class SupportInquiry(BaseModel):
     title: str = Field(min_length=1, max_length=160)
     body: str = Field(min_length=1, max_length=4000)
     consent: bool
+    email_marketing_consent: bool = Field(default=False, strict=True)
+    locale: Literal["en", "es"] = "en"
 
 
 class SupportInquiryResult(BaseModel):
@@ -320,6 +322,8 @@ async def support_inquiry(
         )
     )
     await db.flush()
+    await email_marketing.enroll(db, email=payload.email, consent=payload.email_marketing_consent,
+                                 source="support_inquiry", outcome="inquiry_received", locale=payload.locale)
     return SupportInquiryResult(ok=True)
 
 
@@ -407,6 +411,7 @@ class PublicBookingCreate(BaseModel):
     preferred_bank_method: Literal["plaid", "statements", "decide_later"] | None = None
     notes: str | None = Field(default=None, max_length=1000)
     transactional_sms_consent: bool = False
+    email_marketing_consent: bool = Field(default=False, strict=True)
     #: Campaign hint carried by the link (e.g. the rep product booklet appends
     #: ?source=field_desk_product). Recorded for the desk; never decides a file.
     source: str | None = Field(default=None, max_length=64)
@@ -658,7 +663,8 @@ async def public_booking_create(
                 "video" if booking.google_meet_enabled else "phone"
             ),
             "payload": payload.model_dump(
-                mode="json", exclude={"creation_idempotency_key"}
+                mode="json", exclude={"creation_idempotency_key"} if payload.email_marketing_consent
+                else {"creation_idempotency_key", "email_marketing_consent"}
             ),
         }
     )
@@ -894,6 +900,8 @@ async def public_booking_create(
         )
     )
 
+    await email_marketing.enroll(db, email=payload.email, consent=payload.email_marketing_consent,
+                                 source="public_booking", program=selected_variant, outcome="booked")
     delivery_operation = await _deliver_booking(
         db,
         user,
@@ -1220,6 +1228,8 @@ class CapitalPartnerApplicationIn(BaseModel):
     notes: str | None = Field(default=None, max_length=4000)
 
     consent: bool
+    email_marketing_consent: bool = Field(default=False, strict=True)
+    locale: Literal["en", "es"] = "en"
 
 
 class CapitalPartnerApplicationResult(BaseModel):
@@ -1342,6 +1352,8 @@ async def capital_partner_application(
         )
     )
     await db.flush()
+    await email_marketing.enroll(db, email=payload.contact_email, consent=payload.email_marketing_consent,
+                                 source="capital_partner_application", outcome="pending", locale=payload.locale)
     return CapitalPartnerApplicationResult(ok=True, id=str(app_row.id))
 
 
