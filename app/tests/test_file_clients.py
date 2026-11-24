@@ -22,13 +22,15 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from app.dealer_os.models import DealerRepInboxMessage, DealerRepInboxThread
-from app.enums import Role
+from app.dealer_os.models import DealerBusiness, DealerRepInboxMessage, DealerRepInboxThread
+from app.enums import LoanStage, LoanType, Role
 from app.models.application_profile import ApplicationProfile
 from app.models.bucket import Bucket, BucketFile, BucketRequestedDocument
 from app.models.client import Client
 from app.models.file_event import FileEvent
+from app.models.loan import Loan
 from app.models.message_send import MessageSend
+from app.models.payments import ActualFundingConfirmation
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.sms_message import SmsMessage
 from app.models.user import User
@@ -536,21 +538,126 @@ async def test_the_summary_counts_live_files_and_where_they_stand(db) -> None:
 
     summary = await fc.desk_summary(db, now=NOW)
 
-    assert summary["active"] == 4  # archived and denied files have left the desk; a funded one has not
+    assert summary["active"] == 3
     assert summary["new_7d"] == 2
-    assert summary["no_documents"] == 3
+    assert summary["no_documents"] == 2
     assert summary["without_client"] == 1
     stages = {row["key"]: row["count"] for row in summary["stages"]}
     assert stages == {
         "submitted": 1, "collecting_docs": 1, "in_underwriting": 1,
-        "term_sheet_provided": 0, "approved": 0, "closed_won": 1,
+        "term_sheet_provided": 0, "approved": 0, "closed_won": 0,
     }
     assert [row["key"] for row in summary["stages"]] == list(fc.LIFECYCLE_ORDER)
+
+
+async def test_funded_files_have_their_own_staff_queue(db) -> None:
+    from app.routers.dealer_ai_intake import list_dealer_ai_leads
+
+    staff = await _user(db)
+    client = await _client(db)
+    review, _, _ = await _file(db, client=client, status="completed", outcome_status="closed")
+    won, _, _ = await _file(db, underwriting_status="closed_won", status="denied")
+    rescue, _, _ = await _file(db, foreclosure_rescue_status="funded")
+    archived_won, _, _ = await _file(db, underwriting_status="closed_won", archived=True)
+    lost, _, _ = await _file(db, underwriting_status="closed_lost")
+    archived, _, _ = await _file(db, archived=True)
+    source, _, _ = await _file(db, client=client, with_profile=False, business="Source financing")
+    linked, _, linked_profile = await _file(db, client=client, status="completed")
+    source_loan = Loan(deal_id="QC-SOURCE", source_intake_id=source.id, client_id=client.id,
+                       address="101 Test Road", type=LoanType.DSCR, amount=10000, stage=LoanStage.CLOSING)
+    linked_loan = Loan(deal_id="QC-PROFILE", client_id=client.id, address="102 Test Road",
+                       type=LoanType.DSCR, amount=10000, stage=LoanStage.FUNDED)
+    db.add_all([source_loan, linked_loan])
+    await db.flush()
+    linked_profile.loan_id = linked_loan.id
+    await db.flush()
+    # As in a fresh request, read all timestamps back through the same database driver.
+    db.expunge_all()
+    source_loan = await db.get(Loan, source_loan.id)
+
+    async def read(**filters):
+        return await list_dealer_ai_leads(user=staff, db=db, **filters)
+
+    assert {item.id for item in (await read()).items} == {review.id, source.id}
+    source_loan.stage = LoanStage.FUNDED
+    await db.flush()
+    assert [item.id for item in (await read()).items] == [review.id]
+    assert (await read(q="Source financing")).total == 0
+
+    funded_ids = {won.id, rescue.id, source.id, linked.id, archived_won.id}
+    funded = await read(archived_filter="funded")
+    assert {item.id for item in funded.items} == funded_ids
+    assert {item.workspace_state for item in funded.items if item.id != archived_won.id} == {"funded"}
+    assert next(item for item in funded.items if item.id == archived_won.id).workspace_state == "archived"
+    assert (await read(archived_filter="funded", q="Source financing")).items[0].id == source.id
+    assert {item.id for item in (await read(status_filter="closed_won")).items} == funded_ids
+    assert {item.id for item in (await read(archived_filter="archived")).items} == {lost.id, archived.id}
+    assert (await read(archived_filter="all")).total == 8
+    assert [item.id for item in (await read(archived_filter="all", status_filter="completed")).items] == [review.id]
+    first = await read(archived_filter="funded", limit=2)
+    second = await read(archived_filter="funded", offset=2)
+    assert first.total == second.total == len(funded_ids)
+    assert [item.id for item in first.items + second.items] == [item.id for item in funded.items]
+    # Some older promoted intakes only hold the pointer on the intake itself.
+    source_loan.source_intake_id = None
+    source_record = await db.get(PublicUnderwritingIntake, source.id)
+    source_record.promoted_loan_id = source_loan.id
+    await db.flush()
+    assert (await read(archived_filter="funded", q="Source financing")).total == 1
+    source_loan.stage = LoanStage.CLOSING
+    await db.flush()
+    assert {item.id for item in (await read()).items} == {review.id, source.id}
+
+
+async def test_only_current_actual_funding_confirmations_move_files_out_of_active(db) -> None:
+    from app.routers.dealer_ai_intake import list_dealer_ai_leads
+
+    staff = await _user(db)
+    paid, _, paid_profile = await _file(db, underwriting_status="approved")
+    superseded, _, superseded_profile = await _file(db, underwriting_status="approved")
+    for profile, superseded_at in [(paid_profile, None), (superseded_profile, NOW)]:
+        db.add(ActualFundingConfirmation(
+            application_profile_id=profile.id, version=1, actual_funding_date=NOW.date(),
+            actual_funded_amount=10000, funding_party_name="Test lender", confirmed_at=NOW,
+            superseded_at=superseded_at,
+        ))
+    await db.flush()
+    db.expunge_all()
+    active = await list_dealer_ai_leads(user=staff, db=db)
+    funded = await list_dealer_ai_leads(user=staff, db=db, archived_filter="funded")
+    assert [row.id for row in active.items] == [superseded.id]
+    assert [row.id for row in funded.items] == [paid.id]
+    assert funded.items[0].underwriting_status == "approved"
+    assert funded.items[0].workspace_state == "funded"
+
+
+async def test_dealer_funding_only_moves_the_linked_deal(db) -> None:
+    from app.routers.dealer_ai_intake import list_dealer_ai_leads
+
+    staff = await _user(db)
+    client = await _client(db)
+    handoff, _, _ = await _file(db, client=client)
+    sibling, _, sibling_profile = await _file(db, client=client)
+    incomplete, _, _ = await _file(db, client=client)
+    older, _, older_profile = await _file(db, client=client)
+    paid = DealerBusiness(name="Current handoff", handoff_intake_id=handoff.id, status="complete", funded_amount=12000)
+    legacy = DealerBusiness(name="Historical profile link", status="complete", funded_amount=20000)
+    db.add_all([paid, legacy, DealerBusiness(name="Incomplete", handoff_intake_id=incomplete.id, status="complete")])
+    await db.flush()
+    sibling_profile.dealer_id = paid.id  # A stale profile pointer cannot override the current handoff.
+    older_profile.dealer_id = legacy.id
+    await db.flush()
+    db.expunge_all()
+    active = await list_dealer_ai_leads(user=staff, db=db)
+    funded = await list_dealer_ai_leads(user=staff, db=db, archived_filter="funded")
+    assert {row.id for row in active.items} == {sibling.id, incomplete.id}
+    assert {row.id for row in funded.items} == {handoff.id, older.id}
 
 
 async def test_activity_names_the_file_and_the_client_and_filters_by_kind(db) -> None:
     client = await _client(db)
     intake, _bucket, profile = await _file(db, client=client)
+    _won_intake, _won_bucket, won_profile = await _file(db, client=client, underwriting_status="closed_won")
     no_intake = ApplicationProfile(underwriting_status="collecting_docs")  # a file that never came through an intake
     db.add(no_intake)
     await db.flush()
@@ -564,6 +671,7 @@ async def test_activity_names_the_file_and_the_client_and_filters_by_kind(db) ->
         line("message.sent", "Dana sent a message", 20),
         line("status.changed", "Moved to underwriting", 10, visibility="desk"),
         line("document.received", "Not an intake file", 5, target=no_intake),
+        line("status.changed", "Funded", 1, target=won_profile),
     ])
     await db.flush()
 

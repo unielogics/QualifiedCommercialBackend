@@ -20,7 +20,7 @@ from typing import Literal
 from uuid import UUID, uuid4
 
 from fastapi import BackgroundTasks, Depends, HTTPException, Request, Response, status
-from sqlalchemy import or_, select
+from sqlalchemy import literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, with_loader_criteria
 
@@ -98,7 +98,7 @@ async def list_dealer_ai_leads(
     status_filter: str | None = None,
     probability_status: str | None = None,
     variant_filter: str | None = None,
-    archived_filter: Literal["active", "archived", "all"] = "active",
+    archived_filter: Literal["active", "funded", "archived", "all"] = "active",
     partner_user_id: UUID | None = None,
     limit: int = 50,
     offset: int = 0,
@@ -106,8 +106,14 @@ async def list_dealer_ai_leads(
     core._require_super_admin(user)
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
+    funded = core._staff_file_funded_clause()
+    status_key = (status_filter or "all").strip().lower()
+    if archived_filter == "active" and status_key in {"funded", "closed_won"}:
+        # Existing clients select Funded in Status while still sending the default view.
+        archived_filter = "funded"
+    row_funded = funded if archived_filter == "all" else literal(archived_filter == "funded")
     stmt = (
-        select(core.PublicUnderwritingIntake)
+        select(core.PublicUnderwritingIntake, row_funded.label("funded"))
         .join(core.Bucket, core.PublicUnderwritingIntake.bucket_id == core.Bucket.id)
         .options(
             selectinload(core.PublicUnderwritingIntake.bucket).selectinload(core.Bucket.requested_documents).selectinload(core.BucketRequestedDocument.template_file),
@@ -119,23 +125,23 @@ async def list_dealer_ai_leads(
             selectinload(core.PublicUnderwritingIntake.delete_requested_by),
             with_loader_criteria(core.BucketFile, core.BucketFile.deleted_at.is_(None), include_aliases=True),
         )
-        .order_by(core.PublicUnderwritingIntake.updated_at.desc())
+        .order_by(core.PublicUnderwritingIntake.updated_at.desc(), core.PublicUnderwritingIntake.id)
     )
-    closed_lifecycle = core._closed_intake_lifecycle_clause()
     if archived_filter == "active":
-        stmt = stmt.where(
-            core.Bucket.archived_at.is_(None),
-            ~closed_lifecycle,
-        )
+        stmt = stmt.where(core._active_staff_file_clause())
+    elif archived_filter == "funded":
+        stmt = stmt.where(funded)
     elif archived_filter == "archived":
-        # "Archived" is the operator's historical-work queue.  It includes
-        # explicit bucket archives and lifecycle-closed files, but only the
-        # former receives a Restore action.
         stmt = stmt.where(
-            or_(core.Bucket.archived_at.is_not(None), closed_lifecycle)
+            ~funded, or_(core.Bucket.archived_at.is_not(None), core._terminal_intake_clause())
         )
-    if status_filter and status_filter != "all":
-        stmt = stmt.where(core._intake_status_filter_clause(status_filter))
+    if status_key in {"closed_won", "funded"}:
+        if archived_filter != "funded":
+            stmt = stmt.where(funded)
+    elif status_key == "completed":
+        stmt = stmt.where(core.PublicUnderwritingIntake.status == "completed", ~funded)
+    elif status_key != "all":
+        stmt = stmt.where(core._intake_status_filter_clause(status_key))
     if partner_user_id is not None:
         stmt = stmt.where(core.PublicUnderwritingIntake.broker_id == partner_user_id)
     if variant_filter and variant_filter != "all":
@@ -147,14 +153,15 @@ async def list_dealer_ai_leads(
             stmt = stmt.where(core.PublicUnderwritingIntake.variant == variant_filter)
     if q and q.strip():
         stmt = stmt.where(core._intake_search_clause(q))
-    rows = list((await db.execute(stmt)).scalars().unique().all())
+    rows = (await db.execute(stmt)).unique().all()
     if probability_status and probability_status != "all":
         rows = [
             row for row in rows
-            if str(core._lead_result(row).get("probability_status") or "") == probability_status
+            if str(core._lead_result(row[0]).get("probability_status") or "") == probability_status
         ]
     total = len(rows)
-    page = rows[offset:offset + limit]
+    page_rows = rows[offset:offset + limit]
+    page = [row for row, _ in page_rows]
     underwriting_by_intake = await core._underwriting_statuses_by_intake(
         db, [row.id for row in page]
     )
@@ -167,8 +174,9 @@ async def list_dealer_ai_leads(
             row,
             underwriting_status=underwriting_by_intake.get(row.id),
             effective_profile_hold=row.id in profile_hold_intake_ids,
+            funded=is_funded,
         )
-        for row in page
+        for row, is_funded in page_rows
     ]
     # NEW badges: unseen client/broker activity per lead for THIS admin,
     # against their per-lead seen cursors (default window: last 7 days for
