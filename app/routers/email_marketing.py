@@ -1,7 +1,7 @@
 """Database-wide marketing audiences are restricted to super administrators."""
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from fastapi.responses import HTMLResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,12 +12,19 @@ from app.enums import Role
 from app.models.user import User
 from app.services import email_marketing as marketing
 from app.services import email_marketing_delivery as delivery
+from app.services import email_marketing_directory as directory_service
 
 admin = APIRouter(prefix="/admin/email-marketing", tags=["email-marketing"])
 public = APIRouter(prefix="/public/email-marketing", tags=["email-marketing"])
 Db = Annotated[AsyncSession, Depends(get_db)]
 Admin = Annotated[User, Depends(require_role(Role.SUPER_ADMIN))]
 Token = Annotated[str, Query(min_length=1, max_length=120)]
+
+
+@admin.post("/directory")
+async def recipient_directory(payload: directory_service.DirectoryRequest, db: Db, user: Admin, response: Response):
+    response.headers["Cache-Control"] = "private, no-store"
+    return await directory_service.directory(db, payload)
 
 
 @admin.get("/options")
@@ -38,6 +45,12 @@ async def preview(payload: marketing.AudienceFilters, db: Db, user: Admin):
 @admin.post("/campaigns")
 async def create_campaign(payload: marketing.CampaignInput, db: Db, user: Admin):
     return await marketing.create_campaign(db, user.id, payload)
+
+
+@admin.post("/campaigns/preview")
+async def preview_campaign(payload: marketing.CampaignPreview, db: Db, user: Admin, response: Response):
+    response.headers["Cache-Control"] = "private, no-store"
+    return await marketing.preview_campaign(db, payload)
 
 
 @admin.get("/campaigns")

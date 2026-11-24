@@ -1,7 +1,6 @@
 """Batch delivery for the consented social follow sequence and operator campaigns."""
 from __future__ import annotations
 
-import html
 import logging
 import re
 from datetime import UTC, datetime, timedelta
@@ -14,7 +13,7 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.models.email_marketing import MarketingCampaign, MarketingDelivery, MarketingSubscriber
 from app.models.message_send import MessageSend
-from app.services import email_marketing
+from app.services import email_marketing, marketing_content
 from app.services.email.ses_client import ses_configured
 from app.services.messaging import outbox
 from app.services.prospect_outreach import _lock_suppression_addresses
@@ -58,22 +57,23 @@ def delivery_readiness() -> tuple[bool, str]:
     return True, "Automatic email delivery is enabled."
 
 
-def compose(subscriber, delivery, campaign):
+def compose(subscriber, delivery, campaign, *, context=None):
     language = subscriber.locale
     subject, message = (campaign.subject, campaign.body) if campaign else SEQUENCE[language][delivery.step]
     settings = get_settings()
     token = email_marketing.unsubscribe_token(subscriber.id)
     url = f"{settings.public_api_url.rstrip('/')}/api/v1/public/email-marketing/unsubscribe?token={token}"
     address = settings.prospect_mailing_address.strip()
-    unsub = "Cancelar suscripción" if language == "es" else "Unsubscribe"
-    plain = f"{message}\n\nQualified Commercial · {address}\n{unsub}: {url}"
-    paragraphs = "".join(f"<p>{html.escape(p).replace(chr(10), '<br>')}</p>" for p in message.split("\n\n"))
-    markup = (f'<div style="font-family:Arial,sans-serif;max-width:640px;margin:auto">{paragraphs}'
-              '<hr>'
-              f'<p>Qualified Commercial · {html.escape(address)}<br><a href="{html.escape(url, quote=True)}">{unsub}</a></p></div>')
-    return outbox.Draft(to=subscriber.email, subject=subject, body_text=plain, body_html=markup,
-                        artifact_locale=language, from_name="Qualified Commercial", secrets=(token,),
-                        headers={"List-Unsubscribe": f"<{url}>", "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"}).with_social_footer()
+    rendered = marketing_content.render_message(
+        subject=subject, body=message, body_html=campaign.body_html if campaign else None,
+        values=context, locale=language, mailing_address=address, unsubscribe_url=url,
+        personalize=campaign is not None and campaign.selection is not None,
+    )
+    return outbox.Draft(
+        to=subscriber.email, subject=rendered.subject, body_text=rendered.body_text, body_html=rendered.body_html,
+        artifact_locale=language, from_name="Qualified Commercial", secrets=(token,),
+        headers={"List-Unsubscribe": f"<{url}>", "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"},
+    )
 
 
 async def finish(db, delivery, status, now):
@@ -110,7 +110,12 @@ async def dispatch_one(db, identifier: int, now: datetime):
     if eligible is None:
         await finish(db, delivery, "blocked", now)
         return
-    draft = compose(subscriber, delivery, campaign)
+    context = None
+    if campaign is not None and campaign.selection is not None:
+        from app.services.email_marketing_directory import recipient_context
+
+        context = await recipient_context(db, subscriber.id, program_key=filters.program)
+    draft = compose(subscriber, delivery, campaign, context=context)
     key = f"campaign_{campaign.id}" if campaign else f"social_follow_{delivery.step}"
     ledger = await outbox.record(db, channel="email", status="queued", context="email_marketing",
                                  draft=draft, template_key=key, subject=outbox.Subject(

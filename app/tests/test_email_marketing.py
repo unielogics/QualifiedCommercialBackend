@@ -1,16 +1,19 @@
 """Real database coverage of audience identity, campaign snapshots and durable dispatch."""
 from datetime import UTC, datetime, timedelta
+from email import policy
+from email.parser import BytesParser
 from types import SimpleNamespace
 from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy import event, select
 
 from app.models.application_profile import ApplicationProfile, ApplicationProgramSelection
 from app.models.client import Client
-from app.models.email_marketing import MarketingDelivery, MarketingSubscriber
+from app.models.email_marketing import MarketingCampaign, MarketingDelivery, MarketingSubscriber
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.services import email_marketing as marketing
 from app.services import email_marketing_delivery as delivery
@@ -127,3 +130,94 @@ async def test_queue_retry_changed_outcome_and_provider_ambiguity(db, monkeypatc
     await delivery.dispatch_one(db, second.id, now + timedelta(days=6))
     assert second.status == "uncertain" and provider.call_count == 3
     assert await db.scalar(select(MarketingDelivery.id).where(MarketingDelivery.step == 2)) is None
+
+
+async def test_selected_recipient_html_preview_and_scheduled_delivery(db, monkeypatch):
+    for address in ["selected@example.org", "excluded@example.org"]:
+        await marketing.enroll(db, email=address, source="contact", consent=True)
+    await db.commit()
+    members = {row.email: row for row in await db.scalars(select(MarketingSubscriber))}
+    member_id = members["selected@example.org"].id
+    excluded = members["excluded@example.org"].id
+    selection = {"mode": "all", "excluded_ids": [excluded]}
+    template = {"subject": "News for {{email}}", "body_html": "<table><tr><td>Updates for {{email}}</td></tr></table>",
+                "filters": {}, "selection": selection}
+    preview = await marketing.preview_campaign(db, marketing.CampaignPreview(**template))
+    assert preview["eligible_count"] == 1 and preview["sample_id"] == member_id
+    assert "<td>Updates for selected@example.org</td>" in preview["body_html"]
+    assert "Updates for selected@example.org" in preview["body_text"]
+    with pytest.raises(HTTPException, match="outside"):
+        await marketing.preview_campaign(db, marketing.CampaignPreview(**template, sample_id=excluded))
+
+    when = (datetime.now(UTC) + timedelta(days=3)).replace(microsecond=0)
+    actor = uuid4()
+    payload = marketing.CampaignInput(id=uuid4(), name="Scheduled newsletter",
+                                      scheduled_at=when.isoformat(), expected_recipient_count=1, **template)
+    with pytest.raises(HTTPException) as mismatch:
+        await marketing.create_campaign(db, actor, payload.model_copy(update={"expected_recipient_count": 5}))
+    assert mismatch.value.status_code == 409
+    assert await db.get(MarketingCampaign, payload.id) is None
+    assert await db.scalar(select(MarketingDelivery.id).where(MarketingDelivery.campaign_id == payload.id)) is None
+    saved = await marketing.create_campaign(db, actor, payload)
+    assert saved["recipient_count"] == 1
+    assert saved["scheduled_at"].replace(tzinfo=UTC) == when
+    await marketing.enroll(db, email="later@example.org", source="contact", consent=True)
+    assert (await marketing.create_campaign(db, actor, payload.model_copy(update={"expected_recipient_count": 2})))["recipient_count"] == 1
+    with pytest.raises(HTTPException) as changed:
+        await marketing.create_campaign(db, actor, payload.model_copy(update={"scheduled_at": when + timedelta(days=1)}))
+    assert changed.value.status_code == 409
+
+    job = (await db.scalars(select(MarketingDelivery).where(MarketingDelivery.campaign_id == payload.id))).one()
+    assert job.subscriber_id == member_id and job.due_at.replace(tzinfo=UTC) == when
+    monkeypatch.setattr(marketing, "_secret", lambda: b"test-only")
+    monkeypatch.setattr(delivery.outbox, "_encrypt_body", lambda _value: ("test", "fernet"))
+    provider = Mock(return_value={"MessageId": "mock"})
+    monkeypatch.setattr(ses_client, "_ses_client", lambda _region: SimpleNamespace(send_raw_email=provider))
+    monkeypatch.setattr(ses_client, "get_settings", lambda: SimpleNamespace(
+        ses_from_address="desk@example.org", ses_region="us-east-1", ses_configuration_set=""))
+    await delivery.dispatch_one(db, job.id, when - timedelta(seconds=1))
+    provider.assert_not_called()
+    await delivery.dispatch_one(db, job.id, when)
+    await delivery.dispatch_one(db, job.id, when + timedelta(hours=1))
+    provider.assert_called_once()
+    wire = BytesParser(policy=policy.default).parsebytes(provider.call_args.kwargs["RawMessage"]["Data"])
+    assert wire["Subject"] == preview["subject"] and wire.get_content_type() == "multipart/alternative"
+    real_unsubscribe = wire["List-Unsubscribe"].strip("<>")
+    for part, key in (("html", "body_html"), ("plain", "body_text")):
+        expected = preview[key].replace("https://example.invalid/unsubscribe-preview", real_unsubscribe)
+        assert wire.get_body(preferencelist=(part,)).get_content().rstrip("\n") == expected
+
+    class AfterSchedule(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return when + timedelta(hours=4)
+
+    monkeypatch.setattr(marketing, "datetime", AfterSchedule)
+    assert (await marketing.create_campaign(db, actor, payload))["sent"] == 1
+    past_request = payload.model_copy(update={"id": uuid4()})
+    with pytest.raises(HTTPException, match="future"):
+        await marketing.create_campaign(db, actor, past_request)
+    assert await db.get(MarketingCampaign, past_request.id) is None
+
+
+def test_schedule_rejects_ambiguous_wall_times_and_converts_explicit_offset():
+    fields = dict(id=uuid4(), name="Newsletter", subject="Update", body="Message", filters={})
+    with pytest.raises(ValidationError):
+        marketing.CampaignInput(**fields, scheduled_at="2027-03-15T10:00:00")
+    assert marketing.CampaignInput(**fields, scheduled_at="2027-03-15T10:00:00-04:00").scheduled_at == datetime(
+        2027, 3, 15, 14, tzinfo=UTC)
+
+
+async def test_migrated_campaign_accepts_legacy_retry_and_preserves_literal_text(db, monkeypatch):
+    actor = uuid4()
+    campaign = MarketingCampaign(id=uuid4(), created_by=actor, subject="Reference {{reference}}", name="Old campaign",
+                                 body="A literal template example: {{first_name}}", filters={})
+    db.add(campaign)
+    await db.commit()
+    replay = marketing.CampaignInput(id=campaign.id, name=campaign.name, subject=campaign.subject,
+                                     body=campaign.body, filters={})
+    assert (await marketing.create_campaign(db, actor, replay))["recipient_count"] == 0
+    monkeypatch.setattr(marketing, "_secret", lambda: b"test-only")
+    draft = delivery.compose(SimpleNamespace(id=uuid4(), email="borrower@example.org", locale="en"),
+                             SimpleNamespace(step=None), campaign)
+    assert draft.subject == campaign.subject and campaign.body in draft.body_text
