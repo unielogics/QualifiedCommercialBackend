@@ -23,6 +23,7 @@ from app.config import get_settings
 from app.db import get_db
 from app.enums import ProductAccountType, Role
 from app.models.user import User
+from app.services.signup_marketing import enroll_verified_signup
 from app.services.user_access import ensure_legacy_product_access, has_product_access
 
 log = logging.getLogger(__name__)
@@ -539,6 +540,7 @@ async def _resolve_current_user(
                 )
             ).scalar_one()
             log.info("Auto-provisioned user clerk_id=%s email=%s name=%s", clerk_id, email, name)
+        await enroll_verified_signup(db, user, clerk_user)
     elif (
         user.email.endswith("@unknown")
         or user.name.startswith("user_")
@@ -560,6 +562,7 @@ async def _resolve_current_user(
         clerk_user = await _fetch_clerk_user(clerk_id)
         email, name = _profile_from_clerk(payload, clerk_user, clerk_id)
         if email != user.email or name != user.name:
+            first_known_email = user.email.endswith("@unknown")
             old_name = user.name
             user.email = email
             user.name = name
@@ -570,6 +573,8 @@ async def _resolve_current_user(
             ):
                 client.name = name
             await db.flush()
+            if first_known_email:
+                await enroll_verified_signup(db, user, clerk_user)
             log.info(
                 "Backfilled identity for clerk_id=%s email=%s name=%r (was %r)",
                 clerk_id, email, name, old_name,

@@ -120,6 +120,7 @@ from app.routers import (
     google as google_router,
 )
 from app.routers import marketing_consent as marketing_consent_router
+from app.routers import marketing_permission_requests as marketing_permission_router
 from app.routers import (
     pipeline as pipeline_router,
 )
@@ -137,9 +138,11 @@ from app.routers import (
     webhooks as webhooks_router,
 )
 from app.server_errors import server_error_response
+from app.services.marketing_permission_logs import protect_permission_logs
 
 settings = get_settings()
 logging.basicConfig(level=settings.log_level)
+protect_permission_logs()
 log = logging.getLogger("qc")
 
 app = FastAPI(
@@ -363,6 +366,8 @@ for r in [
     secure_ssns_router.router,
     email_marketing_router.admin,
     email_marketing_router.public,
+    marketing_permission_router.admin,
+    marketing_permission_router.public,
     marketing_consent_router.router,
     intake.router,
     rates.router,

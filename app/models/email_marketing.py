@@ -70,3 +70,32 @@ class MarketingDelivery(Base):
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(16), default="queued")
     message_send_id: Mapped[UUID | None] = mapped_column(ForeignKey("message_sends.id", ondelete="SET NULL"))
+
+
+class MarketingPermissionBatch(Base):
+    __tablename__ = "email_marketing_permission_batches"
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    created_by: Mapped[UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    action: Mapped[str] = mapped_column(String(20))
+    task_count: Mapped[int] = mapped_column(Integer, default=0)
+    requested_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class MarketingPermissionRequest(Base):
+    __tablename__ = "email_marketing_permission_requests"
+    __table_args__ = (Index("ix_marketing_permission_due", "status", "due_at"),)
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    email: Mapped[str] = mapped_column(String(320), unique=True)
+    locale: Mapped[str] = mapped_column(String(2))
+    created_by: Mapped[UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    batch_id: Mapped[UUID] = mapped_column(ForeignKey("email_marketing_permission_batches.id"))
+    invite_batch_id: Mapped[UUID | None] = mapped_column(ForeignKey("email_marketing_permission_batches.id"))
+    status: Mapped[str] = mapped_column(String(16))
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    message_send_id: Mapped[UUID | None] = mapped_column(ForeignKey("message_sends.id", ondelete="SET NULL"))
+    task_event_id: Mapped[UUID | None] = mapped_column(ForeignKey("calendar_events.id", ondelete="SET NULL"))

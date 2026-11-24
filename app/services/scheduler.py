@@ -124,11 +124,21 @@ def start_scheduler() -> None:
     gmail_push_configured = bool(get_settings().gmail_pubsub_topic)
 
     from app.services.email_marketing_delivery import drain_pending as drain_email_marketing
+    from app.services.marketing_permission_delivery import drain_pending as drain_permission_requests
+    from app.services.marketing_permission_tasks import reconcile_tasks as reconcile_permission_tasks
     from app.services.resource_nurture import drain_pending as drain_resource_nurture
 
     scheduler.add_job(
         _wrap(drain_email_marketing), "interval", seconds=60,
         id="email_marketing", replace_existing=True, coalesce=True, max_instances=1,
+    )
+    scheduler.add_job(
+        _wrap(drain_permission_requests), "interval", seconds=60,
+        id="marketing_permission_delivery", replace_existing=True, coalesce=True, max_instances=1,
+    )
+    scheduler.add_job(
+        _wrap(reconcile_permission_tasks), "interval", minutes=15,
+        id="marketing_permission_tasks", replace_existing=True, coalesce=True, max_instances=1,
     )
 
     scheduler.add_job(

@@ -33,6 +33,7 @@ class SowLineItem(BaseModel):
 
 
 class PrequalRequestCreate(BaseModel):
+    email_marketing_consent: bool = Field(default=False, strict=True)
     target_property_address: str = Field(min_length=3, max_length=500)
     # For F&F this is the BRV (Before Repair Value — what the borrower
     # is paying for the as-is property). For DSCR it's the purchase

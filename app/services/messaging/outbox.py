@@ -31,6 +31,7 @@ from app.services.email.user_inbox_sync import _encrypt_body
 from app.services.messaging.redact import mask_all
 
 log = logging.getLogger(__name__)
+PERMISSION_REQUEST_CONTEXT = "marketing_permission"
 
 
 @dataclass
@@ -211,7 +212,13 @@ async def deliver_email(
     have one, falling back to firm SES — the existing `send_as_user` behaviour.
     Without it the message goes from the firm address.
     """
-    draft = draft.with_social_footer()
+    # Permission requests deliberately contain only the recipient's choice.
+    # The same context disables the firm transport's fallback signature.
+    if context == PERMISSION_REQUEST_CONTEXT:
+        if sender_user_id is not None or not draft.body_html:
+            raise ValueError("Permission invitations require the firm's HTML email transport.")
+    else:
+        draft = draft.with_social_footer()
     to = (draft.to or "").strip()
     if not to or "@" not in to:
         row = recorded_row
@@ -365,7 +372,9 @@ async def _send_ses(context: str, transport, **kwargs):
     # A resource campaign batch must not block the API event loop while the
     # synchronous SES SDK waits on the network. No session or ORM object enters
     # this thread; only the transport's plain email arguments do.
-    if context in {"resource_nurture", "email_marketing"}:
+    if context == PERMISSION_REQUEST_CONTEXT:
+        kwargs["include_social_footer"] = False
+    if context in {"resource_nurture", "email_marketing", PERMISSION_REQUEST_CONTEXT}:
         return await asyncio.to_thread(transport, **kwargs)
     return transport(**kwargs)
 
@@ -479,7 +488,9 @@ async def mark_delivery(
         # suppresses. A full mailbox is not a dead address. Resource nurture
         # is explicitly educational outreach too. Other client transactional
         # mail remains outside this outreach suppression rule.
-        outreach = row.prospect_id is not None or getattr(row, "context", "") in {"resource_nurture", "email_marketing"}
+        outreach = row.prospect_id is not None or getattr(row, "context", "") in {
+            "resource_nurture", "email_marketing", PERMISSION_REQUEST_CONTEXT,
+        }
         if outreach and row.to_email and _is_permanent(event, detail):
             from app.services.prospect_outreach import set_suppression
 

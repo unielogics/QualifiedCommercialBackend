@@ -141,6 +141,7 @@ def send_raw_email(
     source_name: str | None = None,
     reply_to: str | None = None,
     headers: dict[str, str] | None = None,
+    include_social_footer: bool = True,
 ) -> SesSendResult:
     """Send a MIME email through SES.
 
@@ -163,7 +164,8 @@ def send_raw_email(
         return SesSendResult(False, None, "bad recipients")
 
     try:
-        body_text, body_html = with_social_footer(body_text, body_html)
+        if include_social_footer:
+            body_text, body_html = with_social_footer(body_text, body_html)
         msg = EmailMessage()
         msg["From"] = formataddr(((source_name or "Qualified Commercial").strip(), from_addr))
         msg["To"] = ", ".join(recipients)
