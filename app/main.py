@@ -119,6 +119,7 @@ from app.routers import form_kinds as form_kinds_router
 from app.routers import (
     google as google_router,
 )
+from app.routers import marketing_consent as marketing_consent_router
 from app.routers import (
     pipeline as pipeline_router,
 )
@@ -362,6 +363,7 @@ for r in [
     secure_ssns_router.router,
     email_marketing_router.admin,
     email_marketing_router.public,
+    marketing_consent_router.router,
     intake.router,
     rates.router,
     regional_managers.router,
