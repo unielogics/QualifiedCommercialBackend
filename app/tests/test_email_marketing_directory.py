@@ -7,12 +7,14 @@ from sqlalchemy import func, select
 from app.dealer_os.models import DealerRepContact
 from app.models.activity import Activity
 from app.models.client import Client
+from app.models.dealer_prospect import DealerProspect, DealerProspectOutcomeDefinition
 from app.models.email_marketing import MarketingDelivery, MarketingSubscriber
 from app.models.funding_program import FundingProgramCatalog
 from app.models.prospect_outreach import EmailSuppression
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.schemas.email_marketing_audience import RecipientSelection
 from app.services import email_marketing as marketing
+from app.services import email_marketing_delivery as delivery
 from app.services import email_marketing_directory as directory
 from app.tests._sqlite_schema import sqlite_session, sqlite_template
 
@@ -93,3 +95,49 @@ async def test_file_filter_and_recipient_merge_never_identify_referrer_as_borrow
     sub.unsubscribed_at = datetime.now(UTC)
     await db.flush()
     assert (await browse(db))["rows"][0]["reason"] == "Unsubscribed"
+
+
+async def test_crm_funding_intent_and_disposition_follow_the_same_opportunity(db):
+    answered = DealerProspectOutcomeDefinition(key="reached", label="Spoke with owner")
+    missed = DealerProspectOutcomeDefinition(key="no_answer", label="No answer")
+    db.add_all([answered, missed])
+    await db.flush()
+    updates = []
+    for number, (email, intent, result) in enumerate([
+        ("owner@example.org", "working_capital", answered),
+        ("owner@example.org", "equipment", missed),
+        ("historical@example.org", "working_capital", answered),
+    ]):
+        contact = DealerRepContact(full_name="Example Owner", email=email)
+        db.add(contact)
+        await db.flush()
+        opportunity = DealerProspect(company_id=uuid4(), primary_contact_id=contact.id, stage_definition_id=uuid4(),
+            last_outcome_definition_id=result.id, funding_intent=intent, email_normalized=email,
+            phone_normalized=f"+1201555000{number}", dealer_name_normalized=f"store {number}")
+        db.add(opportunity)
+        updates.append(opportunity)
+    await marketing.enroll(db, email="owner@example.org", consent=True, source="support_inquiry")
+    sub = await db.scalar(select(MarketingSubscriber))
+    filters = marketing.AudienceFilters(program="working_capital", outcome="prospect:reached", source="database:crm_prospect")
+    options = await marketing.filter_options(db)
+    assert {"value": "prospect:reached", "label": "Prospect · Spoke with owner"} in options["outcomes"]
+    assert "working_capital" in {o["value"] for o in options["programs"]}
+    result = await browse(db, filters=filters, selection={"mode": "all"})
+    assert (result["total_count"], result["eligible_count"], result["selected_count"]) == (2, 1, 1)
+    assert list(await db.scalars(directory.selected_ids(filters, None))) == [sub.id]
+    for patch in [{"source": None}, {"source": None, "outcome": None}]:
+        assert list(await db.scalars(marketing.eligible_ids(filters.model_copy(update=patch)))) == [sub.id]
+    for patch in [{"program": "equipment"}, {"source": "support_inquiry"}, {"outcome": "prospect:no_answer"}]:
+        assert list(await db.scalars(marketing.eligible_ids(filters.model_copy(update=patch)))) == []
+
+    inputs = marketing.CampaignInput(id=uuid4(), name="Updates", subject="An update", body="News", filters=filters)
+    campaign = await marketing.create_campaign(db, uuid4(), inputs)
+    assert campaign["recipient_count"] == 1
+    updates[0].last_outcome_definition_id = missed.id
+    await db.commit()
+    job = await db.scalar(select(MarketingDelivery).where(MarketingDelivery.campaign_id == inputs.id))
+    # Earlier selection is frozen, but the recipient no longer matches at send time.
+    from unittest.mock import AsyncMock, patch
+    with patch.object(delivery, "_lock_suppression_addresses", new=AsyncMock()):
+        await delivery.dispatch_one(db, job.id, datetime.now(UTC))
+    assert job.status == "blocked"

@@ -200,6 +200,23 @@ async def test_selected_recipient_html_preview_and_scheduled_delivery(db, monkey
     assert await db.get(MarketingCampaign, past_request.id) is None
 
 
+async def test_fictional_preview_with_empty_directory_cannot_create_or_send(db):
+    template = {"subject": "Hola {{first_name}}", "body_html": "<p>{{full_name}} de {{business_name}}</p>",
+                "filters": {"locale": "es"}, "selection": {"mode": "explicit", "included_ids": []}}
+    # Passing no session proves this mode reads and writes no recipient data.
+    preview = await marketing.preview_campaign(None, marketing.CampaignPreview(**template, sample_mode="example"))
+    assert preview["sample_id"] is None and preview["eligible_count"] == 0
+    assert preview["sample_email"] == "taylor@example.invalid" and preview["subject"] == "Hola Taylor"
+    assert "Taylor Morgan de Example Company" in preview["body_html"] and "Cancelar suscripción" in preview["body_text"]
+    with pytest.raises(HTTPException, match="eligible recipient"):
+        await marketing.preview_campaign(db, marketing.CampaignPreview(**template))
+    with pytest.raises(ValidationError):
+        marketing.CampaignInput(**template, name="Sample newsletter", id=uuid4(), sample_mode="example")
+    with pytest.raises(HTTPException, match="No eligible"):
+        await marketing.create_campaign(db, uuid4(), marketing.CampaignInput(**template, name="Newsletter", id=uuid4()))
+    assert await db.scalar(select(MarketingDelivery.id)) is None
+
+
 def test_schedule_rejects_ambiguous_wall_times_and_converts_explicit_offset():
     fields = dict(id=uuid4(), name="Newsletter", subject="Update", body="Message", filters={})
     with pytest.raises(ValidationError):

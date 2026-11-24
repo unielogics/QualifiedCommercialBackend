@@ -90,6 +90,7 @@ class CampaignInput(CampaignMessage):
 
 class CampaignPreview(CampaignMessage):
     sample_id: UUID | None = None
+    sample_mode: Literal["recipient", "example"] = "recipient"
 
 
 async def queue_step(db, subscriber_id: UUID, step: int, due_at: datetime):
@@ -168,6 +169,15 @@ def matching_subscribers(filters: AudienceFilters):
         query = query.where(subscriber.email.in_(origin_addresses(filters.source)))
     elif filters.source:
         contexts = contexts.where(capture.source == filters.source)
+    prospect_match = None
+    if (filters.program or filters.outcome) and filters.source in (None, "database:crm_prospect"):
+        from app.services.email_marketing_directory import prospect_addresses
+
+        scoped_to_prospect = filters.source == "database:crm_prospect" or (filters.outcome or "").startswith("prospect:")
+        if scoped_to_prospect or not filters.outcome:
+            prospect_match = and_(contexts.exists(), subscriber.email.in_(prospect_addresses(filters)))
+        if scoped_to_prospect:
+            return query.where(prospect_match)
     if filters.program or filters.outcome:
         # Compare an outcome and a selected program on the same application.
         # Address-only form captures may acquire a funding application later.
@@ -195,7 +205,7 @@ def matching_subscribers(filters: AudienceFilters):
                     else_=func.coalesce(intake.variant, capture.program),
                 ) == filters.program),
             ))
-    return query.where(contexts.exists())
+    return query.where(or_(contexts.exists(), prospect_match) if prospect_match is not None else contexts.exists())
 
 
 def unsubscribe_token(subscriber_id: UUID):
@@ -249,8 +259,12 @@ async def filter_options(db):
     outcomes = labels([*await values(PublicUnderwritingIntake.outcome_status), *await values(MarketingEnrollment.outcome)])
     outcomes.extend({"value": f"file:{item['value']}", "label": "File · " + item["label"]}
                     for item in labels(await values(ApplicationProfile.underwriting_status)))
-    from app.services.email_marketing_directory import ORIGINS
+    from app.services.email_marketing_directory import ORIGINS, prospect_options
 
+    intents, dispositions = await prospect_options(db)
+    for intent in intents:
+        programs.setdefault(intent, "Prospect intent · " + intent.replace("_", " ").title())
+    outcomes.extend(dispositions)
     sources = labels(await values(MarketingEnrollment.source))
     sources.extend({"value": "database:" + code, "label": "Directory · " + name} for code, name in ORIGINS.items())
     return {"programs": [{"value": k, "label": v} for k, v in sorted(programs.items(), key=lambda i: i[1])],
@@ -262,24 +276,34 @@ async def preview_campaign(db, payload: CampaignPreview):
     from app.config import get_settings
     from app.services.email_marketing_directory import recipient_context, selected_ids
 
-    recipients = selected_ids(payload.filters, payload.selection).subquery()
-    count = await db.scalar(select(func.count()).select_from(recipients))
-    if not count:
-        raise HTTPException(422, "Select at least one eligible recipient to preview.")
-    query = select(MarketingSubscriber).join(recipients, recipients.c.id == MarketingSubscriber.id)
-    if payload.sample_id is not None:
-        query = query.where(MarketingSubscriber.id == payload.sample_id)
-    sample = await db.scalar(query.order_by(MarketingSubscriber.email, MarketingSubscriber.id).limit(1))
-    if sample is None:
-        raise HTTPException(422, "This preview recipient is outside the current selection.")
-    context = await recipient_context(db, sample.id, program_key=payload.filters.program)
+    if payload.sample_mode == "example":
+        if payload.sample_id is not None:
+            raise HTTPException(422, "Choose an example preview or a selected recipient.")
+        count, sample_id, email = 0, None, "taylor@example.invalid"
+        locale = payload.filters.locale or "en"
+        context = {"first_name": "Taylor", "last_name": "Morgan", "full_name": "Taylor Morgan",
+                   "business_name": "Example Company", "email": email,
+                   "program": "Financiamiento comercial" if locale == "es" else "Business financing"}
+    else:
+        recipients = selected_ids(payload.filters, payload.selection).subquery()
+        count = await db.scalar(select(func.count()).select_from(recipients))
+        if not count:
+            raise HTTPException(422, "Select at least one eligible recipient to preview.")
+        query = select(MarketingSubscriber).join(recipients, recipients.c.id == MarketingSubscriber.id)
+        if payload.sample_id is not None:
+            query = query.where(MarketingSubscriber.id == payload.sample_id)
+        sample = await db.scalar(query.order_by(MarketingSubscriber.email, MarketingSubscriber.id).limit(1))
+        if sample is None:
+            raise HTTPException(422, "This preview recipient is outside the current selection.")
+        context = await recipient_context(db, sample.id, program_key=payload.filters.program)
+        sample_id, email, locale = sample.id, sample.email, sample.locale
     rendered = marketing_content.render_message(
         subject=payload.subject, body=payload.body, body_html=payload.body_html, values=context,
-        locale=sample.locale, mailing_address=get_settings().prospect_mailing_address.strip(),
+        locale=locale, mailing_address=get_settings().prospect_mailing_address.strip(),
         unsubscribe_url="https://example.invalid/unsubscribe-preview",
     )
     return {"subject": rendered.subject, "body_text": rendered.body_text, "body_html": rendered.body_html,
-            "eligible_count": count, "sample_id": sample.id, "sample_email": sample.email}
+            "eligible_count": count, "sample_id": sample_id, "sample_email": email}
 
 
 async def create_campaign(db, actor_id, payload: CampaignInput):

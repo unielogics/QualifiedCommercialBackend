@@ -79,7 +79,7 @@ def _origins(*, filter_files=False):
                                                ApplicationProgramSelection.removed_at.is_(None)))
     prospects = _record(p.email_normalized, case((func.lower(func.trim(rep.email)) == p.email_normalized, rep.full_name)),
                         p.dealer_name_normalized, "crm_prospect", 30, program=p.funding_intent,
-                        outcome=DealerProspectOutcomeDefinition.key if filter_files else None
+                        outcome=(literal("prospect:") + DealerProspectOutcomeDefinition.key) if filter_files else None
                         ).select_from(p).outerjoin(rep, rep.id == p.primary_contact_id).where(
                             p.archived_at.is_(None), rep.archived_at.is_(None))
     if filter_files:
@@ -116,6 +116,24 @@ def origin_addresses(source):
     if stmt is None:
         return select(literal(None, String())).where(false())
     return select(stmt.subquery().c.email)
+
+
+def prospect_addresses(filters):
+    """Apply the whole intent/outcome pair to a single active opportunity."""
+    rows = _origins(filter_files=True)["crm_prospect"].subquery()
+    # Language belongs to the subscribing person, not their prospect row.
+    return _raw_matches(rows, filters.model_copy(update={"locale": None}))
+
+
+async def prospect_options(db):
+    prospect = DealerProspect
+    outcome = DealerProspectOutcomeDefinition
+    intents = await db.scalars(select(prospect.funding_intent).distinct().where(
+        prospect.archived_at.is_(None), prospect.funding_intent.is_not(None)))
+    dispositions = await db.execute(select(outcome.key, outcome.label).where(or_(
+        outcome.is_active.is_(True), outcome.id.in_(select(prospect.last_outcome_definition_id)
+            .where(prospect.archived_at.is_(None))))).order_by(outcome.sort_order, outcome.key))
+    return list(intents), [{"value": "prospect:" + key, "label": "Prospect · " + label} for key, label in dispositions]
 
 
 def _identities(*, filter_files=False):
@@ -170,8 +188,10 @@ def _raw_matches(raw, filters):
     if filters.program:
         query = query.where(raw.c.program == filters.program)
     if filters.outcome:
-        query = query.where(raw.c.stage == filters.outcome[5:] if filters.outcome.startswith("file:")
-                            else raw.c.outcome == filters.outcome)
+        outcome = filters.outcome
+        if filters.source == "database:crm_prospect" and ":" not in outcome:
+            outcome = "prospect:" + outcome
+        query = query.where(raw.c.stage == outcome[5:] if outcome.startswith("file:") else raw.c.outcome == outcome)
     if filters.locale:
         query = query.where(raw.c.locale == filters.locale)
     return query
