@@ -413,6 +413,10 @@ def _scope_calendar_for_audience(user: User, stmt: Select) -> Select:
     instead of scattered across endpoints."""
     if user.role == Role.SUPER_ADMIN:
         return stmt
+    # Permission review is restricted to marketing administrators, even for
+    # roles that can see firm-wide loan and appointment events.
+    stmt = stmt.where(or_(CalendarEvent.external_ref_kind.is_(None),
+                          CalendarEvent.external_ref_kind.not_in(("marketing_permission", "marketing_permission_review"))))
     if user.role == Role.CLIENT:
         if user.client is None:
             # Borrower with no client record can never see anyone else's

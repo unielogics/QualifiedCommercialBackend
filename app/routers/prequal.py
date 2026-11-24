@@ -409,6 +409,14 @@ async def _create_request(
         )
     await db.flush()
     await db.refresh(req)
+    if user.role == Role.CLIENT and payload.email_marketing_consent:
+        from app.services.email_marketing import enroll
+
+        await enroll(
+            db, email=user.email, consent=True, source="borrower_prequalification", program=payload.loan_type,
+            outcome="prequalification_requested", locale=user.ui_locale or "en",
+            client_id=user.client.id if user.client else None,
+        )
     return req
 
 

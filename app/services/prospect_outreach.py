@@ -2385,6 +2385,7 @@ async def set_suppression(
     await db.execute(
         select(DealerProspect.id)
         .where(DealerProspect.email_normalized == normalized)
+        .order_by(DealerProspect.id)
         .with_for_update()
     )
     await _lock_suppression_addresses(db, [normalized])

@@ -9,7 +9,7 @@ from uuid import UUID, uuid4, uuid5
 
 from fastapi import HTTPException
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import Uuid, and_, case, exists, func, insert, literal, or_, select
+from sqlalchemy import Uuid, and_, case, func, insert, literal, or_, select, union_all
 from sqlalchemy.dialects.postgresql import insert as upsert
 
 from app.models.application_profile import ApplicationProfile, ApplicationProgramSelection
@@ -134,19 +134,30 @@ def intake_owner_email():
     )), else_=intake.email)))
 
 
-def contact_hold_reason(address):
+def contact_restrictions():
+    """One searchable address/reason stream shared by the directory and live send guards."""
+    from app.models.email_marketing import MarketingPermissionRequest
+
+    def entry(address, priority, reason):
+        return select(address.label("email"), literal(priority).label("priority"), reason.label("reason"))
+
     intake = PublicUnderwritingIntake
-    suppression = select(EmailSuppression.reason).where(EmailSuppression.email_normalized == address,
-        EmailSuppression.active.is_(True)).correlate_except(EmailSuppression).scalar_subquery()
-    return case(
-        (suppression.is_not(None), literal("Email suppression: ") + suppression),
-        (exists().where(DealerProspect.email_normalized == address, DealerProspect.do_not_contact.is_(True))
-         .correlate_except(DealerProspect), "Prospect marked do not contact"),
-        (exists().where(func.lower(func.trim(Client.email)) == address, Client.contact_permission == NO_DIRECT_CONTACT)
-         .correlate_except(Client), "Client contact hold"),
-        (exists().where(intake_owner_email() == address, intake.client_contact_suppressed.is_(True))
-         .correlate_except(intake), "Borrower contact hold"),
-    )
+    return union_all(
+        entry(EmailSuppression.email_normalized, 1, literal("Email suppression: ") + EmailSuppression.reason)
+            .where(EmailSuppression.active.is_(True)),
+        entry(MarketingPermissionRequest.email, 2, literal("Permission request declined"))
+            .where(MarketingPermissionRequest.status == "declined"),
+        entry(DealerProspect.email_normalized, 3, literal("Prospect marked do not contact"))
+            .where(DealerProspect.do_not_contact.is_(True)),
+        entry(func.lower(func.trim(Client.email)), 4, literal("Client contact hold"))
+            .where(Client.contact_permission == NO_DIRECT_CONTACT),
+        entry(intake_owner_email(), 5, literal("Borrower contact hold")).where(intake.client_contact_suppressed.is_(True)),
+    ).subquery()
+
+
+def contact_hold_reason(address):
+    holds = contact_restrictions()
+    return select(holds.c.reason).where(holds.c.email == address).order_by(holds.c.priority).limit(1).scalar_subquery()
 
 
 def eligible_ids(filters: AudienceFilters):
@@ -154,30 +165,42 @@ def eligible_ids(filters: AudienceFilters):
                                                contact_hold_reason(MarketingSubscriber.email).is_(None))
 
 
-def matching_subscribers(filters: AudienceFilters):
-    subscriber = MarketingSubscriber
-    intake = PublicUnderwritingIntake
-    owner_email = intake_owner_email()
+def matching_subscribers(filters: AudienceFilters, *, directory_rows=None):
+    from app.services.email_marketing_directory import PUBLIC_FORMS, _raw_matches, scoped_forms
+
+    subscriber, capture, intake = MarketingSubscriber, MarketingEnrollment, PublicUnderwritingIntake
     query = select(subscriber.id)
-    if filters.locale:
-        query = query.where(subscriber.locale == filters.locale)
-    capture = MarketingEnrollment
     contexts = select(capture.id).where(capture.subscriber_id == subscriber.id).correlate(subscriber)
-    if filters.source and filters.source.startswith("database:"):
-        from app.services.email_marketing_directory import origin_addresses
-
-        query = query.where(subscriber.email.in_(origin_addresses(filters.source)))
-    elif filters.source:
+    any_grant = contexts.exists()
+    directory_source = (filters.source or "").startswith("database:")
+    factual_form = filters.source in PUBLIC_FORMS
+    dimensions = bool(filters.program or filters.outcome)
+    observed = None
+    if directory_source or factual_form or (not filters.source and dimensions):
+        raw = directory_rows if directory_rows is not None else scoped_forms(filters)
+        if raw is None:
+            return query.where(False)
+        observed = subscriber.email.in_(_raw_matches(raw, filters, subscriber_locale=subscriber.locale).correlate(subscriber))
+        if directory_source:
+            return query.where(any_grant, observed)
+        if factual_form:
+            # A durable application carries the current file status. For forms
+            # without a surviving record, use only that form's captured values.
+            recorded = contexts.where(capture.source == filters.source)
+            if filters.program:
+                recorded = recorded.where(capture.program == filters.program)
+            if filters.outcome:
+                recorded = recorded.where(capture.outcome == filters.outcome)
+            fallback = recorded.exists()
+            if filters.locale:
+                fallback = and_(fallback, subscriber.locale == filters.locale)
+            if dimensions:
+                form = select(raw.c.email).where(raw.c.form_source == filters.source)
+                fallback = and_(fallback, subscriber.email.not_in(form.where(raw.c.email.is_not(None))))
+            return query.where(any_grant, or_(observed, fallback))
+    if filters.source:
         contexts = contexts.where(capture.source == filters.source)
-    prospect_match = None
-    if (filters.program or filters.outcome) and filters.source in (None, "database:crm_prospect"):
-        from app.services.email_marketing_directory import prospect_addresses
-
-        scoped_to_prospect = filters.source == "database:crm_prospect" or (filters.outcome or "").startswith("prospect:")
-        if scoped_to_prospect or not filters.outcome:
-            prospect_match = and_(contexts.exists(), subscriber.email.in_(prospect_addresses(filters)))
-        if scoped_to_prospect:
-            return query.where(prospect_match)
+    owner_email = intake_owner_email()
     if filters.program or filters.outcome:
         # Compare an outcome and a selected program on the same application.
         # Address-only form captures may acquire a funding application later.
@@ -205,7 +228,10 @@ def matching_subscribers(filters: AudienceFilters):
                     else_=func.coalesce(intake.variant, capture.program),
                 ) == filters.program),
             ))
-    return query.where(or_(contexts.exists(), prospect_match) if prospect_match is not None else contexts.exists())
+    matched = contexts.exists()
+    if filters.locale:
+        matched = and_(subscriber.locale == filters.locale, matched)
+    return query.where(or_(matched, and_(any_grant, observed)) if observed is not None else matched)
 
 
 def unsubscribe_token(subscriber_id: UUID):
@@ -249,23 +275,25 @@ async def filter_options(db):
     def labels(values):
         return [{"value": val, "label": val.replace("_", " ").title()} for val in sorted(set(values))]
 
+    from app.services.email_marketing_directory import ORIGINS, observed_options, prospect_options
+
+    forms, observed_programs, observed_outcomes = await observed_options(db)
     programs = {p: p.replace("_", " ").title() for p in
-                [*await values(MarketingEnrollment.program), *await values(PublicUnderwritingIntake.variant)]}
+                [*await values(MarketingEnrollment.program), *await values(PublicUnderwritingIntake.variant), *observed_programs]}
     programs.update(dict((await db.execute(select(
         ApplicationProgramSelection.program_key, ApplicationProgramSelection.program_name,
     ).where(ApplicationProgramSelection.removed_at.is_(None)).distinct())).all()))
     programs.update(dict((await db.execute(select(FundingProgramCatalog.program_key, FundingProgramCatalog.name)
                                           .where(FundingProgramCatalog.status == "active"))).all()))
-    outcomes = labels([*await values(PublicUnderwritingIntake.outcome_status), *await values(MarketingEnrollment.outcome)])
+    outcomes = labels([*await values(PublicUnderwritingIntake.outcome_status), *await values(MarketingEnrollment.outcome),
+                       *observed_outcomes])
     outcomes.extend({"value": f"file:{item['value']}", "label": "File · " + item["label"]}
                     for item in labels(await values(ApplicationProfile.underwriting_status)))
-    from app.services.email_marketing_directory import ORIGINS, prospect_options
-
     intents, dispositions = await prospect_options(db)
     for intent in intents:
         programs.setdefault(intent, "Prospect intent · " + intent.replace("_", " ").title())
     outcomes.extend(dispositions)
-    sources = labels(await values(MarketingEnrollment.source))
+    sources = labels([*await values(MarketingEnrollment.source), *forms])
     sources.extend({"value": "database:" + code, "label": "Directory · " + name} for code, name in ORIGINS.items())
     return {"programs": [{"value": k, "label": v} for k, v in sorted(programs.items(), key=lambda i: i[1])],
             "outcomes": outcomes, "sources": sources,
@@ -337,6 +365,8 @@ async def create_campaign(db, actor_id, payload: CampaignInput):
         existing = await db.get(MarketingCampaign, payload.id)
         existing_values = {field: getattr(existing, field) for field in values}
         existing_values["scheduled_at"] = _utc_instant(existing.scheduled_at)
+        if existing.selection is not None:
+            existing_values["selection"] = RecipientSelection.model_validate(existing.selection).model_dump(mode="json")
         if existing.created_by != actor_id or existing_values != values:
             raise HTTPException(409, "This campaign identifier has already been used.")
     return (await list_campaigns(db, campaign_id=payload.id))[0]
