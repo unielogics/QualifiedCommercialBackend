@@ -41,6 +41,7 @@ from sqlalchemy.orm import selectinload, with_loader_criteria
 
 from app.config import get_settings
 from app.db import get_db  # noqa: F401  (handlers reach this through core)
+from app.dealer_os.models import DealerBusiness
 from app.dealer_os.services import client_room, consent_delivery
 from app.deps import CurrentUser  # noqa: F401  (handlers reach this through core)
 from app.enums import (
@@ -49,6 +50,7 @@ from app.enums import (
     CalendarEventStatus,  # noqa: F401  (handlers reach this through core)
     ContractType,
     Language,  # noqa: F401  (handlers reach this through core)
+    LoanStage,
     Role,  # noqa: F401  (handlers reach this through core)
 )
 from app.lead_types import (
@@ -83,7 +85,9 @@ from app.models.dealer_intake_login import (
     DealerIntakeLoginChallenge,  # noqa: F401  (handlers reach this through core)
 )
 from app.models.event import CalendarEvent  # noqa: F401  (handlers reach this through core)
+from app.models.loan import Loan
 from app.models.notification import Notification
+from app.models.payments import ActualFundingConfirmation
 from app.models.public_underwriting_intake import (
     PublicUnderwritingIntake,  # noqa: F401  (handlers reach this through core)
     PublicUnderwritingIntakeArtifact,
@@ -1969,8 +1973,9 @@ class DealerAILeadRow(BaseModel):
     # itself be presented as proof that a deal funded.
     underwriting_status: str | None = None
     # ``closed`` is a lifecycle result and retains evidence access;
+    # ``funded`` is the staff Files table's successful-deals queue;
     # ``archived`` is an explicit operator archive and may be restored.
-    workspace_state: Literal["active", "closed", "archived"] = "active"
+    workspace_state: Literal["active", "closed", "archived", "funded"] = "active"
     workspace_state_reason: str | None = None
     preferred_language: str = "en"
     probability_status: str | None = None
@@ -9073,6 +9078,7 @@ def _lead_row(
     *,
     underwriting_status: str | None = None,
     effective_profile_hold: bool = False,
+    funded: bool = False,
 ) -> DealerAILeadRow:
     result = _lead_result(intake)
     workspace_state, workspace_state_reason = intake_lifecycle.intake_workspace_state(
@@ -9082,6 +9088,7 @@ def _lead_row(
         foreclosure_status=intake.foreclosure_rescue_status,
         underwriting_status=underwriting_status,
     )
+    in_funded_queue = funded and workspace_state != "archived"
     active_files = [
         file
         for file in _active_files(intake.bucket)
@@ -9106,8 +9113,8 @@ def _lead_row(
         status=intake.status,
         outcome_status=intake.outcome_status,
         underwriting_status=underwriting_status,
-        workspace_state=workspace_state,
-        workspace_state_reason=workspace_state_reason,
+        workspace_state="funded" if in_funded_queue else workspace_state,
+        workspace_state_reason="funded" if in_funded_queue else workspace_state_reason,
         preferred_language=intake.preferred_language,
         probability_status=str(result.get("probability_status") or "") or None,
         confidence=str(result.get("confidence") or "") or None,
@@ -9192,41 +9199,91 @@ def _intake_search_clause(query: str):
     return or_(*clauses)
 
 
-def _closed_intake_lifecycle_clause():
-    """SQL counterpart to ``intake_workspace_state`` for queue pagination.
-
-    A lifecycle-closed file belongs in the archive/closed queue but its bucket
-    remains unarchived so reviewers can still inspect and download evidence.
-    The correlated profile check also repairs visibility for older rows whose
-    canonical underwriting status changed before intake mirroring existed.
-    """
-
-    def profile_has_status(*values: str):
-        return (
-            select(ApplicationProfile.id)
-            .where(
-                ApplicationProfile.intake_id == PublicUnderwritingIntake.id,
-                ApplicationProfile.underwriting_status.in_(values),
-            )
-            .exists()
+def _intake_profile_status_clause(*values: str):
+    return (
+        select(ApplicationProfile.id)
+        .where(
+            ApplicationProfile.intake_id == PublicUnderwritingIntake.id,
+            ApplicationProfile.underwriting_status.in_(values),
         )
+        .exists()
+    )
 
-    foreclosure_status = func.coalesce(
-        PublicUnderwritingIntake.foreclosure_rescue_status, ""
+
+def _intake_funded_clause():
+    return or_(
+        _intake_profile_status_clause("closed_won"),
+        func.coalesce(PublicUnderwritingIntake.foreclosure_rescue_status, "") == "funded",
     )
-    canonical_funded = or_(
-        profile_has_status("closed_won"),
-        foreclosure_status == "funded",
+
+
+def _staff_file_funded_clause():
+    # Mark Funded on the loan changes its stage independently of underwriting.
+    # Follow only recorded file links, since a client can have other loans.
+    intake_loan_funded = (
+        select(Loan.id)
+        .where(
+            Loan.stage == LoanStage.FUNDED,
+            or_(
+                Loan.source_intake_id == PublicUnderwritingIntake.id,
+                Loan.id == PublicUnderwritingIntake.promoted_loan_id,
+            ),
+        )
+        .exists()
     )
-    closed_lifecycle = or_(
-        profile_has_status(*intake_lifecycle.TERMINAL_UNDERWRITING_STATUSES),
-        foreclosure_status.in_(intake_lifecycle.TERMINAL_FORECLOSURE_STATUSES),
+    profile_loan_funded = (
+        select(ApplicationProfile.id)
+        .join(Loan, Loan.id == ApplicationProfile.loan_id)
+        .where(ApplicationProfile.intake_id == PublicUnderwritingIntake.id, Loan.stage == LoanStage.FUNDED)
+        .exists()
+    )
+    confirmed_funding = (
+        select(ApplicationProfile.id)
+        .join(ActualFundingConfirmation, ActualFundingConfirmation.application_profile_id == ApplicationProfile.id)
+        .where(
+            ApplicationProfile.intake_id == PublicUnderwritingIntake.id,
+            ActualFundingConfirmation.superseded_at.is_(None),
+        )
+        .exists()
+    )
+    # Dealer finalization uses "complete" plus the actual amount. The recorded
+    # handoff wins over an older profile link if the intake was replaced.
+    dealer_finalized = (
+        select(DealerBusiness.id)
+        .outerjoin(ApplicationProfile, ApplicationProfile.dealer_id == DealerBusiness.id)
+        .where(
+            DealerBusiness.status == "complete",
+            DealerBusiness.funded_amount > 0,
+            or_(
+                DealerBusiness.handoff_intake_id == PublicUnderwritingIntake.id,
+                and_(DealerBusiness.handoff_intake_id.is_(None), ApplicationProfile.intake_id == PublicUnderwritingIntake.id),
+            ),
+        )
+        .exists()
+    )
+    return or_(_intake_funded_clause(), intake_loan_funded, profile_loan_funded, confirmed_funding, dealer_finalized)
+
+
+def _terminal_intake_clause():
+    return or_(
+        _intake_profile_status_clause(*intake_lifecycle.TERMINAL_UNDERWRITING_STATUSES),
+        func.coalesce(PublicUnderwritingIntake.foreclosure_rescue_status, "").in_(
+            intake_lifecycle.TERMINAL_FORECLOSURE_STATUSES
+        ),
         PublicUnderwritingIntake.status.in_(intake_lifecycle.TERMINAL_INTAKE_STATUSES),
         PublicUnderwritingIntake.outcome_status.in_(
             intake_lifecycle.TERMINAL_OUTCOME_STATUSES
         ),
     )
-    return and_(~canonical_funded, closed_lifecycle)
+
+
+def _closed_intake_lifecycle_clause():
+    """SQL counterpart to intake_workspace_state for existing partner and room workflows."""
+    return and_(~_intake_funded_clause(), _terminal_intake_clause())
+
+
+def _active_staff_file_clause():
+    return and_(Bucket.archived_at.is_(None), ~_terminal_intake_clause(), ~_staff_file_funded_clause())
 
 
 def _intake_status_filter_clause(status_filter: str):
@@ -9234,48 +9291,30 @@ def _intake_status_filter_clause(status_filter: str):
 
     normalized = status_filter.strip().lower()
 
-    def profile_status(*values: str):
-        return (
-            select(ApplicationProfile.id)
-            .where(
-                ApplicationProfile.intake_id == PublicUnderwritingIntake.id,
-                ApplicationProfile.underwriting_status.in_(values),
-            )
-            .exists()
-        )
     if normalized in {"denied", "disqualified"}:
         return or_(
             PublicUnderwritingIntake.status.in_(("denied", "disqualified")),
             PublicUnderwritingIntake.outcome_status.in_(("denied", "disqualified")),
             func.coalesce(PublicUnderwritingIntake.foreclosure_rescue_status, "")
             == "declined",
-            profile_status("denied"),
+            _intake_profile_status_clause("denied"),
         )
     if normalized in {"closed_lost", "lost", "withdrawn", "withdrawn_expired"}:
         return or_(
             PublicUnderwritingIntake.status.in_(("closed", "closed_lost")),
             func.coalesce(PublicUnderwritingIntake.foreclosure_rescue_status, "")
             == "withdrawn_expired",
-            profile_status("closed_lost"),
+            _intake_profile_status_clause("closed_lost"),
         )
     if normalized in {"closed_won", "funded"}:
-        return or_(
-            func.coalesce(PublicUnderwritingIntake.foreclosure_rescue_status, "")
-            == "funded",
-            profile_status("closed_won"),
-        )
+        return _intake_funded_clause()
     if normalized == "completed":
         # Legacy ``completed`` also carried funded rows.  The UI exposes a
         # dedicated Funded filter now, so Review complete must exclude records
         # whose canonical lifecycle proves funding.
-        canonical_funded = or_(
-            func.coalesce(PublicUnderwritingIntake.foreclosure_rescue_status, "")
-            == "funded",
-            profile_status("closed_won"),
-        )
         return and_(
             PublicUnderwritingIntake.status == "completed",
-            ~canonical_funded,
+            ~_intake_funded_clause(),
         )
     return PublicUnderwritingIntake.status == status_filter
 
