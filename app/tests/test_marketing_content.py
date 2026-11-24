@@ -91,6 +91,13 @@ def test_exported_responsive_newsletter_preserves_its_own_layout():
     assert result.body_text.count("mso") == 0 and 'Follow Qualified Commercial' in markup
 
 
+def test_newsletter_conditional_comments_do_not_trigger_declaration_validation():
+    template = ('<!DOCTYPE html><!--[if mso]><table><tr><td><![endif]-->'
+                '<p>Visible newsletter</p><!-- sample: <![BOGUS]> -->')
+    result = render_message(subject="News", body="", body_html=template, **ENVELOPE)
+    assert "Visible newsletter" in result.body_html and "BOGUS" not in result.body_html
+
+
 @pytest.mark.parametrize("style", [
     "@import url(https://example.test/foreign.css);",
     ".a{background-image:url(javascript:bad)}",

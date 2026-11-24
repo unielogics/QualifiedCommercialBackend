@@ -15,6 +15,10 @@ from app.services.email.social_footer import with_social_footer
 
 MERGE_FIELDS = ("first_name", "last_name", "full_name", "business_name", "email", "program")
 _TOKEN = re.compile(r"\{\{\s*([a-z_]+)\s*\}\}")
+# Some Python releases treat an unknown <![section]> as a comment, while
+# others raise before invoking a parser callback. Inspect declarations in
+# source order, skipping ordinary HTML comments (including Outlook markup).
+_DECLARATIONS = re.compile(r"<!--.*?(?:--!?>|\Z)|<!\[([^\]\s>]+)", re.DOTALL)
 _TAGS = set("p br hr div span center header footer main section article figure figcaption address font h1 h2 h3 h4 h5 h6 strong b em i u s small sub sup a img ul ol li blockquote table thead tbody tfoot tr td th caption".split())
 _BLOCKS = set("p div center h1 h2 h3 h4 h5 h6 blockquote ul ol table caption".split())
 _VOID = {"br", "hr", "img"}
@@ -270,6 +274,10 @@ class _Fragment(HTMLParser):
             self.plain.append(re.sub(r"\s+", " ", value))
 
     def render(self, source: str) -> tuple[str, str]:
+        for declaration in _DECLARATIONS.finditer(source):
+            name = declaration[1]
+            if name and name.lower() not in {"if", "else", "endif", "cdata"}:
+                raise ValueError("Remove the invalid HTML declaration from the template.")
         try:
             self.feed(source)
             self.close()
