@@ -431,7 +431,7 @@ async def test_a_takeover_reply_is_told_to_the_client_once_the_push_already_reac
 
 async def _reply(thread_id, user, *, audit_client=False):
     intake = SimpleNamespace(id=uuid.uuid4(), bucket_id=uuid.uuid4(), bucket_upload_link_id=None, last_message_at=None, preferred_language=None)
-    bucket = SimpleNamespace(id=intake.bucket_id)
+    bucket = SimpleNamespace(id=intake.bucket_id, archived_at=None)
 
     def get(model, key):
         return intake if model is comms_router.PublicUnderwritingIntake else bucket
