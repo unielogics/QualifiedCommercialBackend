@@ -678,6 +678,7 @@ class BucketNote(TimestampMixin, Base):
     author_role: Mapped[str] = mapped_column(String(40), nullable=False)
     visibility: Mapped[str] = mapped_column(String(24), nullable=False, default="admin", server_default="admin")
     channel: Mapped[str] = mapped_column(String(16), nullable=False, default="partner", server_default="partner")
+    include_in_ai_context: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
     bucket: Mapped[Bucket] = relationship(back_populates="notes")

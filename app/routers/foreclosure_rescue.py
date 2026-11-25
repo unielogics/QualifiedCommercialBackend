@@ -335,7 +335,7 @@ def _read(intake: PublicUnderwritingIntake) -> ForeclosureRescueRead:
     messages = [
         ProfessionalMessageRead(id=row.id, author_name=row.author_name, content=row.content, created_at=row.created_at)
         for row in sorted(intake.bucket.notes, key=lambda note: note.created_at)
-        if row.visibility == "shared"
+        if row.visibility == "shared" and getattr(row, "channel", None) != "internal"
     ]
     status_key = intake.foreclosure_rescue_status or "new_rescue"
     return ForeclosureRescueRead(

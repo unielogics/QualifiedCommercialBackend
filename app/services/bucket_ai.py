@@ -48,6 +48,7 @@ from app.models.user import User
 from app.services import (
     bank_transactions_export,
     funding_requests,
+    internal_note_ai,
     mca_funding_policy,
     mca_funding_prompts,
     mca_refinance_policy,
@@ -4886,7 +4887,11 @@ async def create_chat_reply(
         share=share,
         vendor_access=vendor_access,
         intake_id=intake_id,
+        user=user,
     )
+    private_context = context.get("internal_note_context")
+    note_fingerprint = private_context["fingerprint"] if private_context else internal_note_ai.PUBLIC_FINGERPRINT
+    user_row.metadata_json = {"internal_note_context_fingerprint": note_fingerprint}
     review_type = (bucket.ai_context or {}).get("review_type")
     model = model_light()
 
@@ -4905,6 +4910,7 @@ async def create_chat_reply(
         thread_user_id=user.id if user else None,
         exclude_id=user_row.id,
     )
+    history = internal_note_ai.current_history(history, private_context)
     convo = _thread_turns_for_model(history)
     chat_messages_arg: list[dict[str, str]] = [
         {"role": "user", "content": json.dumps({"context": context}, default=str)}
@@ -4943,7 +4949,8 @@ async def create_chat_reply(
                 audience=audience,
                 funding_intent=_funding_intent(bucket.ai_context),
             )
-            + (ADMIN_LOOKUP_FLOOR if admin_lookup else ""),
+            + (ADMIN_LOOKUP_FLOOR if admin_lookup else "")
+            + ("\n" + internal_note_ai.NOTE_RULE if private_context and private_context.get("notes") else ""),
             messages=chat_messages_arg,
         )
         raw_text = _text_from_response(resp)
@@ -4955,6 +4962,14 @@ async def create_chat_reply(
             parsed["proposed_action_items"] = []
             parsed["proposed_context_patch"] = None
             parsed["proposed_borrower_facts"] = None
+        if private_context and private_context.get("notes"):
+            # Staff observations can help an internal answer, but must never
+            # become verified borrower facts, shared context or external tasks.
+            parsed["proposed_context_patch"] = None
+            parsed["proposed_borrower_facts"] = None
+            # Legacy partner clients can read the bucket's admin task route;
+            # even an admin-only proposal would persist private note content.
+            parsed["proposed_action_items"] = []
         # Never surface raw JSON scaffolding: prefer the parsed answer, then a
         # targeted answer-string extraction, and only then the raw text if it does
         # not itself look like a JSON object.
@@ -4980,7 +4995,7 @@ async def create_chat_reply(
             proposed_context_patch=json_safe_metadata(patch),
             provider="bedrock",
             model=getattr(resp, "model", None) or model,
-            metadata_json=json_safe_metadata({"raw": parsed}),
+            metadata_json=json_safe_metadata({"raw": parsed, "internal_note_context_fingerprint": note_fingerprint}),
         )
         db.add(assistant)
         await db.flush()
@@ -5021,6 +5036,7 @@ async def create_chat_reply(
             role="assistant",
             author_name="Bucket AI",
             content=f"AI is unavailable right now: {exc}",
+            metadata_json={"internal_note_context_fingerprint": note_fingerprint},
         )
         db.add(assistant)
         await db.flush()
@@ -5358,6 +5374,7 @@ async def _chat_context(
     share: BucketShare | None,
     vendor_access: BucketVendorAccess | None,
     intake_id: UUID | None = None,
+    user: User | None = None,
 ) -> dict[str, Any]:
     readiness_profile = None
     # A bucket may back more than one logical application.  When an intake is
@@ -5457,7 +5474,8 @@ async def _chat_context(
             "document_template_library": [_template_context(template) for template in templates],
             "files": [_file_context(file) for file in visible_files],
             "linked_evidence_files": [_file_context(file) for file in linked_files],
-            "notes": [_note_context(note) for note in bucket.notes],
+            "notes": [_note_context(note) for note in bucket.notes if not internal_note_ai.private_channel(note)],
+            **({"internal_note_context": packet} if (packet := internal_note_ai.context(bucket, user, audience)) else {}),
             "latest_review": review.result if review else None,
             "program_readiness": program_context,
             "action_items": [_task_context(task) for task in tasks],
@@ -5522,7 +5540,9 @@ async def _chat_context(
     if share is not None:
         review = await latest_review(db, bucket.id)
         tasks = await visible_action_items(db, bucket.id, route="share", share_id=share.id, approved_only=True)
-        notes = [note for note in bucket.notes if note.visibility == "shared" or share.can_see_internal_notes]
+        notes = [note for note in bucket.notes
+                 if not internal_note_ai.private_channel(note)
+                 and (note.visibility == "shared" or share.can_see_internal_notes)]
         public_ai_context = _statement_lists(_public_ai_context(bucket), bucket)
         public_review_type = public_ai_context.get("review_type") if public_ai_context else None
         from app.services.financial_workspace import filter_current_files
@@ -5568,9 +5588,10 @@ async def _chat_context(
         tasks = await visible_action_items(db, bucket.id, route="vendor", vendor_access_id=vendor_access.id, approved_only=True)
         notes = [
             note for note in bucket.notes
-            if note.visibility == "shared"
-            or note.vendor_access_id == vendor_access.id
-            or vendor_access.can_see_internal_notes
+            if not internal_note_ai.private_channel(note)
+            and (note.visibility == "shared"
+                 or note.vendor_access_id == vendor_access.id
+                 or vendor_access.can_see_internal_notes)
         ]
         public_ai_context = _statement_lists(_public_ai_context(bucket), bucket)
         public_review_type = public_ai_context.get("review_type") if public_ai_context else None

@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 CommunicationChannel = Literal[
     "client",
@@ -73,6 +73,7 @@ class UnifiedCommunicationMessage(BaseModel):
     seen: bool = True
     delivery_status: str | None = None
     images: list[CommunicationImage] = Field(default_factory=list)
+    include_in_ai_context: bool | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class UnifiedCommunicationThreadDetail(BaseModel):
@@ -84,6 +85,7 @@ class UnifiedCommunicationThreadDetail(BaseModel):
 class UnifiedCommunicationCompose(BaseModel):
     body: str = Field(default="", max_length=20_000)
     image_ids: list[UUID] = Field(default_factory=list, max_length=10)
+    include_in_ai_context: StrictBool = False
 
     @model_validator(mode="after")
     def content_required(self):
@@ -92,6 +94,11 @@ class UnifiedCommunicationCompose(BaseModel):
         if len(set(self.image_ids)) != len(self.image_ids):
             raise ValueError("Attach each image only once.")
         return self
+
+
+class InternalNoteAIContextUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    include_in_ai_context: StrictBool
 
 
 class UnifiedCommunicationSeen(BaseModel):

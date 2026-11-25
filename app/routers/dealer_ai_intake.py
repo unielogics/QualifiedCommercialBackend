@@ -155,6 +155,7 @@ from app.services import (
     inline_images,  # noqa: F401  (handlers reach this through core)
     intake_lifecycle,
     intake_retention,  # noqa: F401  (handlers reach this through core)
+    internal_note_ai,
     locked_file_requests,
     mca_refinance_policy,  # noqa: F401  (handlers reach this through core)
     merchant_processing,
@@ -7766,10 +7767,10 @@ async def _response(
             # preview nor download; delivery endpoints still validate strictly.
             log.exception("Unable to calculate package freshness for intake %s", intake.id)
     email_sends = await _management_email_sends(db, intake.id) if include_management else []
-    # Internal notes thread — admin/dealer-partner only, never the client.
+    # Team/partner discussion is distinct from the private staff notes channel.
     notes = (
         sorted(
-            (n for n in intake.bucket.notes if n.visibility == "admin"),
+            (n for n in intake.bucket.notes if n.visibility == "admin" and not internal_note_ai.private_channel(n)),
             key=lambda n: n.created_at,
         )
         if admin_thread
@@ -9666,7 +9667,7 @@ def _channel_side(role) -> str:
 
 def _channel_last_message(intake: PublicUnderwritingIntake) -> DealerLeadMessagePreview | None:
     notes = sorted(
-        (n for n in intake.bucket.notes if n.visibility == "admin"),
+        (n for n in intake.bucket.notes if n.visibility == "admin" and not internal_note_ai.private_channel(n)),
         key=lambda n: n.created_at,
     )
     if not notes:
@@ -9713,6 +9714,7 @@ async def _channel_unread_by_intake(
             select(BucketNote.bucket_id, BucketNote.author_role, BucketNote.created_at).where(
                 BucketNote.bucket_id.in_(list(bucket_to_intake.keys())),
                 BucketNote.visibility == "admin",
+                BucketNote.channel != "internal",
             )
         )
     ).all()
@@ -10222,7 +10224,7 @@ async def _build_channel_inbox(
     db: AsyncSession, user: User, intakes: list[PublicUnderwritingIntake]
 ) -> DealerLeadInboxResponse:
     # Only leads that actually have a team<->partner thread belong in the inbox.
-    threaded = [i for i in intakes if any(n.visibility == "admin" for n in i.bucket.notes)]
+    threaded = [i for i in intakes if any(n.visibility == "admin" and not internal_note_ai.private_channel(n) for n in i.bucket.notes)]
     unread = await _channel_unread_by_intake(db, user=user, intakes=threaded)
     items = [_inbox_item(i, unread.get(i.id, 0)) for i in threaded]
     items.sort(key=lambda it: it.last_message_at or datetime.min.replace(tzinfo=UTC), reverse=True)
