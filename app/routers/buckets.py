@@ -150,6 +150,7 @@ from app.services import (
     document_versions,
     file_events,
     intake_retention,
+    internal_note_ai,
     locked_file_requests,
     provenance,
     retention_holds,
@@ -3508,7 +3509,8 @@ async def get_vendor_bucket(
         files.append(item)
     notes = [
         note for note in access.bucket.notes
-        if note.visibility == "shared" or note.vendor_access_id == access.id or access.can_see_internal_notes
+        if not internal_note_ai.private_channel(note)
+        and (note.visibility == "shared" or note.vendor_access_id == access.id or access.can_see_internal_notes)
     ]
     review = await latest_review(db, access.bucket_id)
     tasks = await visible_action_items(db, access.bucket_id, route="vendor", vendor_access_id=access.id, approved_only=True) if access.can_view_ai_tasks else []
@@ -4534,11 +4536,12 @@ async def share_access(
     # A "shared" note is visible to this recipient only if it was authored by
     # the operator (no share/vendor owner) or by this same share — not by other
     # share recipients or vendors on the bucket (which would leak their PII and
-    # comments). can_see_internal_notes still widens to everything.
+    # comments). Legacy visibility permission never opens the staff-only channel.
     notes = [
         n for n in share.bucket.notes
-        if share.can_see_internal_notes
-        or (n.visibility == "shared" and n.vendor_access_id is None and n.share_id in (None, share.id))
+        if not internal_note_ai.private_channel(n)
+        and (share.can_see_internal_notes
+             or (n.visibility == "shared" and n.vendor_access_id is None and n.share_id in (None, share.id)))
     ]
     review = await latest_review(db, share.bucket_id)
     tasks = await visible_action_items(db, share.bucket_id, route="share", share_id=share.id, approved_only=True) if share.can_view_ai_tasks else []

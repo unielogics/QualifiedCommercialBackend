@@ -43,6 +43,7 @@ from app.schemas.communication import (
     FileCommunicationUnread,
     FileCommunicationUnreadBatchRequest,
     FileCommunicationUnreadBatchResponse,
+    InternalNoteAIContextUpdate,
     UnifiedCommunicationCompose,
     UnifiedCommunicationMessage,
     UnifiedCommunicationSeen,
@@ -62,6 +63,7 @@ from app.services.dealer_partner_access import (
     REFERRAL_PARTNER_ROLES,
     require_dealer_partner_standing,
 )
+from app.services.internal_notes import is_internal_note
 from app.services.user_access import is_audit_client
 
 log = logging.getLogger(__name__)
@@ -866,7 +868,13 @@ async def _thread_summary(db: AsyncSession, user: User, thread_id: str) -> Unifi
             intake_id = UUID(parts[1])
         except ValueError:
             intake_id = None
-        intake = next((item for item in await _visible_intakes(db, user) if item.id == intake_id), None)
+        if parts[2] == "internal" and user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC} and intake_id is not None:
+            # A file opened directly can be older than the bounded inbox scan.
+            intake = (await db.execute(select(PublicUnderwritingIntake)
+                .join(Bucket, Bucket.id == PublicUnderwritingIntake.bucket_id)
+                .where(PublicUnderwritingIntake.id == intake_id, Bucket.archived_at.is_(None)))).scalar_one_or_none()
+        else:
+            intake = next((item for item in await _visible_intakes(db, user) if item.id == intake_id), None)
         if intake is not None:
             channel = parts[2]
             label = {
@@ -1289,6 +1297,7 @@ async def get_unified_communication_thread(
                 UnifiedCommunicationMessage(
                     id=str(row.id), thread_id=thread_id, body=row.content, sender_name=row.author_name,
                     sender_type=row.author_role, direction=_message_direction(user, row.author_role), channel=channel, transport="portal", created_at=row.created_at,
+                    include_in_ai_context=bool(getattr(row, "include_in_ai_context", False)) if channel == "internal" and is_internal_note(row) else None,
                 ) for row in rows
             ]
     elif parts[0] == "dealer":
@@ -1377,6 +1386,44 @@ def _loan_reply_event_title(user: User) -> str:
     return "Reply from the desk"
 
 
+@router.patch("/threads/{thread_id:path}/notes/{note_id}/ai-context", response_model=UnifiedCommunicationThreadDetail)
+async def update_internal_note_ai_context(
+    thread_id: str,
+    note_id: UUID,
+    payload: InternalNoteAIContextUpdate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> UnifiedCommunicationThreadDetail:
+    if user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Underwriter access required")
+    parts = thread_id.split(":")
+    if len(parts) != 3 or parts[0] != "intake" or parts[2] != "internal":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Internal note not found")
+    try:
+        intake_id = UUID(parts[1])
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Internal note not found") from exc
+    thread = await _thread_summary(db, user, thread_id)
+    if not thread.can_reply:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This conversation is read-only from your desk")
+    note = (await db.execute(select(BucketNote)
+        .join(PublicUnderwritingIntake, PublicUnderwritingIntake.bucket_id == BucketNote.bucket_id)
+        .join(Bucket, Bucket.id == BucketNote.bucket_id)
+        .where(PublicUnderwritingIntake.id == intake_id, BucketNote.id == note_id,
+            BucketNote.visibility == "admin", BucketNote.channel == "internal",
+            BucketNote.share_id.is_(None), BucketNote.vendor_access_id.is_(None), Bucket.archived_at.is_(None))
+        .with_for_update(of=BucketNote))).scalar_one_or_none()
+    if note is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Internal note not found")
+    if bool(getattr(note, "include_in_ai_context", False)) != payload.include_in_ai_context:
+        note.include_in_ai_context = payload.include_in_ai_context
+        await file_events.emit(db, intake_id=intake_id, kind="note.ai_context.updated",
+            visibility=file_events.VISIBILITY_DESK, title="Internal note AI context updated", actor=user,
+            target_type="note", target_id=note.id, meta={"include_in_ai_context": note.include_in_ai_context})
+    await db.commit()
+    return await get_unified_communication_thread(thread_id, user, db)
+
+
 @router.post("/threads/{thread_id:path}/messages", response_model=UnifiedCommunicationThreadDetail)
 async def reply_unified_communication_thread(
     thread_id: str,
@@ -1390,6 +1437,11 @@ async def reply_unified_communication_thread(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "This conversation is read-only from your desk")
     body = payload.body.strip()
     parts = thread_id.split(":")
+    internal_note = len(parts) == 3 and parts[0] == "intake" and parts[2] == "internal"
+    if internal_note and user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Underwriter access required")
+    if payload.include_in_ai_context and not internal_note:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "AI context selection applies only to internal notes")
     delivered = False
     warning = None
     images = await _outbound_images(db, payload.image_ids, user) if parts[0] != "email" else []
@@ -1413,6 +1465,10 @@ async def reply_unified_communication_thread(
     elif parts[0] == "intake":
         intake = await db.get(PublicUnderwritingIntake, UUID(parts[1]))
         channel = parts[2]
+        if internal_note:
+            active_bucket = await db.get(Bucket, intake.bucket_id) if intake is not None else None
+            if active_bucket is None or active_bucket.archived_at is not None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Internal note conversation not found")
         if channel in {"underwriter_ai", "client"}:
             from app.services.ai import engagement
             from app.services.bucket_ai import create_chat_reply, create_human_message
@@ -1451,7 +1507,8 @@ async def reply_unified_communication_thread(
                     intake_id=intake.id,
                 )
         else:
-            db.add(BucketNote(bucket_id=intake.bucket_id, author_name=user.name or user.email, author_role=str(user.role), visibility="admin", channel="internal" if channel == "internal" else "partner", content=body))
+            db.add(BucketNote(bucket_id=intake.bucket_id, author_name=user.name or user.email, author_role=str(user.role), visibility="admin", channel="internal" if channel == "internal" else "partner", content=body,
+                include_in_ai_context=payload.include_in_ai_context if internal_note else False))
             # File timeline: a note on the partner channel is the team's; an
             # internal note stays with the desk.
             await file_events.emit(

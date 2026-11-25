@@ -239,7 +239,7 @@ async def list_broker_lead_notes(
 ) -> list[core.BucketNoteRead]:
     await core._require_dealer_partner(user, db)
     intake = await core._load_broker_dealer_lead(db, user, intake_id)
-    notes = sorted((n for n in intake.bucket.notes if n.visibility == "admin"), key=lambda n: n.created_at)
+    notes = sorted((n for n in intake.bucket.notes if n.visibility == "admin" and not core.internal_note_ai.private_channel(n)), key=lambda n: n.created_at)
     # The lead was authorised above; whoever may read the note may see what was
     # pasted into it.
     images = await core.inline_images.hydrate(db, "bucket_note", [str(note.id) for note in notes])
