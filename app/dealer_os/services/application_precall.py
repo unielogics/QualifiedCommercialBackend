@@ -593,18 +593,22 @@ async def send_kit(
 
 
 async def rotate_passcode(db: AsyncSession, intake: PublicUnderwritingIntake):
-    from app.routers.buckets import _hash_passcode
+    """A fresh PIN for an AI intake's room, stored the way every room PIN is.
 
+    ``client_room._store_passcode`` writes the hash that opens the room and the
+    encrypted copy authorized staff read back, and clears the client-choice
+    stamp, exactly as the dealer room's rotation does. This used to set the
+    hash by hand and drop the copy, so after a pre-call "rotate PIN" the desk
+    could never see the PIN again and asking the client for an unlocked copy
+    of a locked PDF answered 409 ``application_room_pin_required``.
+    """
     from .client_room import ClientRoom
 
     link = await _room_link(db, intake)
     if link is None:
         raise RuntimeError("The AI Intake has no active application room")
     pin = client_room._generate_passcode()
-    link.passcode_hash = _hash_passcode(pin)
-    link.encrypted_passcode = None
-    link.passcode_encryption_provider = None
-    link.passcode_set_by_client_at = None
+    client_room._store_passcode(link, pin)
     link.expires_at = None
     await db.flush()
     return ClientRoom(link=link, url=_room_url(link.token), passcode=pin)

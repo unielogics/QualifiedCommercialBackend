@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -201,25 +204,81 @@ def test_only_one_writer_sets_a_room_pin() -> None:
     which is how a self-serve intake ended up with a room nobody could enter and
     how staff were shown a rotated PIN that no longer opened the room. Shares are
     a different model with no encrypted copy, so they are excluded on purpose.
+
+    Every module under app/ is read, not a chosen few: the pre-call rotation in
+    dealer_os/services/application_precall.py wrote the hash by hand and
+    dropped the copy for months because only three routers were checked.
     """
     import re
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
+    home = root / "dealer_os" / "services" / "client_room.py"
     offenders: list[str] = []
-    for path in [
-        root / "routers" / "buckets.py",
-        root / "routers" / "application_profiles.py",
-        root / "routers" / "dealer_ai_intake.py",
-    ]:
-        source = path.read_text().splitlines()
+    for path in sorted(root.rglob("*.py")):
+        if "tests" in path.relative_to(root).parts or path == home:
+            continue
+        source = path.read_text(encoding="utf-8").splitlines()
         for number, line in enumerate(source, start=1):
-            if not re.search(r"passcode_hash\s*=\s*_hash_passcode", line):
+            writes_hash = re.search(r"passcode_hash\s*=\s*[\w.]*_hash_passcode", line)
+            drops_copy = re.search(r"encrypted_passcode\s*=\s*None", line)
+            if not (writes_hash or drops_copy):
                 continue
             # Walk back to the nearest constructor or assignment target.
             context = "\n".join(source[max(0, number - 12):number])
             if "BucketShare(" in context or "share." in line:
                 continue
-            offenders.append(f"{path.name}:{number}")
+            offenders.append(f"{path.relative_to(root)}:{number}")
 
     assert offenders == [], f"write these through client_room._store_passcode: {offenders}"
+
+
+@pytest.mark.asyncio
+async def test_a_rotated_ai_intake_room_pin_reads_back_and_the_old_pin_stops_working(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-call "rotate PIN" action on an AI intake file. It used to keep
+    only the hash, so the desk could not see the new PIN again and asking the
+    client for an unlocked copy of a locked PDF answered 409."""
+    from app.dealer_os.services import application_precall
+    from app.routers.application_profiles import _require_usable_unlocked_copy_room
+
+    monkeypatch.setattr(
+        client_room,
+        "get_settings",
+        lambda: SimpleNamespace(
+            provider_secrets_kms_key_id="", app_env="test", frontend_app_url="https://app.example.test"
+        ),
+    )
+    link = SimpleNamespace(
+        id="room-link",
+        token="room-token",
+        status="active",
+        expires_at=None,
+        completed_at=None,
+        allow_multiple_sessions=True,
+        passcode_hash=None,
+        encrypted_passcode=None,
+        passcode_encryption_provider=None,
+        passcode_set_by_client_at=None,
+    )
+    client_room._store_passcode(link, "482913")
+    link.passcode_set_by_client_at = datetime(2026, 11, 1, tzinfo=UTC)  # the client had chosen it
+    db = SimpleNamespace(flush=AsyncMock())
+
+    with (
+        patch.object(application_precall, "_room_link", new=AsyncMock(return_value=link)),
+        patch.object(client_room, "_generate_passcode", return_value="604127"),
+    ):
+        room = await application_precall.rotate_passcode(db, SimpleNamespace(id=uuid4()))
+
+    assert room.passcode == "604127"
+    assert room.url == "https://app.example.test/buckets/request/room-token"
+    assert client_room.read_passcode(link) == "604127"
+    assert link.passcode_encryption_provider == "fernet"
+    assert _verify_passcode("604127", link.passcode_hash)
+    assert not _verify_passcode("482913", link.passcode_hash)
+    # A desk-issued PIN is a generated one again: the room offers the client
+    # their own choice on the next entry.
+    assert link.passcode_set_by_client_at is None
+    _require_usable_unlocked_copy_room(link)  # no longer 409 application_room_pin_required
