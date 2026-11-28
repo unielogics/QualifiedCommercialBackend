@@ -33,16 +33,16 @@ def test_unknown_or_blank_zones_fall_back_to_the_firm_default() -> None:
 
 def test_the_file_updates_digest_speaks_local_time() -> None:
     event = SimpleNamespace(created_at=NOON_UTC_NOV, title="Uploaded 20260630-statements-1204-.pdf", body=None)
-    subject, text, html = render_digest("Body Good Studio LLC", [event], titles_only=True, link=None, tz=zone("America/New_York"))
-    assert subject == "1 update on Body Good Studio LLC"
+    subject, text, html = render_digest("Sample Fabrication LLC", [event], titles_only=True, link=None, tz=zone("America/New_York"))
+    assert subject == "1 update on Sample Fabrication LLC"
     assert "Nov 3, 11:04 AM ET — Uploaded" in text
     assert "UTC" not in text and "UTC" not in html
 
 
 def test_the_activity_digest_speaks_local_time() -> None:
     items = [{
-        "created_at": NOON_UTC_NOV, "lead_name": "Body Good Studio LLC", "intake_id": None,
-        "actor_name": "Linda Louis", "actor_role": "public_lead", "label": "uploaded a file",
+        "created_at": NOON_UTC_NOV, "lead_name": "Sample Fabrication LLC", "intake_id": None,
+        "actor_name": "Riley Chen", "actor_role": "public_lead", "label": "uploaded a file",
         "detail": "20260630-statements-1204-.pdf", "action": "dealer_ai_file_uploaded",
     }]
     _subject, text, _html = _format_digest(items, public_url="https://app.example.com", tz=zone("America/New_York"))

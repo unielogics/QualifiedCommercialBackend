@@ -53,3 +53,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Snapshots of live client files for scripts/review_eval.py: client data, never committed.
+scripts/review_eval_fixtures/*.json

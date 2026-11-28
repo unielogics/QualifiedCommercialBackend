@@ -47,7 +47,7 @@ def test_quick_add_accepts_frontend_name_alias_and_normalizes_phone() -> None:
     payload = ProspectCreate(
         contact_id=contact_id,
         name="  Rocio Martinez  ",
-        dealer_name=" Grace Auto Sales ",
+        dealer_name=" Sample Auto Sales ",
         lead_type="dealer",
         email="ROCIO@EXAMPLE.COM",
         phone="(973) 555-0148",
@@ -56,7 +56,7 @@ def test_quick_add_accepts_frontend_name_alias_and_normalizes_phone() -> None:
 
     assert payload.contact_name == "Rocio Martinez"
     assert payload.contact_id == contact_id
-    assert payload.dealer_name == "Grace Auto Sales"
+    assert payload.dealer_name == "Sample Auto Sales"
     assert payload.phone == "+19735550148"
     assert payload.initial_note == "Spoke about dealership working capital."
 
@@ -64,7 +64,7 @@ def test_quick_add_accepts_frontend_name_alias_and_normalizes_phone() -> None:
 def test_quick_add_normalizes_blank_initial_note_to_none() -> None:
     payload = ProspectCreate(
         contact_name="Rocio Martinez",
-        dealer_name="Grace Auto Sales",
+        dealer_name="Sample Auto Sales",
         lead_type="dealer",
         email="rocio@example.com",
         phone="(973) 555-0148",
@@ -131,7 +131,7 @@ async def test_pipeline_list_filters_business_contact_type_and_intent(monkeypatc
 async def test_quick_add_route_forwards_private_initial_note(monkeypatch) -> None:
     payload = ProspectCreate(
         contact_name="Rocio Martinez",
-        dealer_name="Grace Auto Sales",
+        dealer_name="Sample Auto Sales",
         lead_type="dealer",
         email="rocio@example.com",
         phone="(973) 555-0148",
@@ -192,7 +192,7 @@ async def test_create_prospect_records_private_initial_note_after_created_activi
         db,
         user,
         contact_name="Rocio Martinez",
-        dealer_name="Grace Auto Sales",
+        dealer_name="Sample Auto Sales",
         email="rocio@example.com",
         phone="+19735550148",
         source="quick_add",
@@ -445,7 +445,7 @@ async def test_prospect_timeline_uses_stable_same_timestamp_tie_breaker() -> Non
         stage_definition_id=uuid4(),
         email_normalized="rocio@example.com",
         phone_normalized="+19735550148",
-        dealer_name_normalized="grace auto sales",
+        dealer_name_normalized="sample auto sales",
         source="quick_add",
         version=1,
     )
@@ -458,7 +458,7 @@ async def test_prospect_timeline_uses_stable_same_timestamp_tie_breaker() -> Non
         sms_marketing_consented_at=None,
         sms_opted_out_at=None,
     )
-    company = SimpleNamespace(name="Grace Auto Sales")
+    company = SimpleNamespace(name="Sample Auto Sales")
     stage = SimpleNamespace(id=prospect.stage_definition_id, key="new", label="New", sort_order=0)
     owner = SimpleNamespace(name="Pipeline User")
 
@@ -553,20 +553,20 @@ def test_reorder_rejects_duplicate_definition_ids() -> None:
 
 
 def test_dealer_identity_normalization_is_case_and_spacing_stable() -> None:
-    assert prospects.normalize_dealer_name("  GRACE   Auto Sales  ") == "grace auto sales"
-    assert prospects.normalize_dealer_name("Ｇｒａｃｅ Auto") == "grace auto"
+    assert prospects.normalize_dealer_name("  SAMPLE   Auto Sales  ") == "sample auto sales"
+    assert prospects.normalize_dealer_name("Ｓａｍｐｌｅ Auto") == "sample auto"
 
 
 def test_ai_intake_candidate_explains_all_matching_identity_signals() -> None:
     prospect = SimpleNamespace(
         email_normalized="rocio@example.com",
         phone_normalized="+19735550148",
-        dealer_name_normalized="grace auto sales",
+        dealer_name_normalized="sample auto sales",
     )
     intake = SimpleNamespace(
         email="ROCIO@example.com",
         phone="(973) 555-0148",
-        business_name="  Grace   Auto Sales ",
+        business_name="  Sample   Auto Sales ",
     )
 
     assert prospects.intake_candidate_match_reasons(prospect, intake) == [
@@ -580,12 +580,12 @@ def test_portfolio_candidate_explains_all_matching_identity_signals() -> None:
     prospect = SimpleNamespace(
         email_normalized="rocio@example.com",
         phone_normalized="+19735550148",
-        dealer_name_normalized="grace auto sales",
+        dealer_name_normalized="sample auto sales",
     )
     application = SimpleNamespace(
         email="ROCIO@example.com",
         phone="(973) 555-0148",
-        name="  Grace   Auto Sales ",
+        name="  Sample   Auto Sales ",
     )
 
     assert prospect_conversion.portfolio_candidate_match_reasons(
@@ -685,7 +685,7 @@ async def test_legacy_ai_conversion_honors_existing_portfolio_conversion(monkeyp
         contact_id=uuid4(),
         contact_name="Rocio Martinez",
         name="Rocio Martinez",
-        dealer_name="Grace Auto Sales",
+        dealer_name="Sample Auto Sales",
         email="rocio@example.com",
         phone="+19735550148",
         stage_id=uuid4(),
@@ -749,7 +749,7 @@ async def test_general_conversion_retry_with_stale_version_returns_existing_dest
         contact_id=uuid4(),
         contact_name="Rocio Martinez",
         name="Rocio Martinez",
-        dealer_name="Grace Auto Sales",
+        dealer_name="Sample Auto Sales",
         email="rocio@example.com",
         phone="+19735550148",
         stage_id=uuid4(),
@@ -813,7 +813,7 @@ async def test_active_conversion_candidate_cannot_use_reactivate(monkeypatch, ta
         target=target,
         status="active",
         archived=False,
-        display_name="Grace Auto Sales",
+        display_name="Sample Auto Sales",
         email="rocio@example.com",
         phone="+19735550148",
         created_at=datetime.now(UTC),
@@ -870,7 +870,7 @@ async def test_owner_reassignment_rotates_only_owner_derived_contact_grants(monk
         owner_user_id=previous_owner_id,
         primary_contact_id=contact.id,
         company_id=company.id,
-        dealer_name_normalized="grace auto sales",
+        dealer_name_normalized="sample auto sales",
         email_normalized="rocio@example.com",
         phone_normalized="+19735550148",
     )
@@ -973,7 +973,7 @@ async def test_team_owned_portfolio_conversion_does_not_create_rep_reporting_row
         phone_e164="+19735550148",
         dealer_id=None,
     )
-    company = SimpleNamespace(id=prospect.company_id, name="Grace Auto Sales")
+    company = SimpleNamespace(id=prospect.company_id, name="Sample Auto Sales")
     added = []
 
     async def get(model, row_id):
@@ -1613,7 +1613,7 @@ def _unconverted_identity_prospect():
         owner_user_id=uuid4(),
         converted_application_id=None,
         converted_intake_id=None,
-        dealer_name_normalized="grace auto sales",
+        dealer_name_normalized="sample auto sales",
         email_normalized="rocio@example.com",
         phone_normalized="+19735550148",
     )
@@ -1676,7 +1676,7 @@ async def test_detect_conversion_reports_hidden_matches_without_identity_details
     assert set(error.value.detail) == {"code", "message"}
     serialized = str(error.value.detail).lower()
     assert "rocio" not in serialized
-    assert "grace auto" not in serialized
+    assert "sample auto" not in serialized
     assert str(prospect.owner_user_id) not in serialized
     lock.assert_awaited_once()
     candidate_scan.assert_awaited_once()
@@ -1697,7 +1697,7 @@ async def test_visible_conversion_choice_takes_priority_over_hidden_match(
         target=target,
         status="active",
         archived=False,
-        display_name="Visible Grace Auto Sales file",
+        display_name="Visible Sample Auto Sales file",
         email="rocio@example.com",
         phone="+19735550148",
         created_at=datetime.now(UTC),
@@ -1799,7 +1799,7 @@ async def test_legacy_visible_choice_takes_priority_over_hidden_match(
     candidate = SimpleNamespace(
         id=uuid4(),
         full_name="Rocio Martinez",
-        business_name="Grace Auto Sales",
+        business_name="Sample Auto Sales",
         status="collecting",
         outcome_status="submitted",
         created_at=datetime.now(UTC),
@@ -1923,7 +1923,7 @@ async def test_locked_rescan_detects_candidate_created_after_prior_lookup(
     events: list[str] = []
     candidate = prospect_router.DealerBusiness(
         id=uuid4(),
-        name="Grace Auto Sales",
+        name="Sample Auto Sales",
         email="rocio@example.com",
         phone="+19735550148",
         status="active",

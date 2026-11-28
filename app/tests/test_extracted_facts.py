@@ -60,8 +60,8 @@ def test_canonical_field_key_uses_curated_aliases_without_fuzzy_merging() -> Non
 
 def test_accepted_alias_hides_every_pending_suggestion_for_logical_field() -> None:
     rows = [
-        fact("business_name", "Grace Auto Sales", status="accepted"),
-        fact("legal_entity_name", "Grace Auto Sales and Service, Inc."),
+        fact("business_name", "Sample Auto Sales", status="accepted"),
+        fact("legal_entity_name", "Sample Auto Sales and Service, Inc."),
         fact("entity_type", "Corporation"),
     ]
 
@@ -69,9 +69,9 @@ def test_accepted_alias_hides_every_pending_suggestion_for_logical_field() -> No
 
 
 def test_accept_resolves_all_values_but_reject_resolves_only_repeated_value() -> None:
-    selected = fact("business_name", "Grace Auto Sales")
-    same = fact("legal_entity_name", "  grace auto sales  ")
-    alternative = fact("legal_entity_name", "Grace Auto Sales and Service, Inc.")
+    selected = fact("business_name", "Sample Auto Sales")
+    same = fact("legal_entity_name", "  sample auto sales  ")
+    alternative = fact("legal_entity_name", "Sample Auto Sales and Service, Inc.")
     unrelated = fact("entity_type", "Corporation")
     rows = [selected, same, alternative, unrelated]
 
@@ -177,7 +177,7 @@ async def test_capture_does_not_reopen_an_accepted_canonical_field() -> None:
                 scalar_rows([]),
                 scalar_rows([profile]),
                 scalar_rows([
-                    fact("business_name", "Grace Auto Sales", status="accepted")
+                    fact("business_name", "Sample Auto Sales", status="accepted")
                 ]),
             ]
         ),
@@ -190,7 +190,7 @@ async def test_capture_does_not_reopen_an_accepted_canonical_field() -> None:
         classification="tax_return",
         analysis={
             "profile_facts": {
-                "legal_entity_name": {"value": "Grace Auto Sales and Service, Inc."}
+                "legal_entity_name": {"value": "Sample Auto Sales and Service, Inc."}
             },
             "key_facts": {},
         },
@@ -268,8 +268,8 @@ async def test_draft_status_counts_logical_fields_not_per_file_repeats() -> None
                 rows([(file_id, "completed")]),
                 rows(
                     [
-                        ("business_name", "accepted", "grace auto sales", {"value": "Grace Auto Sales"}),
-                        ("legal_entity_name", "suggested", "grace auto sales and service inc", {"value": "Grace Auto Sales and Service, Inc."}),
+                        ("business_name", "accepted", "sample auto sales", {"value": "Sample Auto Sales"}),
+                        ("legal_entity_name", "suggested", "sample auto sales and service inc", {"value": "Sample Auto Sales and Service, Inc."}),
                         ("entity_type", "suggested", "corporation", {"value": "Corporation"}),
                         ("business_entity_type", "suggested", "corporation", {"value": "Corporation"}),
                     ]

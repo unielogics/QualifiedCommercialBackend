@@ -1,6 +1,6 @@
 """Linking what the client already gave to what the application needs.
 
-Body Good Studio LLC uploaded six statements and signed the credit
+Sample Fabrication LLC uploaded six statements and signed the credit
 authorization in its room, and the application still showed every ask open:
 the playbook had minted its own rows beside the room's checklist, and the
 June statement (a cycle of May 30 to June 30) had been filed under May.
@@ -259,8 +259,8 @@ def _link():
         id=uuid4(),
         bucket_id=uuid4(),
         passcode_hash="hash",
-        recipient_name="Linda Louis",
-        recipient_email="linda@example.com",
+        recipient_name="Riley Chen",
+        recipient_email="riley@example.com",
         passcode_set_by_client_at=None,
         status="active", expires_at=None,
     )

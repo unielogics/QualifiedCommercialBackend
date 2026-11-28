@@ -94,12 +94,12 @@ def test_another_persons_link_on_the_same_room_is_not_the_clients_sign_in() -> N
     bucket = uuid4()
     room = {
         bucket: [
-            ("john@graceauto.example", _room(1, EARLIER)),
-            ("bobwake@example.com", _room(10, NOW)),  # the partner's own link
+            ("jordan.sample@example.com", _room(1, EARLIER)),
+            ("alex.rivera@example.com", _room(10, NOW)),  # the partner's own link
         ]
     }
     summary = client_signins.summary_for(
-        bucket_ids=[bucket], intake_ids=[], emails=["john@graceauto.example"], room=room, code={}
+        bucket_ids=[bucket], intake_ids=[], emails=["jordan.sample@example.com"], room=room, code={}
     )
     assert summary == SigninSummary(count=1, last_at=EARLIER, room_count=1)
 
@@ -227,17 +227,17 @@ async def test_sign_in_history_names_who_entered_and_mixes_in_code_sign_ins() ->
     room_rows = [
         SimpleNamespace(
             id=uuid4(), bucket_id=bucket, action="upload_link_accessed", target_id="link-1",
-            actor_name="John Grace", actor_email="John@GraceAuto.example",
+            actor_name="Jordan Sample", actor_email="Jordan.Sample@Example.com",
             created_at=EARLIER, ip_address="203.0.113.9", user_agent="Safari",
         ),
         SimpleNamespace(
             id=uuid4(), bucket_id=bucket, action="upload_link_accessed", target_id="link-2",
-            actor_name="Robert Wake", actor_email="bobwake@example.com",
+            actor_name="Alex Rivera", actor_email="alex.rivera@example.com",
             created_at=EARLIER - timedelta(hours=1), ip_address="198.51.100.7", user_agent="Chrome",
         ),
         SimpleNamespace(
             id=uuid4(), bucket_id=bucket, action="upload_passcode_failed", target_id="link-1",
-            actor_name="John Grace", actor_email=None,
+            actor_name="Jordan Sample", actor_email=None,
             created_at=EARLIER - timedelta(hours=2), ip_address="203.0.113.9", user_agent="Safari",
         ),
     ]
@@ -248,7 +248,7 @@ async def test_sign_in_history_names_who_entered_and_mixes_in_code_sign_ins() ->
     ]
     db = _Session(_Result(room_rows), _Result(code_rows))
     events = await client_signins.signin_events(
-        db, bucket_ids=[bucket], intake_ids=[intake], emails=["john@graceauto.example"]
+        db, bucket_ids=[bucket], intake_ids=[intake], emails=["jordan.sample@example.com"]
     )
     assert [(event.action, event.own) for event in events] == [
         ("email_code_signin", True),
@@ -256,11 +256,11 @@ async def test_sign_in_history_names_who_entered_and_mixes_in_code_sign_ins() ->
         ("room_pin_signin", False),
         ("room_pin_failed", True),
     ]
-    assert events[1].reason == "Entered the secure room with the room PIN as John Grace"
+    assert events[1].reason == "Entered the secure room with the room PIN as Jordan Sample"
     assert events[1].request_metadata["upload_link_id"] == "link-1"
     assert events[1].request_metadata["ip_address"] == "203.0.113.9"
-    assert events[2].reason == "Robert Wake entered the secure room with their own PIN link"
-    assert events[2].request_metadata["actor_email"] == "bobwake@example.com"
+    assert events[2].reason == "Alex Rivera entered the secure room with their own PIN link"
+    assert events[2].request_metadata["actor_email"] == "alex.rivera@example.com"
     assert events[3].reason == "Wrong room PIN was entered"
     assert events[0].request_metadata["intake_id"] == str(intake)
 

@@ -83,8 +83,8 @@ def test_repeated_names_get_a_counter_before_the_extension() -> None:
 
 def test_archive_file_name_is_the_room_name_plus_files() -> None:
     assert (
-        bucket_file_archive.archive_file_name("Little Star Therapy Services Inc")
-        == "Little Star Therapy Services Inc files.zip"
+        bucket_file_archive.archive_file_name("Sample Therapy Services Inc")
+        == "Sample Therapy Services Inc files.zip"
     )
     assert bucket_file_archive.archive_file_name("Café ☕ / Nov") == "Caf Nov files.zip"
     assert bucket_file_archive.archive_file_name(None) == "room files.zip"
@@ -179,7 +179,7 @@ def archive_storage(monkeypatch):
     monkeypatch.setattr(
         buckets,
         "_load_bucket_or_404",
-        AsyncMock(return_value=SimpleNamespace(name="Little Star Therapy Services Inc")),
+        AsyncMock(return_value=SimpleNamespace(name="Sample Therapy Services Inc")),
     )
     monkeypatch.setattr(buckets, "_log", AsyncMock())
     return objects
@@ -200,7 +200,7 @@ async def test_archive_route_returns_one_zip_and_audits_each_file(archive_storag
     )
 
     assert response.media_type == "application/zip"
-    assert "Little Star Therapy Services Inc files.zip" in response.headers["content-disposition"]
+    assert "Sample Therapy Services Inc files.zip" in response.headers["content-disposition"]
     assert response.headers["x-files-packaged"] == "2"
     with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
         assert archive.namelist() == ["Statement.pdf", "Statement (2).pdf"]

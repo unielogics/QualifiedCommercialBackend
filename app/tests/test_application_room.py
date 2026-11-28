@@ -137,12 +137,12 @@ def test_admin_intake_requires_a_matching_shape_room_pin() -> None:
 
 def test_admin_upload_links_accept_only_six_digit_room_pins() -> None:
     assert (
-        BucketUploadLinkCreate(recipient_name="Robert Wake", passcode="989619").passcode
+        BucketUploadLinkCreate(recipient_name="Alex Rivera", passcode="989619").passcode
         == "989619"
     )
     for invalid in ("Welcome123!", "12345", "1234567", "١٢٣٤٥٦"):
         with pytest.raises(ValidationError):
-            BucketUploadLinkCreate(recipient_name="Robert Wake", passcode=invalid)
+            BucketUploadLinkCreate(recipient_name="Alex Rivera", passcode=invalid)
 
 
 def test_pin_rotation_accepts_only_six_numeric_digits() -> None:

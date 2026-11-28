@@ -25,7 +25,7 @@ def _bucket():
 
 
 def _link(paused_until=None):
-    return SimpleNamespace(id=uuid4(), ai_paused_until=paused_until, recipient_name="Loyd Bradley")
+    return SimpleNamespace(id=uuid4(), ai_paused_until=paused_until, recipient_name="Morgan Lee")
 
 
 def _db():
@@ -110,7 +110,7 @@ async def test_a_borrower_turn_during_a_takeover_is_marked_as_theirs():
             bucket=bucket,
             audience="uploader",
             message="sure, my number is 555 0148",
-            actor_name="Loyd Bradley",
+            actor_name="Morgan Lee",
             upload_link=link,
             sender_kind="client",
         )
@@ -132,7 +132,7 @@ async def test_client_turn_asks_the_model_when_no_one_has_taken_over():
     with patch("app.routers.dealer_ai_intake.create_chat_reply",
                new=AsyncMock(return_value=([SimpleNamespace(), answer], [], None))) as reply:
         messages, assistant_message, paused = await _client_chat_turn(
-            None, intake, "can I add them later?", actor_name="Loyd Bradley"
+            None, intake, "can I add them later?", actor_name="Morgan Lee"
         )
 
     assert paused is False
@@ -151,7 +151,7 @@ async def test_client_turn_is_recorded_but_unanswered_during_a_takeover():
     with patch("app.routers.dealer_ai_intake.create_chat_reply", new=AsyncMock()) as reply, \
          patch("app.routers.dealer_ai_intake.create_human_message", new=AsyncMock(return_value=row)) as human:
         messages, assistant_message, paused = await _client_chat_turn(
-            None, intake, "sure, my number is 555 0148", actor_name="Loyd Bradley"
+            None, intake, "sure, my number is 555 0148", actor_name="Morgan Lee"
         )
 
     reply.assert_not_awaited()
@@ -172,7 +172,7 @@ async def test_the_model_answers_again_once_the_window_lapses():
     with patch("app.routers.dealer_ai_intake.create_chat_reply",
                new=AsyncMock(return_value=([SimpleNamespace(), answer], [], None))) as reply:
         _messages, assistant_message, paused = await _client_chat_turn(
-            None, intake, "anything else?", actor_name="Loyd Bradley"
+            None, intake, "anything else?", actor_name="Morgan Lee"
         )
 
     assert paused is False
@@ -189,7 +189,7 @@ async def test_a_room_with_no_upload_link_still_answers():
     with patch("app.routers.dealer_ai_intake.create_chat_reply",
                new=AsyncMock(return_value=([answer], [], None))):
         _messages, _assistant, paused = await _client_chat_turn(
-            None, intake, "hello", actor_name="Loyd Bradley"
+            None, intake, "hello", actor_name="Morgan Lee"
         )
 
     assert paused is False

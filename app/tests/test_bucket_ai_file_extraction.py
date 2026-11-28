@@ -529,8 +529,8 @@ async def test_zip_children_inherit_parent_bucket_and_actual_upload_link():
             db,
             parent,
             SimpleNamespace(),
-            actor_name="Grace",
-            actor_email="grace@example.com",
+            actor_name="Jordan",
+            actor_email="jordan@example.com",
         )
 
     assert parent.extraction_status == "extracted"
@@ -583,8 +583,8 @@ async def test_zip_fetch_failure_remains_retryable():
             db,
             parent,
             SimpleNamespace(),
-            actor_name="Grace",
-            actor_email="grace@example.com",
+            actor_name="Jordan",
+            actor_email="jordan@example.com",
         )
 
     assert parent.extraction_status == "retryable"
@@ -613,8 +613,8 @@ async def test_zip_fetch_failure_becomes_terminal_after_bounded_runs():
                 db,
                 parent,
                 SimpleNamespace(),
-                actor_name="Grace",
-                actor_email="grace@example.com",
+                actor_name="Jordan",
+                actor_email="jordan@example.com",
             )
 
     assert parent.extraction_status == "skipped"
@@ -707,8 +707,8 @@ async def test_analysis_drain_retries_zip_without_an_analysis_placeholder():
         status="uploaded",
         deleted_at=None,
         extraction_status="retryable",
-        uploaded_by_name="Grace",
-        uploaded_by_email="grace@example.com",
+        uploaded_by_name="Jordan",
+        uploaded_by_email="jordan@example.com",
     )
     ids = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [file.id]))
     empty = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
@@ -729,8 +729,8 @@ async def test_analysis_drain_retries_zip_without_an_analysis_placeholder():
         db,
         file,
         None,
-        actor_name="Grace",
-        actor_email="grace@example.com",
+        actor_name="Jordan",
+        actor_email="jordan@example.com",
     )
 
 
@@ -759,8 +759,8 @@ async def test_zip_entry_count_is_rejected_before_zipfile_materializes_entries()
             db,
             parent,
             SimpleNamespace(),
-            actor_name="Grace",
-            actor_email="grace@example.com",
+            actor_name="Jordan",
+            actor_email="jordan@example.com",
         )
 
     assert parent.extraction_status == "skipped"
@@ -792,8 +792,8 @@ async def test_zip_with_trailing_bytes_cannot_bypass_directory_prescan():
             db,
             parent,
             SimpleNamespace(),
-            actor_name="Grace",
-            actor_email="grace@example.com",
+            actor_name="Jordan",
+            actor_email="jordan@example.com",
         )
 
     assert parent.extraction_status == "skipped"

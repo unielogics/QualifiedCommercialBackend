@@ -16,7 +16,9 @@ Usage (inside the backend container or an env with app deps):
     python scripts/review_eval.py dealer-venture  # run one fixture by name
 
 Fixtures live in scripts/review_eval_fixtures/*.json — snapshot new ones
-from live leads with scripts/snapshot_review_fixture.py. Fixture shape:
+from live leads with scripts/snapshot_review_fixture.py. A snapshot is the
+client's own data and the repository is public, so the folder's *.json is
+ignored by git and stays on the machine that made it. Fixture shape:
     {
       "name": "dealer-venture",
       "review_type": "dealer_gatekeeper_v1",

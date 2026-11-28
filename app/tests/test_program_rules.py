@@ -524,7 +524,7 @@ def test_password_protected_skip_retains_actionable_reason_code() -> None:
             skip_reason="password_protected",
             skip_detail="This PDF requires a password.",
         ),
-        expected_entity="Grace Auto Sales",
+        expected_entity="Sample Auto Sales",
         duplicate_content=False,
     )
 
@@ -544,41 +544,41 @@ def test_entity_matching_accepts_legal_suffix_normalization(expected: str, obser
 @pytest.mark.parametrize(
     ("expected", "observed"),
     [
-        ("Grace Auto Sales", "Grace Auto Repair"),
-        ("Grace Auto Sales", "Amazing Grace Auto Sales"),
-        ("Grace Auto", "Grace Auto and Service"),
-        ("Grace Auto Sales", "Grace Auto Sales East"),
-        ("Grace Auto Sales", "Grace Auto Sales and Leasing"),
-        ("Grace Auto Sales", "Grace Auto Sales and Service Center"),
-        ("Grace Auto Sales", "Grace Auto Sales and Service, Inc."),
-        ("Grace Auto Sales and Service, Inc.", "Grace Auto Sales"),
+        ("Sample Auto Sales", "Sample Auto Repair"),
+        ("Sample Auto Sales", "Amazing Sample Auto Sales"),
+        ("Sample Auto", "Sample Auto and Service"),
+        ("Sample Auto Sales", "Sample Auto Sales East"),
+        ("Sample Auto Sales", "Sample Auto Sales and Leasing"),
+        ("Sample Auto Sales", "Sample Auto Sales and Service Center"),
+        ("Sample Auto Sales", "Sample Auto Sales and Service, Inc."),
+        ("Sample Auto Sales and Service, Inc.", "Sample Auto Sales"),
     ],
 )
 def test_entity_matching_rejects_generic_or_merely_similar_names(expected: str, observed: str) -> None:
     assert _entities_match(expected, observed) is False
 
 
-def test_ai_decision_accepts_grace_legal_name_expansion() -> None:
+def test_ai_decision_accepts_a_legal_name_expansion() -> None:
     requirement = SimpleNamespace(
         requirement_key="business_bank_statements_6_months",
         label="Last 6 months business bank statements",
         category="financials",
     )
     file = SimpleNamespace(
-        file_name="Grace Auto statement.pdf",
-        content_hash="grace-hash",
+        file_name="Sample Auto statement.pdf",
+        content_hash="sample-hash",
         statement_period="2026-08",
     )
     analysis = SimpleNamespace(
         id=uuid4(),
         status="completed",
-        content_hash="grace-hash",
+        content_hash="sample-hash",
         confidence="high",
         classification="bank_statement",
         error=None,
         skip_reason=None,
         skip_detail=None,
-        analysis={"profile_facts": {"legal_entity_name": {"value": "Grace Auto Sales and Service, Inc."}}},
+        analysis={"profile_facts": {"legal_entity_name": {"value": "Sample Auto Sales and Service, Inc."}}},
     )
     corroborating = SimpleNamespace(
         id=uuid4(),
@@ -586,31 +586,31 @@ def test_ai_decision_accepts_grace_legal_name_expansion() -> None:
         content_hash="tax-hash",
         confidence="high",
         classification="tax_return",
-        analysis={"profile_facts": {"legal_entity_name": {"value": "Grace Auto Sales and Service, Inc."}}},
+        analysis={"profile_facts": {"legal_entity_name": {"value": "Sample Auto Sales and Service, Inc."}}},
     )
     aliases = _corroborated_entity_aliases(
-        "Grace Auto Sales", [analysis, corroborating]
+        "Sample Auto Sales", [analysis, corroborating]
     )
 
     decision = _automatic_evidence_decision(
         requirement=requirement,
         file=file,
         analysis=analysis,
-        expected_entity="Grace Auto Sales",
+        expected_entity="Sample Auto Sales",
         duplicate_content=False,
         corroborated_entities=aliases,
     )
 
     assert decision[:2] == ("accepted", "validated")
-    assert aliases == {"graceautosalesservice"}
+    assert aliases == {"sampleautosalesservice"}
     assert AI_EVIDENCE_DECISION_ALGORITHM == "ai-evidence-v5-content-first-review"
 
 
 @pytest.mark.asyncio
 async def test_operator_accepted_legal_name_becomes_an_authoritative_alias() -> None:
     accepted = SimpleNamespace(
-        value={"value": "Grace Auto Sales East, Inc."},
-        normalized_value="grace auto sales east inc",
+        value={"value": "Sample Auto Sales East, Inc."},
+        normalized_value="sample auto sales east inc",
     )
     result = SimpleNamespace(
         scalars=lambda: SimpleNamespace(all=lambda: [accepted])
@@ -619,7 +619,7 @@ async def test_operator_accepted_legal_name_becomes_an_authoritative_alias() -> 
 
     aliases = await _accepted_entity_aliases(db, uuid4())
 
-    assert aliases == {"graceautosaleseast"}
+    assert aliases == {"sampleautosaleseast"}
 
 
 def test_one_document_type_cannot_self_corroborate_an_entity_alias() -> None:
@@ -632,14 +632,14 @@ def test_one_document_type_cannot_self_corroborate_an_entity_alias() -> None:
             classification="bank_statement",
             analysis={
                 "profile_facts": {
-                    "legal_entity_name": {"value": "Grace Auto Sales East, Inc."}
+                    "legal_entity_name": {"value": "Sample Auto Sales East, Inc."}
                 }
             },
         )
         for index in range(3)
     ]
 
-    assert _corroborated_entity_aliases("Grace Auto Sales", analyses) == set()
+    assert _corroborated_entity_aliases("Sample Auto Sales", analyses) == set()
 
 
 def test_evidence_decision_key_appends_alias_corroboration_add_and_remove() -> None:
@@ -649,7 +649,7 @@ def test_evidence_decision_key_appends_alias_corroboration_add_and_remove() -> N
         "analysis_version": 1,
         "criteria_version": 3,
         "analyzed_at": "2026-09-14T19:05:00+00:00",
-        "expected_entity": "Grace Auto Sales",
+        "expected_entity": "Sample Auto Sales",
         "duplicate_content": False,
     }
 
@@ -657,7 +657,7 @@ def test_evidence_decision_key_appends_alias_corroboration_add_and_remove() -> N
         **common, corroborated_entities=set()
     )
     corroborated_context = _evidence_decision_context_key(
-        **common, corroborated_entities={"graceautosalesservice"}
+        **common, corroborated_entities={"sampleautosalesservice"}
     )
     after_removal_context = _evidence_decision_context_key(
         **common, corroborated_entities=set()
@@ -675,7 +675,7 @@ def test_evidence_decision_key_appends_alias_corroboration_add_and_remove() -> N
     assert after_removal != before
 
     renamed = _evidence_decision_context_key(
-        **{**common, "expected_entity": "Grace Auto Sales and Service"},
+        **{**common, "expected_entity": "Sample Auto Sales and Service"},
         corroborated_entities=set(),
     )
     duplicate = _evidence_decision_context_key(
@@ -685,11 +685,11 @@ def test_evidence_decision_key_appends_alias_corroboration_add_and_remove() -> N
     assert duplicate != before_context
 
     conjunction_changed = _evidence_decision_context_key(
-        **{**common, "expected_entity": "Grace and Auto Sales"},
+        **{**common, "expected_entity": "Sample and Auto Sales"},
         corroborated_entities=set(),
     )
     ampersand_equivalent = _evidence_decision_context_key(
-        **{**common, "expected_entity": "Grace & Auto Sales"},
+        **{**common, "expected_entity": "Sample & Auto Sales"},
         corroborated_entities=set(),
     )
     assert conjunction_changed != before_context
@@ -761,8 +761,8 @@ async def test_unchanged_staff_override_remains_effective_during_reconciliation(
         links=[link],
         inventory={file_id: file},
         analyses={file_id: analysis},
-        expected_entity="Grace Auto Sales",
-        corroborated_entities={"graceautosalesandservice"},
+        expected_entity="Sample Auto Sales",
+        corroborated_entities={"sampleautosalesandservice"},
         criteria_version=1,
     )
 
@@ -792,14 +792,14 @@ def test_two_document_types_do_not_corroborate_an_unapproved_branch_suffix() -> 
             classification=classification,
             analysis={
                 "profile_facts": {
-                    "legal_entity_name": {"value": "Grace Auto Sales East, Inc."}
+                    "legal_entity_name": {"value": "Sample Auto Sales East, Inc."}
                 }
             },
         )
         for classification in ("bank_statement", "tax_return")
     ]
 
-    assert _corroborated_entity_aliases("Grace Auto Sales", analyses) == set()
+    assert _corroborated_entity_aliases("Sample Auto Sales", analyses) == set()
 
 
 def test_coverage_counts_distinct_periods_not_file_count() -> None:

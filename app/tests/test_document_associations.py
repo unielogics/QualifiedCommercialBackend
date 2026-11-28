@@ -223,7 +223,7 @@ def test_association_denial_and_stale_decisions_override_an_automatic_exact_name
     from app.services.application_programs import _automatic_evidence_decision
     from app.tests.test_ai_accepts_validated_evidence import _analysis, _file, _requirement
 
-    args = dict(requirement=_requirement(), file=_file(), analysis=_analysis(), expected_entity="Body Good Studio LLC", duplicate_content=False)
+    args = dict(requirement=_requirement(), file=_file(), analysis=_analysis(), expected_entity="Sample Fabrication LLC", duplicate_content=False)
     assert _automatic_evidence_decision(**args)[0] == "accepted"
     assert _automatic_evidence_decision(**args, identity_association={"status": status})[:2] == (decision, code)
 

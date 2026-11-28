@@ -174,7 +174,7 @@ def test_main_mca_answers_and_native_contract_terms_round_trip_together():
     assert rows[0]["mca_modified"] is False and rows[0]["mca_modification_note"] == "No change"
     assert facts["debts"][0]["factor_rate"] == 1.38 and facts["debts"][0]["payment_frequency"] == "daily"
     assert facts["total_monthly_debt_service"] == 8820
-    rendered = dealer_forms_pdf.build_debt_schedule_html(business_name="Little Star Therapy", rows=rows,
+    rendered = dealer_forms_pdf.build_debt_schedule_html(business_name="Sample Therapy", rows=rows,
         total_balance=40000, total_monthly=8820)
     assert "1.380×" in rendered and "$420.00" in rendered and "Daily" in rendered
     assert "Modified by the funder for lower sales or revenue: No" in rendered

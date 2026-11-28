@@ -59,15 +59,15 @@ def _creation_schemas():
     from app.routers.public import InvestorInquiry, PublicBookingCreate, SupportInquiry
 
     return [
-        (DealerIntakeStart, {"full_name": "Loyd Bradley", "email": "l@example.com"}),
-        (FundingReviewStart, {"full_name": "Loyd Bradley", "email": "l@example.com"}),
-        (McaRefiStart, {"full_name": "Loyd Bradley", "email": "l@example.com"}),
-        (AdminLeadCreate, {"full_name": "Loyd Bradley", "email": "l@example.com"}),
-        (BrokerLeadCreate, {"full_name": "Loyd Bradley", "email": "l@example.com"}),
-        (AdminLeadFromBucketCreate, {"full_name": "Loyd Bradley", "email": "l@example.com"}),
-        (InvestorInquiry, {"name": "Loyd Bradley", "email": "l@example.com"}),
-        (SupportInquiry, {"name": "Loyd Bradley", "email": "l@example.com", "message": "hello"}),
-        (PublicBookingCreate, {"name": "Loyd Bradley", "email": "l@example.com"}),
+        (DealerIntakeStart, {"full_name": "Morgan Lee", "email": "m@example.com"}),
+        (FundingReviewStart, {"full_name": "Morgan Lee", "email": "m@example.com"}),
+        (McaRefiStart, {"full_name": "Morgan Lee", "email": "m@example.com"}),
+        (AdminLeadCreate, {"full_name": "Morgan Lee", "email": "m@example.com"}),
+        (BrokerLeadCreate, {"full_name": "Morgan Lee", "email": "m@example.com"}),
+        (AdminLeadFromBucketCreate, {"full_name": "Morgan Lee", "email": "m@example.com"}),
+        (InvestorInquiry, {"name": "Morgan Lee", "email": "m@example.com"}),
+        (SupportInquiry, {"name": "Morgan Lee", "email": "m@example.com", "message": "hello"}),
+        (PublicBookingCreate, {"name": "Morgan Lee", "email": "m@example.com"}),
     ]
 
 

@@ -61,7 +61,7 @@ def test_an_untouched_empty_schedule_is_unknown_but_explicit_no_debt_is_complete
 def test_debt_free_pdf_records_explicit_declaration():
     renderer = Mock(return_value=SimpleNamespace(write_pdf=lambda: b"%PDF declaration"))
     with patch.dict("sys.modules", {"weasyprint": SimpleNamespace(HTML=renderer)}):
-        render_debt_schedule_pdf(business_name="Little Star Therapy", rows=[], total_balance=0,
+        render_debt_schedule_pdf(business_name="Sample Therapy", rows=[], total_balance=0,
                                  total_monthly=0, no_debt=True)
     assert "declares that it has no outstanding business debt" in renderer.call_args.kwargs["string"]
 

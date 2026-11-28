@@ -100,16 +100,16 @@ def test_detail_is_capped_so_a_long_path_cannot_overflow_the_column():
 
 
 def test_a_row_written_before_the_trail_says_so_instead_of_guessing():
-    legacy = BucketFile(file_name="statement.pdf", uploaded_by_name="Loyd Bradley")
-    assert provenance.describe_document(legacy) == "Uploaded by Loyd Bradley"
+    legacy = BucketFile(file_name="statement.pdf", uploaded_by_name="Morgan Lee")
+    assert provenance.describe_document(legacy) == "Uploaded by Morgan Lee"
 
     blank = BucketFile(file_name="mystery.pdf")
     assert provenance.describe_document(blank) == "Source not recorded"
 
 
 def test_a_stamped_row_reads_as_the_channel_it_came_through():
-    row = BucketFile(file_name="bank.pdf", source_kind="client_room", uploaded_by_name="Loyd Bradley")
-    assert provenance.describe_document(row) == "Client uploaded in their room · Loyd Bradley"
+    row = BucketFile(file_name="bank.pdf", source_kind="client_room", uploaded_by_name="Morgan Lee")
+    assert provenance.describe_document(row) == "Client uploaded in their room · Morgan Lee"
 
 
 def test_the_file_row_exposes_the_same_line_to_the_api():

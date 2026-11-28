@@ -144,7 +144,7 @@ async def test_the_primary_owner_resolves_to_the_files_own_client():
 
     # This is what makes the FICO written on the Client row genuinely theirs.
     client_id = uuid4()
-    borrower = Client(name="Loyd Bradley")
+    borrower = Client(name="Morgan Lee")
     db = _db(scalars=[client_id], get={client_id: borrower})
 
     resolved = await _resolve_owner_client(db, _dealer(), _owner(is_primary=True))

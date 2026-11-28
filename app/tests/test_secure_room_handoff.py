@@ -34,7 +34,7 @@ def _link(**over):
 
 def _intake(link=None):
     return SimpleNamespace(
-        id=uuid4(), bucket_id=uuid4(), full_name="Loyd Bradley", email="loyd@example.com",
+        id=uuid4(), bucket_id=uuid4(), full_name="Morgan Lee", email="morgan@example.com",
         bucket_upload_link=link if link is not None else _link(),
     )
 
@@ -192,7 +192,7 @@ def _upload_link_row(**over):
 
     row = SimpleNamespace(
         id=uuid4(), bucket_id=uuid4(), token="room-token",
-        recipient_name="John Grace", recipient_email="john@example.com",
+        recipient_name="Jordan Sample", recipient_email="john@example.com",
         expires_at=None, allow_notes=True, allow_multiple_sessions=True,
         can_use_ai_chat=True, can_view_ai_tasks=True, status="active",
         completed_at=None, created_at=datetime.now(UTC),

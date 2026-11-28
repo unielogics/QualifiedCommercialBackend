@@ -388,7 +388,7 @@ def _populated(record: dict[str, Any]) -> int:
 
 
 def _bank_stem(bank: str) -> str:
-    """'JPMorgan Chase Bank, N.A.' -> 'jpmorgan'; 'Pinnacle Bank (Horizon 75)' -> 'pinnacle'.
+    """'JPMorgan Chase Bank, N.A.' -> 'jpmorgan'; 'Pinnacle Bank (Sample 12)' -> 'pinnacle'.
     The reader prints a bank's name differently from statement to statement;
     the first word plus the last four digits is what stays the same."""
     words = [
@@ -413,7 +413,7 @@ _STATEMENT_AMOUNT_KEYS = (
 
 def _last4(value: Any) -> str:
     """The last four digits of whatever the reader printed: "x4884",
-    "Bus Plus Checking – …0865"."""
+    "Bus Plus Checking – …4821"."""
     return re.sub(r"\D", "", str(value or ""))[-4:]
 
 

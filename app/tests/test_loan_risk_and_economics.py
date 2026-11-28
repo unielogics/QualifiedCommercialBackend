@@ -267,8 +267,8 @@ def test_a_sheet_recorded_before_structures_existed_reads_the_structure_off_its_
     )
     assert term_sheet_terms(legacy_level)["structure"] == "amortizing"
     assert term_sheet_terms(legacy_level)["payment_stated"] is False
-    # Grace Auto's real sheet: fully_amortizing in extra, weekly, 400k at 32% over 13 months, 36,662.07 a month.
-    grace = SimpleNamespace(
+    # A recorded sheet: fully_amortizing in extra, weekly, 400k at 32% over 13 months, 36,662.07 a month.
+    sheet = SimpleNamespace(
         version=1,
         funding_party_name="Quidity",
         approved_amount=400000,
@@ -282,7 +282,7 @@ def test_a_sheet_recorded_before_structures_existed_reads_the_structure_off_its_
             "payment_frequency": "weekly",
         },
     )
-    cockpit["dscr"]["proposed"] = proposed_payment(term_sheet_terms(grace))
+    cockpit["dscr"]["proposed"] = proposed_payment(term_sheet_terms(sheet))
     proposed = proposed_terms_block(cockpit)
     assert proposed["structure"] == "amortizing" and proposed["payment_note"] is None
     assert proposed["monthly_payment"] == 36662.07

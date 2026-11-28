@@ -2495,7 +2495,7 @@ def _plausible_entity_expansion(expected: object, observed: object) -> bool:
     This is only a candidate gate. It never accepts evidence on its own; the
     same longer name must also be independently present in two document types.
     Keeping the full intake name as an exact prefix avoids fuzzy matches such
-    as ``Amazing Grace Auto Sales`` or ``Grace Auto Repair``.
+    as ``Amazing Sample Auto Sales`` or ``Sample Auto Repair``.
     """
 
     expected_words = _entity_words(expected)

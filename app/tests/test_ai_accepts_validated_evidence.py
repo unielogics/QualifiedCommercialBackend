@@ -1,6 +1,6 @@
 """The AI accepts what it has validated; a person corrects or overrides.
 
-Body Good Studio's six statements sat at "received unverified" because the
+Sample Fabrication's six statements sat at "received unverified" because the
 baseline requirement's objective sentence had become an executable document
 check, which cannot run over six statements, and the failure to run was read
 as a failure to pass. Its signed authorization waited for a person to confirm
@@ -64,7 +64,7 @@ def test_checks_that_could_not_run_are_told_apart_from_checks_that_failed() -> N
 def _analysis(classification="bank_statement"):
     return SimpleNamespace(
         status="completed", classification=classification, confidence="high", content_hash="h1", analysis_version=4,
-        analysis={"key_facts": {"statement_period": "2026-05-30 to 2026-06-30", "account_holder": "Body Good Studio LLC"}, "document_type_candidates": [], "evidence_claims": [], "limitations": [], "red_flags": []},
+        analysis={"key_facts": {"statement_period": "2026-05-30 to 2026-06-30", "account_holder": "Sample Fabrication LLC"}, "document_type_candidates": [], "evidence_claims": [], "limitations": [], "red_flags": []},
         document_type_candidates=[], evidence_claims=[], skip_reason=None, skip_detail=None, error=None,
         analyzed_at=datetime(2026, 11, 3, tzinfo=UTC),
     )
@@ -78,7 +78,7 @@ def test_a_validated_statement_is_accepted_when_the_grounded_checks_cannot_run()
     requirement = _requirement(review_checks=[{"key": "custom_1", "label": "Objective", "instructions": "Confirm balances", "severity": "review"}])
     assessment = {"status": "unknown", "reason": "The complete evidence exceeds the AI review text limit; staff review is needed.", "checks": []}
     decision, code, explanation, _confidence = _automatic_evidence_decision(
-        requirement=requirement, file=_file(), analysis=_analysis(), expected_entity="Body Good Studio LLC",
+        requirement=requirement, file=_file(), analysis=_analysis(), expected_entity="Sample Fabrication LLC",
         duplicate_content=False, corroborated_entities=set(), review_checks=requirement.review_checks,
         check_assessment=assessment, requires_human=False,
     )
@@ -87,7 +87,7 @@ def test_a_validated_statement_is_accepted_when_the_grounded_checks_cannot_run()
 
     failed = {"status": "review", "reason": "Document checks need attention.", "checks": [{"key": "custom_1", "status": "fail", "severity": "review"}]}
     decision, code, _explanation, _confidence = _automatic_evidence_decision(
-        requirement=requirement, file=_file(), analysis=_analysis(), expected_entity="Body Good Studio LLC",
+        requirement=requirement, file=_file(), analysis=_analysis(), expected_entity="Sample Fabrication LLC",
         duplicate_content=False, corroborated_entities=set(), review_checks=requirement.review_checks,
         check_assessment=failed, requires_human=False,
     )

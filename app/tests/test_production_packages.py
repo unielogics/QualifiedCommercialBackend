@@ -488,13 +488,13 @@ async def test_a_document_reading_fills_what_no_column_holds():
     """
     profile = SimpleNamespace(id=uuid.uuid4(), dealer_id=None, intake_id=None, entity_type=None,
                               vertical="dealer", naics_code=None)
-    facts = [_fact("entity_type", "llc"), _fact("legal_entity_name", "Bradley Motors LLC"), _fact("naics_code", "441110")]
+    facts = [_fact("entity_type", "llc"), _fact("legal_entity_name", "Sample Motors LLC"), _fact("naics_code", "441110")]
     db = _prefill_db(lambda *_: None, None, facts=facts)
     with patch.object(prefill.profiles, "owner_rows", AsyncMock(return_value=[])):
         result = await prefill.build_prefill(db, profile, None)
 
     assert result.values["dealer_entity"] == "Limited liability company"
-    assert result.values["dealer_name"] == "Bradley Motors LLC"
+    assert result.values["dealer_name"] == "Sample Motors LLC"
     assert result.values["identity_naics"] == "441110"
     # Unconfirmed, and labelled, so the operator is asked to check it.
     assert result.provenance["dealer_entity"]["confirmed"] is False

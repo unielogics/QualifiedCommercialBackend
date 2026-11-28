@@ -36,11 +36,11 @@ def _pull(fico=701, notes="isoftpull_id=abc; fico_source=full_feed", response=No
 def _intake(variant="main_street_v1", state=None):
     return SimpleNamespace(
         id=uuid4(), bucket_id=uuid4(), client_id=uuid4(), variant=variant, intake_state=dict(state or {}),
-        business_name="Body Good Studio LLC", full_name="Linda Louis",
+        business_name="Sample Fabrication LLC", full_name="Riley Chen",
     )
 
 
-APPLICANT = {"legal_first_name": "Linda", "legal_last_name": "Louis", "dob": "1980-05-30", "street": "1 Main", "city": "Miami", "state": "FL", "zip": "33101"}
+APPLICANT = {"legal_first_name": "Riley", "legal_last_name": "Chen", "dob": "1980-01-15", "street": "100 Sample St", "city": "Miami", "state": "FL", "zip": "33101"}
 
 
 def test_the_score_source_and_the_stand_in_are_read_from_the_notes() -> None:
@@ -75,7 +75,7 @@ async def test_signing_runs_the_pull_and_records_it_on_the_intake() -> None:
     assert record["status"] == "completed" and record["fico"] == 701 and record["fico_source"] == "full_feed"
     assert intake.intake_state["credit_pull"]["pull_id"] == str(pull.id)
     applicant = run.await_args.kwargs["applicant"]
-    assert applicant.dob == date(1980, 5, 30) and applicant.ssn is None
+    assert applicant.dob == date(1980, 1, 15) and applicant.ssn is None
     stamp.assert_awaited_once()
     alert.assert_not_awaited()
 

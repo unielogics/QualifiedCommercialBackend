@@ -1,6 +1,6 @@
 """What the AI fills in on its own so a person only corrects.
 
-Body Good Studio had six accepted statements and still read "needs
+Sample Fabrication had six accepted statements and still read "needs
 information" for revenue, cash flow, NSF count, years in business and
 industry, so no program could be pinned.
 """

@@ -16,3 +16,8 @@ docker-compose.yml
 .vscode
 .idea
 .DS_Store
+
+# The qcbackend image is public: keep test files and local snapshots of live
+# client files out of it. CI runs the tests from the checkout, not the image.
+app/tests
+scripts/review_eval_fixtures/*.json

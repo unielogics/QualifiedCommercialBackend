@@ -4,7 +4,9 @@ Pulls the bucket's per-file analyses, requested documents, file metadata, and
 AI context from the database and writes scripts/review_eval_fixtures/<name>.json
 with an expectations stub derived from the CURRENT latest review (±15% bands on
 its numeric key metrics). Review the generated expectations by hand — they
-encode what "correct" means for this file from now on.
+encode what "correct" means for this file from now on. The snapshot is the
+client's own data: it is ignored by git and must never be committed (the
+repository and its images are public).
 
 Usage (inside the backend container):
     python scripts/snapshot_review_fixture.py <bucket_id> <fixture-name>

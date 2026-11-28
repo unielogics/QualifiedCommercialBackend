@@ -26,8 +26,8 @@ def _pull(**over):
         "client_id": CLIENT,
         "application_owner_id": None,
         "status": "completed",
-        "legal_first_name": "Linda",
-        "legal_last_name": "Louis",
+        "legal_first_name": "Riley",
+        "legal_last_name": "Chen",
         "email": None,
         "dob": date(1979, 4, 2),
         "street": "1 Main St",
@@ -49,9 +49,9 @@ def _owner(**over):
     row = {
         "id": uuid4(),
         "profile_id": uuid4(),
-        "first_name": "Linda",
-        "last_name": "Louis",
-        "email": "linda@bodygoodstudio.com",
+        "first_name": "Riley",
+        "last_name": "Chen",
+        "email": "riley.chen@example.com",
         "dob": None,
         "street": None,
         "city": None,
@@ -102,7 +102,7 @@ def quiet(monkeypatch):
 
 
 def test_names_normalize_and_tiers_follow_the_score() -> None:
-    assert credit_links.normalize_name(" Linda ", "LOUIS") == "linda louis"
+    assert credit_links.normalize_name(" Riley ", "CHEN") == "riley chen"
     assert credit_links.normalize_name(None, None) == ""
     assert [credit_links.tier_for(s) for s in (742, 660, 600, None)] == ["Tier 1", "Tier 2", "Tier 3", None]
     assert profile_routes._credit_tier(719) == "Tier 2"
@@ -185,7 +185,7 @@ async def test_linking_points_both_ways_and_fills_the_owner_identity(quiet) -> N
     assert owner.credit_summary["linked_how"] == "manual"
     assert owner.credit_summary["attention"].startswith("The linked report has not been imported")
     assert (owner.dob, owner.street, owner.city, owner.state, owner.zip) == (date(1979, 4, 2), "1 Main St", "Miami", "FL", "33101")
-    assert result["words"] == "Linked by hand: pull from Nov 3, 2026, no score returned, to Linda Louis"
+    assert result["words"] == "Linked by hand: pull from Nov 3, 2026, no score returned, to Riley Chen"
     assert result["intake_id"] == str(profile.intake_id)
     db.flush.assert_awaited()
     assert quiet.record.await_args.kwargs["action"] == "owner.credit_linked"
@@ -209,7 +209,7 @@ async def test_a_second_owner_on_the_same_file_is_refused_but_another_file_may_s
     second = _owner(profile_id=profile.id)
     pull = _pull(application_owner_id=first.id)
 
-    with pytest.raises(credit_links.LinkConflict, match="already linked to Linda Louis"):
+    with pytest.raises(credit_links.LinkConflict, match="already linked to Riley Chen"):
         await credit_links.link_pull(_db(get=lambda *a: first), profile, second, pull)
 
     sibling_file = _profile()
@@ -268,7 +268,7 @@ async def test_auto_link_on_a_file_links_exact_matches_and_names_who_waits(quiet
 
     report = await credit_links.auto_link_profile(_db([ready, likely_only, nothing, done]), profile, how=credit_links.HOW_SWEEP)
 
-    assert [entry["owner_name"] for entry in report["linked"]] == ["Linda Louis"]
+    assert [entry["owner_name"] for entry in report["linked"]] == ["Riley Chen"]
     assert ready.credit_pull_id == exact_pull.id
     assert [(w["owner_name"], w["reason"][:22]) for w in report["waiting"]] == [
         ("Mark Lee", "Only a name match on a"),
@@ -294,11 +294,11 @@ async def test_a_fresh_pull_needs_exactly_one_waiting_owner(quiet, monkeypatch) 
 
 async def test_the_sweep_reports_every_pull_it_looked_at(monkeypatch) -> None:
     connected = _pull()
-    orphan = _pull(legal_first_name="Steve", legal_last_name="Johnson", fico=742, notes="fico_source=scraped:fico_8")
+    orphan = _pull(legal_first_name="Taylor", legal_last_name="Reed", fico=742, notes="fico_source=scraped:fico_8")
 
     async def fresh(db, pull, *, actor=None, how=credit_links.HOW_AUTOMATIC):
         if pull is connected:
-            return [{"owner_name": "Linda Louis", "score": None, "fico_source": None}], None
+            return [{"owner_name": "Riley Chen", "score": None, "fico_source": None}], None
         return [], "No owner with this name is waiting on the client's files"
 
     monkeypatch.setattr(credit_links, "link_fresh_pull", fresh)
@@ -309,7 +309,7 @@ async def test_the_sweep_reports_every_pull_it_looked_at(monkeypatch) -> None:
     assert report["unmatched"] == [
         {
             "pull_id": str(orphan.id),
-            "name": "Steve Johnson",
+            "name": "Taylor Reed",
             "client_id": str(CLIENT),
             "pulled_at": PULLED.isoformat(),
             "score_words": "score 742",
@@ -320,7 +320,7 @@ async def test_the_sweep_reports_every_pull_it_looked_at(monkeypatch) -> None:
 
 
 async def test_the_hook_only_links_in_automatic_mode(monkeypatch) -> None:
-    fresh = AsyncMock(return_value=([{"owner_name": "Linda Louis"}], None))
+    fresh = AsyncMock(return_value=([{"owner_name": "Riley Chen"}], None))
     monkeypatch.setattr(credit_links, "link_fresh_pull", fresh)
 
     monkeypatch.setattr(credit_links, "mode", AsyncMock(return_value="manual"))
@@ -328,7 +328,7 @@ async def test_the_hook_only_links_in_automatic_mode(monkeypatch) -> None:
     fresh.assert_not_awaited()
 
     monkeypatch.setattr(credit_links, "mode", AsyncMock(return_value="automatic"))
-    assert await credit_links.after_pull(_db(), _pull()) == [{"owner_name": "Linda Louis"}]
+    assert await credit_links.after_pull(_db(), _pull()) == [{"owner_name": "Riley Chen"}]
     assert await credit_links.after_pull(_db(), _pull(status="revoked")) == []
 
 
@@ -374,8 +374,8 @@ async def test_the_desk_hears_what_the_sweep_connected(monkeypatch) -> None:
         {
             "at": "now",
             "linked": [
-                {"owner_name": "Linda Louis", "score": None, "fico_source": None},
-                {"owner_name": "Steve Johnson", "score": 742, "fico_source": "scraped:fico_8"},
+                {"owner_name": "Riley Chen", "score": None, "fico_source": None},
+                {"owner_name": "Taylor Reed", "score": 742, "fico_source": "scraped:fico_8"},
             ],
             "unmatched": [{}],
         },
@@ -383,7 +383,7 @@ async def test_the_desk_hears_what_the_sweep_connected(monkeypatch) -> None:
     kwargs = notify.await_args.kwargs
     assert kwargs["recipient_ids"] == {admin.id}
     assert kwargs["title"] == "2 credit pulls connected to file owners"
-    assert kwargs["body"] == "Linda Louis: no score returned\nSteve Johnson: score 742"
+    assert kwargs["body"] == "Riley Chen: no score returned\nTaylor Reed: score 742"
     assert kwargs["deep_link"] == "/settings?section=credit_linking"
 
 

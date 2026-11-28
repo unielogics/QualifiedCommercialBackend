@@ -470,7 +470,7 @@ async def test_extracted_facts_stay_with_source_bucket_while_links_are_discovere
         classification="tax_return",
         analysis={
             "profile_facts": {
-                "legal_entity_name": {"value": "Grace Auto Sales and Service, Inc."}
+                "legal_entity_name": {"value": "Sample Auto Sales and Service, Inc."}
             },
             "key_facts": {},
         },

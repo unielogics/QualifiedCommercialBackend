@@ -310,7 +310,7 @@ def _legacy_body(assets, liabilities):
     return financial_statements.from_legacy_submission(
         assets=assets,
         liabilities=liabilities,
-        owner_full_name="John Grace",
+        owner_full_name="Jordan Sample",
         statement_date="2026-09-05",
     )
 

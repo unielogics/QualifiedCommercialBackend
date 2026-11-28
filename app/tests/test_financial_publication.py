@@ -92,7 +92,7 @@ async def test_scoped_ai_uses_accepted_schedule_instead_of_partial_new_family_an
     other = SimpleNamespace(id=uuid4(), profile_id=profile_id, kind="debt_schedule", label="New period")
     accepted = SimpleNamespace(id=uuid4(), version_number=2, source="form", status="published", created_at=datetime.now(UTC),
         pdf_file_id=file_id, source_file_id=None, key_facts={"total_monthly_debt_service": 1500},
-        body={"business_name": "Little Star Therapy", "debts": [
+        body={"business_name": "Sample Therapy", "debts": [
             {"lender": "Kapfi", "balance": "40000", "monthly_payment": "1000"},
             {"lender": "Other", "balance": "9000", "monthly_payment": "500", "count_in_dscr": False},
         ]})
